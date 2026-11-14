@@ -45,3 +45,7 @@ A profile is a folder in `~/.config/herdr-pa/profiles/<name>/` (`profile.json`, 
 `pa-core-check` fails if `runtime/core`, `runtime/tools` or the mod names a profile's tools. Each
 profile lists its own terms in `profile.json` (`"coreCheck": ["..."]`), so this repo holds no such list.
 `herdr-app check mods/project-agent` loads the mod once.
+
+## Licence
+
+Apache License 2.0; see `LICENSE` and `NOTICE`.

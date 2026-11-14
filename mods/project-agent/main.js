@@ -385,7 +385,7 @@ export default class ProjectAgent extends View {
         .when(Boolean(c.task) && !this.data?.evidence?.has(c.task), (el) => el.child(div().flex_none().text_size(11.5).text_color(t.dim).child(c.task)))
         .child(div().flex_1())
         .child(div().flex_none().text_size(10.5).text_color(t.dim).child(when(open ? c.created : c.answered)))
-        .child(this.chip(t, open ? "open" : `answered: ${c.answer}`, open ? t.blocked : t.dim)))
+        .child(this.chip(t, open ? "open" : c.status === "withdrawn" ? "withdrawn" : `answered: ${c.answer}`, open ? t.blocked : t.dim)))
       .child(div().text_size(13).font_semibold().text_color(t.foreground).child(String(c.question)))
       .when(Boolean(c.context), (el) => el.child(div().text_size(12).text_color(t.muted).child(String(c.context))))
       .when(Boolean(task), (el) => el.children(this.actions(t, task, space)))
@@ -407,7 +407,9 @@ export default class ProjectAgent extends View {
             .when(Boolean(picked) && !busy, (b) => b.cursor_pointer().hover((s) => s.opacity(0.88)).on_click((_e, cx) => this.answer(space, entry, picked, cx)))
             .child(busy ? "Saving…" : picked ? `Submit answer: ${picked}` : "Submit answer"))
           .child(div().flex_1().min_w(0).text_size(10.5).text_color(t.dim).child(picked ? "Add a note above if you want; it is sent with the answer." : "Pick an option, add a note if you want, then submit."))))
-      .when(!open && Boolean(c.note), (el) => el.child(div().text_size(12).text_color(t.muted).child(`Note: ${c.note}`)))
+      // Closed from the conversation: say so, with the words that decided it (or why it was withdrawn).
+      .when(!open && Boolean(c.answeredBy), (el) => el.child(div().text_size(11).text_color(t.dim).child(c.status === "withdrawn" ? "Closed by the Project Agent as no longer needed" : `Answered by the ${c.answeredBy}`)))
+      .when(!open && Boolean(c.note), (el) => el.child(div().text_size(12).text_color(t.muted).child(c.status === "withdrawn" ? `Why: ${c.note}` : c.answeredBy ? `You said: “${c.note}”` : `Note: ${c.note}`)))
       .when(Boolean(this.failed[entry.id]), (el) => el.child(div().text_size(11.5).text_color(t.blocked).child(this.failed[entry.id])));
   }
 

@@ -14,6 +14,8 @@ One file, selected by the name it is invoked as (symlinks in ~/.local/bin):
   pa-cleanup [--kill] [--dry-run] [--space ID]   remove finished workers whose evidence is recorded
   pa-doctor [--space ID]                         check a space's state files; exit 1 if any is broken
   pa-task list|done|reopen|park|delete|restore|purge   the person's own changes to tasks (see pa-task --help)
+  pa-decide <card> --answer LABEL --quote TEXT   record a decision the person made in conversation
+  pa-decide <card> --withdraw --why TEXT         close a card the conversation made moot
   pa-sync --on MACHINE [--dry-run]               copy core/, tools/ and profiles/ to another Herdr machine
   pa-core-check                                  fail if the generic core names a profile's tools
 """
@@ -801,8 +803,8 @@ def cmd_doctor(args):
         card = load(os.path.join("decisions", name))
         if card is None:
             continue
-        if not isinstance(card.get("question"), str) or not isinstance(card.get("options"), list) or card.get("status") not in ("open", "answered"):
-            problems.append("decisions/{}: needs question, options and status open|answered".format(name))
+        if not isinstance(card.get("question"), str) or not isinstance(card.get("options"), list) or card.get("status") not in ("open", "answered", "withdrawn"):
+            problems.append("decisions/{}: needs question, options and status open|answered|withdrawn".format(name))
         elif card["status"] == "open":
             open_cards += 1
     notes.append("{} open decision(s)".format(open_cards))
@@ -934,6 +936,53 @@ def cmd_task(args):
             print("(The Project Agent could not be told right now; it reads the ledger on its next pass.)")
 
 
+def cmd_decide(args):
+    """Closes an open decision card from the conversation: with the person's answer in their own
+    words, or as withdrawn. For the orchestrator; every use is journaled and shown on the card."""
+    directory, agent = space_for_command(args.space)
+    ident(args.card, "card id")
+    path = os.path.join(directory, "decisions", args.card + ".json")
+    card = read_json(path)
+    if not card:
+        raise Problem("no decision card {}".format(args.card))
+    if card.get("status") != "open":
+        raise Problem("{} is already {}".format(args.card, card.get("status")))
+    stamp = now()
+    if args.withdraw:
+        if not (args.why or "").strip():
+            raise Problem("--withdraw needs --why \"<reason>\"")
+        card.update(status="withdrawn", answer=None, note=args.why.strip(), answered=stamp, answeredBy="orchestrator: withdrawn")
+        what = "withdrawn"
+    else:
+        if card.get("worktree"):
+            raise Problem("a card that deletes a worktree is answered in the panel, not in conversation")
+        labels = [o.get("label") for o in card.get("options") or []]
+        match = next((l for l in labels if str(l).lower() == str(args.answer or "").strip().lower()), None)
+        if match is None:
+            raise Problem("--answer must be one of this card's options: {}".format(", ".join(map(str, labels))))
+        quote = (args.quote or "").strip()
+        if len(quote) < 2:
+            raise Problem("--quote needs the person's own words that decide it")
+        card.update(status="answered", answer=match, note=quote, answered=stamp, answeredBy="person, in conversation")
+        what = "answered {}".format(match)
+        # A rule proposal's card decides the rule too, as it does in the panel.
+        decided = "active" if str(match).lower().startswith("approve") else "declined" if str(match).lower().startswith("decline") else None
+        if card.get("rule") and decided:
+            rules_path = os.path.join(directory, "rules.json")
+            rules = read_json(rules_path) or {}
+            for r in rules.get("rules", []):
+                if r.get("id") == card["rule"] and r.get("status") == "proposed":
+                    r["status"] = decided
+                    r.setdefault("history", []).append({"at": stamp, "by": "person", "change": ("approved" if decided == "active" else "declined") + " in conversation"})
+            if rules.get("rules") is not None:
+                write_json(rules_path, rules)
+    write_json(path, card)
+    with open(os.path.join(directory, "journal.jsonl"), "a") as journal:
+        journal.write(json.dumps({"at": stamp, "by": "orchestrator", "trigger": "conversation", "task": card.get("task"), "decision": args.card,
+                                  "why": "{}: {}".format(what, card["note"])}) + "\n")
+    print("{} {} ({}).".format(args.card, what, card["answeredBy"]))
+
+
 def cmd_sync(args):
     """Each machine has its own copy of ~/.config/herdr-pa. This copies the shared parts (not
     config.json, the registry or any space's state) to another machine known to hc."""
@@ -1058,13 +1107,24 @@ def main():
         parser.add_argument("task", nargs="?")
         parser.add_argument("--space")
         return cmd_task(parser.parse_args())
+    if kind == "pa-decide":
+        parser.add_argument("card")
+        parser.add_argument("--answer", help="one of the card's option labels")
+        parser.add_argument("--quote", help="the person's own words that decide it")
+        parser.add_argument("--withdraw", action="store_true", help="close the card without an answer")
+        parser.add_argument("--why", help="why it no longer applies (with --withdraw)")
+        parser.add_argument("--space")
+        args = parser.parse_args()
+        if not args.withdraw and not args.answer:
+            raise Problem("give --answer LABEL --quote TEXT, or --withdraw --why TEXT")
+        return cmd_decide(args)
     if kind == "pa-sync":
         parser.add_argument("--on", required=True, help="the machine's name in `hc machine ls`")
         parser.add_argument("--dry-run", action="store_true")
         return cmd_sync(parser.parse_args())
     if kind == "pa-core-check":
         return cmd_core_check(parser.parse_args())
-    raise Problem("invoke as pa-start, pa-session, pa-claude, pa-codex, pa-profile, pa-peers, pa-pass, pa-cleanup, pa-doctor, pa-task, pa-sync or pa-core-check")
+    raise Problem("invoke as pa-start, pa-session, pa-claude, pa-codex, pa-profile, pa-peers, pa-pass, pa-cleanup, pa-doctor, pa-task, pa-decide, pa-sync or pa-core-check")
 
 
 if __name__ == "__main__":

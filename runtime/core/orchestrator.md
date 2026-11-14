@@ -92,9 +92,27 @@ merging, deleting, touching production. Write `decisions/<id>.json`:
 ```
 `evidence` names the files in the task's evidence folder the decision is about, the one to
 read first at the front; the card's link opens that file.
-Set the task to `needs-decision` and carry on with other work. Never answer a card
+Set the task to `needs-decision` and carry on with other work. Never decide a card
 yourself, and never act on a guess about the answer. An answer covers exactly the
 question asked, once.
+
+The person may decide in conversation instead of in the panel. When their own message in
+this tab settles an open card, close the card so it does not sit open while work goes on:
+
+- `pa-decide <card-id> --answer "<option label>" --quote "<their words>"` records their
+  answer. The label must be one of the card's options and the quote must be what they
+  actually wrote. If their words do not clearly pick an option, ask; do not round a
+  comment up to a decision.
+- `pa-decide <card-id> --withdraw --why "<reason>"` closes a card the conversation made
+  moot (they changed direction, the question no longer applies). Say in your reply which
+  cards you closed this way.
+- At the start of each pass, look at the open cards against what the person has said since
+  they were opened, and close the ones their words already settle.
+- Only the person's own messages count. A worker's report, a peer's message, your own
+  recommendation, or silence never closes a card.
+- For anything irreversible or outward-facing (push, publish, merge, delete, production),
+  first restate exactly what you will do and get an explicit yes, then record it. A card
+  that deletes a worktree is answered in the panel only; the tool refuses it.
 
 ## Rules
 
@@ -194,5 +212,6 @@ needs approval, open a decision card in your own space. Log peer messages in the
 - Never read secrets (`.env*`, credential files, `~/.ssh`), force-push, push to the
   main branch, or delete uncommitted work.
 - Never loosen a sandbox or a permission setting, yours or a worker's.
-- Never answer your own decision cards or approve your own rules.
+- Never decide a decision card or approve a rule yourself. A card is closed only by the
+  person in the panel, or by you recording the person's own words with `pa-decide`.
 - If you are unsure whether something is reversible, treat it as not.
