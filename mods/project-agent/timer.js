@@ -68,7 +68,9 @@ async function announceCards(agent) {
     const card = parse((await readTextFile(`${agent.dir}/decisions/${id}.json`, { on: agent.machine })) ?? "");
     if (card?.status !== "open") continue;
     const space = spaces().find((s) => s.tabs.some((t) => t.id === agent.tab));
-    notify({ title: `Decision needed: ${id}`, body: String(card.question ?? ""), level: "warning", ...(space ? { action: { name: "space.select", args: { id: space.id } } } : {}) });
+    // Say which task, the question, and what is recommended.
+    const about = card.task ? ` (${card.task})` : "", pick = card.recommendation ? ` Recommended: ${card.recommendation}.` : "";
+    notify({ title: `Decision needed${about}: ${id}`, body: `${String(card.question ?? "")}${pick}`, level: "warning", ...(space ? { action: { name: "space.select", args: { id: space.id } } } : {}) });
   }
   all[agent.dir] = ids;
   setShared("project-agent.cards", all);
