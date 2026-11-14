@@ -101,6 +101,10 @@ export default class ProjectAgent extends View {
         }
         const allSpots = { ...(shared("my-files.places") ?? {}) };
         if (JSON.stringify(allSpots[space.id] ?? []) !== JSON.stringify(spots)) { if (spots.length) allSpots[space.id] = spots; else delete allSpots[space.id]; setShared("my-files.places", allSpots); }
+        // The profile's main-branch names, for views that compare a branch with its base.
+        const mains = Array.isArray(data.profile?.mainBranches) ? data.profile.mainBranches : [];
+        const allMains = { ...(shared("project-agent.mainBranches") ?? {}) };
+        if (JSON.stringify(allMains[space.id] ?? []) !== JSON.stringify(mains)) { if (mains.length) allMains[space.id] = mains; else delete allMains[space.id]; setShared("project-agent.mainBranches", allMains); }
         // And which task each worker belongs to (an Agents view can link a worker back to its task).
         const crew = {};
         for (const x of data.ledger?.tasks ?? []) for (const w of x.workers ?? []) if (w.address) crew[space.machine ? `${space.machine}/${w.address}` : w.address] = { task: x.id, title: String(x.title ?? ""), role: w.role ?? null, state: x.state ?? null };
