@@ -1,0 +1,36 @@
+{
+  "name": "personal",
+  "claude": [
+    "claude"
+  ],
+  "codex": [
+    "codex",
+    "--no-daemon"
+  ],
+  "path": [],
+  "models": {},
+  "tests": {
+    "affected": "",
+    "full": ""
+  },
+  "changeRequest": {
+    "name": "pull request",
+    "tool": "GitHub",
+    "create": "gh pr create --draft"
+  },
+  "ci": [
+    "GitHub Actions"
+  ],
+  "tracker": "GitHub issues (optional)",
+  "actions": [],
+  "linkTemplates": [],
+  "mcpServers": {
+    "playwright": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@playwright/mcp@latest"
+      ]
+    }
+  }
+}

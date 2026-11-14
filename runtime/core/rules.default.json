@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "rules": [
+    { "id": "r-build-before-review", "title": "Build before review",
+      "text": "A task that changed code needs a clean build and passing tests, with the output in build.log, before it moves to review.",
+      "why": "Review time is wasted on code that does not build.", "appliesTo": "review" },
+    { "id": "r-adversarial-review", "title": "Adversarial review before review",
+      "text": "A different worker than the author reviews the work with fresh context and writes REVIEW.md before the task moves to review.",
+      "why": "Authors miss their own mistakes; separation of duties.", "appliesTo": "review" },
+    { "id": "r-no-push-without-decision", "title": "No push or publish without a decision",
+      "text": "Pushing, publishing a change request, merging and deleting always need an answered decision card first.",
+      "why": "These cannot be taken back.", "appliesTo": "all" },
+    { "id": "r-workers-report", "title": "Workers report with hc send",
+      "text": "Every worker handoff ends with the instruction to report with hc send to the orchestrator's address when done or stuck.",
+      "why": "The orchestrator learns about finished work from reports, not by polling.", "appliesTo": "all" }
+  ]
+}

@@ -1,0 +1,6 @@
+*.bak-*
+.DS_Store
+__pycache__/
+*.pyc
+gpui-kit.d.ts
+jsconfig.json
