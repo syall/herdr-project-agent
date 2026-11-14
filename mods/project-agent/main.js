@@ -96,8 +96,8 @@ export default class ProjectAgent extends View {
         const spots = data.evidence?.size ? [{ label: "All evidence", path: `${dir}/evidence`, group: "Project Agent" }] : [];
         for (const x of byNewest.slice(0, 15)) {
           const files = data.evidence?.get(x.id);
-          if (files) spots.push({ label: `${x.id} evidence · ${files.length} ${files.length === 1 ? "file" : "files"}`, detail: String(x.title ?? ""), path: `${dir}/evidence/${x.id}`, group: "Project Agent" });
-          if (x.worktree) spots.push({ label: `${x.id} worktree`, detail: String(x.title ?? ""), path: String(x.worktree), group: "Project Agent" });
+          if (files) spots.push({ label: `${x.id} evidence · ${files.length} ${files.length === 1 ? "file" : "files"}`, detail: String(x.title ?? ""), path: `${dir}/evidence/${x.id}`, group: "Project Agent", task: x.id });
+          if (x.worktree) spots.push({ label: `${x.id} worktree`, detail: String(x.title ?? ""), path: String(x.worktree), group: "Project Agent", task: x.id });
         }
         const allSpots = { ...(shared("my-files.places") ?? {}) };
         if (JSON.stringify(allSpots[space.id] ?? []) !== JSON.stringify(spots)) { if (spots.length) allSpots[space.id] = spots; else delete allSpots[space.id]; setShared("my-files.places", allSpots); }
@@ -270,7 +270,7 @@ export default class ProjectAgent extends View {
 
   // Points the Files view at a task's evidence folder; `file` opens that file in it (else its list).
   showEvidence(space, task, file) {
-    setShared("my-files.root", { space: space.id, path: `${stateDir(space)}/evidence/${task}`, label: `evidence ${task}`, file: file ?? null, at: Date.now() });
+    setShared("my-files.root", { space: space.id, path: `${stateDir(space)}/evidence/${task}`, label: `evidence ${task}`, file: file ?? null, task, at: Date.now() });
     run("layout.select", { stack: "panel-body", child: "files" });
   }
 
