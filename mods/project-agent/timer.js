@@ -6,7 +6,7 @@
 // schedule.json ownership: the person (this panel) and the orchestrator write the settings;
 // only this timer writes lastPass and nextPass. pass-request.json is the on-demand queue.
 
-import { terminals, hc, readTextFile, exec, shared, setShared } from "herdr";
+import { terminals, hc, readTextFile, exec, shared, setShared, notify, spaces } from "herdr";
 import { paHome, replaceFile } from "./store.js";
 
 export const MIN_MINUTES = 5;
@@ -37,7 +37,7 @@ export function holdReason(schedule, ledger) {
 export function projectAgents() {
   return terminals().filter((t) => t.state === "live" && t.labels?.["herdr.pa"]).map((t) => {
     const machine = String(t.address).includes("/") ? String(t.address).split("/")[0] : null;
-    return { address: t.address, machine, status: t.status ?? null, dir: `${paHome(machine)}/spaces/${t.labels["herdr.pa"]}`, name: t.labels["herdr.pa.name"] ?? "" };
+    return { address: t.address, machine, status: t.status ?? null, tab: (machine ? `${machine}/` : "") + (t.labels["herdr.tab"] ?? ""), dir: `${paHome(machine)}/spaces/${t.labels["herdr.pa"]}`, name: t.labels["herdr.pa.name"] ?? "" };
   });
 }
 
@@ -54,7 +54,28 @@ export async function patchJson(path, machine, change, fallback) {
   await replaceFile(path, `${JSON.stringify(change({ ...value }), null, 2)}\n`, text, machine);
 }
 
+// A notification for each decision card that is new and open, for every Project Agent (not only
+// the space on screen). The cards seen per agent are kept in shared "project-agent.cards"; the
+// first look at an agent only records what is there.
+async function announceCards(agent) {
+  const r = await exec("ls", ["-1", `${agent.dir}/decisions`], { on: agent.machine, timeout: 10000 });
+  if (r.code !== 0) return;
+  const ids = r.stdout.split("\n").filter((n) => /^[A-Za-z0-9_.-]+\.json$/.test(n)).map((n) => n.slice(0, -5));
+  const all = { ...(shared("project-agent.cards") ?? {}) }, seen = all[agent.dir];
+  const fresh = seen ? ids.filter((id) => !seen.includes(id)) : [];
+  if (seen && !fresh.length && seen.length === ids.length) return;
+  for (const id of fresh.slice(0, 5)) {
+    const card = parse((await readTextFile(`${agent.dir}/decisions/${id}.json`, { on: agent.machine })) ?? "");
+    if (card?.status !== "open") continue;
+    const space = spaces().find((s) => s.tabs.some((t) => t.id === agent.tab));
+    notify({ title: `Decision needed: ${id}`, body: String(card.question ?? ""), level: "warning", ...(space ? { action: { name: "space.select", args: { id: space.id } } } : {}) });
+  }
+  all[agent.dir] = ids;
+  setShared("project-agent.cards", all);
+}
+
 async function tickOne(agent, now) {
+  await announceCards(agent).catch(() => {});
   const busy = agent.status === "working" || agent.status === "blocked";
   const [scheduleText, ledgerText, requestText] = await Promise.all(["schedule.json", "ledger.json", "pass-request.json"].map((f) => readTextFile(`${agent.dir}/${f}`, { on: agent.machine })));
   const schedule = parse(scheduleText ?? ""), ledger = parse(ledgerText ?? ""), request = parse(requestText ?? "");

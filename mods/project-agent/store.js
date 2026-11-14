@@ -72,6 +72,16 @@ export function taskActions(profile, profileDir, task, platform) {
   }).filter(Boolean);
 }
 
+// Instruction files changed since the agent's session last started: the names, or []. The
+// launcher writes session.log at each start, and the agent reads its instructions only then.
+export async function staleInstructions(space, profile) {
+  const root = paHome(space.machine), script = 'cd "$1" 2>/dev/null || exit 0; [ -f "$2/session.log" ] || exit 0; find core "profiles/$3/context.md" -name "*.md" -newer "$2/session.log" 2>/dev/null';
+  try {
+    const r = await exec("sh", ["-c", script, "sh", root, `spaces/${localId(space.id)}`, profile ?? ""], { on: space.machine ?? null, timeout: 10000 });
+    return r.stdout.split("\n").filter(Boolean).map((p) => p.split("/").pop());
+  } catch { return []; }
+}
+
 // A task's artifacts as links: [{ label, url }], https only, each once. From the task itself
 // ("links": [{ label, url }] and "changeRequest": { id, url }), and from the profile's
 // "linkTemplates" ([{ "match": "<regex>", "url": "https://.../{0}" }]): every id the pattern

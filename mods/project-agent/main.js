@@ -7,7 +7,7 @@
 import { View, div } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, ScrollHandle } from "gpui-base";
 import { spaces, panes, agents, terminals, theme, run, exec, props, home, watchFolder, notify, shared, setShared, closeOverlay, openOverlay, window, layout } from "herdr";
-import { loadSpace, loadDecisions, answerDecision, notifyOrchestrator, changeRules, touched, localId, paHome, stateDir, taskActions, taskLinks, evidenceTasks, cardEvidence } from "./store.js";
+import { loadSpace, loadDecisions, answerDecision, notifyOrchestrator, changeRules, touched, localId, paHome, stateDir, taskActions, taskLinks, evidenceTasks, cardEvidence, staleInstructions } from "./store.js";
 import { RulesPane } from "./rules.js";
 import { SetupPane } from "./setup.js";
 import { Keeper } from "./keeper.js";
@@ -77,7 +77,7 @@ export default class ProjectAgent extends View {
     this.loading = space.id;
     cx.spawn(async (cx) => {
       let data, cards = [];
-      try { data = await loadSpace(space, props()?.profile); if (data.agent) { cards = await loadDecisions(space); await this.rules.load(space); data.evidence = await evidenceTasks(space); } }
+      try { data = await loadSpace(space, props()?.profile); if (data.agent) { cards = await loadDecisions(space); await this.rules.load(space); data.evidence = await evidenceTasks(space); data.stale = await staleInstructions(space, data.agent.profile); } }
       catch (e) { data = { agent: null, errors: [String(e.message ?? e)] }; }
       this.loading = null;
       if (spaces().find((s) => s.active)?.id === space.id) {
@@ -468,6 +468,9 @@ export default class ProjectAgent extends View {
       .child(v_flex().px(12).py(8).gap(2).flex_none().border_b(1).border_color(t.border).text_size(11.5).text_color(t.dim)
         .child(div().truncate().child(String(a.project ?? "").replace(home(), "~")))
         .child(div().child(`profile ${a.profile ?? "?"} · ${active} active of ${tasks.length} tasks · pass ${data.ledger?.passCount ?? 0}`)))
+      // The agent reads its instructions when its session starts; say when they have changed since.
+      .when((data.stale ?? []).length > 0 && Boolean(live), (el) => el.child(div().px(12).py(6).border_b(1).border_color(t.border).bg(t.working + "1a").text_size(11.5).text_color(t.foreground)
+        .child(`Its instructions changed since this agent started (${data.stale.slice(0, 3).join(", ")}). Type /exit in its tab: it restarts in place, keeps the conversation and loads them.`)))
       .child(this.scheduleBar(t, space, data))
       .child(h_flex().px(8).py(6).gap(4).flex_none().border_b(1).border_color(t.border)
         .child(tab("decisions", openCards.length ? `Decisions · ${openCards.length}` : "Decisions"))
