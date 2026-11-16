@@ -861,6 +861,75 @@ class Close(Base):
         self.assertEqual(self.ended(), [])
         self.assertEqual(self.journal(), [])
 
+    # ---- the verifier's surviving mutants (VERIFY.md section 4) ----
+    def while_waiting(self, change):
+        """Run a close while another holder of the ledger lock makes `change` (then lets go)."""
+        import fcntl
+        held = threading.Event()
+
+        def other():
+            with open(os.path.join(self.dir, ".ledger.lock"), "a") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                held.set()
+                time.sleep(0.4)
+                change()
+        t = threading.Thread(target=other)
+        t.start()
+        held.wait(5)
+        result = self.close("t31", "--evidence", "FINDINGS.md")
+        t.join()
+        return result
+
+    def test_w23_ledger_reread_under_the_lock(self):  # reread-ledger-lock: no lost update
+        def other_writer():
+            led = self.ledger()
+            led["tasks"][0]["state"] = "review"
+            led["tasks"].append({"id": "t-009", "title": "added meanwhile", "state": "queued", "workers": []})
+            self.ledger(led)
+        code, _, err = self.while_waiting(other_writer)
+        self.assertEqual(code, 0, err)
+        led = self.ledger()
+        self.assertEqual(led["tasks"][0]["state"], "review", "the other writer's change survives the close")
+        self.assertEqual(led["tasks"][1]["id"], "t-009")
+        self.assertTrue(self.entry("t-003", "t31")["finished"])
+
+    def test_w24_keep_set_while_waiting(self):  # identity-under-lock (keep)
+        def keep():
+            led = self.ledger()
+            led["tasks"][0]["workers"][0].update(keep=True, keptAt="2026-11-16T10:00:00Z", keepQuote="keep it")
+            self.ledger(led)
+        before_journal = raw(os.path.join(self.dir, "journal.jsonl"))
+        self.refused(self.while_waiting(keep), "is marked keep")
+        self.assertFalse(self.entry("t-003", "t31").get("finished"))
+        self.assertEqual(raw(os.path.join(self.dir, "journal.jsonl")), before_journal)
+
+    def test_w24b_address_taken_by_another_terminal_while_waiting(self):  # identity-under-lock (name)
+        def reused():
+            self.terms["t31"]["name"] = "someone-else"
+        self.refused(self.while_waiting(reused), "t31 is now a different terminal (someone-else)")
+        self.assertFalse(self.entry("t-003", "t31").get("finished"))
+
+    def test_w25_entry_removed_while_waiting(self):  # notrec-lock
+        def removed():
+            led = self.ledger()
+            led["tasks"][0]["workers"] = []
+            self.ledger(led)
+        self.refused(self.while_waiting(removed), "t31 is not a recorded worker of this space")
+        self.assertEqual(self.ledger()["tasks"][0]["workers"], [])
+
+    def test_w26_git_status_failing_is_not_clean(self):  # unreadable-gitfail
+        real = shutil.which("git")
+        bin_dir = os.path.join(self.tmp, "bin")
+        write(os.path.join(bin_dir, "git"), '#!/bin/sh\nfor a in "$@"; do [ "$a" = status ] && {{ echo broken >&2; exit 1; }}; done\nexec "{}" "$@"\n'.format(real))
+        os.chmod(os.path.join(bin_dir, "git"), 0o755)
+        saved = os.environ["PATH"]
+        os.environ["PATH"] = bin_dir + os.pathsep + saved
+        try:
+            result = self.close("t31", "--evidence", "FINDINGS.md")
+        finally:
+            os.environ["PATH"] = saved
+        self.refused(result, "cannot tell whether {} holds uncommitted work".format(os.path.realpath(self.wt)))
+
 
 class Keep(Base):
     """R3: pa-worker keep <address> --quote "<words>" [--off]; close and pa-cleanup honour it."""
@@ -1127,6 +1196,49 @@ class Leftovers(Base):
         self.assertIn("--leftovers already ran (workerPolicy since 2026-11-16T10:00:00Z); nothing was done", out)
         self.assertEqual(self.snapshot(), before)
         self.assertEqual(self.ended(), [])
+
+    # ---- the verifier's surviving mutants (VERIFY.md section 4) ----
+    def test_l10_a_handoff_that_names_a_file_keeps_the_worker(self):  # lo-handoff
+        self.add("t-001", "t31", "t-001-build")
+        self.note(trigger="message", task="t-001", why="sent t31 an update, see FINDINGS.md")
+        self.add("t-002", "t32", "t-002-build")
+        self.note(trigger="report", task="t-002", why="t32 reported FINDINGS.md; then asked t32 for a fix round")
+        code, out, _ = self.worker("close", "--leftovers", "--dry-run")
+        self.assertIn("kept t31 (t-001-build, t-001): no recorded report after its last handoff", out)
+        self.assertIn("kept t32 (t-002-build, t-002): no recorded report after its last handoff", out)
+
+    def test_l11_dry_run_lists_a_gone_worker_as_kept(self):  # lo-gone
+        self.add("t-001", "t31", "t-001-build")
+        self.note(trigger="report", task="t-001", why="t31 reported FINDINGS.md")
+        del self.terms["t31"]
+        code, out, _ = self.worker("close", "--leftovers", "--dry-run")
+        self.assertIn("kept t31 (t-001-build, t-001): gone; left for the agent to read", out)
+        self.assertNotIn("would close", out)
+
+    def test_l12_a_real_run_takes_the_ledger_lock(self):  # lo-nolock
+        import fcntl
+        self.add("t-001", "t31", "t-001-build")
+        self.note(trigger="report", task="t-001", why="t31 reported FINDINGS.md")
+        held = threading.Event()
+
+        def other():
+            with open(os.path.join(self.dir, ".ledger.lock"), "a") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                led = self.ledger()  # a read-modify-write like pa-task's, under the lock
+                held.set()
+                time.sleep(0.4)
+                led["tasks"].append({"id": "t-009", "title": "added meanwhile", "state": "queued", "workers": []})
+                self.ledger(led)
+        t = threading.Thread(target=other)
+        t.start()
+        held.wait(5)
+        code, _, err = self.worker("close", "--leftovers")
+        t.join()
+        self.assertEqual(code, 0, err)
+        led = self.ledger()
+        self.assertEqual([x["id"] for x in led["tasks"]], ["t-001", "t-009"], "the other writer's task survives")
+        self.assertTrue(self.entry("t-001", "t31")["finished"])
+        self.assertIn("workerPolicy", led)
 
 
 class Describe(Base):
@@ -1424,6 +1536,18 @@ class Describe(Base):
         self.assertLess(took, 4)
         self.assertIn("Not described (time limit of 1.5 s): r", self.md())
         self.assertIn("more repositories (WORKTREE.md)", card["context"])
+
+    def test_d16_merged_into_any_main_branch(self):  # mg-all
+        bare = os.path.join(self.tmp, "remote.git")
+        sh(self.tmp, "git", "init", "-q", "--bare", bare)
+        sh(self.proj, "git", "remote", "add", "origin", bare)
+        sh(self.proj, "git", "push", "-q", "origin", "main")
+        sh(self.proj, "git", "remote", "set-head", "origin", "main")
+        c1 = self.commit(self.wt, "a.txt", "a\n", "merged locally only")
+        sh(self.proj, "git", "merge", "-q", "--ff-only", c1)  # local main has it, origin/main does not
+        repo = self.open_card()["changes"]["repos"][0]
+        self.assertEqual(repo["base"], "origin/main")
+        self.assertEqual([(c["sha"], c["merged"]) for c in repo["commits"]], [(c1, True)])
 
 
 if __name__ == "__main__":
