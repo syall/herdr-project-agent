@@ -26,8 +26,11 @@ A new space opens with a 600 x 440 dialog: a Project Agent card (`Set up for <fo
   tab. "Another folder…" swaps the page for a path field with folder completion (Tab or a click
   completes, Enter confirms; "Browse…" on this computer). A tile opens that session instead.
   Keys: Enter, 1 to 5, Esc. The tab underneath accepts the same choice typed.
-- **The agent's tab:** kept first in its space, reopened if its terminal ends while the space
-  lives on, resumed with the same conversation. It ends when its space is closed.
+- **The agent's tab:** kept first in its space. If its launcher is gone (a bare shell is left, or
+  its terminal finished), it is restored in the same tab within about 45 s and resumed with the
+  same conversation; the tab stays protected throughout. A tab that vanished is reopened in a new
+  tab. A launcher that cannot start shows why and waits for Enter. It ends when its space is closed.
+  After updating this repo, run `pa-sync --on <machine>` so remote launchers get the same behaviour.
 - **Decisions:** open cards first, newest first. Clicking an option selects it; `Submit answer`
   sends it with the note. The answer is written into the card file and the agent is told with
   `hc send`; a failed send is retried every 10 s and the panel says so. The card's link opens
@@ -52,8 +55,8 @@ A new space opens with a 600 x 440 dialog: a Project Agent card (`Set up for <fo
 ## Built from
 
 - `mods/project-agent/`: `main.js` (panel), `store.js` (file reads, guarded writes, links),
-  `rules.js`, `timer.js` (schedule), `keeper.js` (the agent tab: tracking, ordering, reopening,
-  the new-space dialog), `setup.js` (the new-space dialog), `worker.js` (the delete-worker dialog), `pathfield.js`, `project.svg`,
+  `rules.js`, `timer.js` (schedule), `keeper.js` (the agent tab: tracking, ordering, restoring in place
+  with `keeper.lock` between Herdr clients, the new-space dialog), `setup.js` (the new-space dialog), `worker.js` (the delete-worker dialog), `pathfield.js`, `project.svg`,
   `mod.json` (`{ "place": "none" }`).
 - Layout: a block `{ "mod": "project-agent" }` in the right panel's stack, optionally with
   `props.profile`, and a floating block `{ "mod": "project-agent", "props": { "timer": true } }`

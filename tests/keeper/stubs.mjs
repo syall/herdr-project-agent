@@ -49,7 +49,7 @@ export const writeTextFile = async (path, text, expected) => {
 export const exec = async (command, args = [], options = {}) => {
   const on = options?.on ?? null;
   if (offline(on)) throw new Error(`machine ${on} is unreachable`);
-  if (command === "python3" && args[0] === "-c" && args.length === 4) {
+  if (command === "python3" && args[0] === "-c" && args.length === 5) {
     const [, , path, expected, text] = args, files = (g.__files ??= {}), k = key(path, on);
     if ((files[k] ?? "") !== expected) return { code: 3, stdout: "", stderr: "" };
     files[k] = text;

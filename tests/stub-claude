@@ -5,7 +5,7 @@
 #   STUB_EXIT              exit code after sleeping (default 0)
 #   STUB_FAIL_RESUME_ONCE  1: the first start with --resume exits 1 at once (marker: $STUB_LOG.failed)
 log=${STUB_LOG:-/dev/null}
-printf '%s\n' "$*" >> "$log"
+printf '%s\n' "$*" | tr '\n' ' ' >> "$log"; echo >> "$log"
 if [ "${STUB_FAIL_RESUME_ONCE:-0}" = 1 ]; then
   case " $* " in
     *" --resume "*)

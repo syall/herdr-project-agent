@@ -37,6 +37,7 @@ import uuid
 HOME = os.path.expanduser("~")
 ROOT = os.environ.get("HERDR_PA_HOME") or os.path.join(HOME, ".config", "herdr-pa")
 APP = os.environ.get("HERDR_APP_HOME") or os.path.join(HOME, ".config", "herdr-app")
+CLAUDE_HOME = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(HOME, ".claude")
 ID = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
@@ -264,6 +265,122 @@ def live_terminals():
     return out
 
 
+# ---- launcher liveness and the resume rule ----------------------------------------------------
+# The launcher writes spaces/<id>/heartbeat ("<epoch> <address>") every 10 s while it runs, and
+# session.log lines "<iso> start resume=... session=<id> ..." and "<iso> exit code=C after=Ns".
+
+FRESH = 30  # a heartbeat older than this many seconds means its launcher is gone
+RAN = 20  # a session that ran this long exists and can be resumed
+
+
+def read_heartbeat(directory):
+    """(epoch, address) from the space's heartbeat file, or None."""
+    try:
+        parts = read_text(os.path.join(directory, "heartbeat")).split()
+        return (int(parts[0]), parts[1]) if len(parts) >= 2 else None
+    except ValueError:
+        return None
+
+
+def launcher_alive(directory, address, fresh=FRESH, now=None):
+    """The space's launcher runs in `address`: the heartbeat names it and is at most `fresh` s old."""
+    hb = read_heartbeat(directory)
+    if not hb or not address or hb[1] != local_id(address):
+        return False
+    return (time.time() if now is None else now) - hb[0] <= fresh
+
+
+def other_launcher_alive(directory, address, fresh=FRESH):
+    """launcher_alive, but a heartbeat that is getting old (a beat missed, or its launcher just
+    died) is watched until it either moves again or passes `fresh`, so a launcher that is
+    replacing a dead one is not refused because it started a few seconds too early."""
+    deadline = time.time() + fresh
+    while True:
+        hb = read_heartbeat(directory)
+        if not hb or not address or hb[1] != local_id(address):
+            return False
+        age = time.time() - hb[0]
+        if age > fresh:
+            return False
+        if age <= 12 or time.time() >= deadline:
+            return True
+        time.sleep(2)
+
+
+def parse_time(text):
+    try:
+        return datetime.datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc).timestamp()
+    except ValueError:
+        return None
+
+
+def session_ran(directory, session_id):
+    """True when session.log shows that session_id ran for at least RAN seconds: its last start
+    line is followed by an exit after >= RAN s, or (killed while running: no exit line) the
+    heartbeat kept beating RAN s past the start."""
+    if not session_id:
+        return False
+    lines = read_text(os.path.join(directory, "session.log")).splitlines()
+    start, last_start = None, None
+    for i, line in enumerate(lines):
+        words = line.split()
+        if len(words) >= 2 and words[1] == "start":
+            last_start = i
+            if "session=" + session_id in words[2:]:
+                start = i
+    if start is None:
+        return False
+    for line in lines[start + 1:]:
+        words = line.split()
+        if len(words) >= 2 and words[1] == "start":
+            break
+        if len(words) >= 2 and words[1] == "exit":
+            m = re.search(r"\bafter=(\d+)s\b", line)
+            return bool(m and int(m.group(1)) >= RAN)
+    began = parse_time(lines[start].split()[0])
+    hb = read_heartbeat(directory)
+    return bool(start == last_start and began is not None and hb and hb[0] >= began + RAN)
+
+
+def claude_slug(path):
+    """Claude's folder name for a project under ~/.claude/projects."""
+    return re.sub(r"[^A-Za-z0-9]", "-", path)
+
+
+def transcript_state(project, session_id):
+    """True / False: Claude's transcript for session_id exists / does not. None: Claude's layout
+    here is unknown (no projects folder, or none for this project). Existence only; never read."""
+    folder = os.path.join(CLAUDE_HOME, "projects", claude_slug(project))
+    if not session_id or not os.path.isdir(folder):
+        return None
+    return os.path.isfile(os.path.join(folder, session_id + ".jsonl"))
+
+
+def should_resume(agent, directory, project):
+    """(resume?, why): why is flag | ran | transcript | new."""
+    sid = agent.get("sessionId")
+    if not sid:
+        return False, "new"
+    if agent.get("sessionStarted"):
+        return True, "flag"
+    if session_ran(directory, sid):
+        return True, "ran"
+    if transcript_state(project, sid) is True:
+        return True, "transcript"
+    return False, "new"
+
+
+def after_exit(agent, resume, code, lasted, quick_resume_fails, transcript):
+    """agent.json after the agent exited. One quick failed resume is not proof the session is
+    gone (a crash, a network error): only a missing transcript or a second one in a row is."""
+    if lasted >= RAN:
+        agent["sessionStarted"] = True
+    elif resume and code != 0 and (transcript is False or quick_resume_fails >= 2):
+        agent["sessionStarted"] = False  # nothing to resume: start a new session next
+        agent.pop("sessionId", None)
+    return agent
+
+
 def live_spaces(terms):
     return {(t.get("labels") or {}).get("herdr.space") for t in terms.values()} - {None}
 
@@ -326,6 +443,7 @@ def init_state(space, project, p, name=None, terminal=None, tab=None, adopt=True
                   "updated": now()})
     agent.setdefault("created", now())
     if terminal:
+        agent.pop("closed", None)  # a launcher runs here again: the space is open (Close Project Agent marks it)
         agent["terminal"] = terminal
         # Every terminal this agent has run in: workers started from an earlier one are still its own.
         agent["terminals"] = ([t for t in agent.get("terminals", []) if t != terminal] + [terminal])[-20:]
@@ -427,12 +545,41 @@ def ask_setup(p, project, address):
         print("Not one of the choices above.")
 
 
+def error_wait(address, problem):
+    """pa-session could not start: show why in the tab and wait for Enter, instead of leaving a
+    plain shell that looks like a Project Agent. The label tells the keeper (and people) why."""
+    message = " ".join(str(problem).split())
+    call(["hc", "label", address, "herdr.pa.error=" + message[:120]], check=False)
+    print("\n[Project Agent] It cannot start: {}\n"
+          "               Fix the cause, then press Enter to try again.".format(message), flush=True)
+    try:
+        input()
+    except EOFError:
+        time.sleep(60)
+    call(["hc", "label", address, "herdr.pa.error="], check=False)  # `key=` removes the label
+
+
 def cmd_session(args):
     address = os.environ.get("HC_TERMINAL_ID")
     info = hc_get(address)
     labels = info.get("labels") or {}
     space = local_id(args.space or labels.get("herdr.space"))
     project = os.path.realpath(os.path.expanduser(args.project or os.getcwd()))
+    ctx = {"directory": None, "beat": False}
+    if args.auto or not address or not space or not sys.stdin.isatty():
+        return run_session(args, address, labels, space, project, ctx)  # no one to show an error to: as before
+    while True:
+        try:
+            return run_session(args, address, labels, space, project, ctx)
+        except (Problem, OSError) as e:
+            try:
+                error_wait(address, e)
+            except KeyboardInterrupt:  # the person stops it: the tab's shell takes over, as before
+                call(["hc", "label", address, "herdr.pa.error="], check=False)
+                sys.exit(2)
+
+
+def run_session(args, address, labels, space, project, ctx):
     existing = read_json(os.path.join(ROOT, "spaces", space, "agent.json"), {}) if space and ID.match(space) else {}
     p = load_profile(args.profile or (existing or {}).get("profile"))
     # A space made in the home folder has no project: a plain Claude tab (pa-start turns one on).
@@ -440,22 +587,28 @@ def cmd_session(args):
         exec_plain(p)
     if not address or not space:
         raise Problem("pa-session runs in a Herdr tab (no HC_TERMINAL_ID or herdr.space label here)")
+    directory = os.path.join(ROOT, "spaces", space) if ID.match(space) else None
     if args.ask:
         # A new space: ask first. Not when this space already has an agent (a second tab is a plain one).
         running = (existing or {}).get("terminal")
         info_other = hc_get(running) if running and running != address else {}
-        if info_other.get("state") == "live" and (info_other.get("labels") or {}).get("herdr.pa") == space:
+        if (info_other.get("state") == "live" and (info_other.get("labels") or {}).get("herdr.pa") == space
+                and directory and launcher_alive(directory, running)):
             exec_plain(p)
         if sys.stdin.isatty():
             project = ask_setup(p, project, address)
+            args.ask = False  # asked once; a retry after an error does not ask again
         elif project == os.path.realpath(HOME):
             exec_plain(p)
     if not os.path.isdir(project):
         raise Problem("project folder does not exist: " + project)
     terms = live_terminals()
     other = (existing or {}).get("terminal")
-    if other and other != address and terms and other in terms and (terms[other].get("labels") or {}).get("herdr.pa") == space:
-        # One per space. A second tab in the same space is an ordinary Claude tab.
+    # One per space: another live terminal labelled for it whose launcher still beats. A labelled
+    # terminal whose launcher is gone (a shell left behind) is what this one replaces.
+    if (other and other != address and terms and other in terms and (terms[other].get("labels") or {}).get("herdr.pa") == space
+            and directory and other_launcher_alive(directory, other)):
+        # A second tab in the same space is an ordinary Claude tab.
         if args.auto:
             exec_plain(p)
         raise Problem("this space already has a Project Agent in terminal {}".format(other))
@@ -464,7 +617,8 @@ def cmd_session(args):
           "herdr.pa.project=" + project, "herdr.pa.name=" + agent["name"]])
     signal.signal(signal.SIGINT, signal.SIG_IGN)  # Ctrl-C belongs to the agent, not this wrapper
 
-    running = {"since": None, "session": None, "marked": False}
+    running = ctx.setdefault("running", {"since": None, "session": None, "marked": False})
+    ctx["directory"] = directory
 
     def beat():
         # The tab bar reads this: a live terminal whose heartbeat stopped has lost its launcher.
@@ -475,7 +629,7 @@ def cmd_session(args):
                 write_text(os.path.join(directory, "heartbeat"), "{} {}\n".format(int(time.time()), address))
                 # A session that has run for 20 s exists: record it now, so a tab that is killed
                 # (this launcher with it) still resumes the same conversation when it reopens.
-                if running["since"] and not running["marked"] and time.time() - running["since"] >= 20:
+                if running["since"] and not running["marked"] and time.time() - running["since"] >= RAN:
                     current = read_json(os.path.join(directory, "agent.json"), {}) or {}
                     if current.get("sessionId") == running["session"]:
                         current["sessionStarted"] = True
@@ -490,11 +644,15 @@ def cmd_session(args):
             except (OSError, ValueError, AttributeError):
                 pass
             time.sleep(10)
-    threading.Thread(target=beat, daemon=True).start()
-    quick = 0
+    if not ctx["beat"]:  # one heartbeat thread, also when a start is retried after an error
+        threading.Thread(target=beat, daemon=True).start()
+        ctx["beat"] = True
+    quick, quick_resume_fails = 0, 0
     while True:
         agent = read_json(os.path.join(directory, "agent.json"), agent)
-        resume = bool(agent.get("sessionId") and agent.get("sessionStarted")) and not args.fresh
+        resume, why = should_resume(agent, directory, project)
+        if args.fresh:
+            resume, why = False, "fresh"
         if not resume:
             agent["sessionId"], agent["sessionStarted"] = str(uuid.uuid4()), False
         args.fresh = False
@@ -511,21 +669,22 @@ def cmd_session(args):
             argv += ["Your session was restarted. Read your state folder (ledger.json, journal.jsonl, decisions/, "
                      "rules.json), then say in one line where things stand. Do not start new work until asked."]
         argv = resolve(argv, p)
-        session_log(directory, "start resume={} session={}".format(resume, agent["sessionId"]))
+        session_log(directory, "start resume={} session={} reason={}".format(resume, agent["sessionId"], why))
         began = time.time()
         running.update(since=began, session=agent["sessionId"], marked=False)
         code = subprocess.call(argv, cwd=project)
         running["since"] = None
         lasted = time.time() - began
         session_log(directory, "exit code={} after={:.0f}s".format(code, lasted))
-        agent = read_json(os.path.join(directory, "agent.json"), agent)
-        if lasted >= 20:
-            quick = 0
-            agent["sessionStarted"] = True
+        if lasted >= RAN:
+            quick, quick_resume_fails = 0, 0
         else:
             quick += 1
-            if resume and code != 0:
-                agent["sessionStarted"] = False  # nothing to resume: start a new session next
+            quick_resume_fails = quick_resume_fails + 1 if resume and code != 0 else 0
+        session = agent["sessionId"]
+        agent = read_json(os.path.join(directory, "agent.json"), agent)
+        transcript = transcript_state(project, session) if resume and code != 0 and lasted < RAN else None
+        agent = after_exit(agent, resume, code, lasted, quick_resume_fails, transcript)
         write_json(os.path.join(directory, "agent.json"), agent)
         print("\n[Project Agent] The agent exited (code {}). It restarts here; close the space to end it.".format(code), flush=True)
         if quick >= 3:
@@ -552,8 +711,11 @@ def cmd_start(args):
     existing = read_json(os.path.join(space_dir(space), "agent.json"), {}) or {}
     p = load_profile(args.profile or existing.get("profile"))
     terms = live_terminals() or {}
-    if existing.get("terminal") in terms and (terms[existing["terminal"]].get("labels") or {}).get("herdr.pa") == space:
-        print("This space already has a Project Agent (terminal {}).".format(existing["terminal"]))
+    running = existing.get("terminal")
+    # A labelled terminal whose launcher stopped beating is a shell left behind, not a Project Agent.
+    if (running in terms and (terms[running].get("labels") or {}).get("herdr.pa") == space
+            and launcher_alive(space_dir(space), running)):
+        print("This space already has a Project Agent (terminal {}).".format(running))
         return
     session = ["pa-session", "--space", space, "--project", project, "--profile", p["name"]]
     if args.dry_run:

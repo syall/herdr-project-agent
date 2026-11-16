@@ -53,10 +53,16 @@ export default class ProjectAgent extends View {
     cx.timer.every(15000, (cx) => cx.spawn(async (cx) => { await tick(this.me); if (!props()?.timer) this.reload(cx); }));
     // The keeper (Project Agent tabs: tracking, ordering, reopening, the new-space dialog) runs in
     // the copy that holds the timer lease, so it runs once however many copies a layout has.
-    this.keeper = new Keeper();
+    this.keeper = new Keeper(this.me);
     const mine = () => shared("project-agent.timer")?.id === this.me;
-    cx.spawn(async () => { await tick(this.me); });
-    cx.timer.every(1500, () => { if (mine()) this.keeper.syncPA(); });
+    let keeping = false; // this copy held the lease last tick: read heartbeats and agent.json at once when it takes it
+    cx.spawn(async (cx) => { await tick(this.me); if (mine()) { keeping = true; this.keeper.readBeats(cx); } });
+    cx.timer.every(1500, (cx) => {
+      if (!mine()) { keeping = false; return; }
+      if (!keeping) { keeping = true; this.keeper.readBeats(cx); }
+      this.keeper.syncPA(cx);
+    });
+    cx.timer.every(250, (cx) => { if (mine() && this.keeper.busy()) this.keeper.syncPA(cx); }); // while a restore runs
     cx.timer.every(400, () => { if (mine()) this.keeper.offerSetup(); });
     cx.timer.every(15000, (cx) => { if (mine()) this.keeper.readBeats(cx); });
     if (props()?.timer) return; // the always-on copy only keeps time; it shows nothing
