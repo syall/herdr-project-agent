@@ -7,7 +7,7 @@
 // only this timer writes lastPass and nextPass. pass-request.json is the on-demand queue.
 
 import { terminals, hc, readTextFile, exec, shared, setShared, notify, spaces } from "herdr";
-import { paHome, replaceFile } from "./store.js";
+import { paHome, replaceFile, localId } from "./store.js";
 
 export const MIN_MINUTES = 5;
 export const PRESETS = [5, 10, 15, 30, 60];
@@ -33,12 +33,23 @@ export function holdReason(schedule, ledger) {
   return null;
 }
 
-// Every live Project Agent this window knows, from its terminal's labels.
+// Every Project Agent the keeper records in this window (shared "project-agent.tabs"), one per
+// space: { address, machine, status, tab, dir, name, alive }. alive: the record says its launcher
+// runs in that terminal, and the terminal is live. Passes go only to an alive one; a labelled
+// terminal without that (a kept shell, the old terminal during a restore) gets nothing.
 export function projectAgents() {
-  return terminals().filter((t) => t.state === "live" && t.labels?.["herdr.pa"]).map((t) => {
-    const machine = String(t.address).includes("/") ? String(t.address).split("/")[0] : null;
-    return { address: t.address, machine, status: t.status ?? null, tab: (machine ? `${machine}/` : "") + (t.labels["herdr.tab"] ?? ""), dir: `${paHome(machine)}/spaces/${t.labels["herdr.pa"]}`, name: t.labels["herdr.pa.name"] ?? "" };
-  });
+  const ts = terminals(), byDir = new Map();
+  for (const [tab, r] of Object.entries(shared("project-agent.tabs") ?? {})) {
+    if (!r?.space) continue;
+    const machine = String(r.space).includes("/") ? String(r.space).split("/")[0] : null;
+    const dir = `${paHome(machine)}/spaces/${localId(r.space)}`;
+    const term = ts.find((t) => t.address === r.terminal && t.state === "live");
+    const alive = r.alive === true && Boolean(term);
+    const prev = byDir.get(dir);
+    if (prev && (prev.alive || !alive)) continue;
+    byDir.set(dir, { address: r.terminal, machine, status: term?.status ?? null, tab, dir, name: r.name ?? "", alive });
+  }
+  return [...byDir.values()];
 }
 
 async function send(agent, message) {
@@ -78,6 +89,7 @@ async function announceCards(agent) {
 
 async function tickOne(agent, now) {
   await announceCards(agent).catch(() => {});
+  if (!agent.alive) return; // no launcher known to run there: nothing is typed into that terminal
   const busy = agent.status === "working" || agent.status === "blocked";
   const [scheduleText, ledgerText, requestText] = await Promise.all(["schedule.json", "ledger.json", "pass-request.json"].map((f) => readTextFile(`${agent.dir}/${f}`, { on: agent.machine })));
   const schedule = parse(scheduleText ?? ""), ledger = parse(ledgerText ?? ""), request = parse(requestText ?? "");

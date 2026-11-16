@@ -896,6 +896,8 @@ def cmd_pass(args):
         write_json(schedule_path, schedule)
         print("Scheduled passes {} for {}. On-demand passes still run.".format("paused" if args.pause else "resumed", agent.get("name")))
         return
+    if not launcher_alive(directory, agent["terminal"]):  # a labelled terminal can be a bare shell its launcher left
+        raise Problem("the Project Agent for {} is not running (its launcher's heartbeat is missing or old)".format(agent.get("name")))
     if term.get("status") in ("working", "blocked"):
         old = read_json(request_path, {}) or {}
         write_json(request_path, {"pending": True, "retro": bool(args.retro or (old.get("pending") and old.get("retro"))), "at": now(), "by": "pa-pass"})
@@ -1145,7 +1147,9 @@ def cmd_task(args):
                                       "why": "changed by the person with pa-task " + args.action}) + "\n")
     print("{}: {} -> {}.{}".format(args.task, before, after, " " + note if note else ""))
     term = hc_get(agent.get("terminal"))
-    if term.get("state") == "live" and (term.get("labels") or {}).get("herdr.pa") == agent.get("space"):
+    if term.get("state") != "live" or (term.get("labels") or {}).get("herdr.pa") != agent.get("space") or not launcher_alive(directory, agent.get("terminal")):
+        print("(The Project Agent is not running; it reads the ledger when it starts.)")
+    else:
         try:
             call(["hc", "send", agent["terminal"], "The person changed task {} from {} to {} in the panel. Re-read ledger.json before you "
                   "write it again, and do not undo this.".format(args.task, before, after)])

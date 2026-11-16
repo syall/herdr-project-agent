@@ -648,9 +648,11 @@ def cmd_worker(args):
         subprocess.call([os.path.join(os.path.dirname(os.path.realpath(__file__)), "pa.py"), "task", "delete", facts["task"], "--space", space])
     elif facts.get("task"):
         term = pa.hc_get(agent.get("terminal"))
-        if term.get("state") == "live":
+        if term.get("state") == "live" and pa.launcher_alive(directory, agent.get("terminal")):
             pa.call(["hc", "send", agent["terminal"], "The person deleted worker {} of task {}. {} Re-read ledger.json; do not start a replacement "
                      "unless they ask.".format(facts["address"], facts["task"], " ".join(did[1:]))], check=False)
+        else:
+            print("(The Project Agent is not running; it reads the ledger when it starts.)")
 
 
 def cmd_full_suite(_args):
