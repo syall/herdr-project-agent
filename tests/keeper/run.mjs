@@ -30,7 +30,7 @@ const runsOf = (...names) => g.__runs.filter(([n]) => names.includes(n));
 // One space (local unless `machine`), its PA tab tb1 with pane p1 / terminal t1 running a shell
 // that is still labelled as the space's PA, a record for it, agent.json, and a heartbeat.
 function world({ machine = null, tabPresent = true, termLive = true, program = shell, status = null, config = "open", record = true, extraPanes = [], extraTerms = [],
-  argv = ["pa-session"], title = "zsh", created = undefined } = {}) {
+  argv = ["pa-session"], title = "zsh", created = undefined, report = undefined, app = undefined, foreground = undefined } = {}) {
   const q = (id) => (machine ? `${machine}/${id}` : id);
   const tb = q("tb1"); // remote tab ids carry the machine prefix, like terminals and panes
   const dir = machine ? `.config/herdr-pa/spaces/${S}` : `/home/u/.config/herdr-pa/spaces/${S}`;
@@ -40,9 +40,9 @@ function world({ machine = null, tabPresent = true, termLive = true, program = s
   g.__machines = [{ name: null, layout: "ready" }, ...(machine ? [{ name: machine, layout: "ready" }] : [])];
   const tabs = [...(tabPresent ? [{ id: tb, index: 1, name: "PA: proj", named: true }] : []), { id: q("tb9"), index: tabPresent ? 2 : 1, name: "2", named: false }];
   g.__spaces = [{ id: sid, name: "proj", machine, folder: "/proj", active: true, tabs }];
-  g.__panes = [...(tabPresent && termLive ? [{ pane: q("p1"), terminal: q("t1"), tab: tb, title, status, program }] : []), ...extraPanes,
+  g.__panes = [...(tabPresent && termLive ? [{ pane: q("p1"), terminal: q("t1"), tab: tb, title, status, program, app: app ?? null }] : []), ...extraPanes,
     { pane: q("p9"), terminal: q("t9"), tab: q("tb9"), title: "zsh", status: null, program: shell }];
-  g.__terminals = [...(termLive ? [{ address: q("t1"), state: "live", argv, ...(created === undefined ? {} : { created_ms: created }), labels: { "herdr.pa": S, "herdr.pa.name": "proj", "herdr.pa.project": "/proj", "herdr.pa.profile": "test" }, status, program }] : []),
+  g.__terminals = [...(termLive ? [{ address: q("t1"), state: "live", argv, ...(created === undefined ? {} : { created_ms: created }), ...(report === undefined ? {} : { report }), ...(foreground === undefined ? {} : { foreground }), labels: { "herdr.pa": S, "herdr.pa.name": "proj", "herdr.pa.project": "/proj", "herdr.pa.profile": "test" }, status, program }] : []),
     ...extraTerms, { address: q("t9"), state: "live", argv: ["zsh"], labels: {}, status: null, program: shell }];
   g.__shared = { "project-agent.tabs": record ? { [tb]: { space: sid, project: "/proj", profile: "test", name: "proj", terminal: q("t1") } } : {} };
   g.__files = {}; g.__fail = [];
@@ -320,7 +320,11 @@ cases["K-noshell"] = async () => { // the new pane is a plain shell (old pa-sess
   for (let i = 1; i <= 3; i++) {
     check(await waitSplit(k, i, 150000), `split ${i}`);
     newPane(`p2${i}`, { address: `t2${i}`, state: "live", argv: wrapped(), labels: {}, status: null, program: shell });
-    check(await until(k, 40000, () => runsOf("pane.close").length >= i), `attempt ${i}: its own plain-shell pane closed (runs ${JSON.stringify(g.__runs.filter(([n]) => n !== "tab.move"))})`);
+    const at = g.__now;
+    await sim(k, 35000);
+    check(runsOf("pane.close").length === i - 1, `attempt ${i}: a plain shell with no launcher signal is not closed after 35 s (a slow login shell, R2-M3)`);
+    check(await until(k, 100000, () => runsOf("pane.close").length >= i), `attempt ${i}: its own plain-shell pane closed (runs ${JSON.stringify(g.__runs.filter(([n]) => n !== "tab.move"))})`);
+    check(g.__now - at <= 125000, `attempt ${i}: given up within about 2 minutes (after ${(g.__now - at) / 1000} s)`);
     const close = runsOf("pane.close")[i - 1][1];
     check(close.pane === `p2${i}`, `closes only the pane it made (got ${JSON.stringify(close)})`);
     g.__panes = g.__panes.filter((p) => p.pane !== `p2${i}`); g.__terminals = g.__terminals.filter((t) => t.address !== `t2${i}`);
@@ -340,9 +344,46 @@ const leftAlone = async (opts, what) => {
   check(runsOf("pane.split", "pane.close", "tab.new", "tab.close").length === 0, `${what}: no pane.* / tab.* (got ${JSON.stringify(g.__runs)})`);
   check(g.__notes.length === 1, `${what}: one notice (got ${JSON.stringify(noteText())})`);
 };
-cases["K-kept-stale"] = () => restores({ argv: ["/bin/zsh"], program: shell, status: "idle", title: "PA: proj" }, "kept shell (argv /bin/zsh) with a stale status and the dead agent's title");
+// R2-I1: restore only on positive evidence of an idle shell; any agent report, or a foreground that is not a shell, is left alone.
+cases["K-kept-stale"] = () => leftAlone({ argv: ["/bin/zsh"], program: shell, status: "idle", title: "PA: proj" }, "kept shell with an agent status still set (it may be a live agent: R2-I1)");
+cases["K-kept-prompt"] = () => restores({ argv: ["/bin/zsh"], program: shell, status: null, title: "PA: proj", foreground: { name: "zsh", argv: ["-zsh"] } }, "kept shell at its prompt (foreground zsh), dead agent's title");
 cases["K-kept-argv"] = () => restores({ argv: ["/bin/zsh"], program: { key: "program", name: "zsh", shell: false, agent: false }, status: "done", title: "PA: proj" }, "kept shell known only by its bare-shell argv");
 cases["K-wrapper"] = () => restores({ argv: wrapped(), program: shell, status: null, title: "PA: proj" }, "wrapper shell after pa-session exited");
+cases["K-nvim-kept"] = () => leftAlone({ argv: ["/bin/zsh"], program: { key: "nvim", name: "Neovim", shell: false, agent: false }, status: null, title: "nvim agent.json" }, "nvim in a kept shell");
+cases["K-make-kept"] = () => leftAlone({ argv: ["/bin/zsh"], program: { key: "program", name: "make", shell: false, agent: false }, status: null, title: "make" }, "make (an unlisted program) in a kept shell");
+cases["K-idle-agent-kept"] = () => leftAlone({ argv: ["/bin/zsh"], program: shell, status: "done", report: { app: "claude-code", state: "done" }, app: "claude-code", title: "PA: proj" },
+  "an idle agent in a kept shell (status done with app set, 'PA: ' title; terminal-shapes.md item 1), even if the program table says zsh");
+cases["K-foreground-nvim"] = () => leftAlone({ argv: ["/bin/zsh"], program: shell, status: null, foreground: { name: "nvim", argv: ["nvim", "agent.json"] } }, "the program table says zsh but the foreground process is nvim");
+cases["K-close-recheck"] = async () => { // the old pane is closed only if it is still an idle shell when the new launcher beats
+  world({ argv: ["/bin/zsh"], program: shell, status: null });
+  const k = await start();
+  check(await waitSplit(k, 1, 50000), "split");
+  const t2 = newPane("p2", { address: "t2", state: "live", argv: ARGV(), labels: {}, status: null, program: launcher });
+  await sim(k, 250);
+  const old = g.__terminals.find((t) => t.address === "t1");
+  old.program = { key: "nvim", name: "Neovim", shell: false, agent: false }; // the person opened an editor in it meanwhile
+  g.__panes.find((p) => p.pane === "p1").program = old.program;
+  t2.labels = { "herdr.pa": S }; t2.program = claude;
+  g.__files[`:/home/u/.config/herdr-pa/spaces/${S}/heartbeat`] = `${Math.floor(g.__now / 1000)} t2\n`;
+  await sim(k, 15000);
+  check(runsOf("pane.close").length === 0, `old pane not closed while something runs in it (got ${JSON.stringify(runsOf("pane.close"))})`);
+  check(!records().tb1.recovering && records().tb1.terminal === "t2", "restore completed onto the new terminal");
+  check(g.__notes.some((n) => /left open/i.test(`${n.title} ${n.body}`)), `notice that the old pane was left open (got ${JSON.stringify(noteText())})`);
+};
+cases["K-slow-start"] = async () => { // a slow start: shell (rc files) for 40 s, then the launcher says it is starting; never closed
+  world();
+  const k = await start();
+  check(await waitSplit(k, 1, 50000), "split");
+  const t2 = newPane("p2", { address: "t2", state: "live", argv: wrapped(), labels: {}, status: null, program: shell });
+  await sim(k, 40000);
+  t2.labels = { "herdr.pa.starting": S }; t2.program = launcher; // pa-session began (hc calls, lock, another launcher's heartbeat)
+  await sim(k, 150000);
+  check(runsOf("pane.close").length === 0 && splits().length === 1, `a launcher that said it is starting is not closed or replaced (got ${JSON.stringify(g.__runs.filter(([n]) => n !== "tab.move"))})`);
+  t2.labels = { "herdr.pa": S }; t2.program = claude;
+  g.__files[`:/home/u/.config/herdr-pa/spaces/${S}/heartbeat`] = `${Math.floor(g.__now / 1000)} t2\n`;
+  check(await until(k, 15000, () => runsOf("pane.close").length > 0), "completes once it runs");
+  check(runsOf("pane.close").every(([, a]) => a.pane === "p1"), "only the old pane closed");
+};
 cases["K-agent-in-kept"] = () => leftAlone({ argv: ["/bin/zsh"], program: { key: "claude", name: "Claude Code", shell: false, agent: true }, status: "idle", title: "PA: proj" }, "hand-started agent in a kept shell");
 cases["K-agent-shell"] = () => leftAlone({ argv: ["/bin/zsh"], program: { key: "claude", name: "Claude Code", shell: true, agent: true }, status: null }, "program.shell true but program.agent true");
 cases["K-shell-working"] = () => leftAlone({ argv: wrapped(), program: shell, status: "working" }, "program.shell true but an agent status of working");

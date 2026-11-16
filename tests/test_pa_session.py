@@ -300,6 +300,81 @@ class ReviewRound(Base):
         self.assertIs(seen["handler"], signal.default_int_handler)
 
 
+class Round3(Base):
+    """REVIEW.md round 2: R2-M1 (first start time kept across retries), R2-M2 (a 'starting'
+    label), R2-N2 (bounded launch lock)."""
+
+    def fixtures3(self, began):
+        self.log("{} start resume=False session={}".format(iso(began), SID))  # killed 5 s in: never ran
+        self.heartbeat(began + 5, "t9")
+        prof = os.path.join(pa.ROOT, "profiles", "test")
+        os.makedirs(prof, exist_ok=True)
+        dump({"name": "test", "claude": ["true"], "codex": ["true"]}, os.path.join(prof, "profile.json"))
+        dump({"version": 1, "space": "sp1", "project": self.project, "profile": "test", "name": "proj",
+              "terminal": "t9", "sessionId": SID, "sessionStarted": False}, os.path.join(self.dir, "agent.json"))
+        pa.hc_get = lambda address: {}
+        pa.live_terminals = lambda: {}
+        self.calls = []
+        pa.call = lambda argv, check=True: self.calls.append(argv) or ""
+
+    def run_once(self, ctx):
+        started = []
+
+        class Stop(Exception):
+            pass
+
+        class NoThread:
+            def __init__(self, target=None, daemon=None):
+                pass
+
+            def start(self):
+                pass
+
+        def fake_call(argv, cwd=None):
+            started.append(argv)
+            raise Stop()
+        saved = (pa.threading.Thread, pa.subprocess.call, signal.getsignal(signal.SIGINT))
+        pa.threading.Thread, pa.subprocess.call = NoThread, fake_call
+        try:
+            args = types.SimpleNamespace(space="sp1", project=self.project, profile="test", name=None, auto=False, ask=False, fresh=False)
+            with self.assertRaises(Stop):
+                pa.run_session(args, "t1", {}, "sp1", self.project, ctx)
+        finally:
+            pa.threading.Thread, pa.subprocess.call = saved[0], saved[1]
+            signal.signal(signal.SIGINT, saved[2])
+        return started[0]
+
+    def test_u18_retry_keeps_the_first_start_time(self):
+        # This launcher started 30 s ago, beat during an error-wait (its own heartbeat, 2 s old), and
+        # is retried now: its own beats still do not make the earlier, never-run session resumable.
+        began = int(time.time()) - 3600
+        self.fixtures3(began)
+        self.heartbeat(time.time() - 2, "t1")
+        os.makedirs(os.path.join(self.dir, "decisions"), exist_ok=True)
+        argv = self.run_once({"beat": True, "started": time.time() - 30})
+        self.assertNotIn("--resume", argv)
+
+    def test_u19_claim_clears_the_starting_label(self):
+        self.fixtures3(int(time.time()) - 3600)
+        self.run_once({"beat": True})
+        labels = [a for a in self.calls if a[:2] == ["hc", "label"]]
+        self.assertTrue(any("herdr.pa.starting=" in a for a in labels), labels)
+        self.assertTrue(any("herdr.pa=sp1" in a and "herdr.pa.starting=" in a for a in labels),
+                        "the launcher's own labels and the cleared 'starting' label go together: {}".format(labels))
+
+    def test_u20_launch_lock_wait_is_bounded(self):
+        held = pa.launch_lock("sp1")
+        try:
+            began = time.time()
+            with self.assertRaises(pa.Problem) as e:
+                pa.launch_lock("sp1", wait=1)
+            self.assertLess(time.time() - began, 5)
+            self.assertIn("starting", str(e.exception))
+        finally:
+            held.close()
+        pa.launch_lock("sp1", wait=1).close()  # free again once released
+
+
 def tearDownModule():
     shutil.rmtree(TMP, ignore_errors=True)
 
