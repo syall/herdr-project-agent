@@ -732,10 +732,11 @@ def report_path(directory, task_id, address, given):
     return os.path.relpath(path, folder)
 
 
-def end_worker(directory, ledger, task, entry, address, report, by, trigger):
+def end_worker(directory, ledger, task, entry, address, report, by, trigger, actor=None):
     """Ends one worker whose checks passed: kill if live, rm, then mark its ledger entry and journal
     it. The caller holds the ledger lock, re-read the ledger and re-checked the status. Returns the
-    line to print. Never touches the worktree, the branch, the task or the evidence."""
+    line to print. Never touches the worktree, the branch, the task or the evidence. `by` goes into the
+    entry's closedBy; `actor` (default: `by`) is who the journal line says ran it."""
     info = pa.hc_get(address)
     note = ""
     if info:
@@ -749,7 +750,7 @@ def end_worker(directory, ledger, task, entry, address, report, by, trigger):
     task["updated"] = stamp
     pa.write_json(os.path.join(directory, "ledger.json"), ledger)
     name = entry.get("name") or "unnamed"
-    append_journal(directory, {"by": by, "trigger": trigger, "task": task.get("id"),
+    append_journal(directory, {"by": actor or by, "trigger": trigger, "task": task.get("id"),
                                "why": "closed worker {} ({}) after reading its report {}".format(address, name, report)})
     return "Closed worker {} ({}, task {}); its worktree and branch are untouched.{}".format(address, name, task.get("id"), note)
 
@@ -818,8 +819,139 @@ def keep_worker(directory, agent, address, quote, off):
     print("{} ({}, task {}) {}.".format(address, name, task.get("id"), "is no longer kept" if off else "is marked keep: it is not closed by the agent"))
 
 
+LEFTOVER_REASONS = {"keep": "marked keep", "working": "working", "blocked": "blocked"}
+HANDOFF = re.compile(r"\b(sent|send|sends|update|updated|handoff|handed|reused|restarted|started|asked)\b", re.I)
+
+
+def report_files(folder):
+    """{relative path: mtime} of the non-empty files in a task's evidence folder."""
+    found = {}
+    for root, _dirs, files in os.walk(folder):
+        for f in files:
+            path = os.path.join(root, f)
+            if os.path.isfile(path) and os.path.getsize(path) > 0:
+                found[os.path.relpath(path, folder)] = os.path.getmtime(path)
+    return found
+
+
+def leftover_report(directory, task_id, address, name, journal):
+    """(report file, None) when the journal shows this worker's report was read, else (None, reason).
+    The last journal line naming the worker (its address or name as a whole word) decides: it must be a
+    report, or name a file in the evidence folder without handing the worker more work."""
+    files = report_files(os.path.join(directory, "evidence", task_id))
+    if not files:
+        return None, "no recorded report"
+    words = [re.compile(r"(?<![A-Za-z0-9]){}(?![A-Za-z0-9])".format(re.escape(address)))]
+    if name:
+        words.append(re.compile(r"(?<![A-Za-z0-9-]){}(?![A-Za-z0-9-])".format(re.escape(name))))
+    last = None
+    for line in journal:
+        text = json.dumps(line, ensure_ascii=False)
+        if any(w.search(text) for w in words):
+            last = line
+    if last is None:
+        return None, "no recorded report"
+    text = json.dumps(last, ensure_ascii=False)
+    named = sorted((f for f in files if re.search(r"(?<![\w./-]){}(?![\w/-])".format(re.escape(f)), text)), key=len, reverse=True)
+    if last.get("trigger") != "report" and (HANDOFF.search(str(last.get("why", ""))) or not named):
+        return None, "no recorded report after its last handoff"
+    return (named[0] if named else max(files, key=files.get)), None
+
+
+def leftover_refusal(directory, agent, profile, task, entry, info, journal):
+    """Why an old-style worker is kept: the reason for its `kept` line, or None with its report file."""
+    address = entry.get("address") or ""
+    if address == agent.get("terminal"):
+        return "it is the Project Agent", None
+    if "/" in address:
+        return "on another machine", None
+    refusal = identity_refusal(address, task, entry, info)
+    if refusal:
+        return LEFTOVER_REASONS.get(refusal[0]) or "now a different terminal ({})".format(info.get("name") or "unnamed"), None
+    if not info:
+        return "gone; left for the agent to read", None
+    refusal = status_refusal(address, entry, info)
+    if refusal:
+        return LEFTOVER_REASONS.get(refusal[0]) or "status {}".format(info.get("status") or "none"), None
+    report, why = leftover_report(directory, task.get("id"), address, entry.get("name"), journal)
+    if why:
+        return why, None
+    refusal = worktree_refusal(task, profile)
+    if refusal:
+        path = os.path.realpath(os.path.expanduser(task["worktree"]))
+        if refusal[0] == "uncommitted":
+            return "uncommitted files in {} ({})".format(path, re.search(r" has (\d+) uncommitted", refusal[1]).group(1)), None
+        return "cannot read {}".format(path), None
+    return None, report
+
+
+def read_journal(directory):
+    lines = []
+    for raw_line in pa.read_text(os.path.join(directory, "journal.jsonl")).splitlines():
+        try:
+            line = json.loads(raw_line)
+        except ValueError:
+            continue
+        if isinstance(line, dict):
+            lines.append(line)
+    return lines
+
+
+def leftover_plan(directory, agent, profile, ledger):
+    """([(task, entry, report)] to close, [(task, entry, reason)] kept), for every recorded worker not yet finished."""
+    journal = read_journal(directory)
+    close, kept = [], []
+    for task in ledger.get("tasks", []):
+        for entry in task.get("workers") or []:
+            if entry.get("finished"):
+                continue
+            info = pa.hc_get(entry.get("address")) if "/" not in (entry.get("address") or "") else {}
+            why, report = leftover_refusal(directory, agent, profile, task, entry, info, journal)
+            (kept.append((task, entry, why)) if why else close.append((task, entry, report)))
+    return close, kept
+
+
+def kept_line(task, entry, why):
+    return "kept {} ({}, {}): {}".format(entry.get("address"), entry.get("name") or "unnamed", task.get("id"), why)
+
+
 def close_leftovers(directory, agent, profile, dry_run):
-    raise pa.Problem("pa-worker close --leftovers is not built yet")
+    """pa-worker close --leftovers [--dry-run] (spec 3.4): closes, once, the workers recorded before the
+    one-worker-per-job rule whose report the journal shows was read. Only this ledger's workers are looked at."""
+    if dry_run:
+        close, kept = leftover_plan(directory, agent, profile, read_ledger(directory))
+        for task, entry, report in close:
+            print("would close {} ({}, {}): report {}".format(entry.get("address"), entry.get("name") or "unnamed", task.get("id"), report))
+        for item in kept:
+            print(kept_line(*item))
+        if not close and not kept:
+            print("No old-style workers to close.")
+        return
+    by = "agent" if by_an_agent() else "person"
+    with ledger_lock(directory):
+        ledger = read_ledger(directory)
+        close, kept = leftover_plan(directory, agent, profile, ledger)
+        append_journal(directory, {"by": by, "trigger": "leftovers", "why": "closing old-style workers: {} (reports read); keeping {}".format(
+            ", ".join(e.get("address") for _t, e, _r in close) or "none",
+            ", ".join("{} ({})".format(e.get("address"), why) for _t, e, why in kept) or "none")})
+        done = []
+        for task, entry, report in close:
+            address = entry.get("address")
+            info = pa.hc_get(address)  # read again just before the kill
+            refusal = identity_refusal(address, task, entry, info) or status_refusal(address, entry, info)
+            if refusal or not info:
+                kept.append((task, entry, (LEFTOVER_REASONS.get(refusal[0]) or refusal[1]) if refusal else "gone; left for the agent to read"))
+                continue
+            done.append(end_worker(directory, ledger, task, entry, address, report, "leftovers", "leftovers", by))
+        ledger["workerPolicy"] = {"style": "per-job", "since": pa.now()}
+        pa.write_json(os.path.join(directory, "ledger.json"), ledger)
+    for line in done:
+        print(line)
+    for item in kept:
+        print(kept_line(*item))
+    if not done and not kept:
+        print("No old-style workers to close.")
+    print("workerPolicy is set (per-job): --leftovers is not needed again.")
 
 
 def cmd_worker(args):
