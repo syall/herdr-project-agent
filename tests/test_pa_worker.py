@@ -249,5 +249,122 @@ class DeleteUnchanged(Base):
         self.assertEqual(self.snapshot(), before)
 
 
+class WorktreeRule(Base):
+    """R4: a Delete/Keep card only once every task using the worktree is done or parked."""
+
+    def setUp(self):
+        super().setUp()
+        self.proj = self.repo()
+        self.wt = self.worktree(self.proj, "t-003-x")
+
+    def check(self, *extra):
+        return self.run_cmd("pa-worktree", "check", "--open-cards", "--space", "sp1", *extra)
+
+    def card(self, task="t-003"):
+        return pa.read_json(os.path.join(self.dir, "decisions", "d-wt-{}.json".format(task)))
+
+    def test_c1_in_progress_task_with_its_worker_closed_opens_no_card(self):
+        self.add_task("t-003", "in-progress", self.wt, [{"address": "t31", "role": "build", "name": "t-003-tests", "finished": True}])
+        code, out, _ = self.check()
+        self.assertEqual(code, 0)
+        self.assertIn("t-003: tasks still t-003 in-progress; asked once every task using it is done or parked", out)
+        self.assertIsNone(self.card())
+        self.assertFalse(os.path.exists(os.path.join(self.dir, "decisions")) and os.listdir(os.path.join(self.dir, "decisions")))
+
+    def test_c2_shared_worktree_waits_for_every_task(self):
+        self.add_task("t-003", "done", self.wt, [{"address": "t31", "role": "build", "name": "t-003-tests"}])
+        self.add_task("t-004", "review", self.wt, [{"address": "t41", "role": "build", "name": "t-004-fix"}])
+        code, out, _ = self.check()
+        self.assertIn("tasks still t-004 review", out)
+        self.assertIsNone(self.card())
+        led = self.ledger()
+        led["tasks"][1]["state"] = "done"
+        self.ledger(led)
+        code, out, _ = self.check()
+        self.assertIn("opened card d-wt-t-003", out)
+        self.assertIsNotNone(self.card())
+
+    def test_c2b_parked_counts_as_over(self):
+        self.add_task("t-003", "done", self.wt, [])
+        self.add_task("t-004", "parked", self.wt, [])
+        self.check()
+        self.assertIsNotNone(self.card())
+
+    def test_c3_workers_that_exited_on_their_own_still_lead_to_a_card(self):
+        self.add_task("t-003", "done", self.wt, [{"address": "t31", "role": "build", "name": "t-003-tests"}])
+        self.term("t31", "t-003-tests", status=None, state="finished", reason="exited")
+        code, out, _ = self.check()
+        self.assertIn("opened card d-wt-t-003", out)
+        card = self.card()
+        self.assertIsNotNone(card)
+        self.assertIn("t-003-tests (exited)", card["context"])
+
+    def test_c3b_closed_worker_reads_closed_and_no_workers_recorded(self):
+        self.add_task("t-003", "done", self.wt, [{"address": "t31", "role": "build", "name": "t-003-tests", "finished": True}])
+        self.check()
+        self.assertIn("t-003-tests (closed)", self.card()["context"])
+        os.unlink(os.path.join(self.dir, "decisions", "d-wt-t-003.json"))
+        led = self.ledger()
+        led["tasks"][0]["workers"] = []
+        self.ledger(led)
+        self.check()
+        self.assertIn("no workers recorded", self.card()["context"])
+
+    def test_c3c_without_open_cards_it_lists_the_candidate(self):
+        self.add_task("t-003", "done", self.wt, [{"address": "t31", "role": "build", "name": "t-003-tests", "finished": True}])
+        code, out, _ = self.run_cmd("pa-worktree", "check", "--space", "sp1")
+        self.assertIn("t-003: candidate", out)
+        self.assertIsNone(self.card())
+
+    def test_c3d_a_live_worker_or_other_terminal_still_blocks(self):
+        self.add_task("t-003", "done", self.wt, [{"address": "t31", "role": "build", "name": "t-003-tests"}])
+        self.term("t31", "t-003-tests")
+        code, out, _ = self.check()
+        self.assertIn("t-003: in use by t31", out)
+        del self.terms["t31"]
+        self.term("t77", "someone", cwd=self.wt)
+        code, out, _ = self.check()
+        self.assertIn("another terminal is working in it (t77)", out)
+        self.assertIsNone(self.card())
+
+    def test_c4_unchanged_branches(self):
+        # keepWorktree
+        self.add_task("t-003", "done", self.wt, [], keepWorktree=True)
+        self.assertIn("t-003: kept (keepWorktree is set)", self.check()[1])
+        self.assertIsNone(self.card())
+        # the project's main checkout
+        self.ledger({"version": 1, "tasks": []})
+        self.add_task("t-005", "done", self.proj, [])
+        self.assertIn("is the project's main checkout; never removed", self.check()[1])
+        self.assertIsNone(self.card("t-005"))
+        # an answered Keep is not asked again
+        self.ledger({"version": 1, "tasks": []})
+        self.add_task("t-003", "done", self.wt, [])
+        dump({"id": "d-wt-t-003", "task": "t-003", "worktree": self.wt, "status": "answered", "answer": "Keep"},
+             os.path.join(self.dir, "decisions", "d-wt-t-003.json"))
+        before = raw(os.path.join(self.dir, "decisions", "d-wt-t-003.json"))
+        self.assertIn("kept, not asked again", self.check()[1])
+        self.assertEqual(raw(os.path.join(self.dir, "decisions", "d-wt-t-003.json")), before)
+        # an open card on a reopened task is left as it is
+        led = self.ledger()
+        led["tasks"][0]["state"] = "queued"
+        self.ledger(led)
+        dump({"id": "d-wt-t-003", "task": "t-003", "worktree": self.wt, "status": "open", "answer": None, "context": "old one-line text"},
+             os.path.join(self.dir, "decisions", "d-wt-t-003.json"))
+        before = raw(os.path.join(self.dir, "decisions", "d-wt-t-003.json"))
+        self.assertIn("card d-wt-t-003 is open", self.check()[1])
+        self.assertEqual(raw(os.path.join(self.dir, "decisions", "d-wt-t-003.json")), before)
+
+    def test_c4b_remove_still_rechecks_uncommitted_files(self):
+        self.add_task("t-003", "done", self.wt, [])
+        dump({"id": "d-wt-t-003", "task": "t-003", "worktree": os.path.realpath(self.wt), "status": "answered", "answer": "Delete",
+              "snapshot": {"uncommitted": 0, "unpushed": 0}}, os.path.join(self.dir, "decisions", "d-wt-t-003.json"))
+        write(os.path.join(self.wt, "new.txt"), "unsaved\n")
+        code, _, err = self.run_cmd("pa-worktree", "remove", "t-003", "--space", "sp1")
+        self.assertEqual(code, 2)
+        self.assertIn("more uncommitted files now (1) than when the person answered (0)", err)
+        self.assertTrue(os.path.isdir(self.wt))
+
+
 if __name__ == "__main__":
     unittest.main()
