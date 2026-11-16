@@ -221,10 +221,10 @@ export async function answerDecision(space, entry, label, note) {
   return next;
 }
 
-// Tells the orchestrator. hc holds a message while someone is typing there, and refuses while the
-// agent is blocked on a question; the caller keeps the notice and tries again later.
-export async function notifyOrchestrator(space, agent, message) {
-  const address = space.machine ? `${space.machine}/${agent.terminal}` : agent.terminal;
+// Tells the orchestrator at `address` (machine-qualified, from liveTarget: chosen when sending).
+// hc holds a message while someone is typing there, and refuses while the agent is blocked on a
+// question; the caller keeps the notice and tries again later.
+export async function notifyOrchestrator(address, message) {
   const r = await hc(["send", address, message]);
   if (r.code !== 0) throw new Error((r.stderr || r.stdout || "hc send failed").trim().slice(0, 300));
 }

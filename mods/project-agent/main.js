@@ -48,7 +48,7 @@ export default class ProjectAgent extends View {
     this.spotlight = null; // card id reached from its task: drawn with an accent border
     this.busy = {}; // card id -> answering now
     this.failed = {}; // card id -> why the answer wasn't written
-    this.unsent = []; // [{ space, agent, message }] notices the orchestrator hasn't had yet
+    this.unsent = []; // [{ spaceId, message, why? }] notices the orchestrator hasn't had yet (its terminal is looked up when sending)
     this.opening = {}; // space id -> when this copy asked the keeper to open its Project Agent
     this.openMsg = {}; // space id -> why the last Open did not start anything
     this.confirmOpen = {}; // space id -> { tab, terminal }: a look-alike agent runs; asking first
@@ -164,7 +164,6 @@ export default class ProjectAgent extends View {
     delete this.choice[entry.id];
     this.busy[entry.id] = true; delete this.failed[entry.id];
     const note = (this.notes[entry.id]?.value() ?? "").trim();
-    const agent = this.data?.agent;
     cx.notify();
     cx.spawn(async (cx) => {
       try {
@@ -172,7 +171,7 @@ export default class ProjectAgent extends View {
         // A card for a rule proposal ("rule": "<id>", options Approve / Decline) decides that rule too.
         const decided = entry.card?.rule && (/^approve/i.test(label) ? "active" : /^decline/i.test(label) ? "declined" : null);
         if (decided) await changeRules(space, (rules) => rules.map((r) => (r.id === entry.card.rule && r.status === "proposed" ? touched({ ...r, status: decided }, decided === "active" ? "approved" : "declined") : r)));
-        this.unsent.push({ space, agent, message: `decision ${entry.id} answered` });
+        this.unsent.push({ spaceId: space.id, message: `decision ${entry.id} answered` });
         this.resend(cx);
       } catch (e) { this.failed[entry.id] = String(e.message ?? e); }
       delete this.busy[entry.id];
@@ -181,17 +180,21 @@ export default class ProjectAgent extends View {
     });
   }
 
-  // Deliver what the orchestrator hasn't had yet; an undelivered notice is kept and retried.
+  // Deliver what the orchestrator hasn't had yet, to the terminal its launcher runs in now. With
+  // none, nothing is sent and the notice waits; an undelivered notice is kept and retried. A
+  // space's notices go out in order: one that waits holds back the ones after it.
   resend(cx) {
     if (!this.unsent.length || this.sending) return;
     this.sending = true;
     cx.spawn(async (cx) => {
-      const left = [];
+      const left = [], held = new Set();
       for (const item of this.unsent.splice(0)) {
-        try { await notifyOrchestrator(item.space, item.agent, item.message); }
-        catch (e) { left.push({ ...item, why: String(e.message ?? e) }); }
+        const target = !held.has(item.spaceId) && liveTarget(item.spaceId);
+        if (!target) { held.add(item.spaceId); left.push(item); continue; }
+        try { await notifyOrchestrator(target.address, item.message); }
+        catch (e) { held.add(item.spaceId); left.push({ ...item, why: String(e.message ?? e) }); }
       }
-      this.unsent.push(...left);
+      this.unsent = [...left, ...this.unsent]; // kept ones first: anything queued meanwhile comes after
       this.sending = false;
       cx.notify();
     });
@@ -202,7 +205,7 @@ export default class ProjectAgent extends View {
     const entry = this.cards.find((c) => c.card?.status === "open" && c.card.rule === id);
     const label = entry?.card.options?.find((o) => (what === "declined" ? /^decline/i : /^approve/i).test(o.label))?.label;
     if (label) await answerDecision(space, entry, label, what === "edited and approved" ? "Edited before approving; read rules.json." : "");
-    this.unsent.push({ space, agent: this.data?.agent, message: label ? `decision ${entry.id} answered` : `rule ${id} ${what}` });
+    this.unsent.push({ spaceId: space.id, message: label ? `decision ${entry.id} answered` : `rule ${id} ${what}` });
     this.resend(cx);
     this.reload(cx);
   }
@@ -504,7 +507,7 @@ export default class ProjectAgent extends View {
     const tab = (id, label) => div().id(`view-${id}`).px(9).h(24).flex().items_center().rounded(6).text_size(12).cursor_pointer()
       .bg(view === id ? t.selected : t.chrome).text_color(view === id ? t.foreground : t.muted).hover((s) => s.bg(t.hover))
       .on_click((_e, cx) => { this.view = id; cx.notify(); }).child(label);
-    const unsent = this.unsent.filter((u) => u.space.id === space.id);
+    const unsent = this.unsent.filter((u) => u.spaceId === space.id);
     return root
       .child(head(`PA: ${a.name ?? space.name}`, h_flex().flex_none().gap(6).items_center()
         .child(div().size(7).rounded(4).bg(live ? t[live.status] ?? t.idle : t.dim))
@@ -528,8 +531,11 @@ export default class ProjectAgent extends View {
         .child(tab("tasks", `Tasks · ${tasks.length}`))
         .child(tab("rules", this.rules.data?.error ? "Rules · !" : `Rules · ${(this.rules.data?.rules ?? []).filter((r) => r.status === "active").length}`)))
       .children((data.errors ?? []).map((e) => div().px(12).py(6).text_size(11.5).text_color(t.blocked).child(e)))
-      .when(unsent.length > 0, (el) => el.child(div().px(12).py(6).text_size(11.5).text_color(t.blocked)
-        .child(`Saved, but the Project Agent hasn't been told yet (${unsent[0].why ?? "sending"}). Trying again every 10 s.`)))
+      .when(unsent.length > 0 && !live, (el) => el.child(h_flex().px(12).py(6).gap(8).items_center().text_size(11.5).text_color(t.foreground)
+        .child(div().flex_1().min_w(0).child("Answer saved. The Project Agent is not running."))
+        .child(this.openButton(t, space, a, "pa-open-notice", waiting))))
+      .when(unsent.length > 0 && Boolean(live), (el) => el.child(div().px(12).py(6).text_size(11.5).text_color(t.blocked)
+        .child(`Saved, but the Project Agent hasn't been told yet (${unsent[0]?.why ?? "sending"}). Trying again every 10 s.`)))
       .when(view === "tasks", (el) => el.child(v_flex().id("pa-tasks").flex_1().min_h(0).p(8).gap(6).overflow_y_scrollbar()
         .when(!tasks.length, (e) => e.child(note("No tasks yet. Give the Project Agent a goal in its tab.")))
         .children(sections.flatMap((s) => {
