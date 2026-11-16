@@ -435,12 +435,13 @@ def worktree_facts(path, profile=None):
         return None
     if os.path.realpath(common) == os.path.realpath(os.path.join(top, ".git")):
         return {"main": True}
-    _c, status, _ = git(path, "status", "--porcelain")
+    files = status_files(path)
     _c, branch, _ = git(path, "rev-parse", "--abbrev-ref", "HEAD")
     _c, ahead, _ = git(path, "rev-list", "--count", "HEAD", "--not", "--remotes")
+    if files is None:
+        return None
     return {"main": False, "repo": os.path.dirname(os.path.realpath(common)), "branch": branch,
-            "uncommitted": len([l for l in status.splitlines() if l.strip() and not l[3:].startswith(".claude/")]),
-            "unpushed": int(ahead) if ahead.isdigit() else 0}
+            "uncommitted": len(files), "unpushed": int(ahead) if ahead.isdigit() else 0}
 
 
 def inside(path, folder):
@@ -491,6 +492,21 @@ MD_COMMITS, MD_FILES = 200, 500  # what WORKTREE.md lists per repository
 DESCRIBE_REPOS = 20  # repositories described at all (each costs about 8 git calls)
 NO_REPOS = "this kind of worktree lists no repositories; counts only"
 SQUASH = "(a squash merge shows as not merged)"
+DESCRIBE_DEADLINE = 60  # seconds for describing a whole worktree; repositories past it are named, not described
+CONTROL = re.compile("[\x00-\x1f\x7f\x85\u2028\u2029]")
+
+
+def clean(text):
+    """Repository and ledger text as one visible line: control characters (a newline in a file name, a
+    terminal escape) become escapes, so they cannot add lines or styling to a card or WORKTREE.md."""
+    named = {"\n": "\\n", "\r": "\\r", "\t": "\\t"}
+    return CONTROL.sub(lambda m: named.get(m.group(), "\\x{:02x}".format(ord(m.group())) if ord(m.group()) < 256
+                                           else "\\u{:04x}".format(ord(m.group()))), str(text if text is not None else ""))
+
+
+def md(text, limit=300):
+    """clean() for WORKTREE.md, also safe inside a code span or a table cell."""
+    return cut(clean(text), limit).replace("`", "'").replace("|", "\\|")
 
 
 def cut(text, limit):
@@ -503,70 +519,80 @@ def cut_path(path, limit=PATH):
     return path if len(path) <= limit else "…" + path[-(limit - 1):]
 
 
-def describe_repo(path, profile=None, name=None):
+def describe_repo(path, profile=None, name=None, deadline=None):
     """One git repository: its branch, the main branch it came from, the commits on the branch (merged
     into the main branch? pushed?), the files they change, and what is uncommitted (spec 4.3)."""
     repo = {"name": name or os.path.basename(path.rstrip(os.sep)), "path": path, "branch": None, "base": None, "fork": None,
             "commits": [], "commitsTotal": 0, "merged": 0, "pushed": 0, "files": [], "filesTotal": 0, "added": 0, "removed": 0,
-            "uncommitted": [], "uncommittedTotal": 0, "error": None}
+            "uncommitted": [], "uncommittedTotal": 0, "error": None, "head": None, "fetched": None}
+
+    def g(*args):  # every call within GIT_TIMEOUT, and within the whole description's deadline
+        left = GIT_TIMEOUT if deadline is None else min(GIT_TIMEOUT, max(0.2, deadline - time.time()))
+        return git(path, *args, timeout=left)
 
     def fail(err):
-        repo["error"] = repo["error"] or (str(err or "git failed").strip()[:200] or "git failed")
+        repo["error"] = repo["error"] or (clean(str(err or "git failed").strip())[:200] or "git failed")
 
-    code, branch, err = git(path, "rev-parse", "--abbrev-ref", "HEAD")
+    code, branch, err = g("rev-parse", "--abbrev-ref", "HEAD")
     if code:
         fail(err)
         return repo
-    repo["branch"] = branch
+    repo["branch"] = clean(branch)
+    repo["head"] = g("rev-parse", "HEAD")[1] or None
+    # Merged and pushed come from local refs: say when they were last fetched.
+    code, common, _ = g("rev-parse", "--path-format=absolute", "--git-common-dir")
+    fetch_head = os.path.join(common, "FETCH_HEAD") if not code and common else None
+    if fetch_head and os.path.isfile(fetch_head):
+        repo["fetched"] = iso(os.path.getmtime(fetch_head))
     # The main branch: origin/HEAD's target, then main, master, trunk, then the profile's main branches.
     names = []
-    code, target, _ = git(path, "symbolic-ref", "--short", "refs/remotes/origin/HEAD")
+    code, target, _ = g("symbolic-ref", "--short", "refs/remotes/origin/HEAD")
     if not code and target:
         names.append(target)
     names += ["main", "master", "trunk"]
     for b in (profile or {}).get("mainBranches") or []:
         names += [b, "origin/" + b]
-    bases = [n for n in dict.fromkeys(names) if n != branch and git(path, "rev-parse", "--verify", "--quiet", n + "^{commit}")[0] == 0]
+    bases = [n for n in dict.fromkeys(names) if n != branch and g("rev-parse", "--verify", "--quiet", n + "^{commit}")[0] == 0]
     repo["base"] = bases[0] if bases else None
     # Where the branch began: its creation in the reflog (still right after a fast-forward merge), else the merge-base.
     fork = None
     if branch != "HEAD":
-        code, out, _ = git(path, "reflog", "show", "--format=%H", "refs/heads/" + branch)
+        code, out, _ = g("reflog", "show", "--format=%H", "refs/heads/" + branch)
         oldest = out.splitlines()[-1].strip() if not code and out else None
-        if oldest and git(path, "merge-base", "--is-ancestor", oldest, "HEAD")[0] == 0:
+        if oldest and g("merge-base", "--is-ancestor", oldest, "HEAD")[0] == 0:
             fork = oldest
     if not fork and bases:
-        code, out, err = git(path, "merge-base", "HEAD", bases[0])
+        code, out, err = g("merge-base", "HEAD", bases[0])
         fork = out if not code and out else None
         if code:
             fail(err)
     if fork:
-        repo["fork"] = git(path, "rev-parse", "--short", fork)[1] or fork[:7]
-        code, count, _ = git(path, "rev-list", "--count", fork + "..HEAD")
-        code, out, err = git(path, "log", "-n", str(MD_COMMITS + 1), "--format=%H%x1f%h%x1f%s", fork + "..HEAD")
+        repo["fork"] = g("rev-parse", "--short", fork)[1] or fork[:7]
+        code, count, _ = g("rev-list", "--count", fork + "..HEAD")
+        code, out, err = g("log", "-n", str(MD_COMMITS + 1), "--format=%H%x1f%h%x1f%s", fork + "..HEAD")
         if code:
             fail(err)
         rows = [line.split("\x1f", 2) for line in out.splitlines() if line.count("\x1f") >= 2] if not code else []
         repo["commitsTotal"] = max(int(count) if count.isdigit() else 0, len(rows))
         unmerged = []  # per main-branch candidate: the branch commits it does not contain
         for b in bases:
-            code, out, _ = git(path, "rev-list", "HEAD", "--not", fork, b)
+            code, out, _ = g("rev-list", "HEAD", "--not", fork, b)
             if not code:
                 unmerged.append(set(out.split()))
         picked = set()  # commits whose patch is already in the main branch (rebased or picked)
         if repo["base"] and repo["commitsTotal"] <= MD_COMMITS:
-            code, out, _ = git(path, "cherry", repo["base"], "HEAD", fork)
+            code, out, _ = g("cherry", repo["base"], "HEAD", fork)
             picked = {line[2:].strip() for line in out.splitlines() if line.startswith("- ")} if not code else set()
-        code, out, err = git(path, "rev-list", "HEAD", "--not", "--remotes")
+        code, out, err = g("rev-list", "HEAD", "--not", "--remotes")
         if code:
             fail(err)
         unpushed = set(out.split())
         for full, short, subject in rows:
             merged = (any(full not in u for u in unmerged) or full in picked) if unmerged else None
-            repo["commits"].append({"sha": short, "subject": subject, "merged": merged, "pushed": not code and full not in unpushed})
+            repo["commits"].append({"sha": short, "subject": clean(subject), "merged": merged, "pushed": not code and full not in unpushed})
         repo["merged"] = sum(1 for c in repo["commits"] if c["merged"])
         repo["pushed"] = sum(1 for c in repo["commits"] if c["pushed"])
-        code, out, err = git(path, "diff", "--numstat", "-z", "-M", fork, "HEAD")
+        code, out, err = g("diff", "--numstat", "-z", "-M", fork, "HEAD")
         if code:
             fail(err)
         parts, i = (out.split("\x00") if not code else []), 0
@@ -585,7 +611,7 @@ def describe_repo(path, profile=None, name=None):
             repo["added"] += added or 0
             repo["removed"] += removed or 0
             if len(repo["files"]) < MD_FILES:
-                repo["files"].append({"path": name_, "added": added, "removed": removed})
+                repo["files"].append({"path": clean(name_), "added": added, "removed": removed})
     elif not repo["error"]:
         fail("no main branch found")
     files = status_files(path)
@@ -593,14 +619,16 @@ def describe_repo(path, profile=None, name=None):
         fail("git status failed")
     else:
         repo["uncommittedTotal"] = len(files)
-        repo["uncommitted"] = [{"path": f, "status": st} for st, f in files[:MD_FILES]]
+        repo["uncommitted"] = [{"path": clean(f), "status": st} for st, f in files[:MD_FILES]]
     return repo
 
 
 def describe_worktree(row, facts, profile):
     """The tasks using the worktree and each repository in it (spec 4.2, 4.4)."""
-    desc = {"tasks": [{"id": t, "title": row.get("titles", {}).get(t, ""), "state": row.get("states", {}).get(t)} for t in row["tasks"]],
-            "repos": [], "notDescribed": [], "note": None, "error": None, "kind": facts.get("kind") or "git worktree"}
+    desc = {"tasks": [{"id": clean(t), "title": clean(row.get("titles", {}).get(t, "")), "state": clean(row.get("states", {}).get(t))}
+                      for t in row["tasks"]],
+            "repos": [], "notDescribed": [], "notDescribedWhy": {}, "note": None, "error": None, "kind": clean(facts.get("kind") or "git worktree")}
+    deadline = time.time() + DESCRIBE_DEADLINE
     if facts.get("remove"):  # the profile's own kind: its status script names the repositories, if it can
         paths = facts.get("repos") or []
         if not paths:
@@ -609,15 +637,18 @@ def describe_worktree(row, facts, profile):
     else:
         paths, names = [row["path"]], [os.path.basename(facts.get("repo") or row["path"])]
     for i, path in enumerate(paths):
-        if i >= DESCRIBE_REPOS:
-            desc["notDescribed"].append(os.path.basename(path))
+        why = ("more than {} repositories".format(DESCRIBE_REPOS) if i >= DESCRIBE_REPOS else
+               "time limit of {:g} s".format(DESCRIBE_DEADLINE) if time.time() >= deadline else None)
+        if why:
+            desc["notDescribed"].append(clean(os.path.basename(path)))
+            desc["notDescribedWhy"].setdefault(why, []).append(clean(os.path.basename(path)))
             continue
         try:
-            desc["repos"].append(describe_repo(path, profile, names[i]))
+            desc["repos"].append(describe_repo(path, profile, names[i], deadline))
         except Exception as e:  # noqa: BLE001 - a description never stops the card
             desc["repos"].append(dict(name=names[i] or os.path.basename(path), path=path, branch=None, base=None, fork=None,
                                       commits=[], commitsTotal=0, merged=0, pushed=0, files=[], filesTotal=0, added=0, removed=0,
-                                      uncommitted=[], uncommittedTotal=0, error=str(e)[:200]))
+                                      uncommitted=[], uncommittedTotal=0, error=clean(e)[:200], head=None, fetched=None))
     return desc
 
 
@@ -642,6 +673,8 @@ def repo_lines(r):
             r["base"] or "its start", r["fork"], n, "" if n == 1 else "s",
             "{} merged into {}".format(r["merged"], r["base"]) if r["base"] else "merged: unknown", r["pushed"])
     lines = [head]
+    if r["commitsTotal"]:
+        lines.append("  merged and pushed are from local refs; last fetch: {}".format(r.get("fetched") or "never"))
     shown = r["commits"][:CARD_COMMITS]
     for c in shown:
         lines.append("  {} {}  ({}, {})".format(c["sha"], cut(c["subject"], SUBJECT), merged_word(c), "pushed" if c["pushed"] else "not pushed"))
@@ -712,36 +745,39 @@ def card_changes(desc):
 
 
 def worktree_md(desc, row, facts, gone, card_id):
-    """WORKTREE.md: the same sections as the card, with the larger caps (spec 4.6)."""
-    out = ["# Worktree {}".format(row["path"]), "", "{}. Written {} with decision card {}.".format(
-        desc.get("kind") or "git worktree", pa.now(), card_id), "", "## Tasks", ""]
-    out += ['- {} "{}" ({})'.format(t["id"], t["title"], t["state"]) for t in desc["tasks"]]
+    """WORKTREE.md: the same sections as the card, with the larger caps (spec 4.6). Every piece of
+    repository or ledger text goes through md(), so it stays inside its own line, code span or cell."""
+    out = ["# Worktree {}".format(md(row["path"], 1000)), "", "{}. Written {} with decision card {}.".format(
+        md(desc.get("kind") or "git worktree"), pa.now(), card_id), "", "## Tasks", ""]
+    out += ['- {} "{}" ({})'.format(md(t["id"]), md(t["title"]), md(t["state"])) for t in desc["tasks"]]
     if desc.get("note") or desc.get("error"):
-        out += [""] + ([desc["note"]] if desc.get("note") else []) + (["Could not read the changes: " + desc["error"]] if desc.get("error") else [])
+        out += [""] + ([desc["note"]] if desc.get("note") else []) + (["Could not read the changes: " + md(desc["error"])] if desc.get("error") else [])
         out.append("Uncommitted files: {}. Commits not on any remote: {}.".format(facts.get("uncommitted", 0), facts.get("unpushed", 0)))
     for r in desc["repos"]:
-        out += ["", "## {}".format(r["name"]), "", "`{}`: branch `{}`{}.".format(r["path"], r["branch"] or "?", ", from `{}` at `{}`".format(
-            r["base"] or "its start", r["fork"]) if r["fork"] else "")]
+        out += ["", "## {}".format(md(r["name"])), "", "`{}`: branch `{}`{}.".format(md(r["path"], 1000), md(r["branch"] or "?"),
+                ", from `{}` at `{}`".format(md(r["base"] or "its start"), md(r["fork"])) if r["fork"] else "")]
+        if r["commitsTotal"]:
+            out += ["", "Merged and pushed are from local refs; last fetch: {}.".format(r.get("fetched") or "never")]
         if r["error"]:
-            out += ["", "Could not read the changes: {}".format(r["error"])]
+            out += ["", "Could not read the changes: {}".format(md(r["error"]))]
         out += ["", "### Commits ({}, {} merged, {} pushed)".format(r["commitsTotal"], r["merged"], r["pushed"]), ""]
-        out += ["- `{}` {} ({}, {})".format(c["sha"], c["subject"], merged_word(c), "pushed" if c["pushed"] else "not pushed")
+        out += ["- `{}` {} ({}, {})".format(md(c["sha"]), md(c["subject"]), merged_word(c), "pushed" if c["pushed"] else "not pushed")
                 for c in r["commits"][:MD_COMMITS]] or ["- none"]
         if r["commitsTotal"] > MD_COMMITS:
             out.append("- … {} more".format(r["commitsTotal"] - MD_COMMITS))
         out += ["", "### Files changed ({}, {})".format(r["filesTotal"], counts(r["added"], r["removed"]) or "+0"), ""]
         if r["files"]:
             out += ["| File | Added | Removed |", "|---|---|---|"] + ["| `{}` | {} | {} |".format(
-                f["path"], "binary" if f["added"] is None else f["added"], "" if f["removed"] is None else f["removed"]) for f in r["files"]]
+                md(f["path"]), "binary" if f["added"] is None else f["added"], "" if f["removed"] is None else f["removed"]) for f in r["files"]]
             if r["filesTotal"] > len(r["files"]):
-                out.append("\n… {} more".format(r["filesTotal"] - len(r["files"])))
+                out += ["", "… {} more".format(r["filesTotal"] - len(r["files"]))]
         else:
             out.append("None.")
         out += ["", "### Uncommitted ({})".format(r["uncommittedTotal"]), ""]
-        out += ["- `{}` {}".format(u["status"], u["path"]) for u in r["uncommitted"]] or ["None."]
-    if desc.get("notDescribed"):
-        out += ["", "Not described (more than {} repositories): {}".format(DESCRIBE_REPOS, ", ".join(desc["notDescribed"]))]
-    out += ["", "## Workers", "", gone, "", "## Deleting", "", deleting_text(facts), ""]
+        out += ["- `{}` {}".format(md(u["status"]), md(u["path"])) for u in r["uncommitted"]] or ["None."]
+    for why, names in (desc.get("notDescribedWhy") or {}).items():
+        out += ["", "Not described ({}): {}".format(why, ", ".join(md(n) for n in names))]
+    out += ["", "## Workers", "", md(gone, 2000), "", "## Deleting", "", md(deleting_text(facts), 2000), ""]
     return "\n".join(out)
 
 
@@ -760,7 +796,10 @@ def cmd_worktree(args):
         for row in rows.values():
             task, facts = row["tasks"][0], row["facts"]
             card = pa.read_json(card_path(directory, task))
+            if card and card.get("status") == "withdrawn":
+                card = None  # asked again once every task is done or parked
             fates = [w["fate"] for w in row["workers"]]
+            still = tasks_still(row)
             if not facts:
                 print("{}: gone or not a git worktree ({})".format(task, row["path"]))
             elif facts.get("main"):
@@ -768,20 +807,35 @@ def cmd_worktree(args):
             elif row["keep"]:
                 print("{}: kept (keepWorktree is set)".format(task))
             elif card and card.get("status") == "answered":
-                print("{}: card {} answered {!r}{}".format(task, card["id"], card.get("answer"),
-                      ": run `pa-worktree remove {}`".format(task) if str(card.get("answer", "")).lower().startswith("delete") else ": kept, not asked again"))
+                delete = str(card.get("answer", "")).lower().startswith("delete")
+                if delete and still:
+                    print("{}: card {} answered {!r}, but tasks still {}; pa-worktree remove refuses until every task using it is "
+                          "done or parked".format(task, card["id"], card.get("answer"), still))
+                else:
+                    print("{}: card {} answered {!r}{}".format(task, card["id"], card.get("answer"),
+                          ": run `pa-worktree remove {}`".format(task) if delete else ": kept, not asked again"))
+            elif card and still and not args.open_cards:
+                print("{}: card {} is open, but tasks still {}; --open-cards withdraws it".format(task, card["id"], still))
+            elif card and still:
+                # A task was reopened after the card opened: the question no longer stands.
+                why = "tasks still {}; it is asked again once every task using the worktree is done or parked".format(still)
+                card.update(status="withdrawn", answer=None, note="Withdrawn by pa-worktree check: " + why, answered=pa.now(),
+                            answeredBy="pa-worktree check: withdrawn")
+                pa.write_json(card_path(directory, task), card)
+                append_journal(directory, {"by": "agent" if by_an_agent() else "person", "trigger": "worktree", "task": task,
+                                           "why": "withdrew card {}: {}".format(card["id"], why)})
+                print("{}: withdrew card {}: {}".format(task, card["id"], why))
             elif card:
                 print("{}: card {} is open".format(task, card["id"]))
-            elif any(s not in ("done", "parked") for s in row["states"].values()):
-                print("{}: tasks still {}; asked once every task using it is done or parked".format(
-                    task, ", ".join("{} {}".format(i, s) for i, s in row["states"].items() if s not in ("done", "parked"))))
+            elif still:
+                print("{}: tasks still {}; asked once every task using it is done or parked".format(task, still))
             elif "live" in fates:
                 print("{}: in use by {}".format(task, ", ".join(w["address"] for w in row["workers"] if w["fate"] == "live")))
             elif row["others"]:
                 print("{}: another terminal is working in it ({})".format(task, ", ".join(row["others"])))
             else:
                 # Every task is done or parked and nothing runs inside: a candidate, however its workers ended.
-                gone = ", ".join("{} ({})".format(w["name"] or w["address"], w["fate"]) for w in row["workers"]) or "no workers recorded"
+                gone = ", ".join("{} ({})".format(clean(w["name"] or w["address"]), w["fate"]) for w in row["workers"]) or "no workers recorded"
                 if not args.open_cards:
                     print("{}: candidate, every task done or parked ({}); --open-cards asks the person".format(task, gone))
                     continue
@@ -790,8 +844,9 @@ def cmd_worktree(args):
                 try:
                     desc = describe_worktree(row, facts, profile)
                 except Exception as e:  # noqa: BLE001 - describing never stops the card (AC7.5)
-                    desc = {"tasks": [{"id": t, "title": row["titles"].get(t, ""), "state": row["states"].get(t)} for t in row["tasks"]],
-                            "repos": [], "notDescribed": [], "note": None, "error": str(e)[:200], "kind": facts.get("kind") or "git worktree"}
+                    desc = {"tasks": [{"id": clean(t), "title": clean(row["titles"].get(t, "")), "state": clean(row["states"].get(t))} for t in row["tasks"]],
+                            "repos": [], "notDescribed": [], "notDescribedWhy": {}, "note": None, "error": clean(e)[:200],
+                            "kind": clean(facts.get("kind") or "git worktree")}
                 card_id = "d-wt-" + task
                 evidence = []
                 try:
@@ -799,10 +854,10 @@ def cmd_worktree(args):
                     evidence = ["WORKTREE.md"]
                 except OSError:
                     pass
-                squash = (" " + SQUASH if not facts.get("removesBranches") and any(c["merged"] is False for r in desc["repos"] for c in r["commits"]) else "")
+                squash = (" " + SQUASH if any(c["merged"] is False for r in desc["repos"] for c in r["commits"]) else "")
                 pa.write_json(card_path(directory, task), {
                     "id": card_id, "task": task, "worktree": row["path"],
-                    "question": "Delete the worktree for {}?".format(", ".join('{} "{}"'.format(t, cut(row["titles"].get(t, ""), 60)) for t in row["tasks"])),
+                    "question": "Delete the worktree for {}?".format(", ".join('{} "{}"'.format(clean(t), cut(clean(row["titles"].get(t, "")), 60)) for t in row["tasks"])),
                     "context": card_context(desc, row, facts, gone),
                     "evidence": evidence,
                     "changes": card_changes(desc),
@@ -811,7 +866,12 @@ def cmd_worktree(args):
                                 {"label": "Keep", "detail": "Leave the worktree. It will not be asked about again."}],
                     "recommendation": "Keep" if dirty else "Delete", "status": "open", "answer": None, "note": None,
                     "snapshot": {"uncommitted": facts["uncommitted"], "unpushed": facts["unpushed"],
-                                 "commits": sum(r["commitsTotal"] for r in desc["repos"])}, "created": pa.now(), "answered": None})
+                                 "commits": sum(r["commitsTotal"] for r in desc["repos"]),
+                                 # what pa-worktree remove compares: each repository's HEAD and its uncommitted files
+                                 "heads": {r["path"]: r["head"] for r in desc["repos"] if r.get("head")},
+                                 "uncommittedFiles": {r["path"]: [u["path"] for u in r["uncommitted"]] for r in desc["repos"]
+                                                      if r.get("head") and r["uncommittedTotal"] == len(r["uncommitted"])}},
+                    "created": pa.now(), "answered": None})
                 print("{}: opened card d-wt-{} (recommends {})".format(task, task, "Keep" if dirty else "Delete"))
         if not rows:
             print("No task in the ledger has a worktree.")
@@ -833,6 +893,9 @@ def cmd_worktree(args):
         raise pa.Problem("{} is the project's main checkout; it is never removed".format(row["path"]))
     if row["keep"]:
         raise pa.Problem("keepWorktree is set on the task")
+    still = tasks_still(row)
+    if still:
+        raise pa.Problem("tasks still {}; a worktree is removed only once every task using it is done or parked. Nothing was removed".format(still))
     busy = [w["address"] for w in row["workers"] if w["fate"] == "live"] + row["others"]
     if busy:
         raise pa.Problem("still in use by {}; nothing was removed".format(", ".join(busy)))
@@ -843,7 +906,34 @@ def cmd_worktree(args):
     if facts.get("removesBranches") and facts["unpushed"] > snapshot.get("unpushed", 0):
         raise pa.Problem("there are more unpushed commits now ({}) than when the person answered ({}); ask again".format(
             facts["unpushed"], snapshot.get("unpushed", 0)))
+    changed = changed_since_card(snapshot)
+    if changed:
+        raise pa.Problem(changed + "; ask again. Nothing was removed")
     print(remove_worktree(row["path"], facts) + " (card {})".format(card["id"]))
+
+
+def tasks_still(row):
+    """'t-003 in-progress, t-004 review' for the tasks using a worktree that are not done or parked."""
+    return ", ".join("{} {}".format(clean(i), clean(s)) for i, s in row["states"].items() if s not in ("done", "parked"))
+
+
+def changed_since_card(snapshot):
+    """What changed in the worktree since its card's snapshot, in a way that matters: a repository's HEAD
+    moved (new commits), or an uncommitted file that the card did not list. None when nothing did."""
+    for path, head in (snapshot.get("heads") or {}).items():
+        code, now_head, err = git(path, "rev-parse", "HEAD")
+        if code:
+            return "cannot read {} ({})".format(path, clean(err) or "git failed")
+        if now_head != head:
+            return "{} has new commits since the card (HEAD was {}, now {})".format(path, head[:7], now_head[:7])
+    for path, listed in (snapshot.get("uncommittedFiles") or {}).items():
+        files = status_files(path)
+        if files is None:
+            return "cannot read {} (git status failed)".format(path)
+        new = sorted({clean(f) for _s, f in files} - set(listed))
+        if new:
+            return "{} has uncommitted files that were not on the card: {}".format(path, ", ".join(new[:5]) + (", +{} more".format(len(new) - 5) if len(new) > 5 else ""))
+    return None
 
 
 def remove_worktree(path, facts):
@@ -903,6 +993,8 @@ def worker_facts(directory, agent, profile, address):
 # changes nothing. Only a terminal recorded in this space's ledger is ever ended.
 
 CLOSABLE = ("idle", "done")  # hc statuses a worker may be closed in (also: exited, or already gone)
+ORCHESTRATOR_FILES = ("intent.md",)  # the orchestrator's own artefact (sdlc.md); spec.md and plan.md are workers'
+TOOL_FILES = ("GATE.json", "WORKTREE.md")  # written by pa-gate and pa-worktree, never a worker's report
 
 
 @contextlib.contextmanager
@@ -923,16 +1015,47 @@ def append_journal(directory, line):
         journal.write(json.dumps(dict({"at": pa.now()}, **line)) + "\n")
 
 
-def recorded(ledger, address):
-    """(task, entry) of the worker the ledger records at this address, or (None, None). An address
-    recorded twice (an old, closed worker and a new one) gives the one not yet finished."""
+def recorded(ledger, address, info=None):
+    """(task, entry) of the worker the ledger records at this address, or (None, None). When the address
+    is recorded more than once (a core restart can hand an old address out again), an entry not yet
+    finished comes first, and among those the one whose name is the live terminal's name."""
     found = [(t, w) for t in ledger.get("tasks", []) for w in t.get("workers") or [] if w.get("address") == address]
-    found.sort(key=lambda tw: bool(tw[1].get("finished")))
+    live_name = (info or {}).get("name")
+    found.sort(key=lambda tw: (bool(tw[1].get("finished")), not (live_name and tw[1].get("name") == live_name)))
     return found[0] if found else (None, None)
 
 
+def read_terminal(address):
+    """(hc get record, None); ({}, None) when hc says there is no such terminal; (None, why) when hc
+    cannot tell. `pa.hc_get` gives {} for any hc error, so an empty answer is checked with `hc ls --all`."""
+    info = pa.hc_get(address)
+    if info:
+        return info, None
+    try:
+        listed = json.loads(pa.call(["hc", "ls", "--all", "--json"])).get("terminals", [])
+    except (pa.Problem, ValueError, AttributeError):
+        return None, "hc did not answer"
+    if any(t.get("address") == address for t in listed):
+        return None, "hc get failed, but hc ls lists it"
+    return {}, None
+
+
 def worker_label(address, entry, info):
-    return "{} ({})".format(address, entry.get("name") or info.get("name") or "unnamed")
+    return "{} ({})".format(address, entry.get("name") or (info or {}).get("name") or "unnamed")
+
+
+def worker_start(entry, info):
+    """When the worker started (epoch seconds): the ledger's `started`, else hc's created_ms; None if unknown."""
+    if entry.get("started"):
+        stamp = pa.parse_time(str(entry["started"]))
+        if stamp:
+            return stamp
+    created = (info or {}).get("created_ms")
+    return created / 1000.0 if isinstance(created, (int, float)) and created > 0 else None
+
+
+def iso(epoch):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
 
 
 def identity_refusal(address, task, entry, info):
@@ -963,11 +1086,18 @@ def status_refusal(address, entry, info):
     return "status", "{} has status {}; nothing was closed".format(address, status or "none")
 
 
+def own_file(name):
+    """The files pa-hooks install writes into a worktree: never counted as work."""
+    return name in (SETTINGS, TASK_FILE) or name.startswith(SETTINGS + ".bak-pa-hooks")
+
+
 def status_files(path):
-    """[(XY status, path)] of the uncommitted files in a git checkout, without .claude/ ones; None if git cannot tell."""
+    """[(XY status, path)] of the uncommitted files in a git checkout, every untracked file listed
+    whatever the repository's own config, without pa-hooks' own files; None if git cannot tell.
+    Ignored files are not seen."""
     try:
-        r = subprocess.run(["git", "-C", path, "status", "--porcelain"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                           universal_newlines=True, timeout=GIT_TIMEOUT)
+        r = subprocess.run(["git", "-C", path, "status", "--porcelain", "--untracked-files=all", "--ignore-submodules=none"],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=GIT_TIMEOUT)
     except (OSError, subprocess.TimeoutExpired):
         return None
     if r.returncode:
@@ -975,32 +1105,18 @@ def status_files(path):
     files = []
     for line in r.stdout.splitlines():
         name = line[3:].split(" -> ")[-1].strip().strip('"')
-        if name and not name.startswith(".claude/"):
+        if name and not own_file(name):
             files.append((line[:2].strip(), name))
     return files
 
 
-def worktree_refusal(task, profile):
-    """The task's worktree holds uncommitted files, or its state cannot be read. A worktree that is
-    gone (or none) is fine: there is nothing in it to lose."""
-    if not task.get("worktree"):
-        return None
-    path = os.path.realpath(os.path.expanduser(task["worktree"]))
-    if not os.path.exists(path):
-        return None
-    facts = worktree_facts(path, profile)
-    custom = (profile or {}).get("worktree") or {}
-    if not facts:
-        why = ("the profile's worktree status script failed" if custom.get("marker") and os.path.exists(os.path.join(path, custom["marker"]))
-               else "not a git worktree")
-        return "unreadable", "cannot tell whether {} holds uncommitted work ({}); nothing was closed".format(path, why)
-    if facts.get("remove"):  # the profile's own kind: its status script gives a count
-        count, names = facts["uncommitted"], []
-    else:
-        files = status_files(path)
-        if files is None:
-            return "unreadable", "cannot tell whether {} holds uncommitted work (git status failed); nothing was closed".format(path)
-        count, names = len(files), [f for _s, f in files]
+def uncommitted_refusal(path, names_known=True, count=None):
+    """A refusal for a checkout with uncommitted files, or None."""
+    files = status_files(path)
+    if files is None:
+        return "unreadable", "cannot tell whether {} holds uncommitted work (git status failed); nothing was closed".format(path)
+    names = [f for _s, f in files]
+    count = max(count or 0, len(names))
     if count:
         listed = names[:5] + (["+{} more".format(len(names) - 5)] if len(names) > 5 else [])
         return "uncommitted", "{} has {} uncommitted file(s){}; have them committed or reported first. Nothing was closed".format(
@@ -1008,8 +1124,73 @@ def worktree_refusal(task, profile):
     return None
 
 
-def report_path(directory, task_id, address, given):
-    """The report file the agent read, relative to evidence/<task>/. It must be inside that folder and not empty."""
+def worktree_refusal(task, profile, info=None):
+    """(refusal or None, what was checked, what could not be seen). It looks at the task's worktree
+    (each repository a profile kind lists, too) and at the git checkout the worker's terminal runs in.
+    A worktree that is gone (or none) is fine: there is nothing in it to lose."""
+    checked, unseen = [], []
+    path = os.path.realpath(os.path.expanduser(task["worktree"])) if task.get("worktree") else None
+    if path and os.path.exists(path):
+        facts = worktree_facts(path, profile)
+        custom = (profile or {}).get("worktree") or {}
+        if not facts:
+            why = ("the profile's worktree status script failed" if custom.get("marker") and os.path.exists(os.path.join(path, custom["marker"]))
+                   else "not a git worktree")
+            return ("unreadable", "cannot tell whether {} holds uncommitted work ({}); nothing was closed".format(path, why)), checked, unseen
+        if facts.get("remove"):  # the profile's own kind: its script's count, and each repository it lists
+            for repo in facts.get("repos") or []:
+                refusal = uncommitted_refusal(repo)
+                if refusal:
+                    return refusal, checked, unseen
+                checked.append(repo)
+            if facts["uncommitted"]:
+                return ("uncommitted", "{} has {} uncommitted file(s); have them committed or reported first. Nothing was closed".format(
+                    path, facts["uncommitted"])), checked, unseen
+            if not facts.get("repos"):
+                unseen.append("{} is checked by its profile's script only (it lists no repositories)".format(path))
+            checked.append(path)
+        else:
+            refusal = uncommitted_refusal(path)
+            if refusal:
+                return refusal, checked, unseen
+            checked.append(path)
+    cwd = (info or {}).get("cwd") or ((info or {}).get("foreground") or {}).get("cwd")
+    if cwd and not any(inside(cwd, c) for c in checked):
+        cwd = os.path.realpath(cwd)
+        code, top, _ = git(cwd, "rev-parse", "--show-toplevel") if os.path.isdir(cwd) else (1, "", "")
+        if code or not top:
+            unseen.append("{} is not in a git checkout".format(cwd))
+        elif not any(inside(top, c) for c in checked):
+            refusal = uncommitted_refusal(os.path.realpath(top))
+            if refusal:
+                return refusal, checked, unseen
+            checked.append(os.path.realpath(top))
+    return None, checked, unseen
+
+
+def checked_note(checked, unseen):
+    return "Checked for uncommitted work: {}; ignored files are not seen{}.".format(
+        ", ".join(checked) or "none (no worktree, and no git checkout where it ran)",
+        "; not seen: " + "; ".join(unseen) if unseen else "")
+
+
+def report_problem(folder, rel, given, address, start):
+    """Why a file in the evidence folder cannot stand for this worker's report, or None."""
+    if rel in ORCHESTRATOR_FILES:
+        return "{} is the orchestrator's own file, not a worker's report; name the file that holds this worker's report".format(given)
+    if os.path.basename(rel) in TOOL_FILES:
+        return "{} is written by the Project Agent's tools, not a worker's report; name the file that holds this worker's report".format(given)
+    if start is not None:
+        written = os.path.getmtime(os.path.join(folder, rel))
+        if written < start:
+            return "evidence {} was last written before {} started ({} < {}); name the file that holds this worker's report".format(
+                given, address, iso(written), iso(start))
+    return None
+
+
+def report_path(directory, task_id, address, given, start=None):
+    """The report file the agent read, relative to evidence/<task>/. It must be inside that folder, not
+    empty, not the orchestrator's or the tools' own file, and written after the worker started."""
     if not given:
         raise pa.Problem("pa-worker close needs --evidence <file>: the report you read, in evidence/{}/".format(task_id))
     folder = os.path.realpath(os.path.join(directory, "evidence", task_id))
@@ -1021,19 +1202,26 @@ def report_path(directory, task_id, address, given):
     with open(path, "rb") as f:
         if not f.read().strip():
             raise pa.Problem("evidence {} is empty; read the report before closing".format(given))
-    return os.path.relpath(path, folder)
+    rel = os.path.relpath(path, folder)
+    problem = report_problem(folder, rel, given, address, start)
+    if problem:
+        raise pa.Problem(problem)
+    return rel
 
 
 def end_worker(directory, ledger, task, entry, address, info, report, by, trigger, actor=None):
     """Ends one worker whose checks passed: kill if live, rm, then mark its ledger entry and journal
     it. The caller holds the ledger lock, re-read the ledger and re-checked the status (`info`, the
-    `hc get` it checked; empty when the terminal is already gone). Returns the
-    line to print. Never touches the worktree, the branch, the task or the evidence. `by` goes into the
-    entry's closedBy; `actor` (default: `by`) is who the journal line says ran it."""
+    `hc get` it checked; empty when the terminal is already gone). A kill that leaves the terminal
+    live raises, and nothing is recorded. Returns the line to print. Never touches the worktree, the
+    branch, the task or the evidence. `by` goes into the entry's closedBy; `actor` (default: `by`) is
+    who the journal line says ran it."""
     note = ""
     if info:
         if info.get("state") == "live":
             pa.call(["hc", "kill", address], check=False)
+            if pa.hc_get(address).get("state") == "live":
+                raise pa.Problem("hc kill did not end {} (it is still live); nothing was recorded".format(address))
         pa.call(["hc", "rm", address], check=False)
         if pa.hc_get(address):
             note = " (ended {} but hc rm did not remove its record)".format(address)
@@ -1047,33 +1235,44 @@ def end_worker(directory, ledger, task, entry, address, info, report, by, trigge
     return "Closed worker {} ({}, task {}); its worktree and branch are untouched.{}".format(address, name, task.get("id"), note)
 
 
+def unrecorded(address):
+    return pa.Problem("{} is not a recorded worker of this space; nothing was closed (if it is yours, close it in Herdr)".format(address))
+
+
 def close_worker(directory, agent, profile, address, evidence):
     """pa-worker close <address> --evidence F (spec 3.2 and 3.3)."""
     if "/" in address:
         raise pa.Problem("{} is on another machine; pa-worker close runs on the machine the space runs on".format(address))
     if address == agent.get("terminal"):
         raise pa.Problem("that is the Project Agent itself; it ends when its space is closed")
-    task, entry = recorded(read_ledger(directory), address)
+    info, why = read_terminal(address)
+    task, entry = recorded(read_ledger(directory), address, info)
     if not entry:
-        raise pa.Problem("{} is not a recorded worker of this space; nothing was closed (if it is yours, close it in Herdr)".format(address))
-    info = pa.hc_get(address)
+        raise unrecorded(address)
+    if info is None:
+        raise pa.Problem("cannot read {}'s state from hc ({}); nothing was closed".format(address, why))
     refusal = identity_refusal(address, task, entry, info)
     if refusal:
         raise pa.Problem(refusal[1])
     if entry.get("finished") and not info:
         print("{} is already closed.".format(address))
         return
-    report = report_path(directory, task["id"], address, evidence)
-    refusal = status_refusal(address, entry, info) or worktree_refusal(task, profile)
+    report = report_path(directory, task["id"], address, evidence, worker_start(entry, info))
+    refusal = status_refusal(address, entry, info)
+    if refusal:
+        raise pa.Problem(refusal[1])
+    refusal, checked, unseen = worktree_refusal(task, profile, info)
     if refusal:
         raise pa.Problem(refusal[1])
     by = "agent" if by_an_agent() else "person"
     with ledger_lock(directory):
         ledger = read_ledger(directory)
-        task, entry = recorded(ledger, address)
+        info, why = read_terminal(address)
+        task, entry = recorded(ledger, address, info)
         if not entry:
-            raise pa.Problem("{} is not a recorded worker of this space; nothing was closed (if it is yours, close it in Herdr)".format(address))
-        info = pa.hc_get(address)
+            raise unrecorded(address)
+        if info is None:
+            raise pa.Problem("cannot read {}'s state from hc ({}); nothing was closed".format(address, why))
         refusal = identity_refusal(address, task, entry, info) or status_refusal(address, entry, info)
         if refusal:
             raise pa.Problem(refusal[1])
@@ -1081,17 +1280,19 @@ def close_worker(directory, agent, profile, address, evidence):
             print("{} is already closed.".format(address))
             return
         print(end_worker(directory, ledger, task, entry, address, info, report, by, "close"))
+    print(checked_note(checked, unseen))
 
 
 def keep_worker(directory, agent, address, quote, off):
-    """pa-worker keep <address> --quote "<the person's words>" [--off] (spec 3.5). It only marks the
-    ledger entry; it reopens nothing."""
+    """pa-worker keep <address> --quote "<the person's words>" [--off] (spec 3.5). Both ways need the
+    person's own words, stored and journaled as given. It only marks the ledger entry; it reopens nothing."""
     if "/" in address:
         raise pa.Problem("{} is on another machine; pa-worker keep runs on the machine the space runs on".format(address))
     if address == agent.get("terminal"):
         raise pa.Problem("that is the Project Agent itself; it ends when its space is closed")
-    if not off and not (quote or "").strip():
-        raise pa.Problem('pa-worker keep needs --quote "<the person\'s own words>"')
+    if not (quote or "").strip():
+        raise pa.Problem('pa-worker keep{} needs --quote "<the person\'s own words>"'.format(" --off" if off else ""))
+    quote = quote.strip()
     with ledger_lock(directory):
         ledger = read_ledger(directory)
         task, entry = recorded(ledger, address)
@@ -1103,11 +1304,11 @@ def keep_worker(directory, agent, address, quote, off):
             return
         stamp = pa.now()
         if off:
-            entry.update(keep=False, unkeptAt=stamp)
-            why = "{} ({}) is no longer kept, at the person's word".format(address, name)
+            entry.update(keep=False, unkeptAt=stamp, unkeepQuote=quote)
+            why = 'the person said {} may be closed again: "{}"'.format(address, quote)
         else:
-            entry.update(keep=True, keptAt=stamp, keepQuote=quote.strip())
-            why = 'the person asked to keep {} open: "{}"'.format(address, quote.strip())
+            entry.update(keep=True, keptAt=stamp, keepQuote=quote)
+            why = 'the person asked to keep {} open: "{}"'.format(address, quote)
         task["updated"] = stamp
         pa.write_json(os.path.join(directory, "ledger.json"), ledger)
         append_journal(directory, {"by": "agent" if by_an_agent() else "person", "trigger": "keep", "task": task.get("id"), "why": why})
@@ -1115,7 +1316,8 @@ def keep_worker(directory, agent, address, quote, off):
 
 
 LEFTOVER_REASONS = {"keep": "marked keep", "working": "working", "blocked": "blocked"}
-HANDOFF = re.compile(r"\b(sent|send|sends|update|updated|handoff|handed|reused|restarted|started|asked)\b", re.I)
+HANDOFF = r"\b(?:sent|send|sends|update|updated|handoff|handed|reused|restarted|asked|told)\b"
+REPORTED = r"(?:'s)?\s*[:,-]?\s*(?:reported|reports|report)\b"
 
 
 def report_files(folder):
@@ -1129,32 +1331,54 @@ def report_files(folder):
     return found
 
 
-def leftover_report(directory, task_id, address, name, journal):
-    """(report file, None) when the journal shows this worker's report was read, else (None, reason).
-    The last journal line naming the worker (its address or name as a whole word) decides: it must be a
-    report, or name a file in the evidence folder without handing the worker more work."""
-    files = report_files(os.path.join(directory, "evidence", task_id))
-    if not files:
-        return None, "no recorded report"
-    words = [re.compile(r"(?<![A-Za-z0-9]){}(?![A-Za-z0-9])".format(re.escape(address)))]
+def worker_words(address, name):
+    """Patterns for the worker's address and name, as whole words."""
+    words = [r"(?<![A-Za-z0-9]){}(?![A-Za-z0-9])".format(re.escape(address))]
     if name:
-        words.append(re.compile(r"(?<![A-Za-z0-9-]){}(?![A-Za-z0-9-])".format(re.escape(name))))
+        words.append(r"(?<![A-Za-z0-9-]){}(?![A-Za-z0-9-])".format(re.escape(name)))
+    return words
+
+
+def line_text(line):
+    return " ".join(str(v) for k, v in sorted(line.items()) if k != "at" and isinstance(v, (str, int, float)))
+
+
+def leftover_report(directory, task_id, address, name, journal, start=None):
+    """(report file, None) when the journal shows this worker reported, else (None, reason). The last
+    journal line naming the worker decides: its `from`/`by` is the worker, or it says the worker
+    reported ("t31 reported", "report from t31"), and it hands the worker no more work. A line about
+    another worker never counts. The report is a file the line names, else the newest file in the
+    evidence folder; either way written after the worker started, and not the orchestrator's or the tools'."""
+    folder = os.path.join(directory, "evidence", task_id)
+    files = {f: m for f, m in report_files(folder).items() if not report_problem(folder, f, f, address, start)}
+    words = worker_words(address, name)
     last = None
     for line in journal:
-        text = json.dumps(line, ensure_ascii=False)
-        if any(w.search(text) for w in words):
+        if any(re.search(w, line_text(line)) for w in words):
             last = line
     if last is None:
         return None, "no recorded report"
-    text = json.dumps(last, ensure_ascii=False)
-    named = sorted((f for f in files if re.search(r"(?<![\w./-]){}(?![\w/-])".format(re.escape(f)), text)), key=len, reverse=True)
-    if last.get("trigger") != "report" and (HANDOFF.search(str(last.get("why", ""))) or not named):
+    text = line_text(last)
+    if any(re.search(HANDOFF + r"\W+(?:\S+\W+){0,3}?" + w, text, re.I) for w in words):
         return None, "no recorded report after its last handoff"
-    return (named[0] if named else max(files, key=files.get)), None
+    said = any(str(last.get(k)) in (address, name) for k in ("from", "by") if last.get(k)) or any(
+        re.search(w + REPORTED, text, re.I) or re.search(r"\breport(?:ed)?\s+(?:from|by)\s+" + w, text, re.I) for w in words)
+    if not said:
+        return None, "no recorded report"
+    everything = report_files(folder)
+    named = sorted((f for f in everything if re.search(r"(?<![\w./-]){}(?![\w/-])".format(re.escape(f)), text)), key=len, reverse=True)
+    good = [f for f in named if f in files]
+    if named and not good:
+        return None, "no recorded report"
+    if good:
+        return good[0], None
+    if not files:
+        return None, "no recorded report"
+    return max(files, key=files.get), None
 
 
 def leftover_refusal(directory, agent, profile, task, entry, info, journal):
-    """Why an old-style worker is kept: the reason for its `kept` line, or None with its report file."""
+    """Why an old-style worker is kept: (the reason for its `kept` line, None), or (None, its report file)."""
     address = entry.get("address") or ""
     if address == agent.get("terminal"):
         return "it is the Project Agent", None
@@ -1168,12 +1392,13 @@ def leftover_refusal(directory, agent, profile, task, entry, info, journal):
     refusal = status_refusal(address, entry, info)
     if refusal:
         return LEFTOVER_REASONS.get(refusal[0]) or "status {}".format(info.get("status") or "none"), None
-    report, why = leftover_report(directory, task.get("id"), address, entry.get("name"), journal)
+    report, why = leftover_report(directory, task.get("id"), address, entry.get("name"), journal, worker_start(entry, info))
     if why:
         return why, None
-    refusal = worktree_refusal(task, profile)
+    refusal, _checked, _unseen = worktree_refusal(task, profile, info)
     if refusal:
-        path = os.path.realpath(os.path.expanduser(task["worktree"]))
+        path = re.match(r"(?:cannot tell whether )?(.+?) (?:has \d+ uncommitted|holds uncommitted)", refusal[1])
+        path = path.group(1) if path else (task.get("worktree") or "?")
         if refusal[0] == "uncommitted":
             return "uncommitted files in {} ({})".format(path, re.search(r" has (\d+) uncommitted", refusal[1]).group(1)), None
         return "cannot read {}".format(path), None
@@ -1213,6 +1438,10 @@ def kept_line(task, entry, why):
 def close_leftovers(directory, agent, profile, dry_run):
     """pa-worker close --leftovers [--dry-run] (spec 3.4): closes, once, the workers recorded before the
     one-worker-per-job rule whose report the journal shows was read. Only this ledger's workers are looked at."""
+    policy = read_ledger(directory).get("workerPolicy")
+    if policy:
+        print("--leftovers already ran (workerPolicy since {}); nothing was done.".format((policy or {}).get("since")))
+        return
     if dry_run:
         close, kept = leftover_plan(directory, agent, profile, read_ledger(directory))
         for task, entry, report in close:
@@ -1237,7 +1466,10 @@ def close_leftovers(directory, agent, profile, dry_run):
             if refusal or not info:
                 kept.append((task, entry, (LEFTOVER_REASONS.get(refusal[0]) or refusal[1]) if refusal else "gone; left for the agent to read"))
                 continue
-            done.append(end_worker(directory, ledger, task, entry, address, info, report, "leftovers", "leftovers", by))
+            try:
+                done.append(end_worker(directory, ledger, task, entry, address, info, report, "leftovers", "leftovers", by))
+            except pa.Problem as e:
+                kept.append((task, entry, str(e)))
         ledger["workerPolicy"] = {"style": "per-job", "since": pa.now()}
         pa.write_json(os.path.join(directory, "ledger.json"), ledger)
     for line in done:
