@@ -31,13 +31,19 @@ A new space opens with a 600 x 440 dialog: a Project Agent card (`Set up for <fo
   with a notice), it is restored in the same tab within about 45 s and resumed with the
   same conversation; the tab stays protected throughout. A tab that vanished is reopened in a new
   tab. A launcher that cannot start shows why and waits for Enter. It ends when its space is closed.
+  When no launcher runs (the header says "Not running"), **Open Project Agent** in the header opens
+  it again in a new tab, resumed (on a remote space too); it shows "Opening…" until the tab is
+  recorded and says why if nothing started after 30 s. If an agent that looks like this one runs
+  by hand in the space, it asks first.
   After updating this repo, run `pa-sync --on <machine>` before installing the mod: an older
   `pa-session` on that machine refuses to replace the dead shell, so restores there fail (the keeper
   gives up on its new pane after 2 minutes, retries, and after 3 tries says "Project Agent needs
   you") until it is synced.
 - **Decisions:** open cards first, newest first. Clicking an option selects it; `Submit answer`
   sends it with the note. The answer is written into the card file and the agent is told with
-  `hc send`; a failed send is retried every 10 s and the panel says so. The card's link opens
+  `hc send`, in the terminal its launcher runs in at that moment; a failed send is retried every
+  10 s and the panel says so. With no Project Agent running, nothing is sent: the panel says
+  "Answer saved. The Project Agent is not running." and offers Open; the notice goes out once it runs. The card's link opens
   the evidence file it is about. Answered cards fold away below.
 - **Tasks:** one section per state (finished ones start folded), newest first. An expanded task
   shows its goal, tier, a chip per worker (a live one opens in the Agents view), a button per
@@ -80,7 +86,8 @@ A new space opens with a 600 x 440 dialog: a Project Agent card (`Set up for <fo
   machine), `pa-task` (your task changes), `pa-session` (starting an agent), the system opener
   for a link you click, and a profile's declared action when its button is clicked.
 - Shared state it sets: `project-agent.tabs` (tab id -> `{ space, project, profile, name,
-  terminal }`), `project-agent.open`, `project-agent.worktrees`, `project-agent.workers`,
+  terminal, alive? }`), `project-agent.open` (open cards per space), `project-agent.openAgent`
+  (Open Project Agent requests; the panel writes, the keeper deletes), `project-agent.worktrees`, `project-agent.workers`,
   `project-agent.timer`, `my-files.root` and `my-files.places` (for a Files view that honours
   them). It reads `project-agent.show` (`{ space, task, at }`) to open a task on request.
 - Agents are recognised by the label `herdr.pa=<space-id>` that the launcher sets on its own
@@ -115,4 +122,8 @@ A new space opens with a 600 x 440 dialog: a Project Agent card (`Set up for <fo
   changes the file to `answered` and the agent's terminal receives `decision <id> answered`.
 - Breaking `rules.json` by hand shows the error and no button writes to it.
 - With a task active and the last pass older than the cadence, the agent's terminal receives
-  `scheduled pass` within 15 s, and `schedule.json` gets a new `lastPass` and `nextPass`.
+  `scheduled pass` within 15 s, and `schedule.json` gets a new `lastPass` and `nextPass`; a bare
+  shell its launcher left behind receives nothing.
+- With no Project Agent running in a configured space, the header says "Not running" and Open
+  Project Agent opens one tab `PA: <name>` that resumes the conversation; a second click while it
+  runs opens nothing.

@@ -27,8 +27,10 @@ State lives in `~/.config/herdr-pa/spaces/<space-id>/` and is not part of this r
 ## What your tab bar needs
 
 The mod keeps shared state `project-agent.tabs` (tab id -> `{ space, project, profile, name, terminal }`,
-plus `recovering` while the keeper restores that tab). It cannot draw or guard controls that other mods
-own, so those mods read that key:
+plus `recovering` while the keeper restores that tab, and `alive: true` while the keeper knows the
+launcher runs in `terminal`: the terminal is live, labelled for the space, and the heartbeat names it).
+It cannot draw or guard controls that other mods own, so those mods read that key (presence and
+`terminal` are enough):
 
 - the tab bar: no close or pin control on a listed tab; the close-tab shortcut refuses it;
 - the tab and terminal right-click menus: no "Close" / "Close pane" for it;
@@ -72,8 +74,35 @@ New spaces start the launcher with `space.new { argv: ["pa-session", "--ask"] }`
   lost: the old tab and its record stay; `pa-sync` and then `pa-start` in the space fix it.
 - **A vanished tab** (closed some way the mods do not guard) is still reopened in a new tab; its old
   record stays until the new tab is recorded.
+- **Open Project Agent** (Project view) covers what the keeper does not reopen by itself: a space with
+  no record (a hand-run or never-recorded agent, or a tab closed while no keeper ran), or a keeper
+  that gave up after 3 failures. It shows whenever agent.json exists and no record is `alive`.
 - `pa-session` and `pa-start` refuse to start a second Project Agent only while another terminal's
   launcher is alive; a labelled terminal whose heartbeat stopped is replaced.
+
+## Open requests: `project-agent.openAgent`
+
+Shared `project-agent.openAgent` = `{ "<space id>": { "at": <ms>, "by": "panel", "why"?: "<text>" } }`.
+The Project view writes an entry when Open Project Agent is clicked; only the keeper deletes it, and
+only the entry it handled (same `at`). The keeper takes a request once the space's machine is ready
+and its agent.json has been read since the request: it takes `keeper.lock`, runs
+`tab.new { space, folder: <project>, name: "PA: <name>", focus: true, argv: pa-session --space … --project … --profile … --name … }`
+(the launcher resumes the conversation by its own rule), and records the new tab on the first tick it
+shows, before the launcher labels it. It refuses (deletes the request, one notice) while a record's
+launcher runs or beats elsewhere, a labelled terminal of the space has a fresh heartbeat, or a restore
+or open is under way. While it waits it writes `why`; after 30 s it gives the request up with a notice.
+A live agent that looks like this Project Agent but does not run under its launcher (pane title
+`PA: <name>`, the project folder, or the space's label) gets a confirm in the panel first.
+(`project-agent.open` is something else: the number of open decision cards per space.)
+
+## Messages go only to a live launcher
+
+The panel's "decision … answered" and "rule …" notices are sent to the record whose `alive` is true,
+looked up when sending; with none, nothing is sent and the panel says "Answer saved. The Project
+Agent is not running." The pass timer sends passes only to an `alive` record's terminal; new-card
+notifications still cover every recorded space. `pa-pass`, and the notices of `pa-task` and
+`pa-worker delete`, also require the launcher's heartbeat to name the terminal and be fresh, so
+nothing is typed into a bare shell a launcher left behind.
 
 ## Profiles
 
@@ -85,8 +114,9 @@ A profile is a folder in `~/.config/herdr-pa/profiles/<name>/` (`profile.json`, 
 `pa-core-check` fails if `runtime/core`, `runtime/tools` or the mod names a profile's tools. Each
 profile lists its own terms in `profile.json` (`"coreCheck": ["..."]`), so this repo holds no such list.
 `herdr-app check mods/project-agent` loads the mod once.
-`tests/run-all.sh` runs this repo's tests (a Python 3.7 parse check, `pa.py` unit tests, a keeper
-harness under Node, and a `pa-session` check against a private hc core); `--affected` runs only the
+`tests/run-all.sh` runs this repo's tests (a Python 3.7 parse check, the unit tests in
+`tests/test_*.py`, a keeper harness and a panel render harness under Node, and a `pa-session` check
+against a private hc core); `--affected` runs only the
 fast set. After updating, run `pa-sync --on <machine>` before installing the mod, so remote launchers
 get the new `pa-session` (see the install order above).
 

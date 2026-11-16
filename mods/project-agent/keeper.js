@@ -5,9 +5,9 @@
 // gone, and opens the setup dialog for a new space. "alive: true" means the launcher is known
 // to run in that terminal (its label and its heartbeat name it): messages go only there.
 // The panel's "Open Project Agent" asks through shared "project-agent.openAgent"
-// ({ "<space id>": { at, by, why? } }): the keeper opens a new PA tab for it, never a second one. The labels are the truth; the shared state
-// is rebuilt from them. A tab bar, menu or pane header reads "project-agent.tabs" to leave
-// out its close and pin controls for that tab.
+// ({ "<space id>": { at, by, why? } }): the keeper opens a new PA tab for it, never a second one.
+// The labels are the truth; the shared state is rebuilt from them. A tab bar, menu or pane
+// header reads "project-agent.tabs" to leave out its close and pin controls for that tab.
 // A space counts only while its agent.json exists and is not marked closed ("configured").
 // Runs in one copy of the mod only (the one holding the timer lease); a keeper.lock file in the
 // space's state folder keeps two Herdr clients from restoring the same Project Agent at once.
