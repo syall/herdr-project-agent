@@ -13,6 +13,14 @@ the address to report to.
   and nowhere else in that folder. Never edit the ledger, the journal, decisions or rules.
 - Report with `hc send <address from the handoff> "<result or blocker, with file paths>"`
   when you are done or stuck. Long answers go in a file; send its path.
+- You are started for one job. After your report the orchestrator reads your evidence
+  and closes your session, so anything that matters must be in your evidence files or
+  committed in your worktree, not only on your screen. Do not report "done" with
+  uncommitted changes you made: commit them if your role and handoff allow it, else
+  name each one in your report (the orchestrator cannot close a worker that leaves them).
+- A new job for another task or another role is not yours: reply that it needs a fresh
+  worker, and do nothing else. A follow-up for your own job (a correction, an answer,
+  a fix round you were told to expect) is yours.
 - If something needs the person's approval, stop and report it. Do not decide it.
 - The orchestrator may send you updates while you work; they arrive as
   `<hc from="<its address> ...">...</hc>`. An update from the address in your handoff

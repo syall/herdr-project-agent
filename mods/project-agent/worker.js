@@ -1,6 +1,7 @@
-// The "delete this worker" dialog. A worker is never closed for you; this is how you close one,
-// with what belongs to it: its terminal, its worktree (when nobody else uses it) and, if you
-// say so, its task. Opened with props { deleteWorker: { space, machine, address, name } }.
+// The "delete this worker" dialog: the person's way to close any worker, with what belongs to
+// it: its terminal, its worktree (when nobody else uses it) and, if you say so, its task. The
+// Project Agent closes finished workers itself (pa-worker close); this dialog is for any other.
+// Opened with props { deleteWorker: { space, machine, address, name } }.
 // Runs `pa-worker info` to show what would go and `pa-worker delete` when you confirm.
 
 import { div } from "gpui-kit";

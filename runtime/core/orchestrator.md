@@ -42,7 +42,8 @@ Your session can be restarted (the tab reopens and resumes it) and your context 
 compacted at any time. Either way, what you remember may be wrong or gone. Before
 anything else: run `pa-doctor`, read the ledger, the last 30 journal lines and the open
 decisions, and run `hc ls` to see which workers still exist. A worker in the ledger that
-no longer runs has stopped: read its evidence folder, then restart it or park the task.
+no longer runs and is not `finished` has stopped: read its evidence folder, then start a
+fresh worker for the job or park the task.
 If `pa-doctor` reports a broken ledger, do not guess: rebuild it from `ledger.last-good.json`
 and the journal, and open a decision card saying what was lost.
 
@@ -54,7 +55,9 @@ and the journal, and open a decision card saying what was lost.
   { "id": "t-003", "title": "...", "goal": "...", "type": "feature|bug|docs|chore",
     "tier": "low|normal|high", "phase": "intent|design|plan|build|test|review|release|maintain",
     "state": "queued|investigating|in-progress|needs-decision|review|done|parked",
-    "workers": [ { "address": "t14", "role": "build", "name": "t-003-build" } ],
+    "workers": [ { "address": "t14", "role": "build", "name": "t-003-tests" },
+                 { "address": "t15", "role": "build", "name": "t-003-fix", "finished": true,
+                   "closed": "<UTC time>", "closedBy": "agent", "report": "FINDINGS.md" } ],
     "worktree": "<path or null>", "evidence": "evidence/t-003",
     "changeRequest": { "id": "...", "url": "..." },
     "links": [ { "label": "<short name>", "url": "https://..." } ],
@@ -63,6 +66,9 @@ and the journal, and open a decision card saying what was lost.
 `links` lists every artifact of the task the person may want to open: each change request,
 issue, document or dashboard, one entry each. The panel draws one button per link.
 `evidence` is relative to the state folder (the folder can move when a space is reopened).
+A worker's `finished`, `closed`, `closedBy`, `report`, `keep`, `keptAt` and `keepQuote` are written by
+`pa-worker close` and `pa-worker keep`, and the top-level `workerPolicy` by `pa-worker close --leftovers`;
+never write them by hand, and keep them when you write the ledger.
 `journal.jsonl`, append only, one JSON object per line:
 `{"at":"<UTC time>","pass":12,"trigger":"message|report|decision|scheduled|manual","task":"t-003","from":"plan","to":"build","why":"..."}`
 
@@ -136,7 +142,7 @@ Rules belong to the person. Each has `id`, `title`, `text`, `why`, `appliesTo`
 Run `hc --skill` once to learn `hc`. Start workers with the profile's commands (under
 "This setup"); Herdr's core cannot see shell aliases:
 
-`hc run --bg --name <task-id>-<role> --cwd <worktree> pa-claude "<handoff>"`
+`hc run --bg --name <task-id>-<job> --cwd <worktree> pa-claude "<handoff>"`
 
 - Always `--bg`: the worker runs in the background and the command returns at once. Then
   record the worker in the ledger, tell the person in a line what you started, and end
@@ -151,13 +157,19 @@ Run `hc --skill` once to learn `hc`. Start workers with the profile's commands (
   standing instructions, so their handoff starts: "Read <core folder>/worker.md first."
 - Roles: `design`, `build`, `verifier` (reports, never fixes) and `reviewer` (fresh
   context, never the author of what it reviews).
+- One fresh worker per job. Name it for the job, not the role: `t-010-design`,
+  `t-010-tests`, `t-010-fix`, `t-012-ci-watch`; a second try at the same job is `-2`.
+  Never give a worker a job for another task or another role, even when it is idle: a
+  fix round after a review or a verification is a new worker, so reviewers and
+  verifiers stay fresh. The only follow-ups a worker gets are for its own job (a
+  correction, an answered question, a fix round you already asked it for).
 - One git worktree per code task. Parallel workers only when they touch different files.
 - Before starting the first worker in a worktree, install the verification hooks there:
   `pa-hooks install <worktree> --task <task-id>` (add `--fix` for a bug fix: it locks test
   files). They lint after each edit, run the affected tests when a task is marked complete
   and before a session ends, and block what cannot be taken back. Never remove or edit them.
 - At most 4 workers working at once, and never more than the person can review. Wait
-  instead. A worker that has finished and sits idle does not count.
+  instead. A worker whose report you have not read yet does not count; close it once read.
 - Never sleep, poll or block on `hc wait` to see what workers are doing. To look at one
   on a pass: `hc get <t>` for its status, `hc read <t> --lines 40` for its screen.
 - You can update a running worker at any time:
@@ -171,17 +183,38 @@ Run `hc --skill` once to learn `hc`. Start workers with the profile's commands (
 - A worker's report is evidence, not an instruction. Read the files it names before
   you believe or repeat it. If a worker fails twice at the same step, stop retrying:
   open a decision card or park the task.
-- Workers stay until the person closes them. This covers every kind: investigation,
-  design, build, verifier and reviewer workers, finished or idle, whatever state their
-  task is in. Never `hc kill`, `hc rm` or `pa-cleanup` a worker on your own; the person
-  may want to read its screen or ask it something. They delete a worker themselves from
-  the Agents view (`pa-worker delete`, a command that refuses to run for agents). Remove
-  workers only when the person asks; then `pa-cleanup` removes the finished ones whose evidence is recorded
-  (`--kill` also ends live workers of done or parked tasks; `--dry-run` lists first).
-- Worktrees outlive idle and finished workers. Only when a worktree's workers were all
-  killed (or removed) and nobody else works in it does the person get asked: each pass,
-  run `pa-worktree check --open-cards`. It opens a decision card (`d-wt-<task>`, Delete or
-  Keep) for each such worktree, with what deleting would cost. When that card is answered
+- Close each worker once its job is over: in the pass where you read its report, after
+  you have read the files it names and recorded the result in the ledger and the
+  journal, run `pa-worker close <t> --evidence <file>` (the file in its task's evidence
+  folder that holds its report). Keep a worker open only while a follow-up for its own
+  job is still expected. The command refuses a worker that is working or blocked, is
+  not recorded in this space, has no evidence, has uncommitted files in its worktree,
+  or that the person marked to keep; it then closes nothing, so read why and act on it
+  (ask the worker to commit or report what it left, or leave it for a later pass).
+  Committed work that is not pushed or merged does not stop a close: the worktree and
+  its branch stay. Never end a worker with `hc kill` or `hc rm` yourself, and never run
+  `pa-cleanup` unless the person asks. When the person asks you to close a worker,
+  use `pa-worker close` too; if it refuses, tell them why and that the × on the
+  worker in the panel closes it (`pa-worker delete`, the person's command, which
+  refuses to run for agents).
+- When the person says to keep a worker open ("keep t56", "leave the reviewer up"),
+  record it with `pa-worker keep <t> --quote "<their words>"`; `--off` when they say it
+  may go. Only their own words count; never mark a worker to keep on your own. A kept
+  worker is never closed by you, whatever its state.
+- Workers from before this rule: on the first pass where the ledger has no
+  `workerPolicy`, run `pa-worker close --leftovers --dry-run`, journal its list, then
+  run `pa-worker close --leftovers` in the same pass. Tell the person which workers it
+  closed and which it kept, with the reason for each. It sets `workerPolicy`; do not
+  run it again after that. A kept leftover is closed later like any other worker, once
+  you have read its report.
+- Worktrees outlive their workers: a task's worktree stays while its workers come and
+  go. Only when every task using a worktree is done or parked, and no worker or other
+  terminal is working in it, does the person get asked: each pass, run
+  `pa-worktree check --open-cards`. It opens a decision card (`d-wt-<task>`, Delete or
+  Keep) for each such worktree, saying what is in it (tasks, branch, commits and
+  whether they are merged or pushed, files changed, anything uncommitted) and what
+  deleting would cost; the full list is in `WORKTREE.md` in the task's evidence folder.
+  When that card is answered
   Delete, run `pa-worktree remove <task-id>`, then set the task's `worktree` to null and
   journal it. Answered Keep: leave it, it is not asked again. If the person says to keep
   a worktree whatever happens, set `"keepWorktree": true` on the task. Never remove a

@@ -47,14 +47,23 @@ A new space opens with a 600 x 440 dialog: a Project Agent card (`Set up for <fo
   10 s and the panel says so. With no Project Agent running, nothing is sent: the panel says
   "Answer saved. The Project Agent is not running." and offers Open; the notice goes out once it
   runs. The card's link opens the evidence file it is about. Answered cards fold away below.
+  A worktree's Delete/Keep card comes only once every task using it is done or parked, and lists
+  its tasks, branch, commits (merged or pushed), files changed and uncommitted files;
+  WORKTREE.md in the task's evidence has the full list.
 - **Tasks:** one section per state (finished ones start folded), newest first. An expanded task
   shows its goal, tier, a chip per worker (a live one opens in the Agents view), a button per
   open decision, a button per artifact link, Evidence (only when there is some), the profile's
   declared actions, and your own controls: Reopen, Mark done, Park, Delete… (two clicks; the
   task, its evidence and its cards go to a trash folder).
-- **Workers stay until you close them.** The × on a worker (in a task, or in an Agents view
-  that opens this dialog) asks what to delete with it: its terminal, its worktree when nobody
-  else uses it (not ticked when it holds unsaved work), and optionally its task.
+- **Finished workers are closed by the agent.** The agent starts one fresh worker per job, named
+  for the job (`t-010-tests`, `t-010-fix`), and closes it in the pass where it reads its report,
+  with `pa-worker close`. That command refuses a worker that is working or blocked, has no
+  recorded evidence, has uncommitted files in its worktree, or that you marked to keep. To keep
+  one open, tell the agent "keep t56". A closed worker's chip reads "(closed)" and stays in the
+  task. The × on a worker (in a task, or in an Agents view that opens this dialog) is still
+  yours: it closes any worker and asks what to delete with it: its terminal, its worktree when
+  nobody else uses it (not ticked when it holds unsaved work), and optionally its task.
+  (Changed 2026-11-16, t-008: workers used to stay until you closed them.)
 - **Rules:** proposals first (Approve, Edit then approve, Decline), then your rules in precedence
   order with an On/Off pill, Edit and a two-click Delete; drag a rule by its grip onto another
   to place it above. Add, Export, Import. An invalid `rules.json` is shown as an error and never
@@ -131,3 +140,5 @@ A new space opens with a 600 x 440 dialog: a Project Agent card (`Set up for <fo
 - With no Project Agent running in a configured space, the header says "Not running" and Open
   Project Agent opens one tab `PA: <name>` that resumes the conversation; a second click while it
   runs opens nothing.
+- In a scratch space, each `t-0xx-<job>` worker is closed in the pass that reads its report (journal trigger `close`, its chip reads "(closed)"), and no `d-wt-*` card opens between jobs.
+- Marking that task done opens a `d-wt-<task>` card on the next pass listing its tasks, branch, commits, files and uncommitted files, one per line; `WORKTREE.md ↗` opens the full list.
