@@ -7,6 +7,8 @@
 //   __offline [machine names]                               readTextFile/exec on them throw
 //   __fail    ["<machine>:<path>"]                          readTextFile of these throws (a failed read)
 //   __hang    ["<machine>:<path>"]                          readTextFile of these never settles
+//   __delay   { "<machine>:<path>": ms }                    readTextFile of these settles once __now has moved on by ms
+//   __gen                                                   bumped by each new world: a delayed read of an old world fails
 //   __runs    [[name, args]]                                every run() call
 //   __notes   [notification]                                every notify() call
 //   __reads   ["<machine>:<path>"]                          every readTextFile() call
@@ -40,6 +42,11 @@ export const readTextFile = async (path, options = {}) => {
   if (offline(on)) throw new Error(`machine ${on} is unreachable`);
   if ((g.__fail ?? []).includes(key(path, on))) throw new Error("read failed");
   if ((g.__hang ?? []).includes(key(path, on))) return new Promise(() => {});
+  const wait = (g.__delay ?? {})[key(path, on)];
+  if (wait) {
+    const until = g.__now + wait, gen = g.__gen;
+    while (g.__now < until) { if (g.__gen !== gen) throw new Error("an old world"); await new Promise((r) => setTimeout(r, 1)); }
+  }
   const v = (g.__files ?? {})[key(path, on)];
   return v === undefined ? null : v;
 };

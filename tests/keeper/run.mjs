@@ -36,7 +36,7 @@ function world({ machine = null, tabPresent = true, termLive = true, program = s
   const tb = q("tb1"); // remote tab ids carry the machine prefix, like terminals and panes
   const dir = machine ? `.config/herdr-pa/spaces/${S}` : `/home/u/.config/herdr-pa/spaces/${S}`;
   const sid = machine ? `${machine}/${S}` : S;
-  g.__now = T0;
+  g.__now = T0; g.__gen = (g.__gen ?? 0) + 1; g.__delay = {};
   g.__runs = []; g.__notes = []; g.__reads = []; g.__writes = []; g.__overlays = []; g.__offline = [];
   g.__machines = [{ name: null, layout: "ready" }, ...(machine ? [{ name: machine, layout: "ready" }] : [])];
   const tabs = [...(tabPresent ? [{ id: tb, index: 1, name: "PA: proj", named: true }] : []), { id: q("tb9"), index: tabPresent ? 2 : 1, name: "2", named: false }];
@@ -694,6 +694,7 @@ function timerWorld({ alive = true, schedule = { everyMinutes: 5, lastPass: isoA
   g.__hcs = []; g.__ls = {}; g.__hcFail = [];
   if (terminal !== "t1") g.__shared["project-agent.tabs"].tb1.terminal = terminal;
   if (alive) g.__shared["project-agent.tabs"].tb1.alive = true;
+  g.__shared["project-agent.keeper"] = { id: "me", at: T0 }; // this copy's keeper has judged the records
   g.__files[`:${SDIR}/schedule.json`] = JSON.stringify(schedule);
   g.__files[`:${SDIR}/ledger.json`] = JSON.stringify({ tasks: [] });
   if (request) g.__files[`:${SDIR}/pass-request.json`] = JSON.stringify(request);
@@ -729,6 +730,122 @@ cases["T-manual"] = async () => { // a queued on-demand pass with no alive recor
   await timer.tick("me");
   check(passes().length === 0, `nothing sent (got ${JSON.stringify(g.__hcs)})`);
   check(JSON.parse(g.__files[`:${SDIR}/pass-request.json`]).pending === true, "request still pending");
+};
+
+// ---- t-003 review round (REVIEW.md I1, M1-M4) ----
+// After an Open replaced a record that was not running: for `ms`, the new tab stays the record,
+// the old terminal t1 is never alive and never pinned, and no record points at it again.
+async function staysNew(k, ms, what, each = () => {}) {
+  const at = g.__now;
+  await sim(k, ms, () => {
+    each();
+    const r = records();
+    check(r.tb2?.terminal === "t2", `${what}: tb2 is the record at +${(g.__now - at) / 1000} s (got ${JSON.stringify(r)})`);
+    check(!Object.values(r).some((x) => x.terminal === "t1"), `${what}: no record on the old terminal t1 at +${(g.__now - at) / 1000} s (got ${JSON.stringify(r)})`);
+  });
+  check(!runsOf("terminal.pin").some(([, a]) => a.terminal === "t1" && g.__runs.indexOf(runsOf("tab.new")[0]) < g.__runs.findIndex((x) => x[0] === "terminal.pin" && x[1].terminal === "t1")),
+    `${what}: t1 not pinned after the Open (runs ${JSON.stringify(runsOf("terminal.pin"))})`);
+}
+const pinsAfterOpen = (address) => { const from = g.__runs.indexOf(tabNews()[0]); return g.__runs.slice(from).filter(([n, a]) => n === "terminal.pin" && a.terminal === address); };
+const launcherBeats = (w) => () => { const t2 = g.__terminals.find((t) => t.address === "t2"); if (t2) { t2.labels = { "herdr.pa": S }; t2.program = claude; t2.status = "idle"; } g.__files[w.f("heartbeat")] = `${Math.floor(g.__now / 1000)} t2\n`; };
+
+cases["K-open-retire-shell"] = async () => { // I1: Open over a stopped keeper's kept shell; the new launcher labels itself and beats
+  const w = world();
+  const k = await start();
+  check(await until(k, 700000, () => splits().length === 3 && k.stopped[S]), "stopped after 3 failed restores");
+  request(S);
+  check(await until(k, 10000, () => tabNews().length === 1), "tab.new after the request");
+  appear(null, "tb2", "p2", "t2");
+  await sim(k, 250);
+  await staysNew(k, 25000, "kept shell, launcher beats", launcherBeats(w));
+  check(pinsAfterOpen("t1").length === 0, `t1 never pinned (got ${JSON.stringify(pinsAfterOpen("t1"))})`);
+  check(records().tb2.alive === true, `the new launcher is alive at the end (got ${JSON.stringify(records())})`);
+};
+
+cases["K-open-retire-nolabel"] = async () => { // I1: the new launcher never labels itself (waits on an error, or refused)
+  world();
+  const k = await start();
+  check(await until(k, 700000, () => splits().length === 3 && k.stopped[S]), "stopped after 3 failed restores");
+  request(S);
+  check(await until(k, 10000, () => tabNews().length === 1), "tab.new after the request");
+  appear(null, "tb2", "p2", "t2");
+  await sim(k, 250);
+  await staysNew(k, 25000, "new launcher unlabelled");
+  check(pinsAfterOpen("t1").length === 0, "t1 never pinned");
+};
+
+cases["K-open-retire-foreign"] = async () => { // I1: a hand-run agent with the stale label in the old tab, confirmed past in the panel
+  const w = world({ program: claude, status: "idle", created: T0 - 600000 });
+  const k = await start();
+  check(await until(k, 90000, () => noteText().some((n) => /runs something else/.test(n))), "the old tab is judged foreign");
+  request(S);
+  check(await until(k, 10000, () => tabNews().length === 1), "tab.new after the request");
+  appear(null, "tb2", "p2", "t2");
+  await sim(k, 250);
+  await staysNew(k, 25000, "hand-run agent with a stale label", launcherBeats(w));
+  check(pinsAfterOpen("t1").length === 0, "t1 never pinned");
+};
+
+cases["K-alive-shell"] = async () => { // M1: a launcher that died leaves an idle shell: not alive from the first tick that shows it
+  const w = world({ program: claude, status: "idle", created: T0 - 600000 });
+  const k = await start();
+  await sim(k, 20000, beating(w));
+  check(records().tb1.alive === true, "alive while it runs");
+  const t1 = g.__terminals.find((t) => t.address === "t1"), p1 = g.__panes.find((p) => p.pane === "p1");
+  t1.program = shell; t1.status = null; p1.program = shell; p1.status = null;
+  await sim(k, 1500);
+  check(!records().tb1.alive, `not alive once its terminal is an idle shell (got ${JSON.stringify(records().tb1)})`);
+};
+
+cases["K-alive-old-beat"] = async () => { // M1: a heartbeat that names the terminal but is old is not "alive"
+  const w = world({ program: claude, status: "idle", created: T0 - 600000 });
+  g.__files[w.f("heartbeat")] = `${T0 / 1000 - 60} t1\n`;
+  const k = await start();
+  await sim(k, 3000);
+  check(!records().tb1.alive, `not alive on a 60-s-old heartbeat (got ${JSON.stringify(records().tb1)})`);
+};
+
+cases["K-lock-leak"] = async () => { // M3: a lock that lands after its request was given up is released, not kept
+  const w = world({ tabPresent: false, termLive: false, record: false });
+  g.__delay[`:${w.dir}/keeper.lock`] = 35000;
+  request(S);
+  const k = await start();
+  await sim(k, 33000);
+  check(!requests()[S], "request given up after 30 s");
+  check(tabNews().length === 0, "nothing opened");
+  await sim(k, 10000);
+  const text = g.__files[`:${w.dir}/keeper.lock`];
+  check(!text || JSON.parse(text).released === true, `keeper.lock released once it landed (got ${text})`);
+  check(k.locks[S]?.state !== "held", `the keeper does not think it holds the lock (got ${JSON.stringify(k.locks[S])})`);
+};
+
+cases["K-lock-stale-held"] = async () => { // M3: a lock this keeper took long ago and never refreshed is not "held" any more
+  const w = world();
+  const k = await start();
+  k.locks[S] = { state: "held", text: JSON.stringify({ client: "me", at: new Date(T0).toISOString(), tab: null }), at: T0 };
+  g.__files[`:${w.dir}/keeper.lock`] = JSON.stringify({ client: "other", at: new Date(T0 + 70000).toISOString(), tab: "tb1" });
+  g.__now = T0 + 80000;
+  check(k.lock(cx, g.__spaces[0], "tb1", g.__now) === false, "an unrefreshed held lock past its TTL is taken again, not trusted");
+  await flush();
+  check(k.locks[S]?.state === "busy", `another client's fresh lock wins (got ${JSON.stringify(k.locks[S])})`);
+};
+
+cases["K-open-starting"] = async () => { // M4: a second Open while the opened tab's launcher waits on an error: refused
+  const { w, k } = await openFromRequest();
+  appear(null, "tb2", "p2", "t2", { "herdr.pa.error": "project folder does not exist: /proj" });
+  await sim(k, 60000);
+  check(records().tb2?.terminal === "t2", `the new tab is recorded (got ${JSON.stringify(records())})`);
+  request(w.sid);
+  await sim(k, 5000);
+  check(tabNews().length === 1, `no second tab (got ${JSON.stringify(tabNews())})`);
+  check(!requests()[w.sid] && noteText().some((n) => /already opening|starting/i.test(n)), `refused with a notice (got ${JSON.stringify(noteText())})`);
+};
+
+cases["T-stale-keeper"] = async () => { // M2: an "alive" written by a keeper that is not this copy's: no pass until this keeper has judged
+  timerWorld();
+  g.__shared["project-agent.keeper"] = { id: "old-copy", at: T0 - 3600000 };
+  await timer.tick("me");
+  check(passes().length === 0, `nothing sent on a stale alive mark (got ${JSON.stringify(g.__hcs)})`);
 };
 
 const pick = process.argv.slice(2);

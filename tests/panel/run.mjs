@@ -30,21 +30,23 @@ const check = (ok, what) => { if (!ok) throw new Failed(what); };
 
 // One local space sp1 with a plain tab tb9 (shell t9). agent: write agent.json (its "terminal"
 // field names `agentTerminal`); records: project-agent.tabs; extra: more panes/terminals.
-function world({ agent = true, agentTerminal = "t30", records = {}, extraPanes = [], extraTerms = [], extraTabs = [], agents = [] } = {}) {
-  g.__now = T0;
+function world({ agent = true, agentTerminal = "t30", records = {}, extraPanes = [], extraTerms = [], extraTabs = [], agents = [], machine = null } = {}) {
+  g.__now = T0; g.__gen = (g.__gen ?? 0) + 1; g.__delay = {};
   g.__runs = []; g.__notes = []; g.__reads = []; g.__writes = []; g.__overlays = []; g.__offline = []; g.__hcs = []; g.__hcFail = []; g.__ls = {};
-  g.__machines = [{ name: null, layout: "ready" }];
-  g.__spaces = [{ id: S, name: "proj", machine: null, folder: "/proj", active: true, tabs: [{ id: "tb9", index: 1, name: "2", named: false }, ...extraTabs] }];
+  g.__machines = [{ name: null, layout: "ready" }, ...(machine ? [{ name: machine, layout: "ready" }] : [])];
+  g.__spaces = [{ id: machine ? `${machine}/${S}` : S, name: "proj", machine, folder: "/proj", active: true, tabs: [{ id: "tb9", index: 1, name: "2", named: false }, ...extraTabs] }];
   g.__panes = [{ pane: "p9", terminal: "t9", tab: "tb9", title: "zsh", cwd: "/proj", status: null, program: shell }, ...extraPanes];
   g.__terminals = [{ address: "t9", state: "live", argv: ["zsh"], labels: {}, status: null, program: shell }, ...extraTerms];
   g.__agents = agents;
   g.__props = {};
-  g.__shared = { "project-agent.tabs": records };
+  // A keeper ("K", in another copy) holds the lease and has judged the records.
+  g.__shared = { "project-agent.tabs": records, "project-agent.timer": { id: "K", at: T0 }, "project-agent.keeper": { id: "K", at: T0 } };
   g.__files = {}; g.__fail = []; g.__hang = [];
   if (agent) {
-    g.__files[`:${DIR}/agent.json`] = JSON.stringify({ space: S, project: "/proj", profile: "test", name: "proj", terminal: agentTerminal });
-    g.__files[`:${DIR}/ledger.json`] = JSON.stringify({ tasks: [] });
-    g.__files[`:/home/u/.config/herdr-pa/profiles/test/profile.json`] = JSON.stringify({ name: "test" });
+    const dir = machine ? `${machine}:.config/herdr-pa/spaces/${S}` : `:${DIR}`, home = machine ? `${machine}:.config/herdr-pa` : ":/home/u/.config/herdr-pa";
+    g.__files[`${dir}/agent.json`] = JSON.stringify({ space: S, project: "/proj", profile: "test", name: "proj", terminal: agentTerminal });
+    g.__files[`${dir}/ledger.json`] = JSON.stringify({ tasks: [] });
+    g.__files[`${home}/profiles/test/profile.json`] = JSON.stringify({ name: "test" });
   }
 }
 
@@ -204,6 +206,80 @@ cases["R8-rule"] = async () => { // a rule decided in the Rules view behaves the
   g.__shared["project-agent.tabs"] = alive("t4w");
   v.resend(cx); await flush();
   check(JSON.stringify(sends()) === JSON.stringify([["send", "t4w", "rule r-1 approved"]]), `sent once (got ${JSON.stringify(sends())})`);
+};
+
+// ---- t-003 review round (REVIEW.md M2, M4, M5, M6, N2) ----
+cases["P-stale-keeper"] = async () => { // M2: an alive record from a keeper that is not the lease holder's: not trusted
+  const v = await cardsWorld({ records: alive(), extraTabs: [paTab], extraPanes: [paPane()], extraTerms: [paTerm()], agents: [{ address: "t4w", status: "working" }] });
+  g.__shared["project-agent.keeper"] = { id: "an-old-copy", at: T0 - 3600000 };
+  const { text, clicks } = look(v);
+  check(!/working/.test(text) && /unknown/i.test(text), `status unknown, not the stale one (got ${text.slice(0, 200)})`);
+  check(!clicks["pa-open"], "no Open while nobody has judged (no keeper would take it)");
+  await answerCard(v, "d-x");
+  v.resend(cx); await flush();
+  check(sends().length === 0, `no notice sent on a stale alive mark (got ${JSON.stringify(g.__hcs)})`);
+  g.__shared["project-agent.keeper"] = { id: "K", at: T0 + 1000 };
+  v.resend(cx); await flush();
+  check(JSON.stringify(sends()) === JSON.stringify([["send", "t4w", "decision d-x answered"]]), `sent once the lease holder's keeper has judged (got ${JSON.stringify(sends())})`);
+};
+
+cases["P-offline"] = async () => { // M6: the space's machine is offline: "Machine offline", no Open
+  world({ machine: "m" });
+  const v = await mount();
+  check(/Not running/.test(look(v).text), "loaded while online, no record: Not running");
+  g.__machines[1].layout = "unavailable"; g.__offline = ["m"];
+  const { text, clicks } = look(v);
+  check(/machine offline/i.test(text) && !/Not running/.test(text), `says the machine is offline (got ${text.slice(0, 200)})`);
+  check(!clicks["pa-open"], "no Open while its machine is offline");
+};
+
+cases["P-open-starting"] = async () => { // M4: the tab opened but its launcher waits on an error: keep Opening…, show the error
+  world();
+  const v = await mount();
+  await click(v, "pa-open");
+  delete g.__shared[REQ][S]; // taken by the keeper
+  g.__shared["project-agent.tabs"] = { tb1: { space: S, project: "/proj", profile: "test", name: "proj", terminal: "t4w" } };
+  g.__spaces[0].tabs.push(paTab); g.__panes.push({ ...paPane(), status: null, program: { key: "program", name: "Python", shell: false, agent: false } });
+  g.__terminals.push({ address: "t4w", state: "live", argv: ["pa-session"], labels: { "herdr.pa.error": "project folder does not exist: /proj" }, status: null, program: { key: "program", name: "Python", shell: false, agent: false } });
+  g.__now += 31000;
+  const { text, clicks } = look(v);
+  check(!/did not appear/.test(text), `no wrong "did not appear" (got ${text.slice(0, 400)})`);
+  check(/project folder does not exist/.test(text) && /Enter/.test(text), `shows the launcher's error (got ${text.slice(0, 400)})`);
+  check(!clicks["pa-open"], "no second Open while its launcher waits");
+};
+
+const lookAlikeWorld = (pane) => world({ extraTabs: [{ id: "tb3", index: 2, name: pane.tabName ?? "claude", named: true }],
+  extraPanes: [{ pane: "p3", terminal: "t3", tab: "tb3", title: pane.title, cwd: pane.cwd, status: "idle", program: claude }],
+  extraTerms: [{ address: "t3", state: "live", argv: ["claude", "--resume"], labels: {}, status: "idle", program: claude }], agents: [{ address: "t3", status: "idle" }] });
+cases["P-lookalike-tabname"] = async () => { // M5: Claude sets its own pane title; the tab name says PA: <name>
+  lookAlikeWorld({ tabName: "PA: proj", title: "✳ Claude Code", cwd: "/elsewhere" });
+  const v = await mount();
+  await click(v, "pa-open");
+  check(/seems to run in tab/.test(look(v).text) && !(g.__shared[REQ] ?? {})[S], "confirm first");
+};
+cases["P-lookalike-subfolder"] = async () => { // M5: run by hand from a subfolder of the project (or with a trailing slash)
+  for (const cwd of ["/proj/src", "/proj/"]) {
+    lookAlikeWorld({ title: "✳ Claude Code", cwd });
+    const v = await mount();
+    await click(v, "pa-open");
+    check(/seems to run in tab/.test(look(v).text) && !(g.__shared[REQ] ?? {})[S], `confirm first for cwd ${cwd}`);
+  }
+  lookAlikeWorld({ title: "✳ Claude Code", cwd: "/project-other" });
+  const v = await mount();
+  await click(v, "pa-open");
+  check(Boolean((g.__shared[REQ] ?? {})[S]), "a sibling folder with the same prefix is not a match");
+};
+
+cases["R8-retry"] = async () => { // N2: a live target whose hc send fails: kept, said, retried, then sent once
+  const v = await cardsWorld({ records: alive("t4w"), extraTabs: [paTab], extraPanes: [paPane()], extraTerms: [paTerm()], agents: [{ address: "t4w", status: "blocked" }] }, ["d-x", "d-y"]);
+  g.__hcFail = ["t4w"];
+  await answerCard(v, "d-x");
+  await answerCard(v, "d-y");
+  check(/hasn't been told yet \(refused\)\. Trying again every 10 s\./.test(look(v).text), `retry message (got ${look(v).text.slice(0, 400)})`);
+  check(sends().length >= 1 && !sends().some((x) => x[2] === "decision d-y answered"), `the second notice waits behind the first (got ${JSON.stringify(sends())})`);
+  g.__hcFail = []; g.__hcs = [];
+  v.resend(cx); await flush();
+  check(JSON.stringify(sends()) === JSON.stringify([["send", "t4w", "decision d-x answered"], ["send", "t4w", "decision d-y answered"]]), `both sent, in order (got ${JSON.stringify(sends())})`);
 };
 
 const pick = process.argv.slice(2);

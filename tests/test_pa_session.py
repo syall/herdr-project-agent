@@ -546,8 +546,6 @@ def tearDownModule():
     shutil.rmtree(TMP, ignore_errors=True)
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 # t-003 R9: pa-pass, pa-task's notice and pa-worker delete's notice go only to a live launcher.
@@ -620,3 +618,7 @@ class LiveLauncherOnly(Base):
         self.run_quiet(pa_hooks.cmd_worker, args)
         self.assertEqual(len(self.sends()), 1)
         self.assertEqual(self.sends()[0][2], "t1")
+
+
+if __name__ == "__main__":
+    unittest.main()
