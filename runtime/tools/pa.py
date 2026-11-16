@@ -554,7 +554,7 @@ def error_wait(address, problem):
     plain shell that looks like a Project Agent. The label tells the keeper (and people) why."""
     message = " ".join(str(problem).split())
     signal.signal(signal.SIGINT, signal.default_int_handler)  # Ctrl-C stops the wait, even after the launcher ignored it
-    call(["hc", "label", address, "herdr.pa.error=" + message[:120]], check=False)
+    call(["hc", "label", address, "herdr.pa.error=" + message[:120], "herdr.pa.starting="], check=False)
     print("\n[Project Agent] It cannot start: {}\n"
           "               Fix the cause, then press Enter to try again.".format(message), flush=True)
     try:
@@ -574,28 +574,41 @@ def cmd_session(args):
     if args.auto or not address or not space or not sys.stdin.isatty():
         return run_session(args, address, labels, space, project, ctx)  # no one to show an error to: as before
     while True:
+        # Tell the keeper this launcher has begun, before the slow steps (hc calls, the launch
+        # lock, another launcher's heartbeat), so a slow start is not taken for a plain shell.
+        if not args.ask:  # a new space's first tab asks first; it is never a restore
+            call(["hc", "label", address, "herdr.pa.starting=" + space], check=False)
         try:
             return run_session(args, address, labels, space, project, ctx)
         except (Problem, OSError) as e:
             try:
                 error_wait(address, e)
             except KeyboardInterrupt:  # the person stops it: the tab's shell takes over, as before
-                call(["hc", "label", address, "herdr.pa.error="], check=False)
+                call(["hc", "label", address, "herdr.pa.error=", "herdr.pa.starting="], check=False)
                 sys.exit(2)
 
 
-def launch_lock(space):
+def launch_lock(space, wait=60):
     """An exclusive lock, per space, around "is another launcher alive?" up to "this one is labelled
     and has beaten once", so two launchers started at the same moment cannot both pass the check.
-    Outside spaces/<id>/ so init_state can still move a folder into place."""
+    Outside spaces/<id>/ so init_state can still move a folder into place. Waits at most `wait` s:
+    a launcher stuck inside it must not block every later one without a word."""
     os.makedirs(ROOT, exist_ok=True)
     f = open(os.path.join(ROOT, ".launch-{}.lock".format(ident(local_id(space), "space id"))), "a")
-    fcntl.flock(f, fcntl.LOCK_EX)
-    return f
+    deadline = time.time() + wait
+    while True:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return f
+        except (BlockingIOError, PermissionError):
+            if time.time() >= deadline:
+                f.close()
+                raise Problem("another pa-session for this space is still starting (waited {} s)".format(wait))
+            time.sleep(0.5)
 
 
 def run_session(args, address, labels, space, project, ctx):
-    started = time.time()  # heartbeats from now on are this launcher's own
+    started = ctx.setdefault("started", time.time())  # heartbeats from this launcher's first start on are its own
     existing = read_json(os.path.join(ROOT, "spaces", space, "agent.json"), {}) if space and ID.match(space) else {}
     p = load_profile(args.profile or (existing or {}).get("profile"))
     # A space made in the home folder has no project: a plain Claude tab (pa-start turns one on).
@@ -641,7 +654,7 @@ def claim(args, address, labels, space, project, p, existing, directory):
         raise Problem("this space already has a Project Agent in terminal {}".format(other))
     directory, agent = init_state(space, project, p, args.name, address, local_id(labels.get("herdr.tab")), terms=terms)
     call(["hc", "label", address, "herdr.pa=" + space, "herdr.pa.profile=" + p["name"],
-          "herdr.pa.project=" + project, "herdr.pa.name=" + agent["name"]])
+          "herdr.pa.project=" + project, "herdr.pa.name=" + agent["name"], "herdr.pa.starting="])
     write_text(os.path.join(directory, "heartbeat"), "{} {}\n".format(int(time.time()), address))
     return directory, agent
 

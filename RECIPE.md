@@ -26,13 +26,15 @@ A new space opens with a 600 x 440 dialog: a Project Agent card (`Set up for <fo
   tab. "Another folder…" swaps the page for a path field with folder completion (Tab or a click
   completes, Enter confirms; "Browse…" on this computer). A tile opens that session instead.
   Keys: Enter, 1 to 5, Esc. The tab underneath accepts the same choice typed.
-- **The agent's tab:** kept first in its space. If its launcher is gone (a bare shell is left, or
-  its terminal finished), it is restored in the same tab within about 45 s and resumed with the
+- **The agent's tab:** kept first in its space. If its launcher is gone (an idle shell is left at its
+  prompt, or its terminal finished; anything else running there, an agent included, is left alone
+  with a notice), it is restored in the same tab within about 45 s and resumed with the
   same conversation; the tab stays protected throughout. A tab that vanished is reopened in a new
   tab. A launcher that cannot start shows why and waits for Enter. It ends when its space is closed.
   After updating this repo, run `pa-sync --on <machine>` before installing the mod: an older
   `pa-session` on that machine refuses to replace the dead shell, so restores there fail (the keeper
-  closes its new pane, retries, and after 3 tries says "Project Agent needs you") until it is synced.
+  gives up on its new pane after 2 minutes, retries, and after 3 tries says "Project Agent needs
+  you") until it is synced.
 - **Decisions:** open cards first, newest first. Clicking an option selects it; `Submit answer`
   sends it with the note. The answer is written into the card file and the agent is told with
   `hc send`; a failed send is retried every 10 s and the panel says so. The card's link opens

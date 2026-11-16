@@ -17,16 +17,31 @@ const tabs = () => shared("project-agent.tabs") ?? {};
 const dirOf = (space) => `${space.machine ? "" : `${home()}/`}.config/herdr-pa/spaces/${localId(space.id)}`;
 const beatAddress = (text) => String(text ?? "").trim().split(/\s+/)[1] ?? null; // heartbeat: "<epoch> <address>"
 const argvOf = (r) => ["pa-session", "--space", localId(r.space), "--project", r.project, "--profile", r.profile, "--name", r.name];
-const ACTIVE = new Set(["working", "blocked"]); // an agent status that means something reports work right now
-const SHELL = /(^|\/)-?(sh|bash|zsh|fish|dash|ksh|tcsh|csh)$/; // a bare shell's program
+const SHELL = /(^|\/)-?(sh|bash|zsh|fish|dash|ksh|tcsh|csh)$/; // a shell's program or process name
+const present = (v) => v !== undefined && v !== null && v !== "" && !(typeof v === "object" && Object.keys(v).length === 0);
+
+// Positive evidence that a terminal is an idle shell at its prompt, the only thing the keeper
+// replaces (and closes): no agent detected or reporting (any status at all, an app, a report: a
+// live idle agent reports "done" with its app; terminal-shapes.md), the program table names a
+// shell, and the foreground process, when the app gives one, is a shell too. Anything else
+// (an editor, a build, ssh, an unknown program, any agent) is left alone.
+function idleShell(term, pane) {
+  const program = term.program ?? {};
+  if (program.agent || present(term.status) || present(term.report) || present(term.app) || present(pane?.app) || present(pane?.status)) return false;
+  const named = program.shell === true || program.key === "shell" || SHELL.test(String(program.key ?? "")) || SHELL.test(String(program.name ?? ""));
+  if (!named) return false;
+  const fg = term.foreground;
+  return !(fg && typeof fg === "object" && !SHELL.test(String(fg.name ?? "")));
+}
 
 const STALE_READS = 2; // unchanged heartbeat comparisons that mean its launcher is gone
 const MIN_GAP = 12000; // reads closer than this to the last counted one are not a comparison
 const READ_GAP = 30000; // reads further apart than this (sleep, slow machine) start counting again
 const YOUNG = 30000; // a terminal this new is never judged stale
 const MISSING = 4000; // a PA terminal or tab gone this long is restored
-const TIMEOUT = 30000; // a restore that has not produced a running launcher by then is judged
-const STARTING = 90000; // a new launcher that still has not labelled itself by then is given up
+const TIMEOUT = 30000; // a restore with no new terminal by then is given up
+const GIVE_UP = 120000; // a new terminal that never shows a launcher (no label, no "starting") by then is given up
+const SLOW = 180000; // a launcher that said it is starting but has not labelled itself: tell the person once
 const RETRY = 60000; // at most one restore a minute per space
 const FAIL_WINDOW = 600000, MAX_FAILS = 3; // then stop until the person acts
 const LOCK_TTL = 60000; // another client's lock older than this may be taken over
@@ -92,7 +107,7 @@ export class Keeper {
   busy() {
     const now = Date.now(), sp = spaces();
     const ready = (sid) => { const s = sp.find((x) => x.id === sid); return Boolean(s && this.machineReady(s)); };
-    return Object.values(tabs()).some((r) => r.recovering && !r.recovering.waiting && ready(r.space) && now - r.recovering.since < STARTING + 5000)
+    return Object.values(tabs()).some((r) => r.recovering && !r.recovering.waiting && ready(r.space) && now - r.recovering.since < GIVE_UP + 5000)
       || Object.entries(this.pending).some(([sid, p]) => ready(sid) && now - p.since < TIMEOUT + 5000)
       || Object.entries(this.locks).some(([sid, l]) => l.state === "taking" && ready(sid) && now - l.at < 10000);
   }
@@ -215,14 +230,8 @@ export class Keeper {
     const b = this.beat[tab];
     if (!b) return "alive"; // not read yet
     if (b.same < STALE_READS) return beatAddress(b.value) === localId(term.address) ? "alive" : "elsewhere";
-    // The launcher is gone. A shell left behind is restored; anything else is left alone. A status
-    // or title the dead agent left is not evidence either way; an agent detected now always is.
-    const program = term.program ?? {};
-    if (program.agent || ACTIVE.has(term.status)) return "foreign";
-    const argv = Array.isArray(term.argv) ? term.argv.map(String) : null;
-    // A core keep-recovery replaces the program with a bare shell: argv no longer runs pa-session.
-    const kept = Boolean(argv?.length) && SHELL.test(argv[0]) && !argv.some((a) => /pa-session/.test(a));
-    return kept || (program.shell ?? program.key === "shell") ? "shell" : "foreign";
+    // The launcher is gone. Only an idle shell is restored; when unsure, leave it and tell (foreign).
+    return idleShell(term, ps.find((p) => p.terminal === term.address)) ? "shell" : "foreign";
   }
 
   // Runs on a timer, not in render: adopts labelled terminals, keeps each Project Agent tab
@@ -371,26 +380,40 @@ export class Keeper {
     }
     if (rec.waiting) { rec.waiting = false; rec.since = now; } // Enter pressed: judge it afresh
     if (labelled && beatAddress(this.hb[space.id]) === localId(rec.to)) {
-      // Running and beating: close the old pane, but only if it still holds the old PA terminal.
+      // Running and beating. Close the old pane only if it still holds the old PA terminal and that
+      // is still an idle shell (or has ended): the person may have started something in it meanwhile.
       const old = rec.pane && ps.find((p) => p.pane === rec.pane);
-      if (old && old.terminal === rec.from && !ts.find((t) => t.address === rec.from)?.parent) run("pane.close", { pane: rec.pane });
+      const oldTerm = ts.find((t) => t.address === rec.from);
+      const closable = old && old.terminal === rec.from && !oldTerm?.parent && (!oldTerm || oldTerm.state !== "live" || idleShell(oldTerm, old));
+      if (closable) run("pane.close", { pane: rec.pane });
       this.retired.add(rec.from);
       delete r.recovering; delete this.beat[tab]; delete this.stopped[space.id];
       this.release(cx, space);
       run("terminal.pin", { terminal: rec.to, pinned: true });
-      notify({ title: "Project Agent restored", body: `${r.name}: restarted in its tab; its session resumes.`, level: "success" });
+      notify({ title: "Project Agent restored", body: `${r.name}: restarted in its tab; its session resumes.${old && !closable ? " Its old pane was left open because something runs in it." : ""}`, level: "success" });
       return;
     }
     if (labelled) this.peek(cx, space, now);
-    const program = term.program ?? {};
-    const plain = !program.agent && (program.shell ?? program.key === "shell");
-    if (plain && now - rec.since > TIMEOUT) {
-      // A shell where the launcher should be: an old pa-session refused (pa-sync not run), or the
-      // person stopped it. Close the pane the keeper made; the old one still holds the record.
-      giveUp("its new terminal is a plain shell: the launcher there stopped or refused to start (on a remote machine, run pa-sync --on <machine> once)", true);
+    if (labelled || term.labels?.["herdr.pa.starting"]) {
+      // The launcher has begun (labelled, or said it is starting): wait, never close; tell once if slow.
+      if (now - rec.since > SLOW && !rec.slow) {
+        rec.slow = true;
+        notify({ title: "Project Agent still starting", body: `${r.name}: its launcher has not finished starting after 3 minutes. Look at its tab.`, level: "warning" });
+      }
       return;
     }
-    if (!labelled && now - rec.since > STARTING) giveUp("its new launcher did not start within 90 s", true);
+    // No sign of a launcher yet: a slow login shell, an older pa-session (pa-sync not run) that
+    // refused, or a person who stopped it. Wait (bounded), tell once, then give up; close the
+    // pane only if it is the keeper's own and an idle shell.
+    const age = now - rec.since;
+    if (age > TIMEOUT && !rec.told) {
+      rec.told = true;
+      notify({ title: "Project Agent restore waiting", body: `${r.name}: its new pane shows no launcher yet (on a remote machine, run pa-sync --on <machine> once).`, level: "warning" });
+    }
+    if (age <= GIVE_UP) return;
+    const pane = ps.find((p) => p.terminal === rec.to);
+    if (idleShell(term, pane)) giveUp("its new terminal is a plain shell: the launcher there stopped or refused to start (on a remote machine, run pa-sync --on <machine> once)", true);
+    else giveUp("its new terminal did not start the launcher within 2 minutes; it was left open because something runs in it", false);
   }
 
   // The tab itself is gone while its space lives on: open a new one (until Change 2's Close /
