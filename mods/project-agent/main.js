@@ -6,8 +6,8 @@
 
 import { View, div } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, ScrollHandle } from "gpui-base";
-import { spaces, panes, agents, terminals, theme, run, exec, props, home, watchFolder, notify, shared, setShared, closeOverlay, openOverlay, window, layout } from "herdr";
-import { loadSpace, loadDecisions, answerDecision, notifyOrchestrator, changeRules, touched, localId, paHome, stateDir, taskActions, taskLinks, evidenceTasks, cardEvidence, staleInstructions, liveTarget, lookAlike, OPEN_REQUESTS } from "./store.js";
+import { spaces, panes, agents, terminals, machines, theme, run, exec, props, home, watchFolder, notify, shared, setShared, closeOverlay, openOverlay, window, layout } from "herdr";
+import { loadSpace, loadDecisions, answerDecision, notifyOrchestrator, changeRules, touched, localId, paHome, stateDir, taskActions, taskLinks, evidenceTasks, cardEvidence, staleInstructions, liveTarget, lookAlike, OPEN_REQUESTS, keeperJudging, startingLabels } from "./store.js";
 import { RulesPane } from "./rules.js";
 import { SetupPane } from "./setup.js";
 import { Keeper } from "./keeper.js";
@@ -17,6 +17,8 @@ import { tick, cadence, holdReason, setSchedule, requestPass, PRESETS, MIN_MINUT
 const ACTIVE = ["needs-decision", "review", "in-progress", "investigating", "queued"];
 const ORDER = [...ACTIVE, "parked", "done"];
 const OPEN_WAIT = 30000; // an Open request with nothing started by then: say why, offer the button again
+const OPEN_SLOW = 180000; // its new tab is recorded but its launcher has not started by then: say so
+const paRecords = (spaceId) => Object.values(shared("project-agent.tabs") ?? {}).filter((r) => r?.space === spaceId);
 const when = (iso) => { const d = new Date(iso); return Number.isNaN(d.getTime()) ? "" : d.toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }); };
 
 export default class ProjectAgent extends View {
@@ -49,7 +51,7 @@ export default class ProjectAgent extends View {
     this.busy = {}; // card id -> answering now
     this.failed = {}; // card id -> why the answer wasn't written
     this.unsent = []; // [{ spaceId, message, why? }] notices the orchestrator hasn't had yet (its terminal is looked up when sending)
-    this.opening = {}; // space id -> when this copy asked the keeper to open its Project Agent
+    this.opening = {}; // space id -> { at, before }: when this copy asked the keeper to open its Project Agent, and the record terminals then
     this.openMsg = {}; // space id -> why the last Open did not start anything
     this.confirmOpen = {}; // space id -> { tab, terminal }: a look-alike agent runs; asking first
     this.me = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`; // this copy, for the timer lease
@@ -137,7 +139,7 @@ export default class ProjectAgent extends View {
     delete this.confirmOpen[space.id];
     const at = Date.now();
     setShared(OPEN_REQUESTS, { ...(shared(OPEN_REQUESTS) ?? {}), [space.id]: { at, by: "panel" } });
-    this.opening[space.id] = at;
+    this.opening[space.id] = { at, before: paRecords(space.id).map((r) => r.terminal) };
     cx.notify();
   }
 
@@ -477,16 +479,30 @@ export default class ProjectAgent extends View {
     const a = data.agent;
     // Who is live: the keeper's record whose launcher runs (not agent.json's terminal, which goes
     // stale when the agent is started again elsewhere).
-    const target = liveTarget(space.id);
+    // What is known: its machine is offline; no current keeper has judged the records (the marks
+    // may be a stale copy's); it runs (live); or it does not (down: the only state with Open).
+    const offline = Boolean(space.machine) && !machines().some((m) => m.name === space.machine && m.layout === "ready");
+    const target = offline ? null : liveTarget(space.id);
+    const known = offline ? "offline" : !keeperJudging() ? "unknown" : target ? "live" : "down";
     const live = target ? agents().find((x) => x.address === target.address) ?? { status: null } : null;
     const req = (shared(OPEN_REQUESTS) ?? {})[space.id], now = Date.now();
     if (target) { delete this.opening[space.id]; delete this.openMsg[space.id]; delete this.confirmOpen[space.id]; }
-    if (this.opening[space.id] && now - this.opening[space.id] > OPEN_WAIT) {
-      this.openMsg[space.id] = `The Project Agent did not open within 30 s: ${req?.why ?? (req ? "the request was not taken (the keeper runs in a layout with the Project Agent panel)" : "its new tab did not appear; see the notifications")}.`;
-      delete this.opening[space.id];
+    // A recorded launcher that is starting, or waits on an error for Enter: still opening.
+    const recTerms = paRecords(space.id).map((r) => terminals().find((x) => x.address === r.terminal && x.state === "live")).filter(Boolean);
+    const startingNow = recTerms.map(startingLabels).find(Boolean) ?? null;
+    const o = this.opening[space.id];
+    if (o && !startingNow) {
+      const opened = recTerms.some((x) => !o.before.includes(x.address)); // the keeper recorded a new tab since the click
+      if (now - o.at > (opened ? OPEN_SLOW : OPEN_WAIT)) {
+        this.openMsg[space.id] = opened ? "The Project Agent's new tab is open, but its launcher has not started after 3 minutes. Look at its tab."
+          : req ? `The Project Agent did not open within 30 s: ${req.why ?? "the request was not taken (the keeper runs in a layout with the Project Agent panel)"}.`
+          : "The Project Agent did not open: the keeper took the request but no new tab was recorded. See the notifications for why.";
+        delete this.opening[space.id];
+      }
     }
-    const waiting = !target && (Boolean(this.opening[space.id]) || Boolean(req && now - Number(req.at) < OPEN_WAIT));
-    const like = this.confirmOpen[space.id];
+    const waiting = known === "down" && (Boolean(this.opening[space.id]) || Boolean(req && now - Number(req.at) < OPEN_WAIT) || Boolean(startingNow));
+    const like = known === "down" ? this.confirmOpen[space.id] : null;
+    const stateText = { offline: "Machine offline · status unknown", unknown: "Status unknown", down: "Not running" }[known];
     // Newest first: by when a task last changed (else when it was made), then by id.
     const stamp = (x) => String(x.updated ?? x.created ?? "");
     const tasks = [...(data.ledger?.tasks ?? [])].sort((x, y) => stamp(y).localeCompare(stamp(x)) || String(y.id ?? "").localeCompare(String(x.id ?? ""), undefined, { numeric: true }));
@@ -511,14 +527,16 @@ export default class ProjectAgent extends View {
     return root
       .child(head(`PA: ${a.name ?? space.name}`, h_flex().flex_none().gap(6).items_center()
         .child(div().size(7).rounded(4).bg(live ? t[live.status] ?? t.idle : t.dim))
-        .child(div().text_size(11).text_color(t.dim).child(live ? live.status ?? "running" : "Not running"))
-        .when(!live, (el) => el.child(this.openButton(t, space, a, "pa-open", waiting)))))
-      .when(!live && Boolean(like), (el) => el.child(v_flex().px(12).py(8).gap(6).flex_none().border_b(1).border_color(t.border).bg(t.working + "1a").text_size(11.5).text_color(t.foreground)
+        .child(div().text_size(11).text_color(t.dim).child(live ? live.status ?? "running" : stateText))
+        .when(known === "down", (el) => el.child(this.openButton(t, space, a, "pa-open", waiting)))))
+      .when(known === "down" && Boolean(startingNow?.error), (el) => el.child(div().px(12).py(6).border_b(1).border_color(t.border).text_size(11.5).text_color(t.blocked)
+        .child(`The Project Agent is waiting: ${startingNow?.error}. Fix it, then press Enter in its tab.`)))
+      .when(Boolean(like), (el) => el.child(v_flex().px(12).py(8).gap(6).flex_none().border_b(1).border_color(t.border).bg(t.working + "1a").text_size(11.5).text_color(t.foreground)
         .child(div().child(`A Claude session for this Project Agent seems to run in tab ${like?.tab}. Opening another starts a second one. Open anyway?`))
         .child(h_flex().gap(6)
           .child(this.button(t, "pa-open-anyway", "Open anyway", (_e, cx) => this.requestOpen(space, a, cx, true), true))
           .child(this.button(t, "pa-open-cancel", "Cancel", (_e, cx) => { delete this.confirmOpen[space.id]; cx.notify(); })))))
-      .when(!live && Boolean(this.openMsg[space.id]), (el) => el.child(div().px(12).py(6).border_b(1).border_color(t.border).text_size(11.5).text_color(t.blocked).child(this.openMsg[space.id] ?? "")))
+      .when(known === "down" && Boolean(this.openMsg[space.id]), (el) => el.child(div().px(12).py(6).border_b(1).border_color(t.border).text_size(11.5).text_color(t.blocked).child(this.openMsg[space.id] ?? "")))
       .child(v_flex().px(12).py(8).gap(2).flex_none().border_b(1).border_color(t.border).text_size(11.5).text_color(t.dim)
         .child(div().truncate().child(String(a.project ?? "").replace(home(), "~")))
         .child(div().child(`profile ${a.profile ?? "?"} · ${active} active of ${tasks.length} tasks · pass ${data.ledger?.passCount ?? 0}`)))
@@ -532,8 +550,10 @@ export default class ProjectAgent extends View {
         .child(tab("rules", this.rules.data?.error ? "Rules · !" : `Rules · ${(this.rules.data?.rules ?? []).filter((r) => r.status === "active").length}`)))
       .children((data.errors ?? []).map((e) => div().px(12).py(6).text_size(11.5).text_color(t.blocked).child(e)))
       .when(unsent.length > 0 && !live, (el) => el.child(h_flex().px(12).py(6).gap(8).items_center().text_size(11.5).text_color(t.foreground)
-        .child(div().flex_1().min_w(0).child("Answer saved. The Project Agent is not running."))
-        .child(this.openButton(t, space, a, "pa-open-notice", waiting))))
+        .child(div().flex_1().min_w(0).child(known === "down" ? "Answer saved. The Project Agent is not running."
+          : known === "offline" ? "Answer saved. Its machine is offline; the Project Agent is told once it is back and running."
+          : "Answer saved. The Project Agent is told once its status is known."))
+        .when(known === "down", (e) => e.child(this.openButton(t, space, a, "pa-open-notice", waiting)))))
       .when(unsent.length > 0 && Boolean(live), (el) => el.child(div().px(12).py(6).text_size(11.5).text_color(t.blocked)
         .child(`Saved, but the Project Agent hasn't been told yet (${unsent[0]?.why ?? "sending"}). Trying again every 10 s.`)))
       .when(view === "tasks", (el) => el.child(v_flex().id("pa-tasks").flex_1().min_h(0).p(8).gap(6).overflow_y_scrollbar()

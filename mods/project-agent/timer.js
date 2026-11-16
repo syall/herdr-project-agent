@@ -7,7 +7,7 @@
 // only this timer writes lastPass and nextPass. pass-request.json is the on-demand queue.
 
 import { terminals, hc, readTextFile, exec, shared, setShared, notify, spaces } from "herdr";
-import { paHome, replaceFile, localId } from "./store.js";
+import { paHome, replaceFile, localId, keeperJudging } from "./store.js";
 
 export const MIN_MINUTES = 5;
 export const PRESETS = [5, 10, 15, 30, 60];
@@ -36,15 +36,16 @@ export function holdReason(schedule, ledger) {
 // Every Project Agent the keeper records in this window (shared "project-agent.tabs"), one per
 // space: { address, machine, status, tab, dir, name, alive }. alive: the record says its launcher
 // runs in that terminal, and the terminal is live. Passes go only to an alive one; a labelled
-// terminal without that (a kept shell, the old terminal during a restore) gets nothing.
+// terminal without that (a kept shell, the old terminal during a restore) gets nothing, and so
+// does every record while the marks are not the current keeper's (after a reload or takeover).
 export function projectAgents() {
-  const ts = terminals(), byDir = new Map();
+  const ts = terminals(), byDir = new Map(), judged = keeperJudging();
   for (const [tab, r] of Object.entries(shared("project-agent.tabs") ?? {})) {
     if (!r?.space) continue;
     const machine = String(r.space).includes("/") ? String(r.space).split("/")[0] : null;
     const dir = `${paHome(machine)}/spaces/${localId(r.space)}`;
     const term = ts.find((t) => t.address === r.terminal && t.state === "live");
-    const alive = r.alive === true && Boolean(term);
+    const alive = judged && r.alive === true && Boolean(term);
     const prev = byDir.get(dir);
     if (prev && (prev.alive || !alive)) continue;
     byDir.set(dir, { address: r.terminal, machine, status: term?.status ?? null, tab, dir, name: r.name ?? "", alive });

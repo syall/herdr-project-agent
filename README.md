@@ -28,7 +28,11 @@ State lives in `~/.config/herdr-pa/spaces/<space-id>/` and is not part of this r
 
 The mod keeps shared state `project-agent.tabs` (tab id -> `{ space, project, profile, name, terminal }`,
 plus `recovering` while the keeper restores that tab, and `alive: true` while the keeper knows the
-launcher runs in `terminal`: the terminal is live, labelled for the space, and the heartbeat names it).
+launcher runs in `terminal`: the terminal is live, labelled for the space, not an idle shell, and a
+heartbeat at most 40 s old names it). The keeper that wrote the marks also writes
+`project-agent.keeper` (`{ id, at }`); readers trust `alive` only while that keeper holds the timer
+lease (`project-agent.timer`, fresh within 50 s), so marks left by a reloaded or closed copy count for
+nothing until the new keeper has judged.
 It cannot draw or guard controls that other mods own, so those mods read that key (presence and
 `terminal` are enough):
 
@@ -76,7 +80,11 @@ New spaces start the launcher with `space.new { argv: ["pa-session", "--ask"] }`
   record stays until the new tab is recorded.
 - **Open Project Agent** (Project view) covers what the keeper does not reopen by itself: a space with
   no record (a hand-run or never-recorded agent, or a tab closed while no keeper ran), or a keeper
-  that gave up after 3 failures. It shows whenever agent.json exists and no record is `alive`.
+  that gave up after 3 failures. It shows whenever agent.json exists, the space's machine is ready,
+  the current keeper has judged, and no record is `alive`. While the machine is offline the header
+  says "Machine offline · status unknown"; before a keeper has judged, "Status unknown"; neither
+  offers Open. An Open over a record that is not running (a kept shell, a hand-run program) replaces
+  that record and retires its terminal: it is never adopted or marked alive again.
 - `pa-session` and `pa-start` refuse to start a second Project Agent only while another terminal's
   launcher is alive; a labelled terminal whose heartbeat stopped is replaced.
 
@@ -91,8 +99,10 @@ and its agent.json has been read since the request: it takes `keeper.lock`, runs
 shows, before the launcher labels it. It refuses (deletes the request, one notice) while a record's
 launcher runs or beats elsewhere, a labelled terminal of the space has a fresh heartbeat, or a restore
 or open is under way. While it waits it writes `why`; after 30 s it gives the request up with a notice.
-A live agent that looks like this Project Agent but does not run under its launcher (pane title
-`PA: <name>`, the project folder, or the space's label) gets a confirm in the panel first.
+A request is also refused while the space's recorded launcher is starting or waits for Enter on an
+error; the panel keeps "Opening…" and shows that error. A live agent that looks like this Project
+Agent but does not run under its launcher (tab name or pane title `PA: <name>`, a folder in the
+project, or the space's label) gets a confirm in the panel first.
 (`project-agent.open` is something else: the number of open decision cards per space.)
 
 ## Messages go only to a live launcher
@@ -101,8 +111,15 @@ The panel's "decision … answered" and "rule …" notices are sent to the recor
 looked up when sending; with none, nothing is sent and the panel says "Answer saved. The Project
 Agent is not running." The pass timer sends passes only to an `alive` record's terminal; new-card
 notifications still cover every recorded space. `pa-pass`, and the notices of `pa-task` and
-`pa-worker delete`, also require the launcher's heartbeat to name the terminal and be fresh, so
-nothing is typed into a bare shell a launcher left behind.
+`pa-worker delete`, also require the launcher's heartbeat to name the terminal and be at most 30 s
+old.
+
+The remaining window: when a launcher dies, the panel and the timer stop as soon as the app shows its
+terminal as an idle shell (the next keeper tick), or at the latest when its last heartbeat is 40 s
+old; `pa-pass`, `pa-task` and `pa-worker` stop when it is 30 s old. A message sent in those seconds
+can still reach the terminal the launcher just left. A remote launcher must write the heartbeat
+(run `pa-sync --on <machine>`): one from before the heartbeat existed is never `alive`, so it gets
+no passes and no answer notices.
 
 ## Profiles
 

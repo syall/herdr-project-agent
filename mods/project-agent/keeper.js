@@ -13,7 +13,7 @@
 // space's state folder keeps two Herdr clients from restoring the same Project Agent at once.
 
 import { spaces, panes, terminals, machines, focused, run, openOverlay, notify, readTextFile, home, shared, setShared } from "herdr";
-import { replaceFile, OPEN_REQUESTS as REQUESTS } from "./store.js";
+import { replaceFile, OPEN_REQUESTS as REQUESTS, KEEPER_MARK } from "./store.js";
 
 const localId = (id) => String(id ?? "").split("/").pop();
 const tabs = () => shared("project-agent.tabs") ?? {};
@@ -22,7 +22,11 @@ const beatAddress = (text) => String(text ?? "").trim().split(/\s+/)[1] ?? null;
 const argvOf = (r) => ["pa-session", "--space", localId(r.space), "--project", r.project, "--profile", r.profile, "--name", r.name];
 const SHELL = /(^|\/)-?(sh|bash|zsh|fish|dash|ksh|tcsh|csh)$/; // a shell's program or process name
 const FRESH = 30000; // a heartbeat this recent means its launcher runs (pa.py's FRESH)
-const beatFresh = (text, now) => { const [epoch, address] = String(text ?? "").trim().split(/\s+/); return Number(epoch) * 1000 >= now - FRESH ? address ?? null : null; };
+// For "alive": the launcher beats every 10 s and the keeper reads every 15 s, so a running
+// launcher's last read beat is up to ~25 s old; 40 s leaves room for a slow read or clock skew.
+const ALIVE_BEAT = 40000;
+const beatFresh = (text, now, within = FRESH) => { const [epoch, address] = String(text ?? "").trim().split(/\s+/); return Number(epoch) * 1000 >= now - within ? address ?? null : null; };
+const starting = (term) => Boolean(term?.labels?.["herdr.pa.starting"] || term?.labels?.["herdr.pa.error"]); // a launcher that has begun and not finished starting
 const present = (v) => v !== undefined && v !== null && v !== "" && !(typeof v === "object" && Object.keys(v).length === 0);
 
 // Positive evidence that a terminal is an idle shell at its prompt, the only thing the keeper
@@ -185,27 +189,37 @@ export class Keeper {
   lock(cx, space, tab, now) {
     const l = this.locks[space.id];
     const path = `${dirOf(space)}/keeper.lock`, on = space.machine ?? null;
-    if (l?.state === "held") {
+    // Held, and refreshed within its TTL: still ours. Not refreshed for longer (nobody used it),
+    // another client may have taken it over: take it again through the file.
+    if (l?.state === "held" && (now - l.at <= LOCK_TTL || l.refreshing)) {
       if (cx && now - l.at > LOCK_TTL / 2 && !l.refreshing && now - (l.tried ?? 0) >= 5000) { // a long wait: keep it from looking abandoned
         l.refreshing = true; l.tried = now;
         const text = JSON.stringify({ client: this.me, at: new Date(now).toISOString(), tab });
-        cx.spawn(async () => { try { await replaceFile(path, text, l.text, on); l.text = text; l.at = now; } catch { /* taken over */ } l.refreshing = false; });
+        cx.spawn(async () => {
+          try { await replaceFile(path, text, l.text, on); l.text = text; l.at = now; }
+          catch { if (this.locks[space.id] === l) this.locks[space.id] = { state: "busy", at: Date.now() }; } // taken over: not ours any more
+          l.refreshing = false;
+        });
       }
       return true;
     }
     if (!cx || (l?.state === "taking" && now - l.at < 20000) || (l?.state === "busy" && now - l.at < 5000)) return false;
-    this.locks[space.id] = { state: "taking", at: now };
+    const take = { state: "taking", at: now };
+    this.locks[space.id] = take;
     cx.spawn(async () => {
       try {
         const old = await readTextFile(path, { on });
         let info = null;
         try { info = old ? JSON.parse(old) : null; } catch { /* unreadable: free */ }
         const t = Date.now();
-        if (info && !info.released && info.client !== this.me && t - Date.parse(info.at) <= LOCK_TTL) { this.locks[space.id] = { state: "busy", at: t }; return; }
+        if (info && !info.released && info.client !== this.me && t - Date.parse(info.at) <= LOCK_TTL) { if (this.locks[space.id] === take) this.locks[space.id] = { state: "busy", at: t }; return; }
+        if (this.locks[space.id] !== take) return; // released (or retaken) while reading: do not take it
         const text = JSON.stringify({ client: this.me, at: new Date(t).toISOString(), tab });
         await replaceFile(path, text, old, on);
-        this.locks[space.id] = { state: "held", text, at: t };
-      } catch { this.locks[space.id] = { state: "busy", at: Date.now() }; }
+        if (this.locks[space.id] === take) { this.locks[space.id] = { state: "held", text, at: t }; return; }
+        // Released while writing: give it back at once.
+        try { await replaceFile(path, JSON.stringify({ released: true, at: new Date(Date.now()).toISOString() }), text, on); } catch { /* expires */ }
+      } catch { if (this.locks[space.id] === take) this.locks[space.id] = { state: "busy", at: Date.now() }; }
     });
     return false;
   }
@@ -328,7 +342,11 @@ export class Keeper {
       if (!here) { this.reopen(cx, tab, r, space, now); continue; }
       if (here.index !== 1) run("tab.move", { id: tab, index: 1 });
       const state = this.classify(tab, r, ts, ps, now);
-      if (state === "alive" && ts.find((x) => x.address === r.terminal)?.labels?.["herdr.pa"] === localId(space.id) && beatAddress(this.hb[space.id]) === localId(r.terminal)) r.alive = true;
+      // alive: labelled for the space, a fresh heartbeat naming it, and not positively an idle shell
+      // (a launcher that died leaves one: from that tick on nothing is sent there).
+      const term = ts.find((x) => x.address === r.terminal);
+      if (state === "alive" && term?.labels?.["herdr.pa"] === localId(space.id) && beatFresh(this.hb[space.id], now, ALIVE_BEAT) === localId(r.terminal)
+        && !idleShell(term, ps.find((p) => p.terminal === r.terminal))) r.alive = true;
       if (state !== "foreign") delete this.noticed[space.id]; // the next "something else" is a new episode
       if (state === "alive" || state === "elsewhere") { delete this.missing[tab]; if (state === "alive") delete this.stopped[space.id]; continue; }
       if (state === "foreign") {
@@ -344,6 +362,9 @@ export class Keeper {
     if ((wantRead || readAll) && cx && !this.reading) this.read(cx, readAll);
     const after = JSON.stringify(records);
     if (after !== before) setShared("project-agent.tabs", records);
+    // The records' alive marks are this keeper's from now on: readers trust them only when the
+    // keeper that wrote them is the lease holder's (store.js keeperJudging).
+    if (shared(KEEPER_MARK)?.id !== this.me) setShared(KEEPER_MARK, { id: this.me, at: now });
   }
 
   // Open requests from the panel ("Open Project Agent"). Each is taken once its machine is ready
@@ -357,7 +378,12 @@ export class Keeper {
     for (const [sid, req] of Object.entries(reqs)) {
       const space = sp.find((s) => s.id === sid);
       const name = this.config[sid]?.info?.name || space?.name || sid;
-      const done = (title, body, level = "info") => { this.dropRequest(sid, req); if (title) notify({ title, body: `${name}: ${body}`, level }); };
+      const done = (title, body, level = "info") => {
+        this.dropRequest(sid, req);
+        // A lock taken for this request and not used: give it back (a restore or an open in progress keeps its own).
+        if (space && !this.pending[sid] && !Object.values(records).some((r) => r.space === sid && r.recovering)) this.release(cx, space);
+        if (title) notify({ title, body: `${name}: ${body}`, level });
+      };
       if (!space) { done(); continue; }
       const waitOr = (why) => { // keep waiting, or give up after 30 s
         if (now - (Number(req?.at) || now) > TIMEOUT) done("Project Agent not opened", `${why}. Try again when that has changed.`, "warning");
@@ -369,6 +395,7 @@ export class Keeper {
       if (conf.state === "absent") { done(); continue; } // not a Project Agent space
       const mine = Object.entries(records).filter(([, r]) => r.space === sid);
       if (this.pending[sid] || mine.some(([, r]) => r.recovering)) { done("Project Agent already opening", "it is being opened or restored already."); continue; }
+      if (mine.some(([, r]) => starting(ts.find((t) => t.address === r.terminal && t.state === "live")))) { done("Project Agent already opening", "its launcher is starting (or waiting for Enter in its tab)."); continue; }
       const running = mine.some(([tab, r]) => space.tabs.some((x) => x.id === tab) && ["alive", "elsewhere"].includes(this.classify(tab, r, ts, ps, now)))
         || ts.some((t) => t.state === "live" && !t.parent && t.labels?.["herdr.pa"] === localId(sid) && !this.retired.has(t.address) && beatFresh(this.hb[sid], now) === localId(t.address));
       if (running) { done("Project Agent already running", "it is already running in its tab."); continue; }
@@ -376,7 +403,9 @@ export class Keeper {
       if (!info.project || !info.profile) { done("Project Agent not opened", "its agent.json has no project or profile; fix it, or run pa-start in the space.", "warning"); continue; }
       if (!this.lock(cx, space, null, now)) { waitOr(this.locks[sid]?.state === "busy" ? "another Herdr client holds its keeper.lock" : "taking its keeper.lock"); continue; }
       // The person asked: the restore limits (one a minute, stop after 3 failures) do not apply.
-      for (const [tab] of mine) { delete records[tab]; delete this.missing[tab]; delete this.beat[tab]; }
+      // The replaced record's terminal (a kept shell, or a program the person confirmed past) keeps
+      // its stale label: retire it, so it is never adopted or marked alive again (as a restore does).
+      for (const [tab, r] of mine) { if (r.terminal) this.retired.add(r.terminal); delete records[tab]; delete this.missing[tab]; delete this.beat[tab]; }
       delete this.stopped[sid]; delete this.fails[sid]; delete this.warned[sid];
       this.reopened[sid] = now;
       const record = { space: sid, project: info.project, profile: info.profile, name: info.name || space.name };

@@ -43,8 +43,8 @@ A new space opens with a 600 x 440 dialog: a Project Agent card (`Set up for <fo
   sends it with the note. The answer is written into the card file and the agent is told with
   `hc send`, in the terminal its launcher runs in at that moment; a failed send is retried every
   10 s and the panel says so. With no Project Agent running, nothing is sent: the panel says
-  "Answer saved. The Project Agent is not running." and offers Open; the notice goes out once it runs. The card's link opens
-  the evidence file it is about. Answered cards fold away below.
+  "Answer saved. The Project Agent is not running." and offers Open; the notice goes out once it
+  runs. The card's link opens the evidence file it is about. Answered cards fold away below.
 - **Tasks:** one section per state (finished ones start folded), newest first. An expanded task
   shows its goal, tier, a chip per worker (a live one opens in the Agents view), a button per
   open decision, a button per artifact link, Evidence (only when there is some), the profile's
@@ -122,8 +122,9 @@ A new space opens with a 600 x 440 dialog: a Project Agent card (`Set up for <fo
   changes the file to `answered` and the agent's terminal receives `decision <id> answered`.
 - Breaking `rules.json` by hand shows the error and no button writes to it.
 - With a task active and the last pass older than the cadence, the agent's terminal receives
-  `scheduled pass` within 15 s, and `schedule.json` gets a new `lastPass` and `nextPass`; a bare
-  shell its launcher left behind receives nothing.
+  `scheduled pass` within 15 s, and `schedule.json` gets a new `lastPass` and `nextPass`; once the
+  app shows a dead launcher's terminal as an idle shell (or its heartbeat is 40 s old), that
+  terminal receives no pass (README, "Messages go only to a live launcher").
 - With no Project Agent running in a configured space, the header says "Not running" and Open
   Project Agent opens one tab `PA: <name>` that resumes the conversation; a second click while it
   runs opens nothing.
