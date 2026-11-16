@@ -25,12 +25,13 @@ class El {
   children(list) { for (const x of list ?? []) this.child(x); return this; }
   when(cond, fn) { return cond ? fn(this) ?? this : this; }
 }
-// Any other builder method (styling, hover, scroll, ...) returns the element itself.
+// Any other builder method (styling, hover, scroll, ...) returns the element itself; its last
+// arguments are kept in `style` (for example style.pl is [12] after .pl(12)).
 const make = (kind) => new Proxy(new El(kind), {
   get(target, name, recv) {
     if (name in target) return Reflect.get(target, name, recv);
     if (typeof name === "symbol") return undefined;
-    return () => recv;
+    return (...args) => { (target.style ??= {})[name] = args; return recv; };
   },
 });
 
@@ -43,6 +44,18 @@ export const h_flex = () => make("h_flex");
 export const InputState = { new: (o = {}) => { let v = o.value ?? ""; return { value: () => v, set: (x) => { v = x; }, release() {} }; } };
 export const Input = { new: () => make("input") };
 export const ScrollHandle = { new: () => ({ scroll_to_item() {} }) };
+
+// Every element whose own children include the string `text`, depth first.
+export function findText(root, text) {
+  const found = [];
+  const walk = (x) => {
+    if (x === null || typeof x !== "object") return;
+    if ((x.kids ?? []).some((k) => typeof k !== "object" && String(k) === text)) found.push(x);
+    for (const k of x.kids ?? []) walk(k);
+  };
+  walk(root);
+  return found;
+}
 
 // The rendered tree: its text (each element's strings, depth first) and its click targets.
 export function inspect(root) {

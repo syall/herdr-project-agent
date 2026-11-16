@@ -452,6 +452,41 @@ cases["P-stale-starting"] = async () => { // a stale starting/error label on an 
   }
 };
 
+// ---- t-008: card context line by line; closed and kept worker chips ----
+cases["P1-context-lines"] = async () => { // a multi-line context renders one row per line; "  " lines are indented
+  world();
+  g.__files[`:${DIR}/decisions/d-wt-t-003.json`] = JSON.stringify({ id: "d-wt-t-003", task: "t-003", status: "open", question: "Delete the worktree?",
+    context: "ctx-a\nctx-b\n  ctx-c", options: [{ label: "Delete" }, { label: "Keep" }], created: "2026-11-16T10:00:00Z" });
+  g.__files[`:${DIR}/decisions/d-one.json`] = JSON.stringify({ id: "d-one", status: "open", question: "Q?", context: "one line of context",
+    options: [{ label: "A" }], created: "2026-11-16T09:00:00Z" });
+  g.__ls[`:${DIR}/decisions`] = ["d-wt-t-003.json", "d-one.json"];
+  const v = await mount();
+  const tree = v.render(cx);
+  const [a, b, c] = ["ctx-a", "ctx-b", "ctx-c"].map((x) => stubs.findText(tree, x));
+  check(a.length === 1 && b.length === 1 && c.length === 1, `one row per line (got ${a.length}, ${b.length}, ${c.length}; text ${inspect(tree).text.slice(0, 300)})`);
+  check(JSON.stringify(c[0].style?.pl) === "[12]" && !a[0].style?.pl, `the "  " line is indented, the others not (got ${JSON.stringify(c[0].style)})`);
+  const one = stubs.findText(tree, "one line of context");
+  check(one.length === 1 && one[0].kind === "div", `a one-line context is one row, as before (got ${one.length})`);
+};
+
+cases["P2-worker-chips"] = async () => { // a closed worker reads (closed), a kept one "· kept"; others unchanged
+  world({ extraTerms: [{ address: "t32", state: "live", argv: ["claude"], labels: {}, status: "idle", program: claude },
+                       { address: "t33", state: "live", argv: ["claude"], labels: {}, status: "working", program: claude }] });
+  g.__files[`:${DIR}/ledger.json`] = JSON.stringify({ tasks: [{ id: "t-003", title: "T", state: "in-progress", workers: [
+    { address: "t31", role: "build", name: "t-003-tests", finished: true, closed: "2026-11-16T10:00:00Z", closedBy: "agent", report: "FINDINGS.md" },
+    { address: "t32", role: "reviewer", name: "t-003-review", keep: true, keptAt: "2026-11-16T10:00:00Z", keepQuote: "keep it" },
+    { address: "t33", role: "verifier", name: "t-003-verify" },
+    { address: "t34", role: "build", name: "t-003-old" }] }] });
+  const v = await mount();
+  await click(v, "view-tasks");
+  await click(v, "task-head-t-003");
+  const { text } = look(v);
+  check(/build t31 \(closed\)/.test(text), `closed chip (got ${text.slice(0, 400)})`);
+  check(/reviewer t32 · kept ↗/.test(text), `kept chip, still live (got ${text.slice(0, 400)})`);
+  check(/verifier t33 ↗/.test(text) && !/verifier t33 · kept/.test(text), "a live worker unchanged");
+  check(/build t34 \(ended\)/.test(text), "a gone worker that was not closed still reads (ended)");
+};
+
 const pick = process.argv.slice(2);
 let failed = 0;
 for (const [name, fn] of Object.entries(cases)) {
