@@ -7,7 +7,7 @@ Selected by the name it is invoked as (symlinks in ~/.local/bin):
   pa-hooks install <worktree> --task ID [--fix] install the hooks below into a worktree's local settings
   pa-hooks remove <worktree>                    take them out again
   pa-full-suite                                 run the full test suite once, output into build.log
-  pa-worktree check [--open-cards]              worktrees whose workers were all killed: list them, open decision cards
+  pa-worktree check [--open-cards]              worktrees whose tasks are all done or parked: list them, open decision cards
   pa-worktree remove <task-id>                  delete a task's worktree, only with an answered "Delete" card
   pa-worker info <address>                      what deleting a worker would remove, as JSON
   pa-worker delete <address> [--keep-worktree] [--discard] [--with-task]
@@ -431,7 +431,8 @@ def inside(path, folder):
 
 
 def worktree_state(directory, agent, profile=None):
-    """Per worktree in the ledger: its tasks, its workers' fates, and anyone else working inside it."""
+    """Per worktree in the ledger: its tasks (with their states and titles), its workers' fates, and anyone
+    else working inside it. A worker's fate: live, closed (its ledger entry is finished), killed, removed or exited."""
     ledger = pa.read_json(os.path.join(directory, "ledger.json"), {}) or {}
     live = pa.live_terminals() or {}
     rows = {}
@@ -439,12 +440,15 @@ def worktree_state(directory, agent, profile=None):
         if not task.get("worktree") or not task.get("id"):
             continue
         path = os.path.realpath(os.path.expanduser(task["worktree"]))
-        row = rows.setdefault(path, {"path": path, "tasks": [], "keep": False, "workers": []})
+        row = rows.setdefault(path, {"path": path, "tasks": [], "states": {}, "titles": {}, "keep": False, "workers": []})
         row["tasks"].append(task["id"])
+        row["states"][task["id"]] = task.get("state")
+        row["titles"][task["id"]] = task.get("title") or ""
         row["keep"] = row["keep"] or bool(task.get("keepWorktree"))
         for w in task.get("workers") or []:
             info = pa.hc_get(w.get("address"))
-            fate = "live" if info.get("state") == "live" else ("killed" if info.get("reason") == "killed" else
+            fate = "live" if info.get("state") == "live" else ("closed" if w.get("finished") else
+                                                              "killed" if info.get("reason") == "killed" else
                                                               "removed" if not info else "exited")
             row["workers"].append({"address": w.get("address"), "name": w.get("name") or info.get("name"), "fate": fate})
     for row in rows.values():
@@ -482,16 +486,18 @@ def cmd_worktree(args):
                       ": run `pa-worktree remove {}`".format(task) if str(card.get("answer", "")).lower().startswith("delete") else ": kept, not asked again"))
             elif card:
                 print("{}: card {} is open".format(task, card["id"]))
+            elif any(s not in ("done", "parked") for s in row["states"].values()):
+                print("{}: tasks still {}; asked once every task using it is done or parked".format(
+                    task, ", ".join("{} {}".format(i, s) for i, s in row["states"].items() if s not in ("done", "parked"))))
             elif "live" in fates:
                 print("{}: in use by {}".format(task, ", ".join(w["address"] for w in row["workers"] if w["fate"] == "live")))
             elif row["others"]:
                 print("{}: another terminal is working in it ({})".format(task, ", ".join(row["others"])))
-            elif not any(f in ("killed", "removed") for f in fates):
-                print("{}: its workers {}; nothing to do".format(task, "exited on their own" if fates else "were never recorded"))
             else:
-                gone = ", ".join("{} ({})".format(w["name"] or w["address"], w["fate"]) for w in row["workers"])
+                # Every task is done or parked and nothing runs inside: a candidate, however its workers ended.
+                gone = ", ".join("{} ({})".format(w["name"] or w["address"], w["fate"]) for w in row["workers"]) or "no workers recorded"
                 if not args.open_cards:
-                    print("{}: candidate, all workers killed or removed ({}); --open-cards asks the person".format(task, gone))
+                    print("{}: candidate, every task done or parked ({}); --open-cards asks the person".format(task, gone))
                     continue
                 loses_commits = facts.get("removesBranches") and facts["unpushed"] > 0
                 dirty = facts["uncommitted"] > 0 or loses_commits
@@ -500,7 +506,7 @@ def cmd_worktree(args):
                 pa.write_json(card_path(directory, task), {
                     "id": "d-wt-" + task, "task": task, "worktree": row["path"],
                     "question": "Delete the worktree for {}?".format(", ".join(row["tasks"])),
-                    "context": "{}. Its workers were killed or removed: {}. No other terminal is working in it. Uncommitted files: {}. "
+                    "context": "{}. Workers: {}. No other terminal is working in it. Uncommitted files: {}. "
                                "Commits not on any remote: {}. {}{}.".format(
                                    row["path"], gone, facts["uncommitted"], facts["unpushed"], kept,
                                    "; deleting DISCARDS the uncommitted files" if facts["uncommitted"] else ""),
