@@ -347,7 +347,7 @@ const leftAlone = async (opts, what) => {
 // R2-I1: restore only on positive evidence of an idle shell; any agent report, or a foreground that is not a shell, is left alone.
 cases["K-kept-stale"] = () => leftAlone({ argv: ["/bin/zsh"], program: shell, status: "idle", title: "PA: proj" }, "kept shell with an agent status still set (it may be a live agent: R2-I1)");
 cases["K-kept-prompt"] = () => restores({ argv: ["/bin/zsh"], program: shell, status: null, title: "PA: proj", foreground: { name: "zsh", argv: ["-zsh"] } }, "kept shell at its prompt (foreground zsh), dead agent's title");
-cases["K-kept-argv"] = () => restores({ argv: ["/bin/zsh"], program: { key: "program", name: "zsh", shell: false, agent: false }, status: "done", title: "PA: proj" }, "kept shell known only by its bare-shell argv");
+cases["K-kept-argv"] = () => restores({ argv: ["/bin/zsh"], program: { key: "program", name: "zsh", shell: false, agent: false }, status: null, title: "PA: proj" }, "kept shell whose program table entry only names zsh, no status");
 cases["K-wrapper"] = () => restores({ argv: wrapped(), program: shell, status: null, title: "PA: proj" }, "wrapper shell after pa-session exited");
 cases["K-nvim-kept"] = () => leftAlone({ argv: ["/bin/zsh"], program: { key: "nvim", name: "Neovim", shell: false, agent: false }, status: null, title: "nvim agent.json" }, "nvim in a kept shell");
 cases["K-make-kept"] = () => leftAlone({ argv: ["/bin/zsh"], program: { key: "program", name: "make", shell: false, agent: false }, status: null, title: "make" }, "make (an unlisted program) in a kept shell");
