@@ -56,6 +56,8 @@ async function mount() {
   return v;
 }
 const look = (v) => inspect(v.render(cx));
+// Time passes while the keeper (in another copy) keeps running: its lease and its mark stay fresh.
+const advance = (ms) => { g.__now += ms; for (const k of ["project-agent.timer", "project-agent.keeper"]) if (g.__shared[k]?.id === "K") g.__shared[k] = { id: "K", at: g.__now }; };
 async function click(v, id) {
   const { clicks } = look(v);
   check(Boolean(clicks[id]), `a click target ${id} (have ${Object.keys(clicks).join(", ")})`);
@@ -122,7 +124,7 @@ cases["P-open-click"] = async () => { // the click posts a request; "Opening…"
   check(req && req.at === T0 && req.by === "panel", `request written (got ${JSON.stringify(g.__shared[REQ])})`);
   let { text, clicks } = look(v);
   check(/Opening…/.test(text) && !clicks["pa-open"], `Opening… and no click (got ${text.slice(0, 200)}; clicks ${Object.keys(clicks)})`);
-  delete g.__shared[REQ][S]; g.__now += 3000; // the keeper took it; the tab is not recorded yet
+  delete g.__shared[REQ][S]; advance(3000); // the keeper took it; the tab is not recorded yet
   ({ text, clicks } = look(v));
   check(/Opening…/.test(text) && !clicks["pa-open"], "still Opening… until the tab is recorded");
   g.__shared["project-agent.tabs"] = alive(); g.__spaces[0].tabs.push(paTab); g.__panes.push(paPane()); g.__terminals.push(paTerm()); g.__agents = [{ address: "t4w", status: "idle" }];
@@ -135,7 +137,7 @@ cases["P-open-timeout"] = async () => { // nothing started after 30 s: says why,
   const v = await mount();
   await click(v, "pa-open");
   g.__shared[REQ][S].why = "another Herdr client holds its keeper.lock";
-  g.__now += 31000;
+  advance(31000);
   const { text, clicks } = look(v);
   check(/did not open|not opened/i.test(text) && /keeper\.lock/.test(text), `a message with the reason (got ${text.slice(0, 400)})`);
   check(Boolean(clicks["pa-open"]), "the button is back");
@@ -241,7 +243,7 @@ cases["P-open-starting"] = async () => { // M4: the tab opened but its launcher 
   g.__shared["project-agent.tabs"] = { tb1: { space: S, project: "/proj", profile: "test", name: "proj", terminal: "t4w" } };
   g.__spaces[0].tabs.push(paTab); g.__panes.push({ ...paPane(), status: null, program: { key: "program", name: "Python", shell: false, agent: false } });
   g.__terminals.push({ address: "t4w", state: "live", argv: ["pa-session"], labels: { "herdr.pa.error": "project folder does not exist: /proj" }, status: null, program: { key: "program", name: "Python", shell: false, agent: false } });
-  g.__now += 31000;
+  advance(31000);
   const { text, clicks } = look(v);
   check(!/did not appear/.test(text), `no wrong "did not appear" (got ${text.slice(0, 400)})`);
   check(/project folder does not exist/.test(text) && /Enter/.test(text), `shows the launcher's error (got ${text.slice(0, 400)})`);
@@ -288,9 +290,9 @@ cases["P-open-why-kept"] = async () => { // F2: the keeper gives the request up 
   const v = await mount();
   await click(v, "pa-open");
   g.__shared[REQ][S].why = "its machine m is offline";
-  g.__now += 10000; look(v);
+  advance(10000); look(v);
   delete g.__shared[REQ][S]; // the keeper expired it (and notified)
-  g.__now += 21000;
+  advance(21000);
   const { text, clicks } = look(v);
   check(/offline/.test(text) && !/no new tab/.test(text), `the keeper's reason, not a guess (got ${text.slice(0, 300)})`);
   check(Boolean(clicks["pa-open"]), "the button is back");
@@ -338,6 +340,38 @@ cases["R8-order"] = async () => { // M20 (D10): a kept notice goes before one qu
   g.__hcFail = []; g.__hcs = [];
   v.resend(cx); await flush();
   check(JSON.stringify(sends().map((x) => x[2])) === JSON.stringify(["m1", "m2"]), `m1 then m2 (got ${JSON.stringify(sends())})`);
+};
+
+// ---- t-003 review round 2 (REVIEW.md R2-I2, R2-M2, R2-N2) ----
+cases["P-stopped-vanish"] = async () => { // R2-I2: the keeper stopped and the tab vanished: Open, not "Reopening…"
+  world({ records: { tb1: { ...keptShell.tb1, stopped: true } } });
+  const v = await mount();
+  const { text, clicks } = look(v);
+  check(/Not running/.test(text) && !/Reopening/.test(text) && Boolean(clicks["pa-open"]), `Open offered (got ${text.slice(0, 200)})`);
+  await click(v, "pa-open");
+  check(Boolean((g.__shared[REQ] ?? {})[S]), "the click writes a request");
+  world({ records: keptShell }); // not stopped: the keeper reopens it by itself
+  const v2 = await mount();
+  check(/Reopening/.test(look(v2).text) && !look(v2).clicks["pa-open"], "not stopped: Reopening…, no Open");
+};
+
+cases["P-restoring-error"] = async () => { // R2-M2: a restore whose new launcher waits on an error: say why
+  world({ records: { tb1: { ...keptShell.tb1, terminal: "t2", recovering: { since: T0, from: "t1", to: "t2" } } }, extraTabs: [paTab],
+    extraPanes: [{ pane: "p2", terminal: "t2", tab: "tb1", title: "", cwd: "/proj", status: null, program: shell }],
+    extraTerms: [{ address: "t2", state: "live", argv: ["pa-session"], labels: { "herdr.pa.error": "profile test is missing" }, status: null, program: shell }] });
+  const v = await mount();
+  const { text } = look(v);
+  check(/Restoring/.test(text) && /profile test is missing/.test(text) && /Enter/.test(text), `Restoring… with the error (got ${text.slice(0, 300)})`);
+};
+
+cases["P-frozen-mark"] = async () => { // R2-N2: a mark the keeper has not refreshed for 20 s (a reload): alive not trusted
+  const v = await cardsWorld({ records: alive(), extraTabs: [paTab], extraPanes: [paPane()], extraTerms: [paTerm()], agents: [{ address: "t4w", status: "working" }] });
+  check(/working/.test(look(v).text), "trusted while fresh");
+  g.__now += 25000; g.__shared["project-agent.timer"] = { id: "K", at: g.__now - 5000 }; // lease still fresh, the mark frozen
+  check(/unknown/i.test(look(v).text) && !/working/.test(look(v).text), `frozen mark: Status unknown (got ${look(v).text.slice(0, 200)})`);
+  await answerCard(v, "d-x");
+  v.resend(cx); await flush();
+  check(sends().length === 0, `no notice on frozen marks (got ${JSON.stringify(g.__hcs)})`);
 };
 
 const pick = process.argv.slice(2);

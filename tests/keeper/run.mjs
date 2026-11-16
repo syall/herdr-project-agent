@@ -892,6 +892,47 @@ cases["K-open-fresh-read"] = async () => { // M14 (D6): agent.json is read again
   check(argv.includes("other") && argv.includes("/proj2"), `argv from agent.json as it is now (got ${JSON.stringify(argv)})`);
 };
 
+// ---- t-003 review round 2 (REVIEW.md R2-I2, R2-M1, R2-N2) ----
+cases["K-stopped-vanish"] = async () => { // R2-I2: stopped, then the tab vanishes: the record says stopped; Open works
+  const w = world();
+  const k = await start();
+  check(await until(k, 700000, () => k.stopped[S]), "stopped after 3 failed restores");
+  await sim(k, 1500);
+  check(records().tb1?.stopped === true, `the record says stopped (got ${JSON.stringify(records())})`);
+  g.__spaces[0].tabs = g.__spaces[0].tabs.filter((x) => x.id !== "tb1"); g.__panes = g.__panes.filter((p) => p.tab !== "tb1"); g.__terminals = g.__terminals.filter((t) => t.address !== "t1");
+  await sim(k, 300000);
+  check(tabNews().length === 0 && records().tb1?.stopped === true, `no reopen while stopped, the record still says so (runs ${JSON.stringify(tabNews())}, records ${JSON.stringify(records())})`);
+  request(S);
+  check(await until(k, 10000, () => tabNews().length === 1), "Open: one tab.new");
+  appear(null, "tb2", "p2", "t2");
+  await sim(k, 20000, launcherBeats(w));
+  check(records().tb2?.terminal === "t2" && !records().tb2.stopped && !records().tb1 && records().tb2.alive === true, `the new tab is the record, alive, not stopped (got ${JSON.stringify(records())})`);
+  check(tabNews().length === 1, "one tab.new");
+};
+
+cases["K-retired-relaunch"] = async () => { // R2-M1: a launcher really started again in a retired terminal is adopted
+  const w = world();
+  const k = await start();
+  check(await until(k, 700000, () => k.stopped[S]), "stopped");
+  request(S);
+  check(await until(k, 10000, () => tabNews().length === 1), "Open: tab.new");
+  appear(null, "tb2", "p2", "t2");
+  await sim(k, 20000); // its launcher never starts (t2 stays unlabelled)
+  check(records().tb2?.terminal === "t2", "the new tab is the record");
+  const t1 = g.__terminals.find((t) => t.address === "t1"), p1 = g.__panes.find((p) => p.pane === "p1");
+  t1.program = claude; t1.status = "idle"; p1.program = claude; p1.status = "idle"; t1.labels = { ...t1.labels, "herdr.pa": S }; // the person runs the launcher in the old tab
+  check(await until(k, 60000, () => records().tb1?.terminal === "t1" && records().tb1.alive === true, beating(w)), `t1 adopted and alive (got ${JSON.stringify(records())})`);
+  check(!records().tb2, "the failed tab's record is replaced");
+};
+
+cases["K-mark-refresh"] = async () => { // R2-N2: the keeper keeps its mark fresh (readers ignore one older than 20 s)
+  world();
+  const k = await start();
+  await sim(k, 60000);
+  const m = g.__shared["project-agent.keeper"];
+  check(m?.id === "me" && g.__now - m.at <= 12000, `mark refreshed (got ${JSON.stringify(m)} at +${(g.__now - T0) / 1000} s)`);
+};
+
 const pick = process.argv.slice(2);
 let failed = 0;
 for (const [name, fn] of Object.entries(cases)) {
