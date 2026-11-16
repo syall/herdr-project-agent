@@ -81,6 +81,79 @@ cases["P-noagent"] = async () => { // no agent.json: today's branch, the start b
   check(made && made[1].argv[0] === "pa-session", `pa-start runs pa-session in a new tab (got ${JSON.stringify(g.__runs)})`);
 };
 
+// ---- R6: Open Project Agent ----
+const REQ = "project-agent.openAgent";
+const alive = (terminal = "t4w") => ({ tb1: { space: S, project: "/proj", profile: "test", name: "proj", terminal, alive: true } });
+const paTab = { id: "tb1", index: 1, name: "PA: proj", named: true };
+const paPane = (terminal = "t4w") => ({ pane: "p1", terminal, tab: "tb1", title: "PA: proj", cwd: "/proj", status: "working", program: claude });
+const paTerm = (address = "t4w") => ({ address, state: "live", argv: ["pa-session"], labels: { "herdr.pa": S }, status: "working", program: claude });
+
+cases["P-open-shown"] = async () => { // agent.json, no records, no labelled terminal
+  world();
+  const v = await mount();
+  const { text, clicks } = look(v);
+  check(/Not running/.test(text), `header says Not running (got ${text.slice(0, 300)})`);
+  check(Boolean(clicks["pa-open"]) && /Open Project Agent/.test(text), `an Open Project Agent button (clicks ${Object.keys(clicks)})`);
+};
+
+cases["P-open-hidden"] = async () => { // an alive record: no button, the agent's status
+  world({ records: alive(), extraTabs: [paTab], extraPanes: [paPane()], extraTerms: [paTerm()], agents: [{ address: "t4w", status: "working" }] });
+  const v = await mount();
+  const { text, clicks } = look(v);
+  check(!clicks["pa-open"] && !/Not running/.test(text), `no Open button while it runs (clicks ${Object.keys(clicks)})`);
+  check(/working/.test(text), `shows its status (got ${text.slice(0, 200)})`);
+};
+
+cases["P-open-norecord-stale-terminal"] = async () => { // agent.json's terminal names some other live agent; no record
+  world({ agentTerminal: "t5", extraPanes: [{ pane: "p5", terminal: "t5", tab: "tb9", title: "worker", cwd: "/wt", status: "idle", program: claude }],
+    extraTerms: [{ address: "t5", state: "live", argv: ["claude"], parent: "t1", labels: {}, status: "idle", program: claude }], agents: [{ address: "t5", status: "idle" }] });
+  const v = await mount();
+  const { text, clicks } = look(v);
+  check(Boolean(clicks["pa-open"]) && /Not running/.test(text), `Open offered: agent.json's terminal is not the PA's (got ${text.slice(0, 200)})`);
+};
+
+cases["P-open-click"] = async () => { // the click posts a request; "Opening…" and disabled until the tab is recorded
+  world();
+  const v = await mount();
+  await click(v, "pa-open");
+  const req = (g.__shared[REQ] ?? {})[S];
+  check(req && req.at === T0 && req.by === "panel", `request written (got ${JSON.stringify(g.__shared[REQ])})`);
+  let { text, clicks } = look(v);
+  check(/Opening…/.test(text) && !clicks["pa-open"], `Opening… and no click (got ${text.slice(0, 200)}; clicks ${Object.keys(clicks)})`);
+  delete g.__shared[REQ][S]; g.__now += 3000; // the keeper took it; the tab is not recorded yet
+  ({ text, clicks } = look(v));
+  check(/Opening…/.test(text) && !clicks["pa-open"], "still Opening… until the tab is recorded");
+  g.__shared["project-agent.tabs"] = alive(); g.__spaces[0].tabs.push(paTab); g.__panes.push(paPane()); g.__terminals.push(paTerm()); g.__agents = [{ address: "t4w", status: "idle" }];
+  ({ text, clicks } = look(v));
+  check(!/Opening…|Not running/.test(text) && !clicks["pa-open"], `running: no button (got ${text.slice(0, 200)})`);
+};
+
+cases["P-open-timeout"] = async () => { // nothing started after 30 s: says why, the button is back
+  world();
+  const v = await mount();
+  await click(v, "pa-open");
+  g.__shared[REQ][S].why = "another Herdr client holds its keeper.lock";
+  g.__now += 31000;
+  const { text, clicks } = look(v);
+  check(/did not open|not opened/i.test(text) && /keeper\.lock/.test(text), `a message with the reason (got ${text.slice(0, 400)})`);
+  check(Boolean(clicks["pa-open"]), "the button is back");
+};
+
+cases["P-lookalike"] = async () => { // a hand-run agent that looks like this PA: confirm first
+  world({ extraTabs: [{ id: "tb3", index: 2, name: "claude", named: false }], extraPanes: [{ pane: "p3", terminal: "t3", tab: "tb3", title: "PA: proj", cwd: "/elsewhere", status: "idle", program: claude }],
+    extraTerms: [{ address: "t3", state: "live", argv: ["claude", "--resume"], labels: {}, status: "idle", program: claude }], agents: [{ address: "t3", status: "idle" }] });
+  const v = await mount();
+  await click(v, "pa-open");
+  check(!(g.__shared[REQ] ?? {})[S], `no request before the confirm (got ${JSON.stringify(g.__shared[REQ])})`);
+  const { text, clicks } = look(v);
+  check(/seems to run in tab/.test(text) && Boolean(clicks["pa-open-anyway"]) && Boolean(clicks["pa-open-cancel"]), `confirm shown (got ${text.slice(0, 400)})`);
+  await click(v, "pa-open-cancel");
+  check(!(g.__shared[REQ] ?? {})[S] && !/seems to run in tab/.test(look(v).text), "Cancel: nothing written, confirm gone");
+  await click(v, "pa-open");
+  await click(v, "pa-open-anyway");
+  check(Boolean((g.__shared[REQ] ?? {})[S]), "Open anyway writes the request");
+};
+
 const pick = process.argv.slice(2);
 let failed = 0;
 for (const [name, fn] of Object.entries(cases)) {
