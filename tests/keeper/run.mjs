@@ -9,9 +9,10 @@ const here = path.dirname(new URL(import.meta.url).pathname);
 const src = path.join(here, "..", "..", "mods", "project-agent");
 const dst = fs.mkdtempSync(path.join(os.tmpdir(), "t001-keeper-"));
 fs.copyFileSync(path.join(here, "stubs.mjs"), path.join(dst, "stubs.mjs"));
-for (const f of ["keeper.js", "store.js"]) fs.writeFileSync(path.join(dst, f), fs.readFileSync(path.join(src, f), "utf8").replace(/from "herdr"/g, 'from "./stubs.mjs"'));
+for (const f of ["keeper.js", "store.js", "timer.js"]) fs.writeFileSync(path.join(dst, f), fs.readFileSync(path.join(src, f), "utf8").replace(/from "herdr"/g, 'from "./stubs.mjs"'));
 const stubs = await import(path.join(dst, "stubs.mjs"));
 const { Keeper } = await import(path.join(dst, "keeper.js"));
+const timer = await import(path.join(dst, "timer.js"));
 const { cx, flush } = stubs;
 const g = globalThis;
 
@@ -683,6 +684,51 @@ cases["K-alive"] = async () => { // alive: true only for a beating record termin
   g.__machines[1].layout = "unavailable"; g.__offline = ["m"];
   await sim(k, 3000);
   check(!records()["m/tb1"].alive, `not alive while its machine is offline (got ${JSON.stringify(records())})`);
+};
+
+// ---- t-003 R9: passes only to a live launcher terminal (timer.js) ----
+const isoAt = (ms) => new Date(ms).toISOString().replace(/\.\d+Z$/, "Z");
+const SDIR = `/home/u/.config/herdr-pa/spaces/${S}`;
+function timerWorld({ alive = true, schedule = { everyMinutes: 5, lastPass: isoAt(T0 - 600000), onlyWhileActive: false }, request = null, extraTerms = [], extraPanes = [], terminal = "t1" } = {}) {
+  const w = world({ argv: ARGV(), program: shell, status: null, extraTerms, extraPanes });
+  g.__hcs = []; g.__ls = {}; g.__hcFail = [];
+  if (terminal !== "t1") g.__shared["project-agent.tabs"].tb1.terminal = terminal;
+  if (alive) g.__shared["project-agent.tabs"].tb1.alive = true;
+  g.__files[`:${SDIR}/schedule.json`] = JSON.stringify(schedule);
+  g.__files[`:${SDIR}/ledger.json`] = JSON.stringify({ tasks: [] });
+  if (request) g.__files[`:${SDIR}/pass-request.json`] = JSON.stringify(request);
+  return w;
+}
+const passes = () => g.__hcs.filter((a) => a[0] === "send");
+
+cases["T-alive"] = async () => { // alive record, pass due: sent to the record's terminal
+  timerWorld();
+  await timer.tick("me");
+  check(JSON.stringify(passes()) === JSON.stringify([["send", "t1", "scheduled pass"]]), `scheduled pass to t1 (got ${JSON.stringify(g.__hcs)})`);
+};
+
+cases["T-kept-shell"] = async () => { // a labelled kept shell, record not alive: no pass; new-card toasts still come
+  timerWorld({ alive: false });
+  g.__shared["project-agent.cards"] = { [SDIR]: [] };
+  g.__ls[`:${SDIR}/decisions`] = ["d-1.json"];
+  g.__files[`:${SDIR}/decisions/d-1.json`] = JSON.stringify({ id: "d-1", status: "open", question: "Which?", options: [{ label: "A" }] });
+  await timer.tick("me");
+  check(passes().length === 0, `nothing sent into the shell (got ${JSON.stringify(g.__hcs)})`);
+  check(g.__notes.some((n) => /Decision needed/.test(n.title)), `card toast posted (got ${JSON.stringify(g.__notes)})`);
+};
+
+cases["T-two-labelled"] = async () => { // old and new terminal both labelled during a restore: only the alive record's
+  timerWorld({ terminal: "t2", extraPanes: [{ pane: "p2", terminal: "t2", tab: "tb1", title: "", status: "idle", program: claude }],
+    extraTerms: [{ address: "t2", state: "live", argv: ARGV(), labels: { "herdr.pa": S, "herdr.pa.name": "proj" }, status: "idle", program: claude }] });
+  await timer.tick("me");
+  check(JSON.stringify(passes()) === JSON.stringify([["send", "t2", "scheduled pass"]]), `one pass, to t2 (got ${JSON.stringify(g.__hcs)})`);
+};
+
+cases["T-manual"] = async () => { // a queued on-demand pass with no alive record: nothing sent, still pending
+  timerWorld({ alive: false, request: { pending: true, retro: false, at: isoAt(T0), by: "pa-pass" } });
+  await timer.tick("me");
+  check(passes().length === 0, `nothing sent (got ${JSON.stringify(g.__hcs)})`);
+  check(JSON.parse(g.__files[`:${SDIR}/pass-request.json`]).pending === true, "request still pending");
 };
 
 const pick = process.argv.slice(2);

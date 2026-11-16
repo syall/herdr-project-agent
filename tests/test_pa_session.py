@@ -548,3 +548,75 @@ def tearDownModule():
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# t-003 R9: pa-pass, pa-task's notice and pa-worker delete's notice go only to a live launcher.
+hooks_spec = importlib.util.spec_from_file_location("pa_hooks", os.path.join(HERE, "..", "runtime", "tools", "pa_hooks.py"))
+sys.modules["pa"] = pa  # pa_hooks imports pa: the copy loaded above, with the temp homes
+pa_hooks = importlib.util.module_from_spec(hooks_spec)
+hooks_spec.loader.exec_module(pa_hooks)
+
+
+class LiveLauncherOnly(Base):
+    def setUp(self):
+        super().setUp()
+        self.saved_hooks = {k: getattr(pa_hooks, k) for k in ("load_context", "worker_facts", "by_an_agent")}
+        dump({"space": "sp1", "name": "proj", "project": self.project, "profile": "test", "terminal": "t1"}, os.path.join(self.dir, "agent.json"))
+        dump({"tasks": [{"id": "t-1", "state": "queued", "workers": [{"address": "t5", "role": "build"}]}]}, os.path.join(self.dir, "ledger.json"))
+        self.calls = []
+        pa.hc_get = lambda address: {"state": "live", "status": "idle", "labels": {"herdr.pa": "sp1"}} if address else {}
+
+        def call(argv, check=True):
+            self.calls.append(list(argv))
+            return ""
+        pa.call = call
+
+    def tearDown(self):
+        for k, v in self.saved_hooks.items():
+            setattr(pa_hooks, k, v)
+        super().tearDown()
+
+    def sends(self):
+        return [c for c in self.calls if c[:2] == ["hc", "send"]]
+
+    def run_quiet(self, fn, *args):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            fn(*args)
+        return out.getvalue()
+
+    def test_u_pass_stale_heartbeat_is_not_running(self):
+        args = types.SimpleNamespace(space="sp1", pause=False, resume=False, retro=False)
+        self.heartbeat(time.time() - 3600, "t1")
+        with self.assertRaises(pa.Problem) as e:
+            self.run_quiet(pa.cmd_pass, args)
+        self.assertIn("not running", str(e.exception))
+        self.assertEqual(self.sends(), [])
+        self.heartbeat(time.time() - 2, "t1")  # control: a live launcher gets the pass
+        self.run_quiet(pa.cmd_pass, args)
+        self.assertEqual(self.sends(), [["hc", "send", "t1", "manual pass"]])
+
+    def test_u_task_stale_heartbeat_skips_the_notice(self):
+        self.heartbeat(time.time() - 3600, "t1")
+        out = self.run_quiet(pa.cmd_task, types.SimpleNamespace(action="done", task="t-1", space="sp1"))
+        self.assertEqual(self.sends(), [])
+        self.assertIn("not running", out)
+        self.assertEqual(load(os.path.join(self.dir, "ledger.json"))["tasks"][0]["state"], "done")
+        self.heartbeat(time.time() - 2, "t1")  # control
+        self.run_quiet(pa.cmd_task, types.SimpleNamespace(action="park", task="t-1", space="sp1"))
+        self.assertEqual(len(self.sends()), 1)
+        self.assertEqual(self.sends()[0][2], "t1")
+
+    def test_u_worker_delete_stale_heartbeat_skips_the_notice(self):
+        agent = load(os.path.join(self.dir, "agent.json"))
+        pa_hooks.load_context = lambda space: (self.dir, agent, {})
+        pa_hooks.worker_facts = lambda directory, agent, profile, address: ({"address": "t5", "name": "w", "state": "gone", "task": "t-1", "worktree": None}, None)
+        pa_hooks.by_an_agent = lambda: False
+        args = types.SimpleNamespace(space="sp1", address="t5", action="delete", keep_worktree=False, discard=False, with_task=False)
+        self.heartbeat(time.time() - 3600, "t1")
+        self.run_quiet(pa_hooks.cmd_worker, args)
+        self.assertEqual(self.sends(), [])
+        self.heartbeat(time.time() - 2, "t1")  # control
+        self.run_quiet(pa_hooks.cmd_worker, args)
+        self.assertEqual(len(self.sends()), 1)
+        self.assertEqual(self.sends()[0][2], "t1")
