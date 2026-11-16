@@ -12,6 +12,8 @@ Selected by the name it is invoked as (symlinks in ~/.local/bin):
   pa-worker info <address>                      what deleting a worker would remove, as JSON
   pa-worker delete <address> [--keep-worktree] [--discard] [--with-task]
                                                 the person's command: end a worker and remove what belongs to it
+  pa-worker close <address> --evidence F         end a worker whose report is read (agents may run it; guarded)
+  pa-worker close --leftovers [--dry-run]        close every recorded worker that meets the same guards
   pa-hook <name>                                one hook, called by the agent harness (reads its JSON on stdin):
       lint-after-edit   after each edit: lint the changed file
       affected-tests    when a task is marked complete, and (--stop) before the session ends
@@ -21,6 +23,7 @@ Selected by the name it is invoked as (symlinks in ~/.local/bin):
 A failing hook exits with code 2, which sends the agent back to fix it.
 """
 import argparse
+import contextlib
 import json
 import os
 import re
@@ -600,16 +603,209 @@ def worker_facts(directory, agent, profile, address):
     return out, row
 
 
+# ---- pa-worker close ------------------------------------------------------------------------
+# The agent ends a worker once it has read its report. Every check below only reads; a refusal
+# changes nothing. Only a terminal recorded in this space's ledger is ever ended.
+
+GIT_TIMEOUT = 20  # seconds, for each git call made while checking or describing a worktree
+CLOSABLE = ("idle", "done")  # hc statuses a worker may be closed in (also: exited, or already gone)
+
+
+@contextlib.contextmanager
+def ledger_lock(directory):
+    """The lock pa-task and pa-worker take around a read-modify-write of ledger.json."""
+    import fcntl
+    with open(os.path.join(directory, ".ledger.lock"), "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
+def read_ledger(directory):
+    return pa.read_json(os.path.join(directory, "ledger.json"), {}) or {}
+
+
+def append_journal(directory, line):
+    with open(os.path.join(directory, "journal.jsonl"), "a") as journal:
+        journal.write(json.dumps(dict({"at": pa.now()}, **line)) + "\n")
+
+
+def recorded(ledger, address):
+    """(task, entry) of the worker the ledger records at this address, or (None, None). An address
+    recorded twice (an old, closed worker and a new one) gives the one not yet finished."""
+    found = [(t, w) for t in ledger.get("tasks", []) for w in t.get("workers") or [] if w.get("address") == address]
+    found.sort(key=lambda tw: bool(tw[1].get("finished")))
+    return found[0] if found else (None, None)
+
+
+def worker_label(address, entry, info):
+    return "{} ({})".format(address, entry.get("name") or info.get("name") or "unnamed")
+
+
+def identity_refusal(address, task, entry, info):
+    """The terminal at this address is no longer the recorded worker, or the person said to keep it."""
+    if info:
+        got, want = info.get("name") or "", entry.get("name")
+        if (got != want) if want else not got.startswith(str(task.get("id")) + "-"):
+            return "name", "{} is now a different terminal ({}), not {}; nothing was closed".format(
+                address, got or "unnamed", want or "a worker of " + str(task.get("id")))
+    if entry.get("keep"):
+        return "keep", '{} is marked keep ({}: "{}"); only the person closes it, with the × in the panel'.format(
+            worker_label(address, entry, info), entry.get("keptAt"), entry.get("keepQuote"))
+    return None
+
+
+def status_refusal(address, entry, info):
+    """Only an idle, done, exited or gone worker is closed."""
+    if not info:
+        return None
+    status = info.get("status") or ""
+    if status == "working":
+        return "working", "{} is working; close it after its report".format(worker_label(address, entry, info))
+    if status == "blocked":
+        return "blocked", "{} is blocked on a question or a permission; bring that to the person, do not close it".format(
+            worker_label(address, entry, info))
+    if status in CLOSABLE or (not status and info.get("state") == "finished"):
+        return None
+    return "status", "{} has status {}; nothing was closed".format(address, status or "none")
+
+
+def status_files(path):
+    """[(XY status, path)] of the uncommitted files in a git checkout, without .claude/ ones; None if git cannot tell."""
+    try:
+        r = subprocess.run(["git", "-C", path, "status", "--porcelain"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           universal_newlines=True, timeout=GIT_TIMEOUT)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode:
+        return None
+    files = []
+    for line in r.stdout.splitlines():
+        name = line[3:].split(" -> ")[-1].strip().strip('"')
+        if name and not name.startswith(".claude/"):
+            files.append((line[:2].strip(), name))
+    return files
+
+
+def worktree_refusal(task, profile):
+    """The task's worktree holds uncommitted files, or its state cannot be read. A worktree that is
+    gone (or none) is fine: there is nothing in it to lose."""
+    if not task.get("worktree"):
+        return None
+    path = os.path.realpath(os.path.expanduser(task["worktree"]))
+    if not os.path.exists(path):
+        return None
+    facts = worktree_facts(path, profile)
+    custom = (profile or {}).get("worktree") or {}
+    if not facts:
+        why = ("the profile's worktree status script failed" if custom.get("marker") and os.path.exists(os.path.join(path, custom["marker"]))
+               else "not a git worktree")
+        return "unreadable", "cannot tell whether {} holds uncommitted work ({}); nothing was closed".format(path, why)
+    if facts.get("remove"):  # the profile's own kind: its status script gives a count
+        count, names = facts["uncommitted"], []
+    else:
+        files = status_files(path)
+        if files is None:
+            return "unreadable", "cannot tell whether {} holds uncommitted work (git status failed); nothing was closed".format(path)
+        count, names = len(files), [f for _s, f in files]
+    if count:
+        listed = names[:5] + (["+{} more".format(len(names) - 5)] if len(names) > 5 else [])
+        return "uncommitted", "{} has {} uncommitted file(s){}; have them committed or reported first. Nothing was closed".format(
+            path, count, " ({})".format(", ".join(listed)) if listed else "")
+    return None
+
+
+def report_path(directory, task_id, address, given):
+    """The report file the agent read, relative to evidence/<task>/. It must be inside that folder and not empty."""
+    if not given:
+        raise pa.Problem("pa-worker close needs --evidence <file>: the report you read, in evidence/{}/".format(task_id))
+    folder = os.path.realpath(os.path.join(directory, "evidence", task_id))
+    path = os.path.realpath(given if os.path.isabs(given) else os.path.join(folder, given))
+    if not path.startswith(folder + os.sep):
+        raise pa.Problem("{} is not in {}'s task evidence folder evidence/{}/".format(given, address, task_id))
+    if not os.path.isfile(path):
+        raise pa.Problem("evidence {} is missing".format(given))
+    with open(path, "rb") as f:
+        if not f.read().strip():
+            raise pa.Problem("evidence {} is empty; read the report before closing".format(given))
+    return os.path.relpath(path, folder)
+
+
+def end_worker(directory, ledger, task, entry, address, report, by, trigger):
+    """Ends one worker whose checks passed: kill if live, rm, then mark its ledger entry and journal
+    it. The caller holds the ledger lock, re-read the ledger and re-checked the status. Returns the
+    line to print. Never touches the worktree, the branch, the task or the evidence."""
+    info = pa.hc_get(address)
+    note = ""
+    if info:
+        if info.get("state") == "live":
+            pa.call(["hc", "kill", address], check=False)
+        pa.call(["hc", "rm", address], check=False)
+        if pa.hc_get(address):
+            note = " (ended {} but hc rm did not remove its record)".format(address)
+    stamp = pa.now()
+    entry.update(finished=True, closed=stamp, closedBy=by, report=report)
+    task["updated"] = stamp
+    pa.write_json(os.path.join(directory, "ledger.json"), ledger)
+    name = entry.get("name") or "unnamed"
+    append_journal(directory, {"by": by, "trigger": trigger, "task": task.get("id"),
+                               "why": "closed worker {} ({}) after reading its report {}".format(address, name, report)})
+    return "Closed worker {} ({}, task {}); its worktree and branch are untouched.{}".format(address, name, task.get("id"), note)
+
+
+def close_worker(directory, agent, profile, address, evidence):
+    """pa-worker close <address> --evidence F (spec 3.2 and 3.3)."""
+    if "/" in address:
+        raise pa.Problem("{} is on another machine; pa-worker close runs on the machine the space runs on".format(address))
+    if address == agent.get("terminal"):
+        raise pa.Problem("that is the Project Agent itself; it ends when its space is closed")
+    task, entry = recorded(read_ledger(directory), address)
+    if not entry:
+        raise pa.Problem("{} is not a recorded worker of this space; nothing was closed (if it is yours, close it in Herdr)".format(address))
+    info = pa.hc_get(address)
+    refusal = identity_refusal(address, task, entry, info)
+    if refusal:
+        raise pa.Problem(refusal[1])
+    if entry.get("finished") and not info:
+        print("{} is already closed.".format(address))
+        return
+    report = report_path(directory, task["id"], address, evidence)
+    refusal = status_refusal(address, entry, info) or worktree_refusal(task, profile)
+    if refusal:
+        raise pa.Problem(refusal[1])
+    by = "agent" if by_an_agent() else "person"
+    with ledger_lock(directory):
+        ledger = read_ledger(directory)
+        task, entry = recorded(ledger, address)
+        if not entry:
+            raise pa.Problem("{} is not a recorded worker of this space; nothing was closed (if it is yours, close it in Herdr)".format(address))
+        info = pa.hc_get(address)
+        refusal = identity_refusal(address, task, entry, info) or status_refusal(address, entry, info)
+        if refusal:
+            raise pa.Problem(refusal[1])
+        print(end_worker(directory, ledger, task, entry, address, report, by, "close"))
+
+
+def close_leftovers(directory, agent, profile, dry_run):
+    raise pa.Problem("pa-worker close --leftovers is not built yet")
+
+
 def cmd_worker(args):
-    space = pa.local_id(args.space or space_from_terminal() or "")
+    given = args.space or space_from_terminal() or ""
+    space = pa.local_id(given)
     if not space:
         raise pa.Problem("pass --space <id>")
+    if args.action == "close" and "/" in given and not os.path.isdir(pa.space_dir(space)):
+        raise pa.Problem("space {} lives on {}; run pa-worker there (its Project Agent does)".format(given, given.split("/")[0]))
     directory, agent, profile = load_context(space)
+    if args.action == "close":
+        if args.leftovers:
+            return close_leftovers(directory, agent, profile, args.dry_run)
+        return close_worker(directory, agent, profile, args.address, args.evidence)
     facts, row = worker_facts(directory, agent, profile, args.address)
     if args.action == "info":
         print(json.dumps(facts, indent=2))
         return
-    if by_an_agent():
+    if by_an_agent():  # delete only: close is the agent's
         raise pa.Problem("pa-worker delete is the person's command. To remove a worker or a worktree, ask the person.")
     if facts["address"] == agent.get("terminal"):
         raise pa.Problem("that is the Project Agent itself; it ends when its space is closed")
@@ -714,13 +910,21 @@ def main():
             raise pa.Problem("pa-worktree remove needs a task id")
         return cmd_worktree(args)
     if kind == "pa-worker":
-        parser.add_argument("action", choices=("info", "delete"))
-        parser.add_argument("address")
-        parser.add_argument("--keep-worktree", action="store_true", help="leave its worktree in place")
-        parser.add_argument("--discard", action="store_true", help="delete the worktree even with uncommitted files or unpushed commits")
-        parser.add_argument("--with-task", action="store_true", help="also delete its task, with the task's evidence and cards (to the trash)")
+        parser.add_argument("action", choices=("info", "delete", "close"))
+        parser.add_argument("address", nargs="?")
+        parser.add_argument("--keep-worktree", action="store_true", help="delete: leave its worktree in place")
+        parser.add_argument("--discard", action="store_true", help="delete: delete the worktree even with uncommitted files or unpushed commits")
+        parser.add_argument("--with-task", action="store_true", help="delete: also delete its task, with the task's evidence and cards (to the trash)")
+        parser.add_argument("--evidence", help="close: the report you read, a file in evidence/<task>/")
+        parser.add_argument("--leftovers", action="store_true", help="close: every recorded worker from before one-worker-per-job that meets the guards")
+        parser.add_argument("--dry-run", action="store_true", help="close --leftovers: only list what it would do")
         parser.add_argument("--space")
-        return cmd_worker(parser.parse_args())
+        args = parser.parse_args()
+        if args.action == "close" and bool(args.address) == bool(args.leftovers):
+            raise pa.Problem("pa-worker close needs an address and --evidence, or --leftovers")
+        if args.action != "close" and not args.address:
+            raise pa.Problem("pa-worker {} needs an address".format(args.action))
+        return cmd_worker(args)
     if kind == "pa-full-suite":
         return cmd_full_suite(parser.parse_args())
     raise pa.Problem("invoke as pa-gate, pa-hooks, pa-hook, pa-worktree, pa-worker or pa-full-suite")
