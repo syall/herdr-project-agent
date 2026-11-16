@@ -483,7 +483,11 @@ export default class ProjectAgent extends View {
     // may be a stale copy's); it runs (live); or it does not (down: the only state with Open).
     const offline = Boolean(space.machine) && !machines().some((m) => m.name === space.machine && m.layout === "ready");
     const target = offline ? null : liveTarget(space.id);
-    const known = offline ? "offline" : !keeperJudging() ? "unknown" : target ? "live" : "down";
+    const recs = Object.entries(shared("project-agent.tabs") ?? {}).filter(([, r]) => r?.space === space.id);
+    const known = offline ? "offline" : !keeperJudging() ? "unknown" : target ? "live"
+      : recs.some(([, r]) => r.recovering) ? "restoring" // the keeper restores it in its tab
+      : recs.some(([tab]) => !space.tabs.some((x) => x.id === tab)) ? "reopening" // its tab vanished: the keeper reopens it
+      : "down";
     const live = target ? agents().find((x) => x.address === target.address) ?? { status: null } : null;
     const req = (shared(OPEN_REQUESTS) ?? {})[space.id], now = Date.now();
     if (target) { delete this.opening[space.id]; delete this.openMsg[space.id]; delete this.confirmOpen[space.id]; }
@@ -491,18 +495,20 @@ export default class ProjectAgent extends View {
     const recTerms = paRecords(space.id).map((r) => terminals().find((x) => x.address === r.terminal && x.state === "live")).filter(Boolean);
     const startingNow = recTerms.map(startingLabels).find(Boolean) ?? null;
     const o = this.opening[space.id];
+    if (o && req?.why) o.why = req.why; // kept: the keeper may give the request up (and delete it) before the panel's 30 s
     if (o && !startingNow) {
       const opened = recTerms.some((x) => !o.before.includes(x.address)); // the keeper recorded a new tab since the click
       if (now - o.at > (opened ? OPEN_SLOW : OPEN_WAIT)) {
         this.openMsg[space.id] = opened ? "The Project Agent's new tab is open, but its launcher has not started after 3 minutes. Look at its tab."
           : req ? `The Project Agent did not open within 30 s: ${req.why ?? "the request was not taken (the keeper runs in a layout with the Project Agent panel)"}.`
+          : o.why ? `The Project Agent did not open: ${o.why}.`
           : "The Project Agent did not open: the keeper took the request but no new tab was recorded. See the notifications for why.";
         delete this.opening[space.id];
       }
     }
     const waiting = known === "down" && (Boolean(this.opening[space.id]) || Boolean(req && now - Number(req.at) < OPEN_WAIT) || Boolean(startingNow));
     const like = known === "down" ? this.confirmOpen[space.id] : null;
-    const stateText = { offline: "Machine offline · status unknown", unknown: "Status unknown", down: "Not running" }[known];
+    const stateText = { offline: "Machine offline · status unknown", unknown: "Status unknown", restoring: "Restoring…", reopening: "Reopening…", down: "Not running" }[known];
     // Newest first: by when a task last changed (else when it was made), then by id.
     const stamp = (x) => String(x.updated ?? x.created ?? "");
     const tasks = [...(data.ledger?.tasks ?? [])].sort((x, y) => stamp(y).localeCompare(stamp(x)) || String(y.id ?? "").localeCompare(String(x.id ?? ""), undefined, { numeric: true }));

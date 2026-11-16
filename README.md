@@ -82,8 +82,9 @@ New spaces start the launcher with `space.new { argv: ["pa-session", "--ask"] }`
   no record (a hand-run or never-recorded agent, or a tab closed while no keeper ran), or a keeper
   that gave up after 3 failures. It shows whenever agent.json exists, the space's machine is ready,
   the current keeper has judged, and no record is `alive`. While the machine is offline the header
-  says "Machine offline · status unknown"; before a keeper has judged, "Status unknown"; neither
-  offers Open. An Open over a record that is not running (a kept shell, a hand-run program) replaces
+  says "Machine offline · status unknown"; before a keeper has judged, "Status unknown"; while the
+  keeper restores the record's tab, "Restoring…", and while it reopens a vanished one, "Reopening…".
+  None of these offers Open. An Open over a record that is not running (a kept shell, a hand-run program) replaces
   that record and retires its terminal: it is never adopted or marked alive again.
 - `pa-session` and `pa-start` refuse to start a second Project Agent only while another terminal's
   launcher is alive; a labelled terminal whose heartbeat stopped is replaced.
