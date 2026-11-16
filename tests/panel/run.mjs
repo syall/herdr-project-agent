@@ -427,6 +427,17 @@ cases["P-open-slow"] = async () => { // N10: the new tab is recorded but its lau
   check(/has not started after 3 minutes/.test(text) && Boolean(clicks["pa-open"]), `after 3 minutes it says so and Open is back (got ${text.slice(0, 300)})`);
 };
 
+cases["P-open-error-long"] = async () => { // N5d: clicked, the new launcher waits on an error for minutes: no timeout message, no Open
+  world();
+  const v = await mount();
+  await click(v, "pa-open");
+  delete g.__shared[REQ][S];
+  startingRecord({ "herdr.pa.error": "profile test is missing" });
+  advance(200000);
+  const { text, clicks } = look(v);
+  check(/profile test is missing/.test(text) && !/has not started after 3 minutes|did not open/.test(text) && !clicks["pa-open"], `the error, no timeout message (got ${text.slice(0, 300)})`);
+};
+
 const pick = process.argv.slice(2);
 let failed = 0;
 for (const [name, fn] of Object.entries(cases)) {
