@@ -1024,12 +1024,12 @@ def report_path(directory, task_id, address, given):
     return os.path.relpath(path, folder)
 
 
-def end_worker(directory, ledger, task, entry, address, report, by, trigger, actor=None):
+def end_worker(directory, ledger, task, entry, address, info, report, by, trigger, actor=None):
     """Ends one worker whose checks passed: kill if live, rm, then mark its ledger entry and journal
-    it. The caller holds the ledger lock, re-read the ledger and re-checked the status. Returns the
+    it. The caller holds the ledger lock, re-read the ledger and re-checked the status (`info`, the
+    `hc get` it checked; empty when the terminal is already gone). Returns the
     line to print. Never touches the worktree, the branch, the task or the evidence. `by` goes into the
     entry's closedBy; `actor` (default: `by`) is who the journal line says ran it."""
-    info = pa.hc_get(address)
     note = ""
     if info:
         if info.get("state") == "live":
@@ -1077,7 +1077,10 @@ def close_worker(directory, agent, profile, address, evidence):
         refusal = identity_refusal(address, task, entry, info) or status_refusal(address, entry, info)
         if refusal:
             raise pa.Problem(refusal[1])
-        print(end_worker(directory, ledger, task, entry, address, report, by, "close"))
+        if entry.get("finished") and not info:  # closed meanwhile (another pa-worker close)
+            print("{} is already closed.".format(address))
+            return
+        print(end_worker(directory, ledger, task, entry, address, info, report, by, "close"))
 
 
 def keep_worker(directory, agent, address, quote, off):
@@ -1234,7 +1237,7 @@ def close_leftovers(directory, agent, profile, dry_run):
             if refusal or not info:
                 kept.append((task, entry, (LEFTOVER_REASONS.get(refusal[0]) or refusal[1]) if refusal else "gone; left for the agent to read"))
                 continue
-            done.append(end_worker(directory, ledger, task, entry, address, report, "leftovers", "leftovers", by))
+            done.append(end_worker(directory, ledger, task, entry, address, info, report, "leftovers", "leftovers", by))
         ledger["workerPolicy"] = {"style": "per-job", "since": pa.now()}
         pa.write_json(os.path.join(directory, "ledger.json"), ledger)
     for line in done:
