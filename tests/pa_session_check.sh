@@ -1,5 +1,5 @@
 #!/bin/sh
-# Integration check for pa-session (t-001, spec §4.1: S1 S2 S5 S6a S7) against a PRIVATE hc core.
+# Integration check for pa-session (t-001, spec §4.1: S1 S2 S3 S5 S6a S7) against a PRIVATE hc core.
 # Usage: tests/pa_session_check.sh <scratch dir made by tests/setup-scratch.sh>
 # Every hc call goes through scratch(): its own HC_SESSION and XDG folders under the scratch dir,
 # HC_TERMINAL_ID / HC_SOCKET / HC_TERMINAL_SOCKET / HC_SCOPE unset (HC_TERMINAL_SOCKET names the live
@@ -12,6 +12,7 @@ case "$S" in /tmp/*|/private/tmp/*|/var/folders/*) ;; *) echo "refusing: $S is n
 SESSION="pa-t001-$$"
 SP=sp0123456789abcdef0123456789abcdef
 SP2=spfedcba9876543210fedcba9876543210
+SP3=sp00112233445566778899aabbccddeeff
 LOG="$S/stub.log"
 scratch() {
   env -u HC_TERMINAL_ID -u HC_SOCKET -u HC_TERMINAL_SOCKET -u HC_SCOPE -u CLAUDECODE \
@@ -59,9 +60,9 @@ if [ "$live" != 0 ] || [ -z "$sock" ] || [ -n "$outside" ]; then
 fi
 echo "scratch core: session $SESSION, pid $pid, listening socket $sock (under $S), live=$live"
 cleanup() {
-  for t in n1 n2 n3 n4 n5; do scratch hc kill "$t" >/dev/null 2>&1; done
+  for t in n1 n2 n3 n4 n5 n6 n7; do scratch hc kill "$t" >/dev/null 2>&1; done
   sleep 1
-  for t in n1 n2 n3 n4 n5; do scratch hc rm "$t" >/dev/null 2>&1; done
+  for t in n1 n2 n3 n4 n5 n6 n7; do scratch hc rm "$t" >/dev/null 2>&1; done
   scratch hc server stop >/dev/null 2>&1
 }
 trap cleanup EXIT
@@ -124,6 +125,27 @@ if wait_for 15 has_lines $((before + 1)); then
   [ -z "$(label n5 herdr.pa.error)" ] && pass "S7 herdr.pa.error removed" || fail S7 "label still: $(label n5 herdr.pa.error)"
   [ "$(label n5 herdr.pa)" = "$SP2" ] && pass "S7 labelled after the retry" || fail S7 "herdr.pa=$(label n5 herdr.pa)"
 else fail S7 "no start after Enter; n5: $(scratch hc read n5 2>&1 | tail -n 5)"; fi
+
+# S3: killed after 5 s (the session never ran 20 s), the next start is a new session.
+before=$(lines)
+start n6 "$SP3" "$S/proj"
+if wait_for 15 has_lines $((before + 1)); then
+  sid3=$(agent "$SP3" sessionId)
+  sleep 4
+  scratch hc kill n6 >/dev/null
+  wait_for 10 not_live n6
+  sleep 20  # a restore comes later than this (the keeper needs ~30-45 s): the session is long dead
+  start n7 "$SP3" "$S/proj"
+  if wait_for 15 has_lines $((before + 2)); then
+    case "$(last)" in
+      *"--resume "*) fail S3 "resumed a session that never ran: $(last | cut -c1-90)" ;;
+      *"--session-id $sid3 "*) fail S3 "reused the never-run session id $sid3" ;;
+      *"--session-id "*) pass "S3 new session after a 5-s run" ;;
+      *) fail S3 "stub argv: $(last | cut -c1-90)" ;;
+    esac
+    tail -n 1 "$S/pa/spaces/$SP3/session.log" | grep -q "reason=new" && pass "S3 session.log reason=new" || fail S3 "session.log: $(tail -n 1 "$S/pa/spaces/$SP3/session.log")"
+  else fail S3 "no second start; n7: $(scratch hc read n7 2>&1 | tail -n 5)"; fi
+else fail S3 "stub never started; n6: $(scratch hc read n6 2>&1 | tail -n 5)"; fi
 
 [ "$fails" = 0 ] && echo "all pa-session checks passed" || echo "$fails pa-session check(s) failed"
 [ "$fails" = 0 ]

@@ -10,6 +10,8 @@ import io
 import json
 import os
 import shutil
+import signal
+import builtins
 import sys
 import tempfile
 import time
@@ -230,6 +232,72 @@ class Liveness(Base):
         dump(agent, path)
         pa.init_state("sp1", self.project, p)
         self.assertIn("closed", load(path))
+
+
+class ReviewRound(Base):
+    """REVIEW.md I1 (the launcher's own heartbeat) and M4 (Ctrl-C in error-wait)."""
+
+    def test_u16_own_heartbeat_does_not_make_a_session_ran(self):
+        # The reviewer's probe: session X started an hour ago in t9 and was killed after 5 s (no exit
+        # line; t9's last beat at +5 s). A new launcher in t1 must start a new session, even though
+        # its own first heartbeat is written before it decides.
+        began = int(time.time()) - 3600
+        self.log("{} start resume=False session={}".format(iso(began), SID))
+        self.heartbeat(began + 5, "t9")
+        prof = os.path.join(pa.ROOT, "profiles", "test")
+        os.makedirs(prof, exist_ok=True)
+        dump({"name": "test", "claude": ["true"], "codex": ["true"]}, os.path.join(prof, "profile.json"))
+        dump({"version": 1, "space": "sp1", "project": self.project, "profile": "test", "name": "proj",
+              "terminal": "t9", "sessionId": SID, "sessionStarted": False}, os.path.join(self.dir, "agent.json"))
+        pa.hc_get = lambda address: {}
+        pa.live_terminals = lambda: {}
+        pa.call = lambda argv, check=True: ""
+        heartbeat = self.heartbeat
+
+        class FirstBeat:  # the real beat thread writes the heartbeat at once; do that, then nothing
+            def __init__(self, target=None, daemon=None):
+                pass
+
+            def start(self):
+                heartbeat(time.time(), "t1")
+        started = []
+
+        class Stop(Exception):
+            pass
+
+        def fake_call(argv, cwd=None):
+            started.append(argv)
+            raise Stop()
+        saved = (pa.threading.Thread, pa.subprocess.call, signal.getsignal(signal.SIGINT))
+        pa.threading.Thread, pa.subprocess.call = FirstBeat, fake_call
+        try:
+            args = types.SimpleNamespace(space="sp1", project=self.project, profile="test", name=None, auto=False, ask=False, fresh=False)
+            with self.assertRaises(Stop):
+                pa.run_session(args, "t1", {}, "sp1", self.project, {"beat": False})
+        finally:
+            pa.threading.Thread, pa.subprocess.call = saved[0], saved[1]
+            signal.signal(signal.SIGINT, saved[2])
+        argv = started[0]
+        self.assertNotIn("--resume", argv)
+        self.assertIn("--session-id", argv)
+        self.assertNotEqual(argv[argv.index("--session-id") + 1], SID)
+
+    def test_u17_error_wait_lets_ctrl_c_through(self):
+        pa.call = lambda argv, check=True: ""
+        seen = {}
+
+        def fake_input(*a):
+            seen["handler"] = signal.getsignal(signal.SIGINT)
+            return ""
+        saved_input, saved = builtins.input, signal.signal(signal.SIGINT, signal.SIG_IGN)
+        builtins.input = fake_input
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                pa.error_wait("t1", pa.Problem("profile command not found: x"))
+        finally:
+            builtins.input = saved_input
+            signal.signal(signal.SIGINT, saved)
+        self.assertIs(seen["handler"], signal.default_int_handler)
 
 
 def tearDownModule():

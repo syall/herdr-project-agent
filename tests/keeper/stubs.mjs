@@ -5,6 +5,7 @@
 //   __shared                                                shared state (setShared writes here)
 //   __files   { "<machine or ''>:<path>": text }            files readTextFile sees (null/absent: none)
 //   __offline [machine names]                               readTextFile/exec on them throw
+//   __fail    ["<machine>:<path>"]                          readTextFile of these throws (a failed read)
 //   __runs    [[name, args]]                                every run() call
 //   __notes   [notification]                                every notify() call
 //   __reads   ["<machine>:<path>"]                          every readTextFile() call
@@ -33,6 +34,7 @@ export const readTextFile = async (path, options = {}) => {
   const on = options?.on ?? null;
   (g.__reads ??= []).push(key(path, on));
   if (offline(on)) throw new Error(`machine ${on} is unreachable`);
+  if ((g.__fail ?? []).includes(key(path, on))) throw new Error("read failed");
   const v = (g.__files ?? {})[key(path, on)];
   return v === undefined ? null : v;
 };
