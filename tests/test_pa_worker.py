@@ -1212,7 +1212,11 @@ class Describe(Base):
         self.assertIn("Deleting: the branch t-003-x and its commits are kept; the 1 uncommitted files are DISCARDED.", lines)
         self.assertEqual(lines[-1], "Full list: WORKTREE.md")
         self.assertEqual(card["evidence"], ["WORKTREE.md"])
-        self.assertEqual(card["snapshot"], {"uncommitted": 1, "unpushed": 1, "commits": 3})
+        snap = card["snapshot"]
+        self.assertEqual((snap["uncommitted"], snap["unpushed"], snap["commits"]), (1, 1, 3))
+        # review round 1, I1: what pa-worktree remove compares later
+        self.assertEqual(snap["heads"], {os.path.realpath(self.wt): sh(self.wt, "git", "rev-parse", "HEAD")})
+        self.assertEqual(snap["uncommittedFiles"], {os.path.realpath(self.wt): ["README"]})
         self.assertEqual(card["recommendation"], "Keep")
         md = self.md()
         for text in ("c1 adds a", "c2 adds b", "c3 trims a", "a.txt", "README", "t-003-x"):
