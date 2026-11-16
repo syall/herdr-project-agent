@@ -883,10 +883,8 @@ cases["K-drop-newer"] = async () => { // M9: the keeper deletes only the request
 
 cases["K-open-fresh-read"] = async () => { // M14 (D6): agent.json is read again for a request; its current profile is used
   const w = world({ tabPresent: false, termLive: false, record: false });
-  const k = await start(); // agent.json not read yet (no record, no request)
-  await sim(k, 3000);
-  g.__files[w.f("agent.json")] = JSON.stringify({ space: S, project: "/proj", profile: "test", name: "proj" });
-  k.readBeats(cx); await flush(); // known as "test"
+  const k = await start();
+  k.config[S] = { state: "open", at: T0, info: { project: "/proj", profile: "test", name: "proj" } }; // read earlier, as "test"
   g.__files[w.f("agent.json")] = JSON.stringify({ space: S, project: "/proj2", profile: "other", name: "proj" });
   g.__now += 1000; request(S);
   check(await until(k, 10000, () => tabNews().length > 0), "tab.new");
