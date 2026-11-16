@@ -282,6 +282,64 @@ cases["R8-retry"] = async () => { // N2: a live target whose hc send fails: kept
   check(JSON.stringify(sends()) === JSON.stringify([["send", "t4w", "decision d-x answered"], ["send", "t4w", "decision d-y answered"]]), `both sent, in order (got ${JSON.stringify(sends())})`);
 };
 
+// ---- t-003 verifier round (VERIFY.md F2, F3, §4 surviving mutations) ----
+cases["P-open-why-kept"] = async () => { // F2: the keeper gives the request up first: the panel keeps its reason
+  world();
+  const v = await mount();
+  await click(v, "pa-open");
+  g.__shared[REQ][S].why = "its machine m is offline";
+  g.__now += 10000; look(v);
+  delete g.__shared[REQ][S]; // the keeper expired it (and notified)
+  g.__now += 21000;
+  const { text, clicks } = look(v);
+  check(/offline/.test(text) && !/no new tab/.test(text), `the keeper's reason, not a guess (got ${text.slice(0, 300)})`);
+  check(Boolean(clicks["pa-open"]), "the button is back");
+};
+
+const keptShell = { tb1: { space: S, project: "/proj", profile: "test", name: "proj", terminal: "t1" } };
+cases["P-kept-shell"] = async () => { // M3b: a record that is not alive (kept shell): Not running, Open, nothing sent
+  const v = await cardsWorld({ records: keptShell, extraTabs: [paTab], extraPanes: [{ pane: "p1", terminal: "t1", tab: "tb1", title: "zsh", cwd: "/home/u", status: null, program: shell }],
+    extraTerms: [{ address: "t1", state: "live", argv: ["zsh"], labels: { "herdr.pa": S }, status: null, program: shell }] });
+  const { text, clicks } = look(v);
+  check(/Not running/.test(text) && Boolean(clicks["pa-open"]), `Not running + Open (got ${text.slice(0, 200)})`);
+  await answerCard(v, "d-x");
+  v.resend(cx); await flush();
+  check(sends().length === 0, `nothing typed into the kept shell (got ${JSON.stringify(g.__hcs)})`);
+};
+
+cases["P-restoring"] = async () => { // F3: while the keeper restores (or reopens) the record: no Open
+  world({ records: { tb1: { ...keptShell.tb1, recovering: { since: T0, from: "t1" } } }, extraTabs: [paTab],
+    extraPanes: [{ pane: "p1", terminal: "t1", tab: "tb1", title: "zsh", cwd: "/proj", status: null, program: shell }], extraTerms: [{ address: "t1", state: "live", argv: ["zsh"], labels: {}, status: null, program: shell }] });
+  let v = await mount();
+  check(/Restoring/.test(look(v).text) && !look(v).clicks["pa-open"], `Restoring…, no Open (got ${look(v).text.slice(0, 200)})`);
+  world({ records: keptShell }); // its tab vanished: the keeper reopens it
+  v = await mount();
+  check(/Reopening/.test(look(v).text) && !look(v).clicks["pa-open"], `Reopening…, no Open (got ${look(v).text.slice(0, 200)})`);
+};
+
+cases["P-lookalike-negative"] = async () => { // M7d, M7e: a worker, or an unrelated agent elsewhere, is no look-alike
+  lookAlikeWorld({ tabName: "claude", title: "✳ Claude Code", cwd: "/elsewhere" });
+  let v = await mount();
+  await click(v, "pa-open");
+  check(Boolean((g.__shared[REQ] ?? {})[S]) && !/seems to run/.test(look(v).text), "an unrelated agent: no confirm");
+  world({ extraTabs: [{ id: "tb3", index: 2, name: "PA: proj worker", named: true }], extraPanes: [{ pane: "p3", terminal: "t3", tab: "tb3", title: "PA: proj", cwd: "/proj", status: "working", program: claude }],
+    extraTerms: [{ address: "t3", state: "live", argv: ["claude"], parent: "t1", labels: {}, status: "working", program: claude }] });
+  v = await mount();
+  await click(v, "pa-open");
+  check(Boolean((g.__shared[REQ] ?? {})[S]) && !/seems to run/.test(look(v).text), "a worker (parent set): no confirm");
+};
+
+cases["R8-order"] = async () => { // M20 (D10): a kept notice goes before one queued while it was being sent
+  const v = await cardsWorld({ records: alive("t4w"), extraTabs: [paTab], extraPanes: [paPane()], extraTerms: [paTerm()], agents: [{ address: "t4w", status: "idle" }] }, []);
+  v.unsent = [{ spaceId: S, message: "m1" }];
+  g.__hcFail = ["t4w"];
+  g.__onHc = () => { g.__onHc = null; v.unsent.push({ spaceId: S, message: "m2" }); };
+  v.resend(cx); await flush();
+  g.__hcFail = []; g.__hcs = [];
+  v.resend(cx); await flush();
+  check(JSON.stringify(sends().map((x) => x[2])) === JSON.stringify(["m1", "m2"]), `m1 then m2 (got ${JSON.stringify(sends())})`);
+};
+
 const pick = process.argv.slice(2);
 let failed = 0;
 for (const [name, fn] of Object.entries(cases)) {

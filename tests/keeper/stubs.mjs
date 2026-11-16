@@ -15,6 +15,7 @@
 //   __writes  ["<machine>:<path>"]                          every file write
 //   __hcs     [[args]]                                      every hc() call (hc send ... included)
 //   __hcFail  ["<address>"]                                 hc send to these exits 1
+//   __onHc    fn(args)                                      called inside each hc() call, before it settles
 //   __ls      { "<machine or ''>:<dir>": ["name", ...] }    what `ls -1 <dir>` lists
 //   __now                                                   Date.now()
 const g = globalThis;
@@ -76,6 +77,8 @@ export const exec = async (command, args = [], options = {}) => {
 };
 export const hc = async (args = []) => {
   (g.__hcs ??= []).push(args);
+  await Promise.resolve();
+  g.__onHc?.(args);
   if (args[0] === "send" && (g.__hcFail ?? []).includes(args[1])) return { code: 1, stdout: "", stderr: "refused" };
   return { code: 0, stdout: "", stderr: "" };
 };

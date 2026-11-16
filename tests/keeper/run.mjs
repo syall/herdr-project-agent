@@ -848,6 +848,52 @@ cases["T-stale-keeper"] = async () => { // M2: an "alive" written by a keeper th
   check(passes().length === 0, `nothing sent on a stale alive mark (got ${JSON.stringify(g.__hcs)})`);
 };
 
+// ---- t-003 verifier round (VERIFY.md §4 surviving mutations) ----
+cases["K-open-labelled-norecord"] = async () => { // M1c: a labelled terminal with a fresh beat and no record (before any adoption): refused
+  const w = world({ program: claude, status: "idle", record: false, created: T0 - 600000 });
+  const k = new Keeper("me");
+  k.config[S] = { state: "open", at: T0, info: { project: "/proj", profile: "test", name: "proj" } };
+  k.hb[S] = `${T0 / 1000 - 2} t1\n`;
+  request(S, T0 - 1000);
+  k.openRequests(cx, {}, g.__spaces, g.__terminals, g.__panes, T0);
+  check(tabNews().length === 0 && !requests()[S], `refused, request removed (runs ${JSON.stringify(g.__runs)}, requests ${JSON.stringify(requests())})`);
+  check(noteText().some((n) => /already running/i.test(n)), "notice: already running");
+  void w;
+};
+
+cases["K-alive-nolabel"] = async () => { // M5 (D4): a beating terminal that no longer carries the launcher's label is not alive
+  const w = world({ program: claude, status: "idle", created: T0 - 600000 });
+  const k = await start();
+  await sim(k, 20000, beating(w));
+  check(records().tb1.alive === true, "alive while labelled");
+  delete g.__terminals.find((t) => t.address === "t1").labels["herdr.pa"];
+  await sim(k, 1500, beating(w));
+  check(!records().tb1.alive, `not alive without the label (got ${JSON.stringify(records().tb1)})`);
+};
+
+cases["K-drop-newer"] = async () => { // M9: the keeper deletes only the request it handled, not a newer one
+  world();
+  const k = new Keeper("me");
+  request(S, T0 + 5);
+  k.dropRequest(S, { at: T0, by: "panel" });
+  check(requests()[S]?.at === T0 + 5, `newer request kept (got ${JSON.stringify(requests())})`);
+  k.dropRequest(S, { at: T0 + 5, by: "panel" });
+  check(!requests()[S], "the handled one is deleted");
+};
+
+cases["K-open-fresh-read"] = async () => { // M14 (D6): agent.json is read again for a request; its current profile is used
+  const w = world({ tabPresent: false, termLive: false, record: false });
+  const k = await start(); // agent.json not read yet (no record, no request)
+  await sim(k, 3000);
+  g.__files[w.f("agent.json")] = JSON.stringify({ space: S, project: "/proj", profile: "test", name: "proj" });
+  k.readBeats(cx); await flush(); // known as "test"
+  g.__files[w.f("agent.json")] = JSON.stringify({ space: S, project: "/proj2", profile: "other", name: "proj" });
+  g.__now += 1000; request(S);
+  check(await until(k, 10000, () => tabNews().length > 0), "tab.new");
+  const argv = tabNews()[0][1].argv;
+  check(argv.includes("other") && argv.includes("/proj2"), `argv from agent.json as it is now (got ${JSON.stringify(argv)})`);
+};
+
 const pick = process.argv.slice(2);
 let failed = 0;
 for (const [name, fn] of Object.entries(cases)) {
