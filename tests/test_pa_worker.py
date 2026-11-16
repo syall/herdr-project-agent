@@ -671,5 +671,78 @@ class Close(Base):
         self.assertEqual(self.ended(), [])
 
 
+class Keep(Base):
+    """R3: pa-worker keep <address> --quote "<words>" [--off]; close and pa-cleanup honour it."""
+
+    def setUp(self):
+        super().setUp()
+        self.add_task("t-003", "in-progress", None, [{"address": "t31", "role": "build", "name": "t-003-tests"}])
+        self.term("t31", "t-003-tests")
+        self.evidence("t-003")
+        pa_hooks.by_an_agent = lambda: True
+
+    def test_k1_keep_and_off(self):
+        code, out, err = self.worker("keep", "t31", "--quote", "keep t31, I want to ask it something")
+        self.assertEqual(code, 0, err)
+        w = self.entry("t-003", "t31")
+        self.assertEqual((w["keep"], w["keepQuote"]), (True, "keep t31, I want to ask it something"))
+        self.assertRegex(w["keptAt"], r"^\d{4}-")
+        line = self.journal()[-1]
+        self.assertEqual((line["trigger"], line["task"]), ("keep", "t-003"))
+        self.assertIn('the person asked to keep t31 open: "keep t31, I want to ask it something"', line["why"])
+        self.assertEqual(self.ended(), [])
+        self.assertRefused(self.worker("close", "t31", "--evidence", "FINDINGS.md"), "is marked keep")
+        code, out, err = self.worker("keep", "t31", "--off")
+        self.assertEqual(code, 0, err)
+        w = self.entry("t-003", "t31")
+        self.assertEqual((w["keep"], w["keepQuote"]), (False, "keep t31, I want to ask it something"))
+        self.assertRegex(w["unkeptAt"], r"^\d{4}-")
+        self.assertIn("no longer kept", self.journal()[-1]["why"])
+        self.assertEqual(self.worker("close", "t31", "--evidence", "FINDINGS.md")[0], 0)
+
+    def test_k1b_refusals(self):
+        before = self.snapshot()
+        for quote in ([], ["--quote", "  "]):
+            self.assertRefused(self.worker("keep", "t31", *quote), 'pa-worker keep needs --quote "<the person\'s own words>"')
+        self.assertRefused(self.worker("keep", "t99", "--quote", "x"), "t99 is not a recorded worker of this space")
+        self.assertRefused(self.worker("keep", "t0", "--quote", "x"), "that is the Project Agent itself")
+        self.assertRefused(self.worker("keep", "m1/t31", "--quote", "x"), "m1/t31 is on another machine")
+        self.assertEqual(self.snapshot(), before)
+        code, out, _ = self.worker("keep", "t31", "--off")
+        self.assertEqual(code, 0)
+        self.assertIn("t31 is not marked keep", out)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_k1c_keep_on_a_closed_worker(self):
+        self.assertEqual(self.worker("close", "t31", "--evidence", "FINDINGS.md")[0], 0)
+        calls = len(self.calls)
+        code, _, err = self.worker("keep", "t31", "--quote", "keep that one")
+        self.assertEqual(code, 0, err)
+        w = self.entry("t-003", "t31")
+        self.assertTrue(w["keep"] and w["finished"])
+        self.assertEqual([c for c in self.calls[calls:] if c[:2] != ["hc", "get"]], [], "keep reopens nothing")
+
+    def test_k1d_info_shows_keep_finished_closed(self):
+        self.worker("keep", "t31", "--quote", "keep it")
+        code, out, _ = self.worker("info", "t31")
+        facts = json.loads(out)
+        self.assertEqual((facts["keep"], facts["finished"], facts["closed"]), (True, False, None))
+
+    def test_k2_cleanup_skips_kept_workers(self):
+        led = self.ledger()
+        led["tasks"][0]["state"] = "done"
+        led["tasks"][0]["workers"].append({"address": "t32", "role": "verifier", "name": "t-003-verify"})
+        led["tasks"][0]["workers"][0].update(keep=True, keptAt="2026-11-16T10:00:00Z", keepQuote="keep t31")
+        self.ledger(led)
+        self.term("t32", "t-003-verify")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            pa.cmd_cleanup(argparse.Namespace(space="sp1", kill=True, dry_run=False))
+        self.assertIn("kept t31 t-003-tests (t-003): marked keep", out.getvalue())
+        self.assertNotIn(["hc", "kill", "t31"], self.calls)
+        self.assertNotIn(["hc", "rm", "t31"], self.calls)
+        self.assertIn(["hc", "kill", "t32"], self.calls, "a worker that is not kept is still cleaned up")
+
+
 if __name__ == "__main__":
     unittest.main()
