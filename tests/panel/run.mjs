@@ -154,6 +154,58 @@ cases["P-lookalike"] = async () => { // a hand-run agent that looks like this PA
   check(Boolean((g.__shared[REQ] ?? {})[S]), "Open anyway writes the request");
 };
 
+// ---- R8: notices go to the live terminal chosen at send time ----
+const card = (id) => { g.__files[`:${DIR}/decisions/${id}.json`] = JSON.stringify({ id, status: "open", question: `Q ${id}?`, options: [{ label: "A" }, { label: "B" }], created: "2026-11-16T10:00:00Z" }); };
+async function cardsWorld(opts = {}, ids = ["d-x"]) {
+  world(opts);
+  for (const id of ids) card(id);
+  g.__ls[`:${DIR}/decisions`] = ids.map((id) => `${id}.json`);
+  const v = await mount();
+  return v;
+}
+async function answerCard(v, id) { await click(v, `opt-${id}-0`); await click(v, `submit-${id}`); }
+const sends = () => g.__hcs.filter((a) => a[0] === "send");
+
+cases["R8-none"] = async () => { // no alive target: nothing sent, a plain message with the Open button
+  const v = await cardsWorld();
+  await answerCard(v, "d-x");
+  check(JSON.parse(g.__files[`:${DIR}/decisions/d-x.json`]).status === "answered", "the answer is written");
+  v.resend(cx); await flush();
+  check(sends().length === 0, `no hc send (got ${JSON.stringify(g.__hcs)})`);
+  const { text, clicks } = look(v);
+  check(/Answer saved\. The Project Agent is not running\./.test(text) && !/Trying again/.test(text), `plain not-running message (got ${text.slice(0, 500)})`);
+  check(Boolean(clicks["pa-open"]), "the Open button is offered");
+};
+
+cases["R8-later"] = async () => { // an alive target appears: each queued notice sent once, in order
+  const v = await cardsWorld({}, ["d-x", "d-y"]);
+  await answerCard(v, "d-x");
+  await answerCard(v, "d-y");
+  check(sends().length === 0, "nothing sent while not running");
+  g.__shared["project-agent.tabs"] = alive("t4w");
+  v.resend(cx); await flush();
+  v.resend(cx); await flush();
+  check(JSON.stringify(sends()) === JSON.stringify([["send", "t4w", "decision d-x answered"], ["send", "t4w", "decision d-y answered"]]), `sent once each, in order, to the record's terminal (got ${JSON.stringify(sends())})`);
+  check(!/Answer saved|hasn't been told/.test(look(v).text), "no message left");
+};
+
+cases["R8-stale"] = async () => { // agent.json names a dead t30; the alive record names t4w: only t4w
+  const v = await cardsWorld({ agentTerminal: "t30", records: alive("t4w") });
+  await answerCard(v, "d-x");
+  check(JSON.stringify(sends()) === JSON.stringify([["send", "t4w", "decision d-x answered"]]), `sent to t4w only (got ${JSON.stringify(g.__hcs)})`);
+};
+
+cases["R8-rule"] = async () => { // a rule decided in the Rules view behaves the same
+  const v = await cardsWorld({}, []);
+  const space = g.__spaces[0];
+  await v.ruleDecided(space, "r-1", "approved", cx); await flush();
+  check(sends().length === 0, `nothing sent while not running (got ${JSON.stringify(g.__hcs)})`);
+  check(/Answer saved\. The Project Agent is not running\./.test(look(v).text), "plain not-running message");
+  g.__shared["project-agent.tabs"] = alive("t4w");
+  v.resend(cx); await flush();
+  check(JSON.stringify(sends()) === JSON.stringify([["send", "t4w", "rule r-1 approved"]]), `sent once (got ${JSON.stringify(sends())})`);
+};
+
 const pick = process.argv.slice(2);
 let failed = 0;
 for (const [name, fn] of Object.entries(cases)) {
