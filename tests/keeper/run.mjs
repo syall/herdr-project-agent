@@ -503,6 +503,188 @@ cases["K-g1"] = async () => { // the 2-minute give-up never closes a new pane th
   check(noteText().some((n) => /left open/i.test(n)), `notice says it was left open (got ${JSON.stringify(noteText())})`);
 };
 
+// ---- t-003: Open Project Agent requests (shared "project-agent.openAgent"), record-less adoption, alive ----
+const REQ = "project-agent.openAgent";
+const request = (sid = S, at = g.__now) => { g.__shared[REQ] = { ...(g.__shared[REQ] ?? {}), [sid]: { at, by: "panel" } }; };
+const requests = () => g.__shared[REQ] ?? {};
+const tabNews = () => runsOf("tab.new");
+const beating = (w, address = "t1") => () => { g.__files[w.f("heartbeat")] = `${Math.floor(g.__now / 1000)} ${address}\n`; };
+const appear = (machine, tab, pane, term, labels = {}) => {
+  const q = (id) => (machine ? `${machine}/${id}` : id);
+  g.__spaces[0].tabs.push({ id: q(tab), index: g.__spaces[0].tabs.length + 1, name: "PA: proj", named: true });
+  g.__panes.push({ pane: q(pane), terminal: q(term), tab: q(tab), title: "", status: null, program: launcher });
+  g.__terminals.push({ address: q(term), state: "live", argv: ARGV(), labels, status: null, program: launcher });
+};
+
+async function openFromRequest({ machine = null } = {}) {
+  const w = world({ machine, tabPresent: false, termLive: false, record: false });
+  request(w.sid);
+  const k = await start();
+  check(await until(k, 10000, () => tabNews().length > 0), `tab.new after the request (runs ${JSON.stringify(g.__runs)}, reads ${JSON.stringify(g.__reads)})`);
+  const [, made] = tabNews()[0];
+  check(made.space === w.sid && made.folder === "/proj" && made.name === "PA: proj" && made.focus === true, `tab.new space/folder/name/focus (got ${JSON.stringify(made)})`);
+  check(JSON.stringify(made.argv) === JSON.stringify(ARGV()), `argv is the keeper's own pa-session line (got ${JSON.stringify(made.argv)})`);
+  check(Boolean(k.pending[w.sid]), "a pending entry for the space");
+  check(!requests()[w.sid], `request removed once started (got ${JSON.stringify(requests())})`);
+  return { w, k };
+}
+
+cases["K-open"] = async () => { await openFromRequest(); };
+
+cases["K-open-norecord"] = async () => { // empty project-agent.tabs: the new tab is recorded on the first fast tick, before it labels
+  const { k } = await openFromRequest();
+  check(Object.keys(records()).length === 0, "no record before the tab appears");
+  await sim(k, 500);
+  appear(null, "tb2", "p2", "t2");
+  await sim(k, 250);
+  check(records().tb2?.terminal === "t2" && records().tb2.space === S && records().tb2.project === "/proj" && records().tb2.profile === "test" && records().tb2.name === "proj",
+    `new tab recorded within one fast tick from the request's agent.json (got ${JSON.stringify(records())})`);
+  check(!k.pending[S], "pending cleared");
+  check(tabNews().length === 1 && runsOf("tab.close", "pane.close", "pane.split").length === 0, `nothing else run (got ${JSON.stringify(g.__runs)})`);
+};
+
+cases["K-open-remote"] = async () => { // qualified ids, agent.json read on the machine with a relative path
+  const { w, k } = await openFromRequest({ machine: "m" });
+  check(g.__reads.includes(`m:.config/herdr-pa/spaces/${S}/agent.json`), `agent.json read on m with a relative path (reads ${JSON.stringify(g.__reads)})`);
+  appear("m", "tb2", "p2", "t2");
+  await sim(k, 250);
+  check(records()["m/tb2"]?.terminal === "m/t2" && records()["m/tb2"].space === w.sid, `remote tab recorded (got ${JSON.stringify(records())})`);
+};
+
+cases["K-open-offline"] = async () => { // the space's machine is offline: nothing, request kept (until it expires)
+  const w = world({ machine: "m", tabPresent: false, termLive: false, record: false });
+  g.__machines[1].layout = "unavailable"; g.__offline = ["m"];
+  request(w.sid);
+  const k = await start();
+  await sim(k, 20000);
+  check(tabNews().length === 0, `no tab.new while offline (got ${JSON.stringify(g.__runs)})`);
+  check(Boolean(requests()[w.sid]), "request kept while offline");
+  await sim(k, 15000);
+  check(!requests()[w.sid], "request given up after 30 s");
+  check(noteText().some((n) => /offline|not reachable|unreachable/i.test(n)), `a notice says the machine is offline (got ${JSON.stringify(noteText())})`);
+  check(tabNews().length === 0, "still no tab.new");
+};
+
+const refused = async (w, k, what) => {
+  request(w.sid);
+  await sim(k, 6000, beating(w));
+  check(tabNews().length === 0, `${what}: no tab.new (got ${JSON.stringify(tabNews())})`);
+  check(!requests()[w.sid], `${what}: request removed (got ${JSON.stringify(requests())})`);
+  check(noteText().some((n) => /already running/i.test(n)), `${what}: notice "already running" (got ${JSON.stringify(noteText())})`);
+};
+
+cases["K-open-alive"] = async () => { // a record whose launcher beats in its terminal: refused
+  const w = world({ program: claude, status: "idle", created: T0 - 600000 });
+  const k = await start();
+  await sim(k, 3000, beating(w));
+  await refused(w, k, "alive record");
+};
+
+cases["K-open-labelled"] = async () => { // no record, a live labelled terminal whose fresh heartbeat names it: refused
+  const w = world({ program: claude, status: "idle", record: false, created: T0 - 600000 });
+  const k = new Keeper("me");
+  await refused(w, k, "labelled terminal");
+};
+
+cases["K-open-pending"] = async () => { // a Change-1 reopen (or an in-place restore) under way: no second tab
+  const w = world({ tabPresent: false, termLive: false });
+  const k = await start();
+  check(await until(k, 10000, () => tabNews().length === 1), "the keeper's own reopen");
+  request(w.sid);
+  await sim(k, 5000);
+  check(tabNews().length === 1, `no second tab.new (got ${JSON.stringify(tabNews())})`);
+  check(!requests()[w.sid], "request removed");
+  const w2 = world();
+  const k2 = await start();
+  check(await waitSplit(k2, 1, 50000), "an in-place restore starts");
+  newPane("p2", { address: "t2", state: "live", argv: ARGV(), labels: {}, status: null, program: launcher });
+  await sim(k2, 500);
+  check(Boolean(records().tb1.recovering), "restoring");
+  request(w2.sid);
+  await sim(k2, 5000);
+  check(tabNews().length === 0, `no tab.new during a restore (got ${JSON.stringify(tabNews())})`);
+  check(!requests()[w2.sid], "request removed");
+};
+
+cases["K-open-lock"] = async () => { // another client holds keeper.lock: waits; after 30 s the request goes, with a notice
+  const w = world({ tabPresent: false, termLive: false, record: false });
+  g.__files[`:${w.dir}/keeper.lock`] = JSON.stringify({ client: "other", at: new Date(T0).toISOString(), tab: "tbX" });
+  request(w.sid);
+  const k = await start();
+  await sim(k, 20000);
+  check(tabNews().length === 0, `no tab.new while another client's lock is fresh (got ${JSON.stringify(g.__runs)})`);
+  check(Boolean(requests()[w.sid]), "request still waiting");
+  await sim(k, 15000);
+  check(!requests()[w.sid], "request removed after 30 s");
+  check(noteText().some((n) => /lock|another Herdr/i.test(n)), `notice names the lock (got ${JSON.stringify(noteText())})`);
+  await sim(k, 60000);
+  check(tabNews().length === 0, `nothing opened later (got ${JSON.stringify(tabNews())})`);
+};
+
+cases["K-open-absent"] = async () => { // no agent.json: request removed, nothing done
+  const w = world({ config: "absent", tabPresent: false, termLive: false, record: false });
+  request(w.sid);
+  const k = await start();
+  await sim(k, 5000);
+  check(g.__runs.length === 0, `no run calls (got ${JSON.stringify(g.__runs)})`);
+  check(!requests()[w.sid], "request removed");
+};
+
+cases["K-open-twice"] = async () => { // a second request right after the first: one tab
+  const { w, k } = await openFromRequest();
+  g.__now += 10; request(w.sid);
+  await sim(k, 5000);
+  check(tabNews().length === 1, `one tab.new (got ${JSON.stringify(tabNews())})`);
+  check(!requests()[w.sid], "second request removed");
+};
+
+cases["K-open-stopped"] = async () => { // the keeper gave up restoring (3 failures): a request still opens a new tab
+  world();
+  const k = await start();
+  check(await until(k, 700000, () => splits().length === 3 && k.stopped[S]), "stopped after 3 failed restores");
+  request(S);
+  check(await until(k, 10000, () => tabNews().length === 1), `tab.new after the request (runs ${JSON.stringify(g.__runs.filter(([n]) => n !== "tab.move").slice(-3))})`);
+  appear(null, "tb2", "p2", "t2");
+  await sim(k, 250);
+  check(records().tb2?.terminal === "t2" && !records().tb1, `the new tab is the record now (got ${JSON.stringify(records())})`);
+};
+
+cases["K-reopen-unchanged"] = async () => { // option A: a vanished recorded tab is still reopened after 4 s, without a request
+  const w = world({ tabPresent: false, termLive: false });
+  const k = await start();
+  const t0 = g.__now;
+  check(await until(k, 10000, () => tabNews().length > 0), "tab.new");
+  check(g.__now - t0 >= 4000, `not before 4 s (after ${(g.__now - t0) / 1000} s)`);
+  check(JSON.stringify(tabNews()[0][1].argv) === JSON.stringify(ARGV()), "pa-session argv");
+  check(!Object.values(g.__files).some((t) => /"closed"/.test(t)) && !g.__writes.some((x) => /agent\.json$/.test(x)), "agent.json not written");
+  check(g.__shared["project-agent.features"] === undefined, "no project-agent.features");
+  void w;
+};
+
+cases["K-alive"] = async () => { // alive: true only for a beating record terminal
+  let w = world({ program: claude, status: "idle", created: T0 - 600000 });
+  let k = await start();
+  await sim(k, 20000, beating(w));
+  check(records().tb1.alive === true, `alive when its launcher beats in it (got ${JSON.stringify(records().tb1)})`);
+  await sim(k, 40000, beating(w, "t7"));
+  check(!records().tb1.alive, `not alive when the heartbeat names another terminal (got ${JSON.stringify(records().tb1)})`);
+  // During a restore: never alive.
+  w = world({ created: T0 - 600000 });
+  k = await start();
+  let seen = false;
+  await sim(k, 60000, () => { const r = records().tb1; if (r?.recovering) { seen = true; check(!r.alive, `not alive while recovering (got ${JSON.stringify(r)})`); } });
+  check(seen, "a restore ran");
+  // Offline: not alive.
+  w = world({ machine: "m", program: claude, status: "idle", created: T0 - 600000 });
+  g.__files[w.f("heartbeat")] = `${T0 / 1000 - 5} t1\n`;
+  k = await start();
+  await sim(k, 20000, beating(w));
+  check(records()["m/tb1"].alive === true, `remote record alive (got ${JSON.stringify(records())})`);
+  g.__machines[1].layout = "unavailable"; g.__offline = ["m"];
+  await sim(k, 3000);
+  check(!records()["m/tb1"].alive, `not alive while its machine is offline (got ${JSON.stringify(records())})`);
+};
+
 const pick = process.argv.slice(2);
 let failed = 0;
 for (const [name, fn] of Object.entries(cases)) {
