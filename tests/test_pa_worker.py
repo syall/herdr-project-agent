@@ -744,5 +744,153 @@ class Keep(Base):
         self.assertIn(["hc", "kill", "t32"], self.calls, "a worker that is not kept is still cleaned up")
 
 
+class Leftovers(Base):
+    """R5: pa-worker close --leftovers [--dry-run] (spec 3.4)."""
+
+    def setUp(self):
+        super().setUp()
+        pa_hooks.by_an_agent = lambda: True
+
+    def add(self, tid, address, name, status="idle", report=True, worktree=None, **entry):
+        self.add_task(tid, "in-progress", worktree, [dict({"address": address, "role": "build", "name": name}, **entry)])
+        self.term(address, name, status=status)
+        self.evidence(tid)
+
+    def note(self, **line):
+        with open(os.path.join(self.dir, "journal.jsonl"), "a") as f:
+            f.write(json.dumps(dict({"at": "2026-11-15T10:00:00Z"}, **line)) + "\n")
+
+    def mix(self):
+        """Seven old-style workers: one passes every guard, six are kept for different reasons."""
+        proj = self.repo()
+        dirty = self.worktree(proj, "t-004-x")
+        write(os.path.join(dirty, "README"), "changed\n")
+        self.add("t-001", "t2s", "t-001-build")
+        self.note(trigger="report", task="t-001", why="t2s reported; read FINDINGS.md")
+        self.add("t-002", "t34", "t-002-build", status="working")
+        self.note(trigger="report", task="t-002", why="t34 reported")
+        self.add("t-003", "t36", "t-003-build", status="blocked")
+        self.note(trigger="report", task="t-003", why="t36 reported")
+        self.add("t-004", "t37", "t-004-build", worktree=dirty)
+        self.note(trigger="report", task="t-004", why="t37 reported")
+        self.add("t-005", "t38", "t-005-build")
+        self.add("t-006", "t39", "t-006-build")
+        self.note(trigger="report", task="t-006", why="t39 reported; read FINDINGS.md")
+        self.note(trigger="message", task="t-006", why="sent update to t39: fix the lint")
+        self.add("t-007", "t40", "t-007-build", keep=True, keptAt="2026-11-16T09:00:00Z", keepQuote="keep t40")
+        self.note(trigger="report", task="t-007", why="t40 reported; FINDINGS.md")
+        return os.path.realpath(dirty)
+
+    def expect_kept(self, out, dirty):
+        for line in ("kept t34 (t-002-build, t-002): working", "kept t36 (t-003-build, t-003): blocked",
+                     "kept t37 (t-004-build, t-004): uncommitted files in {} (1)".format(dirty),
+                     "kept t38 (t-005-build, t-005): no recorded report",
+                     "kept t39 (t-006-build, t-006): no recorded report after its last handoff",
+                     "kept t40 (t-007-build, t-007): marked keep"):
+            self.assertIn(line, out)
+
+    def test_l1_the_mix(self):
+        dirty = self.mix()
+        lines = len(self.journal())
+        code, out, err = self.worker("close", "--leftovers")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.ended(), [["hc", "kill", "t2s"], ["hc", "rm", "t2s"]])
+        self.expect_kept(out, dirty)
+        w = self.entry("t-001", "t2s")
+        self.assertEqual((w["finished"], w["closedBy"], w["report"]), (True, "leftovers", "FINDINGS.md"))
+        for tid, address in (("t-002", "t34"), ("t-003", "t36"), ("t-004", "t37"), ("t-005", "t38"), ("t-006", "t39"), ("t-007", "t40")):
+            self.assertFalse(self.entry(tid, address).get("finished"), address)
+        new = self.journal()[lines:]
+        self.assertEqual([l["trigger"] for l in new], ["leftovers", "leftovers"])
+        self.assertIn("closing old-style workers: t2s (reports read); keeping t34 (working), t36 (blocked)", new[0]["why"])
+        self.assertIn("closed worker t2s (t-001-build)", new[1]["why"])
+        policy = self.ledger()["workerPolicy"]
+        self.assertEqual(policy["style"], "per-job")
+        self.assertRegex(policy["since"], r"^\d{4}-")
+
+    def test_l2_dry_run_writes_nothing(self):
+        dirty = self.mix()
+        before = self.snapshot()
+        code, out, err = self.worker("close", "--leftovers", "--dry-run")
+        self.assertEqual(code, 0, err)
+        self.assertIn("would close t2s (t-001-build, t-001): report FINDINGS.md", out)
+        self.expect_kept(out, dirty)
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(self.calls, [], "a dry run makes no hc call but hc get")
+        self.assertNotIn("workerPolicy", self.ledger())
+
+    def test_l3_never_unrecorded_pa_or_gone(self):
+        self.term("t77", "t-001-build")  # not in the ledger, even with a matching name
+        self.add_task("t-001", "in-progress", None, [{"address": "t0", "role": "build", "name": "PA: S"},
+                                                    {"address": "t2g", "role": "build", "name": "t-001-old"}])
+        self.term("t0", "PA: S")
+        self.evidence("t-001")
+        self.note(trigger="report", task="t-001", why="t2g reported; FINDINGS.md; t0 too")
+        code, out, _ = self.worker("close", "--leftovers")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.ended(), [])
+        self.assertIn("kept t0 (PA: S, t-001): it is the Project Agent", out)
+        self.assertIn("kept t2g (t-001-old, t-001): gone; left for the agent to read", out)
+        self.assertFalse(self.entry("t-001", "t2g").get("finished"))
+        self.assertIn("t77", self.terms)
+
+    def test_l4_nothing_to_do(self):
+        self.add("t-001", "t31", "t-001-build", finished=True)
+        code, out, _ = self.worker("close", "--leftovers")
+        self.assertEqual(code, 0)
+        self.assertIn("No old-style workers to close.", out)
+        self.assertEqual(self.ledger()["workerPolicy"]["style"], "per-job")
+        self.assertEqual(self.ended(), [])
+
+    def test_l5_whole_word_address(self):
+        self.add("t-001", "t31", "t-001-build")
+        self.note(trigger="report", task="t-001", why="t310 reported; FINDINGS.md")
+        code, out, _ = self.worker("close", "--leftovers", "--dry-run")
+        self.assertIn("kept t31 (t-001-build, t-001): no recorded report", out)
+
+    def test_l6_newest_file_and_name_match(self):
+        self.add("t-001", "t31", "t-001-tests")
+        old = self.evidence("t-001", "FINDINGS.md")
+        os.utime(old, (time.time() - 3600, time.time() - 3600))
+        self.evidence("t-001", "VERIFY.md")
+        self.evidence("t-001", "EMPTY.md", "")
+        self.note(trigger="report", task="t-001", why="t-001-tests is done")
+        code, out, err = self.worker("close", "--leftovers")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.entry("t-001", "t31")["report"], "VERIFY.md")
+
+    def test_l6b_empty_evidence_folder(self):
+        self.add("t-001", "t31", "t-001-tests")
+        os.unlink(os.path.join(self.dir, "evidence", "t-001", "FINDINGS.md"))
+        self.note(trigger="report", task="t-001", why="t31 reported")
+        code, out, _ = self.worker("close", "--leftovers", "--dry-run")
+        self.assertIn("kept t31 (t-001-tests, t-001): no recorded report", out)
+
+    def test_l7_status_changes_mid_run(self):
+        self.add("t-001", "t31", "t-001-a")
+        self.note(trigger="report", task="t-001", why="t31 reported")
+        self.add("t-002", "t32", "t-002-a")
+        self.note(trigger="report", task="t-002", why="t32 reported")
+        real, seen = self.fake_get, []
+
+        def flipping(address):
+            if address == "t32":
+                seen.append(address)
+                if len(seen) > 1:
+                    self.terms["t32"]["status"] = "working"
+            return real(address)
+        pa.hc_get = flipping
+        lines = len(self.journal())
+        code, out, err = self.worker("close", "--leftovers")
+        self.assertEqual(code, 0, err)
+        self.assertIn("kept t32 (t-002-a, t-002): working", out)
+        self.assertNotIn(["hc", "kill", "t32"], self.calls)
+        new = self.journal()[lines:]
+        self.assertIn("t32", new[0]["why"])  # the plan line still says it was to be closed
+        self.assertFalse(any("closed worker t32" in l["why"] for l in new))
+        self.assertTrue(self.entry("t-001", "t31")["finished"])
+        self.assertFalse(self.entry("t-002", "t32").get("finished"))
+
+
 if __name__ == "__main__":
     unittest.main()
