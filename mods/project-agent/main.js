@@ -7,7 +7,7 @@
 import { View, div } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, ScrollHandle } from "gpui-base";
 import { spaces, panes, agents, terminals, theme, run, exec, props, home, watchFolder, notify, shared, setShared, closeOverlay, openOverlay, window, layout } from "herdr";
-import { loadSpace, loadDecisions, answerDecision, notifyOrchestrator, changeRules, touched, localId, paHome, stateDir, taskActions, taskLinks, evidenceTasks, cardEvidence, staleInstructions } from "./store.js";
+import { loadSpace, loadDecisions, answerDecision, notifyOrchestrator, changeRules, touched, localId, paHome, stateDir, taskActions, taskLinks, evidenceTasks, cardEvidence, staleInstructions, liveTarget, lookAlike, OPEN_REQUESTS } from "./store.js";
 import { RulesPane } from "./rules.js";
 import { SetupPane } from "./setup.js";
 import { Keeper } from "./keeper.js";
@@ -16,6 +16,7 @@ import { tick, cadence, holdReason, setSchedule, requestPass, PRESETS, MIN_MINUT
 
 const ACTIVE = ["needs-decision", "review", "in-progress", "investigating", "queued"];
 const ORDER = [...ACTIVE, "parked", "done"];
+const OPEN_WAIT = 30000; // an Open request with nothing started by then: say why, offer the button again
 const when = (iso) => { const d = new Date(iso); return Number.isNaN(d.getTime()) ? "" : d.toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }); };
 
 export default class ProjectAgent extends View {
@@ -48,6 +49,9 @@ export default class ProjectAgent extends View {
     this.busy = {}; // card id -> answering now
     this.failed = {}; // card id -> why the answer wasn't written
     this.unsent = []; // [{ space, agent, message }] notices the orchestrator hasn't had yet
+    this.opening = {}; // space id -> when this copy asked the keeper to open its Project Agent
+    this.openMsg = {}; // space id -> why the last Open did not start anything
+    this.confirmOpen = {}; // space id -> { tab, terminal }: a look-alike agent runs; asking first
     this.me = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`; // this copy, for the timer lease
     this.schedule = { open: false, error: null, custom: null, quietFrom: null, quietTo: null }; // the schedule bar
     cx.timer.every(15000, (cx) => cx.spawn(async (cx) => { await tick(this.me); if (!props()?.timer) this.reload(cx); }));
@@ -122,6 +126,25 @@ export default class ProjectAgent extends View {
       }
       if (this.again) { this.again = false; this.reload(cx); }
     });
+  }
+
+  // "Open Project Agent": asks the keeper (shared request), which opens a new tab running the
+  // launcher and records it. A live agent that looks like this one gets a confirm first.
+  requestOpen(space, agent, cx, anyway) {
+    delete this.openMsg[space.id];
+    const like = !anyway && lookAlike(space, agent);
+    if (like) { this.confirmOpen[space.id] = like; cx.notify(); return; }
+    delete this.confirmOpen[space.id];
+    const at = Date.now();
+    setShared(OPEN_REQUESTS, { ...(shared(OPEN_REQUESTS) ?? {}), [space.id]: { at, by: "panel" } });
+    this.opening[space.id] = at;
+    cx.notify();
+  }
+
+  openButton(t, space, agent, id, waiting) {
+    const el = div().id(id).flex_none().px(8).h(24).flex().items_center().rounded(6).border(1).border_color(waiting ? t.border : t.accent).text_size(11.5)
+      .text_color(waiting ? t.dim : t.foreground);
+    return waiting ? el.child("Opening…") : el.cursor_pointer().hover((s) => s.bg(t.hover)).on_click((_e, cx) => this.requestOpen(space, agent, cx, false)).child("Open Project Agent");
   }
 
   start(space, folder) {
@@ -449,7 +472,18 @@ export default class ProjectAgent extends View {
           .on_click(() => this.start(space, folder)).child(`Start a Project Agent for ${folder.split("/").pop()}`))));
     }
     const a = data.agent;
-    const live = agents().find((x) => x.address === (space.machine ? `${space.machine}/${a.terminal}` : a.terminal));
+    // Who is live: the keeper's record whose launcher runs (not agent.json's terminal, which goes
+    // stale when the agent is started again elsewhere).
+    const target = liveTarget(space.id);
+    const live = target ? agents().find((x) => x.address === target.address) ?? { status: null } : null;
+    const req = (shared(OPEN_REQUESTS) ?? {})[space.id], now = Date.now();
+    if (target) { delete this.opening[space.id]; delete this.openMsg[space.id]; delete this.confirmOpen[space.id]; }
+    if (this.opening[space.id] && now - this.opening[space.id] > OPEN_WAIT) {
+      this.openMsg[space.id] = `The Project Agent did not open within 30 s: ${req?.why ?? (req ? "the request was not taken (the keeper runs in a layout with the Project Agent panel)" : "its new tab did not appear; see the notifications")}.`;
+      delete this.opening[space.id];
+    }
+    const waiting = !target && (Boolean(this.opening[space.id]) || Boolean(req && now - Number(req.at) < OPEN_WAIT));
+    const like = this.confirmOpen[space.id];
     // Newest first: by when a task last changed (else when it was made), then by id.
     const stamp = (x) => String(x.updated ?? x.created ?? "");
     const tasks = [...(data.ledger?.tasks ?? [])].sort((x, y) => stamp(y).localeCompare(stamp(x)) || String(y.id ?? "").localeCompare(String(x.id ?? ""), undefined, { numeric: true }));
@@ -473,8 +507,15 @@ export default class ProjectAgent extends View {
     const unsent = this.unsent.filter((u) => u.space.id === space.id);
     return root
       .child(head(`PA: ${a.name ?? space.name}`, h_flex().flex_none().gap(6).items_center()
-        .child(div().size(7).rounded(4).bg(live ? t[live.status] ?? t.dim : t.dim))
-        .child(div().text_size(11).text_color(t.dim).child(live ? live.status : "no status"))))
+        .child(div().size(7).rounded(4).bg(live ? t[live.status] ?? t.idle : t.dim))
+        .child(div().text_size(11).text_color(t.dim).child(live ? live.status ?? "running" : "Not running"))
+        .when(!live, (el) => el.child(this.openButton(t, space, a, "pa-open", waiting)))))
+      .when(!live && Boolean(like), (el) => el.child(v_flex().px(12).py(8).gap(6).flex_none().border_b(1).border_color(t.border).bg(t.working + "1a").text_size(11.5).text_color(t.foreground)
+        .child(div().child(`A Claude session for this Project Agent seems to run in tab ${like?.tab}. Opening another starts a second one. Open anyway?`))
+        .child(h_flex().gap(6)
+          .child(this.button(t, "pa-open-anyway", "Open anyway", (_e, cx) => this.requestOpen(space, a, cx, true), true))
+          .child(this.button(t, "pa-open-cancel", "Cancel", (_e, cx) => { delete this.confirmOpen[space.id]; cx.notify(); })))))
+      .when(!live && Boolean(this.openMsg[space.id]), (el) => el.child(div().px(12).py(6).border_b(1).border_color(t.border).text_size(11.5).text_color(t.blocked).child(this.openMsg[space.id] ?? "")))
       .child(v_flex().px(12).py(8).gap(2).flex_none().border_b(1).border_color(t.border).text_size(11.5).text_color(t.dim)
         .child(div().truncate().child(String(a.project ?? "").replace(home(), "~")))
         .child(div().child(`profile ${a.profile ?? "?"} · ${active} active of ${tasks.length} tasks · pass ${data.ledger?.passCount ?? 0}`)))

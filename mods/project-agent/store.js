@@ -2,9 +2,41 @@
 // space's machine. This mod writes nothing here except decision answers and rule
 // changes (later milestones); the orchestrator owns the ledger and the journal.
 
-import { home, readTextFile, writeTextFile, exec, hc } from "herdr";
+import { home, readTextFile, writeTextFile, exec, hc, shared, panes, terminals } from "herdr";
 
 export const localId = (id) => String(id ?? "").split("/").pop();
+
+// "Open Project Agent" requests: { "<space id>": { at, by, why? } }. The panel writes one, the
+// keeper takes it and deletes it (why: what it is still waiting for).
+export const OPEN_REQUESTS = "project-agent.openAgent";
+
+// The space's Project Agent terminal that its launcher is known to run in (the keeper's record
+// with alive: true), or null. Messages for the agent go only here.
+export function liveTarget(spaceId) {
+  const found = Object.entries(shared("project-agent.tabs") ?? {}).find(([, r]) => r?.space === spaceId && r.alive === true && r.terminal);
+  return found ? { tab: found[0], address: found[1].terminal } : null;
+}
+
+// A live agent in the space that looks like this Project Agent but does not run under its live
+// launcher (run by hand, say): its pane title is "PA: <name>", its folder is the project, or it
+// still carries the space's label. Workers (terminals with a parent) are not counted. A guess:
+// a false match only adds a confirm. Returns { tab, terminal } or null.
+export function lookAlike(space, agent) {
+  const tabs = new Map((space.tabs ?? []).map((t) => [t.id, t]));
+  const ts = terminals(), skip = liveTarget(space.id)?.address;
+  for (const p of panes()) {
+    const tab = tabs.get(p.tab);
+    if (!tab || !p.terminal || p.terminal === skip) continue;
+    const term = ts.find((t) => t.address === p.terminal);
+    if (!term || term.state !== "live" || term.parent) continue;
+    if (!(term.program?.agent || p.program?.agent || p.app)) continue;
+    const label = term.labels?.["herdr.pa"];
+    if (label && label !== localId(space.id)) continue;
+    const title = String(p.title ?? ""), name = agent?.name ? `PA: ${agent.name}` : null;
+    if (label || (name && title.startsWith(name)) || (agent?.project && p.cwd === agent.project)) return { tab: `${tab.index ?? ""}${tab.name ? ` (${tab.name})` : ""}`.trim(), terminal: p.terminal };
+  }
+  return null;
+}
 
 // On another machine, paths are relative to that machine's home.
 export const paHome = (machine) => (machine ? ".config/herdr-pa" : `${home()}/.config/herdr-pa`);

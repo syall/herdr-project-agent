@@ -13,7 +13,7 @@
 // space's state folder keeps two Herdr clients from restoring the same Project Agent at once.
 
 import { spaces, panes, terminals, machines, focused, run, openOverlay, notify, readTextFile, home, shared, setShared } from "herdr";
-import { replaceFile } from "./store.js";
+import { replaceFile, OPEN_REQUESTS as REQUESTS } from "./store.js";
 
 const localId = (id) => String(id ?? "").split("/").pop();
 const tabs = () => shared("project-agent.tabs") ?? {};
@@ -21,7 +21,6 @@ const dirOf = (space) => `${space.machine ? "" : `${home()}/`}.config/herdr-pa/s
 const beatAddress = (text) => String(text ?? "").trim().split(/\s+/)[1] ?? null; // heartbeat: "<epoch> <address>"
 const argvOf = (r) => ["pa-session", "--space", localId(r.space), "--project", r.project, "--profile", r.profile, "--name", r.name];
 const SHELL = /(^|\/)-?(sh|bash|zsh|fish|dash|ksh|tcsh|csh)$/; // a shell's program or process name
-const REQUESTS = "project-agent.openAgent"; // the panel writes a request, the keeper deletes it
 const FRESH = 30000; // a heartbeat this recent means its launcher runs (pa.py's FRESH)
 const beatFresh = (text, now) => { const [epoch, address] = String(text ?? "").trim().split(/\s+/); return Number(epoch) * 1000 >= now - FRESH ? address ?? null : null; };
 const present = (v) => v !== undefined && v !== null && v !== "" && !(typeof v === "object" && Object.keys(v).length === 0);
