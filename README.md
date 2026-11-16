@@ -30,9 +30,10 @@ The mod keeps shared state `project-agent.tabs` (tab id -> `{ space, project, pr
 plus `recovering` while the keeper restores that tab, and `alive: true` while the keeper knows the
 launcher runs in `terminal`: the terminal is live, labelled for the space, not an idle shell, and a
 heartbeat at most 40 s old names it). The keeper that wrote the marks also writes
-`project-agent.keeper` (`{ id, at }`); readers trust `alive` only while that keeper holds the timer
-lease (`project-agent.timer`, fresh within 50 s), so marks left by a reloaded or closed copy count for
-nothing until the new keeper has judged.
+`project-agent.keeper` (`{ id, at }`, rewritten every 10 s); readers trust `alive` only while that
+keeper holds the timer lease (`project-agent.timer`, fresh within 50 s) and its mark is under 20 s
+old, so marks left by a reloaded or closed copy count for nothing until the new keeper has judged.
+`stopped: true` marks a record whose keeper gave up restoring it (3 failures in 10 minutes).
 It cannot draw or guard controls that other mods own, so those mods read that key (presence and
 `terminal` are enough):
 
@@ -83,9 +84,12 @@ New spaces start the launcher with `space.new { argv: ["pa-session", "--ask"] }`
   that gave up after 3 failures. It shows whenever agent.json exists, the space's machine is ready,
   the current keeper has judged, and no record is `alive`. While the machine is offline the header
   says "Machine offline · status unknown"; before a keeper has judged, "Status unknown"; while the
-  keeper restores the record's tab, "Restoring…", and while it reopens a vanished one, "Reopening…".
-  None of these offers Open. An Open over a record that is not running (a kept shell, a hand-run program) replaces
-  that record and retires its terminal: it is never adopted or marked alive again.
+  keeper restores the record's tab, "Restoring…" (with the launcher's error, if it waits on one), and
+  while it reopens a vanished one, "Reopening…". None of these offers Open. A keeper that stopped
+  after 3 failures marks its records `stopped: true`: then the panel says "Not running" and offers
+  Open, also when the tab has vanished. An Open over a record that is not running (a kept shell, a
+  hand-run program) replaces that record and retires its terminal: it is not adopted or marked alive
+  again unless a launcher really starts there later (a new heartbeat, fresh, naming it).
 - `pa-session` and `pa-start` refuse to start a second Project Agent only while another terminal's
   launcher is alive; a labelled terminal whose heartbeat stopped is replaced.
 
@@ -115,10 +119,19 @@ notifications still cover every recorded space. `pa-pass`, and the notices of `p
 `pa-worker delete`, also require the launcher's heartbeat to name the terminal and be at most 30 s
 old.
 
-The remaining window: when a launcher dies, the panel and the timer stop as soon as the app shows its
-terminal as an idle shell (the next keeper tick), or at the latest when its last heartbeat is 40 s
-old; `pa-pass`, `pa-task` and `pa-worker` stop when it is 30 s old. A message sent in those seconds
-can still reach the terminal the launcher just left. A remote launcher must write the heartbeat
+The remaining windows:
+- When a launcher dies, the panel and the timer stop as soon as the app shows its terminal as an
+  idle shell (the next keeper tick), or at the latest when its last heartbeat is 40 s old;
+  `pa-pass`, `pa-task` and `pa-worker` stop when it is 30 s old. A kept shell that still shows the
+  agent's last status or report is not counted as an idle shell, so it stays `alive` for up to
+  about 40 s (measured 38 s). A message sent in those seconds can still reach the terminal the
+  launcher just left.
+- After a mod reload or a quick app restart, the old marks look current until the keeper's mark is
+  20 s old (it rewrites it every 10 s while it runs). No pass is sent then (the timer waits for its
+  own keeper), but an answer notice can still go to a terminal whose launcher died in those
+  seconds, and the header can show a stale status.
+- On the first tick after a keeper takes over, before its first heartbeat read lands, a record can
+  show "Not running" with Open for a moment; a click then is refused ("already running"). A remote launcher must write the heartbeat
 (run `pa-sync --on <machine>`): one from before the heartbeat existed is never `alive`, so it gets
 no passes and no answer notices.
 

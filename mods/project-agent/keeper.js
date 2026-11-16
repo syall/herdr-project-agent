@@ -88,7 +88,7 @@ export class Keeper {
     this.pending = {}; // space id -> { tab, since, before, record? }: a reopened or requested tab not yet seen (record: for a request with no old record)
     this.locks = {}; // space id -> { state: "taking" | "held" | "busy", text, at }
     this.seen = {}; // terminal address -> when the keeper first saw it
-    this.retired = new Set(); // old PA terminals replaced by a restore: never adopted again
+    this.retired = new Map(); // old PA terminals replaced by a restore or an Open -> the heartbeat text then: not adopted again unless a launcher really starts there (a new, fresh beat names it)
     this.ready = {}; // machine name -> its layout state last tick
     this.peeked = {}; // space id -> last fast heartbeat read
     this.reading = false;
@@ -278,9 +278,16 @@ export class Keeper {
     for (const a of Object.keys(this.seen)) if (!live.has(a)) { delete this.seen[a]; this.retired.delete(a); }
 
     for (const term of ts) {
-      if (term.state !== "live" || !term.labels?.["herdr.pa"] || term.parent || this.retired.has(term.address)) continue;
+      if (term.state !== "live" || !term.labels?.["herdr.pa"] || term.parent) continue;
       const pane = ps.find((p) => p.terminal === term.address);
       const space = pane && spaceOfTab(pane.tab);
+      if (this.retired.has(term.address)) {
+        // Its stale label stays; only a launcher started there again (a heartbeat that changed since
+        // it was retired and freshly names it) makes it the Project Agent again.
+        const hb = space && this.hb[space.id];
+        if (!space || hb === this.retired.get(term.address) || beatFresh(hb, now) !== localId(term.address)) continue;
+        this.retired.delete(term.address);
+      }
       if (!space || !this.machineReady(space) || records[pane.tab]?.terminal === term.address) continue;
       const c = cfg(space);
       if (c !== "open") { if (c !== "absent") wantRead = true; continue; } // no agent.json: not a Project Agent space
@@ -360,11 +367,15 @@ export class Keeper {
     }
 
     if ((wantRead || readAll) && cx && !this.reading) this.read(cx, readAll);
+    // stopped: the keeper will not restore or reopen this space by itself (3 failures); the panel offers Open.
+    for (const r of Object.values(records)) { if (this.stopped[r.space]) r.stopped = true; else delete r.stopped; }
     const after = JSON.stringify(records);
     if (after !== before) setShared("project-agent.tabs", records);
     // The records' alive marks are this keeper's from now on: readers trust them only when the
     // keeper that wrote them is the lease holder's (store.js keeperJudging).
-    if (shared(KEEPER_MARK)?.id !== this.me) setShared(KEEPER_MARK, { id: this.me, at: now });
+    // Rewritten every 10 s: readers ignore a mark older than 20 s (its keeper stopped, a reload).
+    const mark = shared(KEEPER_MARK);
+    if (mark?.id !== this.me || now - Number(mark?.at ?? 0) > 10000) setShared(KEEPER_MARK, { id: this.me, at: now });
   }
 
   // Open requests from the panel ("Open Project Agent"). Each is taken once its machine is ready
@@ -405,7 +416,7 @@ export class Keeper {
       // The person asked: the restore limits (one a minute, stop after 3 failures) do not apply.
       // The replaced record's terminal (a kept shell, or a program the person confirmed past) keeps
       // its stale label: retire it, so it is never adopted or marked alive again (as a restore does).
-      for (const [tab, r] of mine) { if (r.terminal) this.retired.add(r.terminal); delete records[tab]; delete this.missing[tab]; delete this.beat[tab]; }
+      for (const [tab, r] of mine) { if (r.terminal) this.retired.set(r.terminal, this.hb[sid] ?? null); delete records[tab]; delete this.missing[tab]; delete this.beat[tab]; }
       delete this.stopped[sid]; delete this.fails[sid]; delete this.warned[sid];
       this.reopened[sid] = now;
       const record = { space: sid, project: info.project, profile: info.profile, name: info.name || space.name };
@@ -490,7 +501,7 @@ export class Keeper {
       const oldTerm = ts.find((t) => t.address === rec.from);
       const closable = old && old.terminal === rec.from && !oldTerm?.parent && (!oldTerm || oldTerm.state !== "live" || idleShell(oldTerm, old));
       if (closable) run("pane.close", { pane: rec.pane });
-      this.retired.add(rec.from);
+      this.retired.set(rec.from, this.hb[space.id] ?? null);
       delete r.recovering; delete this.beat[tab]; delete this.stopped[space.id];
       this.release(cx, space);
       run("terminal.pin", { terminal: rec.to, pinned: true });

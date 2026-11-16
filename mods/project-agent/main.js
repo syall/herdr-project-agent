@@ -486,7 +486,7 @@ export default class ProjectAgent extends View {
     const recs = Object.entries(shared("project-agent.tabs") ?? {}).filter(([, r]) => r?.space === space.id);
     const known = offline ? "offline" : !keeperJudging() ? "unknown" : target ? "live"
       : recs.some(([, r]) => r.recovering) ? "restoring" // the keeper restores it in its tab
-      : recs.some(([tab]) => !space.tabs.some((x) => x.id === tab)) ? "reopening" // its tab vanished: the keeper reopens it
+      : recs.some(([tab, r]) => !r.stopped && !space.tabs.some((x) => x.id === tab)) ? "reopening" // its tab vanished: the keeper reopens it (unless it has stopped: then Open)
       : "down";
     const live = target ? agents().find((x) => x.address === target.address) ?? { status: null } : null;
     const req = (shared(OPEN_REQUESTS) ?? {})[space.id], now = Date.now();
@@ -535,10 +535,10 @@ export default class ProjectAgent extends View {
         .child(div().size(7).rounded(4).bg(live ? t[live.status] ?? t.idle : t.dim))
         .child(div().text_size(11).text_color(t.dim).child(live ? live.status ?? "running" : stateText))
         .when(known === "down", (el) => el.child(this.openButton(t, space, a, "pa-open", waiting)))))
-      .when(known === "down" && Boolean(startingNow?.error), (el) => el.child(div().px(12).py(6).border_b(1).border_color(t.border).text_size(11.5).text_color(t.blocked)
+      .when((known === "down" || known === "restoring") && Boolean(startingNow?.error), (el) => el.child(div().px(12).py(6).border_b(1).border_color(t.border).text_size(11.5).text_color(t.blocked)
         .child(`The Project Agent is waiting: ${startingNow?.error}. Fix it, then press Enter in its tab.`)))
       .when(Boolean(like), (el) => el.child(v_flex().px(12).py(8).gap(6).flex_none().border_b(1).border_color(t.border).bg(t.working + "1a").text_size(11.5).text_color(t.foreground)
-        .child(div().child(`A Claude session for this Project Agent seems to run in tab ${like?.tab}. Opening another starts a second one. Open anyway?`))
+        .child(div().child(`An agent seems to run in tab ${like?.tab} for this project. If it is this Project Agent run by hand, opening another starts a second one. Open anyway?`))
         .child(h_flex().gap(6)
           .child(this.button(t, "pa-open-anyway", "Open anyway", (_e, cx) => this.requestOpen(space, a, cx, true), true))
           .child(this.button(t, "pa-open-cancel", "Cancel", (_e, cx) => { delete this.confirmOpen[space.id]; cx.notify(); })))))

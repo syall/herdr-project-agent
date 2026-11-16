@@ -15,9 +15,10 @@ export const OPEN_REQUESTS = "project-agent.openAgent";
 // takeover the marks are a stale copy's until the new keeper has judged (and rewritten this).
 export const KEEPER_MARK = "project-agent.keeper";
 const LEASE_STALE = 50000; // timer.js takes the lease over after this much silence
+const MARK_STALE = 20000; // the keeper rewrites its mark every 10 s while it runs
 export function keeperJudging() {
-  const lease = shared("project-agent.timer"), mark = shared(KEEPER_MARK);
-  return Boolean(lease?.id && Date.now() - Number(lease.at) < LEASE_STALE && mark?.id === lease.id);
+  const lease = shared("project-agent.timer"), mark = shared(KEEPER_MARK), now = Date.now();
+  return Boolean(lease?.id && now - Number(lease.at) < LEASE_STALE && mark?.id === lease.id && now - Number(mark.at) < MARK_STALE);
 }
 
 // A launcher that has begun and not finished starting (or waits for Enter on an error).
