@@ -370,12 +370,13 @@ export default class ProjectAgent extends View {
         .when((task.workers ?? []).length > 0, (e) => e.child(h_flex().gap(6).flex_wrap().children((task.workers ?? []).map((w, i) => {
           const address = space.machine ? `${space.machine}/${w.address}` : w.address;
           const term = terminals().find((x) => x.address === address && x.state === "live");
-          const label = `${w.role ?? "worker"} ${w.address ?? ""}`.trim();
+          // Read-only marks the tools write: "kept" (pa-worker keep) and "(closed)" (pa-worker close).
+          const label = `${w.role ?? "worker"} ${w.address ?? ""}`.trim() + (w.keep ? " · kept" : "");
           return h_flex().id(`worker-${task.id}-${i}`).flex_none().px(8).h(24).gap(6).items_center().rounded(6).border(1).border_color(t.border).text_size(11.5)
             .text_color(term ? t.foreground : t.dim)
             .when(Boolean(term), (b) => b.cursor_pointer().hover((s) => s.bg(t.hover)).on_click(() => this.showAgent(address)))
             .child(div().size(6).rounded(3).bg(term ? t[term.status] ?? t.idle : t.dim))
-            .child(term ? `${label} ↗` : `${label} (ended)`)
+            .child(term ? `${label} ↗` : w.finished ? `${label} (closed)` : `${label} (ended)`)
             // The × opens the delete dialog: the person's way to close any worker (the agent closes finished ones itself).
             .child(div().id(`worker-x-${task.id}-${i}`).flex_none().px(3).text_color(t.dim).cursor_pointer().hover((s) => s.text_color(t.blocked))
               .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
@@ -425,7 +426,10 @@ export default class ProjectAgent extends View {
         .child(div().flex_none().text_size(10.5).text_color(t.dim).child(when(open ? c.created : c.answered)))
         .child(this.chip(t, open ? "open" : c.status === "withdrawn" ? "withdrawn" : `answered: ${c.answer}`, open ? t.blocked : t.dim)))
       .child(div().text_size(13).font_semibold().text_color(t.foreground).child(String(c.question)))
-      .when(Boolean(c.context), (el) => el.child(div().text_size(12).text_color(t.muted).child(String(c.context))))
+      // The context, one row per line; a line that starts with two spaces is indented (a worktree card's details).
+      .when(Boolean(c.context) && !String(c.context).includes("\n"), (el) => el.child(div().text_size(12).text_color(t.muted).child(String(c.context))))
+      .when(String(c.context ?? "").includes("\n"), (el) => el.child(v_flex().gap(2).children(String(c.context).split("\n").map((line) =>
+        div().text_size(12).text_color(t.muted).when(line.startsWith("  "), (d) => d.pl(12)).child(line.startsWith("  ") ? line.trimStart() : line)))))
       .when(Boolean(task), (el) => el.children(this.actions(t, task, space)))
       .children((c.options ?? []).map((o, i) => {
         const recommended = c.recommendation === o.label, chosen = open ? picked === o.label : c.answer === o.label;
