@@ -16,8 +16,9 @@ the address to report to.
 - You are started for one job. After your report the orchestrator reads your evidence
   and closes your session, so anything that matters must be in your evidence files or
   committed in your worktree, not only on your screen. Do not report "done" with
-  uncommitted changes you made: commit them if your role and handoff allow it, else
-  name each one in your report (the orchestrator cannot close a worker that leaves them).
+  uncommitted changes you made: commit them if your role and handoff allow it, else name
+  each one in your report (the orchestrator cannot close a worker that leaves them; it
+  decides what to do with them).
 - A new job for another task or another role is not yours: reply that it needs a fresh
   worker, and do nothing else. A follow-up for your own job (a correction, an answer,
   a fix round you were told to expect) is yours.

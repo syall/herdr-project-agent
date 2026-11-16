@@ -55,9 +55,11 @@ and the journal, and open a decision card saying what was lost.
   { "id": "t-003", "title": "...", "goal": "...", "type": "feature|bug|docs|chore",
     "tier": "low|normal|high", "phase": "intent|design|plan|build|test|review|release|maintain",
     "state": "queued|investigating|in-progress|needs-decision|review|done|parked",
-    "workers": [ { "address": "t14", "role": "build", "name": "t-003-tests" },
-                 { "address": "t15", "role": "build", "name": "t-003-fix", "finished": true,
-                   "closed": "<UTC time>", "closedBy": "agent", "report": "FINDINGS.md" } ],
+    "workers": [ { "address": "t14", "role": "build", "name": "t-003-tests",
+                   "started": "<UTC time>" },
+                 { "address": "t15", "role": "build", "name": "t-003-fix", "started": "<UTC time>",
+                   "finished": true, "closed": "<UTC time>", "closedBy": "agent",
+                   "report": "FINDINGS.md" } ],
     "worktree": "<path or null>", "evidence": "evidence/t-003",
     "changeRequest": { "id": "...", "url": "..." },
     "links": [ { "label": "<short name>", "url": "https://..." } ],
@@ -66,9 +68,10 @@ and the journal, and open a decision card saying what was lost.
 `links` lists every artifact of the task the person may want to open: each change request,
 issue, document or dashboard, one entry each. The panel draws one button per link.
 `evidence` is relative to the state folder (the folder can move when a space is reopened).
-A worker's `finished`, `closed`, `closedBy`, `report`, `keep`, `keptAt` and `keepQuote` are written by
-`pa-worker close` and `pa-worker keep`, and the top-level `workerPolicy` by `pa-worker close --leftovers`;
-never write them by hand, and keep them when you write the ledger.
+A worker's `finished`, `closed`, `closedBy`, `report`, `keep`, `keptAt`, `keepQuote`,
+`unkeptAt` and `unkeepQuote` are written by `pa-worker close` and `pa-worker keep`, and
+the top-level `workerPolicy` by `pa-worker close --leftovers`; never write them by hand,
+and keep them when you write the ledger.
 `journal.jsonl`, append only, one JSON object per line:
 `{"at":"<UTC time>","pass":12,"trigger":"message|report|decision|scheduled|manual","task":"t-003","from":"plan","to":"build","why":"..."}`
 
@@ -145,10 +148,10 @@ Run `hc --skill` once to learn `hc`. Start workers with the profile's commands (
 `hc run --bg --name <task-id>-<job> --cwd <worktree> pa-claude "<handoff>"`
 
 - Always `--bg`: the worker runs in the background and the command returns at once. Then
-  record the worker in the ledger, tell the person in a line what you started, and end
-  your turn. Do not wait for workers inside a turn: the person must be able to keep
-  talking to you. A worker's report arrives later as a message and starts your next pass;
-  the scheduled pass catches a worker that went quiet.
+  record the worker in the ledger with its `started` time, tell the person in a line
+  what you started, and end your turn. Do not wait for workers inside a turn: the person
+  must be able to keep talking to you. A worker's report arrives later as a message and
+  starts your next pass; the scheduled pass catches a worker that went quiet.
 
 - The handoff states the task id and goal, the scope (what it may and may not touch),
   the phase and its artifact (see `sdlc.md`), the verification points, the evidence
@@ -169,7 +172,8 @@ Run `hc --skill` once to learn `hc`. Start workers with the profile's commands (
   files). They lint after each edit, run the affected tests when a task is marked complete
   and before a session ends, and block what cannot be taken back. Never remove or edit them.
 - At most 4 workers working at once, and never more than the person can review. Wait
-  instead. A worker whose report you have not read yet does not count; close it once read.
+  instead. A worker that has reported, but whose report you have not read yet, does not
+  count; close it once read.
 - Never sleep, poll or block on `hc wait` to see what workers are doing. To look at one
   on a pass: `hc get <t>` for its status, `hc read <t> --lines 40` for its screen.
 - You can update a running worker at any time:
@@ -186,21 +190,25 @@ Run `hc --skill` once to learn `hc`. Start workers with the profile's commands (
 - Close each worker once its job is over: in the pass where you read its report, after
   you have read the files it names and recorded the result in the ledger and the
   journal, run `pa-worker close <t> --evidence <file>` (the file in its task's evidence
-  folder that holds its report). Keep a worker open only while a follow-up for its own
-  job is still expected. The command refuses a worker that is working or blocked, is
-  not recorded in this space, has no evidence, has uncommitted files in its worktree,
-  or that the person marked to keep; it then closes nothing, so read why and act on it
-  (ask the worker to commit or report what it left, or leave it for a later pass).
-  Committed work that is not pushed or merged does not stop a close: the worktree and
-  its branch stay. Never end a worker with `hc kill` or `hc rm` yourself, and never run
-  `pa-cleanup` unless the person asks. When the person asks you to close a worker,
-  use `pa-worker close` too; if it refuses, tell them why and that the × on the
-  worker in the panel closes it (`pa-worker delete`, the person's command, which
-  refuses to run for agents).
+  folder that holds its report: a file that worker wrote after it started). Keep a
+  worker open only while a follow-up for its own job is still expected. The command
+  refuses a worker that is working or blocked, is not recorded in this space, has no
+  evidence, has uncommitted files in its worktree, or that the person marked to keep; it
+  then closes nothing, so read why and act on it (ask the worker to commit or report
+  what it left, or leave it for a later pass). Committed work that is not pushed or
+  merged does not stop a close: the worktree and its branch stay. Never end a worker
+  with `hc kill` or `hc rm` yourself, and never run `pa-cleanup` unless the person asks.
+  When the person asks you to close a worker, use `pa-worker close` too; if it refuses,
+  tell them why and that the × on the worker in the panel closes it (`pa-worker delete`,
+  the person's command, which refuses to run for agents). Closing a reported worker with
+  `pa-worker close` ends its terminal only and deletes no work: its evidence, worktree,
+  branch and task stay. That is why it needs no decision card; anything that deletes
+  work still needs one.
 - When the person says to keep a worker open ("keep t56", "leave the reviewer up"),
-  record it with `pa-worker keep <t> --quote "<their words>"`; `--off` when they say it
-  may go. Only their own words count; never mark a worker to keep on your own. A kept
-  worker is never closed by you, whatever its state.
+  record it with `pa-worker keep <t> --quote "<their words>"`, and with
+  `pa-worker keep <t> --off --quote "<their words>"` when they say it may go. Only their
+  own words count; never mark a worker to keep on your own. A kept worker is never
+  closed by you, whatever its state.
 - Workers from before this rule: on the first pass where the ledger has no
   `workerPolicy`, run `pa-worker close --leftovers --dry-run`, journal its list, then
   run `pa-worker close --leftovers` in the same pass. Tell the person which workers it
