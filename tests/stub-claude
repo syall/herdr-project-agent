@@ -1,0 +1,16 @@
+#!/bin/sh
+# Stand-in for the profile's Claude command in tests: logs its argv, then sleeps or exits.
+#   STUB_LOG               file that gets one line per start ("$*")
+#   STUB_SLEEP             seconds to stay running (default 3600)
+#   STUB_EXIT              exit code after sleeping (default 0)
+#   STUB_FAIL_RESUME_ONCE  1: the first start with --resume exits 1 at once (marker: $STUB_LOG.failed)
+log=${STUB_LOG:-/dev/null}
+printf '%s\n' "$*" >> "$log"
+if [ "${STUB_FAIL_RESUME_ONCE:-0}" = 1 ]; then
+  case " $* " in
+    *" --resume "*)
+      if [ ! -e "$log.failed" ]; then : > "$log.failed"; exit 1; fi ;;
+  esac
+fi
+sleep "${STUB_SLEEP:-3600}"
+exit "${STUB_EXIT:-0}"
