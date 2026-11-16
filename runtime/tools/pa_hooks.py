@@ -14,6 +14,7 @@ Selected by the name it is invoked as (symlinks in ~/.local/bin):
                                                 the person's command: end a worker and remove what belongs to it
   pa-worker close <address> --evidence F         end a worker whose report is read (agents may run it; guarded)
   pa-worker close --leftovers [--dry-run]        close every recorded worker that meets the same guards
+  pa-worker keep <address> --quote TEXT [--off]  record that the person wants a worker kept open
   pa-hook <name>                                one hook, called by the agent harness (reads its JSON on stdin):
       lint-after-edit   after each edit: lint the changed file
       affected-tests    when a task is marked complete, and (--stop) before the session ends
@@ -592,8 +593,9 @@ def worker_facts(directory, agent, profile, address):
     if not task:
         return out, None
     crew = task.get("workers") or []
-    out.update(task=task.get("id"), title=task.get("title"), taskState=task.get("state"), role=next(w.get("role") for w in crew if w.get("address") == address),
-               onlyWorker=len(crew) == 1)
+    entry = next(w for w in crew if w.get("address") == address)
+    out.update(task=task.get("id"), title=task.get("title"), taskState=task.get("state"), role=entry.get("role"),
+               onlyWorker=len(crew) == 1, keep=bool(entry.get("keep")), finished=bool(entry.get("finished")), closed=entry.get("closed"))
     row = next((r for r in worktree_state(directory, agent, profile).values() if task.get("id") in r["tasks"]), None)
     if row and row["facts"] and not row["facts"].get("main"):
         others = [w["address"] for w in row["workers"] if w["fate"] == "live" and w["address"] != address] + row["others"]
@@ -785,6 +787,37 @@ def close_worker(directory, agent, profile, address, evidence):
         print(end_worker(directory, ledger, task, entry, address, report, by, "close"))
 
 
+def keep_worker(directory, agent, address, quote, off):
+    """pa-worker keep <address> --quote "<the person's words>" [--off] (spec 3.5). It only marks the
+    ledger entry; it reopens nothing."""
+    if "/" in address:
+        raise pa.Problem("{} is on another machine; pa-worker keep runs on the machine the space runs on".format(address))
+    if address == agent.get("terminal"):
+        raise pa.Problem("that is the Project Agent itself; it ends when its space is closed")
+    if not off and not (quote or "").strip():
+        raise pa.Problem('pa-worker keep needs --quote "<the person\'s own words>"')
+    with ledger_lock(directory):
+        ledger = read_ledger(directory)
+        task, entry = recorded(ledger, address)
+        if not entry:
+            raise pa.Problem("{} is not a recorded worker of this space; nothing was marked".format(address))
+        name = entry.get("name") or "unnamed"
+        if off and not entry.get("keep"):
+            print("{} is not marked keep.".format(address))
+            return
+        stamp = pa.now()
+        if off:
+            entry.update(keep=False, unkeptAt=stamp)
+            why = "{} ({}) is no longer kept, at the person's word".format(address, name)
+        else:
+            entry.update(keep=True, keptAt=stamp, keepQuote=quote.strip())
+            why = 'the person asked to keep {} open: "{}"'.format(address, quote.strip())
+        task["updated"] = stamp
+        pa.write_json(os.path.join(directory, "ledger.json"), ledger)
+        append_journal(directory, {"by": "agent" if by_an_agent() else "person", "trigger": "keep", "task": task.get("id"), "why": why})
+    print("{} ({}, task {}) {}.".format(address, name, task.get("id"), "is no longer kept" if off else "is marked keep: it is not closed by the agent"))
+
+
 def close_leftovers(directory, agent, profile, dry_run):
     raise pa.Problem("pa-worker close --leftovers is not built yet")
 
@@ -794,13 +827,15 @@ def cmd_worker(args):
     space = pa.local_id(given)
     if not space:
         raise pa.Problem("pass --space <id>")
-    if args.action == "close" and "/" in given and not os.path.isdir(pa.space_dir(space)):
+    if args.action in ("close", "keep") and "/" in given and not os.path.isdir(pa.space_dir(space)):
         raise pa.Problem("space {} lives on {}; run pa-worker there (its Project Agent does)".format(given, given.split("/")[0]))
     directory, agent, profile = load_context(space)
     if args.action == "close":
         if args.leftovers:
             return close_leftovers(directory, agent, profile, args.dry_run)
         return close_worker(directory, agent, profile, args.address, args.evidence)
+    if args.action == "keep":
+        return keep_worker(directory, agent, args.address, args.quote, args.off)
     facts, row = worker_facts(directory, agent, profile, args.address)
     if args.action == "info":
         print(json.dumps(facts, indent=2))
@@ -910,7 +945,7 @@ def main():
             raise pa.Problem("pa-worktree remove needs a task id")
         return cmd_worktree(args)
     if kind == "pa-worker":
-        parser.add_argument("action", choices=("info", "delete", "close"))
+        parser.add_argument("action", choices=("info", "delete", "close", "keep"))
         parser.add_argument("address", nargs="?")
         parser.add_argument("--keep-worktree", action="store_true", help="delete: leave its worktree in place")
         parser.add_argument("--discard", action="store_true", help="delete: delete the worktree even with uncommitted files or unpushed commits")
@@ -918,6 +953,8 @@ def main():
         parser.add_argument("--evidence", help="close: the report you read, a file in evidence/<task>/")
         parser.add_argument("--leftovers", action="store_true", help="close: every recorded worker from before one-worker-per-job that meets the guards")
         parser.add_argument("--dry-run", action="store_true", help="close --leftovers: only list what it would do")
+        parser.add_argument("--quote", help="keep: the person's own words")
+        parser.add_argument("--off", action="store_true", help="keep: the person says it may be closed again")
         parser.add_argument("--space")
         args = parser.parse_args()
         if args.action == "close" and bool(args.address) == bool(args.leftovers):

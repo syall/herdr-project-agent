@@ -949,7 +949,10 @@ def cmd_cleanup(args):
         finished = info.get("state") == "finished"
         task_over = tasks[task].get("state") in ("done", "parked")
         row = {"address": t["address"], "name": name, "task": task, "state": info.get("state"), "evidence": has_evidence}
-        if not has_evidence:
+        entry = next((w for w in tasks[task].get("workers") or [] if w.get("address") == t["address"]), {})
+        if entry.get("keep"):  # the person said to keep it (pa-worker keep): never removed here, even with --kill
+            kept.append(dict(row, why="marked keep"))
+        elif not has_evidence:
             kept.append(dict(row, why="no evidence recorded yet"))
         elif finished or (task_over and args.kill):
             if not args.dry_run:
