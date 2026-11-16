@@ -392,8 +392,19 @@ def cmd_gate(args):
 
 # ---- pa-worktree ------------------------------------------------------------------------------
 
-def git(path, *args):
-    r = subprocess.run(["git", "-C", path] + list(args), stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+GIT_TIMEOUT = 20  # seconds, for each git call made while checking or describing a worktree
+
+
+def git(path, *args, timeout=None):
+    """(exit code, stdout, stderr), stripped. A call that runs past the timeout gives code 124."""
+    limit = timeout or GIT_TIMEOUT
+    try:
+        r = subprocess.run(["git", "-C", path] + list(args), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           universal_newlines=True, timeout=limit)
+    except subprocess.TimeoutExpired:
+        return 124, "", "git {} timed out after {} s".format(args[0] if args else "", limit)
+    except OSError as e:
+        return 127, "", str(e)
     return r.returncode, r.stdout.strip(), r.stderr.strip()
 
 
@@ -412,9 +423,12 @@ def worktree_facts(path, profile=None):
             facts = None
         if not facts:
             return None
+        # "repos" (optional): the git repositories inside it, so its card can describe each one.
+        repos = [os.path.realpath(r) for r in facts.get("repos") or [] if isinstance(r, str) and os.path.isabs(r)
+                 and os.path.isdir(r) and inside(r, path)]
         return {"main": False, "branch": facts.get("branch", ""), "uncommitted": int(facts.get("uncommitted", 0)),
                 "unpushed": int(facts.get("unpushed", 0)), "removesBranches": bool(facts.get("removesBranches")),
-                "kind": facts.get("kind", "worktree"), "remove": script("remove")}
+                "kind": facts.get("kind", "worktree"), "remove": script("remove"), "repos": repos}
     code, top, _ = git(path, "rev-parse", "--path-format=absolute", "--show-toplevel")
     code2, common, _ = git(path, "rev-parse", "--path-format=absolute", "--git-common-dir")
     if code or code2 or os.path.realpath(top) != os.path.realpath(path):
@@ -463,6 +477,274 @@ def worktree_state(directory, agent, profile=None):
     return rows
 
 
+# ---- what a worktree holds, for its Delete/Keep card (and WORKTREE.md) ----------------------------
+# Read-only git calls, each with GIT_TIMEOUT. Any failure goes into "error"; the card opens anyway.
+
+CARD_REPOS = 6  # repositories shown on the card
+CARD_COMMITS = 8  # commits shown per repository
+CARD_FILES = 10  # changed files shown per repository
+CARD_UNCOMMITTED = 10  # uncommitted files shown per repository
+SUBJECT = 72  # characters of a commit subject
+PATH = 80  # characters of a file path (cut from the left)
+CONTEXT_MAX = 2000  # characters of the card's context, a hard cap
+MD_COMMITS, MD_FILES = 200, 500  # what WORKTREE.md lists per repository
+DESCRIBE_REPOS = 20  # repositories described at all (each costs about 8 git calls)
+NO_REPOS = "this kind of worktree lists no repositories; counts only"
+SQUASH = "(a squash merge shows as not merged)"
+
+
+def cut(text, limit):
+    text = str(text or "")
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+def cut_path(path, limit=PATH):
+    path = str(path or "")
+    return path if len(path) <= limit else "…" + path[-(limit - 1):]
+
+
+def describe_repo(path, profile=None, name=None):
+    """One git repository: its branch, the main branch it came from, the commits on the branch (merged
+    into the main branch? pushed?), the files they change, and what is uncommitted (spec 4.3)."""
+    repo = {"name": name or os.path.basename(path.rstrip(os.sep)), "path": path, "branch": None, "base": None, "fork": None,
+            "commits": [], "commitsTotal": 0, "merged": 0, "pushed": 0, "files": [], "filesTotal": 0, "added": 0, "removed": 0,
+            "uncommitted": [], "uncommittedTotal": 0, "error": None}
+
+    def fail(err):
+        repo["error"] = repo["error"] or (str(err or "git failed").strip()[:200] or "git failed")
+
+    code, branch, err = git(path, "rev-parse", "--abbrev-ref", "HEAD")
+    if code:
+        fail(err)
+        return repo
+    repo["branch"] = branch
+    # The main branch: origin/HEAD's target, then main, master, trunk, then the profile's main branches.
+    names = []
+    code, target, _ = git(path, "symbolic-ref", "--short", "refs/remotes/origin/HEAD")
+    if not code and target:
+        names.append(target)
+    names += ["main", "master", "trunk"]
+    for b in (profile or {}).get("mainBranches") or []:
+        names += [b, "origin/" + b]
+    bases = [n for n in dict.fromkeys(names) if n != branch and git(path, "rev-parse", "--verify", "--quiet", n + "^{commit}")[0] == 0]
+    repo["base"] = bases[0] if bases else None
+    # Where the branch began: its creation in the reflog (still right after a fast-forward merge), else the merge-base.
+    fork = None
+    if branch != "HEAD":
+        code, out, _ = git(path, "reflog", "show", "--format=%H", "refs/heads/" + branch)
+        oldest = out.splitlines()[-1].strip() if not code and out else None
+        if oldest and git(path, "merge-base", "--is-ancestor", oldest, "HEAD")[0] == 0:
+            fork = oldest
+    if not fork and bases:
+        code, out, err = git(path, "merge-base", "HEAD", bases[0])
+        fork = out if not code and out else None
+        if code:
+            fail(err)
+    if fork:
+        repo["fork"] = git(path, "rev-parse", "--short", fork)[1] or fork[:7]
+        code, count, _ = git(path, "rev-list", "--count", fork + "..HEAD")
+        code, out, err = git(path, "log", "-n", str(MD_COMMITS + 1), "--format=%H%x1f%h%x1f%s", fork + "..HEAD")
+        if code:
+            fail(err)
+        rows = [line.split("\x1f", 2) for line in out.splitlines() if line.count("\x1f") >= 2] if not code else []
+        repo["commitsTotal"] = max(int(count) if count.isdigit() else 0, len(rows))
+        unmerged = []  # per main-branch candidate: the branch commits it does not contain
+        for b in bases:
+            code, out, _ = git(path, "rev-list", "HEAD", "--not", fork, b)
+            if not code:
+                unmerged.append(set(out.split()))
+        picked = set()  # commits whose patch is already in the main branch (rebased or picked)
+        if repo["base"] and repo["commitsTotal"] <= MD_COMMITS:
+            code, out, _ = git(path, "cherry", repo["base"], "HEAD", fork)
+            picked = {line[2:].strip() for line in out.splitlines() if line.startswith("- ")} if not code else set()
+        code, out, err = git(path, "rev-list", "HEAD", "--not", "--remotes")
+        if code:
+            fail(err)
+        unpushed = set(out.split())
+        for full, short, subject in rows:
+            merged = (any(full not in u for u in unmerged) or full in picked) if unmerged else None
+            repo["commits"].append({"sha": short, "subject": subject, "merged": merged, "pushed": not code and full not in unpushed})
+        repo["merged"] = sum(1 for c in repo["commits"] if c["merged"])
+        repo["pushed"] = sum(1 for c in repo["commits"] if c["pushed"])
+        code, out, err = git(path, "diff", "--numstat", "-z", "-M", fork, "HEAD")
+        if code:
+            fail(err)
+        parts, i = (out.split("\x00") if not code else []), 0
+        while i < len(parts):
+            bits = parts[i].split("\t", 2)
+            i += 1
+            if len(bits) < 3:
+                continue
+            added, removed, name_ = bits
+            if not name_:  # a rename: the old and the new path follow
+                name_ = parts[i + 1] if i + 1 < len(parts) else ""
+                i += 2
+            added = int(added) if added.isdigit() else None
+            removed = int(removed) if removed.isdigit() else None
+            repo["filesTotal"] += 1
+            repo["added"] += added or 0
+            repo["removed"] += removed or 0
+            if len(repo["files"]) < MD_FILES:
+                repo["files"].append({"path": name_, "added": added, "removed": removed})
+    elif not repo["error"]:
+        fail("no main branch found")
+    files = status_files(path)
+    if files is None:
+        fail("git status failed")
+    else:
+        repo["uncommittedTotal"] = len(files)
+        repo["uncommitted"] = [{"path": f, "status": st} for st, f in files[:MD_FILES]]
+    return repo
+
+
+def describe_worktree(row, facts, profile):
+    """The tasks using the worktree and each repository in it (spec 4.2, 4.4)."""
+    desc = {"tasks": [{"id": t, "title": row.get("titles", {}).get(t, ""), "state": row.get("states", {}).get(t)} for t in row["tasks"]],
+            "repos": [], "notDescribed": [], "note": None, "error": None, "kind": facts.get("kind") or "git worktree"}
+    if facts.get("remove"):  # the profile's own kind: its status script names the repositories, if it can
+        paths = facts.get("repos") or []
+        if not paths:
+            desc["note"] = NO_REPOS
+        names = [None] * len(paths)
+    else:
+        paths, names = [row["path"]], [os.path.basename(facts.get("repo") or row["path"])]
+    for i, path in enumerate(paths):
+        if i >= DESCRIBE_REPOS:
+            desc["notDescribed"].append(os.path.basename(path))
+            continue
+        try:
+            desc["repos"].append(describe_repo(path, profile, names[i]))
+        except Exception as e:  # noqa: BLE001 - a description never stops the card
+            desc["repos"].append(dict(name=names[i] or os.path.basename(path), path=path, branch=None, base=None, fork=None,
+                                      commits=[], commitsTotal=0, merged=0, pushed=0, files=[], filesTotal=0, added=0, removed=0,
+                                      uncommitted=[], uncommittedTotal=0, error=str(e)[:200]))
+    return desc
+
+
+def counts(added, removed):
+    text = " ".join(x for x in ("+{}".format(added) if added else "", "−{}".format(removed) if removed else "") if x)
+    return text
+
+
+def unchanged(repo):
+    return not repo["commitsTotal"] and not repo["filesTotal"] and not repo["uncommittedTotal"] and not repo["error"]
+
+
+def merged_word(c):
+    return "merged: unknown" if c["merged"] is None else "merged" if c["merged"] else "not merged"
+
+
+def repo_lines(r):
+    head = "{}: branch {}".format(r["name"], r["branch"] or "?")
+    if r["fork"]:
+        n = r["commitsTotal"]
+        head += ", from {} at {}: {} commit{}, {}, {} pushed".format(
+            r["base"] or "its start", r["fork"], n, "" if n == 1 else "s",
+            "{} merged into {}".format(r["merged"], r["base"]) if r["base"] else "merged: unknown", r["pushed"])
+    lines = [head]
+    shown = r["commits"][:CARD_COMMITS]
+    for c in shown:
+        lines.append("  {} {}  ({}, {})".format(c["sha"], cut(c["subject"], SUBJECT), merged_word(c), "pushed" if c["pushed"] else "not pushed"))
+    if r["commitsTotal"] > len(shown):
+        lines.append("  … {} shown, {} more".format(len(shown), r["commitsTotal"] - len(shown)))
+    if r["filesTotal"]:
+        listed = ["{} (binary)".format(cut_path(f["path"])) if f["added"] is None else
+                  " ".join(x for x in (cut_path(f["path"]), counts(f["added"], f["removed"])) if x) for f in r["files"][:CARD_FILES]]
+        more = r["filesTotal"] - len(listed)
+        lines.append("  Files changed: {} ({}): {}{}".format(r["filesTotal"], counts(r["added"], r["removed"]) or "+0",
+                                                          ", ".join(listed), ", … {} more".format(more) if more > 0 else ""))
+    if r["uncommittedTotal"]:
+        listed = ["{} {}".format(u["status"], cut_path(u["path"])) for u in r["uncommitted"][:CARD_UNCOMMITTED]]
+        more = r["uncommittedTotal"] - len(listed)
+        lines.append("  Uncommitted: {}: {}{}".format(r["uncommittedTotal"], ", ".join(listed), ", … {} more".format(more) if more > 0 else ""))
+    if r["error"]:
+        lines.append("  could not read the changes: {}".format(r["error"]))
+    return lines
+
+
+def deleting_text(facts):
+    loses_commits = facts.get("removesBranches") and facts.get("unpushed", 0) > 0
+    n = facts.get("uncommitted", 0)
+    lost = "; the {} uncommitted files are DISCARDED".format(n) if n else ""
+    if facts.get("removesBranches"):
+        return "Deleting also deletes its branches ({}){}{}.".format(
+            facts.get("branch"), "; the commits that are on no remote would be LOST" if loses_commits else "", lost)
+    return "Deleting: the branch {} and its commits are kept{}.".format(facts.get("branch"), lost or "; nothing uncommitted is lost")
+
+
+def card_context(desc, row, facts, gone):
+    """The card's context: one fact per line, at most CONTEXT_MAX characters (spec 4.5)."""
+    lines = ["{} ({})".format(row["path"], desc.get("kind") or facts.get("kind") or "git worktree"),
+             "Tasks: " + ", ".join('{} "{}" ({})'.format(t["id"], cut(t["title"], 60), t["state"]) for t in desc["tasks"])]
+    if desc.get("error"):
+        lines.append("could not read the changes: {}".format(desc["error"]))
+    if desc.get("note") or desc.get("error"):
+        lines += [desc["note"]] if desc.get("note") else []
+        lines.append("Uncommitted files: {}. Commits not on any remote: {}.".format(facts.get("uncommitted", 0), facts.get("unpushed", 0)))
+    changed = [r for r in desc["repos"] if not unchanged(r)]
+    for r in changed[:CARD_REPOS]:
+        lines += repo_lines(r)
+    more = max(0, len(changed) - CARD_REPOS) + len(desc.get("notDescribed") or [])
+    if more:
+        lines.append("… and {} more repositories (WORKTREE.md)".format(more))
+    still = [r["name"] for r in desc["repos"] if unchanged(r)]
+    if still:
+        lines.append("Unchanged: " + ", ".join(still))
+    lines += ["Workers: " + gone, "No other terminal is working in it.", deleting_text(facts), "Full list: WORKTREE.md"]
+    text = "\n".join(lines)
+    if len(text) > CONTEXT_MAX:
+        tail_ = "… (full list in WORKTREE.md)"
+        keep = text[:CONTEXT_MAX - len(tail_) - 1]
+        text = (keep[:keep.rfind("\n")] if "\n" in keep else keep) + "\n" + tail_
+    return text
+
+
+def card_changes(desc):
+    """The structured description on the card, with the card's caps; truncated when anything was cut."""
+    truncated = len(desc["repos"]) > CARD_REPOS or bool(desc.get("notDescribed"))
+    repos = []
+    for r in desc["repos"][:CARD_REPOS]:
+        truncated = truncated or r["commitsTotal"] > CARD_COMMITS or r["filesTotal"] > CARD_FILES or r["uncommittedTotal"] > CARD_UNCOMMITTED \
+            or any(len(c["subject"]) > SUBJECT for c in r["commits"][:CARD_COMMITS])
+        repos.append(dict(r, commits=[dict(c, subject=cut(c["subject"], SUBJECT)) for c in r["commits"][:CARD_COMMITS]],
+                          files=r["files"][:CARD_FILES], uncommitted=r["uncommitted"][:CARD_UNCOMMITTED]))
+    return {"tasks": desc["tasks"], "repos": repos, "note": desc.get("note"), "error": desc.get("error"), "truncated": truncated, "at": pa.now()}
+
+
+def worktree_md(desc, row, facts, gone, card_id):
+    """WORKTREE.md: the same sections as the card, with the larger caps (spec 4.6)."""
+    out = ["# Worktree {}".format(row["path"]), "", "{}. Written {} with decision card {}.".format(
+        desc.get("kind") or "git worktree", pa.now(), card_id), "", "## Tasks", ""]
+    out += ['- {} "{}" ({})'.format(t["id"], t["title"], t["state"]) for t in desc["tasks"]]
+    if desc.get("note") or desc.get("error"):
+        out += [""] + ([desc["note"]] if desc.get("note") else []) + (["Could not read the changes: " + desc["error"]] if desc.get("error") else [])
+        out.append("Uncommitted files: {}. Commits not on any remote: {}.".format(facts.get("uncommitted", 0), facts.get("unpushed", 0)))
+    for r in desc["repos"]:
+        out += ["", "## {}".format(r["name"]), "", "`{}`: branch `{}`{}.".format(r["path"], r["branch"] or "?", ", from `{}` at `{}`".format(
+            r["base"] or "its start", r["fork"]) if r["fork"] else "")]
+        if r["error"]:
+            out += ["", "Could not read the changes: {}".format(r["error"])]
+        out += ["", "### Commits ({}, {} merged, {} pushed)".format(r["commitsTotal"], r["merged"], r["pushed"]), ""]
+        out += ["- `{}` {} ({}, {})".format(c["sha"], c["subject"], merged_word(c), "pushed" if c["pushed"] else "not pushed")
+                for c in r["commits"][:MD_COMMITS]] or ["- none"]
+        if r["commitsTotal"] > MD_COMMITS:
+            out.append("- … {} more".format(r["commitsTotal"] - MD_COMMITS))
+        out += ["", "### Files changed ({}, {})".format(r["filesTotal"], counts(r["added"], r["removed"]) or "+0"), ""]
+        if r["files"]:
+            out += ["| File | Added | Removed |", "|---|---|---|"] + ["| `{}` | {} | {} |".format(
+                f["path"], "binary" if f["added"] is None else f["added"], "" if f["removed"] is None else f["removed"]) for f in r["files"]]
+            if r["filesTotal"] > len(r["files"]):
+                out.append("\n… {} more".format(r["filesTotal"] - len(r["files"])))
+        else:
+            out.append("None.")
+        out += ["", "### Uncommitted ({})".format(r["uncommittedTotal"]), ""]
+        out += ["- `{}` {}".format(u["status"], u["path"]) for u in r["uncommitted"]] or ["None."]
+    if desc.get("notDescribed"):
+        out += ["", "Not described (more than {} repositories): {}".format(DESCRIBE_REPOS, ", ".join(desc["notDescribed"]))]
+    out += ["", "## Workers", "", gone, "", "## Deleting", "", deleting_text(facts), ""]
+    return "\n".join(out)
+
+
 def card_path(directory, task):
     return os.path.join(directory, "decisions", "d-wt-{}.json".format(task))
 
@@ -505,20 +787,31 @@ def cmd_worktree(args):
                     continue
                 loses_commits = facts.get("removesBranches") and facts["unpushed"] > 0
                 dirty = facts["uncommitted"] > 0 or loses_commits
-                kept = ("Deleting also deletes its branches ({}){}".format(facts["branch"], "; the commits that are on no remote would be LOST" if loses_commits else "")
-                        if facts.get("removesBranches") else "The branch {} and its commits are kept either way".format(facts["branch"]))
+                try:
+                    desc = describe_worktree(row, facts, profile)
+                except Exception as e:  # noqa: BLE001 - describing never stops the card (AC7.5)
+                    desc = {"tasks": [{"id": t, "title": row["titles"].get(t, ""), "state": row["states"].get(t)} for t in row["tasks"]],
+                            "repos": [], "notDescribed": [], "note": None, "error": str(e)[:200], "kind": facts.get("kind") or "git worktree"}
+                card_id = "d-wt-" + task
+                evidence = []
+                try:
+                    pa.write_text(os.path.join(directory, "evidence", task, "WORKTREE.md"), worktree_md(desc, row, facts, gone, card_id))
+                    evidence = ["WORKTREE.md"]
+                except OSError:
+                    pass
+                squash = (" " + SQUASH if not facts.get("removesBranches") and any(c["merged"] is False for r in desc["repos"] for c in r["commits"]) else "")
                 pa.write_json(card_path(directory, task), {
-                    "id": "d-wt-" + task, "task": task, "worktree": row["path"],
-                    "question": "Delete the worktree for {}?".format(", ".join(row["tasks"])),
-                    "context": "{}. Workers: {}. No other terminal is working in it. Uncommitted files: {}. "
-                               "Commits not on any remote: {}. {}{}.".format(
-                                   row["path"], gone, facts["uncommitted"], facts["unpushed"], kept,
-                                   "; deleting DISCARDS the uncommitted files" if facts["uncommitted"] else ""),
-                    "options": [{"label": "Delete", "detail": "Remove the {}{}.".format(facts.get("kind", "worktree folder"),
-                                 " with everything listed above that is not saved elsewhere" if dirty else "")},
+                    "id": card_id, "task": task, "worktree": row["path"],
+                    "question": "Delete the worktree for {}?".format(", ".join('{} "{}"'.format(t, cut(row["titles"].get(t, ""), 60)) for t in row["tasks"])),
+                    "context": card_context(desc, row, facts, gone),
+                    "evidence": evidence,
+                    "changes": card_changes(desc),
+                    "options": [{"label": "Delete", "detail": "Remove the {}{}.{}".format(facts.get("kind", "worktree folder"),
+                                 " with everything listed above that is not saved elsewhere" if dirty else "", squash)},
                                 {"label": "Keep", "detail": "Leave the worktree. It will not be asked about again."}],
                     "recommendation": "Keep" if dirty else "Delete", "status": "open", "answer": None, "note": None,
-                    "snapshot": {"uncommitted": facts["uncommitted"], "unpushed": facts["unpushed"]}, "created": pa.now(), "answered": None})
+                    "snapshot": {"uncommitted": facts["uncommitted"], "unpushed": facts["unpushed"],
+                                 "commits": sum(r["commitsTotal"] for r in desc["repos"])}, "created": pa.now(), "answered": None})
                 print("{}: opened card d-wt-{} (recommends {})".format(task, task, "Keep" if dirty else "Delete"))
         if not rows:
             print("No task in the ledger has a worktree.")
@@ -609,7 +902,6 @@ def worker_facts(directory, agent, profile, address):
 # The agent ends a worker once it has read its report. Every check below only reads; a refusal
 # changes nothing. Only a terminal recorded in this space's ledger is ever ended.
 
-GIT_TIMEOUT = 20  # seconds, for each git call made while checking or describing a worktree
 CLOSABLE = ("idle", "done")  # hc statuses a worker may be closed in (also: exited, or already gone)
 
 
