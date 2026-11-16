@@ -2,8 +2,9 @@
 # Integration check for pa-session (t-001, spec §4.1: S1 S2 S5 S6a S7) against a PRIVATE hc core.
 # Usage: tests/pa_session_check.sh <scratch dir made by tests/setup-scratch.sh>
 # Every hc call goes through scratch(): its own HC_SESSION and XDG folders under the scratch dir,
-# HC_TERMINAL_ID / HC_SOCKET unset. It refuses to run unless `hc server status` under that
-# environment reports a core with no terminals that is not the default one. Stops that core at the end.
+# HC_TERMINAL_ID / HC_SOCKET / HC_TERMINAL_SOCKET / HC_SCOPE unset (HC_TERMINAL_SOCKET names the live
+# core's socket inside a Herdr terminal). It refuses to run unless `hc server status` under that
+# environment reports a core with no terminals whose listening socket is under the scratch folder. Stops that core at the end.
 set -u
 S=${1:?usage: pa_session_check.sh <scratch dir>}
 case "$S" in /tmp/*|/private/tmp/*|/var/folders/*) ;; *) echo "refusing: $S is not a temp folder" >&2; exit 2 ;; esac
@@ -13,7 +14,7 @@ SP=sp0123456789abcdef0123456789abcdef
 SP2=spfedcba9876543210fedcba9876543210
 LOG="$S/stub.log"
 scratch() {
-  env -u HC_TERMINAL_ID -u HC_SOCKET -u CLAUDECODE \
+  env -u HC_TERMINAL_ID -u HC_SOCKET -u HC_TERMINAL_SOCKET -u HC_SCOPE -u CLAUDECODE \
     HC_SESSION="$SESSION" XDG_STATE_HOME="$S/state" XDG_CONFIG_HOME="$S/config" XDG_RUNTIME_DIR="$S/run" \
     HERDR_PA_HOME="$S/pa" HERDR_APP_HOME="$S/app" CLAUDE_CONFIG_DIR="$S/claude" STUB_LOG="$LOG" \
     PATH="$S/bin:$PATH" "$@"
@@ -43,9 +44,20 @@ last() { tail -n 1 "$LOG"; }
 # The gate (plan C5): a private core, not the person's.
 status=$(scratch hc server status --json) || { echo "SKIP: scratch core did not start"; exit 2; }
 live=$(echo "$status" | json "d.get('live')")
-sock=$(find "$S/run" -name "$SESSION.sock" 2>/dev/null | head -1)
-if [ "$live" != 0 ] || [ -z "$sock" ]; then echo "SKIP: scratch core not isolated (live=$live socket=$sock)"; exit 2; fi
-echo "scratch core: session $SESSION, socket $sock, live=$live"
+pid=$(echo "$status" | json "d.get('pid')")
+# The sockets that core process has open (lsof on our own process; read-only): one must be ours, under $S.
+socks=$(lsof -a -p "$pid" -U -F n 2>/dev/null | sed -n 's/^n//p' | grep '^/' )
+sock=$(echo "$socks" | grep -F "$S/" | grep -F "$SESSION.sock" | head -1)
+outside=$(echo "$socks" | grep -v -F "$S/" | grep -F '.sock' | head -1)
+real_s=$(cd "$S" && pwd -P)
+[ -z "$sock" ] && sock=$(echo "$socks" | grep -F "$real_s/" | grep -F "$SESSION.sock" | head -1)
+[ -n "$outside" ] && echo "$outside" | grep -qF "$real_s/" && outside=""
+if [ "$live" != 0 ] || [ -z "$sock" ] || [ -n "$outside" ]; then
+  echo "SKIP: scratch core not isolated (live=$live pid=$pid socket=${sock:-none under $S} other=${outside:-none})"
+  scratch hc server stop >/dev/null 2>&1
+  exit 2
+fi
+echo "scratch core: session $SESSION, pid $pid, listening socket $sock (under $S), live=$live"
 cleanup() {
   for t in n1 n2 n3 n4 n5; do scratch hc kill "$t" >/dev/null 2>&1; done
   sleep 1

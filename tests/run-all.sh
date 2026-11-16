@@ -7,6 +7,8 @@
 #                                change are skipped; without it, the whole fast set runs.
 # Node: $NODE, else `node` on PATH, else the newest mise install.
 set -u
+# Never reach the person's hc core from a test: drop every variable that names it.
+unset HC_TERMINAL_ID HC_SOCKET HC_TERMINAL_SOCKET HC_SCOPE CLAUDECODE
 here=$(cd "$(dirname "$0")" && pwd)
 repo=$(cd "$here/.." && pwd)
 cd "$repo" || exit 2
@@ -34,7 +36,7 @@ if [ "$affected" = 1 ] && [ -n "${PA_CHANGED_FILES:-}" ]; then
 fi
 
 parse37() { "$PY" -c "import ast,sys; ast.parse(open(sys.argv[1]).read(), feature_version=(3,7)); print('pa.py parses as Python 3.7')" runtime/tools/pa.py; }
-units() { env -u HC_TERMINAL_ID "$PY" -m unittest -v tests/test_pa_session.py; }
+units() { "$PY" -m unittest -v tests/test_pa_session.py; }
 keeper() { [ -n "$NODE" ] || { echo "no node found (set NODE)"; return 1; }; "$NODE" tests/keeper/run.mjs; }
 integration() {
   S=$(mktemp -d /tmp/t001.XXXXXX) || return 1
