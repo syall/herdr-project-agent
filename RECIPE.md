@@ -33,7 +33,9 @@ A new space opens with a 600 x 440 dialog: a Project Agent card (`Set up for <fo
   tab. A launcher that cannot start shows why and waits for Enter. It ends when its space is closed.
   When no launcher runs (the header says "Not running"), **Open Project Agent** in the header opens
   it again in a new tab, resumed (on a remote space too); it shows "Opening…" until the tab is
-  recorded and says why if nothing started after 30 s. If an agent that looks like this one runs
+  recorded and says why if nothing started after 30 s. While the keeper restores or reopens the
+  tab itself the header says "Restoring…" or "Reopening…" instead; once it has given up (3
+  failures) it says "Not running" and offers Open again. If an agent that looks like this one runs
   by hand in the space, it asks first.
   After updating this repo, run `pa-sync --on <machine>` before installing the mod: an older
   `pa-session` on that machine refuses to replace the dead shell, so restores there fail (the keeper
@@ -124,7 +126,8 @@ A new space opens with a 600 x 440 dialog: a Project Agent card (`Set up for <fo
 - With a task active and the last pass older than the cadence, the agent's terminal receives
   `scheduled pass` within 15 s, and `schedule.json` gets a new `lastPass` and `nextPass`; once the
   app shows a dead launcher's terminal as an idle shell (or its heartbeat is 40 s old), that
-  terminal receives no pass (README, "Messages go only to a live launcher").
+  terminal receives no pass (README, "Messages go only to a live launcher", lists the remaining
+  windows).
 - With no Project Agent running in a configured space, the header says "Not running" and Open
   Project Agent opens one tab `PA: <name>` that resumes the conversation; a second click while it
   runs opens nothing.
