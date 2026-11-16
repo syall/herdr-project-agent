@@ -577,19 +577,20 @@ def cmd_session(args):
     ctx = {"directory": None, "beat": False}
     if args.auto or not address or not space or not sys.stdin.isatty():
         return run_session(args, address, labels, space, project, ctx)  # no one to show an error to: as before
-    while True:
-        # Tell the keeper this launcher has begun, before the slow steps (hc calls, the launch
-        # lock, another launcher's heartbeat), so a slow start is not taken for a plain shell.
-        if not args.ask:  # a new space's first tab asks first; it is never a restore
-            call(["hc", "label", address, "herdr.pa.starting=" + space], check=False)
-        try:
-            return run_session(args, address, labels, space, project, ctx)
-        except (Problem, OSError) as e:
+    try:
+        while True:
+            # Tell the keeper this launcher has begun, before the slow steps (hc calls, the launch
+            # lock, another launcher's heartbeat), so a slow start is not taken for a plain shell.
+            if not args.ask:  # a new space's first tab asks first; it is never a restore
+                call(["hc", "label", address, "herdr.pa.starting=" + space], check=False)
             try:
+                return run_session(args, address, labels, space, project, ctx)
+            except (Problem, OSError) as e:
                 error_wait(address, e)
-            except KeyboardInterrupt:  # the person stops it: the tab's shell takes over, as before
-                call(["hc", "label", address, "herdr.pa.error=", "herdr.pa.starting="], check=False)
-                sys.exit(2)
+    except KeyboardInterrupt:  # the person stops it (in error-wait or before): the tab's shell takes over
+        sys.exit(2)
+    finally:  # however it ends, it no longer says it is starting or waiting
+        call(["hc", "label", address, "herdr.pa.error=", "herdr.pa.starting="], check=False)
 
 
 def launch_lock(space, wait=60):
@@ -609,6 +610,9 @@ def launch_lock(space, wait=60):
                 f.close()
                 raise Problem("another pa-session for this space is still starting (waited {} s)".format(wait))
             time.sleep(0.5)
+        except OSError:  # e.g. ENOLCK on a network home: error-wait shows it
+            f.close()
+            raise
 
 
 def run_session(args, address, labels, space, project, ctx):

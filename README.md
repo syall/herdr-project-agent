@@ -61,8 +61,9 @@ New spaces start the launcher with `space.new { argv: ["pa-session", "--ask"] }`
   takes over 3 minutes). If no new pane appears within 30 s, the restore is given up. If the new pane
   shows no launcher at all (an older `pa-session` that refused, or one the person stopped), the keeper
   says so after 30 s and gives up after 2 minutes, closing that pane only if it is an idle shell it made.
-  It tries again a minute after the last attempt began; after 3 failures in 10 minutes it stops
-  (notice "Project Agent needs you").
+  A launcher that said it began and then died (its terminal is an idle shell for 30 s) is given up the
+  same way. It tries again a minute after the last attempt began; after 3 failures in 10 minutes it
+  stops (notice "Project Agent needs you"; with an older remote `pa-session` that takes about 7 minutes).
 - **Install order for other machines:** run `pa-sync --on <machine>` before installing the new mod.
   An older `pa-session` there refuses to start next to the dead shell it should replace (its
   one-per-space check does not test the heartbeat), so every restore on that machine ends as a plain

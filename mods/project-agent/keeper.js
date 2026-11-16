@@ -31,7 +31,11 @@ function idleShell(term, pane) {
   const named = program.shell === true || program.key === "shell" || SHELL.test(String(program.key ?? "")) || SHELL.test(String(program.name ?? ""));
   if (!named) return false;
   const fg = term.foreground;
-  return !(fg && typeof fg === "object" && !SHELL.test(String(fg.name ?? "")));
+  if (!fg || typeof fg !== "object") return true; // not given: the program table decides (a known limit, MC6)
+  if (!SHELL.test(String(fg.name ?? ""))) return false;
+  // A bare interactive shell only: flags like -l / -i, no script and no -c command (bash ./deploy.sh is busy).
+  const rest = Array.isArray(fg.argv) ? fg.argv.slice(1).map(String) : [];
+  return rest.every((a) => /^-/.test(a) && !/^-[A-Za-z]*c/.test(a));
 }
 
 const STALE_READS = 2; // unchanged heartbeat comparisons that mean its launcher is gone
@@ -395,7 +399,16 @@ export class Keeper {
     }
     if (labelled) this.peek(cx, space, now);
     if (labelled || term.labels?.["herdr.pa.starting"]) {
-      // The launcher has begun (labelled, or said it is starting): wait, never close; tell once if slow.
+      // The launcher has begun (labelled, or said it is starting). If its terminal has been an idle
+      // shell for 30 s since, it died (killed, or an old label left behind): give up like a plain shell.
+      if (idleShell(term, ps.find((p) => p.terminal === rec.to))) {
+        rec.idleSince ??= now;
+        if (now - rec.idleSince > TIMEOUT) {
+          giveUp("its launcher stopped before the Project Agent ran (if this keeps happening, look at its tab or run pa-start in the space)", true);
+          return;
+        }
+      } else delete rec.idleSince;
+      // Otherwise wait, never close; tell once if slow.
       if (now - rec.since > SLOW && !rec.slow) {
         rec.slow = true;
         notify({ title: "Project Agent still starting", body: `${r.name}: its launcher has not finished starting after 3 minutes. Look at its tab.`, level: "warning" });
