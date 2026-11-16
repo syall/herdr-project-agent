@@ -353,6 +353,16 @@ cases["K-nvim-kept"] = () => leftAlone({ argv: ["/bin/zsh"], program: { key: "nv
 cases["K-make-kept"] = () => leftAlone({ argv: ["/bin/zsh"], program: { key: "program", name: "make", shell: false, agent: false }, status: null, title: "make" }, "make (an unlisted program) in a kept shell");
 cases["K-idle-agent-kept"] = () => leftAlone({ argv: ["/bin/zsh"], program: shell, status: "done", report: { app: "claude-code", state: "done" }, app: "claude-code", title: "PA: proj" },
   "an idle agent in a kept shell (status done with app set, 'PA: ' title; terminal-shapes.md item 1), even if the program table says zsh");
+// Each agent signal alone is enough (the shape is not known per field: terminal-shapes.md).
+const leftAloneW = async (change, what) => {
+  world({ argv: ["/bin/zsh"], program: shell, status: null, title: "PA: proj" });
+  change(g.__terminals.find((t) => t.address === "t1"), g.__panes.find((p) => p.pane === "p1"));
+  const k = await start(); await sim(k, 90000);
+  check(runsOf("pane.split", "pane.close", "tab.new", "tab.close").length === 0, `${what}: no pane.* / tab.* (got ${JSON.stringify(g.__runs)})`);
+};
+cases["K-signal-status"] = () => leftAloneW((t) => { t.status = "done"; }, "terminal status only");
+cases["K-signal-report"] = () => leftAloneW((t) => { t.report = { app: "claude-code", state: "done" }; }, "agent report only");
+cases["K-signal-app"] = () => leftAloneW((t, p) => { p.app = "claude-code"; }, "pane app only");
 cases["K-foreground-nvim"] = () => leftAlone({ argv: ["/bin/zsh"], program: shell, status: null, foreground: { name: "nvim", argv: ["nvim", "agent.json"] } }, "the program table says zsh but the foreground process is nvim");
 cases["K-close-recheck"] = async () => { // the old pane is closed only if it is still an idle shell when the new launcher beats
   world({ argv: ["/bin/zsh"], program: shell, status: null });
