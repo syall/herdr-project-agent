@@ -1,8 +1,11 @@
 // The keeper: what makes a Project Agent's tab special, for every space this window shows.
 // The agent's launcher labels its own terminal (herdr.pa=<space>); the keeper mirrors those
 // labels into shared state "project-agent.tabs" (tab id -> { space, project, profile, name,
-// terminal, recovering? }), keeps that tab first, restores it in place when its launcher is
-// gone, and opens the setup dialog for a new space. The labels are the truth; the shared state
+// terminal, alive?, recovering? }), keeps that tab first, restores it in place when its launcher is
+// gone, and opens the setup dialog for a new space. "alive: true" means the launcher is known
+// to run in that terminal (its label and its heartbeat name it): messages go only there.
+// The panel's "Open Project Agent" asks through shared "project-agent.openAgent"
+// ({ "<space id>": { at, by, why? } }): the keeper opens a new PA tab for it, never a second one. The labels are the truth; the shared state
 // is rebuilt from them. A tab bar, menu or pane header reads "project-agent.tabs" to leave
 // out its close and pin controls for that tab.
 // A space counts only while its agent.json exists and is not marked closed ("configured").
@@ -18,6 +21,9 @@ const dirOf = (space) => `${space.machine ? "" : `${home()}/`}.config/herdr-pa/s
 const beatAddress = (text) => String(text ?? "").trim().split(/\s+/)[1] ?? null; // heartbeat: "<epoch> <address>"
 const argvOf = (r) => ["pa-session", "--space", localId(r.space), "--project", r.project, "--profile", r.profile, "--name", r.name];
 const SHELL = /(^|\/)-?(sh|bash|zsh|fish|dash|ksh|tcsh|csh)$/; // a shell's program or process name
+const REQUESTS = "project-agent.openAgent"; // the panel writes a request, the keeper deletes it
+const FRESH = 30000; // a heartbeat this recent means its launcher runs (pa.py's FRESH)
+const beatFresh = (text, now) => { const [epoch, address] = String(text ?? "").trim().split(/\s+/); return Number(epoch) * 1000 >= now - FRESH ? address ?? null : null; };
 const present = (v) => v !== undefined && v !== null && v !== "" && !(typeof v === "object" && Object.keys(v).length === 0);
 
 // Positive evidence that a terminal is an idle shell at its prompt, the only thing the keeper
@@ -70,13 +76,13 @@ export class Keeper {
     this.missing = {}; // PA tab id -> when its tab or terminal was first seen gone
     this.beat = {}; // PA tab id -> { value, same, at }: its launcher's heartbeat, how many spaced reads it hasn't changed
     this.hb = {}; // space id -> the heartbeat text last read (any read)
-    this.config = {}; // space id -> { state: "absent" | "closed" | "open", at }; no entry: not read yet
+    this.config = {}; // space id -> { state: "absent" | "closed" | "open", at, info: { project, profile, name } }; no entry: not read yet
     this.reopened = {}; // space id -> when a restore or reopen last started
     this.warned = {}; // space id -> told once that it isn't restoring again yet
     this.fails = {}; // space id -> times of failed restores
     this.stopped = {}; // space id -> gave up after MAX_FAILS; cleared when its PA runs again
     this.noticed = {}; // space id -> told once about a program outside the launcher
-    this.pending = {}; // space id -> { tab, since, before }: a reopened tab not yet seen
+    this.pending = {}; // space id -> { tab, since, before, record? }: a reopened or requested tab not yet seen (record: for a request with no old record)
     this.locks = {}; // space id -> { state: "taking" | "held" | "busy", text, at }
     this.seen = {}; // terminal address -> when the keeper first saw it
     this.retired = new Set(); // old PA terminals replaced by a restore: never adopted again
@@ -137,6 +143,7 @@ export class Keeper {
       const s = pane && sp.find((x) => x.tabs.some((t) => t.id === pane.tab));
       if (s) wanted.set(s.id, s);
     }
+    for (const sid of Object.keys(shared(REQUESTS) ?? {})) { const s = sp.find((x) => x.id === sid); if (s) wanted.set(s.id, s); }
     const list = [...wanted.values()].filter((s) => this.machineReady(s));
     if (!beats) this.reading = true;
     cx.spawn(async () => {
@@ -147,7 +154,7 @@ export class Keeper {
             const text = await readTextFile(`${dir}/agent.json`, { on });
             if (text === null) this.config[space.id] = { state: "absent", at: Date.now() };
             else {
-              try { const v = JSON.parse(text); this.config[space.id] = { state: v?.closed ? "closed" : "open", at: Date.now() }; }
+              try { const v = JSON.parse(text); this.config[space.id] = { state: v?.closed ? "closed" : "open", at: Date.now(), info: { project: v?.project, profile: v?.profile, name: v?.name } }; }
               catch { /* half-written or broken: keep what was known */ }
             }
           } catch { /* unreachable: keep what was known */ }
@@ -277,9 +284,10 @@ export class Keeper {
       run("terminal.pin", { terminal: term.address, pinned: true });
     }
 
-    // Reopened tabs (their old tab vanished): record the new tab as soon as it shows, then drop the old record.
+    // Reopened tabs (their old tab vanished) and requested ones: record the new tab as soon as it
+    // shows, then drop the old record (a request with no old record carries the record's fields).
     for (const [sid, pend] of Object.entries(this.pending)) {
-      const space = sp.find((s) => s.id === sid), r = records[pend.tab];
+      const space = sp.find((s) => s.id === sid), r = pend.record ?? records[pend.tab];
       if (!space || !r) { delete this.pending[sid]; if (space) this.release(cx, space); continue; }
       if (!this.machineReady(space)) { pend.since = now; continue; } // offline: wait, and count the 30 s from its return
       const fresh = space.tabs.filter((x) => !pend.before.includes(x.id));
@@ -287,18 +295,24 @@ export class Keeper {
         ?? fresh.map((x) => (x.name === `PA: ${r.name}` ? ps.find((p) => p.tab === x.id && p.terminal) : null)).find(Boolean);
       if (found) {
         records[found.tab] = { space: r.space, project: r.project, profile: r.profile, name: r.name, terminal: found.terminal };
-        delete records[pend.tab]; delete this.missing[pend.tab]; delete this.beat[pend.tab]; delete this.pending[sid];
+        if (pend.tab) { delete records[pend.tab]; delete this.missing[pend.tab]; delete this.beat[pend.tab]; }
+        delete this.pending[sid];
         this.release(cx, space);
       } else if (now - pend.since > TIMEOUT) {
-        delete records[pend.tab]; delete this.missing[pend.tab]; delete this.beat[pend.tab]; delete this.pending[sid];
+        if (pend.tab) { delete records[pend.tab]; delete this.missing[pend.tab]; delete this.beat[pend.tab]; }
+        delete this.pending[sid];
         this.release(cx, space);
-        this.fail(space, r, "its new tab did not appear", now);
+        if (pend.record) notify({ title: "Project Agent not opened", body: `${r.name}: its new tab did not appear. Try Open Project Agent again.`, level: "warning" });
+        else this.fail(space, r, "its new tab did not appear", now);
       }
     }
+
+    if (this.openRequests(cx, records, sp, ts, ps, now)) wantRead = true;
 
     for (const [tab, r] of Object.entries(records)) {
       const space = sp.find((s) => s.id === r.space);
       if (!space) { delete records[tab]; delete this.missing[tab]; delete this.beat[tab]; continue; } // its space closed: the one way a Project Agent ends
+      delete r.alive; // set again below, only for a launcher known to run in the record's terminal
       if (!this.machineReady(space)) { delete this.beat[tab]; delete this.missing[tab]; continue; } // offline: keep the record, count afresh later
       const c = cfg(space);
       if (c === "unknown") { wantRead = true; continue; }
@@ -315,6 +329,7 @@ export class Keeper {
       if (!here) { this.reopen(cx, tab, r, space, now); continue; }
       if (here.index !== 1) run("tab.move", { id: tab, index: 1 });
       const state = this.classify(tab, r, ts, ps, now);
+      if (state === "alive" && ts.find((x) => x.address === r.terminal)?.labels?.["herdr.pa"] === localId(space.id) && beatAddress(this.hb[space.id]) === localId(r.terminal)) r.alive = true;
       if (state !== "foreign") delete this.noticed[space.id]; // the next "something else" is a new episode
       if (state === "alive" || state === "elsewhere") { delete this.missing[tab]; if (state === "alive") delete this.stopped[space.id]; continue; }
       if (state === "foreign") {
@@ -330,6 +345,63 @@ export class Keeper {
     if ((wantRead || readAll) && cx && !this.reading) this.read(cx, readAll);
     const after = JSON.stringify(records);
     if (after !== before) setShared("project-agent.tabs", records);
+  }
+
+  // Open requests from the panel ("Open Project Agent"). Each is taken once its machine is ready
+  // and its agent.json read; it is refused (deleted, with a notice) while the space's launcher runs
+  // or a restore or open is under way, and given up after 30 s if it cannot start. Taking it
+  // opens a new tab running pa-session (it resumes the conversation by its own rule) and records
+  // that tab from the first tick it shows (pending). True when agent.json should be read.
+  openRequests(cx, records, sp, ts, ps, now) {
+    const reqs = shared(REQUESTS) ?? {};
+    let wantRead = false;
+    for (const [sid, req] of Object.entries(reqs)) {
+      const space = sp.find((s) => s.id === sid);
+      const name = this.config[sid]?.info?.name || space?.name || sid;
+      const done = (title, body, level = "info") => { this.dropRequest(sid, req); if (title) notify({ title, body: `${name}: ${body}`, level }); };
+      if (!space) { done(); continue; }
+      const waitOr = (why) => { // keep waiting, or give up after 30 s
+        if (now - (Number(req?.at) || now) > TIMEOUT) done("Project Agent not opened", `${why}. Try again when that has changed.`, "warning");
+        else this.requestWhy(sid, req, why);
+      };
+      if (!this.machineReady(space)) { waitOr(`its machine ${space.machine} is offline`); continue; }
+      const conf = this.config[sid];
+      if (!conf || conf.at < (Number(req?.at) || 0)) { wantRead = true; waitOr("its agent.json could not be read yet"); continue; } // read it fresh
+      if (conf.state === "absent") { done(); continue; } // not a Project Agent space
+      const mine = Object.entries(records).filter(([, r]) => r.space === sid);
+      if (this.pending[sid] || mine.some(([, r]) => r.recovering)) { done("Project Agent already opening", "it is being opened or restored already."); continue; }
+      const running = mine.some(([tab, r]) => space.tabs.some((x) => x.id === tab) && ["alive", "elsewhere"].includes(this.classify(tab, r, ts, ps, now)))
+        || ts.some((t) => t.state === "live" && !t.parent && t.labels?.["herdr.pa"] === localId(sid) && !this.retired.has(t.address) && beatFresh(this.hb[sid], now) === localId(t.address));
+      if (running) { done("Project Agent already running", "it is already running in its tab."); continue; }
+      const info = conf.info ?? {};
+      if (!info.project || !info.profile) { done("Project Agent not opened", "its agent.json has no project or profile; fix it, or run pa-start in the space.", "warning"); continue; }
+      if (!this.lock(cx, space, null, now)) { waitOr(this.locks[sid]?.state === "busy" ? "another Herdr client holds its keeper.lock" : "taking its keeper.lock"); continue; }
+      // The person asked: the restore limits (one a minute, stop after 3 failures) do not apply.
+      for (const [tab] of mine) { delete records[tab]; delete this.missing[tab]; delete this.beat[tab]; }
+      delete this.stopped[sid]; delete this.fails[sid]; delete this.warned[sid];
+      this.reopened[sid] = now;
+      const record = { space: sid, project: info.project, profile: info.profile, name: info.name || space.name };
+      this.pending[sid] = { tab: null, since: now, before: space.tabs.map((x) => x.id), record };
+      run("tab.new", { space: sid, folder: record.project, name: `PA: ${record.name}`, focus: true, argv: argvOf(record) });
+      done("Project Agent opening", "a new tab; its session resumes.");
+    }
+    return wantRead;
+  }
+
+  // Deletes the request this keeper handled, not a newer one written since (another copy or client).
+  dropRequest(sid, req) {
+    const cur = shared(REQUESTS) ?? {};
+    if (!cur[sid] || cur[sid].at !== req?.at) return;
+    const next = { ...cur };
+    delete next[sid];
+    setShared(REQUESTS, next);
+  }
+
+  // Why a request is still waiting, for the panel's message.
+  requestWhy(sid, req, why) {
+    const cur = shared(REQUESTS) ?? {};
+    if (!cur[sid] || cur[sid].at !== req?.at || cur[sid].why === why) return;
+    setShared(REQUESTS, { ...cur, [sid]: { ...cur[sid], why } });
   }
 
   // May a restore or reopen start now? (Not stopped, at most one a minute, and the lock held.)
@@ -429,8 +501,8 @@ export class Keeper {
     else giveUp("its new terminal did not start the launcher within 2 minutes; it was left open because something runs in it", false);
   }
 
-  // The tab itself is gone while its space lives on: open a new one (until Change 2's Close /
-  // Open controls exist). The old record stays until the new tab is recorded (pending).
+  // The tab itself is gone while its space lives on: open a new one. The old record stays until
+  // the new tab is recorded (pending). "Open Project Agent" covers what this cannot see.
   reopen(cx, tab, r, space, now) {
     if (this.pending[space.id]) return;
     this.missing[tab] ??= now;
