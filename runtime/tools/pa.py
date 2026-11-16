@@ -314,10 +314,11 @@ def parse_time(text):
         return None
 
 
-def session_ran(directory, session_id):
+def session_ran(directory, session_id, before=None):
     """True when session.log shows that session_id ran for at least RAN seconds: its last start
     line is followed by an exit after >= RAN s, or (killed while running: no exit line) the
-    heartbeat kept beating RAN s past the start."""
+    heartbeat kept beating RAN s past the start. A heartbeat from `before` (epoch s) on is this
+    launcher's own, not the one that ran the session, and does not count."""
     if not session_id:
         return False
     lines = read_text(os.path.join(directory, "session.log")).splitlines()
@@ -339,6 +340,8 @@ def session_ran(directory, session_id):
             return bool(m and int(m.group(1)) >= RAN)
     began = parse_time(lines[start].split()[0])
     hb = read_heartbeat(directory)
+    if hb and before is not None and hb[0] >= int(before):
+        hb = None
     return bool(start == last_start and began is not None and hb and hb[0] >= began + RAN)
 
 
@@ -356,14 +359,15 @@ def transcript_state(project, session_id):
     return os.path.isfile(os.path.join(folder, session_id + ".jsonl"))
 
 
-def should_resume(agent, directory, project):
-    """(resume?, why): why is flag | ran | transcript | new."""
+def should_resume(agent, directory, project, before=None):
+    """(resume?, why): why is flag | ran | transcript | new. `before`: when this launcher started
+    (its own heartbeat is not evidence that an earlier session ran)."""
     sid = agent.get("sessionId")
     if not sid:
         return False, "new"
     if agent.get("sessionStarted"):
         return True, "flag"
-    if session_ran(directory, sid):
+    if session_ran(directory, sid, before):
         return True, "ran"
     if transcript_state(project, sid) is True:
         return True, "transcript"
@@ -549,6 +553,7 @@ def error_wait(address, problem):
     """pa-session could not start: show why in the tab and wait for Enter, instead of leaving a
     plain shell that looks like a Project Agent. The label tells the keeper (and people) why."""
     message = " ".join(str(problem).split())
+    signal.signal(signal.SIGINT, signal.default_int_handler)  # Ctrl-C stops the wait, even after the launcher ignored it
     call(["hc", "label", address, "herdr.pa.error=" + message[:120]], check=False)
     print("\n[Project Agent] It cannot start: {}\n"
           "               Fix the cause, then press Enter to try again.".format(message), flush=True)
@@ -579,7 +584,18 @@ def cmd_session(args):
                 sys.exit(2)
 
 
+def launch_lock(space):
+    """An exclusive lock, per space, around "is another launcher alive?" up to "this one is labelled
+    and has beaten once", so two launchers started at the same moment cannot both pass the check.
+    Outside spaces/<id>/ so init_state can still move a folder into place."""
+    os.makedirs(ROOT, exist_ok=True)
+    f = open(os.path.join(ROOT, ".launch-{}.lock".format(ident(local_id(space), "space id"))), "a")
+    fcntl.flock(f, fcntl.LOCK_EX)
+    return f
+
+
 def run_session(args, address, labels, space, project, ctx):
+    started = time.time()  # heartbeats from now on are this launcher's own
     existing = read_json(os.path.join(ROOT, "spaces", space, "agent.json"), {}) if space and ID.match(space) else {}
     p = load_profile(args.profile or (existing or {}).get("profile"))
     # A space made in the home folder has no project: a plain Claude tab (pa-start turns one on).
@@ -602,6 +618,17 @@ def run_session(args, address, labels, space, project, ctx):
             exec_plain(p)
     if not os.path.isdir(project):
         raise Problem("project folder does not exist: " + project)
+    lock = launch_lock(space)
+    try:
+        directory, agent = claim(args, address, labels, space, project, p, existing, directory)
+    finally:
+        lock.close()  # releases the lock
+    signal.signal(signal.SIGINT, signal.SIG_IGN)  # Ctrl-C belongs to the agent, not this wrapper
+    run_agent(args, address, project, p, directory, agent, ctx, started)
+
+
+def claim(args, address, labels, space, project, p, existing, directory):
+    """The one-per-space check, then state, labels and a first heartbeat (under launch_lock)."""
     terms = live_terminals()
     other = (existing or {}).get("terminal")
     # One per space: another live terminal labelled for it whose launcher still beats. A labelled
@@ -615,8 +642,11 @@ def run_session(args, address, labels, space, project, ctx):
     directory, agent = init_state(space, project, p, args.name, address, local_id(labels.get("herdr.tab")), terms=terms)
     call(["hc", "label", address, "herdr.pa=" + space, "herdr.pa.profile=" + p["name"],
           "herdr.pa.project=" + project, "herdr.pa.name=" + agent["name"]])
-    signal.signal(signal.SIGINT, signal.SIG_IGN)  # Ctrl-C belongs to the agent, not this wrapper
+    write_text(os.path.join(directory, "heartbeat"), "{} {}\n".format(int(time.time()), address))
+    return directory, agent
 
+
+def run_agent(args, address, project, p, directory, agent, ctx, started):
     running = ctx.setdefault("running", {"since": None, "session": None, "marked": False})
     ctx["directory"] = directory
 
@@ -650,7 +680,7 @@ def run_session(args, address, labels, space, project, ctx):
     quick, quick_resume_fails = 0, 0
     while True:
         agent = read_json(os.path.join(directory, "agent.json"), agent)
-        resume, why = should_resume(agent, directory, project)
+        resume, why = should_resume(agent, directory, project, before=started)
         if args.fresh:
             resume, why = False, "fresh"
         if not resume:

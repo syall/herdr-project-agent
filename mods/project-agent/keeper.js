@@ -17,20 +17,24 @@ const tabs = () => shared("project-agent.tabs") ?? {};
 const dirOf = (space) => `${space.machine ? "" : `${home()}/`}.config/herdr-pa/spaces/${localId(space.id)}`;
 const beatAddress = (text) => String(text ?? "").trim().split(/\s+/)[1] ?? null; // heartbeat: "<epoch> <address>"
 const argvOf = (r) => ["pa-session", "--space", localId(r.space), "--project", r.project, "--profile", r.profile, "--name", r.name];
-const NO_STATUS = new Set([undefined, null, "", "none", "unknown"]);
+const ACTIVE = new Set(["working", "blocked"]); // an agent status that means something reports work right now
+const SHELL = /(^|\/)-?(sh|bash|zsh|fish|dash|ksh|tcsh|csh)$/; // a bare shell's program
 
 const STALE_READS = 2; // unchanged heartbeat comparisons that mean its launcher is gone
+const MIN_GAP = 12000; // reads closer than this to the last counted one are not a comparison
 const READ_GAP = 30000; // reads further apart than this (sleep, slow machine) start counting again
 const YOUNG = 30000; // a terminal this new is never judged stale
 const MISSING = 4000; // a PA terminal or tab gone this long is restored
-const TIMEOUT = 30000; // a restore that has not produced a new terminal by then is given up
+const TIMEOUT = 30000; // a restore that has not produced a running launcher by then is judged
+const STARTING = 90000; // a new launcher that still has not labelled itself by then is given up
 const RETRY = 60000; // at most one restore a minute per space
 const FAIL_WINDOW = 600000, MAX_FAILS = 3; // then stop until the person acts
 const LOCK_TTL = 60000; // another client's lock older than this may be taken over
 const PEEK = 2000; // heartbeat reads while a restore waits for the new launcher
 
 // A terminal the keeper started for this space's restore: argv runs pa-session for the space
-// (or the launcher already labelled it). Without argv (an older app) any new terminal counts.
+// (or the launcher already labelled it). Without argv any new terminal in the tab counts: a
+// compatibility fallback only (herdr.d.ts documents argv on terminals()).
 function isLauncher(term, space) {
   if (!term || term.state !== "live") return false;
   if (term.labels?.["herdr.pa"] === localId(space.id)) return true;
@@ -83,9 +87,14 @@ export class Keeper {
   }
 
   // True while a restore or reopen is under way: main.js then runs syncPA every 250 ms.
+  // Only for spaces whose machine is ready, and only for a bounded time each: a restore past
+  // its deadline, an offline machine or a lock read that never ends falls back to the 1.5 s tick.
   busy() {
-    return Object.values(tabs()).some((r) => r.recovering && !r.recovering.waiting) || Object.keys(this.pending).length > 0
-      || Object.values(this.locks).some((l) => l.state === "taking");
+    const now = Date.now(), sp = spaces();
+    const ready = (sid) => { const s = sp.find((x) => x.id === sid); return Boolean(s && this.machineReady(s)); };
+    return Object.values(tabs()).some((r) => r.recovering && !r.recovering.waiting && ready(r.space) && now - r.recovering.since < STARTING + 5000)
+      || Object.entries(this.pending).some(([sid, p]) => ready(sid) && now - p.since < TIMEOUT + 5000)
+      || Object.entries(this.locks).some(([sid, l]) => l.state === "taking" && ready(sid) && now - l.at < 10000);
   }
 
   machineReady(space) {
@@ -133,7 +142,7 @@ export class Keeper {
             const last = this.beat[tab];
             // Counted in spaced reads: after the computer sleeps, the clock has jumped but nothing was read.
             if (!last || last.value !== value || now - last.at > READ_GAP) this.beat[tab] = { value, same: 0, at: now };
-            else { last.same += 1; last.at = now; }
+            else if (now - last.at >= MIN_GAP) { last.same += 1; last.at = now; } // closer reads (overlaps) are not counted
           }
         }
       } finally { if (!beats) this.reading = false; }
@@ -152,14 +161,14 @@ export class Keeper {
     const l = this.locks[space.id];
     const path = `${dirOf(space)}/keeper.lock`, on = space.machine ?? null;
     if (l?.state === "held") {
-      if (cx && now - l.at > LOCK_TTL / 2 && !l.refreshing) { // a long wait: keep it from looking abandoned
-        l.refreshing = true;
+      if (cx && now - l.at > LOCK_TTL / 2 && !l.refreshing && now - (l.tried ?? 0) >= 5000) { // a long wait: keep it from looking abandoned
+        l.refreshing = true; l.tried = now;
         const text = JSON.stringify({ client: this.me, at: new Date(now).toISOString(), tab });
         cx.spawn(async () => { try { await replaceFile(path, text, l.text, on); l.text = text; l.at = now; } catch { /* taken over */ } l.refreshing = false; });
       }
       return true;
     }
-    if (!cx || l?.state === "taking" || (l?.state === "busy" && now - l.at < 5000)) return false;
+    if (!cx || (l?.state === "taking" && now - l.at < 20000) || (l?.state === "busy" && now - l.at < 5000)) return false;
     this.locks[space.id] = { state: "taking", at: now };
     cx.spawn(async () => {
       try {
@@ -184,15 +193,16 @@ export class Keeper {
     cx.spawn(async () => { try { await replaceFile(`${dirOf(space)}/keeper.lock`, text, l.text, space.machine ?? null); } catch { /* expires */ } });
   }
 
+  // A restore that was given up. The next one comes a minute after the last start (RETRY),
+  // so the notice can say so; the third in 10 minutes stops them.
   fail(space, r, why, now) {
     const list = (this.fails[space.id] ?? []).filter((t) => now - t < FAIL_WINDOW);
     list.push(now);
     this.fails[space.id] = list;
-    const reason = why ? `: ${why}` : "";
     if (list.length >= MAX_FAILS) {
       this.stopped[space.id] = true;
-      notify({ title: "Project Agent needs you", body: `${r.name}: it could not be restored ${list.length} times in 10 minutes${reason}. Fix the cause, then press Enter in its tab or run pa-start in the space.`, level: "error" });
-    } else notify({ title: "Project Agent not restored", body: `${r.name}${reason}. It tries again in a minute.`, level: "warning" });
+      notify({ title: "Project Agent needs you", body: `${r.name}: it could not be restored ${list.length} times in 10 minutes (last: ${why}). Fix the cause, then run pa-start in the space.`, level: "error" });
+    } else notify({ title: "Project Agent not restored", body: `${r.name}: ${why}. It tries again in a minute.`, level: "warning" });
   }
 
   // The state of a record's terminal: alive (its launcher beats, or it is new) | elsewhere (the
@@ -205,10 +215,14 @@ export class Keeper {
     const b = this.beat[tab];
     if (!b) return "alive"; // not read yet
     if (b.same < STALE_READS) return beatAddress(b.value) === localId(term.address) ? "alive" : "elsewhere";
+    // The launcher is gone. A shell left behind is restored; anything else is left alone. A status
+    // or title the dead agent left is not evidence either way; an agent detected now always is.
     const program = term.program ?? {};
-    const isShell = program.shell ?? program.key === "shell";
-    const title = ps.find((p) => p.terminal === term.address)?.title ?? "";
-    return isShell && !program.agent && NO_STATUS.has(term.status) && !/^PA: /.test(title) ? "shell" : "foreign";
+    if (program.agent || ACTIVE.has(term.status)) return "foreign";
+    const argv = Array.isArray(term.argv) ? term.argv.map(String) : null;
+    // A core keep-recovery replaces the program with a bare shell: argv no longer runs pa-session.
+    const kept = Boolean(argv?.length) && SHELL.test(argv[0]) && !argv.some((a) => /pa-session/.test(a));
+    return kept || (program.shell ?? program.key === "shell") ? "shell" : "foreign";
   }
 
   // Runs on a timer, not in render: adopts labelled terminals, keeps each Project Agent tab
@@ -254,6 +268,7 @@ export class Keeper {
     for (const [sid, pend] of Object.entries(this.pending)) {
       const space = sp.find((s) => s.id === sid), r = records[pend.tab];
       if (!space || !r) { delete this.pending[sid]; if (space) this.release(cx, space); continue; }
+      if (!this.machineReady(space)) { pend.since = now; continue; } // offline: wait, and count the 30 s from its return
       const fresh = space.tabs.filter((x) => !pend.before.includes(x.id));
       const found = fresh.map((x) => ps.find((p) => p.tab === x.id && isLauncher(ts.find((t) => t.address === p.terminal), space))).find(Boolean)
         ?? fresh.map((x) => (x.name === `PA: ${r.name}` ? ps.find((p) => p.tab === x.id && p.terminal) : null)).find(Boolean);
@@ -287,6 +302,7 @@ export class Keeper {
       if (!here) { this.reopen(cx, tab, r, space, now); continue; }
       if (here.index !== 1) run("tab.move", { id: tab, index: 1 });
       const state = this.classify(tab, r, ts, ps, now);
+      if (state !== "foreign") delete this.noticed[space.id]; // the next "something else" is a new episode
       if (state === "alive" || state === "elsewhere") { delete this.missing[tab]; if (state === "alive") delete this.stopped[space.id]; continue; }
       if (state === "foreign") {
         delete this.missing[tab];
@@ -329,7 +345,10 @@ export class Keeper {
 
   advance(cx, tab, r, space, here, now, ts, ps) {
     const rec = r.recovering;
-    const giveUp = (why) => {
+    const giveUp = (why, closeOwn) => {
+      // closeOwn: the new pane is a shell the keeper itself made; nobody else's terminal.
+      const own = closeOwn && ps.find((p) => p.tab === tab && p.terminal === rec.to && !rec.panes.includes(p.pane));
+      if (own && !ts.find((t) => t.address === rec.to)?.parent) run("pane.close", { pane: own.pane });
       r.terminal = rec.from; delete r.recovering;
       this.release(cx, space);
       this.fail(space, r, why, now);
@@ -340,10 +359,17 @@ export class Keeper {
       const fresh = ps.find((p) => p.tab === tab && p.terminal && !rec.panes.includes(p.pane) && isLauncher(ts.find((t) => t.address === p.terminal), space));
       if (fresh) { rec.to = fresh.terminal; r.terminal = fresh.terminal; }
     }
-    if (!rec.to) { if (now - rec.since > TIMEOUT) giveUp("no new terminal started"); return; }
+    if (!rec.to) { if (now - rec.since > TIMEOUT) giveUp("no new terminal started in its tab"); return; }
     const term = ts.find((t) => t.address === rec.to);
-    if (!term || term.state !== "live") { giveUp("its new terminal ended"); return; }
+    if (!term || term.state !== "live") { giveUp("its new terminal ended before the Project Agent started (on a remote machine, run pa-sync --on <machine> once)"); return; }
     const labelled = term.labels?.["herdr.pa"] === localId(space.id);
+    const error = term.labels?.["herdr.pa.error"];
+    if (error) { // the launcher shows why it cannot start and waits for Enter: wait with it, tell once per reason
+      if (rec.waiting !== error) notify({ title: "Project Agent waiting for you", body: `${r.name}: ${error}. Fix it, then press Enter in its tab.`, level: "warning" });
+      rec.waiting = error;
+      return;
+    }
+    if (rec.waiting) { rec.waiting = false; rec.since = now; } // Enter pressed: judge it afresh
     if (labelled && beatAddress(this.hb[space.id]) === localId(rec.to)) {
       // Running and beating: close the old pane, but only if it still holds the old PA terminal.
       const old = rec.pane && ps.find((p) => p.pane === rec.pane);
@@ -356,11 +382,15 @@ export class Keeper {
       return;
     }
     if (labelled) this.peek(cx, space, now);
-    if (now - rec.since > TIMEOUT && !rec.waiting) {
-      // It started but is not running yet: usually waiting for Enter after an error it shows.
-      rec.waiting = true;
-      this.fail(space, r, term.labels?.["herdr.pa.error"] || "it has not started yet", now);
+    const program = term.program ?? {};
+    const plain = !program.agent && (program.shell ?? program.key === "shell");
+    if (plain && now - rec.since > TIMEOUT) {
+      // A shell where the launcher should be: an old pa-session refused (pa-sync not run), or the
+      // person stopped it. Close the pane the keeper made; the old one still holds the record.
+      giveUp("its new terminal is a plain shell: the launcher there stopped or refused to start (on a remote machine, run pa-sync --on <machine> once)", true);
+      return;
     }
+    if (!labelled && now - rec.since > STARTING) giveUp("its new launcher did not start within 90 s", true);
   }
 
   // The tab itself is gone while its space lives on: open a new one (until Change 2's Close /

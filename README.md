@@ -42,18 +42,27 @@ New spaces start the launcher with `space.new { argv: ["pa-session", "--ask"] }`
   mark. The keeper does nothing for other spaces and drops any record it had for them; while a
   machine is offline, or before its agent.json was read, it keeps the record and does nothing.
 - **Detection:** the launcher (`pa-session`) rewrites `spaces/<id>/heartbeat` every 10 s. Read every
-  15 s, a heartbeat unchanged for 2 reads (spaced at most 30 s apart, so a sleeping computer does not
-  count) means the launcher is gone, about 45 s at most. A terminal younger than 30 s is never judged.
-- **In place:** if what is left is a plain shell (or the terminal finished but the tab remains), the
-  keeper takes `spaces/<id>/keeper.lock` (so a second Herdr client does not do the same), splits the
+  15 s, a heartbeat unchanged for 2 comparisons of reads 12-30 s apart (closer reads do not count; a
+  longer gap, such as a sleeping computer, starts again) means the launcher is gone, about 45 s at
+  most. A terminal younger than 30 s is never judged.
+- **In place:** if what is left is a shell (Herdr's program table says shell, or the core's keep-recovery
+  left a bare-shell argv; a status or title the dead agent left does not count), or the terminal
+  finished but the tab remains, the keeper takes `spaces/<id>/keeper.lock` (so a second Herdr client does not do the same), splits the
   tab's pane with a new `pa-session`, points the record at the new terminal as soon as it appears,
   and closes the old pane only once the new launcher is labelled and beating. The tab id, and so
   the record that protects the tab, never changes. The new launcher resumes the same session.
 - **Hands off:** a tab running some other program (a hand-started `claude`) gets one notice and is
   left alone; worker terminals (`parent` set) are never touched.
 - **Failures:** a launcher that cannot start shows the error in its tab, labels its terminal
-  `herdr.pa.error=<why>`, and waits for Enter. The keeper gives up a restore after 30 s, tries at most
-  once a minute, and stops after 3 failures in 10 minutes (notice "Project Agent needs you").
+  `herdr.pa.error=<why>`, and waits for Enter; the keeper waits with it and says so once. If the new
+  pane is a plain shell instead (the launcher there refused or was stopped) or nothing starts, the
+  keeper gives up after 30 s, closes only the pane it made, and tries again a minute later; after 3
+  failures in 10 minutes it stops (notice "Project Agent needs you").
+- **Install order for other machines:** run `pa-sync --on <machine>` before installing the new mod.
+  An older `pa-session` there refuses to start next to the dead shell it should replace (its
+  one-per-space check does not test the heartbeat), so every restore on that machine ends as a plain
+  shell: the keeper closes it, retries, and after 3 tries says "Project Agent needs you". Nothing is
+  lost: the old tab and its record stay; `pa-sync` and then `pa-start` in the space fix it.
 - **A vanished tab** (closed some way the mods do not guard) is still reopened in a new tab; its old
   record stays until the new tab is recorded.
 - `pa-session` and `pa-start` refuse to start a second Project Agent only while another terminal's
@@ -71,7 +80,8 @@ profile lists its own terms in `profile.json` (`"coreCheck": ["..."]`), so this 
 `herdr-app check mods/project-agent` loads the mod once.
 `tests/run-all.sh` runs this repo's tests (a Python 3.7 parse check, `pa.py` unit tests, a keeper
 harness under Node, and a `pa-session` check against a private hc core); `--affected` runs only the
-fast set. After updating, run `pa-sync --on <machine>` so remote launchers get the new `pa-session`.
+fast set. After updating, run `pa-sync --on <machine>` before installing the mod, so remote launchers
+get the new `pa-session` (see the install order above).
 
 ## Licence
 
