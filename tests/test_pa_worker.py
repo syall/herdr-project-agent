@@ -345,15 +345,82 @@ class WorktreeRule(Base):
         before = raw(os.path.join(self.dir, "decisions", "d-wt-t-003.json"))
         self.assertIn("kept, not asked again", self.check()[1])
         self.assertEqual(raw(os.path.join(self.dir, "decisions", "d-wt-t-003.json")), before)
-        # an open card on a reopened task is left as it is
-        led = self.ledger()
-        led["tasks"][0]["state"] = "queued"
-        self.ledger(led)
+        # an open card while every task is done or parked is left as it is
         dump({"id": "d-wt-t-003", "task": "t-003", "worktree": self.wt, "status": "open", "answer": None, "context": "old one-line text"},
              os.path.join(self.dir, "decisions", "d-wt-t-003.json"))
         before = raw(os.path.join(self.dir, "decisions", "d-wt-t-003.json"))
         self.assertIn("card d-wt-t-003 is open", self.check()[1])
         self.assertEqual(raw(os.path.join(self.dir, "decisions", "d-wt-t-003.json")), before)
+        # review round 1, I1: an open card on a reopened task is withdrawn (it used to be left open)
+        led = self.ledger()
+        led["tasks"][0]["state"] = "queued"
+        self.ledger(led)
+        code, out, _ = self.run_cmd("pa-worktree", "check", "--space", "sp1")
+        self.assertIn("card d-wt-t-003 is open, but tasks still t-003 queued", out)
+        self.assertEqual(raw(os.path.join(self.dir, "decisions", "d-wt-t-003.json")), before, "without --open-cards nothing is written")
+        self.assertIn("withdrew card d-wt-t-003: tasks still t-003 queued", self.check()[1])
+        card = self.card()
+        self.assertEqual((card["status"], card["answer"]), ("withdrawn", None))
+        self.assertIn("tasks still t-003 queued", card["note"])
+        self.assertEqual(self.journal()[-1]["trigger"], "worktree")
+        # once the task is done again, a fresh card opens
+        led = self.ledger()
+        led["tasks"][0]["state"] = "done"
+        self.ledger(led)
+        self.assertIn("opened card d-wt-t-003", self.check()[1])
+        self.assertEqual(self.card()["status"], "open")
+
+
+    def answered_delete(self):
+        """A card opened by check, then answered Delete by the person."""
+        self.check()
+        path = os.path.join(self.dir, "decisions", "d-wt-t-003.json")
+        card = load(path)
+        card.update(status="answered", answer="Delete")
+        dump(card, path)
+        return card
+
+    def remove(self):
+        return self.run_cmd("pa-worktree", "remove", "t-003", "--space", "sp1")
+
+    def test_c5_remove_refuses_a_reopened_task(self):
+        self.add_task("t-003", "done", self.wt, [])
+        self.answered_delete()
+        led = self.ledger()
+        led["tasks"][0]["state"] = "in-progress"
+        self.ledger(led)
+        self.assertIn("card d-wt-t-003 answered 'Delete', but tasks still t-003 in-progress", self.check()[1])
+        code, _, err = self.remove()
+        self.assertEqual(code, 2)
+        self.assertIn("tasks still t-003 in-progress; a worktree is removed only once every task using it is done or parked. Nothing was removed", err)
+        self.assertTrue(os.path.isdir(self.wt))
+
+    def test_c6_remove_refuses_new_commits_since_the_card(self):
+        self.add_task("t-003", "done", self.wt, [])
+        self.answered_delete()
+        self.commit(self.wt, "late.txt", "late\n", "a commit after the card")
+        code, _, err = self.remove()
+        self.assertEqual(code, 2)
+        self.assertIn("has new commits since the card", err)
+        self.assertTrue(os.path.isdir(self.wt))
+
+    def test_c6b_remove_refuses_new_uncommitted_files_since_the_card(self):
+        self.add_task("t-003", "done", self.wt, [])
+        write(os.path.join(self.wt, "a.txt"), "seen on the card\n")
+        self.answered_delete()
+        os.unlink(os.path.join(self.wt, "a.txt"))
+        write(os.path.join(self.wt, "b.txt"), "new since the card\n")  # same count, a different file
+        code, _, err = self.remove()
+        self.assertEqual(code, 2)
+        self.assertIn("uncommitted files that were not on the card: b.txt", err)
+        self.assertTrue(os.path.isdir(self.wt))
+
+    def test_c6c_remove_still_works_when_nothing_changed(self):
+        self.add_task("t-003", "done", self.wt, [])
+        self.answered_delete()
+        code, out, err = self.remove()
+        self.assertEqual(code, 0, err)
+        self.assertFalse(os.path.isdir(self.wt))
 
     def test_c4b_remove_still_rechecks_uncommitted_files(self):
         self.add_task("t-003", "done", self.wt, [])
@@ -670,6 +737,130 @@ class Close(Base):
             self.assertEqual(code, 2, action)
         self.assertEqual(self.ended(), [])
 
+    # ---- review round 1 ----
+    def test_w20_evidence_must_be_this_workers(self):  # I4
+        before = self.snapshot()
+        self.evidence("t-003", "intent.md", "the orchestrator's intent\n")
+        self.refused(self.close("t31", "--evidence", "intent.md"), "intent.md is the orchestrator's own file, not a worker's report")
+        for name in ("GATE.json", "WORKTREE.md"):
+            self.evidence("t-003", name, "{}\n")
+            self.refused(self.close("t31", "--evidence", name), "{} is written by the Project Agent's tools, not a worker's report".format(name))
+        old = self.evidence("t-003", "OLD.md", "an earlier worker's report\n")
+        os.utime(old, (time.time() - 7200, time.time() - 7200))
+        self.terms["t31"]["created_ms"] = int((time.time() - 3600) * 1000)
+        self.refused(self.close("t31", "--evidence", "OLD.md"), "OLD.md was last written before t31 started", "name the file that holds this worker's report")
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(self.close("t31", "--evidence", "FINDINGS.md")[0], 0)  # written after the start
+
+    def test_w20b_recorded_start_in_the_ledger(self):  # I4
+        led = self.ledger()
+        led["tasks"][0]["workers"][0]["started"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 3600))
+        self.ledger(led)
+        self.refused(self.close("t31", "--evidence", "FINDINGS.md"), "FINDINGS.md was last written before t31 started")
+
+    def test_w21_hc_failure_is_not_gone(self):  # M1
+        real = self.fake_get
+        pa.hc_get = lambda a: {} if a == "t31" else real(a)  # hc get fails for a terminal that runs
+        self.terms["t31"]["status"] = "working"
+        before = self.snapshot()
+        self.refused(self.close("t31", "--evidence", "FINDINGS.md"), "cannot read t31's state from hc", "nothing was closed")
+        real_call = self.fake_call
+
+        def no_hc(argv, check=True):
+            if argv[:2] == ["hc", "ls"]:
+                raise pa.Problem("hc ls failed: no core")
+            return real_call(argv, check)
+        pa.call = no_hc
+        self.refused(self.close("t31", "--evidence", "FINDINGS.md"), "cannot read t31's state from hc")
+        self.assertEqual(self.snapshot(), before)
+        self.assertFalse(self.entry("t-003", "t31").get("finished"))
+
+    def test_w13d_a_kill_that_fails_records_nothing(self):  # M2
+        real = self.fake_call
+
+        def deaf(argv, check=True):
+            if argv[:2] == ["hc", "kill"]:
+                self.calls.append(list(argv))
+                return ""
+            return real(argv, check)
+        pa.call = deaf
+        before = self.snapshot()
+        code, out, err = self.close("t31", "--evidence", "FINDINGS.md")
+        self.assertEqual(code, 2)
+        self.assertIn("hc kill did not end t31 (it is still live); nothing was recorded", err)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_w8d_untracked_files_whatever_the_repo_config(self):  # M3
+        sh(self.wt, "git", "config", "status.showUntrackedFiles", "no")
+        write(os.path.join(self.wt, "unsaved.py"), "x = 1\n")
+        self.refused(self.close("t31", "--evidence", "FINDINGS.md"), "has 1 uncommitted file(s) (unsaved.py)")
+        os.unlink(os.path.join(self.wt, "unsaved.py"))
+        write(os.path.join(self.wt, ".claude", "skills", "mine.md"), "real work\n")
+        self.refused(self.close("t31", "--evidence", "FINDINGS.md"), ".claude/skills/")
+
+    def test_w8e_no_worktree_checks_where_the_worker_ran(self):  # M3
+        led = self.ledger()
+        led["tasks"][0]["worktree"] = None
+        self.ledger(led)
+        write(os.path.join(self.proj, "left.txt"), "unsaved\n")
+        self.terms["t31"]["cwd"] = os.path.join(self.proj)
+        self.refused(self.close("t31", "--evidence", "FINDINGS.md"), "has 1 uncommitted file(s) (left.txt)")
+        plain = os.path.join(self.tmp, "plain")
+        os.makedirs(plain)
+        self.terms["t31"]["cwd"] = plain
+        code, out, err = self.close("t31", "--evidence", "FINDINGS.md")
+        self.assertEqual(code, 0, err)
+        self.assertIn("not seen: {} is not in a git checkout".format(os.path.realpath(plain)), out)
+
+    def test_w8f_success_says_what_it_checked(self):  # M3
+        code, out, _ = self.close("t31", "--evidence", "FINDINGS.md")
+        self.assertEqual(code, 0)
+        self.assertIn("Checked for uncommitted work: {}".format(os.path.realpath(self.wt)), out)
+        self.assertIn("ignored files are not seen", out)
+
+    def test_w9f_profile_kind_repos_are_checked_one_by_one(self):  # M3
+        kind = self.profile_kind()  # its script says 0 uncommitted
+        repo = os.path.join(kind, "src", "A")
+        os.makedirs(repo)
+        sh(repo, "git", "init", "-q", "-b", "main")
+        self.commit(repo, "README", "x\n", "base")
+        write(os.path.join(repo, "dirty.txt"), "unsaved\n")
+        self.profile_kind(output=json.dumps({"uncommitted": 0, "unpushed": 0, "branch": "b", "repos": [repo]}))
+        self.refused(self.close("t31", "--evidence", "FINDINGS.md"), "dirty.txt")
+
+    def test_w22_two_unfinished_entries_for_one_address(self):  # M10
+        led = self.ledger()
+        led["tasks"].insert(0, {"id": "t-002", "title": "old", "state": "done", "worktree": None,
+                                "workers": [{"address": "t31", "role": "build", "name": "t-002-build"}], "evidence": "evidence/t-002"})
+        self.ledger(led)
+        code, out, err = self.close("t31", "--evidence", "FINDINGS.md")
+        self.assertEqual(code, 0, err)
+        self.assertTrue(self.entry("t-003", "t31")["finished"])
+        self.assertFalse(self.entry("t-002", "t31").get("finished"))
+
+    def test_w11b_closed_meanwhile(self):  # M11: the "already closed" branch under the lock
+        import fcntl
+        held = threading.Event()
+
+        def other_close():  # holds the lock, and while this close waits, finishes the worker
+            with open(os.path.join(self.dir, ".ledger.lock"), "a") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                held.set()
+                time.sleep(0.4)
+                led = self.ledger()
+                led["tasks"][0]["workers"][0].update(finished=True, closed="2026-11-16T10:00:00Z")
+                self.ledger(led)
+                del self.terms["t31"]
+        t = threading.Thread(target=other_close)
+        t.start()
+        held.wait(5)
+        code, out, _ = self.close("t31", "--evidence", "FINDINGS.md")
+        t.join()
+        self.assertEqual(code, 0)
+        self.assertIn("t31 is already closed.", out)
+        self.assertEqual(self.ended(), [])
+        self.assertEqual(self.journal(), [])
+
 
 class Keep(Base):
     """R3: pa-worker keep <address> --quote "<words>" [--off]; close and pa-cleanup honour it."""
@@ -692,12 +883,16 @@ class Keep(Base):
         self.assertIn('the person asked to keep t31 open: "keep t31, I want to ask it something"', line["why"])
         self.assertEqual(self.ended(), [])
         self.assertRefused(self.worker("close", "t31", "--evidence", "FINDINGS.md"), "is marked keep")
-        code, out, err = self.worker("keep", "t31", "--off")
+        # review round 1, I3: --off needs the person's words too, stored and journaled as given
+        self.assertRefused(self.worker("keep", "t31", "--off"), 'pa-worker keep --off needs --quote "<the person\'s own words>"')
+        self.assertTrue(self.entry("t-003", "t31")["keep"])
+        code, out, err = self.worker("keep", "t31", "--off", "--quote", "ok, t31 can go")
         self.assertEqual(code, 0, err)
         w = self.entry("t-003", "t31")
-        self.assertEqual((w["keep"], w["keepQuote"]), (False, "keep t31, I want to ask it something"))
+        self.assertEqual((w["keep"], w["keepQuote"], w["unkeepQuote"]), (False, "keep t31, I want to ask it something", "ok, t31 can go"))
         self.assertRegex(w["unkeptAt"], r"^\d{4}-")
-        self.assertIn("no longer kept", self.journal()[-1]["why"])
+        self.assertIn('the person said t31 may be closed again: "ok, t31 can go"', self.journal()[-1]["why"])
+        self.assertFalse(any("at the person's word" in l["why"] for l in self.journal()))
         self.assertEqual(self.worker("close", "t31", "--evidence", "FINDINGS.md")[0], 0)
 
     def test_k1b_refusals(self):
@@ -708,7 +903,7 @@ class Keep(Base):
         self.assertRefused(self.worker("keep", "t0", "--quote", "x"), "that is the Project Agent itself")
         self.assertRefused(self.worker("keep", "m1/t31", "--quote", "x"), "m1/t31 is on another machine")
         self.assertEqual(self.snapshot(), before)
-        code, out, _ = self.worker("keep", "t31", "--off")
+        code, out, _ = self.worker("keep", "t31", "--off", "--quote", "it can go")
         self.assertEqual(code, 0)
         self.assertIn("t31 is not marked keep", out)
         self.assertEqual(self.snapshot(), before)
@@ -854,7 +1049,8 @@ class Leftovers(Base):
         os.utime(old, (time.time() - 3600, time.time() - 3600))
         self.evidence("t-001", "VERIFY.md")
         self.evidence("t-001", "EMPTY.md", "")
-        self.note(trigger="report", task="t-001", why="t-001-tests is done")
+        # review round 1, I2: the line must say this worker reported ("t-001-tests is done" no longer counts)
+        self.note(trigger="report", task="t-001", why="t-001-tests reported")
         code, out, err = self.worker("close", "--leftovers")
         self.assertEqual(code, 0, err)
         self.assertEqual(self.entry("t-001", "t31")["report"], "VERIFY.md")
@@ -890,6 +1086,47 @@ class Leftovers(Base):
         self.assertFalse(any("closed worker t32" in l["why"] for l in new))
         self.assertTrue(self.entry("t-001", "t31")["finished"])
         self.assertFalse(self.entry("t-002", "t32").get("finished"))
+
+    # ---- review round 1 ----
+    def test_l8_a_line_about_another_worker_never_counts(self):  # I2
+        self.add_task("t-003", "in-progress", None, [{"address": "t31", "role": "build", "name": "t-003-build"},
+                                                    {"address": "t32", "role": "verifier", "name": "t-003-verify"}])
+        self.term("t31", "t-003-build")
+        self.term("t32", "t-003-verify")
+        self.evidence("t-003")
+        self.note(trigger="message", task="t-003", why="sent t32 the verify handoff")
+        self.note(trigger="report", task="t-003", why="t31 reported FINDINGS.md; t32 has not reported yet")
+        code, out, _ = self.worker("close", "--leftovers", "--dry-run")
+        self.assertIn("would close t31 (t-003-build, t-003): report FINDINGS.md", out)
+        self.assertIn("kept t32 (t-003-verify, t-003): no recorded report", out)
+
+    def test_l8b_the_lines_from_field_counts(self):  # I2
+        self.add("t-001", "t31", "t-001-build")
+        self.note(trigger="report", task="t-001", **{"from": "t31"}, why="FINDINGS.md is in")
+        code, out, _ = self.worker("close", "--leftovers", "--dry-run")
+        self.assertIn("would close t31 (t-001-build, t-001): report FINDINGS.md", out)
+
+    def test_l8c_a_report_older_than_the_worker_does_not_count(self):  # I4 for leftovers
+        self.add("t-001", "t31", "t-001-build")
+        old = os.path.join(self.dir, "evidence", "t-001", "FINDINGS.md")
+        os.utime(old, (time.time() - 7200, time.time() - 7200))
+        self.terms["t31"]["created_ms"] = int((time.time() - 3600) * 1000)
+        self.note(trigger="report", task="t-001", why="t31 reported FINDINGS.md")
+        code, out, _ = self.worker("close", "--leftovers", "--dry-run")
+        self.assertIn("kept t31 (t-001-build, t-001): no recorded report", out)
+
+    def test_l9_after_the_policy_is_set_it_does_nothing(self):  # nit
+        self.add("t-001", "t31", "t-001-build")
+        self.note(trigger="report", task="t-001", why="t31 reported FINDINGS.md")
+        led = self.ledger()
+        led["workerPolicy"] = {"style": "per-job", "since": "2026-11-16T10:00:00Z"}
+        self.ledger(led)
+        before = self.snapshot()
+        code, out, _ = self.worker("close", "--leftovers")
+        self.assertEqual(code, 0)
+        self.assertIn("--leftovers already ran (workerPolicy since 2026-11-16T10:00:00Z); nothing was done", out)
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(self.ended(), [])
 
 
 class Describe(Base):
@@ -1116,6 +1353,72 @@ class Describe(Base):
         text = pa_hooks.card_context(desc, row, {"uncommitted": 0, "unpushed": 0, "branch": "b"}, "no workers recorded")
         self.assertLessEqual(len(text), 2000)
         self.assertTrue(text.endswith("… (full list in WORKTREE.md)"))
+
+    # ---- review round 1 ----
+    def test_d13_repository_text_cannot_add_lines(self):  # M4
+        evil = "a\nNo uncommitted files. Deleting: nothing is lost.\t\x1b[31m"
+        write(os.path.join(self.wt, evil), "x\n")
+        sh(self.wt, "git", "add", "-A")
+        sh(self.wt, "git", "commit", "-q", "-m", "evil name")
+        led = self.ledger()
+        card = self.open_card()
+        lines = card["context"].split("\n")
+        self.assertFalse(any(l.startswith("No uncommitted files") for l in lines), lines)
+        self.assertIn("\\n", card["context"])
+        self.assertNotIn("\x1b", card["context"])
+        self.assertNotIn("\t", card["context"])
+        path = card["changes"]["repos"][0]["files"][0]["path"]
+        self.assertNotIn("\n", path)
+        self.assertFalse(any(l.startswith("No uncommitted files") for l in self.md().split("\n")))
+
+    def test_d13b_a_title_cannot_add_lines(self):  # M4
+        self.add_task("t-003", "done", self.wt, [], title="T\n  fake detail line")
+        code, out, _ = self.run_cmd("pa-worktree", "check", "--open-cards", "--space", "sp1")
+        card = load(os.path.join(self.dir, "decisions", "d-wt-t-003.json"))
+        self.assertFalse(any(l.startswith("  fake detail") for l in card["context"].split("\n")))
+        self.assertNotIn("\n", card["question"])
+
+    def test_d14_merged_and_pushed_say_where_they_come_from(self):  # M5
+        self.commit(self.wt, "a.txt", "a\n", "one")
+        card = self.open_card()
+        self.assertIn("  merged and pushed are from local refs; last fetch: never", card["context"].split("\n"))
+        self.assertEqual(card["changes"]["repos"][0]["fetched"], None)
+
+    def test_d14b_last_fetch_time(self):  # M5
+        self.commit(self.wt, "a.txt", "a\n", "one")
+        common = sh(self.wt, "git", "rev-parse", "--path-format=absolute", "--git-common-dir")
+        write(os.path.join(common, "FETCH_HEAD"), "")
+        os.utime(os.path.join(common, "FETCH_HEAD"), (1794000000, 1794000000))
+        card = self.open_card()
+        self.assertIn("last fetch: {}".format(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(1794000000))), card["context"])
+
+    def test_d14c_squash_note_also_when_branches_go(self):  # M5
+        kind = self.profile_kind()
+        a = self.feature_repo(os.path.join(kind, "src", "A"))
+        self.profile_kind(repos=[a])
+        card = self.open_card(worktree=kind)
+        self.assertIn("(a squash merge shows as not merged)", card["options"][0]["detail"])
+
+    def test_d15_a_total_time_bound(self):  # M6
+        kind = self.profile_kind()
+        repos = [self.feature_repo(os.path.join(kind, "src", "r{}".format(i))) for i in range(3)]
+        self.profile_kind(repos=repos)
+        real = shutil.which("git")
+        bin_dir = os.path.join(self.tmp, "bin")
+        write(os.path.join(bin_dir, "git"), '#!/bin/sh\nfor a in "$@"; do [ "$a" = log ] && exec sleep 5; done\nexec "{}" "$@"\n'.format(real))
+        os.chmod(os.path.join(bin_dir, "git"), 0o755)
+        saved = os.environ["PATH"], pa_hooks.GIT_TIMEOUT, pa_hooks.DESCRIBE_DEADLINE
+        os.environ["PATH"] = bin_dir + os.pathsep + saved[0]
+        pa_hooks.GIT_TIMEOUT, pa_hooks.DESCRIBE_DEADLINE = 1, 1.5
+        try:
+            began = time.time()
+            card = self.open_card(worktree=kind)
+            took = time.time() - began
+        finally:
+            os.environ["PATH"], pa_hooks.GIT_TIMEOUT, pa_hooks.DESCRIBE_DEADLINE = saved
+        self.assertLess(took, 4)
+        self.assertIn("Not described (time limit of 1.5 s): r", self.md())
+        self.assertIn("more repositories (WORKTREE.md)", card["context"])
 
 
 if __name__ == "__main__":

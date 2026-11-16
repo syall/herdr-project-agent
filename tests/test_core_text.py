@@ -49,7 +49,9 @@ class Orchestrator(unittest.TestCase):
         self.assertIn("When the person asks you to close a worker, use `pa-worker close` too", self.text)
         self.assertIn("Committed work that is not pushed or merged does not stop a close", self.text)
         self.assertNotIn("Workers stay until the person closes them", self.text)
-        self.assertIn("A worker whose report you have not read yet does not count; close it once read.", self.text)
+        # review round 1, M7: the old sentence could be read as "working workers do not count"
+        self.assertIn("A worker that has reported, but whose report you have not read yet, does not count; close it once read.", self.text)
+        self.assertNotIn("A worker whose report you have not read yet does not count", self.text)
         self.assertNotIn("A worker that has finished and sits idle does not count", self.text)
 
     def test_r2_closed_workers_are_not_stopped_ones(self):  # spec 2.1 b
@@ -73,6 +75,17 @@ class Orchestrator(unittest.TestCase):
         self.assertIn("on the first pass where the ledger has no `workerPolicy`, run `pa-worker close --leftovers --dry-run`", self.text)
         self.assertIn("It sets `workerPolicy`; do not run it again after that.", self.text)
 
+    def test_close_is_not_a_delete(self):  # review round 1, M8 (in the Workers section, not Safety)
+        workers = flat(self.raw[self.raw.index("## Workers"):self.raw.index("## Phases and gates")])
+        self.assertIn("Closing a reported worker with `pa-worker close` ends its terminal only and deletes no work: "
+                      "its evidence, worktree, branch and task stay. That is why it needs no decision card; "
+                      "anything that deletes work still needs one.", workers)
+
+    def test_workers_record_their_start(self):  # review round 1, I4
+        self.assertIn('"started": "<UTC time>"', self.text)
+        self.assertIn("record the worker in the ledger with its `started` time", self.text)
+        self.assertIn("a file that worker wrote after it started", self.text)
+
     def test_safety_unchanged(self):
         self.assertEqual(section(self.raw, "## Safety"), ORCHESTRATOR_SAFETY)
 
@@ -85,7 +98,7 @@ class Worker(unittest.TestCase):
     def test_r1_one_job(self):  # AC1.3
         self.assertIn("You are started for one job.", self.text)
         self.assertIn("A new job for another task or another role is not yours: reply that it needs a fresh worker, and do nothing else.", self.text)
-        self.assertIn("the orchestrator cannot close a worker that leaves them", self.text)
+        self.assertIn("the orchestrator cannot close a worker that leaves them; it decides what to do with them", self.text)
 
     def test_safety_unchanged(self):
         self.assertEqual(section(self.raw, "## Safety"), WORKER_SAFETY)
