@@ -401,7 +401,7 @@ class Close(Base):
         self.assertEqual((lines[0]["trigger"], lines[0]["by"], lines[0]["task"]), ("close", "agent", "t-003"))
         self.assertIn("closed worker t31 (t-003-tests) after reading its report FINDINGS.md", lines[0]["why"])
         self.assertTrue(os.path.isdir(self.wt))
-        self.assertEqual(sh(self.proj, "git", "branch", "--list", "t-003-x"), "t-003-x")
+        self.assertTrue(sh(self.proj, "git", "rev-parse", "--verify", "refs/heads/t-003-x"))
         self.assertNotIn("t31", self.terms)
 
     def test_w1b_the_gate_still_sees_closed_workers(self):
