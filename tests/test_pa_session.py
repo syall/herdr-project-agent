@@ -433,6 +433,115 @@ class Round3Addition(Round3):
         self.assertEqual(inside, ["first", "second"])
 
 
+class Round4(Round3):
+    """REVIEW.md round 3 (R3-M2) and VERIFY.md round 3 survivors (L2, L4, L5, N10)."""
+    test_u18_retry_keeps_the_first_start_time = None  # inherited helpers only
+    test_u19_claim_clears_the_starting_label = None
+    test_u20_launch_lock_wait_is_bounded = None
+
+    def cleared(self):
+        last = self.labels[-1] if self.labels else []
+        return "herdr.pa.starting=" in last and "herdr.pa.error=" in last
+
+    def test_u23_starting_is_set_before_the_slow_steps_and_cleared_on_any_exit(self):
+        seen = {}
+
+        class Crash(Exception):
+            pass
+
+        def run_session(*a):
+            seen["before"] = [c for c in self._calls if c[:2] == ["hc", "label"]]
+            raise Crash()
+        self._calls = []
+        pa.call = lambda argv, check=True: self._calls.append(list(argv)) or ""
+        with self.assertRaises(Crash):
+            self.session_with(run_session)
+        self.assertTrue(any("herdr.pa.starting=sp1" in c for c in seen["before"]), "L2: starting label set before run_session: {}".format(seen["before"]))
+        self.assertTrue(self.cleared(), "R3-M2: labels cleared when pa-session dies: {}".format(self.labels))
+
+    def session_with(self, run_session):
+        calls = self._calls
+        pa.hc_get = lambda address: {"labels": {"herdr.space": "sp1"}} if address else {}
+        saved = (pa.run_session, sys.stdin, os.environ.get("HC_TERMINAL_ID"), builtins.input)
+
+        class TTY(io.StringIO):
+            def isatty(self):
+                return True
+        pa.run_session = run_session
+        sys.stdin = TTY("")
+        os.environ["HC_TERMINAL_ID"] = "t1"
+        args = types.SimpleNamespace(space="sp1", project=self.project, profile="test", name=None, auto=False, ask=False, fresh=False)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                pa.cmd_session(args)
+        finally:
+            pa.run_session, sys.stdin, builtins.input = saved[0], saved[1], saved[3]
+            if saved[2] is None:
+                os.environ.pop("HC_TERMINAL_ID", None)
+            else:
+                os.environ["HC_TERMINAL_ID"] = saved[2]
+            self.labels = [c for c in calls if c[:2] == ["hc", "label"]]
+
+    def test_u24_ctrl_c_outside_error_wait_clears_the_labels(self):
+        def run_session(*a):
+            raise KeyboardInterrupt()  # e.g. while it waits on the launch lock or another launcher's heartbeat
+        self._calls = []
+        pa.call = lambda argv, check=True: self._calls.append(list(argv)) or ""
+        code = None
+        try:
+            self.session_with(run_session)
+        except KeyboardInterrupt:
+            self.fail("R3-M2: Ctrl-C outside error-wait escaped cmd_session, leaving labels: {}".format(self.labels))
+        except SystemExit as e:
+            code = e.code
+        self.assertEqual(code, 2)
+        self.assertTrue(self.cleared(), "labels cleared: {}".format(self.labels))
+
+    def test_u25_error_wait_clears_starting(self):
+        self._calls = []
+        pa.call = lambda argv, check=True: self._calls.append(list(argv)) or ""
+        saved_input, saved_sig = builtins.input, signal.getsignal(signal.SIGINT)
+        builtins.input = lambda *a: ""
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                pa.error_wait("t1", pa.Problem("x"))
+        finally:
+            builtins.input = saved_input
+            signal.signal(signal.SIGINT, saved_sig)
+        first = [c for c in self._calls if c[:2] == ["hc", "label"]][0]
+        self.assertIn("herdr.pa.starting=", first, "L4: the error label replaces 'starting'")
+
+    def test_u26_ctrl_c_in_error_wait_clears_starting(self):
+        def run_session(*a):
+            raise pa.Problem("project folder does not exist")
+
+        def interrupt(*a):
+            raise KeyboardInterrupt()
+        self._calls = []
+        pa.call = lambda argv, check=True: self._calls.append(list(argv)) or ""
+        saved_input = builtins.input
+        builtins.input = interrupt
+        saved_sig = signal.getsignal(signal.SIGINT)
+        try:
+            with self.assertRaises(SystemExit):
+                self.session_with(run_session)
+        finally:
+            builtins.input = saved_input
+            signal.signal(signal.SIGINT, saved_sig)
+        self.assertTrue(self.cleared(), "L5: {}".format(self.labels))
+
+    def test_u27_a_launcher_started_right_after_a_claim_is_refused(self):
+        # N10: claim() writes its first heartbeat at once, so a second launcher that starts before the
+        # first beat thread has run sees the first as alive and is refused.
+        self.fixtures3(int(time.time()) - 3600)
+        self.run_once({"beat": True})  # t1 claims (labels via the stub), its beat thread never runs
+        pa.live_terminals = lambda: {"t1": {"state": "live", "labels": {"herdr.pa": "sp1"}}}
+        args = types.SimpleNamespace(space="sp1", project=self.project, profile="test", name=None, auto=False, ask=False, fresh=False)
+        with self.assertRaises(pa.Problem) as e:
+            pa.run_session(args, "t2", {}, "sp1", self.project, {"beat": True})
+        self.assertIn("already has a Project Agent", str(e.exception))
+
+
 def tearDownModule():
     shutil.rmtree(TMP, ignore_errors=True)
 

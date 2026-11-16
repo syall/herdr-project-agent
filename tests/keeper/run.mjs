@@ -472,6 +472,37 @@ cases["K-cap-lock"] = async () => { // a lock read that never settles: the fast 
   check(splits().length === 0, "no restore without the lock");
 };
 
+// Round 4: REVIEW round 3 (R3-M1, R3-M2) and VERIFY round 3 (G1).
+cases["K-script-kept"] = () => leftAlone({ argv: ["/bin/bash"], program: { key: "shell", name: "bash", shell: true, agent: false }, status: null,
+  foreground: { name: "bash", argv: ["bash", "./deploy.sh"] } }, "a shell script (bash ./deploy.sh) running in a kept shell");
+cases["K-kept-prompt-flags"] = () => restores({ argv: ["/bin/zsh"], program: shell, status: null, foreground: { name: "zsh", argv: ["-zsh", "-l", "-i"] } }, "kept shell at its prompt, login/interactive flags only");
+const deadLauncher = async (labels, what) => { // a launcher that said it began, then died: its terminal is an idle shell again
+  world();
+  const k = await start();
+  check(await waitSplit(k, 1, 50000), "split");
+  newPane("p2", { address: "t2", state: "live", argv: wrapped(), labels, status: null, program: shell });
+  const at = g.__now;
+  check(await until(k, 90000, () => runsOf("pane.close").length > 0), `${what}: given up (runs ${JSON.stringify(g.__runs.filter(([n]) => n !== "tab.move"))}, notes ${JSON.stringify(noteText())})`);
+  check(g.__now - at >= 30000 && g.__now - at <= 45000, `${what}: after it has been an idle shell for 30 s (after ${(g.__now - at) / 1000} s)`);
+  check(runsOf("pane.close")[0][1].pane === "p2", "closes only its own pane");
+  check(records().tb1.terminal === "t1" && !records().tb1.recovering, "record back on the old terminal");
+  const note = noteText().find((n) => /not restored/i.test(n)) ?? "";
+  check(/stopped/i.test(note) && /again in a minute/i.test(note) && /pa-start/.test(note), `notice says what happened and what to do (got ${note})`);
+  g.__panes = g.__panes.filter((p) => p.pane !== "p2"); g.__terminals = g.__terminals.filter((t) => t.address !== "t2");
+  check(await waitSplit(k, 2, 120000), `${what}: retried`);
+};
+cases["K-starting-dead"] = () => deadLauncher({ "herdr.pa.starting": S }, "launcher died after 'starting'");
+cases["K-labelled-dead"] = () => deadLauncher({ "herdr.pa": S }, "launcher died after labelling itself");
+cases["K-g1"] = async () => { // the 2-minute give-up never closes a new pane that is not an idle shell
+  world();
+  const k = await start();
+  check(await waitSplit(k, 1, 50000), "split");
+  newPane("p2", { address: "t2", state: "live", argv: wrapped(), labels: {}, status: null, program: { key: "nvim", name: "Neovim", shell: false, agent: false } });
+  check(await until(k, 140000, () => !records().tb1.recovering), "given up after about 2 minutes");
+  check(runsOf("pane.close").length === 0, `the new pane is not closed when something runs in it (got ${JSON.stringify(runsOf("pane.close"))})`);
+  check(noteText().some((n) => /left open/i.test(n)), `notice says it was left open (got ${JSON.stringify(noteText())})`);
+};
+
 const pick = process.argv.slice(2);
 let failed = 0;
 for (const [name, fn] of Object.entries(cases)) {
