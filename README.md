@@ -131,7 +131,9 @@ The remaining windows:
   own keeper), but an answer notice can still go to a terminal whose launcher died in those
   seconds, and the header can show a stale status.
 - On the first tick after a keeper takes over, before its first heartbeat read lands, a record can
-  show "Not running" with Open for a moment; a click then is refused ("already running"). A remote launcher must write the heartbeat
+  show "Not running" with Open for a moment; a click then is refused ("already running").
+
+A remote launcher must write the heartbeat
 (run `pa-sync --on <machine>`): one from before the heartbeat existed is never `alive`, so it gets
 no passes and no answer notices.
 

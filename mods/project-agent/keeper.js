@@ -34,7 +34,7 @@ const present = (v) => v !== undefined && v !== null && v !== "" && !(typeof v =
 // live idle agent reports "done" with its app; terminal-shapes.md), the program table names a
 // shell, and the foreground process, when the app gives one, is a shell too. Anything else
 // (an editor, a build, ssh, an unknown program, any agent) is left alone.
-function idleShell(term, pane) {
+export function idleShell(term, pane) {
   const program = term.program ?? {};
   if (program.agent || present(term.status) || present(term.report) || present(term.app) || present(pane?.app) || present(pane?.status)) return false;
   const named = program.shell === true || program.key === "shell" || SHELL.test(String(program.key ?? "")) || SHELL.test(String(program.name ?? ""));
@@ -406,7 +406,9 @@ export class Keeper {
       if (conf.state === "absent") { done(); continue; } // not a Project Agent space
       const mine = Object.entries(records).filter(([, r]) => r.space === sid);
       if (this.pending[sid] || mine.some(([, r]) => r.recovering)) { done("Project Agent already opening", "it is being opened or restored already."); continue; }
-      if (mine.some(([, r]) => starting(ts.find((t) => t.address === r.terminal && t.state === "live")))) { done("Project Agent already opening", "its launcher is starting (or waiting for Enter in its tab)."); continue; }
+      // A starting or error label counts only on a terminal that is not an idle shell: a launcher killed
+      // while starting leaves its label on the shell it falls back to.
+      if (mine.some(([, r]) => { const term = ts.find((t) => t.address === r.terminal && t.state === "live"); return starting(term) && !idleShell(term, ps.find((p) => p.terminal === r.terminal)); })) { done("Project Agent already opening", "its launcher is starting (or waiting for Enter in its tab)."); continue; }
       const running = mine.some(([tab, r]) => space.tabs.some((x) => x.id === tab) && ["alive", "elsewhere"].includes(this.classify(tab, r, ts, ps, now)))
         || ts.some((t) => t.state === "live" && !t.parent && t.labels?.["herdr.pa"] === localId(sid) && !this.retired.has(t.address) && beatFresh(this.hb[sid], now) === localId(t.address));
       if (running) { done("Project Agent already running", "it is already running in its tab."); continue; }

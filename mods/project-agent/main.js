@@ -10,7 +10,7 @@ import { spaces, panes, agents, terminals, machines, theme, run, exec, props, ho
 import { loadSpace, loadDecisions, answerDecision, notifyOrchestrator, changeRules, touched, localId, paHome, stateDir, taskActions, taskLinks, evidenceTasks, cardEvidence, staleInstructions, liveTarget, lookAlike, OPEN_REQUESTS, keeperJudging, startingLabels } from "./store.js";
 import { RulesPane } from "./rules.js";
 import { SetupPane } from "./setup.js";
-import { Keeper } from "./keeper.js";
+import { Keeper, idleShell } from "./keeper.js";
 import { WorkerPane } from "./worker.js";
 import { tick, cadence, holdReason, setSchedule, requestPass, PRESETS, MIN_MINUTES } from "./timer.js";
 
@@ -493,7 +493,8 @@ export default class ProjectAgent extends View {
     if (target) { delete this.opening[space.id]; delete this.openMsg[space.id]; delete this.confirmOpen[space.id]; }
     // A recorded launcher that is starting, or waits on an error for Enter: still opening.
     const recTerms = paRecords(space.id).map((r) => terminals().find((x) => x.address === r.terminal && x.state === "live")).filter(Boolean);
-    const startingNow = recTerms.map(startingLabels).find(Boolean) ?? null;
+    // A stale label on an idle shell (its launcher was killed while starting) does not count.
+    const startingNow = recTerms.filter((x) => !idleShell(x, panes().find((p) => p.terminal === x.address))).map(startingLabels).find(Boolean) ?? null;
     const o = this.opening[space.id];
     if (o && req?.why) o.why = req.why; // kept: the keeper may give the request up (and delete it) before the panel's 30 s
     if (o && !startingNow) {
