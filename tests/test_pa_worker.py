@@ -1202,8 +1202,9 @@ class Describe(Base):
         self.assertEqual(lines[0], "{} (git worktree)".format(os.path.realpath(self.wt)))
         self.assertEqual(lines[1], 'Tasks: t-003 "Title of t-003" (done)')
         self.assertEqual(lines[2], "proj: branch t-003-x, from main at {}: 3 commits, 1 merged into main, 2 pushed".format(self.fork))
-        self.assertEqual(lines[3], "  {} c3 trims a  (not merged, not pushed)".format(c3))
-        self.assertEqual(lines[5], "  {} c1 adds a  (merged, pushed)".format(c1))
+        self.assertEqual(lines[3], "  merged and pushed are from local refs; last fetch: never")  # review round 1, M5
+        self.assertEqual(lines[4], "  {} c3 trims a  (not merged, not pushed)".format(c3))
+        self.assertEqual(lines[6], "  {} c1 adds a  (merged, pushed)".format(c1))
         self.assertIn("  Files changed: 2 (+2): a.txt +1, b.txt +1", lines)
         self.assertIn("  Uncommitted: 1: M README", lines)
         self.assertIn("Workers: t-003-tests (closed)", lines)
