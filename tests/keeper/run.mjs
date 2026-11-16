@@ -933,6 +933,37 @@ cases["K-mark-refresh"] = async () => { // R2-N2: the keeper keeps its mark fres
   check(m?.id === "me" && g.__now - m.at <= 12000, `mark refreshed (got ${JSON.stringify(m)} at +${(g.__now - T0) / 1000} s)`);
 };
 
+// ---- t-003 verifier round 2 (VERIFY.md round 2 §4: N4d, N2c) ----
+cases["K-e2e-pass"] = async () => { // N4d: the keeper itself writes (and refreshes) project-agent.keeper; with no hand-written mark, a pass goes out
+  const w = world({ program: claude, status: "idle", created: T0 - 600000 });
+  g.__hcs = []; g.__ls = {};
+  delete g.__shared["project-agent.keeper"];
+  g.__files[`:${SDIR}/schedule.json`] = JSON.stringify({ everyMinutes: 5, lastPass: isoAt(T0 - 600000), onlyWhileActive: false });
+  g.__files[`:${SDIR}/ledger.json`] = JSON.stringify({ tasks: [] });
+  await timer.tick("me"); // the timer takes the lease as "me"; no keeper has judged yet
+  check(passes().length === 0, `no pass before this copy's keeper has judged (got ${JSON.stringify(g.__hcs)})`);
+  const k = await start();
+  await sim(k, 3000, beating(w));
+  const m1 = g.__shared["project-agent.keeper"];
+  check(m1?.id === "me", `the keeper wrote its mark (got ${JSON.stringify(m1)})`);
+  await sim(k, 30000, beating(w));
+  const m2 = g.__shared["project-agent.keeper"];
+  check(m2.at > m1.at && g.__now - m2.at <= 12000, `and refreshed it (got ${JSON.stringify(m1)} then ${JSON.stringify(m2)})`);
+  await timer.tick("me");
+  check(JSON.stringify(passes()) === JSON.stringify([["send", "t1", "scheduled pass"]]), `the pass goes out on the keeper's own marks (got ${JSON.stringify(g.__hcs)})`);
+};
+
+cases["K-alive-steady"] = async () => { // N2c (D16): a healthy launcher (beat every 10 s, read every 15 s) never flaps out of alive
+  const w = world({ program: claude, status: "idle", created: T0 - 600000 });
+  const k = await start();
+  let n = 0, lost = [];
+  await sim(k, 120000, () => {
+    g.__files[w.f("heartbeat")] = `${Math.floor(g.__now / 10000) * 10} t1\n`; // the launcher writes every 10 s
+    if (g.__now - T0 > 20000) { n++; if (!records().tb1.alive) lost.push((g.__now - T0) / 1000); }
+  });
+  check(n > 50 && lost.length === 0, `alive on every tick after the first read (lost at ${JSON.stringify(lost.slice(0, 5))} s)`);
+};
+
 const pick = process.argv.slice(2);
 let failed = 0;
 for (const [name, fn] of Object.entries(cases)) {
