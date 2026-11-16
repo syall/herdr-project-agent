@@ -892,5 +892,231 @@ class Leftovers(Base):
         self.assertFalse(self.entry("t-002", "t32").get("finished"))
 
 
+class Describe(Base):
+    """R7: the worktree card says what the worktree holds; the full list goes to WORKTREE.md (spec 4.2-4.6)."""
+
+    def setUp(self):
+        super().setUp()
+        self.proj = self.repo()
+        self.wt = self.worktree(self.proj, "t-003-x")
+        self.fork = sh(self.proj, "git", "rev-parse", "--short", "main")
+
+    def open_card(self, tasks=(("t-003", "done"),), worktree=None):
+        for tid, state in tasks:
+            self.add_task(tid, state, worktree or self.wt, [{"address": "t31", "role": "build", "name": tid + "-tests", "finished": True}])
+        code, out, err = self.run_cmd("pa-worktree", "check", "--open-cards", "--space", "sp1")
+        self.assertEqual(code, 0, err)
+        self.assertIn("opened card d-wt-" + tasks[0][0], out)
+        return load(os.path.join(self.dir, "decisions", "d-wt-{}.json".format(tasks[0][0])))
+
+    def md(self, task="t-003"):
+        with open(os.path.join(self.dir, "evidence", task, "WORKTREE.md")) as f:
+            return f.read()
+
+    def profile_kind(self, repos=None, extra=""):
+        kind = os.path.join(self.tmp, "kind-wt")
+        write(os.path.join(kind, "marker.txt"), "")
+        out = {"uncommitted": 2, "unpushed": 1, "branch": "A:feat, B:feat", "removesBranches": True, "kind": "custom worktree"}
+        if repos is not None:
+            out["repos"] = repos
+        status = os.path.join(self.tmp, "status.sh")
+        write(status, "#!/bin/sh\ncat <<'JSON'\n{}\nJSON\n".format(json.dumps(out)))
+        os.chmod(status, 0o755)
+        dump({"name": "test2", "claude": ["true"], "codex": ["true"],
+              "worktree": {"marker": "marker.txt", "status": status, "remove": status}}, os.path.join(pa.ROOT, "profiles", "test2", "profile.json"))
+        agent = load(os.path.join(self.dir, "agent.json"))
+        agent["profile"] = "test2"
+        dump(agent, os.path.join(self.dir, "agent.json"))
+        return kind
+
+    def feature_repo(self, folder, commits=1):
+        os.makedirs(folder)
+        sh(folder, "git", "init", "-q", "-b", "main")
+        self.commit(folder, "README", "base\n", "base")
+        sh(folder, "git", "checkout", "-q", "-b", "feat")
+        for i in range(commits):
+            self.commit(folder, "f{}.txt".format(i), "x\n", "feature commit {}".format(i))
+        return folder
+
+    def test_d1_git_worktree_content(self):
+        bare = os.path.join(self.tmp, "remote.git")
+        sh(self.tmp, "git", "init", "-q", "--bare", bare)
+        sh(self.proj, "git", "remote", "add", "origin", bare)
+        c1 = self.commit(self.wt, "a.txt", "one\ntwo\n", "c1 adds a")
+        sh(self.proj, "git", "merge", "-q", "--ff-only", c1)  # c1 is merged into main
+        c2 = self.commit(self.wt, "b.txt", "b\n", "c2 adds b")
+        sh(self.wt, "git", "push", "-q", "origin", "HEAD:refs/heads/t-003-x")  # c1 and c2 are pushed
+        c3 = self.commit(self.wt, "a.txt", "one\n", "c3 trims a")
+        write(os.path.join(self.wt, "README"), "edited\n")
+        card = self.open_card()
+        repo = card["changes"]["repos"][0]
+        self.assertEqual((repo["name"], repo["branch"], repo["base"], repo["fork"]), ("proj", "t-003-x", "main", self.fork))
+        self.assertEqual([(c["sha"], c["merged"], c["pushed"]) for c in repo["commits"]], [(c3, False, False), (c2, False, True), (c1, True, True)])
+        self.assertEqual([c["subject"] for c in repo["commits"]], ["c3 trims a", "c2 adds b", "c1 adds a"])
+        self.assertEqual((repo["commitsTotal"], repo["merged"], repo["pushed"]), (3, 1, 2))
+        self.assertEqual(repo["files"], [{"path": "a.txt", "added": 1, "removed": 0}, {"path": "b.txt", "added": 1, "removed": 0}])
+        self.assertEqual((repo["filesTotal"], repo["added"], repo["removed"]), (2, 2, 0))
+        self.assertEqual(repo["uncommitted"], [{"path": "README", "status": "M"}])
+        self.assertEqual((repo["uncommittedTotal"], repo["error"]), (1, None))
+        self.assertEqual(card["changes"]["tasks"], [{"id": "t-003", "title": "Title of t-003", "state": "done"}])
+        self.assertFalse(card["changes"]["truncated"])
+        self.assertEqual(card["question"], 'Delete the worktree for t-003 "Title of t-003"?')
+        lines = card["context"].split("\n")
+        self.assertEqual(lines[0], "{} (git worktree)".format(os.path.realpath(self.wt)))
+        self.assertEqual(lines[1], 'Tasks: t-003 "Title of t-003" (done)')
+        self.assertEqual(lines[2], "proj: branch t-003-x, from main at {}: 3 commits, 1 merged into main, 2 pushed".format(self.fork))
+        self.assertEqual(lines[3], "  {} c3 trims a  (not merged, not pushed)".format(c3))
+        self.assertEqual(lines[5], "  {} c1 adds a  (merged, pushed)".format(c1))
+        self.assertIn("  Files changed: 2 (+2): a.txt +1, b.txt +1", lines)
+        self.assertIn("  Uncommitted: 1: M README", lines)
+        self.assertIn("Workers: t-003-tests (closed)", lines)
+        self.assertIn("No other terminal is working in it.", lines)
+        self.assertIn("Deleting: the branch t-003-x and its commits are kept; the 1 uncommitted files are DISCARDED.", lines)
+        self.assertEqual(lines[-1], "Full list: WORKTREE.md")
+        self.assertEqual(card["evidence"], ["WORKTREE.md"])
+        self.assertEqual(card["snapshot"], {"uncommitted": 1, "unpushed": 1, "commits": 3})
+        self.assertEqual(card["recommendation"], "Keep")
+        md = self.md()
+        for text in ("c1 adds a", "c2 adds b", "c3 trims a", "a.txt", "README", "t-003-x"):
+            self.assertIn(text, md)
+
+    def test_d2_fast_forward_merged_branch_is_still_described(self):
+        c1 = self.commit(self.wt, "a.txt", "a\n", "first")
+        c2 = self.commit(self.wt, "b.txt", "b\n", "second")
+        sh(self.proj, "git", "merge", "-q", "--ff-only", "t-003-x")
+        repo = self.open_card()["changes"]["repos"][0]
+        self.assertEqual([(c["sha"], c["merged"]) for c in repo["commits"]], [(c2, True), (c1, True)])
+        self.assertEqual(repo["merged"], 2)
+
+    def test_d3_cherry_picked_commit_counts_as_merged(self):
+        c1 = self.commit(self.wt, "a.txt", "a\n", "picked one")
+        c2 = self.commit(self.wt, "b.txt", "b\n", "not picked")
+        self.commit(self.proj, "m.txt", "m\n", "main moves on")
+        sh(self.proj, "git", "cherry-pick", c1)
+        repo = self.open_card()["changes"]["repos"][0]
+        self.assertEqual([(c["sha"], c["merged"]) for c in repo["commits"]], [(c2, False), (c1, True)])
+        card = load(os.path.join(self.dir, "decisions", "d-wt-t-003.json"))
+        self.assertIn("(a squash merge shows as not merged)", card["options"][0]["detail"])
+
+    def test_d4_limits(self):
+        for i in range(29):
+            self.commit(self.wt, "f{:02d}.txt".format(i), "x\n", "commit {}".format(i))
+        for i in range(11):
+            write(os.path.join(self.wt, "g{:02d}.txt".format(i)), "y\n")
+        sh(self.wt, "git", "add", ".")
+        sh(self.wt, "git", "commit", "-q", "-m", "S" * 200)
+        card = self.open_card()
+        repo = card["changes"]["repos"][0]
+        self.assertEqual((repo["commitsTotal"], len(repo["commits"]), repo["filesTotal"], len(repo["files"])), (30, 8, 40, 10))
+        self.assertTrue(card["changes"]["truncated"])
+        self.assertLessEqual(len(repo["commits"][0]["subject"]), 72)
+        self.assertLessEqual(len(card["context"]), 2000)
+        self.assertIn("  … 8 shown, 22 more", card["context"].split("\n"))
+        self.assertIn(", … 30 more", card["context"])
+        md = self.md()
+        self.assertIn("commit 0", md)
+        self.assertIn("g10.txt", md)
+
+    def test_d5_several_repos_from_the_profile_script(self):
+        kind = self.profile_kind()
+        a = self.feature_repo(os.path.join(kind, "src", "A"))
+        b = self.feature_repo(os.path.join(kind, "src", "B"), commits=2)
+        outside = self.feature_repo(os.path.join(self.tmp, "Outside"))
+        self.profile_kind(repos=[a, b, outside, os.path.join(kind, "src", "missing")])
+        card = self.open_card(worktree=kind)
+        self.assertEqual([r["name"] for r in card["changes"]["repos"]], ["A", "B"])
+        self.assertEqual(card["changes"]["repos"][1]["commitsTotal"], 2)
+        context = card["context"]
+        self.assertIn("{} (custom worktree)".format(os.path.realpath(kind)), context)
+        self.assertIn("A: branch feat, from main at", context)
+        self.assertIn("B: branch feat, from main at", context)
+        self.assertNotIn("Outside", context)
+        self.assertIn("Deleting also deletes its branches (A:feat, B:feat)", context)
+
+    def test_d6_profile_script_without_repos(self):
+        kind = self.profile_kind()
+        card = self.open_card(worktree=kind)
+        self.assertEqual(card["changes"]["repos"], [])
+        self.assertEqual(card["changes"]["note"], "this kind of worktree lists no repositories; counts only")
+        self.assertIn("this kind of worktree lists no repositories; counts only", card["context"].split("\n"))
+        self.assertIn("Uncommitted files: 2. Commits not on any remote: 1.", card["context"])
+
+    def test_d7_a_failure_does_not_stop_the_card(self):
+        kind = self.profile_kind()
+        plain = os.path.join(kind, "src", "NotARepo")
+        os.makedirs(plain)
+        self.profile_kind(repos=[plain])
+        card = self.open_card(worktree=kind)
+        repo = card["changes"]["repos"][0]
+        self.assertTrue(repo["error"])
+        self.assertIn("could not read the changes: ", card["context"])
+        self.assertEqual(card["snapshot"]["uncommitted"], 2)
+
+    def test_d8_rename_and_binary(self):
+        sh(self.wt, "git", "mv", "README", "READ-ME.txt")
+        sh(self.wt, "git", "commit", "-q", "-m", "rename")
+        with open(os.path.join(self.wt, "blob.bin"), "wb") as f:
+            f.write(bytes(range(256)) * 4)
+        sh(self.wt, "git", "add", "blob.bin")
+        sh(self.wt, "git", "commit", "-q", "-m", "binary")
+        card = self.open_card()
+        files = {f["path"]: f for f in card["changes"]["repos"][0]["files"]}
+        self.assertIn("READ-ME.txt", files)
+        self.assertNotIn("README", files)
+        self.assertEqual((files["blob.bin"]["added"], files["blob.bin"]["removed"]), (None, None))
+        self.assertIn("blob.bin (binary)", card["context"])
+
+    def test_d9_detached_head(self):
+        c1 = self.commit(self.wt, "a.txt", "a\n", "on the branch")
+        sh(self.wt, "git", "checkout", "-q", "--detach")
+        repo = self.open_card()["changes"]["repos"][0]
+        self.assertEqual((repo["branch"], repo["fork"]), ("HEAD", self.fork))
+        self.assertEqual([c["sha"] for c in repo["commits"]], [c1])
+
+    def test_d10_many_repos(self):
+        kind = self.profile_kind()
+        repos = [self.feature_repo(os.path.join(kind, "src", "r{:02d}".format(i)), commits=0) for i in range(25)]
+        self.profile_kind(repos=repos)
+        card = self.open_card(worktree=kind)
+        self.assertLessEqual(len(card["changes"]["repos"]), 6)
+        self.assertTrue(card["changes"]["truncated"])
+        md = self.md()
+        self.assertEqual(md.count("\n## r"), 20)
+        self.assertIn("Not described (more than 20 repositories): r20, r21, r22, r23, r24", md)
+        self.assertIn("Unchanged: ", card["context"])
+        self.assertLessEqual(len(card["context"]), 2000)
+
+    def test_d11_git_time_cap(self):
+        real = shutil.which("git")
+        bin_dir = os.path.join(self.tmp, "bin")
+        write(os.path.join(bin_dir, "git"), '#!/bin/sh\nfor a in "$@"; do [ "$a" = log ] && exec sleep 5; done\nexec "{}" "$@"\n'.format(real))
+        os.chmod(os.path.join(bin_dir, "git"), 0o755)
+        self.commit(self.wt, "a.txt", "a\n", "slow")
+        saved_path, saved_timeout = os.environ["PATH"], pa_hooks.GIT_TIMEOUT
+        os.environ["PATH"] = bin_dir + os.pathsep + saved_path
+        pa_hooks.GIT_TIMEOUT = 0.5
+        try:
+            began = time.time()
+            card = self.open_card()
+            self.assertLess(time.time() - began, 5)
+        finally:
+            os.environ["PATH"], pa_hooks.GIT_TIMEOUT = saved_path, saved_timeout
+        self.assertIn("timed out", card["changes"]["repos"][0]["error"])
+        self.assertIn("could not read the changes: ", card["context"])
+
+    def test_d12_context_hard_cap(self):
+        subject = "s" * 72
+        repo = {"name": "r", "path": "/x", "branch": "b", "base": "main", "fork": "abc1234", "error": None,
+                "commits": [{"sha": "abc{:04d}".format(i), "subject": subject, "merged": False, "pushed": False} for i in range(8)],
+                "commitsTotal": 8, "merged": 0, "pushed": 0, "files": [], "filesTotal": 0, "added": 0, "removed": 0,
+                "uncommitted": [], "uncommittedTotal": 0}
+        desc = {"tasks": [{"id": "t-1", "title": "T", "state": "done"}], "repos": [dict(repo, name="r{}".format(i)) for i in range(6)],
+                "notDescribed": [], "note": None, "error": None}
+        row = {"path": "/x", "tasks": ["t-1"], "workers": []}
+        text = pa_hooks.card_context(desc, row, {"uncommitted": 0, "unpushed": 0, "branch": "b"}, "no workers recorded")
+        self.assertLessEqual(len(text), 2000)
+        self.assertTrue(text.endswith("… (full list in WORKTREE.md)"))
+
+
 if __name__ == "__main__":
     unittest.main()
