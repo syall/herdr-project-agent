@@ -314,11 +314,15 @@ def parse_time(text):
         return None
 
 
-def session_ran(directory, session_id, before=None):
+READ_FILE = object()
+
+
+def session_ran(directory, session_id, before=None, heartbeat=READ_FILE):
     """True when session.log shows that session_id ran for at least RAN seconds: its last start
     line is followed by an exit after >= RAN s, or (killed while running: no exit line) the
     heartbeat kept beating RAN s past the start. A heartbeat from `before` (epoch s) on is this
-    launcher's own, not the one that ran the session, and does not count."""
+    launcher's own, not the one that ran the session, and does not count. `heartbeat`: the
+    (epoch, address) the previous launcher left, read before this one wrote its own (default: the file)."""
     if not session_id:
         return False
     lines = read_text(os.path.join(directory, "session.log")).splitlines()
@@ -339,7 +343,7 @@ def session_ran(directory, session_id, before=None):
             m = re.search(r"\bafter=(\d+)s\b", line)
             return bool(m and int(m.group(1)) >= RAN)
     began = parse_time(lines[start].split()[0])
-    hb = read_heartbeat(directory)
+    hb = read_heartbeat(directory) if heartbeat is READ_FILE else heartbeat
     if hb and before is not None and hb[0] >= int(before):
         hb = None
     return bool(start == last_start and began is not None and hb and hb[0] >= began + RAN)
@@ -359,7 +363,7 @@ def transcript_state(project, session_id):
     return os.path.isfile(os.path.join(folder, session_id + ".jsonl"))
 
 
-def should_resume(agent, directory, project, before=None):
+def should_resume(agent, directory, project, before=None, heartbeat=READ_FILE):
     """(resume?, why): why is flag | ran | transcript | new. `before`: when this launcher started
     (its own heartbeat is not evidence that an earlier session ran)."""
     sid = agent.get("sessionId")
@@ -367,7 +371,7 @@ def should_resume(agent, directory, project, before=None):
         return False, "new"
     if agent.get("sessionStarted"):
         return True, "flag"
-    if session_ran(directory, sid, before):
+    if session_ran(directory, sid, before, heartbeat):
         return True, "ran"
     if transcript_state(project, sid) is True:
         return True, "transcript"
@@ -633,9 +637,12 @@ def run_session(args, address, labels, space, project, ctx):
         raise Problem("project folder does not exist: " + project)
     lock = launch_lock(space)
     try:
-        directory, agent = claim(args, address, labels, space, project, p, existing, directory)
+        directory, agent, previous = claim(args, address, labels, space, project, p, existing, directory)
     finally:
         lock.close()  # releases the lock
+    # The heartbeat the previous launcher left: the only sign that a killed session ran. Kept from
+    # this launcher's first claim; on a retry the file holds this launcher's own beats.
+    ctx.setdefault("previous", previous)
     signal.signal(signal.SIGINT, signal.SIG_IGN)  # Ctrl-C belongs to the agent, not this wrapper
     run_agent(args, address, project, p, directory, agent, ctx, started)
 
@@ -653,10 +660,11 @@ def claim(args, address, labels, space, project, p, existing, directory):
             exec_plain(p)
         raise Problem("this space already has a Project Agent in terminal {}".format(other))
     directory, agent = init_state(space, project, p, args.name, address, local_id(labels.get("herdr.tab")), terms=terms)
+    previous = read_heartbeat(directory)  # before this launcher's first beat replaces it
     call(["hc", "label", address, "herdr.pa=" + space, "herdr.pa.profile=" + p["name"],
           "herdr.pa.project=" + project, "herdr.pa.name=" + agent["name"], "herdr.pa.starting="])
     write_text(os.path.join(directory, "heartbeat"), "{} {}\n".format(int(time.time()), address))
-    return directory, agent
+    return directory, agent, previous
 
 
 def run_agent(args, address, project, p, directory, agent, ctx, started):
@@ -693,7 +701,7 @@ def run_agent(args, address, project, p, directory, agent, ctx, started):
     quick, quick_resume_fails = 0, 0
     while True:
         agent = read_json(os.path.join(directory, "agent.json"), agent)
-        resume, why = should_resume(agent, directory, project, before=started)
+        resume, why = should_resume(agent, directory, project, before=started, heartbeat=ctx.get("previous"))
         if args.fresh:
             resume, why = False, "fresh"
         if not resume:
