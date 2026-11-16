@@ -375,6 +375,64 @@ class Round3(Base):
         pa.launch_lock("sp1", wait=1).close()  # free again once released
 
 
+class Round3Addition(Round3):
+    """VERIFY.md round 2: the migration case through the real start path (A1.3), and the launch flock."""
+    test_u18_retry_keeps_the_first_start_time = None  # inherited helpers only, not Round3's tests
+    test_u19_claim_clears_the_starting_label = None
+    test_u20_launch_lock_wait_is_bounded = None
+
+    def test_u21_migration_resumes_through_the_real_start_path(self):
+        # The remote space this task exists for: sessionStarted false, no exit line, and the previous
+        # launcher (t9) kept beating for a day after the start. claim() must not erase that evidence.
+        began = int(time.time()) - 2 * 86400
+        self.fixtures3(began)
+        self.heartbeat(began + 86400, "t9")
+        argv = self.run_once({"beat": False})
+        self.assertIn("--resume", argv)
+        self.assertEqual(argv[argv.index("--resume") + 1], SID)
+        with open(os.path.join(self.dir, "session.log")) as f:
+            self.assertIn("start resume=True session={} reason=ran".format(SID), f.read().splitlines()[-1])
+
+    def test_u22_two_launchers_never_claim_at_once(self):
+        # Two launchers for one space start together. While the first is inside claim (init_state,
+        # labelling, first heartbeat), the second must not enter it: the launch lock covers claim.
+        import threading
+        self.fixtures3(int(time.time()) - 3600)
+        inside, gate, entered, errors = [], threading.Event(), threading.Event(), []
+
+        class Stop(Exception):
+            pass
+
+        def fake_init_state(*a, **k):
+            inside.append(threading.current_thread().name)
+            if len(inside) == 1:
+                entered.set()
+                gate.wait(10)  # the first launcher stays inside claim until released
+            raise Stop()
+        pa.init_state = fake_init_state
+
+        def launcher():
+            try:
+                args = types.SimpleNamespace(space="sp1", project=self.project, profile="test", name=None, auto=False, ask=False, fresh=False)
+                pa.run_session(args, "t1", {}, "sp1", self.project, {"beat": True})
+            except Stop:
+                pass
+            except Exception as e:  # noqa: BLE001 - reported below
+                errors.append(e)
+        first = threading.Thread(target=launcher, name="first", daemon=True)
+        first.start()
+        self.assertTrue(entered.wait(5), "the first launcher reached claim")
+        second = threading.Thread(target=launcher, name="second", daemon=True)
+        second.start()
+        time.sleep(1.5)
+        self.assertEqual(inside, ["first"], "the second launcher entered claim while the first was inside it")
+        gate.set()
+        first.join(10)
+        second.join(10)
+        self.assertEqual(errors, [])
+        self.assertEqual(inside, ["first", "second"])
+
+
 def tearDownModule():
     shutil.rmtree(TMP, ignore_errors=True)
 

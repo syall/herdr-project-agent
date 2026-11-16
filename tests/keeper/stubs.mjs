@@ -6,6 +6,7 @@
 //   __files   { "<machine or ''>:<path>": text }            files readTextFile sees (null/absent: none)
 //   __offline [machine names]                               readTextFile/exec on them throw
 //   __fail    ["<machine>:<path>"]                          readTextFile of these throws (a failed read)
+//   __hang    ["<machine>:<path>"]                          readTextFile of these never settles
 //   __runs    [[name, args]]                                every run() call
 //   __notes   [notification]                                every notify() call
 //   __reads   ["<machine>:<path>"]                          every readTextFile() call
@@ -35,6 +36,7 @@ export const readTextFile = async (path, options = {}) => {
   (g.__reads ??= []).push(key(path, on));
   if (offline(on)) throw new Error(`machine ${on} is unreachable`);
   if ((g.__fail ?? []).includes(key(path, on))) throw new Error("read failed");
+  if ((g.__hang ?? []).includes(key(path, on))) return new Promise(() => {});
   const v = (g.__files ?? {})[key(path, on)];
   return v === undefined ? null : v;
 };
@@ -74,6 +76,6 @@ export async function flush() {
   for (let i = 0; i < 20; i++) {
     const batch = pending.splice(0);
     if (!batch.length) { await new Promise((r) => setTimeout(r, 0)); if (!pending.length) return; continue; }
-    await Promise.allSettled(batch);
+    await Promise.race([Promise.allSettled(batch), new Promise((r) => setTimeout(r, 5))]); // a never-settling read (__hang) must not stop the clock
   }
 }

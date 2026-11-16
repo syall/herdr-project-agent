@@ -45,7 +45,7 @@ function world({ machine = null, tabPresent = true, termLive = true, program = s
   g.__terminals = [...(termLive ? [{ address: q("t1"), state: "live", argv, ...(created === undefined ? {} : { created_ms: created }), ...(report === undefined ? {} : { report }), ...(foreground === undefined ? {} : { foreground }), labels: { "herdr.pa": S, "herdr.pa.name": "proj", "herdr.pa.project": "/proj", "herdr.pa.profile": "test" }, status, program }] : []),
     ...extraTerms, { address: q("t9"), state: "live", argv: ["zsh"], labels: {}, status: null, program: shell }];
   g.__shared = { "project-agent.tabs": record ? { [tb]: { space: sid, project: "/proj", profile: "test", name: "proj", terminal: q("t1") } } : {} };
-  g.__files = {}; g.__fail = [];
+  g.__files = {}; g.__fail = []; g.__hang = [];
   const f = (name) => `${machine ?? ""}:${dir}/${name}`;
   if (config === "open") g.__files[f("agent.json")] = JSON.stringify({ space: S, project: "/proj", profile: "test", name: "proj", terminal: "t1" });
   if (config === "closed") g.__files[f("agent.json")] = JSON.stringify({ space: S, project: "/proj", profile: "test", name: "proj", closed: { at: "x", by: "person" } });
@@ -445,6 +445,31 @@ cases["K-foreign-again"] = async () => { // a second "runs something else" episo
   await sim(k, 30000, () => { g.__files[w.f("heartbeat")] = `${Math.floor(g.__now / 1000)} t1\n`; }); // its launcher beats again
   await sim(k, 60000);
   check(g.__notes.length === 2, `told again for the second episode (got ${g.__notes.length})`);
+};
+
+// VERIFY round 2 survivors: the fast-tick caps (N8b, N8d).
+cases["K-cap-restore"] = async () => { // a launcher that says it is starting, forever: the 250 ms tick stops after ~2 min
+  world();
+  const k = await start();
+  check(await waitSplit(k, 1, 50000), "split");
+  newPane("p2", { address: "t2", state: "live", argv: ARGV(), labels: { "herdr.pa.starting": S }, status: null, program: launcher });
+  await sim(k, 30000);
+  check(k.busy(), "busy early in the restore");
+  await sim(k, 100000);
+  check(!k.busy() && Boolean(records().tb1.recovering), `not busy after the cap, restore still waiting (busy ${k.busy()})`);
+  check(runsOf("pane.close").length === 0, "nothing closed");
+};
+cases["K-cap-lock"] = async () => { // a lock read that never settles: the fast tick stops, the take is retried
+  const w = world();
+  g.__hang = [`:${w.dir}/keeper.lock`];
+  const k = await start();
+  check(await until(k, 50000, () => k.busy()), "busy while taking the lock");
+  const n = g.__reads.filter((r) => r.endsWith("/keeper.lock")).length;
+  await sim(k, 12000);
+  check(!k.busy(), "not busy 10 s into a lock take that never ends");
+  await sim(k, 20000);
+  check(g.__reads.filter((r) => r.endsWith("/keeper.lock")).length > n, "the lock take is retried");
+  check(splits().length === 0, "no restore without the lock");
 };
 
 const pick = process.argv.slice(2);
