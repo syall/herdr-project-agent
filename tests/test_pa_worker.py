@@ -366,5 +366,310 @@ class WorktreeRule(Base):
         self.assertTrue(os.path.isdir(self.wt))
 
 
+class Close(Base):
+    """R2: pa-worker close <address> --evidence <file>, with its guards (spec 3.2, 3.3)."""
+
+    def setUp(self):
+        super().setUp()
+        self.proj = self.repo()
+        self.wt = self.worktree(self.proj, "t-003-x")
+        self.add_task("t-003", "in-progress", self.wt, [{"address": "t31", "role": "build", "name": "t-003-tests"}])
+        self.term("t31", "t-003-tests")
+        self.evidence("t-003")
+        pa_hooks.by_an_agent = lambda: True  # the agent runs it
+
+    def close(self, address="t31", *extra):
+        return self.worker("close", address, *extra)
+
+    def refused(self, result, *fragments):
+        self.assertRefused(result, *fragments)
+
+    def test_w1_success(self):
+        code, out, err = self.close("t31", "--evidence", "FINDINGS.md")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.ended(), [["hc", "kill", "t31"], ["hc", "rm", "t31"]])
+        self.assertIn("Closed worker t31 (t-003-tests, task t-003); its worktree and branch are untouched.", out)
+        w = self.entry("t-003", "t31")
+        self.assertIsNotNone(w, "the entry stays in the ledger (AC2.6)")
+        self.assertEqual((w["finished"], w["closedBy"], w["report"], w["role"], w["name"]), (True, "agent", "FINDINGS.md", "build", "t-003-tests"))
+        self.assertRegex(w["closed"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+        task = self.ledger()["tasks"][0]
+        self.assertEqual(task["state"], "in-progress")
+        self.assertTrue(task.get("updated"))
+        lines = self.journal()
+        self.assertEqual(len(lines), 1)
+        self.assertEqual((lines[0]["trigger"], lines[0]["by"], lines[0]["task"]), ("close", "agent", "t-003"))
+        self.assertIn("closed worker t31 (t-003-tests) after reading its report FINDINGS.md", lines[0]["why"])
+        self.assertTrue(os.path.isdir(self.wt))
+        self.assertEqual(sh(self.proj, "git", "branch", "--list", "t-003-x"), "t-003-x")
+        self.assertNotIn("t31", self.terms)
+
+    def test_w1b_the_gate_still_sees_closed_workers(self):
+        """AC1.4: a closed build worker and a closed reviewer still satisfy reviewer-is-not-the-author."""
+        led = self.ledger()
+        led["tasks"][0].update(type="docs", worktree=None, workers=[
+            {"address": "t31", "role": "build", "name": "t-003-tests"}, {"address": "t32", "role": "reviewer", "name": "t-003-review"}])
+        self.ledger(led)
+        self.term("t32", "t-003-review")
+        self.evidence("t-003", "REVIEW.md")
+        self.assertEqual(self.close("t31", "--evidence", "FINDINGS.md")[0], 0)
+        self.assertEqual(self.close("t32", "--evidence", "REVIEW.md")[0], 0)
+        for name in ("intent.md", "spec.md", "plan.md", "DECISIONS.md", "VERIFY.md"):
+            self.evidence("t-003", name)
+        code, out, _ = self.run_cmd("pa-gate", "t-003", "--space", "sp1")
+        self.assertEqual(code, 0, out)
+        self.assertIn("ok    reviewer is not the author", out)
+
+    def test_w1c_absolute_evidence_path_inside_the_folder(self):
+        path = self.evidence("t-003", "sub/REPORT.md")
+        self.assertEqual(self.close("t31", "--evidence", path)[0], 0)
+        self.assertEqual(self.entry("t-003", "t31")["report"], os.path.join("sub", "REPORT.md"))
+
+    def test_w1d_closed_by_the_person(self):
+        pa_hooks.by_an_agent = lambda: False
+        self.assertEqual(self.close("t31", "--evidence", "FINDINGS.md")[0], 0)
+        self.assertEqual(self.entry("t-003", "t31")["closedBy"], "person")
+        self.assertEqual(self.journal()[0]["by"], "person")
+
+    def test_w2_working(self):
+        self.terms["t31"]["status"] = "working"
+        before = self.snapshot()
+        self.refused(self.close("t31", "--evidence", "FINDINGS.md"), "t31 (t-003-tests) is working; close it after its report")
+        self.assertEqual(self.snapshot(), before)
+
+    def test_w3_blocked(self):
+        self.terms["t31"]["status"] = "blocked"
+        before = self.snapshot()
+        self.refused(self.close("t31", "--evidence", "FINDINGS.md"), "t31 (t-003-tests) is blocked on a question or a permission; bring that to the person")
+        self.assertEqual(self.snapshot(), before)
+
+    def test_w3b_unknown_status(self):
+        self.terms["t31"]["status"] = None  # live, but hc reports no agent status
+        before = self.snapshot()
+        self.refused(self.close("t31", "--evidence", "FINDINGS.md"), "t31 has status none; nothing was closed")
+        self.assertEqual(self.snapshot(), before)
+
+    def test_w4_the_project_agent(self):
+        self.term("t0", "PA: S")
+        before = self.snapshot()
+        self.refused(self.close("t0", "--evidence", "FINDINGS.md"), "that is the Project Agent itself; it ends when its space is closed")
+        self.assertEqual(self.snapshot(), before)
+
+    def test_w5_unrecorded(self):
+        self.term("t99", "someone-else")
+        before = self.snapshot()
+        self.refused(self.close("t99", "--evidence", "FINDINGS.md"), "t99 is not a recorded worker of this space; nothing was closed (if it is yours, close it in Herdr)")
+        self.assertEqual(self.snapshot(), before)
+        self.assertIn("t99", self.terms)
+
+    def test_w6_marked_keep(self):
+        led = self.ledger()
+        led["tasks"][0]["workers"][0].update(keep=True, keptAt="2026-11-16T10:00:00Z", keepQuote="leave the tests one up")
+        self.ledger(led)
+        before = self.snapshot()
+        self.refused(self.close("t31", "--evidence", "FINDINGS.md"),
+                     't31 (t-003-tests) is marked keep (2026-11-16T10:00:00Z: "leave the tests one up"); only the person closes it, with the × in the panel')
+        self.assertEqual(self.snapshot(), before)
+
+    def test_w7_evidence(self):
+        before = self.snapshot()
+        self.refused(self.close("t31"), "pa-worker close needs --evidence <file>: the report you read, in evidence/t-003/")
+        self.refused(self.close("t31", "--evidence", "NOPE.md"), "evidence NOPE.md is missing")
+        self.evidence("t-003", "EMPTY.md", "  \n\t\n")
+        self.refused(self.close("t31", "--evidence", "EMPTY.md"), "evidence EMPTY.md is empty; read the report before closing")
+        self.evidence("t-002", "x.md")
+        self.refused(self.close("t31", "--evidence", "../t-002/x.md"), "../t-002/x.md is not in t31's task evidence folder evidence/t-003/")
+        elsewhere = os.path.join(self.tmp, "elsewhere.md")
+        write(elsewhere, "text\n")
+        self.refused(self.close("t31", "--evidence", elsewhere), "is not in t31's task evidence folder evidence/t-003/")
+        os.symlink(elsewhere, os.path.join(self.dir, "evidence", "t-003", "link.md"))
+        self.refused(self.close("t31", "--evidence", "link.md"), "link.md is not in t31's task evidence folder")
+        self.assertEqual(self.snapshot(), before)
+
+    def test_w8_uncommitted(self):
+        write(os.path.join(self.wt, "README"), "changed\n")
+        for i in range(6):
+            write(os.path.join(self.wt, "new{}.txt".format(i)), "x\n")
+        before = self.snapshot()
+        self.refused(self.close("t31", "--evidence", "FINDINGS.md"), "has 7 uncommitted file(s) (", "README", ", +2 more)",
+                     "have them committed or reported first. Nothing was closed")
+        self.assertEqual(self.snapshot(), before)
+
+    def test_w8b_our_own_settings_file_does_not_count(self):
+        write(os.path.join(self.wt, ".claude", "settings.local.json"), "{}\n")
+        self.assertEqual(self.close("t31", "--evidence", "FINDINGS.md")[0], 0)
+
+    def test_w8c_main_checkout_is_checked_too(self):
+        led = self.ledger()
+        led["tasks"][0]["worktree"] = self.proj
+        self.ledger(led)
+        write(os.path.join(self.proj, "mine.txt"), "the person's\n")
+        before = self.snapshot()
+        self.refused(self.close("t31", "--evidence", "FINDINGS.md"), "has 1 uncommitted file(s) (mine.txt)")
+        self.assertEqual(self.snapshot(), before)
+
+    def profile_kind(self, status_code=0, output='{"uncommitted": 0, "unpushed": 0, "branch": "b", "kind": "custom worktree"}'):
+        folder = os.path.join(pa.ROOT, "profiles", "test2")
+        status = os.path.join(self.tmp, "status.sh")
+        write(status, "#!/bin/sh\nprintf '%s\\n' '{}'\nexit {}\n".format(output, status_code))
+        os.chmod(status, 0o755)
+        dump({"name": "test2", "claude": ["true"], "codex": ["true"],
+              "worktree": {"marker": "marker.txt", "status": status, "remove": status}}, os.path.join(folder, "profile.json"))
+        agent = load(os.path.join(self.dir, "agent.json"))
+        agent["profile"] = "test2"
+        dump(agent, os.path.join(self.dir, "agent.json"))
+        kind = os.path.join(self.tmp, "kind-wt")
+        write(os.path.join(kind, "marker.txt"), "")
+        led = self.ledger()
+        led["tasks"][0]["worktree"] = kind
+        self.ledger(led)
+        return kind
+
+    def test_w9_unreadable_worktree(self):
+        self.profile_kind(status_code=1)
+        before = self.snapshot()
+        self.refused(self.close("t31", "--evidence", "FINDINGS.md"), "cannot tell whether", "holds uncommitted work (", "); nothing was closed")
+        self.assertEqual(self.snapshot(), before)
+
+    def test_w9b_profile_kind_with_uncommitted_files(self):
+        self.profile_kind(output='{"uncommitted": 3, "unpushed": 0, "branch": "b"}')
+        self.refused(self.close("t31", "--evidence", "FINDINGS.md"), "has 3 uncommitted file(s)", "Nothing was closed")
+
+    def test_w9c_profile_kind_clean(self):
+        self.profile_kind()
+        self.assertEqual(self.close("t31", "--evidence", "FINDINGS.md")[0], 0)
+
+    def test_w9d_a_folder_that_is_not_a_worktree(self):
+        plain = os.path.join(self.tmp, "plain")
+        os.makedirs(plain)
+        led = self.ledger()
+        led["tasks"][0]["worktree"] = plain
+        self.ledger(led)
+        self.refused(self.close("t31", "--evidence", "FINDINGS.md"), "cannot tell whether {} holds uncommitted work".format(os.path.realpath(plain)))
+
+    def test_w9e_a_worktree_that_is_gone_is_fine(self):
+        led = self.ledger()
+        led["tasks"][0]["worktree"] = os.path.join(self.tmp, "gone")
+        self.ledger(led)
+        self.assertEqual(self.close("t31", "--evidence", "FINDINGS.md")[0], 0)
+
+    def test_w10_unpushed_commits_do_not_block(self):
+        self.commit(self.wt, "a.txt", "a\n", "a commit on no remote")
+        code, _, err = self.close("t31", "--evidence", "FINDINGS.md")
+        self.assertEqual(code, 0, err)
+        self.assertTrue(self.entry("t-003", "t31")["finished"])
+
+    def test_w11_status_reread_under_the_lock(self):
+        real = self.fake_get
+        seen = []
+
+        def flipping(address):
+            if address == "t31":
+                seen.append(address)
+                if len(seen) > 1:
+                    self.terms["t31"]["status"] = "working"
+            return real(address)
+        pa.hc_get = flipping
+        before = self.snapshot()
+        self.refused(self.close("t31", "--evidence", "FINDINGS.md"), "t31 (t-003-tests) is working")
+        self.assertGreaterEqual(len(seen), 2, "the status is read again before the kill")
+        self.assertEqual(self.snapshot(), before)
+
+    def test_w12_already_closed(self):
+        led = self.ledger()
+        led["tasks"][0]["workers"][0].update(finished=True, closed="2026-11-16T10:00:00Z")
+        self.ledger(led)
+        del self.terms["t31"]
+        before = self.snapshot()
+        code, out, _ = self.close("t31")
+        self.assertEqual(code, 0)
+        self.assertIn("t31 is already closed.", out)
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(self.ended(), [])
+
+    def test_w13_gone_but_not_finished(self):
+        del self.terms["t31"]
+        code, out, err = self.close("t31", "--evidence", "FINDINGS.md")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.ended(), [], "no hc call for a terminal that is already gone")
+        self.assertTrue(self.entry("t-003", "t31")["finished"])
+        self.assertEqual(self.journal()[0]["trigger"], "close")
+
+    def test_w13b_exited_on_its_own(self):
+        self.terms["t31"].update(state="finished", status=None, reason="exited")
+        self.assertEqual(self.close("t31", "--evidence", "FINDINGS.md")[0], 0)
+        self.assertEqual(self.ended(), [["hc", "rm", "t31"]])
+
+    def test_w13c_rm_that_leaves_the_record(self):
+        real = self.fake_call
+
+        def stubborn(argv, check=True):
+            if argv[:2] == ["hc", "rm"]:
+                self.calls.append(list(argv))
+                return ""
+            return real(argv, check)
+        pa.call = stubborn
+        code, out, _ = self.close("t31", "--evidence", "FINDINGS.md")
+        self.assertEqual(code, 0)
+        self.assertIn("ended t31 but hc rm did not remove its record", out)
+        self.assertTrue(self.entry("t-003", "t31")["finished"])
+
+    def test_w14_waits_for_the_ledger_lock(self):
+        import fcntl
+        held = threading.Event()
+
+        def hold():
+            with open(os.path.join(self.dir, ".ledger.lock"), "a") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                held.set()
+                time.sleep(0.5)
+        t = threading.Thread(target=hold)
+        t.start()
+        held.wait(5)
+        began = time.time()
+        code, _, err = self.close("t31", "--evidence", "FINDINGS.md")
+        waited = time.time() - began
+        t.join()
+        self.assertEqual(code, 0, err)
+        self.assertGreaterEqual(waited, 0.3)
+        self.assertTrue(self.entry("t-003", "t31")["finished"])
+
+    def test_w15_other_machines(self):
+        self.term("m1/t5", "x")
+        self.refused(self.close("m1/t5", "--evidence", "FINDINGS.md"), "m1/t5 is on another machine; pa-worker close runs on the machine the space runs on")
+        result = self.run_cmd("pa-worker", "close", "t31", "--evidence", "FINDINGS.md", "--space", "m1/sp9")
+        self.refused(result, "space m1/sp9 lives on m1; run pa-worker there (its Project Agent does)")
+
+    def test_w16b_close_is_allowed_inside_an_agent(self):
+        pa_hooks.by_an_agent = lambda: True
+        self.assertEqual(self.close("t31", "--evidence", "FINDINGS.md")[0], 0)
+
+    def test_w17_address_now_names_another_terminal(self):
+        self.terms["t31"]["name"] = "other"
+        before = self.snapshot()
+        self.refused(self.close("t31", "--evidence", "FINDINGS.md"), "t31 is now a different terminal (other), not t-003-tests; nothing was closed")
+        self.assertEqual(self.snapshot(), before)
+
+    def test_w18_no_recorded_name(self):
+        led = self.ledger()
+        del led["tasks"][0]["workers"][0]["name"]
+        self.ledger(led)
+        self.terms["t31"]["name"] = "zzz"
+        self.refused(self.close("t31", "--evidence", "FINDINGS.md"), "t31 is now a different terminal (zzz)", "nothing was closed")
+        self.terms["t31"]["name"] = "t-003-fix"  # a name for the task: it is the worker
+        self.assertEqual(self.close("t31", "--evidence", "FINDINGS.md")[0], 0)
+
+    def test_w19_usage(self):
+        code, _, err = self.worker("close")
+        self.assertEqual(code, 2)
+        self.assertIn("pa-worker close needs an address and --evidence, or --leftovers", err)
+        code, _, err = self.worker("close", "t31", "--leftovers")
+        self.assertIn("pa-worker close needs an address and --evidence, or --leftovers", err)
+        for action in ("info", "delete", "keep"):
+            code, _, err = self.worker(action)
+            self.assertEqual(code, 2, action)
+        self.assertEqual(self.ended(), [])
+
+
 if __name__ == "__main__":
     unittest.main()
