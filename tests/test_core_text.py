@@ -104,7 +104,8 @@ class Docs(unittest.TestCase):  # AC6.1
 
     def test_mod_comments(self):
         self.assertNotIn("A worker is never closed for you", read("mods", "project-agent", "worker.js"))
-        self.assertIn("The Project Agent closes finished workers itself (pa-worker close)", flat(read("mods", "project-agent", "worker.js")))
+        comments = flat(re.sub(r"(?m)^\s*// ?", "", read("mods", "project-agent", "worker.js")))
+        self.assertIn("The Project Agent closes finished workers itself (pa-worker close)", comments)
         main = read("mods", "project-agent", "main.js")
         self.assertNotIn("Workers stay until you close them", main)
         self.assertIn("the person's way to close any worker (the agent closes finished ones itself)", main)
