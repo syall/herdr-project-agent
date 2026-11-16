@@ -11,6 +11,9 @@
 //   __notes   [notification]                                every notify() call
 //   __reads   ["<machine>:<path>"]                          every readTextFile() call
 //   __writes  ["<machine>:<path>"]                          every file write
+//   __hcs     [[args]]                                      every hc() call (hc send ... included)
+//   __hcFail  ["<address>"]                                 hc send to these exits 1
+//   __ls      { "<machine or ''>:<dir>": ["name", ...] }    what `ls -1 <dir>` lists
 //   __now                                                   Date.now()
 const g = globalThis;
 const realNow = Date.now.bind(Date);
@@ -61,9 +64,14 @@ export const exec = async (command, args = [], options = {}) => {
     return { code: 0, stdout: "", stderr: "" };
   }
   (g.__execs ??= []).push([command, args, on]);
+  if (command === "ls" && args[0] === "-1") { const names = (g.__ls ?? {})[key(args[1], on)]; return names ? { code: 0, stdout: names.join("\n") + "\n", stderr: "" } : { code: 1, stdout: "", stderr: "no such folder" }; }
   return { code: 0, stdout: "", stderr: "" };
 };
-export const hc = async () => ({ code: 0, stdout: "", stderr: "" });
+export const hc = async (args = []) => {
+  (g.__hcs ??= []).push(args);
+  if (args[0] === "send" && (g.__hcFail ?? []).includes(args[1])) return { code: 1, stdout: "", stderr: "refused" };
+  return { code: 0, stdout: "", stderr: "" };
+};
 
 // A cx whose spawned work can be awaited: flush() settles everything spawned so far.
 const pending = [];
