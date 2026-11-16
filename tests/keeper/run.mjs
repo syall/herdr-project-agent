@@ -964,6 +964,20 @@ cases["K-alive-steady"] = async () => { // N2c (D16): a healthy launcher (beat e
   check(n > 50 && lost.length === 0, `alive on every tick after the first read (lost at ${JSON.stringify(lost.slice(0, 5))} s)`);
 };
 
+// ---- t-003 review round 3 (REVIEW.md R3-M1) ----
+async function staleLabelOpen(labels, what) { // a launcher killed while starting left its label on what is now an idle shell
+  world();
+  Object.assign(g.__terminals.find((t) => t.address === "t1").labels, labels);
+  const k = await start();
+  check(await until(k, 700000, () => k.stopped[S]), `${what}: stopped after 3 failed restores`);
+  request(S);
+  check(await until(k, 10000, () => tabNews().length === 1), `${what}: Open gives a tab.new (notes ${JSON.stringify(noteText().slice(-2))})`);
+  await sim(k, 5000);
+  check(tabNews().length === 1, `${what}: one tab.new`);
+}
+cases["K-stale-starting"] = () => staleLabelOpen({ "herdr.pa.starting": S }, "stale herdr.pa.starting on an idle shell");
+cases["K-stale-error"] = () => staleLabelOpen({ "herdr.pa.error": "profile test is missing" }, "stale herdr.pa.error on an idle shell");
+
 const pick = process.argv.slice(2);
 let failed = 0;
 for (const [name, fn] of Object.entries(cases)) {

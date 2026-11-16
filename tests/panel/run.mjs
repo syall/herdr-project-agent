@@ -438,6 +438,20 @@ cases["P-open-error-long"] = async () => { // N5d: clicked, the new launcher wai
   check(/profile test is missing/.test(text) && !/has not started after 3 minutes|did not open/.test(text) && !clicks["pa-open"], `the error, no timeout message (got ${text.slice(0, 300)})`);
 };
 
+// ---- t-003 review round 3 (REVIEW.md R3-M1) ----
+cases["P-stale-starting"] = async () => { // a stale starting/error label on an idle shell does not block Open
+  for (const labels of [{ "herdr.pa.starting": S }, { "herdr.pa.error": "profile test is missing" }]) {
+    world({ records: { tb1: { ...keptShell.tb1, stopped: true } }, extraTabs: [paTab],
+      extraPanes: [{ pane: "p1", terminal: "t1", tab: "tb1", title: "zsh", cwd: "/home/u", status: null, program: shell }],
+      extraTerms: [{ address: "t1", state: "live", argv: ["zsh"], labels: { "herdr.pa": S, ...labels }, status: null, program: shell }] });
+    const v = await mount();
+    const { text, clicks } = look(v);
+    check(/Not running/.test(text) && !/Opening…|profile test is missing/.test(text) && Boolean(clicks["pa-open"]), `${JSON.stringify(labels)}: Open offered, no stale state (got ${text.slice(0, 250)})`);
+    await click(v, "pa-open");
+    check(Boolean((g.__shared[REQ] ?? {})[S]), `${JSON.stringify(labels)}: the click writes a request`);
+  }
+};
+
 const pick = process.argv.slice(2);
 let failed = 0;
 for (const [name, fn] of Object.entries(cases)) {
