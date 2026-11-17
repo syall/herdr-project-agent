@@ -1084,6 +1084,23 @@ def claude_files(folder):
     return [(os.path.join(base, n), n[:-6]) for n in names if n.endswith(".jsonl") and not n.startswith("agent-")]
 
 
+def other_spaces_sessions(directory):
+    """Session ids that the other spaces on this machine record (costs/sessions.jsonl) or name (session.log): several
+    spaces can share one project folder, and those sessions are theirs (VERIFY R-d). Ids only."""
+    root, me, out = os.path.join(pa.ROOT, "spaces"), os.path.basename(os.path.normpath(directory)), set()
+    for name in sorted(os.listdir(root)) if os.path.isdir(root) else []:
+        if name == me or not pa.ID.match(name):
+            continue
+        records, _bad = read_lines(os.path.join(root, name, "costs", "sessions.jsonl"))
+        out.update(r["session"] for r in records if isinstance(r.get("session"), str))
+        try:
+            log = pa.read_text(os.path.join(root, name, "session.log"))
+        except (OSError, UnicodeDecodeError):
+            log = ""
+        out.update(re.findall(r"\bsession=([0-9a-f-]{36})\b", log))
+    return out
+
+
 def record_key(r):
     return "{} {}".format(r.get("at"), r.get("terminal"))
 
@@ -1099,7 +1116,7 @@ def bind_pending(ctx):
     ctx["pending"] = []
     if not pending:
         return
-    known = {r.get("session") for r in records if r.get("session")}
+    known = {r.get("session") for r in records if r.get("session")} | other_spaces_sessions(ctx["directory"])
     events = []
     for program in ("codex", "claude"):
         recs = sorted((r for r in pending if (r.get("program") or "claude") == program), key=lambda r: r.get("at") or "")
@@ -1184,7 +1201,7 @@ def reconstruct(directory, dry_run=False, now=None, quiet=False):
     created = parse_ts(agent.get("created") or "") or 0
     folder = costs_dir(directory)
     records, _bad = read_lines(os.path.join(folder, "sessions.jsonl"))
-    known = {r.get("session") for r in records if r.get("session")}
+    known = {r.get("session") for r in records if r.get("session")} | other_spaces_sessions(directory)
     ctx = {"directory": directory, "now": now}
     ledger, journal = space_facts(ctx)
     tasks = {t.get("id"): t for t in ledger.get("tasks", []) or [] if t.get("id")}
