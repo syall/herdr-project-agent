@@ -677,7 +677,7 @@ def attribute_worker(row, sess, ctx):
     if terminal and (task is None or len({t.get("id") for t, _w in entries}) > 1):
         token = re.compile(r"(?<![A-Za-z0-9_-])" + re.escape(terminal) + r"(?![A-Za-z0-9_-])")
         handoff = None
-        since = parse_ts(sess.get("at") or "")  # entries from before this session started are not its handoffs
+        since = parse_ts(sess.get("startedAt") or sess.get("at") or "")  # entries from before this session started are not its handoffs
         for e in journal:
             if e["at"] > start + HANDOFF_SLACK:
                 break
@@ -1431,9 +1431,10 @@ def summarize(directory, rows, records, table, price_problem, profile_name, now,
         if hour >= hour_floor:
             group(hours, hour).add(t, m, calls, rec)
         if r.get("kind") == "pa" and r.get("pass") is not None:
-            p = passes.setdefault(r["pass"], {"pass": r["pass"], "trigger": r.get("trigger"), "from": r.get("from"), "money": 0.0,
+            p = passes.setdefault(r["pass"], {"pass": r["pass"], "trigger": r.get("trigger"), "from": r.get("from"), "money": None,
                                                "tokens": 0, "rebuild": False})
-            p["money"] += m or 0
+            if m is not None:
+                p["money"] = (p["money"] or 0.0) + m
             p["tokens"] += t
             p["rebuild"] = p["rebuild"] or bool(rb_t)
             p["from"] = min(p["from"] or r.get("from"), r.get("from"))
@@ -1494,7 +1495,7 @@ def summarize(directory, rows, records, table, price_problem, profile_name, now,
         "totals": {"tokens": {"in": kinds_total["in"], "out": kinds_total["out"], "cw": kinds_total["cw5m"] + kinds_total["cw1h"],
                               "cr": kinds_total["cr"], "all": total_tokens(kinds_total)},
                    "money": round(total.money, 6) if total.priced else None, "unpricedTokens": unpriced,
-                   "reconstructedMoney": round(recon_money, 6), "calls": total.calls},
+                   "reconstructedMoney": round(recon_money, 6) if total.priced else None, "calls": total.calls},
         "hours": [[h, {"tokens": int(b.tokens), "money": round(b.money, 6) if b.priced else None}] for h, b in sorted(hours.items())],
         "byActivity": by_money(acts),
         "byTask": by_money(task_b, **task_extra),
@@ -1502,7 +1503,8 @@ def summarize(directory, rows, records, table, price_problem, profile_name, now,
         "byKind": {d: by_money(v) for d, v in dims.items()},
         "byDay": by_day,
         "byDayModel": by_day_model,
-        "passes": sorted(({**p, "money": round(p["money"], 6)} for p in passes.values()), key=lambda p: -p["money"])[:PASSES],
+        "passes": sorted(({**p, "money": None if p["money"] is None else round(p["money"], 6)} for p in passes.values()),
+                         key=lambda p: -(p["money"] or 0))[:PASSES],
         "sessions": sess_list[:SESSIONS],
         "unmatched": {"sessions": um[-1].get("sessions", 0), "tokens": um[-1].get("tokens", 0)} if um else {"sessions": 0, "tokens": 0},
         "problems": problems[:20],
@@ -1600,7 +1602,8 @@ def report_lines(s, by=None):
         line += "   + {} unpriced tokens".format(fmt_tokens(tot["unpricedTokens"]))
     if by is None:
         out.append(line)
-        today = sum(e["money"] or 0 for e in s["byDay"] if e["key"] == s["updated"][:10])
+        days = [e for e in s["byDay"] if e["key"] == s["updated"][:10]]
+        today = days[0]["money"] if days else (0.0 if p.get("source") or p.get("currency") else None)
         out.append("Today     {} est. (UTC day)".format(fmt_money(today)))
 
     def table(title, entries, label=lambda e: str(e["key"])):
@@ -2005,10 +2008,11 @@ def validate_row(row, source, account, now):
         raise ValueError("note must be a short text")
     out["note"] = note
     out["source"] = source
-    out["fetchedAt"] = iso(now)
-    out["id"] = hashlib.sha1("|".join(str(out[k]) for k in ("source", "account", "from", "to", "label", "kind")).encode()).hexdigest()[:16]
+    # Scanned before the code adds its own fields: the id is a hash it computes and may hold 12 digits by chance.
     if TWELVE.search(json.dumps(out)) or TWELVE.search(json.dumps(dict(row, amount=out["amount"]), default=str)):
         raise ValueError("a row holds a 12-digit number (an account id?)")
+    out["fetchedAt"] = iso(now)
+    out["id"] = hashlib.sha1("|".join(str(out[k]) for k in ("source", "account", "from", "to", "label", "kind")).encode()).hexdigest()[:16]
     return out
 
 
