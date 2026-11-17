@@ -639,6 +639,19 @@ cases["P-hung-agent-json"] = async () => { // AC5.1: a hung agent.json leaves "L
   check(g.__shared["project-agent.open"][RS] === 3 && JSON.stringify(g.__shared["my-files.places"][RS]) === JSON.stringify(places), `a timeout clears no shared entry (got ${JSON.stringify(g.__shared["project-agent.open"])})`);
 };
 
+cases["P-hung-agent-json-kept"] = async () => { // AC5.1: a hung agent.json with a kept load: the kept tasks and cards stay, with the error line
+  const v = await twoSpaces();
+  show(`${M}/sp2`); look(v); await settle();
+  show(RS); look(v); await settle();
+  g.__hang = [`${M}:${RDIR}/agent.json`];
+  advance(11000); v.reload(cx); await settle();
+  await step(10000);
+  const { text } = look(v);
+  check(/Tasks · 2/.test(text) && /Decisions · 2/.test(text) && /agent\.json: timed out/.test(text), `kept data and the error (got ${text.slice(0, 400)})`);
+  check(v.cache.get(RS)?.cards?.length === 2, `the kept entry is not overwritten (got ${v.cache.get(RS)?.cards?.length})`);
+  check((g.__shared["project-agent.open"] ?? {})[RS] === 2, `the count stays (got ${JSON.stringify(g.__shared["project-agent.open"])})`);
+};
+
 cases["P-cache-cap"] = async () => { // limits: at most 8 spaces kept, the least recently shown dropped
   world({ machine: M });
   for (let i = 2; i <= 9; i++) addRemoteSpace(`sp${i}`, `p${i}`, ledgerOf(i, `p${i}`));
