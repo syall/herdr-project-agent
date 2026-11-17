@@ -3594,6 +3594,128 @@ class CC_Docs(unittest.TestCase):
         self.assertIn("statusline", pa_costs.__doc__)
 
 
+class CC_Limits(CCBase):
+    """t-029 Job 2 (card d-090): REVIEW-R2 R2-L1 (no kill by the pid of a reaped inner command, the Python 3.7/3.8
+    fallback included) and REVIEW L1 (the id checks refuse a trailing newline)."""
+
+    class FakeProc:
+        """A Popen stand-in whose kill() signals nothing and does not poll first, like Popen.kill on 3.7 and 3.8."""
+
+        def __init__(self, returncode):
+            self.pid, self.returncode, self.kills = 999999, returncode, 0
+
+        def kill(self):
+            self.kills += 1
+
+    def kill_calls(self, proc, killpg_fails=False):
+        calls = []
+
+        def fake_killpg(pid, sig):
+            calls.append((pid, sig))
+            if killpg_fails:
+                raise OSError(3, "no such process group")
+        real = pa_costs.os.killpg
+        pa_costs.os.killpg = fake_killpg
+        try:
+            pa_costs.statusline_kill(proc)
+        finally:
+            pa_costs.os.killpg = real
+        return calls
+
+    def test_cl1_a_reaped_process_gets_no_kill(self):
+        for code in (0, 1, -9):
+            proc = self.FakeProc(code)
+            self.assertEqual((self.kill_calls(proc), proc.kills), ([], 0), code)
+            proc = self.FakeProc(code)
+            self.assertEqual((self.kill_calls(proc, killpg_fails=True), proc.kills), ([], 0), "fallback, {}".format(code))
+
+    def test_cl2_a_running_process_is_still_killed(self):
+        proc = self.FakeProc(None)
+        self.assertEqual((self.kill_calls(proc), proc.kills), ([(999999, 9)], 0))
+        proc = self.FakeProc(None)  # killpg fails: the fallback kills the process alone, while it is still ours
+        self.assertEqual((self.kill_calls(proc, killpg_fails=True), proc.kills), ([(999999, 9)], 1))
+
+    def test_cl3_after_a_normal_end_and_after_the_timeout_nothing_is_killed(self):
+        for stub in ("ok", "slow"):
+            out = self.run_sl(cc_bytes(), then=(stub,), now=T0 + (0 if stub == "ok" else 400))
+            self.assertEqual(out, b"STATUS-LINE ok" if stub == "ok" else b"")
+            proc = pa_costs.CC_STOP["proc"]
+            self.assertIsNotNone(proc)
+            self.assertIsNotNone(proc.returncode, "{}: reaped".format(stub))
+            kills = []
+            real_kill = proc.kill
+            proc.kill = lambda: kills.append(1)
+            try:
+                self.assertEqual(self.kill_calls(proc, killpg_fails=True), [], stub)
+            finally:
+                proc.kill = real_kill
+            self.assertEqual(kills, [], stub)
+
+    def test_cl4_a_cancel_after_the_inner_command_ended_kills_nothing(self):
+        out = self.run_sl(cc_bytes())
+        self.assertEqual(out, b"STATUS-LINE ok")
+        proc = pa_costs.CC_STOP["proc"]
+        self.assertIsNotNone(proc.returncode)
+
+        class Exited(Exception):
+            pass
+
+        def fake_exit(code):
+            raise Exited(code)
+        calls = []
+        real_killpg, real_exit, real_kill = pa_costs.os.killpg, pa_costs.os._exit, proc.kill
+        pa_costs.os.killpg, pa_costs.os._exit = (lambda pid, sig: calls.append((pid, sig))), fake_exit
+        proc.kill = lambda: calls.append("kill")
+        try:
+            with self.assertRaises(Exited) as done:
+                pa_costs.statusline_stop()
+        finally:
+            pa_costs.os.killpg, pa_costs.os._exit, proc.kill = real_killpg, real_exit, real_kill
+            pa_costs.CC_STOP["stopping"] = False
+            if pa_costs.CC_STOP["write"].locked():
+                pa_costs.CC_STOP["write"].release()
+        self.assertEqual(done.exception.args, (0,))
+        self.assertEqual(calls, [])
+
+    def test_cl5_a_trailing_newline_is_refused_in_every_id(self):
+        sid = "abcdefgh"
+        for bad in (sid + "\n", CC_SID + "\n"):
+            self.assertIsNone(pa_costs.cc_fields(cc_input(sid=bad), "t5", iso(T0)), repr(bad))
+            before = all_files(pa.ROOT)
+            self.assertEqual(self.run_sl(cc_bytes(sid=bad)), b"STATUS-LINE ok")
+            self.assertEqual([n for n in all_files(pa.ROOT) - before if not n.endswith(".lock")], [], repr(bad))
+        self.assertEqual(pa_costs.cc_fields(cc_input(sid=sid), "t5", iso(T0))["session"], sid)  # the id itself is fine
+        f = pa_costs.cc_fields(cc_input(version="2.1.0\n", model="model-a\n"), "t5\n", iso(T0))
+        self.assertEqual((f["session"], f["version"], f["model"], f["terminal"]), (CC_SID, None, None, None))
+        f = pa_costs.cc_fields(cc_input(version="2.1.0", model="model-a"), "t5", iso(T0))
+        self.assertEqual((f["version"], f["model"], f["terminal"]), ("2.1.0", "model-a", "t5"))
+        os.environ["HC_TERMINAL_ID"] = "t5\n"
+        self.run_sl(cc_bytes())
+        self.assertIsNone(self.cc_record()["terminal"])
+
+    def test_cl6_a_space_id_with_a_trailing_newline_gets_nothing(self):
+        other = os.path.join(pa.ROOT, "spaces", "sp1\n")
+        os.makedirs(other)
+        self.addCleanup(shutil.rmtree, other, True)
+        self.assertEqual(self.run_sl(cc_bytes(), space="sp1\n"), b"STATUS-LINE ok")
+        self.assertEqual(all_files(other), set())
+        self.assertIsNone(self.cc_record())
+
+    def test_cl7_a_stored_record_with_a_trailing_newline_is_skipped(self):
+        rec = {"v": 1, "session": CC_SID, "cost": 1.0, "base": 0, "segments": 1, "durationMs": 1, "apiDurationMs": 1,
+               "model": "model-a", "version": "2.1.0", "terminal": "t5", "first": iso(T0), "at": iso(T0)}
+        self.assertEqual(pa_costs.cc_clean(dict(rec))["session"], CC_SID)
+        self.assertIsNone(pa_costs.cc_clean(dict(rec, session=CC_SID + "\n")))
+        got = pa_costs.cc_clean(dict(rec, model="model-a\n", version="2.1.0\n", terminal="t5\n"))
+        self.assertEqual((got["model"], got["version"], got["terminal"]), (None, None, None))
+        folder = os.path.join(self.dir, "costs", "cc")
+        os.makedirs(folder, exist_ok=True)
+        write(os.path.join(folder, CC_SID + "\n.json"), json.dumps(dict(rec, session=CC_SID + "\n")))
+        records, problems = pa_costs.read_cc(self.dir)
+        self.assertEqual(records, [])
+        self.assertTrue(any("skipped" in p for p in problems), problems)
+
+
 class ZZ_V1_Privacy(unittest.TestCase):
     """Run last: the canary of every fixture reached no file under costs/ or billing/ and no captured output."""
 
