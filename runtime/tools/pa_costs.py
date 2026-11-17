@@ -55,10 +55,14 @@ def _price_entry(entry, where):
     if long is not None:
         if not isinstance(long, dict):
             raise ValueError("{}: long must be an object".format(where))
-        for k in KINDS + ("above",):
+        for k in KINDS:
             v = long.get(k, 0)
             if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0):
                 raise ValueError("{}: long.{} must be a number >= 0 or null".format(where, k))
+        if "above" in long:
+            v = long["above"]
+            if isinstance(v, bool) or not isinstance(v, int) or v <= 0:
+                raise ValueError("{}: long.above must be a positive whole number of prompt tokens, or left out".format(where))
     return entry
 
 
@@ -87,8 +91,17 @@ def load_prices(profile):
             aliases.append((re.compile(a["match"]), a["model"]))
     except (OSError, ValueError, re.error) as e:
         return None, "prices.json of profile {} is not usable ({}): tokens only".format(profile.get("name"), str(e)[:160])
+    # The ledger keeps one long-context part, split at LONG prompt tokens. Another threshold is accepted but named.
+    warnings = []
+    for name, entries in sorted(models.items()):
+        other = sorted({e["long"]["above"] for e in entries if e.get("long") and e["long"].get("above", LONG) != LONG})
+        if other:
+            warnings.append("prices.json of profile {}: {} long.above {} differs from the {} prompt tokens the ledger splits at: "
+                            "calls in between are priced at the base rate".format(profile.get("name"), name[:80],
+                                                                                   ", ".join(str(x) for x in other), LONG))
     return {"currency": raw["currency"], "unit": raw.get("unit"), "source": raw.get("source"), "asOf": raw.get("asOf"),
-            "note": raw.get("note"), "profile": profile.get("name"), "models": models, "aliases": aliases}, None
+            "note": raw.get("note"), "profile": profile.get("name"), "models": models, "aliases": aliases,
+            "warnings": warnings}, None
 
 
 def model_key(table, model):
@@ -1439,6 +1452,7 @@ def summarize(directory, rows, records, table, price_problem, profile_name, now,
     problems = list(problems)
     if price_problem:
         problems.append(price_problem)
+    problems.extend(w for w in (table or {}).get("warnings") or [] if w not in problems)
     return {
         "v": 1, "space": os.path.basename(directory), "updated": iso(now), "account": costs_account(),
         "prices": {"profile": profile_name, "source": (table or {}).get("source"), "asOf": (table or {}).get("asOf"),
@@ -2393,6 +2407,8 @@ def cmd_prices(directory):
     table, problem, name = space_prices(directory)
     if problem:
         print(problem)
+    for warning in (table or {}).get("warnings") or []:
+        print(warning)
     if not table:
         print("No price table in profile {}: tokens only.".format(name))
     else:
