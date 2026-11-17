@@ -11,6 +11,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -2003,6 +2004,114 @@ class FX_BillingRound3(BillingBase):
         self.query_out([brow(amount=0.1234567890123)])  # a long fraction is not an id: the stored amount is rounded
         result, _o, _e = self.fetch(mode="now", now=T0 + len(self.calls()))
         self.assertNotEqual(result["result"], "failed")
+
+
+class FR4_FixRound4(Collecting):
+    """Fix round 4: REVIEW-3 MF2 (no price shows as no price) and VERIFY-3 MF-R3-1 (reconstructed handoff bound)."""
+
+    def turn(self, t, mid, out=10, sid=SID):
+        self.add(self.prompt(t, sid=sid), self.call(t + 2, mid, lines=1, out=out, sid=sid), sid=sid)
+
+    def j(self, t, task, why):
+        self.journal({"at": iso(t), "by": "agent", "trigger": "report", "task": task, "pass": 1, "why": why})
+
+    def test_fr4_mfr31_a_reconstructed_reused_worker_takes_the_journal_handoff(self):
+        # A6, but the session is bound by reconstruct (run long after its turns), not by a launch record.
+        self.ledger({"version": 1, "tasks": [{"id": "t-001", "state": "done", "workers": [{"address": "t5", "role": "design", "name": "t-001-design"}]},
+                                             {"id": "t-002", "state": "in-progress", "workers": [{"address": "t5", "role": "design", "name": "t-001-design"}]}]})
+        os.makedirs(os.path.dirname(self.costs("sessions.jsonl")), exist_ok=True)
+        with open(self.costs("sessions.jsonl"), "a") as f:
+            f.write(json.dumps({"v": 1, "ev": "bind", "at": iso(T0 + 3000), "session": SID, "program": "claude", "kind": "worker",
+                                "task": "t-001", "name": "t-001-design", "role": None, "terminal": "t5", "cwd": self.project,
+                                "startedAt": iso(T0 + 8), "source": "reconstructed", "match": "cwd+start", "confidence": "medium"}) + "\n")
+        self.j(T0 + 5, "t-001", "Started worker t5 (t-001-design)")
+        self.turn(T0 + 8, "m1")
+        self.j(T0 + 500, "t-002", "Sent t5 the design of t-002")
+        self.turn(T0 + 503, "m2")
+        self.collect(T0 + 4000)
+        rows = {r["turn"]: r for r in self.rows()}
+        self.assertEqual(rows[isoms(T0 + 8)]["task"], "t-001")
+        self.assertEqual((rows[isoms(T0 + 503)]["task"], rows[isoms(T0 + 503)]["match"]), ("t-002", "journal-handoff"))
+
+    def pa_pass(self):
+        self.record(session=SID, kind="pa", terminal="t0", parent=None)
+        self.add(self.prompt(T0 + 10), self.call(T0 + 12, "p1", lines=1, out=1000))
+        self.journal({"at": iso(T0 + 20), "trigger": "report", "task": "t-001", "pass": 7})
+        self.collect(T0 + 2000)
+        return load(self.costs("summary.json"))
+
+    def test_fr4_mf2_with_no_price_table_passes_and_today_say_no_price(self):
+        s = self.pa_pass()
+        self.assertIsNone(s["totals"]["money"])
+        self.assertEqual(s["passes"][0]["pass"], 7)
+        self.assertIsNone(s["passes"][0]["money"])
+        self.assertIsNone(s["totals"]["reconstructedMoney"])
+        _r, out, _e = self.run_cmd(pa_costs.report, self.dir, now=T0 + 2000)
+        self.assertIn("Today     — est.", out)
+        self.assertNotIn("0.00", out)
+        _r, out, _e = self.run_cmd(pa_costs.report, self.dir, by="pass", now=T0 + 2000)
+        line = [x for x in out.splitlines() if "pass 7" in x][0]
+        self.assertIn("—", line)
+        self.assertNotIn("0.00", line)
+
+    def test_fr4_mf2_a_real_zero_still_shows_as_zero(self):
+        t = json.loads(json.dumps(PRICES))
+        t["models"]["model-a"][0].update({"in": 0.0, "out": 0.0, "cw5m": 0.0, "cw1h": 0.0, "cr": 0.0})
+        self.prices(t)
+        s = self.pa_pass()
+        self.assertEqual(s["passes"][0]["money"], 0.0)
+        self.assertEqual(s["totals"]["reconstructedMoney"], 0.0)
+        _r, out, _e = self.run_cmd(pa_costs.report, self.dir, now=T0 + 2000)
+        self.assertIn("Today     0.00 est.", out)
+        _r, out, _e = self.run_cmd(pa_costs.report, self.dir, by="pass", now=T0 + 2000)
+        self.assertIn("0.00", [x for x in out.splitlines() if "pass 7" in x][0])
+        self.collect(T0 + 86400 + 2000)  # a table, no row today: zero
+        _r, out, _e = self.run_cmd(pa_costs.report, self.dir, now=T0 + 86400 + 2000)
+        self.assertIn("Today     0.00 est.", out)
+
+    def test_fr4_mf2_with_no_table_and_no_row_today_today_is_no_price(self):
+        self.pa_pass()
+        self.collect(T0 + 86400 + 2000)
+        _r, out, _e = self.run_cmd(pa_costs.report, self.dir, now=T0 + 86400 + 2000)
+        self.assertIn("Today     — est.", out)
+
+
+class FR4_BillingRound4(BillingBase):
+    """Fix round 4: REVIEW-3 MF1, the code's own row id never trips the 12-digit check."""
+
+    def generated(self):
+        labels = ["usage-{}-{}".format(m, k) for m in "abcdefgh" for k in ("in", "out", "cw5m")]
+        days = ["2026-{:02d}-{:02d}".format(1 + d // 28, 1 + d % 28) for d in range(0, 336, 1)][:240]
+        for acct in ("acct1", "acct2"):
+            for label in labels[:12]:
+                for day in days:
+                    yield brow(day=day, account=acct, label=label, kind=label.rsplit("-", 1)[-1])
+
+    def test_fr4_mf1_no_generated_row_is_rejected_for_its_own_id(self):
+        rows = list(self.generated())
+        self.assertGreaterEqual(len(rows), 5000)
+        out = [pa_costs.validate_row(dict(r), "query:q1", "acct1", T0) for r in rows]
+        self.assertEqual(len(out), len(rows))
+        self.assertTrue(any(re.search(r"\d{12}", o["id"]) for o in out))  # the case the review found is in the set
+        review = pa_costs.validate_row(brow(day="2026-01-08", label="usage-a-in", kind="in"), "query:q1", "acct1", T0)
+        self.assertTrue(re.search(r"\d{12}", review["id"]), review["id"])  # REVIEW-3's row: its id holds 12 digits
+
+    def test_fr4_mf1_a_twelve_digit_number_in_any_incoming_field_is_still_rejected(self):
+        base = brow(model="model-a", note="n", quantity=5, unit="tokens")
+        for key in list(base) + ["id", "fetchedAt", "source", "v", "accountId", "extra"]:
+            for value in (TWELVE, "x" + TWELVE + "y", int(TWELVE)):
+                bad = dict(base, **{key: value})
+                with self.assertRaises(ValueError, msg=(key, value)):
+                    pa_costs.validate_row(bad, "query:q1", "acct1", T0)
+
+    def test_fr4_mf1_a_real_sized_batch_is_fetched(self):
+        self.enable()
+        rows = [brow(day="2026-11-{:02d}".format(1 + d % 15), label="usage-{}-in".format(m), kind="in") for d in range(15) for m in "abcdefghijklmnopqrst"]
+        rows.append(brow(day="2026-01-08", label="usage-a-in", kind="in"))
+        self.query_out(rows)
+        result, _o, _e = self.fetch(mode="now", now=T0)
+        self.assertNotEqual(result["result"], "failed", result)
+        self.assertEqual(len(self.billed()), len(rows))
 
 
 ABSENT = object()
