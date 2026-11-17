@@ -832,6 +832,95 @@ class FixH_HcSendText(GuardTest):
         self.assertIsNone(self.check("hc send pa1 'done - see evidence'"))
 
 
+class FixI_BashPaths(GuardTest):
+    """Card d-042 ('Refuse the path in Bash'), R11/AC11: a Bash command that names a path inside a .git folder or the
+    Project Agent's home (the editor rule's paths) is refused, reads included; a space's evidence folder stays allowed."""
+
+    @classmethod
+    def setUpClass(cls):
+        HookGuard.setUpClass.__func__(cls)
+
+    def setUp(self):
+        super().setUp()
+        self.home = os.path.join(TMP, "home-bash")
+        self.spaces = os.path.join(self.home, "spaces")
+        self.space = os.path.join(self.spaces, "sp1")
+        self.evidence = os.path.join(self.space, "evidence")
+        self.repo = os.path.join(TMP, "repo-bash")
+        for d in [os.path.join(self.evidence, "t-x"), os.path.join(self.home, "profiles", "p"), os.path.join(self.repo, ".git"),
+                  os.path.join(self.repo, "src"), os.path.join(self.repo, "realgit")]:
+            os.makedirs(d, exist_ok=True)
+        for link, target in [(os.path.join(self.repo, "state"), self.space), (os.path.join(self.repo, "src", ".git"), os.path.join(self.repo, "realgit")),
+                             (os.path.join(self.repo, "innocent"), os.path.join(self.repo, ".git", "config"))]:
+            if not os.path.lexists(link):
+                os.symlink(target, link)
+
+    def bash_check(self, line, cwd=None):
+        return self.check(line, cwd=cwd or self.repo, spaces_dir=self.spaces, home=self.home)
+
+    def test_refused(self):
+        ledger = os.path.join(self.space, "ledger.json")
+        for line in ["cat .git/HEAD", "cat .git/config", "ls .git", "cat .GIT/config", "sed -n 1p .git/config", "head .git",
+                     "cp x .git/hooks/pre-commit", "cat " + ledger, "cat state/ledger.json", "cat innocent", "cat src/.git/config",
+                     "cd " + self.space + " && cat ledger.json", "cat " + os.path.join(self.evidence, "..", "ledger.json"),
+                     "cat " + os.path.join(self.home, "profiles", "p", "profile.json"), "ls " + self.home, "ls " + self.spaces,
+                     "python3 x.py --out=" + os.path.join(self.home, "core", "x.md"), "git diff --no-index a.py .git/config",
+                     "git status && cat .git/HEAD", ".git/hooks/pre-commit", "find . -path ./.git/config",
+                     # not plain
+                     "cat .git/HEAD > /tmp/head", "echo x >> .git/config", "cat $(echo .git/config)", "cat < " + ledger,
+                     "echo x > " + os.path.join(self.space, "schedule.json"), "cat \"$HOME\"/x .git/config | head > out"]:
+            with self.subTest(line=line):
+                message = self.bash_check(line)
+                self.assertIsNotNone(message, line)
+                for words in ["git commands", "evidence folder", "Project Agent", "There is no override"]:
+                    self.assertIn(words, message)
+
+    def test_cwd_inside_the_home(self):
+        self.assertIsNotNone(self.bash_check("cat ../ledger.json", cwd=self.evidence))
+        self.assertIsNotNone(self.bash_check("cat ledger.json", cwd=self.space))
+        self.assertIsNone(self.bash_check("cat t-x/x.md", cwd=self.evidence))
+
+    def test_ordinary_work_still_passes(self):
+        note = os.path.join(self.evidence, "t-x", "note.md")
+        for line in ["git status", "git log --oneline -5", "git diff --stat HEAD~1", "cd " + self.repo + " && git diff",
+                     "cd src && git status", "git add src/a.py", "git commit -m 'edit .git/config notes'", "tests/run-all.sh --affected",
+                     "pa-full-suite", "make > build.log 2>&1", "cat " + note, "cp build.log " + os.path.join(self.evidence, "t-x") + "/",
+                     "echo x > " + note, "tail -n 20 build.log >> " + note, "hc send pa1 'done: " + note + "'", "cat .gitignore",
+                     "ls .github", "git rev-parse --git-dir", "grep -rn foo src", "python3 -m unittest tests/test_x.py"]:
+            with self.subTest(line=line):
+                self.assertIsNone(self.bash_check(line), line)
+
+    def test_message_names_the_word(self):
+        message = self.bash_check("cat .git/config")
+        self.assertIn(".git/config", message)
+        self.assertTrue(message.startswith("Refused by the Project Agent's allowlist: "), message)
+        self.assertEqual(guard.PROTECTED_PATH.format(".git/config"), message)
+
+    def test_fast(self):
+        line = ""
+        while len(line) < 2000:
+            line += "git status && git diff --stat HEAD~1 src/a.py | head -n 20; git commit -m 'one; two | three' && "
+        line += "git log --oneline -5"
+        times = []
+        for _ in range(100):
+            start = time.perf_counter()
+            self.assertIsNone(self.bash_check(line))
+            times.append(time.perf_counter() - start)
+        self.assertLess(statistics.median(times), 0.010)
+
+    def test_through_the_hook(self):
+        ledger = os.path.join(pa.space_dir("spguard"), "ledger.json")
+        evidence = os.path.join(pa.space_dir("spguard"), "evidence", "t-x")
+        for command in ["cat .git/config", "cat " + ledger, "echo x > " + os.path.join(pa.ROOT, "profiles", "guardp", "profile.json")]:
+            with self.subTest(command=command):
+                code, err = HookGuard.run_hook(self, "Bash", {"command": command})
+                self.assertEqual(code, 2)
+                self.assertIn("evidence folder", err)
+        for command in ["git status", "ls", "echo x > " + os.path.join(evidence, "a.md"), "cat " + os.path.join(evidence, "a.md")]:
+            with self.subTest(command=command):
+                self.assertEqual(HookGuard.run_hook(self, "Bash", {"command": command})[0], 0)
+
+
 def tearDownModule():
     shutil.rmtree(TMP, ignore_errors=True)
 
