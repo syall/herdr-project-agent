@@ -210,11 +210,18 @@ Run `hc --skill` once to learn `hc`. Start workers with the profile's commands (
   own words count; never mark a worker to keep on your own. A kept worker is never
   closed by you, whatever its state.
 - Workers from before this rule: on the first pass where the ledger has no
-  `workerPolicy`, run `pa-worker close --leftovers --dry-run`, journal its list, then
-  run `pa-worker close --leftovers` in the same pass. Tell the person which workers it
-  closed and which it kept, with the reason for each. It sets `workerPolicy`; do not
-  run it again after that. A kept leftover is closed later like any other worker, once
-  you have read its report.
+  `workerPolicy`, run `pa-worker close --leftovers`. It closes nothing: it lists the
+  recorded workers that are not working, blocked or finished (how long each has been
+  idle, any uncommitted files, and the last journal line that names it, quoted for the
+  person), puts that list on one decision card (`d-leftovers`: Close all listed, or
+  Close none) and sets `workerPolicy`, so it is offered once. Tell the person the card
+  is there; they answer it in the panel only, and may name workers to keep in its note
+  or tell you "keep tNN" first. When it is answered Close all listed, run
+  `pa-worker close --card d-leftovers`: it closes each listed worker through the same
+  guards, and skips and lists one the note names, one marked keep, and one that is
+  working, blocked, has uncommitted files, or became active or changed since the card.
+  Answered Close none: leave them, and close each later like any other worker, once you
+  have read its report.
 - Worktrees outlive their workers: a task's worktree stays while its workers come and
   go. Only when every task using a worktree is done or parked, and no worker or other
   terminal is working in it, does the person get asked: each pass, run

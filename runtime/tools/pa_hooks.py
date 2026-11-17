@@ -13,7 +13,8 @@ Selected by the name it is invoked as (symlinks in ~/.local/bin):
   pa-worker delete <address> [--keep-worktree] [--discard] [--with-task]
                                                 the person's command: end a worker and remove what belongs to it
   pa-worker close <address> --evidence F         end a worker whose report is read (agents may run it; guarded)
-  pa-worker close --leftovers [--dry-run]        close every recorded worker that meets the same guards
+  pa-worker close --leftovers [--dry-run]        list the workers from before one-worker-per-job on one decision card
+  pa-worker close [<address>] --card ID          close the workers the person approved on that card (same guards)
   pa-worker keep <address> --quote TEXT [--off]  record that the person wants a worker kept open
   pa-hook <name>                                one hook, called by the agent harness (reads its JSON on stdin):
       lint-after-edit   after each edit: lint the changed file
@@ -1231,7 +1232,7 @@ def report_path(directory, task_id, address, given, start=None):
     return rel
 
 
-def end_worker(directory, ledger, task, entry, address, info, report, by, trigger, actor=None):
+def end_worker(directory, ledger, task, entry, address, info, report, by, trigger, actor=None, why=None):
     """Ends one worker whose checks passed: kill if live, rm, then mark its ledger entry and journal
     it. The caller holds the ledger lock, re-read the ledger and re-checked the status (`info`, the
     `hc get` it checked; empty when the terminal is already gone). A kill that leaves the terminal
@@ -1253,7 +1254,7 @@ def end_worker(directory, ledger, task, entry, address, info, report, by, trigge
     pa.write_json(os.path.join(directory, "ledger.json"), ledger)
     name = entry.get("name") or "unnamed"
     append_journal(directory, {"by": actor or by, "trigger": trigger, "task": task.get("id"),
-                               "why": "closed worker {} ({}) after reading its report {}".format(address, name, report)})
+                               "why": why or "closed worker {} ({}) after reading its report {}".format(address, name, report)})
     return "Closed worker {} ({}, task {}); its worktree and branch are untouched.{}".format(address, name, task.get("id"), note)
 
 
@@ -1261,8 +1262,9 @@ def unrecorded(address):
     return pa.Problem("{} is not a recorded worker of this space; nothing was closed (if it is yours, close it in Herdr)".format(address))
 
 
-def close_worker(directory, agent, profile, address, evidence):
-    """pa-worker close <address> --evidence F (spec 3.2 and 3.3)."""
+def close_worker(directory, agent, profile, address, evidence, card_id=None):
+    """pa-worker close <address> --evidence F (spec 3.2 and 3.3), or --card <id>: the person's answer on a
+    leftovers card stands in for the evidence file (card d-031). Returns the lines to print."""
     if "/" in address:
         raise pa.Problem("{} is on another machine; pa-worker close runs on the machine the space runs on".format(address))
     if address == agent.get("terminal"):
@@ -1277,9 +1279,15 @@ def close_worker(directory, agent, profile, address, evidence):
     if refusal:
         raise pa.Problem(refusal[1])
     if entry.get("finished") and not info:
-        print("{} is already closed.".format(address))
-        return
-    report = report_path(directory, task["id"], address, evidence, worker_start(entry, info))
+        return ["{} is already closed.".format(address)]
+    card = leftovers_card(directory, card_id) if card_id else None
+    if card:
+        problem = card_refusal(card, address, task, entry, info)
+        if problem:
+            raise pa.Problem(problem)
+        report = "card " + card_id
+    else:
+        report = report_path(directory, task["id"], address, evidence, worker_start(entry, info))
     refusal = status_refusal(address, entry, info)
     if refusal:
         raise pa.Problem(refusal[1])
@@ -1298,11 +1306,18 @@ def close_worker(directory, agent, profile, address, evidence):
         refusal = identity_refusal(address, task, entry, info) or status_refusal(address, entry, info)
         if refusal:
             raise pa.Problem(refusal[1])
+        if card:
+            problem = card_refusal(card, address, task, entry, info)
+            if problem:
+                raise pa.Problem(problem)
         if entry.get("finished") and not info:  # closed meanwhile (another pa-worker close)
-            print("{} is already closed.".format(address))
-            return
-        print(end_worker(directory, ledger, task, entry, address, info, report, by, "close"))
-    print(checked_note(checked, unseen))
+            return ["{} is already closed.".format(address)]
+        if card:
+            line = end_worker(directory, ledger, task, entry, address, info, report, by, "leftovers",
+                              why="closed worker {} ({}) on the person's answer to card {}".format(address, entry.get("name") or "unnamed", card_id))
+        else:
+            line = end_worker(directory, ledger, task, entry, address, info, report, by, "close")
+    return [line, checked_note(checked, unseen)]
 
 
 def keep_worker(directory, agent, address, quote, off):
@@ -1337,20 +1352,8 @@ def keep_worker(directory, agent, address, quote, off):
     print("{} ({}, task {}) {}.".format(address, name, task.get("id"), "is no longer kept" if off else "is marked keep: it is not closed by the agent"))
 
 
-LEFTOVER_REASONS = {"keep": "marked keep", "working": "working", "blocked": "blocked"}
-HANDOFF = r"\b(?:sent|send|sends|update|updated|handoff|handed|reused|restarted|asked|told)\b"
-REPORTED = r"(?:'s)?\s*[:,-]?\s*(?:reported|reports|report)\b"
-
-
-def report_files(folder):
-    """{relative path: mtime} of the non-empty files in a task's evidence folder."""
-    found = {}
-    for root, _dirs, files in os.walk(folder):
-        for f in files:
-            path = os.path.join(root, f)
-            if os.path.isfile(path) and os.path.getsize(path) > 0:
-                found[os.path.relpath(path, folder)] = os.path.getmtime(path)
-    return found
+LEFTOVERS_CARD = "d-leftovers"
+CLOSE_ALL, CLOSE_NONE = "Close all listed", "Close none"
 
 
 def worker_words(address, name):
@@ -1365,68 +1368,6 @@ def line_text(line):
     return " ".join(str(v) for k, v in sorted(line.items()) if k != "at" and isinstance(v, (str, int, float)))
 
 
-def leftover_report(directory, task_id, address, name, journal, start=None):
-    """(report file, None) when the journal shows this worker reported, else (None, reason). The last
-    journal line naming the worker decides: its `from`/`by` is the worker, or it says the worker
-    reported ("t31 reported", "report from t31"), and it hands the worker no more work. A line about
-    another worker never counts. The report is a file the line names, else the newest file in the
-    evidence folder; either way written after the worker started, and not the orchestrator's or the tools'."""
-    folder = os.path.join(directory, "evidence", task_id)
-    files = {f: m for f, m in report_files(folder).items() if not report_problem(folder, f, f, address, start)}
-    words = worker_words(address, name)
-    last = None
-    for line in journal:
-        if any(re.search(w, line_text(line)) for w in words):
-            last = line
-    if last is None:
-        return None, "no recorded report"
-    text = line_text(last)
-    if any(re.search(HANDOFF + r"\W+(?:\S+\W+){0,3}?" + w, text, re.I) for w in words):
-        return None, "no recorded report after its last handoff"
-    said = any(str(last.get(k)) in (address, name) for k in ("from", "by") if last.get(k)) or any(
-        re.search(w + REPORTED, text, re.I) or re.search(r"\breport(?:ed)?\s+(?:from|by)\s+" + w, text, re.I) for w in words)
-    if not said:
-        return None, "no recorded report"
-    everything = report_files(folder)
-    named = sorted((f for f in everything if re.search(r"(?<![\w./-]){}(?![\w/-])".format(re.escape(f)), text)), key=len, reverse=True)
-    good = [f for f in named if f in files]
-    if named and not good:
-        return None, "no recorded report"
-    if good:
-        return good[0], None
-    if not files:
-        return None, "no recorded report"
-    return max(files, key=files.get), None
-
-
-def leftover_refusal(directory, agent, profile, task, entry, info, journal):
-    """Why an old-style worker is kept: (the reason for its `kept` line, None), or (None, its report file)."""
-    address = entry.get("address") or ""
-    if address == agent.get("terminal"):
-        return "it is the Project Agent", None
-    if "/" in address:
-        return "on another machine", None
-    refusal = identity_refusal(address, task, entry, info)
-    if refusal:
-        return LEFTOVER_REASONS.get(refusal[0]) or "now a different terminal ({})".format(info.get("name") or "unnamed"), None
-    if not info:
-        return "gone; left for the agent to read", None
-    refusal = status_refusal(address, entry, info)
-    if refusal:
-        return LEFTOVER_REASONS.get(refusal[0]) or "status {}".format(info.get("status") or "none"), None
-    report, why = leftover_report(directory, task.get("id"), address, entry.get("name"), journal, worker_start(entry, info))
-    if why:
-        return why, None
-    refusal, _checked, _unseen = worktree_refusal(task, profile, info)
-    if refusal:
-        path = re.match(r"(?:cannot tell whether )?(.+?) (?:has \d+ uncommitted|holds uncommitted)", refusal[1])
-        path = path.group(1) if path else (task.get("worktree") or "?")
-        if refusal[0] == "uncommitted":
-            return "uncommitted files in {} ({})".format(path, re.search(r" has (\d+) uncommitted", refusal[1]).group(1)), None
-        return "cannot read {}".format(path), None
-    return None, report
-
-
 def read_journal(directory):
     lines = []
     for raw_line in pa.read_text(os.path.join(directory, "journal.jsonl")).splitlines():
@@ -1439,68 +1380,192 @@ def read_journal(directory):
     return lines
 
 
-def leftover_plan(directory, agent, profile, ledger):
-    """([(task, entry, report)] to close, [(task, entry, reason)] kept), for every recorded worker not yet finished."""
+def idle_for(info, now=None):
+    """'3 h' since hc last saw the status change (status_ms), or 'unknown'."""
+    changed = (info or {}).get("status_ms")
+    if not isinstance(changed, (int, float)) or changed <= 0:
+        return "unknown"
+    seconds = max(0, int((now or time.time()) - changed / 1000.0))
+    for unit, size in (("d", 86400), ("h", 3600), ("min", 60)):
+        if seconds >= size:
+            return "{} {}".format(seconds // size, unit)
+    return "{} s".format(seconds)
+
+
+def uncommitted_in(task, profile):
+    """(worktree path or None, uncommitted count or None when it cannot be read, file names)."""
+    if not task.get("worktree"):
+        return None, 0, []
+    path = os.path.realpath(os.path.expanduser(task["worktree"]))
+    if not os.path.exists(path):
+        return path, 0, []
+    facts = worktree_facts(path, profile)
+    if not facts or facts.get("unreadable"):
+        return path, None, []
+    if facts.get("remove"):
+        return path, facts["uncommitted"], []
+    files = status_files(path)
+    return (path, None, []) if files is None else (path, len(files), [clean(f) for _s, f in files])
+
+
+def leftover_list(directory, agent, profile, ledger):
+    """The old-style workers to put on the card, and the ones held back with why. It reads only: hc get,
+    git status, the journal. The last journal line naming a worker is quoted for the person, never read."""
     journal = read_journal(directory)
-    close, kept = [], []
+    listed, held = [], []
     for task in ledger.get("tasks", []):
         for entry in task.get("workers") or []:
-            if entry.get("finished"):
+            address = entry.get("address") or ""
+            if entry.get("finished") or not address or address == agent.get("terminal"):
                 continue
-            info = pa.hc_get(entry.get("address")) if "/" not in (entry.get("address") or "") else {}
-            why, report = leftover_refusal(directory, agent, profile, task, entry, info, journal)
-            (kept.append((task, entry, why)) if why else close.append((task, entry, report)))
-    return close, kept
+            base = {"address": address, "name": entry.get("name"), "task": task.get("id")}
+            if "/" in address:
+                held.append(dict(base, why="on another machine"))
+                continue
+            info = pa.hc_get(address)
+            if entry.get("keep"):
+                held.append(dict(base, why="marked keep"))
+                continue
+            refusal = identity_refusal(address, task, entry, info) or status_refusal(address, entry, info)
+            if refusal:
+                why = {"name": "the address now names another terminal ({})".format(clean(info.get("name") or "unnamed")),
+                       "working": "working", "blocked": "blocked"}.get(refusal[0], "status {}".format(clean(info.get("status") or "none")))
+                held.append(dict(base, why=why))
+                continue
+            path, count, files = uncommitted_in(task, profile)
+            last = None
+            for line in journal:
+                if any(re.search(w, line_text(line)) for w in worker_words(address, entry.get("name"))):
+                    last = line
+            listed.append(dict(base, name=clean(entry.get("name")), title=clean(task.get("title")), taskState=clean(task.get("state")),
+                               role=clean(entry.get("role") or "worker"), state="gone" if not info else clean(info.get("status") or info.get("state")),
+                               idle="gone" if not info else idle_for(info), worktree=path, uncommitted=count, uncommittedFiles=files[:50],
+                               lastLine={k: cut(clean(last.get(k)), 300) for k in ("at", "trigger", "why") if last.get(k) is not None} if last else None))
+    return listed, held
 
 
-def kept_line(task, entry, why):
-    return "kept {} ({}, {}): {}".format(entry.get("address"), entry.get("name") or "unnamed", task.get("id"), why)
+def leftover_line(w):
+    tree = ("; uncommitted: cannot read {}".format(w["worktree"]) if w["uncommitted"] is None else
+            "; uncommitted: {} in {}{}".format(w["uncommitted"], w["worktree"], " ({})".format(", ".join(cut_path(f) for f in w["uncommittedFiles"][:5])
+                                                                                       + (", …" if w["uncommitted"] > 5 else "")) if w["uncommittedFiles"] else "")
+            if w["uncommitted"] else "; nothing uncommitted" if w["worktree"] else "; no worktree")
+    head = '{} {} ({}, {} "{}" {}): {}, idle {}{}'.format(w["address"], w["name"] or "unnamed", w["role"], w["task"], cut(w["title"], 60),
+                                                         w["taskState"], w["state"], w["idle"], tree)
+    last = w.get("lastLine")
+    quoted = ('  last journal line naming it (quoted, not read): "{}" ({}, {})'.format(cut(last.get("why", ""), 160), last.get("at", "?"),
+                                                                                       last.get("trigger", "?")) if last else "  no journal line names it")
+    return [head, quoted]
+
+
+def leftovers_context(listed, held):
+    lines = ["Workers recorded before one-worker-per-job, listed by `pa-worker close --leftovers`. Nothing has been closed."]
+    for w in listed:
+        lines += leftover_line(w)
+    if held:
+        lines.append("Not listed (the agent closes them later, after their reports): " + ", ".join(
+            "{} ({})".format(h["address"], h["why"]) for h in held))
+    text = "\n".join(lines)
+    if len(text) > CONTEXT_MAX:
+        tail_ = "… (every listed worker is in this card's workers field)"
+        keep = text[:CONTEXT_MAX - len(tail_) - 1]
+        text = keep[:keep.rfind("\n")] + "\n" + tail_
+    return text
 
 
 def close_leftovers(directory, agent, profile, dry_run):
-    """pa-worker close --leftovers [--dry-run] (spec 3.4): closes, once, the workers recorded before the
-    one-worker-per-job rule whose report the journal shows was read. Only this ledger's workers are looked at."""
+    """pa-worker close --leftovers [--dry-run], as the person decided on card d-031: list the recorded
+    workers from before one-worker-per-job that are idle and not finished on ONE decision card, and set
+    workerPolicy so it is offered once. It closes nothing; `pa-worker close --card` does, after the person
+    answers the card in the panel."""
     policy = read_ledger(directory).get("workerPolicy")
     if policy:
-        print("--leftovers already ran (workerPolicy since {}); nothing was done.".format((policy or {}).get("since")))
+        print("--leftovers already ran (workerPolicy since {}; card {}); nothing was done.".format(policy.get("since"), policy.get("card") or "none"))
         return
     if dry_run:
-        close, kept = leftover_plan(directory, agent, profile, read_ledger(directory))
-        for task, entry, report in close:
-            print("would close {} ({}, {}): report {}".format(entry.get("address"), entry.get("name") or "unnamed", task.get("id"), report))
-        for item in kept:
-            print(kept_line(*item))
-        if not close and not kept:
-            print("No old-style workers to close.")
+        listed, held = leftover_list(directory, agent, profile, read_ledger(directory))
+        for w in listed:
+            print("would list {} ({}, {}): {}".format(w["address"], w["name"] or "unnamed", w["task"], leftover_line(w)[0].split(": ", 1)[1]))
+        for h in held:
+            print("not listed {} ({}, {}): {}".format(h["address"], h.get("name") or "unnamed", h["task"], h["why"]))
+        if not listed:
+            print("No old-style workers to list.")
         return
     by = "agent" if by_an_agent() else "person"
+    path = os.path.join(directory, "decisions", LEFTOVERS_CARD + ".json")
     with ledger_lock(directory):
         ledger = read_ledger(directory)
-        close, kept = leftover_plan(directory, agent, profile, ledger)
-        append_journal(directory, {"by": by, "trigger": "leftovers", "why": "closing old-style workers: {} (reports read); keeping {}".format(
-            ", ".join(e.get("address") for _t, e, _r in close) or "none",
-            ", ".join("{} ({})".format(e.get("address"), why) for _t, e, why in kept) or "none")})
-        done = []
-        for task, entry, report in close:
-            address = entry.get("address")
-            info = pa.hc_get(address)  # read again just before the kill
-            refusal = identity_refusal(address, task, entry, info) or status_refusal(address, entry, info)
-            if refusal or not info:
-                kept.append((task, entry, (LEFTOVER_REASONS.get(refusal[0]) or refusal[1]) if refusal else "gone; left for the agent to read"))
-                continue
-            try:
-                done.append(end_worker(directory, ledger, task, entry, address, info, report, "leftovers", "leftovers", by))
-            except pa.Problem as e:
-                kept.append((task, entry, str(e)))
-        ledger["workerPolicy"] = {"style": "per-job", "since": pa.now()}
+        listed, held = leftover_list(directory, agent, profile, ledger)
+        opened = bool(listed) and not os.path.exists(path)
+        if opened:
+            pa.write_json(path, {
+                "id": LEFTOVERS_CARD, "kind": "leftovers", "task": None,
+                "question": "Close the {} worker(s) left from before one-worker-per-job?".format(len(listed)),
+                "context": leftovers_context(listed, held),
+                "options": [{"label": CLOSE_ALL, "detail": "The agent closes each listed worker with `pa-worker close --card {}`. It skips a worker "
+                             "you name in the note (or told it to keep), and one that is working, blocked, has uncommitted files, or became "
+                             "active or changed since this card. Worktrees, branches, tasks and evidence stay.".format(LEFTOVERS_CARD)},
+                            {"label": CLOSE_NONE, "detail": "Leave them all. The agent closes each later, once it has read its report."}],
+                "evidence": [], "recommendation": None, "status": "open", "answer": None, "note": None,
+                "workers": listed, "notListed": held, "created": pa.now(), "answered": None})
+        ledger["workerPolicy"] = {"style": "per-job", "since": pa.now(), "card": LEFTOVERS_CARD if listed else None}
         pa.write_json(os.path.join(directory, "ledger.json"), ledger)
-    for line in done:
-        print(line)
-    for item in kept:
-        print(kept_line(*item))
-    if not done and not kept:
-        print("No old-style workers to close.")
-    print("workerPolicy is set (per-job): --leftovers is not needed again.")
+        append_journal(directory, {"by": by, "trigger": "leftovers", "why": "listed {} old-style worker(s) on card {} for the person: {}; not listed: {}; "
+                                   "nothing was closed".format(len(listed), LEFTOVERS_CARD if listed else "(none)",
+                                                               ", ".join(w["address"] for w in listed) or "none",
+                                                               ", ".join("{} ({})".format(h["address"], h["why"]) for h in held) or "none")})
+    for w in listed:
+        print("listed {} ({}, {}): {}".format(w["address"], w["name"] or "unnamed", w["task"], leftover_line(w)[0].split(": ", 1)[1]))
+    for h in held:
+        print("not listed {} ({}, {}): {}".format(h["address"], h.get("name") or "unnamed", h["task"], h["why"]))
+    if not listed:
+        print("No old-style workers to list; no card opened. workerPolicy is set (per-job).")
+    elif opened:
+        print("opened card {} for the person; nothing was closed. workerPolicy is set (per-job).".format(LEFTOVERS_CARD))
+    else:
+        print("card {} exists already; nothing was closed. workerPolicy is set (per-job).".format(LEFTOVERS_CARD))
+
+
+def leftovers_card(directory, card_id):
+    """The answered leftovers card that lets `pa-worker close --card` close workers, or a refusal."""
+    card = pa.read_json(os.path.join(directory, "decisions", card_id + ".json")) if pa.ID.match(card_id or "") else None
+    if not card or card.get("kind") != "leftovers":
+        raise pa.Problem("no leftovers card {}; nothing was closed".format(card_id))
+    if card.get("status") == "open":
+        raise pa.Problem("card {} is not answered yet; the person answers it in the panel. Nothing was closed".format(card_id))
+    if card.get("status") != "answered":
+        raise pa.Problem("card {} is {}; nothing was closed".format(card_id, card.get("status")))
+    if "in conversation" in str(card.get("answeredBy") or ""):
+        raise pa.Problem("card {} is answered in the panel only; nothing was closed".format(card_id))
+    if card.get("answer") != CLOSE_ALL:
+        raise pa.Problem("card {} was answered {!r}; nothing was closed".format(card_id, card.get("answer")))
+    return card
+
+
+def card_refusal(card, address, task, entry, info):
+    """Why this worker is not closed on the card's answer: not on it, named in its note, or changed since."""
+    listed = next((w for w in card.get("workers") or [] if w.get("address") == address and w.get("task") == task.get("id")
+                   and w.get("name") == clean(entry.get("name"))), None)
+    if not listed:
+        return "{} is not on card {}; nothing was closed".format(address, card["id"])
+    if any(re.search(w, str(card.get("note") or "")) for w in worker_words(address, entry.get("name"))):
+        return "the person named {} in the card's note; not closed".format(address)
+    created = pa.parse_time(str(card.get("created") or ""))
+    changed = (info or {}).get("status_ms")
+    if (listed.get("state") == "gone" and info) or (created and isinstance(changed, (int, float)) and changed / 1000.0 > created):
+        return "{} has been active since card {} opened; not closed".format(address, card["id"])
+    return None
+
+
+def close_by_card(directory, agent, profile, card_id):
+    """pa-worker close --card <id>: every worker on the answered leftovers card, each through the normal
+    guards. A worker that fails one is skipped and listed; the others are closed."""
+    card = leftovers_card(directory, card_id)
+    for w in card.get("workers") or []:
+        try:
+            for line in close_worker(directory, agent, profile, w.get("address") or "", None, card_id):
+                print(line)
+        except pa.Problem as e:
+            print("skipped {} ({}, {}): {}".format(w.get("address"), w.get("name") or "unnamed", w.get("task"), e))
 
 
 def cmd_worker(args):
@@ -1514,7 +1579,11 @@ def cmd_worker(args):
     if args.action == "close":
         if args.leftovers:
             return close_leftovers(directory, agent, profile, args.dry_run)
-        return close_worker(directory, agent, profile, args.address, args.evidence)
+        if args.card and not args.address:
+            return close_by_card(directory, agent, profile, args.card)
+        for line in close_worker(directory, agent, profile, args.address, args.evidence, args.card):
+            print(line)
+        return
     if args.action == "keep":
         return keep_worker(directory, agent, args.address, args.quote, args.off)
     facts, row = worker_facts(directory, agent, profile, args.address)
@@ -1632,14 +1701,17 @@ def main():
         parser.add_argument("--discard", action="store_true", help="delete: delete the worktree even with uncommitted files or unpushed commits")
         parser.add_argument("--with-task", action="store_true", help="delete: also delete its task, with the task's evidence and cards (to the trash)")
         parser.add_argument("--evidence", help="close: the report you read, a file in evidence/<task>/")
-        parser.add_argument("--leftovers", action="store_true", help="close: every recorded worker from before one-worker-per-job that meets the guards")
+        parser.add_argument("--leftovers", action="store_true", help="close: list the workers from before one-worker-per-job on one decision card (closes nothing)")
+        parser.add_argument("--card", help="close: an answered leftovers card, in place of --evidence (without an address: every worker on it)")
         parser.add_argument("--dry-run", action="store_true", help="close --leftovers: only list what it would do")
         parser.add_argument("--quote", help="keep: the person's own words")
         parser.add_argument("--off", action="store_true", help="keep: the person says it may be closed again")
         parser.add_argument("--space")
         args = parser.parse_args()
-        if args.action == "close" and bool(args.address) == bool(args.leftovers):
-            raise pa.Problem("pa-worker close needs an address and --evidence, or --leftovers")
+        if args.action == "close" and args.evidence and args.card:
+            raise pa.Problem("pa-worker close takes --evidence or --card, not both")
+        if args.action == "close" and (sum(map(bool, (args.address, args.leftovers))) != 1 if not args.card else bool(args.leftovers)):
+            raise pa.Problem("pa-worker close needs an address and --evidence, or --leftovers, or --card <id>")
         if args.action != "close" and not args.address:
             raise pa.Problem("pa-worker {} needs an address".format(args.action))
         return cmd_worker(args)

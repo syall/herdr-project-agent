@@ -1180,6 +1180,8 @@ def cmd_decide(args):
     else:
         if card.get("worktree"):
             raise Problem("a card that deletes a worktree is answered in the panel, not in conversation")
+        if card.get("kind") == "leftovers":
+            raise Problem("a card that closes workers is answered in the panel, not in conversation")
         labels = [o.get("label") for o in card.get("options") or []]
         match = next((l for l in labels if str(l).lower() == str(args.answer or "").strip().lower()), None)
         if match is None:
