@@ -18,7 +18,8 @@
 // The batched card read (`sh -c <script with "for f in *.json"> sh <dir>`) answers from __ls and __files:
 // each listed name the card-name filter takes that has a file, in byte order, as "name\0text\0". No __ls entry: exit 3 (no folder).
 // cx / makeCx(): the keeper stubs' spawn (flush() awaits it) plus sleep(ms) on the __now clock and a timer that
-// records every(ms, fn) in __timers ([{ ms, fn }]) so a case can fire them.
+// records every(ms, fn) in __timers ([{ ms, fn }]) and after(ms, fn) in __afters, so a case can fire them;
+// write_to_clipboard(text) appends text to __clipboard (t-026).
 export * from "./keeper-stubs.mjs";
 import { readTextFile as baseRead, exec as baseExec, cx as baseCx } from "./keeper-stubs.mjs";
 const g = globalThis;
@@ -74,8 +75,9 @@ export function makeCx(extra = {}) {
   const c = {
     spawn(f) { if (gen !== undefined && g.__gen !== gen) return Promise.resolve(); return baseCx.spawn(() => f(c)); },
     sleep: (ms) => (g.__sleepHang ? new Promise(() => {}) : waitFor(ms ?? 0)),
-    timer: { every(ms, fn) { if (gen === undefined || g.__gen === gen) (g.__timers ??= []).push({ ms, fn }); }, after() {} },
+    timer: { every(ms, fn) { if (gen === undefined || g.__gen === gen) (g.__timers ??= []).push({ ms, fn }); }, after(ms, fn) { if (gen === undefined || g.__gen === gen) (g.__afters ??= []).push({ ms, fn }); } },
     notify() {},
+    write_to_clipboard(text) { (g.__clipboard ??= []).push(text); },
     ...extra,
   };
   return c;

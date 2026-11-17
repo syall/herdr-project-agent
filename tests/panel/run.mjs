@@ -3012,6 +3012,201 @@ cases["C22-rules-view"] = async () => { // Approve in the Rules view (render's c
   check(JSON.stringify(sends()) === JSON.stringify([["send", "t4w", "decision d-r answered"]]), `the Project Agent is told once (got ${JSON.stringify(sends())}; ${stuck(v)})`);
 };
 
+// ---- t-026 Job 1: a Copy control on each card, task, rule and Costs block. It writes plain text lines to the
+// clipboard (stub: __clipboard), shows "Copied" for COPIED_FOR, and changes nothing else. ----
+const COPIED_FOR = 2000;
+const clipReset = () => { g.__clipboard = []; g.__afters = []; };
+const lastClip = () => (g.__clipboard ?? [])[(g.__clipboard ?? []).length - 1];
+// What a click could change: files, writes, runs, execs, sends, overlays, shared state.
+const sideEffects = () => JSON.stringify([g.__files, g.__writes, g.__runs, (g.__execs ?? []).length, g.__hcs, g.__overlays, g.__shared, g.__notes]);
+async function copyCardWorld(cardJson) {
+  world();
+  g.__files[`:${DIR}/decisions/${cardJson.id}.json`] = JSON.stringify(cardJson);
+  g.__ls[`:${DIR}/decisions`] = [`${cardJson.id}.json`];
+  g.__files[`:${DIR}/schedule.json`] = JSON.stringify({ everyMinutes: 15 });
+  const v = await mount(); await settle();
+  clipReset();
+  return v;
+}
+const openCopyCard = { id: "d-c", task: "t-9", status: "open", question: "Q?", context: "line one\n  indented", recommendation: "A",
+  options: [{ label: "A", detail: "do a" }, { label: "B" }], created: "2026-11-16T10:00:00Z" };
+
+cases["T26-copy-open-card"] = async () => { // the card as plain text lines; nothing picked, answered or written
+  const v = await copyCardWorld(openCopyCard);
+  check(/\bCopy\b/.test(look(v).text) && Boolean(look(v).clicks["copy-d-c"]), `a Copy control on the card (clicks ${Object.keys(look(v).clicks)})`);
+  const before = sideEffects();
+  await press(v, "copy-d-c"); await settle();
+  check((g.__clipboard ?? []).length === 1, `one clipboard write (got ${JSON.stringify(g.__clipboard)})`);
+  const lines = lastClip().split("\n");
+  check(lines[0].startsWith("d-c · t-9 · open · "), `line 1: id, task, status, date (got ${lines[0]})`);
+  const want = ["Q?", "line one", "  indented", "Options:", "  A: do a (recommended)", "  B"];
+  check(JSON.stringify(lines.slice(1)) === JSON.stringify(want), `the rest (got ${JSON.stringify(lines.slice(1))})`);
+  check(sideEffects() === before, "nothing written, run, sent or shared");
+  check(!v.choice["d-c"], `no option picked (got ${v.choice["d-c"]})`);
+  check(JSON.parse(g.__files[`:${DIR}/decisions/d-c.json`]).status === "open", "the card is still open");
+  // The card still answers as before, after a Copy.
+  await answerCard(v, "d-c");
+  check(JSON.parse(g.__files[`:${DIR}/decisions/d-c.json`]).answer === "A", "picking and Submit still answer");
+};
+
+cases["T26-copy-answered-card"] = async () => { // answered: the answer, who answered and the note, as drawn
+  const v = await copyCardWorld({ ...openCopyCard, status: "answered", answer: "B", note: "because", answeredBy: "conversation", answered: "2026-11-16T11:00:00Z" });
+  await click(v, "pa-older");
+  await click(v, "copy-d-c");
+  const lines = lastClip().split("\n");
+  check(lines[0].startsWith("d-c · t-9 · answered: B · "), `line 1 (got ${lines[0]})`);
+  const want = ["Q?", "line one", "  indented", "Options:", "  A: do a (recommended)", "  B", "Answer: B", "Answered by the conversation", "You said: “because”"];
+  check(JSON.stringify(lines.slice(1)) === JSON.stringify(want), `the rest (got ${JSON.stringify(lines.slice(1))})`);
+};
+
+cases["T26-copy-evidence-name"] = async () => { // the evidence name the card's link shows
+  world();
+  g.__files[`:${DIR}/decisions/d-e.json`] = JSON.stringify({ id: "d-e", task: "t-1", status: "open", question: "E?", evidence: "REVIEW.md", options: [{ label: "A" }], created: "2026-11-16T10:00:00Z" });
+  g.__ls[`:${DIR}/decisions`] = ["d-e.json"];
+  g.__files[`:${DIR}/ledger.json`] = JSON.stringify({ tasks: [{ id: "t-1", title: "One", state: "review" }] });
+  const v = await mount(); await settle();
+  const shown = Object.keys(look(v).clicks).includes("card-task-d-e");
+  clipReset();
+  await click(v, "copy-d-e");
+  const lines = lastClip().split("\n");
+  if (shown) {
+    const link = look(v).text.split(" | ").find((x) => x.endsWith(" ↗") && /REVIEW|t-1/.test(x));
+    check(lines.includes(`Evidence: ${link.replace(/ ↗$/, "")}`), `the evidence line as linked (link ${link}; got ${JSON.stringify(lines)})`);
+  } else check(!lines.some((l) => l.startsWith("Evidence:")), `no evidence line without the link (got ${JSON.stringify(lines)})`);
+};
+
+cases["T26-copied-mark"] = async () => { // "Copied" for COPIED_FOR, then "Copy"; the redraw is asked for by a timer, not a sleep
+  const v = await copyCardWorld(openCopyCard);
+  const label = () => { const route = pathTo(v.render(cx), "copy-d-c"); return route[route.length - 1].kids.join(""); };
+  check(label() === "Copy", `before: Copy (got ${label()})`);
+  await click(v, "copy-d-c");
+  check(label() === "Copied", `after the click: Copied (got ${label()})`);
+  check((g.__afters ?? []).length === 1 && g.__afters[0].ms >= COPIED_FOR, `one redraw timer of COPIED_FOR (got ${JSON.stringify((g.__afters ?? []).map((x) => x.ms))})`);
+  advance(COPIED_FOR - 500);
+  check(label() === "Copied", "still Copied before COPIED_FOR");
+  advance(600);
+  g.__afters[0].fn(cx); await settle();
+  check(label() === "Copy", `back to Copy (got ${label()})`);
+};
+
+cases["T26-copy-stale-cx"] = async () => { // a click's cx is not kept: copying with a cx that ends after the click throws nothing
+  const v = await copyCardWorld(openCopyCard);
+  await staleClick(v, "copy-d-c");
+  check((g.__clipboard ?? []).length === 1, `copied (got ${JSON.stringify(g.__clipboard)})`);
+  check(!g.__rejected.length, `nothing threw (got ${JSON.stringify(g.__rejected)})`);
+};
+
+cases["T26-copy-push-card"] = async () => { // the push card's facts as drawn; Copy runs no check and no run; Push and Not now as before
+  const { v, file } = await pushWorld();
+  clipReset();
+  const checks = pushExecs("check").length, before = sideEffects();
+  await press(v, `copy-${PID}`); await settle();
+  const text = lastClip(), lines = text.split("\n");
+  check(lines[0].startsWith(`${PID} · t-1 · open · `) && lines[1] === "Push repo main (2 commits)?", `id line and question (got ${JSON.stringify(lines.slice(0, 2))})`);
+  for (const want of ["Repository: /repo", "Commits (2):", "  cc11000 the task's change — A <a@x>", "What will run:", "No force, no tags, no other branches.",
+    "This panel may push: yes", "Options:", "  Push: Push exactly what is listed above, as a fast-forward. No force.", "  Not now: Nothing is pushed. The card closes."])
+    check(lines.includes(want), `has "${want}" (got ${JSON.stringify(lines)})`);
+  check(!text.includes("CONTEXT FROM THE CARD FILE") && !text.includes("DETAIL FROM THE CARD FILE") && !text.includes("Check again"), `not the card file's own text, nor the links (got ${text})`);
+  check(pushExecs("check").length === checks && pushExecs("run").length === 0 && sideEffects() === before, "no check, no run, nothing written");
+  check(!v.choice[PID], "nothing picked");
+  await click(v, `opt-${PID}-0`); await settle();
+  await click(v, `submit-${PID}`); await settle();
+  check(pushExecs("run").length === 1, `Push then Submit runs once, as before (got ${pushExecs("run").length})`);
+  check(Boolean(file), "the card file");
+};
+
+cases["T26-copy-push-notnow"] = async () => { // Not now still answers after a Copy
+  const { v } = await pushWorld({ tool: { run: (args) => json(0, { ok: true, done: true, answer: "Not now", refusal: null, message: "answered Not now", result: null }) } });
+  clipReset();
+  await click(v, `copy-${PID}`);
+  await click(v, `opt-${PID}-1`); await settle();
+  await click(v, `submit-${PID}`); await settle();
+  const run = pushExecs("run");
+  check(run.length === 1 && run[0][1].includes("Not now"), `Not now runs once (got ${JSON.stringify(run.map((x) => x[1]))})`);
+};
+
+cases["T26-copy-task"] = async () => { // the task: id, title, state, goal, workers with addresses, links; nothing opened
+  world({ extraTerms: [{ address: "t32", state: "live", argv: ["claude"], labels: {}, status: "idle", program: claude },
+                       { address: "t33", state: "live", argv: ["claude"], labels: {}, status: "working", program: claude }] });
+  g.__files[`:${DIR}/ledger.json`] = JSON.stringify({ tasks: [{ id: "t-003", title: "T", goal: "Goal text", type: "build", tier: "normal", state: "in-progress", phase: "build",
+    links: [{ label: "CR-1", url: "https://example.test/cr/1" }], workers: [
+    { address: "t31", role: "build", name: "t-003-tests", finished: true, closed: "2026-11-16T10:00:00Z", closedBy: "agent" },
+    { address: "t32", role: "reviewer", name: "t-003-review", keep: true },
+    { address: "t33", role: "verifier", name: "t-003-verify" },
+    { address: "t34", role: "build", name: "t-003-old" }] }] });
+  const v = await mount();
+  await click(v, "view-tasks");
+  await click(v, "task-head-t-003");
+  clipReset();
+  const before = sideEffects();
+  await press(v, "copy-task-t-003"); await settle();
+  const want = ["t-003 T", "State: in-progress · build", "Goal text", "build · normal tier", "Workers:", "  reviewer t32 · kept", "  verifier t33", "  build t34 (ended)", "Links:", "  CR-1: https://example.test/cr/1"];
+  check(lastClip() === want.join("\n"), `the task text (got ${JSON.stringify(lastClip())})`);
+  check(sideEffects() === before && v.open.has("t-003"), "nothing opened, run or folded");
+};
+
+cases["T26-copy-task-remote"] = async () => { // a worker on another machine is copied with its machine-qualified address
+  world({ machine: M });
+  const dir = `${M}:${RDIR}`;
+  g.__files[`${dir}/ledger.json`] = JSON.stringify({ tasks: [{ id: "t-1", title: "One", state: "queued", workers: [{ address: "t50", role: "build" }] }] });
+  g.__files[`${dir}/schedule.json`] = JSON.stringify({ everyMinutes: 15 });
+  const v = await mount(); await settle();
+  await click(v, "view-tasks"); await click(v, "task-head-t-1");
+  clipReset();
+  await click(v, "copy-task-t-1");
+  check((lastClip() ?? "").split("\n").includes(`  build ${M}/t50 (ended)`), `the machine-qualified address (got ${JSON.stringify(lastClip())})`);
+};
+
+cases["T26-copy-armed-delete"] = async () => { // a press on Copy is a press elsewhere: it disarms the armed Delete, deletes nothing
+  const v = await armWorld();
+  await press(v, "delete-t-1");
+  check(armedText(v), "armed");
+  clipReset();
+  await press(v, "copy-task-t-1");
+  check(!armedText(v) && deletes().length === 0, `disarmed, nothing deleted (deletes ${JSON.stringify(deletes())})`);
+  check(lastClip()?.startsWith("t-1 One\n"), `copied (got ${JSON.stringify(lastClip())})`);
+  await press(v, "delete-t-1"); await press(v, "delete-t-1"); await settle();
+  check(deletes().length === 1, "two clicks on Delete still delete");
+};
+
+cases["T26-copy-rule"] = async () => { // the rule as shown; its Delete is not armed, nothing saved
+  const v = await ruleWorld();
+  clipReset();
+  const before = g.__files[RULES];
+  await press(v, "rule-copy-r-one"); await settle();
+  check(lastClip() === ["One · active · all", "One text", "r-one · from person · order 10 · 0 changes"].join("\n"), `the rule text (got ${JSON.stringify(lastClip())})`);
+  check(!ruleArmed(v) && g.__files[RULES] === before, "nothing armed or saved");
+  await press(v, "rule-delete-r-one");
+  check(ruleArmed(v), "the rule Delete still arms");
+};
+
+cases["T26-copy-costs"] = async () => { // the totals, a section (with its open drill rows) and the billed table, as shown
+  const { v } = await costsWorld({ tool: { "billed compare": () => json0(withRows()) } });
+  await settle();
+  clipReset();
+  const execs = g.__execs.length;
+  const { clicks } = costsView(v);
+  for (const id of ["costs-copy-totals", "costs-copy-activity", "costs-copy-task", "costs-copy-kind", "costs-copy-day", "costs-copy-billed"]) check(Boolean(clicks[id]), `${id} (have ${Object.keys(clicks)})`);
+  await press(v, "costs-copy-totals");
+  let lines = lastClip().split("\n");
+  check(/^Estimated from test table prices as of 2027-01-01 \(XTS\) · updated /.test(lines[0]), `the header (got ${lines[0]})`);
+  check(lines.length === 4 && /^Total: .*est\..* · 1,?000 tokens · 94% cache read$/.test(lines[1]) && lines[2].startsWith("Today: ") && lines[3].startsWith("Last 7 days (UTC): "), `the tiles (got ${JSON.stringify(lines)})`);
+  const shown = costsView(v).text;
+  for (const l of lines.slice(1)) for (const part of l.replace(/^[^:]+: /, "").split(" · ")) check(shown.includes(part.split(" · ")[0]), `"${part}" is shown`);
+  await press(v, "costs-copy-activity");
+  lines = lastClip().split("\n");
+  check(lines[0] === "By activity" && lines.length === 4 && lines.slice(1).every((l) => / tokens · /.test(l)), `head and 3 rows (got ${JSON.stringify(lines)})`);
+  await click(v, "costs-activity-0");
+  await press(v, "costs-copy-activity");
+  lines = lastClip().split("\n");
+  check(lines.includes("  Tasks:") && lines.some((l) => /^  t-1 · 600 tokens · /.test(l)), `the open drill rows, indented (got ${JSON.stringify(lines)})`);
+  await press(v, "costs-copy-billed");
+  lines = lastClip().split("\n");
+  check(lines[0] === "Billed (account-wide: includes use outside this space and outside Herdr)", `the billed head (got ${lines[0]})`);
+  check(lines.some((l) => /^model-a \| .* est\. \| .* billed · account-wide$/.test(l)) && lines.some((l) => /^total \| /.test(l)) && lines.some((l) => l.startsWith("Billing query: on · ")), `table rows and the status (got ${JSON.stringify(lines)})`);
+  check(g.__execs.length === execs, "Copy runs nothing");
+};
+
 const pick = process.argv.slice(2);
 let failed = 0;
 for (const [name, fn] of Object.entries(cases)) {
