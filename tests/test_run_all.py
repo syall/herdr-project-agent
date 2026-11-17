@@ -1,5 +1,6 @@
 """tests/run-all.sh itself (t-017 J6, R7): parts in parallel, output in a fixed order, a summary that names
-every part and every failure, PA_SERIAL=1, --affected; J9: TERM, INT and HUP stop every part and its children. The real script runs in a temp copy of the repo whose
+every part and every failure, PA_SERIAL=1, --affected; J9: TERM, INT and HUP stop every part and its children,
+and each unit test module (tests/test_*.py) is its own part. The real script runs in a temp copy of the repo whose
 parts are stubs (stub.sh, chosen per part by STUB_<part>), so no real suite runs here."""
 import os
 import shutil
@@ -10,7 +11,7 @@ import time
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-NAMES = ["python 3.7 parse", "unit tests", "keeper harness", "panel harness", "store harness",
+NAMES = ["python 3.7 parse", "unit tests: test_stub", "keeper harness", "panel harness", "store harness",
          "pa-session integration (private hc core)"]
 
 STUB = r'''k=$1
@@ -48,6 +49,27 @@ class T(unittest.TestCase):
     def test_two(self):
         if M == "fail":
             raise RuntimeError("boom")
+'''
+
+
+# A unit module that records each test it ran; test_x waits until the other module has started (so the two run
+# at once) and fails when STUB_<me>=fail.
+UNIT_MODULE = '''import os, time, unittest
+D = os.environ["STUB_DIR"]
+def mark(line):
+    with open(os.path.join(D, "ran"), "a") as f:
+        f.write(line + "\\n")
+class T(unittest.TestCase):
+    def test_x(self):
+        open(os.path.join(D, "started-{me}"), "w").close()
+        end = time.time() + 20
+        while not os.path.exists(os.path.join(D, "started-{other}")) and time.time() < end:
+            time.sleep(0.05)
+        mark("{me}.test_x")
+        self.assertTrue(os.path.exists(os.path.join(D, "started-{other}")), "test_{other} never started")
+        self.assertNotEqual(os.environ.get("STUB_{me}"), "fail")
+    def test_y(self):
+        mark("{me}.test_y")
 '''
 
 
@@ -127,9 +149,9 @@ class RunAll(unittest.TestCase):
         code, out = self.run_all(units="fail", keeper="fail", panel="crash")
         self.assertEqual(code, 1, out)
         last = out.rstrip().splitlines()[-1]
-        self.assertTrue(last.startswith("=== 3 part(s) failed: unit tests, keeper harness, panel harness (outputs: "), last)
+        self.assertTrue(last.startswith("=== 3 part(s) failed: unit tests: test_stub, keeper harness, panel harness (outputs: "), last)
         tail = self.summary(out)
-        self.assertIn("--- unit tests: FAILED", tail)
+        self.assertIn("--- unit tests: test_stub: FAILED", tail)
         self.assertIn("FAIL: test_one", tail)
         self.assertIn("ERROR: test_two", tail)
         self.assertIn("FAIL K-x: boom", tail)
@@ -275,6 +297,31 @@ class RunAll(unittest.TestCase):
             if proc.poll() is None:
                 proc.kill()
                 proc.wait()
+
+    def test_r9_one_part_per_unit_module(self):
+        # Each tests/test_*.py is its own part, run once, all at once; a failing module is named in the last 40
+        # lines (what pa-full-suite prints) and the run exits 1.
+        write(os.path.join(self.repo, "tests", "test_a.py"), UNIT_MODULE.format(me="a", other="b"))
+        write(os.path.join(self.repo, "tests", "test_b.py"), UNIT_MODULE.format(me="b", other="a"))
+        code, out = self.run_all(b="fail")
+        self.assertEqual(code, 1, out)
+        with open(os.path.join(self.tmp, "ran")) as f:
+            ran = sorted(f.read().split())
+        self.assertEqual(ran, ["a.test_x", "a.test_y", "b.test_x", "b.test_y"], out)
+        parts = ["unit tests: test_a", "unit tests: test_b", "unit tests: test_stub"]
+        body = out.split("\n=== summary", 1)[0]
+        at = [body.index("=== " + name + "\n") for name in parts]
+        self.assertEqual(at, sorted(at), body)
+        self.assertLess(body.index("=== python 3.7 parse\n"), at[0])
+        self.assertLess(at[-1], body.index("=== keeper harness\n"))
+        tail = "\n".join(out.rstrip().splitlines()[-40:])
+        self.assertIn("--- unit tests: test_b: FAILED", tail)
+        self.assertIn("FAIL: test_x (test_b.T", tail)
+        for name in parts[:1] + parts[2:]:
+            self.assertIn("  {}: ok".format(name), tail)
+        self.assertTrue(out.rstrip().splitlines()[-1].startswith("=== 1 part(s) failed: unit tests: test_b (outputs: "), out)
+        folder = self.outputs(out)
+        self.assertEqual(len([f for f in os.listdir(folder) if f.endswith(".log")]), 8, os.listdir(folder))
 
     def test_r7_usage(self):
         code, out = self.run_all("--nope")
