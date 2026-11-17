@@ -65,10 +65,27 @@ class Orchestrator(unittest.TestCase):
                "check findings, a recheck after a fix, the gate, a card). "
                "Start nothing else until asked: no new task, no move to a phase that needs the person, no worker "
                "for a task with an open card. "
-               "If passes are paused in `schedule.json`, or the person's last message asked you to hold, start "
-               "nothing at all until they say go.")
+               "When the person says to hold or to resume, append a journal line recording it, in their words. "
+               "If passes are paused in `schedule.json`, or the last such line in the journal is a hold, start "
+               "nothing at all until they say go.")  # J10 RL-J4-1
         self.assertIn(new, restart)
-        self.assertLess(restart.index("start a fresh worker for the job or park the task."), restart.index(new))
+        self.assertLess(restart.index("start a fresh worker for the job or park the task;"), restart.index(new))
+
+    # t-017 J10: RL-J4-1, RL-J4-3 (REVIEW J4), RL-J5-1 (VERIFY J5) / RL-J5-2 (REVIEW J5)
+    def test_t017_j10_hold_is_journaled(self):  # RL-J4-1
+        restart = flat(self.raw[self.raw.index("## After a restart or a compaction"):self.raw.index("## Files")])
+        self.assertIn("When the person says to hold or to resume, append a journal line recording it, in their "
+                      "words.", restart)
+        self.assertIn("or the last such line in the journal is a hold, start nothing at all", restart)
+        self.assertNotIn("the person's last message asked you to hold", self.text)
+
+    def test_t017_j10_stopped_worker_under_hold(self):  # RL-J4-3
+        self.assertIn("read its evidence folder, then start a fresh worker for the job or park the task; while "
+                      "passes are paused or a hold is on, do neither and only report it.", self.text)
+
+    def test_t017_j10_gate_reads_task_tier(self):  # RL-J5-1 / RL-J5-2
+        self.assertIn("the gate counts it as the reviewer only for a low-tier task.", self.text)
+        self.assertNotIn("counts it as the reviewer for low tier only", self.text)
 
     def test_r2_ledger_fields_are_tool_written(self):  # spec 2.1 a
         self.assertIn('"closedBy": "agent", "report": "FINDINGS.md"', self.text)
@@ -176,7 +193,7 @@ class Orchestrator(unittest.TestCase):
                       "tier: low, the full suite once, the diff, at most 5 mutations on changed logic; normal, add a "
                       "failing-first run for each fix commit, at most 15 mutations; high, what the plan's "
                       "verification points ask. Record a `check` worker in the ledger with role `check`; the gate "
-                      "counts it as the reviewer for low tier only. - One git worktree", workers)
+                      "counts it as the reviewer only for a low-tier task. - One git worktree", workers)  # J10
 
     def test_t017_j5_interim_sentence_gone(self):  # J5 removes the amendment B4 interim
         for name in ("orchestrator.md", "worker.md", "sdlc.md"):
