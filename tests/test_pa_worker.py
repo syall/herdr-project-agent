@@ -1202,15 +1202,21 @@ class Leftovers(Base):
         self.assertFalse(any(l.startswith("Close all listed") for l in card["context"].split("\n")))
         self.assertIn("sent t32 a fix\\nClose all listed", card["context"])
 
-    def test_n6_the_card_is_bounded(self):
+    def shown(self, card):
+        """The addresses whose own line the panel shows (each listed worker's line starts with its address)."""
+        return {line.split(" ", 1)[0] for line in card["context"].split("\n")[1:] if re.match(r"^t\d+ ", line)}
+
+    def test_n6_the_card_holds_only_what_it_shows(self):  # review round 3, R1 (was: a cut context over the full list)
         for i in range(40):
             self.add("t-{:03d}".format(i), "t{}".format(100 + i), "t-{:03d}-build".format(i))
             self.note(trigger="message", task="t-{:03d}".format(i), why="t{} said ".format(100 + i) + "x" * 300)
         self.sweep()
         card = self.card()
-        self.assertEqual(len(card["workers"]), 40)
-        self.assertLessEqual(len(card["context"]), 2000)
-        self.assertTrue(card["context"].endswith("… (every listed worker is in this card's workers field)"))
+        self.assertLessEqual(len(card["workers"]), pa_hooks.LEFTOVERS_PER_CARD)
+        self.assertLessEqual(len(card["context"]), pa_hooks.CONTEXT_MAX)
+        self.assertEqual(self.shown(card), {w["address"] for w in card["workers"]}, "the card holds exactly the workers it shows")
+        self.assertEqual(card["more"], 40 - len(card["workers"]))
+        self.assertIn("{} more old-style workers did not fit on this card".format(card["more"]), card["context"])
 
     # ---- closing on the person's answer ----
     def ready(self):
@@ -1244,7 +1250,7 @@ class Leftovers(Base):
         next(t for t in led["tasks"] if t["id"] == "t-005")["worktree"] = dirty
         next(t for t in led["tasks"] if t["id"] == "t-007")["workers"][0].update(keep=True, keptAt="x", keepQuote="keep t37")
         self.ledger(led)
-        self.answer("Close all listed", note="close them, but keep t32 please")
+        self.answer("Close all listed")
         self.terms["t33"]["status"] = "working"  # working now
         self.terms["t34"]["status_ms"] = int((time.time() + 5) * 1000)  # active since the card opened
         write(os.path.join(dirty, "new.txt"), "unsaved\n")  # t35's worktree has uncommitted work now
@@ -1253,18 +1259,81 @@ class Leftovers(Base):
         lines = len(self.journal())
         code, out, err = self.worker("close", "--card", "d-leftovers")
         self.assertEqual(code, 0, err)
-        self.assertEqual(self.ended(), [["hc", "kill", "t31"], ["hc", "rm", "t31"]])
+        self.assertEqual(self.ended(), [["hc", "kill", "t31"], ["hc", "rm", "t31"], ["hc", "kill", "t32"], ["hc", "rm", "t32"]])
         w = self.entry("t-001", "t31")
         self.assertEqual((w["finished"], w["closedBy"], w["report"]), (True, "agent", "card d-leftovers"))
+        self.assertTrue(self.entry("t-002", "t32")["finished"])
         self.assertTrue(self.entry("t-006", "t36")["finished"])
-        for tid, address, why in (("t-002", "t32", "the person named t32 in the card's note"), ("t-003", "t33", "is working"),
-                                  ("t-004", "t34", "has been active since card d-leftovers opened"), ("t-005", "t35", "uncommitted file"),
-                                  ("t-007", "t37", "is marked keep"), ("t-008", "t38", "is now a different terminal (someone-else)")):
+        for tid, address, why in (("t-003", "t33", "is working"), ("t-004", "t34", "has been active since card d-leftovers opened"),
+                                  ("t-005", "t35", "uncommitted file"), ("t-007", "t37", "is marked keep"),
+                                  ("t-008", "t38", "is now a different terminal (someone-else)")):
             self.assertFalse(self.entry(tid, address).get("finished"), address)
             self.assertRegex(out, r"skipped {} \(.*{}".format(address, re.escape(why)))
         new = self.journal()[lines:]
-        self.assertEqual([l["trigger"] for l in new], ["leftovers", "leftovers"])
+        self.assertEqual([l["trigger"] for l in new], ["leftovers", "leftovers", "leftovers"])
         self.assertIn("on the person's answer to card d-leftovers", new[0]["why"])
+
+    def test_n8b_any_note_closes_nothing(self):  # review round 3, R2: the note is never parsed
+        self.ready()
+        before_tasks = json.dumps(self.ledger()["tasks"])
+        for note in ("keep t32 please", "except T40", "not the job0 worker"):
+            path = os.path.join(self.dir, "decisions", "d-leftovers.json")
+            card = load(path)
+            card.update(status="answered", answer="Close all listed", note=note)
+            dump(card, path)
+            code, out, err = self.worker("close", "--card", "d-leftovers")
+            self.assertEqual(code, 2)
+            self.assertIn("card d-leftovers has a note, so nothing was closed", err)
+            self.assertIn("say \"keep tNN\"", err)
+            self.assertEqual(self.ended(), [])
+            self.assertEqual(json.dumps(self.ledger()["tasks"]), before_tasks)
+            card = load(path)
+            self.assertEqual((card["status"], card["previousAnswer"]), ("withdrawn", "Close all listed"))
+        self.assertRefused(self.worker("close", "t31", "--card", "d-leftovers"), "card d-leftovers is withdrawn")
+        # the person says "keep t32"; the sweep re-issues the question without it
+        self.assertEqual(self.worker("keep", "t32", "--quote", "keep t32 please")[0], 0)
+        code, out, err = self.sweep()
+        self.assertEqual(code, 0, err)
+        self.assertIn("opened card d-leftovers-2", out)
+        again = load(os.path.join(self.dir, "decisions", "d-leftovers-2.json"))
+        self.assertNotIn("t32", {w["address"] for w in again["workers"]})
+        self.assertIn("t31", {w["address"] for w in again["workers"]})
+
+    def test_n12_shown_equals_closed_and_the_rest_comes_next(self):  # review round 3, R1
+        for i in range(12):
+            self.add("t-{:03d}".format(i), "t{}".format(100 + i), "t-{:03d}-job{}".format(i, i))
+            self.note(trigger="message", task="t-{:03d}".format(i), why="t{} handed a long job: ".format(100 + i) + "y" * 150)
+        self.sweep()
+        first = self.card()
+        shown = self.shown(first)
+        self.assertEqual(shown, {w["address"] for w in first["workers"]})
+        self.assertGreater(first["more"], 0)
+        self.answer("Close all listed")
+        self.assertEqual(self.worker("close", "--card", "d-leftovers")[0], 0)
+        closed = {w["address"] for t in self.ledger()["tasks"] for w in t["workers"] if w.get("finished")}
+        self.assertEqual(closed, shown, "exactly the workers the person saw are closed")
+        code, out, err = self.sweep()
+        self.assertEqual(code, 0, err)
+        second = load(os.path.join(self.dir, "decisions", "d-leftovers-2.json"))
+        self.assertFalse(shown & {w["address"] for w in second["workers"]})
+        self.assertEqual(self.shown(second), {w["address"] for w in second["workers"]})
+        path = os.path.join(self.dir, "decisions", "d-leftovers-2.json")
+        second.update(status="answered", answer="Close all listed", note=None)
+        dump(second, path)
+        self.assertEqual(self.worker("close", "--card", "d-leftovers-2")[0], 0)
+        closed = {w["address"] for t in self.ledger()["tasks"] for w in t["workers"] if w.get("finished")}
+        self.assertEqual(closed, shown | self.shown(second))
+        if second["more"] == 0:
+            self.assertIn("--leftovers already ran", self.sweep()[1])
+        self.assertEqual(self.ledger()["workerPolicy"]["cards"][:2], ["d-leftovers", "d-leftovers-2"])
+
+    def test_n13_unknown_activity_is_skipped(self):  # review round 3, recommended
+        self.ready()
+        self.answer("Close all listed")
+        del self.terms["t31"]["status_ms"]
+        code, out, _ = self.worker("close", "--card", "d-leftovers")
+        self.assertIn("skipped t31 (t-001-build, t-001): activity since card d-leftovers opened is unknown", out)
+        self.assertFalse(self.entry("t-001", "t31").get("finished"))
 
     def test_n9_one_worker_by_card(self):
         self.ready()

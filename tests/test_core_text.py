@@ -76,6 +76,10 @@ class Orchestrator(unittest.TestCase):
         self.assertIn("puts that list on one decision card (`d-leftovers`", self.text)
         self.assertIn("When it is answered Close all listed, run `pa-worker close --card d-leftovers`", self.text)
         self.assertIn("Answered Close none: leave them", self.text)
+        # review round 3: R1 (one card at a time, the rest on the next) and R2 (any note closes nothing)
+        self.assertIn("If the person wrote a note, nothing is closed", self.text)
+        self.assertIn("then run `pa-worker close --leftovers` again: it opens the next card", self.text)
+        self.assertNotIn("may name workers to keep in its note", self.text)
         self.assertNotIn("journal its list, then run `pa-worker close --leftovers` in the same pass", self.text)
 
     def test_close_is_not_a_delete(self):  # review round 1, M8 (in the Workers section, not Safety)
