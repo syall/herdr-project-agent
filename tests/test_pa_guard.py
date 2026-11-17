@@ -1311,6 +1311,104 @@ class Split_Texts(GuardTest):
         self.assertEqual(self.check("export GIT_DIR=x"), VARIABLE.format("GIT_DIR=x"))
 
 
+# ---- t-007 part 7b, Job B: the person-only tools ----------------------------------------------------------------------
+PERSON_MSG = ("Refused by the Project Agent's allowlist: {}. pa-push-main and pa-push-allow are the person's commands: a "
+              "main branch is pushed only when the person answers a push card in the panel. Say in your report that the "
+              "work is ready to release. There is no override.")
+
+
+class PersonOnly(GuardTest):
+    """pa-push-main, pa-push-allow and pa_push.py are refused for a worker in every form the guard recognises for git
+    (plan-7b section 2, Job B). The lines are data handed to check_command only; none of them is run."""
+
+    def person(self, line, shown_part=None):
+        message = self.check(line)
+        if shown_part is not None:
+            self.assertEqual(message, PERSON_MSG.format(shown_part), line)
+        else:
+            self.assertIsNotNone(message, line)
+            self.assertTrue(message.startswith("Refused by the Project Agent's allowlist: "), message)
+            self.assertIn("pa-push-main and pa-push-allow are the person's commands", message)
+        return message
+
+    def test_plain(self):
+        line = "pa-push-main run d-push-t-1-1 --answer Push --space S"
+        self.person(line, line)
+        self.person("pa-push-main check d-push-t-1-1 --json", "pa-push-main check d-push-t-1-1 --json")
+        self.person("pa-push-main plan t-1 --repo /tmp/x", "pa-push-main plan t-1 --repo /tmp/x")
+        self.person("make && pa-push-main run x", "pa-push-main run x")
+
+    def test_path_forms(self):
+        for line in ["~/.local/bin/pa-push-main run x", "./pa_push.py run x", "PA-PUSH-MAIN run x", "Pa_Push.PY run x",
+                     "/usr/local/bin/pa-push-allow show", "~/.config/herdr-pa/tools/pa_push.py check x",
+                     "pa-push-allow add --path /tmp/r --space S", "PA-Push-Allow on"]:
+            with self.subTest(line=line):
+                self.person(line, shlex.join(shlex.split(line)))
+
+    def test_launchers(self):
+        for line in ["env pa-push-main run x", "env -i PATH=/bin pa-push-main run x", "nohup pa-push-main run x",
+                     "xargs pa-push-main", "command pa-push-main run x", "exec pa-push-allow off", "time pa-push-main run x",
+                     "sudo pa-push-main run x", "FOO=1 pa-push-main run x", "PAGER=pa-push-main make",
+                     "echo x | xargs pa-push-main run"]:
+            with self.subTest(line=line):
+                self.person(line)
+
+    def test_wrappers(self):
+        for line in ["sh -c 'pa-push-main run x'", "bash -lc 'pa-push-allow on'", "eval 'pa-push-main run x'",
+                     "zsh -c \"pa_push.py run x\"", "env -S 'pa-push-main run x'", "echo 'pa-push-main run x' | sh",
+                     "make && sh -c 'PA-PUSH-MAIN run x'"]:
+            with self.subTest(line=line):
+                self.person(line)
+
+    def test_non_plain(self):
+        for line in ["pa-push-main run $X > /dev/null", "pa-push-${A}main run x", "pa-push-$'main' run x",
+                     "$(pa-push-main run x)", "pa-push-allow on &", "pa_pu${X}sh.py run x", "pa-push-m`:`ain run x",
+                     "pa-push-main run x 2>&1 | tee out.txt"]:
+            with self.subTest(line=line):
+                self.assertEqual(self.check(line), PERSON_MSG.format(line))
+
+    def test_python_runs_tool(self):
+        for line in ["python3 ~/.config/herdr-pa/tools/pa_push.py run x", "python3 runtime/tools/pa_push.py check x",
+                     "/usr/bin/env python3 pa_push.py run x", "python3 -c 'import runpy' pa_push.py"]:
+            with self.subTest(line=line):
+                self.person(line)
+
+    def test_allow_cmd(self):  # AC3.4: a worker cannot change the allowlist through its tool
+        for sub in ["add --path /tmp/r --space S --url file:///tmp/o.git --branch main", "remove --path /tmp/r --space S",
+                    "on", "off", "show", "show --json"]:
+            line = "pa-push-allow " + sub
+            with self.subTest(line=line):
+                self.person(line, line)
+
+    def test_message_text(self):
+        self.assertEqual(guard.PERSON_MSG, PERSON_MSG)
+        self.assertEqual(guard.PERSON_ONLY, ("pa-push-main", "pa-push-allow", "pa_push.py"))
+        message = self.check("pa-push-main run 'a b'")
+        self.assertEqual(message, PERSON_MSG.format("pa-push-main run 'a b'"))
+        for words in ["push card in the panel", "ready to release", "There is no override"]:
+            self.assertIn(words, message)
+
+    def test_unrelated_words_allowed(self):
+        for line in ["python3 -m unittest tests/test_pa_push.py", "python3 -m unittest -v tests/test_pa_push.py > out.txt",
+                     'hc send {} "ready for pa-push-main plan"'.format(PA), "git commit -m 'pa-push-main docs'",
+                     "git commit -m pa-push-main", "hc send {} pa-push-main".format(PA), "ls runtime/tools",
+                     "cat my-pa-push-main.txt", "cat pa-push-main-notes.md", "cat pa_push.pyc", "python3 test_pa_push.py",
+                     "make pa-push", "grep -n push_allow notes.md"]:
+            with self.subTest(line=line):
+                self.assertIsNone(self.check(line))
+
+    def test_git_lines_keep_their_messages(self):  # nothing else in the guard changes
+        self.assertEqual(self.check("git push origin t-x"), OFF_TABLE.format("git push origin t-x"))
+        self.assertEqual(self.check("git diff > x"), NOT_PLAIN)
+        self.assertIsNone(self.check("git status && make"))
+
+    def test_edit_push_allow_refused(self):  # already true (home rule): pinned
+        spaces = os.path.join(pa.ROOT, "spaces")
+        for path in [os.path.join(pa.ROOT, "push-allow.json"), os.path.join(pa.ROOT, "push-allow.json.bak-pa-push-allow")]:
+            with self.subTest(path=path):
+                self.assertEqual(guard.check_edit(path, spaces, cwd=self.cwd, home=pa.ROOT), OFF_TABLE.format(path))
+
+
 def tearDownModule():
     shutil.rmtree(TMP, ignore_errors=True)
 
