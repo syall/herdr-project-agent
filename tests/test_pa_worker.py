@@ -1560,21 +1560,35 @@ class Describe(Base):
         self.assertLessEqual(len(card["context"]), 2000)
 
     def test_d11_git_time_cap(self):
+        # The slow stand-in never ends by itself (it waits until it is killed). Only the slow call gets
+        # the short cap; the quick calls keep the real GIT_TIMEOUT, so machine load cannot time them out.
         real = shutil.which("git")
         bin_dir = os.path.join(self.tmp, "bin")
-        write(os.path.join(bin_dir, "git"), '#!/bin/sh\nfor a in "$@"; do [ "$a" = log ] && exec sleep 5; done\nexec "{}" "$@"\n'.format(real))
+        write(os.path.join(bin_dir, "git"), '#!/bin/sh\nfor a in "$@"; do [ "$a" = log ] && exec sleep 600; done\nexec "{}" "$@"\n'.format(real))
         os.chmod(os.path.join(bin_dir, "git"), 0o755)
         self.commit(self.wt, "a.txt", "a\n", "slow")
-        saved_path, saved_timeout = os.environ["PATH"], pa_hooks.GIT_TIMEOUT
+        real_git, slow = pa_hooks.git, []
+
+        def git(path, *args, timeout=None):
+            if "log" not in args:
+                return real_git(path, *args, timeout=timeout)
+            slow.append(timeout)  # the cap describe_repo gave the call, from GIT_TIMEOUT
+            return real_git(path, *args, timeout=0.5)
+        saved_path = os.environ["PATH"]
         os.environ["PATH"] = bin_dir + os.pathsep + saved_path
-        pa_hooks.GIT_TIMEOUT = 0.5
+        pa_hooks.git = git
         try:
             began = time.time()
             card = self.open_card()
-            self.assertLess(time.time() - began, 5)
+            self.assertLess(time.time() - began, 60)  # the stand-in alone would take 600 s
         finally:
-            os.environ["PATH"], pa_hooks.GIT_TIMEOUT = saved_path, saved_timeout
-        self.assertIn("timed out", card["changes"]["repos"][0]["error"])
+            os.environ["PATH"], pa_hooks.git = saved_path, real_git
+        self.assertEqual(len(slow), 1, slow)
+        self.assertTrue(slow[0] and 0 < slow[0] <= pa_hooks.GIT_TIMEOUT, slow)
+        repo = card["changes"]["repos"][0]
+        self.assertEqual(repo["error"], "git log timed out after 0.5 s")
+        self.assertEqual(repo["branch"], sh(self.wt, "git", "rev-parse", "--abbrev-ref", "HEAD"))  # quick calls got through
+        self.assertEqual(repo["head"], sh(self.wt, "git", "rev-parse", "HEAD"))
         self.assertIn("could not read the changes: ", card["context"])
 
     def test_d12_context_hard_cap(self):
