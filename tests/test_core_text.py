@@ -58,6 +58,18 @@ class Orchestrator(unittest.TestCase):
         self.assertIn("A worker in the ledger that no longer runs and is not `finished` has stopped", self.text)
         self.assertIn("start a fresh worker for the job or park the task", self.text)
 
+    def test_r3_restart_continues_in_flight_work(self):  # t-017 R3 AC3.1-AC3.3, G5 (J4)
+        restart = flat(self.raw[self.raw.index("## After a restart or a compaction"):self.raw.index("## Files")])
+        new = ("After a restart, continue in-flight work: read and close the reports of workers started before it, "
+               "and take the next step the journal already set for a task in its current phase (a fix round after "
+               "check findings, a recheck after a fix, the gate, a card). "
+               "Start nothing else until asked: no new task, no move to a phase that needs the person, no worker "
+               "for a task with an open card. "
+               "If passes are paused in `schedule.json`, or the person's last message asked you to hold, start "
+               "nothing at all until they say go.")
+        self.assertIn(new, restart)
+        self.assertLess(restart.index("start a fresh worker for the job or park the task."), restart.index(new))
+
     def test_r2_ledger_fields_are_tool_written(self):  # spec 2.1 a
         self.assertIn('"closedBy": "agent", "report": "FINDINGS.md"', self.text)
         self.assertIn("never write them by hand, and keep them when you write the ledger", self.text)

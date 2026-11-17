@@ -393,6 +393,19 @@ class Round3Addition(Round3):
         with open(os.path.join(self.dir, "session.log")) as f:
             self.assertIn("start resume=True session={} reason=ran".format(SID), f.read().splitlines()[-1])
 
+    def test_u28_resume_prompt_continues_in_flight_work(self):  # t-017 R3 AC3.1-AC3.3, G5 (J4)
+        began = int(time.time()) - 2 * 86400
+        self.fixtures3(began)
+        self.heartbeat(began + 86400, "t9")
+        argv = self.run_once({"beat": False})
+        self.assertIn("--resume", argv)
+        self.assertEqual(argv[-1], "Your session was restarted. Read your state folder (ledger.json, journal.jsonl, "
+                         "decisions/, rules.json), then say in one line where things stand. Continue in-flight work "
+                         "as orchestrator.md defines it under \"After a restart or a compaction\"; start nothing new "
+                         "until asked, and nothing at all if passes are paused or the person's last message asked "
+                         "you to hold.")
+        self.assertNotIn("Do not start new work until asked.", argv[-1])
+
     def test_u22_two_launchers_never_claim_at_once(self):
         # Two launchers for one space start together. While the first is inside claim (init_state,
         # labelling, first heartbeat), the second must not enter it: the launch lock covers claim.
