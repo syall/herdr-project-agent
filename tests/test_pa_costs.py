@@ -406,8 +406,8 @@ class Collecting(CostsBase):
         rows = lines(self.costs("turns.jsonl"))
         kept = []
         for r in rows:
-            if r.get("ev") == "void":
-                kept = [k for k in kept if not (k["session"] == r["session"] and k["seq"] <= r["upTo"])]
+            if r.get("ev") == "void":  # a subagent file's void ("sub") drops that file's rows only
+                kept = [k for k in kept if not (k["session"] == r["session"] and k.get("sub") == r.get("sub") and k["seq"] <= r["upTo"])]
             else:
                 kept.append(r)
         return kept
@@ -1782,6 +1782,99 @@ class FR_FixRound2(Collecting):
         self.collect(T0 + 4000)
         self.assertEqual(self.totals()["in"], 200)
         self.assertEqual(load(self.costs("state.json"))["held"], [])
+
+
+# ---- fix round 2, P-c: subagent transcripts in separate files --------------------------------------------------
+
+class PC_Subagents(Collecting):
+    def sub_lines(self, t, mid, out, sid=SID, **kw):
+        return [fx.claude_user(isoms(t), sid, self.project, sidechain=True)] + [
+            fx.claude_assistant(isoms(t + 1), sid, self.project, mid, out=out, sidechain=True, **kw)]
+
+    def nested(self, agent, sid=SID):
+        return fx.claude_subagent_path(pa.CLAUDE_HOME, self.project, sid, agent)
+
+    def beside(self, agent):
+        return fx.claude_agent_path(pa.CLAUDE_HOME, self.project, agent)
+
+    def worker(self):
+        self.record(session=SID, kind="worker", terminal="t5", name="t-001-build", task="t-001")
+        self.ledger({"version": 1, "tasks": [{"id": "t-001", "state": "in-progress",
+                                              "workers": [{"address": "t5", "role": "build", "name": "t-001-build"}]}]})
+
+    def test_pc1_both_layouts_are_read_and_attributed_to_the_parent(self):
+        self.worker()
+        self.add(self.prompt(T0 + 1), self.call(T0 + 2, "p1", lines=1, out=10))
+        fx.append(self.nested("agent-a1"), self.sub_lines(T0 + 10, "s1", 100) + self.sub_lines(T0 + 20, "s2", 200))
+        fx.append(self.beside("agent-b2"), self.sub_lines(T0 + 30, "s3", 1000))
+        fx.append(self.beside("agent-c3"), self.sub_lines(T0 + 40, "s4", 5000, sid=SID2))  # another session's
+        self.collect(T0 + 2000)
+        self.assertEqual(self.totals()["out"], 1310)
+        rows = self.rows()
+        self.assertEqual({(r["session"], r["task"], r["role"], r["activity"]) for r in rows}, {(SID, "t-001", "build", "build")})
+        self.assertEqual(sorted(r.get("sub") or "" for r in rows), ["", "agent-a1", "agent-b2"])
+        self.collect(T0 + 2100)
+        self.assertEqual(self.totals()["out"], 1310)  # counted once
+        fx.append(self.nested("agent-a1"), self.sub_lines(T0 + 2200, "s5", 7))
+        self.collect(T0 + 5000)
+        self.assertEqual(self.totals()["out"], 1317)
+        s = load(self.costs("summary.json"))
+        self.assertEqual([(x["task"], x["tokens"]) for x in s["sessions"]], [("t-001", self.totals()["in"] + 1317)])
+
+    def test_pc2_a_call_in_both_the_parent_and_a_subagent_file_counts_once(self):
+        self.worker()
+        self.add(self.prompt(T0 + 1), self.call(T0 + 2, "p1", lines=1, out=10),
+                 fx.claude_assistant(isoms(T0 + 11), SID, self.project, "s1", out=100, sidechain=True))
+        fx.append(self.nested("agent-a1"), self.sub_lines(T0 + 10, "s1", 100))
+        self.collect(T0 + 2000)
+        self.assertEqual(self.totals()["out"], 110)
+
+    def test_pc3_replaced_subagent_file_voids_its_own_rows_only(self):
+        self.worker()
+        self.add(self.prompt(T0 + 1), self.call(T0 + 2, "p1", lines=1, out=10))
+        fx.append(self.nested("agent-a1"), self.sub_lines(T0 + 10, "s1", 100))
+        self.collect(T0 + 2000)
+        before = self.totals()
+        path = self.nested("agent-a1")
+        data = raw(path)
+        with open(path + ".new", "wb") as f:
+            f.write(data)
+        os.replace(path + ".new", path)
+        self.collect(T0 + 2100)
+        voids = [r for r in lines(self.costs("turns.jsonl")) if r.get("ev") == "void"]
+        self.assertEqual([(v["session"], v.get("sub")) for v in voids], [(SID, "agent-a1")])
+        self.assertEqual(self.totals(), before)
+
+    def test_pc4_project_agent_subagent_is_attributed_like_its_turn(self):
+        self.record(session=SID, kind="pa", terminal="t0", parent=None)
+        self.add(self.prompt(T0 + 1), self.call(T0 + 2, "p1", lines=1, out=10))
+        fx.append(self.nested("agent-a1"), self.sub_lines(T0 + 10, "s1", 100))
+        self.journal({"at": iso(T0 + 30), "by": "agent", "trigger": "report", "task": "t-001", "pass": 3})
+        self.collect(T0 + 2000)
+        rows = self.rows()
+        self.assertEqual({(r["kind"], r["activity"], r["task"], r["pass"]) for r in rows}, {("pa", "pass:report", "t-001", 3)})
+        self.assertEqual(self.totals()["out"], 110)
+
+    def test_pc5_reconstruct_does_not_take_subagent_files_for_sessions(self):
+        self.worker()
+        self.add(self.prompt(T0 + 1), self.call(T0 + 2, "p1", lines=1, out=10))
+        fx.append(self.nested("agent-a1"), self.sub_lines(T0 + 10, "s1", 100))
+        fx.append(self.beside("agent-b2"), self.sub_lines(T0 + 30, "s3", 1000))
+        self.run_cmd(pa_costs.reconstruct, self.dir, now=T0 + 5000)
+        recs = lines(self.costs("sessions.jsonl"))
+        self.assertFalse([r for r in recs if r.get("ev") == "bind"])
+        self.assertFalse([r for r in recs if r.get("ev") == "unmatched" and r["sessions"]])
+        self.assertEqual(self.totals()["out"], 1110)
+
+    def test_pc6_missing_state_json_rebuild_keeps_subagent_rows(self):
+        self.worker()
+        self.add(self.prompt(T0 + 1), self.call(T0 + 2, "p1", lines=1, out=10))
+        fx.append(self.nested("agent-a1"), self.sub_lines(T0 + 10, "s1", 100))
+        self.collect(T0 + 2000)
+        before = self.totals()
+        os.unlink(self.costs("state.json"))
+        self.collect(T0 + 2100)
+        self.assertEqual(self.totals(), before)
 
 
 class I1_Install(unittest.TestCase):

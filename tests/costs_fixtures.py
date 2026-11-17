@@ -29,7 +29,7 @@ def claude_user(ts, sid, cwd, text=True, meta=False, tool_result=False, sidechai
 
 
 def claude_assistant(ts, sid, cwd, msg_id, model="model-a", inp=2, out=10, cw5m=0, cw1h=0, cr=0, request_id=None,
-                     uuid=None, flat_cache=False, block="text"):
+                     uuid=None, flat_cache=False, block="text", sidechain=False):
     """One line of one API call. A real call is written as several such lines (one per content block)."""
     usage = {"input_tokens": inp, "output_tokens": out, "cache_read_input_tokens": cr,
              "cache_creation_input_tokens": cw5m + cw1h, "service_tier": "standard"}
@@ -39,7 +39,7 @@ def claude_assistant(ts, sid, cwd, msg_id, model="model-a", inp=2, out=10, cw5m=
                "content": [{"type": block, "text": CANARY, "thinking": CANARY}], "usage": usage}
     if msg_id is not None:
         message["id"] = msg_id
-    obj = {"parentUuid": CANARY, "isSidechain": False, "userType": "external", "cwd": cwd, "sessionId": sid,
+    obj = {"parentUuid": CANARY, "isSidechain": sidechain, "userType": "external", "cwd": cwd, "sessionId": sid,
            "version": "9.9.9", "gitBranch": CANARY, "message": message, "type": "assistant",
            "uuid": uuid or "a-{}-{}".format(msg_id, out), "timestamp": ts}
     if request_id is not None:
@@ -88,6 +88,18 @@ def append(path, lines):
 def claude_path(claude_home, cwd, sid):
     import re
     return os.path.join(claude_home, "projects", re.sub(r"[^A-Za-z0-9]", "-", cwd), sid + ".jsonl")
+
+
+def claude_subagent_path(claude_home, cwd, sid, agent):
+    """A subagent transcript in the parent session's own folder: projects/<slug>/<parent sid>/subagents/<agent>.jsonl.
+    The layout is taken from the person's reference script (FINDINGS section 3), not from a real file."""
+    return os.path.join(os.path.dirname(claude_path(claude_home, cwd, sid)), sid, "subagents", agent + ".jsonl")
+
+
+def claude_agent_path(claude_home, cwd, agent):
+    """A subagent transcript beside the sessions: projects/<slug>/<agent>.jsonl (agent = "agent-..."); its lines name
+    the parent in sessionId (assumed, unverified)."""
+    return os.path.join(os.path.dirname(claude_path(claude_home, cwd, "x")), agent + ".jsonl")
 
 
 def codex_path(codex_home, day, sid):
