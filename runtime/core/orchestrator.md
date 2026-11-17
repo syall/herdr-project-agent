@@ -101,7 +101,8 @@ merging, deleting, touching production. Write `decisions/<id>.json`:
 ```
 `evidence` names the files in the task's evidence folder the decision is about, the one to
 read first at the front; the card's link opens that file.
-A merge card lists every Recorded limit, each with its follow-up task or "accepted".
+The card that asks to publish or merge lists every Recorded limit, each with its follow-up
+task, or for the person to accept.
 Set the task to `needs-decision` and carry on with other work. Never decide a card
 yourself, and never act on a guess about the answer. An answer covers exactly the
 question asked, once.
@@ -172,8 +173,11 @@ Run `hc --skill` once to learn `hc`. Start workers with the profile's commands (
   fix round after a review or a verification is a new worker, so reviewers and
   verifiers stay fresh. The only follow-ups a worker gets are for its own job (a
   correction, an answered question, a fix round you already asked it for).
-- Rounds: a round is one build or fix worker and the check that follows it. A fix round
-  fixes only Must fix findings; Recorded limits and Nits go on the merge card. Stop rule:
+- Rounds: a round is one build or fix worker and the check that follows it. The must-fix
+  bar: a finding that breaks a requirement, the plan, a verification point, safety or
+  security is Must fix; a handoff may not narrow it. A fix round fixes only Must fix
+  findings; Recorded limits and Nits go on the card that asks to publish or merge, each
+  Recorded limit with its follow-up task, or for the person to accept. Stop rule:
   when a task reaches its round cap (low 2, normal 3, high 4) or two rechecks in a row
   find Must fix in the same area, start no further round: open a decision card (cut that
   area into a new task, record it as a limit, or one more round).

@@ -13,7 +13,7 @@ them and names the task.
 | plan | No edits. Files that change, order, risks, proof, citing R-numbers | A build worker, planning only | `plan.md` | The person for high tier (or by rule); otherwise the orchestrator |
 | build | Implement in an isolated worktree, usually one pass | Build workers | Code and tests, `FINDINGS.md`, `DECISIONS.md` | Hooks pass and the build is clean |
 | test | Affected tests until green, then the full suite once; a verifier checks | Build workers, then a verifier | `build.log`, test output, `VERIFY.md` | All verification points pass, full suite passed once, verifier finds no mismatch with `plan.md` |
-| review | A different worker reviews; then the change request's CI checks | A reviewer, never the author | `REVIEW.md`, the draft change request link and its check results | Must fix findings fixed, recorded limits listed on the merge card, checks green, then the person approves publishing (decision card) |
+| review | A different worker reviews; then the change request's CI checks | A reviewer, never the author | `REVIEW.md`, the draft change request link and its check results | Must fix findings fixed, checks green, then the person approves publishing (decision card: it lists every Recorded limit, each with its follow-up task, or for the person to accept) |
 | release | Merge and deploy through the release pipeline | The person | Change request, merge and pipeline links | Always the person's. Agents prepare it and stop |
 | maintain | (Later) a detector watches the metrics the intent named | A script, then the orchestrator | A new `intent.md` | The person triages |
 

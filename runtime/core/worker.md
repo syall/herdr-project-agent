@@ -55,8 +55,7 @@ the address to report to.
   review the diff from the base commit the handoff names.
 - Verifiers, reviewers and check workers label every finding **Must fix** (it breaks a
   requirement, the plan, a verification point, safety or security; say why it blocks
-  the merge), **Recorded limit** (real, but outside the handoff's must-fix bar; name a
-  follow-up) or **Nit**, and end the file with `Verdict: pass` or `Verdict: must fix (<n>)`.
+  the merge), **Recorded limit** (real, but not Must fix; name a follow-up) or **Nit**, and end the file with `Verdict: pass` or `Verdict: must fix (<n>)`.
 
 ## Verification
 
