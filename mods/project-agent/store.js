@@ -64,10 +64,11 @@ export const stateDir = (space) => `${paHome(space.machine)}/spaces/${localId(sp
 export const READ_LIMIT = 10000;
 export const TIMED_OUT = Object.freeze({ timedOut: true });
 // `p`, or TIMED_OUT after `ms` on the cx of the task that waits (cx.sleep: mods have no setTimeout).
-// Without a cx it is just `p`.
+// Without a cx it is just `p`. When it settles either way, `cx.progress()` (if given) is called: the
+// panel's load counts it as progress, so a slow but working load is never given up.
 export function withTimeout(cx, p, ms = READ_LIMIT) {
   if (!cx?.sleep) return p;
-  return Promise.race([p, cx.sleep(ms).then(() => TIMED_OUT, () => TIMED_OUT)]);
+  return Promise.race([p, cx.sleep(ms).then(() => TIMED_OUT, () => TIMED_OUT)]).then((v) => { cx.progress?.(); return v; }, (e) => { cx.progress?.(); throw e; });
 }
 
 async function readJson(path, on, cx) {
@@ -77,6 +78,9 @@ async function readJson(path, on, cx) {
   try { return { value: JSON.parse(text), text, error: null }; }
   catch (e) { return { value: null, text, error: String(e.message ?? e) }; }
 }
+
+// The space's ledger alone ({ value, text, error, timedOut? }), for the hidden panel's refresh.
+export const loadLedger = (space, cx) => readJson(`${stateDir(space)}/ledger.json`, space.machine, cx);
 
 // { agent, ledger, profile, errors } for a space; agent is null when it has no Project Agent
 // (timedOut: agent.json did not answer). With `cx`, each read gives up after READ_LIMIT. After
@@ -233,16 +237,18 @@ const byteOrder = (a, b) => (a < b ? -1 : a > b ? 1 : 0); // names are ASCII: co
 // them all; if that call fails, times out or prints something unreadable, they are read one by one,
 // in parallel (as before, but not in sequence). On this computer the files are read directly.
 // Options: cx (each call gives up after READ_LIMIT), batchOnly (no fallback: null when the call
-// fails), live() (false: the caller no longer wants the result; the fallback is skipped).
+// fails), live() (false: the caller no longer wants the result; the fallback is skipped and the
+// result is null, which the caller must not take for "no cards"). Only exit 0 is a whole batch
+// (exit 3 with no output: no folder); a call killed part way can print whole-looking pairs.
 export async function loadDecisions(space, { cx, batchOnly = false, live } = {}) {
   const on = space.machine ?? null, dir = `${stateDir(space)}/decisions`;
   if (on) {
     let r = null;
     try { r = await withTimeout(cx, exec("sh", ["-c", CARDS_SCRIPT, "sh", dir], { on, timeout: READ_LIMIT })); } catch { r = null; }
     if (r && r !== TIMED_OUT && r.code === 3 && !r.stdout) return []; // no decisions folder: no cards (as a failing ls)
-    const files = r && r !== TIMED_OUT && (r.code === 0 || r.stdout) ? splitBatch(r.stdout) : null;
+    const files = r && r !== TIMED_OUT && r.code === 0 ? splitBatch(r.stdout) : null;
     if (files) return parseCards(files.sort((a, b) => byteOrder(a.name, b.name)).slice(0, MAX_CARDS).map((f) => ({ ...f, path: `${dir}/${f.name}` })));
-    if (batchOnly || (live && !live())) return batchOnly ? null : [];
+    if (batchOnly || (live && !live())) return null;
   }
   let names = [];
   try {
