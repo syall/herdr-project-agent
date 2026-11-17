@@ -2356,6 +2356,8 @@ def billing_comparison(billed, space, here, table):
             value = round(m["billed"] / a, 4)
             factor = {"kind": "scope", "value": value, "applied": False, "few": few,
                       "note": "not applied" + ("; below 1.0: the table over-prices" if value < 1.0 else "")}
+            if key in alls_np:  # the all-spaces figure is the priced part only (VERIFY-5 RL5-3)
+                factor["partial"] = True
             calibrated += t or 0.0
         else:
             factor = {"kind": None, "value": None, "applied": False, "few": few, "note": "no estimate to compare"}
@@ -2371,7 +2373,8 @@ def billing_comparison(billed, space, here, table):
                       "thisSpacePartial": bool(this and this_np), "allSpacesPartial": bool(alls and alls_np),
                       "billed": round(sum(r.get("amount") or 0 for r in rows), 6)},
             # Calibrated only where there is a priced estimate to calibrate; partial when a billed model has unpriced use.
-            "calibrated": round(calibrated, 6) if cal_priced else None, "calibratedPartial": cal_priced and cal_partial,
+            # Also partial when this space has unpriced use of a model that was not billed (VERIFY-5 RL5-1).
+            "calibrated": round(calibrated, 6) if cal_priced else None, "calibratedPartial": cal_priced and (cal_partial or bool(this_np)),
             "noPrice": sorted(this_np | alls_np), "separate": sorted(separate.values(), key=lambda s: s["currency"] or "")}
 
 
@@ -2386,7 +2389,12 @@ def billed_lines(s, now):
     c = billing_comparison(effective_billed(), s, here, table)
     out = ["Billed (account-wide: includes use outside this space and outside Herdr)"]
     if not c["covered"]:
-        out.append("  no billed rows for account {}".format(c["account"]))
+        if not c["separate"]:
+            out.append("  no billed rows for account {}".format(c["account"]))
+        elif c["currency"]:  # rows exist, in another currency only (REVIEW-4 RL4-2)
+            out.append("  no billed rows in {} for account {}".format(c["currency"], c["account"]))
+        else:
+            out.append("  no price table, so no currency to compare: billed rows for account {} are not compared".format(c["account"]))
     else:
         cov = c["covered"]
         out.append("Covered {} – {} ({} of {} days{}) · source {}, fetched {}".format(
@@ -2398,8 +2406,9 @@ def billed_lines(s, now):
             return fmt_money(v) + ("+" if partial else "")
         for m in c["models"]:
             f = m["factor"]
-            fac = "" if f["kind"] is None else "{} factor {}{}".format("price" if f["kind"] == "price" else "scope ratio", f["value"],
-                                                                      " (not applied)" if not f["applied"] else "")
+            fac = "" if f["kind"] is None else "{} factor {}{}{}".format("price" if f["kind"] == "price" else "scope ratio", f["value"],
+                                                                        " (not applied)" if not f["applied"] else "",
+                                                                        " (from a partial estimate)" if f.get("partial") else "")
             out.append("  {:<22} {:>12} {:>16} {:>14}  {}{}{}".format(m["model"][:22], est(m["thisSpace"], m["thisSpacePartial"]), est(m["allSpaces"], m["allSpacesPartial"]),
                                                                     fmt_money(m["billed"]), fac, " (few days)" if f["few"] else "",
                                                                     " (not final)" if m["notFinal"] else ""))
