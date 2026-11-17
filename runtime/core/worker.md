@@ -12,7 +12,14 @@ folder and the address to report to.
 - Write your evidence into `evidence/<task-id>/` in the orchestrator's state folder,
   and nowhere else in that folder. Never edit the ledger, the journal, decisions or rules.
 - Commands that involve git, gh or hc are limited to the allowlist in `pa_guard.py`;
-  anything else is refused: report it to the Project Agent. A bare `git` word counts
+  anything else is refused: report it to the Project Agent. The read-only `git status`,
+  `git log`, `git diff`, `git show` and `git rev-parse` may send their output to a file
+  (`git diff > /tmp/x.diff`) and may take one `-C <folder>` before the subcommand; write
+  every other git, gh or hc command plainly, without a redirect or `-C`. A Bash command
+  that plainly writes into `.git`, the git and gh settings or the Project Agent's state
+  (a redirect, `cp`, `mv`, `rm`, `tee`, `sed -i`) is refused: write reports, logs and
+  notes in your evidence folder, and if such a write is needed, stop and report it. A
+  bare `git` word counts
   too (`grep 'git' notes.md`): use the editor's search tool. If the guard says it is
   unavailable, no Bash command runs, `hc send` included: stop, and say so as your last
   message. Do not set `GIT_*` or `GH_*` variables, and do not write files inside
