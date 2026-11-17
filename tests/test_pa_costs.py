@@ -1123,9 +1123,11 @@ class S_Summary(Collecting):
         self.assertIn("t-002", only)
         self.assertNotIn("By activity", only)
         _r, later, _e = self.run_cmd(pa_costs.report, self.dir, by="day", since="2026-11-17", now=T0 + 5000)
+        later = "\n".join(x for x in later.splitlines() if x.startswith("  "))  # the table, not the header's times
         self.assertIn("2026-11-17", later)
         self.assertNotIn("2026-11-16", later)
         _r, earlier, _e = self.run_cmd(pa_costs.report, self.dir, by="day", until="2026-11-16", now=T0 + 5000)
+        earlier = "\n".join(x for x in earlier.splitlines() if x.startswith("  "))
         self.assertIn("2026-11-16", earlier)
         self.assertNotIn("2026-11-17", earlier)
 
