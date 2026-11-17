@@ -2796,6 +2796,7 @@ function noPriceSummary(shape) {
   s.totals = { ...s.totals, money: null, reconstructedMoney: null, unpricedTokens: 1000 };
   for (const e of [...s.byActivity, ...s.byTask, ...s.byDay, ...s.sessions, ...s.byKind.machine, ...s.byKind.kind]) e.money = null;
   for (const e of s.byActivity) for (const x of [...(e.tasks ?? []), ...(e.reasons ?? [])]) x.money = null;
+  for (const e of s.byTask) for (const x of e.phases ?? []) x.money = null; // the task drill's phases (opened here)
   s.hours = [[isoAt(T0).slice(0, 13), { tokens: 100, money: null }]]; s.passes[0].money = null;
   for (const d of s.byDay) d.byActivity = {};
   return s;
@@ -2813,7 +2814,7 @@ cases["P-costs-cc-priced"] = async () => { // AC7.1, AC7.2, Q2: est. first; the 
   check(total >= 0 && /^XTS\s12\.50 est\.$/.test(segs[total + 1]) && segs[total + 2] === "1k tokens · 94% cache read" && segs[total + 3] === "Claude Code: 9.40 USD (list price) · 2 of 3 Claude sessions",
     `the Total tile: est., its tokens, then Claude Code's line (got ${JSON.stringify(segs.slice(total, total + 5))})`);
   check(segs.includes(LEGEND), `the legend (got ${segs.join(" | ").slice(0, 2500)})`);
-  check(segs.includes("CC 1.60 (1 of 1 session)") && segs.filter((x) => /^CC /.test(x)).length === 1, `a CC cell on the (no task) row only (t-1 is split; got ${JSON.stringify(segs.filter((x) => /CC/.test(x)))})`);
+  check(segs.includes("CC 1.60 (1 of 1 session)") && segs.filter((x) => /^CC \d/.test(x)).length === 1, `a CC cell on the (no task) row only (t-1 is split; got ${JSON.stringify(segs.filter((x) => /CC/.test(x)))})`);
   const noTask = segs.indexOf("(no task)");
   check(/^XTS\s1\.00 est\. · 8%$/.test(segs[noTask + 2]) && segs[noTask + 3] === "CC 1.60 (1 of 1 session)", `est. then CC on the row (got ${JSON.stringify(segs.slice(noTask, noTask + 4))})`);
   await click(v, "costs-task-0"); await settle();
