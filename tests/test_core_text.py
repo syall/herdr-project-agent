@@ -100,8 +100,8 @@ class Orchestrator(unittest.TestCase):
                       "security is Must fix; a handoff may not narrow it. A fix round fixes only Must fix "
                       "findings; Recorded limits and Nits go on the card that asks to publish or merge, each "
                       "Recorded limit with its follow-up task, or for the person to accept. Stop rule: "
-                      "when a task reaches its round cap (low 2, normal 3, high 4) or two rechecks in a row "
-                      "find Must fix in the same area, start no further round: open a decision card (cut that "
+                      "when a task reaches its round cap (low 2, normal 3, high 4) with Must fix still open, or two "
+                      "rechecks in a row find Must fix in what you judge the same area, start no further round: open a decision card (cut that "
                       "area into a new task, record it as a limit, or one more round).", self.text)
 
     def test_t017_r1_handoff_states_bar(self):  # AC1.4
@@ -118,15 +118,52 @@ class Orchestrator(unittest.TestCase):
     def test_t017_r5_scope(self):  # AC5.1-5.3
         self.assertIn("- Scope: the handoff lists the requirements the job builds. A requirement that appears "
                       "after the build starts, from the person, from a finding outside the must-fix bar, or "
-                      "from you, becomes a new task. When the person asks for one mid-task, open a card with "
+                      "from you, becomes a new task, unless the person chooses on a card to widen this one. When the person asks for one mid-task, open a card with "
                       '"New task" recommended and "Add to this task" as the other option.', self.text)
 
     def test_t017_r8_gate_before_check(self):  # AC8.1
-        gates = flat(section(self.raw, "## Phases and gates"))
+        gates = flat(self.raw[self.raw.index("## Phases and gates"):self.raw.index("## Other Project Agents")])
         self.assertIn("Before a task leaves a phase, run `pa-gate <task-id> --phase <phase>`. When a build or "
-                      "fix worker reports, run `pa-gate <task-id> --phase plan` and `--phase build` before "
-                      "starting its check; a missing artifact goes back to that worker as a follow-up for its "
+                      "fix worker reports its build (not a plan-only report), run `pa-gate <task-id> --phase plan` "
+                      "and `--phase build` before starting its check and before closing that worker; a missing artifact goes back to that worker as a follow-up for its "
                       "own job.", gates)
+
+    # t-017 J2 (R2, R4, L2, L3, Nits) and J3 (R11)
+    def rounds(self):
+        return flat(self.raw[self.raw.index("- Rounds:"):self.raw.index("- One git worktree")])
+
+    def test_t017_r2_rechecks(self):  # AC2.1-2.5, G4, spec amendments B1, B2
+        self.assertIn("or one more round). The first check of a task is full: the whole change. A recheck after a "
+                      "fix gets the commit the previous check saw as its base: a fresh verifier on the diff from it "
+                      "to HEAD with one full suite run, and, for normal and high tier, a fresh reviewer on that diff "
+                      "when the fix changed anything but tests or docs. Normal and high tier: the review stays full "
+                      "until one full review finds no Must fix. High tier: the check right before the first card "
+                      "that asks to publish or merge is full. Any tier: a recheck is full when the fix touches files "
+                      "outside the previous fix's diff and outside the task's plan, rewrites more than half of a "
+                      "file the task changed, or follows a rebase with conflicts. The handoff names the base and "
+                      "says full or diff.", self.rounds())
+
+    def test_t017_r4_roles_and_tiers(self):  # AC4.1, AC4.2, AC4.4 (R10), L4, amendment B4
+        self.assertIn("- Roles: `design`, `build`, `verifier` (reports, never fixes), `reviewer` (fresh context, "
+                      "never the author of what it reviews) and `check` (low tier only: the verifier's and the "
+                      "reviewer's job in one fresh worker, never the author).", self.text)
+        workers = flat(self.raw[self.raw.index("## Workers"):self.raw.index("## Phases and gates")])
+        self.assertIn("- Checks by tier (`sdlc.md`): low tier gets one `check` worker; normal a verifier and a "
+                      "reviewer; high a verifier and two reviewers on its full checks. Size the verifier's brief by "
+                      "tier: low, the full suite once, the diff, at most 5 mutations on changed logic; normal, add a "
+                      "failing-first run for each fix commit, at most 15 mutations; high, what the plan's "
+                      "verification points ask. Until the gate accepts the `check` role, record a `check` worker in "
+                      "the ledger with role `reviewer`. - One git worktree", workers)
+
+    def test_t017_r11_round_fields(self):  # AC11.1, AC11.2
+        self.assertIn('"name": "t-003-tests", "round": 1, "started": "<UTC time>" }', self.text)
+        self.assertIn('"name": "t-003-fix", "round": 2, "started": "<UTC time>",', self.text)
+        self.assertIn("On a line about a worker, add `worker` (its address), `round` (the task's round), and for a "
+                      "verifier, reviewer or check worker `check` (`full` or `diff`).", self.text)
+
+    def test_t017_nit_fails_twice(self):  # REVIEW J1 N2
+        self.assertIn("If a worker fails twice at the same step, stop retrying: open a decision card or park the "
+                      "task (a task's rounds have their own stop rule, see Rounds).", self.text)
 
     def test_safety_unchanged(self):
         self.assertEqual(section(self.raw, "## Safety"), ORCHESTRATOR_SAFETY)
@@ -149,8 +186,6 @@ class Worker(unittest.TestCase):
                       "merge), **Recorded limit** (real, but not Must fix; name a "
                       "follow-up) or **Nit**, and end the file with `Verdict: pass` or `Verdict: must fix (<n>)`.",
                       self.text)
-        self.assertIn("write `VERIFY.md`, and report. Never fix anything. On a recheck the handoff names a base "
-                      "commit: check the diff from it to HEAD.", self.text)
         self.assertIn("compliance with `spec.md` and `plan.md`, and write `REVIEW.md`. On a diff recheck, review "
                       "the diff from the base commit the handoff names.", self.text)
         self.assertNotIn("Important or Nit", self.text)
@@ -160,6 +195,32 @@ class Worker(unittest.TestCase):
         rules = flat(self.raw[self.raw.index("## Rules of the job"):self.raw.index("## Roles")])
         self.assertIn("- Before you report, stop every background command you started (a watcher, a server, a "
                       "background shell): your session must go idle, or it cannot be closed.", rules)
+
+    # t-017 J2 (L1, R4, R6)
+    def test_t017_l1_verifier_diff_recheck(self):
+        self.assertIn("write `VERIFY.md`, and report. Never fix anything. On a diff recheck the handoff names a "
+                      "base commit: check the diff from it to HEAD.", self.text)
+        self.assertNotIn("On a recheck the handoff", self.text)
+
+    def test_t017_r4_check_role(self):  # AC4.1, L4
+        roles = flat(self.raw[self.raw.index("## Roles"):self.raw.index("## Verification")])
+        self.assertIn("On a diff recheck, review the diff from the base commit the handoff names. - **check** (low "
+                      "tier only): fresh context, never the author. One worker does the verifier's and the "
+                      "reviewer's job and writes both `VERIFY.md` and `REVIEW.md`. - Verifiers, reviewers", roles)
+
+    def test_t017_r6_one_suite_run(self):  # AC6.1, AC6.2 (Q3)
+        verification = flat(self.raw[self.raw.index("## Verification"):self.raw.index("## Safety")])
+        self.assertIn("- Run the full test suite once per round with `pa-full-suite`; it appends the output to your "
+                      "task's `build.log`. A verifier or check worker runs it at HEAD and no other suite-wide run at "
+                      "that commit (not `--affected`, not the suite's own script); re-run single tests only (a "
+                      "failing-first check, a mutation). Builders: high tier, run it at the end of the Test phase, "
+                      "before the commit; low and normal tier, the affected tests are enough, the verifier's run is "
+                      "the round's.", verification)
+        self.assertNotIn("Run the full test suite once, at the end of the Test phase", self.text)
+
+    def test_t017_nit_lines_wrapped(self):  # VERIFY J1 recheck N1
+        long = [line for line in self.raw.splitlines() if len(line) > 95]
+        self.assertEqual(long, [])
 
     def test_safety_unchanged(self):
         self.assertEqual(section(self.raw, "## Safety"), WORKER_SAFETY)
@@ -173,6 +234,22 @@ class Sdlc(unittest.TestCase):  # t-017 J1 (R1)
                       "accept) |", text)
         self.assertNotIn("merge card", text)  # J1 fix M2
         self.assertNotIn("Important findings", text)
+
+    # t-017 J2 (R2, R4, R6; amendments B1, B3)
+    def test_t017_r2_r6_test_row(self):
+        text = flat(read("runtime", "core", "sdlc.md"))
+        self.assertIn("| test | Affected tests until green; the full suite once per round (the verifier's run; high "
+                      "tier, the builder's too) | Build workers, then a verifier, or for low tier a `check` worker "
+                      "(from the second round, on the fix's diff unless Rounds asks for a full check) |", text)
+
+    def test_t017_r4_tier_column(self):
+        text = flat(read("runtime", "core", "sdlc.md"))
+        self.assertIn("| Tier | Example | Plan approval | Human reviewers before publishing | Agent checks |", text)
+        self.assertIn("still a publish decision card | One `check` worker; rechecks on the diff; round cap 2 |", text)
+        self.assertIn("| One | A verifier and a reviewer; reviews full until one is clean; round cap 3 |", text)
+        self.assertIn("| Two | A verifier and two reviewers; the check before the first card that asks to publish "
+                      "or merge is full; round cap 4 |", text)
+        self.assertIn("`REVIEW.md` by a worker other than the author (for low tier, a `check` worker counts)", text)
 
 
 class Docs(unittest.TestCase):  # AC6.1
