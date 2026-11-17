@@ -274,7 +274,8 @@ class AC5JoinedLines(GuardTest):
         self.assertTrue(guard.involves(["/usr/bin/git", "status"]))
         self.assertTrue(guard.involves(["xargs", "gh"]))
         self.assertFalse(guard.involves(["cat", ".git/HEAD"]))
-        self.assertFalse(guard.involves(["git-lfs", "ls-files"]))
+        self.assertTrue(guard.involves(["git-lfs", "ls-files"]))  # fix round 2: a dashed git program is git
+        self.assertFalse(guard.involves(["cat", "docs/git-guide.md"]))
         self.assertFalse(guard.involves(["echo", "see github.com"]))
 
 
@@ -506,7 +507,8 @@ class AC10Unchanged(unittest.TestCase):
 # ---- Allowlist guard fix round: each case makes the guard stricter -------------------------------------
 # Finding ids: reviewer 1 #n (REVIEW.md), reviewer 2 In/Mn (REVIEW-2.md), verifier Fn (VERIFY.md).
 
-GUARD_UNAVAILABLE_WORDS = ["guard unavailable", "report", "Project Agent", "There is no override"]
+GUARD_UNAVAILABLE_WORDS = ["guard unavailable", "report", "Project Agent", "There is no override",
+                           "hc send is refused too", "last message"]  # fix round 2: REVIEW-4 M1
 
 
 def load_hooks_copy(folder):
@@ -919,6 +921,297 @@ class FixI_BashPaths(GuardTest):
         for command in ["git status", "ls", "echo x > " + os.path.join(evidence, "a.md"), "cat " + os.path.join(evidence, "a.md")]:
             with self.subTest(command=command):
                 self.assertEqual(HookGuard.run_hook(self, "Bash", {"command": command})[0], 0)
+
+
+# ---- Fix round 2 -----------------------------------------------------------------------------------
+# A user home (HOME is patched to it) holding the Project Agent's home at ~/.config/herdr-pa, and a worktree beside it.
+
+class Round2(GuardTest):
+    def setUp(self):
+        super().setUp()
+        self.user = os.path.join(TMP, "r2user")
+        self.home = os.path.join(self.user, ".config", "herdr-pa")
+        self.spaces = os.path.join(self.home, "spaces")
+        self.space = os.path.join(self.spaces, "sp1")
+        self.evidence = os.path.join(self.space, "evidence")
+        self.wt = os.path.join(self.user, "work", "wt")
+        for d in [os.path.join(self.evidence, "t-x"), os.path.join(self.wt, ".git"), os.path.join(self.wt, "src"),
+                  os.path.join(self.wt, ".claude")]:
+            os.makedirs(d, exist_ok=True)
+        for f in [os.path.join(self.wt, "src", "a.py"), os.path.join(self.wt, "b.py"), os.path.join(self.space, "ledger.json"),
+                  os.path.join(self.home, "config.json"), os.path.join(self.wt, ".claude", "pa-task.json")]:
+            open(f, "a").close()
+        patcher = mock.patch.dict(os.environ, {"HOME": self.user, "HERDR_PA_HOME": self.home})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def r2(self, line, cwd=None):
+        return self.check(line, cwd=cwd or self.wt, spaces_dir=self.spaces, home=self.home)
+
+    def fill(self, line):
+        # {name} placeholders only; other braces are shell text
+        for name in ("user", "home", "spaces", "space", "evidence", "wt"):
+            line = line.replace("{" + name + "}", getattr(self, name))
+        return line
+
+    def assert_path_refused(self, lines):
+        for line in lines:
+            line = self.fill(line)
+            with self.subTest(line=line):
+                message = self.r2(line)
+                self.assertIsNotNone(message, line)
+                self.assertIn("names a path inside a .git folder or the Project Agent's home", message)
+
+    def assert_allowed(self, lines):
+        for line in lines:
+            line = self.fill(line)
+            with self.subTest(line=line):
+                self.assertIsNone(self.r2(line), line)
+
+
+class R2a_Exclusions(Round2):
+    """(a) card d-046 'Both': a .git word that names what to skip is not counted; the home still is."""
+
+    def test_exclusions_allowed(self):
+        self.assert_allowed([
+            "grep -rn foo . --exclude-dir=.git", "grep -rn foo --exclude-dir .git .", "grep -rn foo . --exclude=.git",
+            "grep -rn foo . --exclude-dir=.git > /tmp/hits", "find . -path ./.git -prune -o -name x -print",
+            "find . -name .git -prune -o -print", "find . -type d -name .git -prune -o -type f -print",
+            "find . -not -path '*/.git/*' -name x", "find . ! -path './.git/*'", "find . -not -path '*/.git/*' | head",
+            "tar --exclude=.git -cf /tmp/x.tar .", "rsync -a --exclude .git . /tmp/x", "pytest --ignore=.git",
+            "python3 -m pytest --ignore=.git > out.log 2>&1", "rg foo -g '!.git'", "git grep foo", "rg foo",
+        ])
+
+    def test_still_refused(self):
+        self.assert_path_refused([
+            "find . -path ./.git/config", "find . -name .git -print", "cat .git/config --exclude=x",
+            "grep --exclude-from=.git/info/exclude foo .", "rg --ignore-file .git/info/exclude foo",
+            "grep -rn foo . --exclude-dir={home}", "tar --exclude={space}/ledger.json -cf /tmp/x.tar {space}/ledger.json",
+            "find . -path .git -o -print",
+        ])
+
+
+class R2b_UnknownFolderAndQuotes(Round2):
+    """(b) REVIEW-3 I1, REVIEW-4 M2, VERIFY-2 F1/F4: R11 is complete for relative and quoted paths."""
+
+    def test_folder_unknown(self):
+        self.assert_path_refused([
+            "cd ~ ; cat .config/herdr-pa/spaces/sp1/ledger.json", "pushd ~ ; cat .config/herdr-pa/config.json",
+            "cd - && cat ../.config/herdr-pa/config.json", "popd; cat spaces/sp1/ledger.json",
+            "cd ~ ; cat .config/herdr-pa/config.json > /tmp/x", "cd {user}/.config && cat herdr-pa/spaces/sp1/ledger.json > /tmp/o",
+            "cd {user}/.config; cat herdr-pa/spaces/sp1/ledger.json", "builtin cd ~ && cat .config/herdr-pa/config.json",
+            "bash -c 'cd ~; cat .config/herdr-pa/config.json'", "cd src; cat a.py", "cd src || cat ../../../.config/herdr-pa/config.json",
+            "eval cd ~; cat .config/herdr-pa/config.json", "source x.sh && cat .config/herdr-pa/config.json",
+        ])
+
+    def test_folder_known_still_works(self):
+        self.assert_allowed([
+            "cd src && cat a.py", "cd src && make > build.log 2>&1", "cd src && python3 -m unittest > out 2>&1",
+            "cd {wt} && git status", "cd src && git status && git checkout feature", "make test > build.log 2>&1",
+        ])
+
+    def test_known_cd_then_or_makes_the_folder_unknown(self):  # VERIFY-2 F3 (mutation M31)
+        self.assertIsNotNone(self.r2("cd src && git status || git checkout feature"))
+        self.assertIsNotNone(self.r2("cd src && git status ; git checkout feature"))
+        self.assertIsNone(self.r2("cd src && git status && git checkout feature"))
+
+    def test_quotes_and_variables(self):
+        self.assert_path_refused([
+            'cat "$HOME"/.config/herdr-pa/spaces/sp1/ledger.json', 'cat "${HOME}"/.config/herdr-pa/spaces/sp1/ledger.json',
+            "cat $HOME/.config/herdr-pa/config.json | head", "cat ${HOME}/.config/herdr-pa/config.json | head",  # VERIFY-2 F3 M19
+            "cat $HERDR_PA_HOME/spaces/sp1/ledger.json | head", 'cat "${HERDR_PA_HOME}/config.json" > /tmp/x',
+            "cat ~/.config/herdr-pa/config.json > /tmp/x", "cat .gi''t/config > /tmp/x", "cat .g\\it/config > /tmp/x",
+            'cat ".git"/config | head', "cat $'\\x2egit/config' | head", 'echo "$(cat .git/config)" > /tmp/x',
+            "cat ${PWD}/../../.config/herdr-pa/config.json > /tmp/x", "cat `echo x` .git/HEAD",
+            "cat ~/.config/herdr-pa/config.json", "cat ~/.config/herdr-pa/spaces/sp1/../sp1/ledger.json",
+        ])
+
+    def test_globs(self):
+        self.assert_path_refused([
+            "cat .gi?/config > /tmp/x", "cat .g*/HEAD | head", "cp x .g*t/hooks/pre-commit", "ls -la .git* > /tmp/x",
+            "cat .[g]it/config | head", "cat .{g,x}it/config > /tmp/x", "cat {.git,x}/config > /tmp/x",
+            "cat {home}/sp*/sp1/ledger.json > /tmp/x", "cat {user}/.config/*/config.json > /tmp/x",
+            "cat {space}/*.json > /tmp/x", "cat {spaces}/*/ledger.json > /tmp/x", "shopt -s dotglob; cat */config > /tmp/x",
+            "cat *(D) > /tmp/x", "ls .* > /tmp/x", "cat .claude/pa-task.jso? > /tmp/x",
+        ])
+
+    def test_globs_allowed(self):
+        self.assert_allowed([
+            "ls *.py > files.txt", "cat src/*.py | wc -l > n.txt", "ls * > /tmp/x", "wc -l src/* > /tmp/x",
+            "cat {evidence}/*/note.md > /tmp/x", "ls {evidence}/t-x/* > /tmp/x", "echo '*' > /tmp/x",
+            "grep -E '.*' b.py > /tmp/x", "sed 's/.*//' b.py > /tmp/x", "echo '$HOME is set' > /tmp/x",
+        ])
+
+    def test_ordinary_work_still_passes(self):
+        self.assert_allowed([
+            "git status", "git diff --stat HEAD~1", "git add src/a.py", "git commit -m 'fix'", "tests/run-all.sh --affected",
+            "tests/run-all.sh --affected > /tmp/x 2>&1", "pa-full-suite", "echo x > {evidence}/t-x/n.md",
+            'cat "{evidence}/t-x/n.md" | head', "ls {evidence}/t-x/", "PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_x.py",
+            "export PATH=/usr/bin:$PATH && make", "env FOO=1 make", "cat .gitignore", "ls .github", "cat .gitignore > /tmp/x",
+            "ls .github/workflows | head", "hc send pa1 'done: {evidence}/t-x/n.md'",
+        ])
+
+    def test_message_and_hc_texts_are_not_paths(self):  # REVIEW-3 N1
+        self.assert_allowed([
+            "git commit -m '.git/hooks are protected'", "hc send pa1 '.git/config is unchanged'", "git commit -am '.git/x'",
+            "git stash push -m '.git note'", "git merge -m '.git' feature",
+        ])
+        self.assert_path_refused(["git commit -F .git/COMMIT_EDITMSG", "echo '.git/hooks are protected' > .git/x"])
+
+
+class R2b_TaskRecord(Round2):
+    """(e) REVIEW-3 M3: the task record and the hook settings are protected like .git."""
+
+    def test_bash(self):
+        self.assert_path_refused(["cat .claude/pa-task.json", "echo x > .claude/pa-task.json", "rm .claude/pa-task.json",
+                                  "cat .claude/settings.local.json", "cd .claude && cat pa-task.json",
+                                  "cp x {wt}/.claude/pa-task.json"])
+        self.assert_allowed(["ls .claude", "cat .claude/settings.json"])
+
+    def test_editor(self):
+        for path in [os.path.join(self.wt, ".claude", "pa-task.json"), os.path.join(self.wt, ".claude", "settings.local.json"),
+                     os.path.join(self.wt, ".claude", "PA-TASK.json")]:
+            with self.subTest(path=path):
+                self.assertIsNotNone(guard.check_edit(path, self.spaces, cwd=self.wt, home=self.home))
+        self.assertIsNone(guard.check_edit(os.path.join(self.wt, "src", "a.py"), self.spaces, cwd=self.wt, home=self.home))
+
+
+VARIABLE_WORDS = ["sets a git or gh variable", "report", "Project Agent", "There is no override"]
+
+
+class R2c_GitVariables(Round2):
+    """(c) REVIEW-3 I2, REVIEW-4 M3: a command that sets GIT_* or GH_* is refused."""
+
+    def test_refused(self):
+        for line in ["export GIT_CONFIG_COUNT=1 && export GIT_CONFIG_KEY_0=core.fsmonitor && export GIT_CONFIG_VALUE_0=x && git status",
+                     "export GIT_DIR=/tmp/x && git status", "GIT_SSH_COMMAND=x make", "env GIT_DIR=x make",
+                     "GH_REPO=a/b gh pr view 1", "export gh_token=x", "declare -x GIT_WORK_TREE=/tmp", "typeset GIT_PAGER=cat",
+                     "local GIT_X=1", "readonly GH_HOST=x", "set GIT_X=1", "export GIT_DIR", "export -n Git_Dir",
+                     "if true; then GIT_DIR=x git status; fi", "GIT_DIR=x; git status", "GIT_X+=y make",
+                     "export GIT_PAGER='git push origin HEAD'; git log", "export GIT_DIR=$(mktemp -d) && git status",
+                     "GIT_EDITOR=vi make > out", "builtin export GIT_DIR=x"]:
+            with self.subTest(line=line):
+                message = self.r2(line)
+                self.assertIsNotNone(message, line)
+                for words in VARIABLE_WORDS:
+                    self.assertIn(words, message)
+
+    def test_values_naming_git_involve_git(self):
+        for line in ["export PAGER='git push origin HEAD'", "EDITOR='gh pr create' make", "export LESSOPEN='|hc run x'"]:
+            with self.subTest(line=line):
+                self.assertIsNotNone(self.r2(line), line)
+
+    def test_allowed(self):
+        self.assert_allowed(["export FOO=1 && make", "env FOO=bar make", "export GITHUB_WORKSPACE_X=1", "make CC=gcc",
+                             "git commit -m 'GIT_DIR=x is bad'", "echo GIT_DIR > /tmp/x", "python3 x.py --tool=git"])
+
+
+class R2e_DashedAndWrappers(Round2):
+    """(e) REVIEW-3 M4, VERIFY-2 F2: git-<cmd> programs, csh, tcsh, fish, watch and env -S."""
+
+    def test_refused(self):
+        for line in ["git-push origin x", "/Library/Developer/CommandLineTools/usr/libexec/git-core/git-push origin HEAD",
+                     "git-lfs push origin x", "xargs git-push", "GIT-PUSH origin x", "csh -c 'git push'", "tcsh -c 'git push'",
+                     "/bin/tcsh -c 'git push'", "echo 'git push' | csh", "env -S 'git push origin x'", "env -S'git push'",
+                     "env --split-string='git push'", "fish -c 'git push'", "watch 'git push'", "git-push origin x > /tmp/o"]:
+            with self.subTest(line=line):
+                self.assertIsNotNone(self.r2(line), line)
+
+    def test_allowed(self):
+        self.assert_allowed(["cat docs/git-guide.md", "env | sort", "ls -la"])
+
+
+class R2e_NeverAdd(AC8ProfileRows):
+    """(e) REVIEW-3 M1: more rows can never be added."""
+
+    def test_more_rows_are_ignored(self):
+        for command in [["git", "subtree"], ["git", "subtree", "push"], ["git", "credential-osxkeychain"],
+                        ["git", "credential-store"], ["git", "credential-cache"], ["git", "Credential-Store"],
+                        ["git", "maintenance"], ["git", "lfs", "install"], ["git", "lfs", "uninstall"], ["git", "lfs", "lock"],
+                        ["git", "lfs", "unlock"], ["git", "receive-pack"], ["git", "upload-pack"], ["git", "shell"],
+                        ["git", "cvsserver"], ["hc", "run"], ["hc", "kill"], ["hc", "rm"], ["hc", "interrupt"]]:
+            with self.subTest(command=command):
+                rows, note = self.rows([{"command": command, "args": "any"}])
+                self.assertEqual(rows, [])
+                self.assertIn(" ".join(command), note)
+
+    def test_lfs_pull_still_added(self):
+        rows, note = self.rows([{"command": ["git", "lfs", "pull"], "args": "any"}])
+        self.assertEqual((len(rows), note), (1, ""))
+
+
+class R2_Fast(Round2):
+    """AC9 with distinct words (REVIEW-4 N6), in a plain line and in a line whose folder is unknown."""
+
+    def timed(self, line):
+        times = []
+        for _ in range(100):
+            start = time.perf_counter()
+            self.assertIsNone(self.r2(line))
+            times.append(time.perf_counter() - start)
+        return statistics.median(times)
+
+    def test_plain_distinct_words(self):
+        line, n = "", 0
+        while len(line) < 2000:
+            line += "cat src/f{0}.py docs/d{0}/n{0}.md && ".format(n)
+            n += 1
+        self.assertLess(self.timed(line + "true"), 0.010)
+
+    def test_unknown_folder_distinct_words(self):
+        line, n = "cd src; ", 0
+        while len(line) < 2000:
+            line += "cat {0}/evidence/t-x/f{1}.md > /tmp/o{1}; ".format(self.evidence, n)
+            n += 1
+        self.assertLess(self.timed(line + "true"), 0.010)
+
+
+class R2_Hook(unittest.TestCase):
+    """(d) REVIEW-4 M1, (e) REVIEW-3 M5, REVIEW-3 N3 / REVIEW-4 N4: through pa_hooks.hook_guard."""
+
+    @classmethod
+    def setUpClass(cls):
+        HookGuard.setUpClass.__func__(cls)
+        cls.elsewhere = os.path.join(TMP, "r2-elsewhere")
+        os.makedirs(cls.elsewhere, exist_ok=True)
+        open(os.path.join(cls.wt, "only-in-root.py"), "a").close()
+
+    def call(self, tool, tool_input, cwd, env=None):
+        err = io.StringIO()
+        data = {"tool_name": tool, "tool_input": tool_input, "cwd": cwd}
+        with mock.patch.dict(os.environ, dict({"HC_TERMINAL_ID": OWN}, **(env or {}))), contextlib.redirect_stderr(err):
+            try:
+                code = pa_hooks.hook_guard(data, [])
+            except SystemExit as e:
+                code = e.code
+        return code, err.getvalue()
+
+    def test_unavailable_message(self):
+        for words in GUARD_UNAVAILABLE_WORDS:
+            self.assertIn(words, pa_hooks.GUARD_UNAVAILABLE)
+
+    def test_malformed_input_is_refused(self):
+        for data in [{}, {"tool_input": {"command": "git push"}}]:
+            with self.subTest(data=data), contextlib.redirect_stderr(io.StringIO()) as err:
+                with self.assertRaises(SystemExit) as caught:
+                    pa_hooks.hook_guard(data, [])
+                self.assertEqual(caught.exception.code, 2)
+                self.assertIn("guard unavailable", err.getvalue())
+
+    def test_the_hook_does_not_assume_its_folder(self):  # REVIEW-3 M5
+        env = {"CLAUDE_PROJECT_DIR": self.wt}
+        # the reported folder has no task record, but the project folder has: the Project Agent's address still applies
+        self.assertEqual(self.call("Bash", {"command": "hc send w9 'done'"}, self.elsewhere, env)[0], 2)
+        self.assertEqual(self.call("Bash", {"command": "hc send pa1 'done'"}, self.elsewhere, env)[0], 0)
+        # a file in the project folder is not checked out over, whichever folder the hook was given
+        self.assertEqual(self.call("Bash", {"command": "git checkout only-in-root.py"}, self.elsewhere, env)[0], 2)
+        self.assertEqual(self.call("Bash", {"command": "git checkout feature"}, self.elsewhere, env)[0], 0)
+
+    def test_task_record_through_the_hook(self):
+        record = os.path.join(self.wt, ".claude", "pa-task.json")
+        self.assertEqual(self.call("Bash", {"command": "cat .claude/pa-task.json"}, self.wt)[0], 2)
+        self.assertEqual(self.call("Write", {"file_path": record}, self.wt)[0], 2)
+        self.assertEqual(self.call("Read", {"file_path": record}, self.wt)[0], 0)
 
 
 def tearDownModule():
