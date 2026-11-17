@@ -55,7 +55,8 @@ def _load_guard():
 
 # Card d-038 ("Block"): when the guard cannot load or its check fails, the call is refused, not let through.
 GUARD_UNAVAILABLE = ("Refused by the Project Agent's guard: guard unavailable ({}). Commands and edits cannot be checked, "
-                     "so they do not run. Stop and report this to the Project Agent; it repairs the guard. There is no override.")
+                     "so they do not run: hc send is refused too. Stop and report this to the Project Agent by saying so as your "
+                     "last message; it repairs the guard. There is no override.")
 EDIT_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
 
 TASK_FILE = os.path.join(".claude", "pa-task.json")
@@ -243,13 +244,29 @@ def hook_test_lock(data, _args):
 def hook_guard(data, args):
     """The guard fails closed: anything that goes wrong in it refuses the call (block() exits through SystemExit)."""
     try:
+        if not isinstance(data, dict) or not data.get("tool_name"):
+            # Malformed or empty hook input (hook_input gives {}): nothing can be checked, so nothing runs.
+            raise ValueError("no tool call in the hook input")
         return _hook_guard(data, args)
     except Exception as e:  # noqa: BLE001 - card d-038: every failure refuses
         block(GUARD_UNAVAILABLE.format("{}: {}".format(type(e).__name__, e)[:200]))
 
 
+def guard_folders(data):
+    """The folders a tool call may run in, and the task record (REVIEW-3 M5: the hook does not assume that its cwd is
+    the Bash tool's folder). Tried in order: the reported cwd, the project folder, the hook's own folder; the first
+    task record found wins, and its worktree root is one more folder."""
+    candidates = [data.get("cwd"), os.environ.get("CLAUDE_PROJECT_DIR"), os.getcwd()]
+    candidates = [c for c in dict.fromkeys(candidates) if c]
+    for folder in candidates:
+        record, agent, profile = hook_context(dict(data, cwd=folder))
+        if record:
+            return candidates + [record["root"]], (record, agent, profile)
+    return candidates, hook_context(data)
+
+
 def _hook_guard(data, _args):
-    record, agent, profile = hook_context(data)
+    starts, (record, agent, profile) = guard_folders(data)
     tool, tool_input = data.get("tool_name"), data.get("tool_input") or {}
     extra_commands = [(p, "a release tool ({} profile)".format(profile.get("name"))) for p in (profile or {}).get("releaseTools", [])]
     extra_paths = [(p, "a secret ({} profile)".format(profile.get("name"))) for p in (profile or {}).get("secretPaths", [])]
@@ -270,7 +287,7 @@ def _hook_guard(data, _args):
         pa_guard = _load_guard()
         refusal = pa_guard.check_command(command, pa_address=(agent or {}).get("terminal"),
                                          own_address=os.environ.get("HC_TERMINAL_ID"),
-                                         extra_rows=lambda: pa_guard.profile_rows(profile), cwd=data.get("cwd"),
+                                         extra_rows=lambda: pa_guard.profile_rows(profile), cwd=starts,
                                          spaces_dir=os.path.join(pa.ROOT, "spaces"), home=pa.ROOT)
         if refusal:
             block(refusal)
@@ -280,7 +297,7 @@ def _hook_guard(data, _args):
             if path and re.search(pattern, path):
                 block("Blocked by the Project Agent safety hook: {} ({}). {}".format(what, path, ROUTE))
         if tool in EDIT_TOOLS:
-            refusal = _load_guard().check_edit(path, os.path.join(pa.ROOT, "spaces"), cwd=data.get("cwd"), home=pa.ROOT)
+            refusal = _load_guard().check_edit(path, os.path.join(pa.ROOT, "spaces"), cwd=starts, home=pa.ROOT)
             if refusal:
                 block(refusal)
     return 0

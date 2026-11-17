@@ -12,10 +12,15 @@ the address to report to.
 - Write your evidence into `evidence/<task-id>/` in the orchestrator's state folder,
   and nowhere else in that folder. Never edit the ledger, the journal, decisions or rules.
 - Commands that involve git, gh or hc are limited to the allowlist in `pa_guard.py`;
-  anything else is refused: report it to the Project Agent. If the guard says it is
-  unavailable, nothing runs: stop, and say so as your last message. Commands that
-  name a path inside `.git` or the Project Agent's home are refused, reads included:
-  read git state with git commands, and write only into your evidence folder.
+  anything else is refused: report it to the Project Agent. A bare `git` word counts
+  too (`grep 'git' notes.md`): use the editor's search tool. If the guard says it is
+  unavailable, no Bash command runs, `hc send` included: stop, and say so as your last
+  message. Commands that name a path inside `.git`, the Project Agent's home or
+  `.claude/pa-task.json` are refused, reads included: read git state with git
+  commands, and write only into your evidence folder (reading it stays allowed).
+  Search with `git grep` or `rg`, which skip `.git` by themselves. Join `cd` with
+  `&&`, not `;`; run `pa-full-suite` by name, not by path; do not set `GIT_*` or
+  `GH_*` variables.
 - Report with `hc send <address from the handoff> "<result or blocker, with file paths>"`
   when you are done or stuck. Long answers go in a file; send its path.
 - You are started for one job. After your report the orchestrator reads your evidence

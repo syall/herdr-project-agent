@@ -4,15 +4,18 @@ A worker may run the ordinary build, file and text tools freely, and git, gh and
 ALLOWLIST below allow. Anything else that involves git, gh or hc is refused, so that publishing and
 repository settings stay with the person and the Project Agent. Edits inside a .git folder and to the
 Project Agent's decision files are refused too. Everything here runs in-process: no subprocess, no files
-read except to resolve links and to see whether a `git checkout` word names an existing path.
+read except to resolve links, to see whether a `git checkout` / `git restore` word names an existing path, and
+to list the folders a glob word could expand in (R11c).
 
-  check_command(line, pa_address, own_address, extra_rows, cwd)  -> None (allowed) or the refusal message
-  check_edit(path, spaces_dir, cwd)                               -> None (allowed) or the refusal message
+  check_command(line, pa_address, own_address, extra_rows, cwd, spaces_dir, home) -> None (allowed) or the refusal
+  check_edit(path, spaces_dir, cwd, home)                                           -> None (allowed) or the refusal
   profile_rows(profile)                                           -> the profile's "guardAllow" rows, checked
 
 This is a fence for agents that follow their rules, not a sandbox: a program the worker writes itself can
 still start git. The rules it backs are in worker.md.
 """
+import fnmatch
+import itertools
 import os
 import re
 import shlex
@@ -30,6 +33,10 @@ PROTECTED_PATH = ("Refused by the Project Agent's allowlist: {} names a path ins
                   "home. Read git state with git commands (git status, git log, git show, git config --get), and write "
                   "only into your evidence folder. If that is not enough, stop and report this to the Project Agent "
                   "with hc send. There is no override.")
+# R12 (fix round 2): a variable that changes what git or gh do.
+VARIABLE = ("Refused by the Project Agent's allowlist: {} sets a git or gh variable (GIT_*, GH_*), which changes what the "
+            "allowed git and gh commands do. Run the command without it. If it is needed, stop and report this to the "
+            "Project Agent with hc send. There is no override.")
 SHOWN = 300  # longest command or path quoted back in a message
 
 
@@ -142,14 +149,25 @@ def program(word):
     return word.rstrip("/").rsplit("/", 1)[-1].lower()
 
 
+DASHED = re.compile(r"^git-[a-z0-9][a-z0-9-]*$")  # git-push, git-lfs: git's own programs, run without git
+
+
+def is_name(word):
+    p = program(word)
+    return p in NAMES or bool(DASHED.match(p))
+
+
 def involves(words):
-    """A word is git, gh or hc, or a path whose last part is one of them, in any case."""
-    return any(program(w) in NAMES for w in words)
+    """A word is git, gh or hc, or a path whose last part is one of them or a dashed git program, in any case.
+    A NAME=value word whose value names git, gh or hc counts too (PAGER='git push')."""
+    return any(is_name(w) or (ASSIGN.match(w) and involves_text(w.split("=", 1)[1])) for w in words)
 
 
-WHOLE_WORD = re.compile(r"(?<![\w.-])(git|gh|hc)(?![\w.-])", re.IGNORECASE)
-# A shell started with text to run, or eval: its quoted text is a command line of its own.
-WRAPPERS = ("sh", "bash", "zsh", "dash", "ksh", "eval")
+WHOLE_WORD = re.compile(r"(?<![\w.-])(git|gh|hc|git-[a-z0-9-]*[a-z0-9])(?![\w.-])", re.IGNORECASE)
+# A shell started with text to run, or eval: its quoted text is a command line of its own. env -S splits its text too.
+WRAPPERS = ("sh", "bash", "zsh", "dash", "ksh", "csh", "tcsh", "fish", "watch", "eval")
+SPLIT_STRING = re.compile(r"^(-[A-Za-z]*S|--sp)")
+ASSIGN = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)(\[[^\]]*\])?\+?=")
 
 
 def involves_text(line):
@@ -159,8 +177,17 @@ def involves_text(line):
 
 
 def wraps(commands):
-    """A plain line runs a shell or eval somewhere (sh -c '...', echo '...' | sh, env bash -c, eval '...')."""
-    return any(program(w) in WRAPPERS for words in commands for w in words)
+    """A plain line runs a shell or eval somewhere (sh -c '...', echo '...' | sh, env bash -c, eval '...', env -S '...')."""
+    for words in commands:
+        for k, w in enumerate(words):
+            if program(w) in WRAPPERS or (program(w) == "env" and any(SPLIT_STRING.match(a) for a in words[k + 1:])):
+                return True
+    return False
+
+
+def wrapped_text(word):
+    """The text a wrapper runs, without an env -S prefix (-S'git push' is the text 'git push')."""
+    return re.sub(r"^(-[A-Za-z]*S|--split-string=)", "", word)
 
 
 # ---- R6: the table -------------------------------------------------------------------------------
@@ -187,13 +214,13 @@ def explicit_path(a):
 
 
 def file_path(a, cwd):
-    """A path named explicitly that is not a folder: no ~, not only . and .. parts, and not an existing folder in cwd.
-    With the folder unknown (None), nothing counts."""
+    """A path named explicitly that is not a folder: no ~, not only . and .. parts, and not an existing folder in any
+    folder the command may run in (cwd: a tuple). With the folder unknown (None), nothing counts."""
     if not explicit_path(a) or a.startswith("~") or cwd is None:
         return False
     if all(part in ("", ".", "..") for part in os.path.normpath(a).split(os.sep)):
         return False
-    return not os.path.isdir(os.path.join(cwd, a))
+    return not any(os.path.isdir(os.path.join(c, a)) for c in cwd)
 
 
 def opt_name(a):
@@ -267,7 +294,7 @@ def checkout_args(args, ctx):
     if len(args) != 1 or not no_pathspec(args[0]):
         return False
     cwd = ctx.get("cwd")
-    return cwd is not None and not os.path.lexists(os.path.join(cwd, os.path.expanduser(args[0])))
+    return cwd is not None and not any(os.path.lexists(os.path.join(c, os.path.expanduser(args[0]))) for c in cwd)
 
 
 def add_args(args, ctx):
@@ -482,6 +509,12 @@ NEVER_ADD = [
     ("gh", "label"), ("gh", "cache"), ("gh", "project"), ("gh", "ssh-key"), ("gh", "gpg-key"), ("gh", "codespace"),
     ("gh", "org"), ("gh", "agent-task"),
     ("hc", "send"),
+    # fix round 2 (REVIEW-3 M1): publishing a subtree, stored secrets, global config and schedules, lock state on the
+    # server, serving a repository, and starting or stopping other agents. Any git credential-<helper> is refused too.
+    ("git", "subtree"), ("git", "maintenance"), ("git", "lfs", "install"), ("git", "lfs", "uninstall"),
+    ("git", "lfs", "lock"), ("git", "lfs", "unlock"), ("git", "receive-pack"), ("git", "upload-pack"), ("git", "shell"),
+    ("git", "cvsserver"),
+    ("hc", "run"), ("hc", "kill"), ("hc", "rm"), ("hc", "interrupt"),
 ]
 ADDED_SHAPES = {"any": any_args, "none": no_args}
 
@@ -512,7 +545,9 @@ def profile_rows(profile, err=None):
             print("pa-hook guard: ignored a guardAllow row in profile {}: {} names an option; rows name subcommands "
                   "only".format(name, " ".join(command)), file=err)
             continue
-        if any(command[:len(never)] == never or never[:len(command)] == command for never in NEVER_ADD):
+        low = tuple(w.lower() for w in command)
+        if (any(low[:len(never)] == never or never[:len(low)] == low for never in NEVER_ADD)
+                or (low[0] == "git" and len(low) > 1 and low[1].startswith("credential"))):
             print("pa-hook guard: ignored a guardAllow row in profile {}: {} can never be added".format(
                 name, " ".join(command)), file=err)
             continue
@@ -540,27 +575,55 @@ def allowed(words, rows, ctx):
     return False
 
 
-def cd_target(words, cwd):
-    """Where `cd` goes (None: not known)."""
+
+
+# ---- folders: where each command of a line may run --------------------------------------------------
+
+def starts_of(cwd):
+    """The folders the line may start in, as a tuple: the hook passes several (it does not assume its folder)."""
+    if cwd is None:
+        return (os.getcwd(),)
+    folders = [cwd] if isinstance(cwd, str) else [c for c in cwd if c]
+    return tuple(dict.fromkeys(os.path.normpath(os.path.abspath(c)) for c in folders)) or (os.getcwd(),)
+
+
+# A word that may change the shell's folder, other than a `cd <dir> &&` that the tracking follows.
+CHANGERS = ("cd", "pushd", "popd", "chdir", "eval", "source")
+CHANGER_FIRST = (".", "exec", "builtin", "command")
+
+
+def changes_folder(words):
+    return any(program(w) in CHANGERS for w in words) or words[0] in CHANGER_FIRST
+
+
+def cd_target(words, heres):
+    """Where `cd` goes, as a tuple (one folder per starting folder); None: not known."""
     if len(words) == 1:
-        return os.path.expanduser("~")
-    if len(words) != 2 or words[1] == "-" or cwd is None:
+        return (os.path.expanduser("~"),)
+    if len(words) != 2 or words[1] == "-":
         return None
-    return os.path.normpath(os.path.join(cwd, os.path.expanduser(words[1])))
+    target = os.path.expanduser(words[1])
+    if os.path.isabs(target):
+        return (os.path.normpath(target),)
+    if heres is None:
+        return None
+    return tuple(dict.fromkeys(os.path.normpath(os.path.join(h, target)) for h in heres))
 
 
 def folders(commands, ops, start):
-    """The folder each simple command runs in (None: not known).
+    """The folders each simple command may run in (a tuple; None: not known).
 
     A `cd` moves the next commands only when it surely ran and they run only if it did: it comes first, or after ; or
     &&, and is followed by &&. From there the folder is known while commands are joined by &&; after any other
-    operator a failed cd could have left the shell where it was. pushd and popd make the folder unknown."""
-    here, moved, prev, result = start, False, None, []
+    operator a failed cd could have left the shell where it was. Any other word that may change folder (pushd, popd,
+    cd -, builtin cd, eval, source, ...) makes the folder unknown from there on."""
+    here = starts_of(start)
+    moved, prev, result = False, None, []
     for words, op in zip(commands, ops):
         result.append(here)
         if words[0] == "cd" and prev in (None, ";", "&&") and op == "&&":
             here, moved = cd_target(words, here), True
-        elif words[0] in ("cd", "pushd", "popd"):
+        elif changes_folder(words):
             here = None
         elif moved and op not in ("&&", None):
             here = None
@@ -568,47 +631,628 @@ def folders(commands, ops, start):
     return result
 
 
-def check_command(line, pa_address=None, own_address=None, extra_rows=(), cwd=None, spaces_dir=None, home=None):
-    """None when the Bash line may run; else the refusal message (spec section 6).
+def cd_targets(commands, starts):
+    """Every literal cd / pushd / chdir target in the line, from the starting folders."""
+    found = []
+    for words in commands:
+        for k, w in enumerate(words[:-1]):
+            if program(w) in ("cd", "pushd", "chdir") and not words[-1].startswith("-"):
+                found.extend(cd_target(["cd", words[-1]], starts) or ())
+                break
+    return found
 
+
+def unknown_bases(starts, targets, home):
+    """Where a command may run when its folder is not known: (folder, resolve links) pairs. The starting folders and
+    cd targets resolve links; the Project Agent's home, each of its parents and ~ are compared as written."""
+    bases = [(f, True) for f in itertools.chain(starts, targets)]
+    folder = os.path.normpath(os.path.abspath(home))
+    while True:
+        bases.append((folder, False))
+        parent = os.path.dirname(folder)
+        if parent == folder:
+            break
+        folder = parent
+    bases.append((os.path.expanduser("~"), False))
+    return list(dict.fromkeys(bases))
+
+
+# ---- R11: paths named in Bash ------------------------------------------------------------------------------
+
+def message_skips(words):
+    """R11e: the indices of words that are message texts, not paths (git commit/merge/stash -m <msg>, hc send's text)."""
+    skip = set()
+    if words[:2] == ["hc", "send"] and len(words) == 4:
+        skip.add(3)
+    if words[:1] == ["git"]:
+        k = 2 if words[1:2] == ["--no-pager"] else 1
+        if words[k:k + 1] and words[k] in ("commit", "merge", "stash"):
+            for i in range(k + 1, len(words) - 1):
+                if re.match(r"^-[as]*m$", words[i]):
+                    skip.add(i + 1)
+    return skip
+
+
+EXCLUDE_OPTION = re.compile(r"^--(exclude|ignore|skip)")
+
+
+def prunes(words, j):
+    """find: -prune follows, with only -type <x>, -a and -and between."""
+    while j < len(words):
+        if words[j] == "-prune":
+            return True
+        if words[j] == "-type":
+            j += 2
+        elif words[j] in ("-a", "-and"):
+            j += 1
+        else:
+            return False
+    return False
+
+
+def skip_values(words):
+    """R11a (card d-046): the indices of words that name something to skip, where a .git part does not count: the value
+    of --exclude*/--ignore*/--skip* (not *-from / *-file, which name a file to read), and a find -path / -name argument
+    followed by -prune or negated by -not / ! just before it."""
+    out, finding = set(), False
+    for i, w in enumerate(words):
+        if program(w) in ("find", "gfind"):
+            finding = True
+        name = opt_name(w)
+        if EXCLUDE_OPTION.match(name) and not re.search(r"-(from|file)$", name):
+            out.add(i if "=" in w else i + 1)
+        if finding and w in ("-path", "-name") and i + 1 < len(words):
+            if (i > 0 and words[i - 1] in ("-not", "!")) or prunes(words, i + 2):
+                out.add(i + 1)
+    return out
+
+
+def path_hit(part, place, bases, tops, git):
+    """A word part, taken from each folder the command may run in (place) or, unknown, from each of bases, is protected."""
+    path = os.path.expanduser(part)
+    if os.path.isabs(path):
+        return protected(os.path.normpath(path), tops, git=git)
+    pairs = [(f, True) for f in place] if place is not None else bases
+    return any(protected(os.path.normpath(os.path.join(f, path)), tops, resolve=r, git=git) for f, r in pairs)
+
+
+def protected_entry(alternatives, place, bases, tops, git, first, dot_ok):
+    """One word, as its alternatives [(literal, pattern or None)] after brace expansion; None: refuse it."""
+    if alternatives is None:
+        return True
+    for literal, pattern in alternatives:
+        if place is None and (literal.startswith("-") or (first and "/" not in literal)):
+            # An option, or a program found on PATH, is not a path in the folder; its =value part still is.
+            parts = literal.split("=")[1:] if pattern is None else pattern.split("=")[1:]
+        else:
+            parts = [literal] + literal.split("=")[1:] if pattern is None else [pattern] + pattern.split("=")[1:]
+        for part in parts:
+            if not part:
+                continue
+            if pattern is None or not has_glob(part):
+                if path_hit(unescape(part) if pattern is not None else part, place, bases, tops, git):
+                    return True
+            elif pattern_hit(part, place, bases, tops, git, dot_ok):
+                return True
+    return False
+
+
+def protected_word(commands, places, bases, tops, dot_ok=False, entries=None):
+    """The first word that names a protected path; None if there is none. commands: lists of words (literal texts);
+    entries: the same shape with each word's alternatives, for a line that is not plain."""
+    for n, (words, place) in enumerate(zip(commands, places)):
+        skip, nogit = message_skips(words), skip_values(words)
+        for i, word in enumerate(words):
+            if i in skip:
+                continue
+            alternatives = entries[n][i] if entries is not None else [(word, None)]
+            if protected_entry(alternatives, place, bases, tops, i not in nogit, i == 0, dot_ok):
+                return word
+    return None
+
+
+# ---- R11c: globs ---------------------------------------------------------------------------------------------
+
+GLOB_CHAR = re.compile(r"(?<!\[)[*?]|\[(?![*?\[]\])")
+
+
+def has_glob(pattern):
+    """A pattern (quoted glob characters escaped as [*] [?] [[]) has a glob character the shell would expand."""
+    return bool(GLOB_CHAR.search(pattern))
+
+
+def unescape(pattern):
+    return re.sub(r"\[([*?\[])\]", r"\1", pattern)
+
+
+def could(part, name, dot_ok):
+    """A pattern part could match the name (any case). A leading . must be matched by a . (or a [...]) unless dot_ok."""
+    if "*" not in part and "?" not in part and "[" not in part:
+        return part.lower() == name.lower()
+    if part == "**":
+        return dot_ok or not name.startswith(".")
+    if name.startswith(".") and not dot_ok and not part.startswith((".", "[")):
+        return False
+    return fnmatch.fnmatchcase(name.lower(), part.lower())
+
+
+def prefix_could(comps, top_parts, dot_ok):
+    for k, t in enumerate(top_parts):
+        if k >= len(comps):
+            return False
+        if comps[k] == "**":
+            return True
+        if not could(comps[k], t, dot_ok):
+            return False
+    return True
+
+
+def comps_protected(comps, tops, git, dot_ok):
+    """Component by component: the pattern could name a protected path."""
+    if git and any(could(c, ".git", dot_ok) for c in comps):
+        return True
+    if len(comps) >= 2 and any(could(comps[-2], a, dot_ok) and could(comps[-1], b, dot_ok) for a, b in GUARDED):
+        return True
+    spaces, homes = tops
+    for top in spaces:
+        top_parts = [p for p in top.split(os.sep) if p]
+        if prefix_could(comps, top_parts, dot_ok):
+            literal = all(not has_glob(c) for c in comps[:len(top_parts)])
+            rest = comps[len(top_parts):]
+            if not (literal and len(rest) >= 3 and rest[1] == "evidence" and rest[0] != "**"
+                    and not could(rest[0], "..", False) and "**" not in rest[:2]):
+                return True
+            return False  # inside a space's evidence folder
+    return any(prefix_could(comps, [p for p in top.split(os.sep) if p], dot_ok) for top in homes)
+
+
+def pattern_comps(full):
+    """The parts of an absolute pattern, . and .. taken out as the shell would; None when a part could match .."""
+    comps = []
+    for c in full.split("/"):
+        if c in ("", "."):
+            continue
+        if c == "..":
+            if comps:
+                comps.pop()
+        elif has_glob(c) and could(c, "..", False):
+            return None
+        else:
+            comps.append(c)
+    return comps
+
+
+def pattern_hit(pattern, place, bases, tops, git, dot_ok):
+    """A glob word could expand into a protected path: matched part by part from every folder it may be taken from, and,
+    in a known folder, also expanded there with each match checked with links resolved."""
+    pattern = os.path.expanduser(pattern)
+    if os.path.isabs(pattern):
+        fulls = [pattern]
+    else:
+        fulls = [os.path.join(f, pattern) for f in place] if place is not None else [os.path.join(f, pattern) for f, _r in bases]
+    for full in fulls:
+        comps = pattern_comps(full)
+        if comps is None or comps_protected(comps, tops, git, dot_ok):
+            return True
+    if place is not None or os.path.isabs(pattern):
+        for full in fulls:
+            for match in itertools.islice(expand(full, dot_ok), 500):
+                if protected(os.path.normpath(match), tops, git=git):
+                    return True
+    return False
+
+
+LISTED = {}  # folder -> its names, for one check (expand); cleared by check_command
+
+
+def listing(folder):
+    if folder not in LISTED:
+        try:
+            LISTED[folder] = os.listdir(folder)
+        except OSError:
+            LISTED[folder] = []
+    return LISTED[folder]
+
+
+def expand(full, dot_ok):
+    """The existing paths an absolute pattern expands to, part by part as the shell would (a leading . matched only by
+    a ., unless dot_ok), with each folder listed once per check."""
+    found = ["/"]
+    for part in [p for p in full.split("/") if p]:
+        nxt = []
+        for base in found:
+            if not has_glob(part):
+                nxt.append(os.path.join(base, unescape(part)))
+            else:
+                nxt.extend(os.path.join(base, name) for name in listing(base)
+                           if (dot_ok or not name.startswith(".") or part.startswith((".", "[")))
+                           and fnmatch.fnmatchcase(name, part))
+        found = nxt[:500]
+        if not found:
+            return []
+    return [f for f in found if os.path.lexists(f)]
+
+
+# ---- R11b: the words of a line that is not plain ------------------------------------------------------------
+
+ANSI = {"n": "\n", "t": "\t", "r": "\r", "a": "\a", "b": "\b", "e": "\x1b", "E": "\x1b", "f": "\f", "v": "\v",
+        "\\": "\\", "'": "'", '"': '"', "?": "?"}
+
+
+def ansi_c(s, i):
+    """$'...' from just after the opening quote: (text, index after the closing quote)."""
+    out = []
+    n = len(s)
+    while i < n and s[i] != "'":
+        c = s[i]
+        if c == "\\" and i + 1 < n:
+            d = s[i + 1]
+            m = re.match(r"x([0-9A-Fa-f]{1,2})|u([0-9A-Fa-f]{1,4})|U([0-9A-Fa-f]{1,8})|([0-7]{1,3})", s[i + 1:])
+            if m and (d in "xuU" and m.group(0)[0] == d or d in "01234567"):
+                out.append(chr(int(next(g for g in m.groups() if g), 8 if m.group(4) else 16) % 0x110000))
+                i += 1 + len(m.group(0))
+                continue
+            out.append(ANSI.get(d, "\\" + d))
+            i += 2
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out), i + 1
+
+
+def scan_text(line, home):
+    """The simple commands of a line that is not plain, as a shell would see their words.
+
+    Returns (commands, ops, info): commands are lists of words, each a list of (char, unquoted) pairs; ops are the
+    operators after each; info says whether the line is simple (only ; && || | and redirections), and whether a
+    command word is an expansion. Quotes and backslashes are taken out, $'...' decoded, $HOME / ${HOME} and
+    $HERDR_PA_HOME / ${HERDR_PA_HOME} replaced by their folders and $PWD by ., and the text of $(...) and backticks
+    read as commands of their own. Any other expansion ends the word."""
+    s, n, i = line or "", len(line or ""), 0
+    values = {"HOME": os.path.expanduser("~"), "HERDR_PA_HOME": home or os.environ.get("HERDR_PA_HOME", ""), "PWD": "."}
+    commands, ops, words, word = [[]], [], None, []
+    info = {"simple": True, "expansion_command": False}
+    stack = []
+    state = {"word": False}
+
+    def end_word():
+        if state["word"]:
+            commands[-1].append(list(word))
+        del word[:]
+        state["word"] = False
+
+    def end_command(op, simple=True):
+        end_word()
+        if not simple:
+            info["simple"] = False
+        commands.append([])
+        ops.append(op)
+
+    def add(text, unquoted=False):
+        word.extend((c, unquoted) for c in text)
+        state["word"] = True
+
+    def dollar(i):
+        """At a $: (index after it, handled)."""
+        rest = s[i + 1:]
+        if rest.startswith("("):
+            end_command("$(", False)
+            stack.append(")")
+            return i + 2
+        m = re.match(r"\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*)", rest)
+        if m:
+            name = m.group(1) or m.group(2)
+            if name in values and values[name]:
+                add(values[name])
+            else:
+                if not state["word"] and all(ASSIGN.match("".join(c for c, _u in w)) for w in commands[-1]):
+                    info["expansion_command"] = True
+                end_word()
+            return i + 1 + len(m.group(0))
+        m = re.match(r"\{[^}]*\}?|[0-9@*#?$!-]", rest)
+        if m:
+            if not state["word"] and not commands[-1]:
+                info["expansion_command"] = True
+            end_word()
+            return i + 1 + len(m.group(0))
+        add("$")
+        return i + 1
+
+    while i < n:
+        c = s[i]
+        top = stack[-1] if stack else None
+        if top == '"':
+            if c == '"':
+                stack.pop()
+                i += 1
+            elif c == "\\" and i + 1 < n and s[i + 1] in '$`"\\\n':
+                if s[i + 1] != "\n":
+                    add(s[i + 1])
+                i += 2
+            elif c == "$":
+                i = dollar(i)
+            elif c == "`":
+                end_command("`", False)
+                stack.append("`")
+                i += 1
+            else:
+                add(c)
+                i += 1
+            continue
+        if c in " \t":
+            end_word()
+            i += 1
+        elif c == "'":
+            j = s.find("'", i + 1)
+            j = n if j < 0 else j
+            add(s[i + 1:j])
+            i = j + 1
+        elif c == '"':
+            stack.append('"')
+            state["word"] = True
+            i += 1
+        elif c == "\\":
+            if i + 1 < n and s[i + 1] != "\n":
+                add(s[i + 1])
+            i += 2
+        elif c == "$" and s.startswith("$'", i):
+            text, i = ansi_c(s, i + 2)
+            add(text)
+        elif c == "$" and s.startswith('$"', i):
+            stack.append('"')
+            state["word"] = True
+            i += 2
+        elif c == "$":
+            i = dollar(i)
+        elif c == "`":
+            if top == "`":
+                stack.pop()
+            else:
+                stack.append("`")
+            end_command("`", False)
+            i += 1
+        elif c in "<>":
+            end_word()
+            i += 1
+            while i < n and s[i] in "<>&|":
+                if s[i] == "<" and s.startswith("<<", i - 1) and not s.startswith("<<<", i - 1):
+                    info["simple"] = False  # a here-document
+                i += 1
+        elif c == "&":
+            if s.startswith("&&", i):
+                end_command("&&")
+                i += 2
+            elif s.startswith("&>", i):
+                end_word()
+                i += 2
+                while i < n and s[i] == ">":
+                    i += 1
+            else:
+                end_command("&", False)
+                i += 1
+        elif c == "|":
+            if s.startswith("||", i):
+                end_command("||")
+                i += 2
+            elif s.startswith("|&", i):
+                end_command("|", False)
+                i += 2
+            else:
+                end_command("|")
+                i += 1
+        elif c == ";":
+            end_command(";", not s.startswith(";;", i) and not s.startswith(";&", i))
+            i += 1
+            while i < n and s[i] in ";&":
+                i += 1
+        elif c in "()\n\r":
+            if c == ")" and top == ")":
+                stack.pop()
+            end_command(c, False)
+            i += 1
+        elif c in "{}" and not state["word"] and (i + 1 >= n or s[i + 1] in " \t\n;&|)"):
+            end_command(c, False)  # a { ...; } group
+            i += 1
+        elif c == "~" and not state["word"]:
+            m = re.match(r"~[A-Za-z0-9._-]*", s[i:])
+            add(os.path.expanduser(m.group(0)) if s[i + len(m.group(0)):i + len(m.group(0)) + 1] in ("", "/", " ", "\t", ";", "&", "|", ")", ">", "<", ":") else m.group(0))
+            i += len(m.group(0))
+        else:
+            add(c, c in "*?[]{},")
+            i += 1
+    end_word()
+    ops.append(None)
+    pairs = [(w, op) for w, op in zip(commands, ops) if w]
+    return [w for w, _op in pairs], [op for _w, op in pairs], info
+
+
+def braces(chars, limit=64):
+    """Brace expansion of a word (unquoted { , } only): its alternatives, or None when there are more than limit.
+    A {a..b} range becomes *: it makes letters or numbers, never a / or a leading-dot name on its own."""
+    out = []
+    todo = [chars]
+    while todo:
+        chars = todo.pop()
+        start = None
+        for k, (c, u) in enumerate(chars):
+            if u and c == "{":
+                depth, commas, end = 0, [], None
+                for j in range(k, len(chars)):
+                    cj, uj = chars[j]
+                    if uj and cj == "{":
+                        depth += 1
+                    elif uj and cj == "}":
+                        depth -= 1
+                        if depth == 0:
+                            end = j
+                            break
+                    elif uj and cj == "," and depth == 1:
+                        commas.append(j)
+                if end is None:
+                    continue
+                if commas:
+                    cuts = [k] + commas + [end]
+                    for a, b in zip(cuts, cuts[1:]):
+                        todo.append(chars[:k] + chars[a + 1:b] + chars[end + 1:])
+                    start = k
+                    break
+                inner = "".join(c2 for c2, _u in chars[k + 1:end])
+                if re.match(r"^[^{}]+\.\.[^{}]+$", inner):
+                    todo.append(chars[:k] + [("*", True)] + chars[end + 1:])
+                    start = k
+                    break
+        if start is None:
+            out.append(chars)
+        if len(out) + len(todo) > limit:
+            return None
+    return out
+
+
+def alternatives(chars):
+    """[(literal, pattern or None)] for a word: pattern is set when an unquoted glob character is in it."""
+    expanded = braces(chars)
+    if expanded is None:
+        return None
+    result = []
+    for alt in expanded:
+        literal = "".join(c for c, _u in alt)
+        globbing = any(u and c in "*?[" for c, u in alt)
+        pattern = "".join(c if (u and c in "*?[]") else ("[" + c + "]" if c in "*?[" else c) for c, u in alt) if globbing else None
+        result.append((literal, pattern))
+    return result
+
+
+DOT_GLOB = re.compile(r"(?i)dot_?glob|glob_?dots|[*?\]]\(")
+AUTOCD = re.compile(r"(?i)auto_?cd")
+
+
+def text_check(line, starts, home, tops, force_unknown=False):
+    """R11 and R12 for a line that is not plain (or a wrapper's text): the refusal message, or None."""
+    commands, ops, info = scan_text(line, home)
+    if not commands:
+        return None
+    texts = [["".join(c for c, _u in w) for w in words] for words in commands]
+    entries = [[alternatives(w) for w in words] for words in commands]
+    variable = git_variable(texts, plain=False)
+    if tops:
+        targets = cd_targets(texts, starts)
+        bases = unknown_bases(starts, targets, home)
+        unknown = force_unknown or info["expansion_command"] or bool(AUTOCD.search(line or ""))
+        if unknown:
+            places = [None] * len(texts)
+        elif info["simple"]:
+            places = folders(texts, ops, starts)
+        elif any(changes_folder(words) for words in texts):
+            places = [None] * len(texts)
+        else:
+            places = [starts] * len(texts)
+        word = protected_word(texts, places, bases, tops, bool(DOT_GLOB.search(line or "")), entries)
+        if word is not None:
+            return PROTECTED_PATH.format(shown(word))
+    return VARIABLE.format(shown(variable)) if variable is not None else None
+
+
+# ---- R12: GIT_* and GH_* variables ---------------------------------------------------------------------------
+
+GIT_VARIABLE = re.compile(r"^(git|gh)_", re.IGNORECASE)
+SETTERS = ("export", "env", "declare", "typeset", "set", "local", "readonly")
+
+
+def git_variable(commands, plain=True):
+    """The first word that sets a GIT_* or GH_* variable: NAME=value anywhere (message texts aside), or a bare NAME
+    after export, declare, ... ; None if there is none."""
+    for words in commands:
+        skip, setter = message_skips(words), False
+        for i, w in enumerate(words):
+            if i in skip:
+                continue
+            m = ASSIGN.match(w)
+            if m and GIT_VARIABLE.match(m.group(1)):
+                return w
+            if setter and re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", w) and GIT_VARIABLE.match(w):
+                return w
+            if program(w) in SETTERS:
+                setter = True
+    return None
+
+
+# ---- R3, R4: the check ----------------------------------------------------------------------------------------
+
+def check_command(line, pa_address=None, own_address=None, extra_rows=(), cwd=None, spaces_dir=None, home=None):
+    """None when the Bash line may run; else the refusal message (spec sections 6, 7a).
+
+    cwd: the folder the line starts in, or several when that is not certain (pa-hook guard passes the reported folder,
+    the worktree root and the project folder); every one of them is checked.
     extra_rows: the profile's added rows, or a function that returns them; it is called only when a
     command involves git, gh or hc and no row of ALLOWLIST allows it (so its notes come only then).
     home (the Project Agent's home) and spaces_dir turn on R11, as pa-hook guard always does: a word that names a
     path inside a .git folder, or under home other than a space's evidence folder, refuses the line.
     """
-    start = cwd if cwd is not None else os.getcwd()
+    starts = starts_of(cwd)
     tops = (forms(spaces_dir), forms(home)) if home is not None else None
+    LISTED.clear()
+    REAL.clear()
     scanned = split_plain_ops(line or "")
     if scanned is None:
-        if tops:
-            word = protected_word(text_words(line), start, tops)
-            if word is not None:
-                return PROTECTED_PATH.format(shown(word))
+        refusal = text_check(line, starts, home, tops)
+        if refusal:
+            return refusal
         return NOT_PLAIN if involves_text(line) else None
     commands, ops = scanned
     extra = None
     wrapped = wraps(commands)
-    places = folders(commands, ops, start)
+    places = folders(commands, ops, starts)
     if tops:
-        for words, here in zip(commands, places):
-            word = protected_word(words, here, tops)
-            if word is not None:
-                return PROTECTED_PATH.format(shown(word))
+        bases = unknown_bases(starts, cd_targets(commands, starts), home)
+        word = protected_word(commands, places, bases, tops)
+        if word is not None:
+            return PROTECTED_PATH.format(shown(word))
+    variable = git_variable(commands)
+    if variable is not None:
+        return VARIABLE.format(shown(variable))
     for words, here in zip(commands, places):
         # With a shell or eval in the line, git, gh or hc named inside any word's text counts too (it may be run).
-        if involves(words) or (wrapped and any(involves_text(w) for w in words)):
+        if involves(words) or (wrapped and any(involves_text(w) or involves_text(wrapped_text(w)) for w in words)):
             ctx = {"pa_address": pa_address, "own_address": own_address, "cwd": here}
             if not allowed(words, ALLOWLIST, ctx):
                 if extra is None:
                     extra = list((extra_rows() if callable(extra_rows) else extra_rows) or [])
                 if not allowed(words, extra, ctx):
                     return OFF_TABLE.format(shown(" ".join(shlex.quote(w) for w in words)))
+    if tops and wrapped:
+        # A shell's or eval's text is a line of its own, run in a folder that is not known (after the table, so that
+        # sh -c 'git push' gets the off-table message).
+        for words in commands:
+            for w in words:
+                if re.search(r"[\s;&|<>()$`]", w):
+                    refusal = text_check(wrapped_text(w), starts, home, tops, force_unknown=True)
+                    if refusal:
+                        return refusal
     return None
 
 
 # ---- R8: the editor rule ---------------------------------------------------------------------------
 
 STATE_FILES = ("ledger.json", "journal.jsonl", "rules.json", "agent.json")
+# R11d (fix round 2): the worktree's task record and its hook settings, wherever they are.
+GUARDED = ((".claude", "pa-task.json"), (".claude", "settings.local.json"))
+
+
+REAL = {}  # path -> links resolved, for one check (real); cleared by check_command
+
+
+def real(path):
+    """os.path.realpath of a normalised absolute path, each folder resolved once per check (one lstat per new part)."""
+    if path in REAL:
+        return REAL[path]
+    parent, name = os.path.split(path)
+    if not name or name == ".." or parent == path:
+        result = os.path.realpath(path)
+    else:
+        candidate = os.path.join(real(parent), name)
+        result = os.path.realpath(candidate) if os.path.islink(candidate) else candidate
+    REAL[path] = result
+    return result
 
 
 def forms(folder):
@@ -618,21 +1262,25 @@ def forms(folder):
     return {os.path.normpath(os.path.abspath(folder)).lower(), os.path.realpath(folder).lower()}
 
 
-def protected(full, tops, resolve=True):
-    """An absolute path is inside a .git folder (or is a worktree's .git file), or inside the spaces folder other than
-    <space>/evidence/..., or anywhere else under the home. tops: (forms(spaces_dir), forms(home)). Checked as written
-    and, with resolve, after resolving links."""
+def protected(full, tops, resolve=True, git=True):
+    """An absolute path is inside a .git folder (or is a worktree's .git file; not counted when git is False), is a task
+    record or hook settings file (GUARDED), or is inside the spaces folder other than <space>/evidence/..., or anywhere
+    else under the home. tops: (forms(spaces_dir), forms(home)). Checked as written and, with resolve, after resolving
+    links."""
     spaces, homes = tops
     candidates = {full.lower()}
     if resolve:
-        candidates.add(os.path.realpath(full).lower())
+        candidates.add(real(full).lower())
     for low in candidates:
-        if ".git" in low.split(os.sep):
+        parts = low.split(os.sep)
+        if git and ".git" in parts:
+            return True
+        if tuple(parts[-2:]) in GUARDED:
             return True
         for top in spaces:
             if low == top or low.startswith(top + os.sep):
-                parts = low[len(top) + 1:].split(os.sep)
-                if len(parts) < 3 or parts[1] != "evidence":
+                rest = low[len(top) + 1:].split(os.sep)
+                if len(rest) < 3 or rest[1] != "evidence":
                     return True
                 break
         else:
@@ -641,47 +1289,22 @@ def protected(full, tops, resolve=True):
     return False
 
 
-HOME_VAR = re.compile(r"\$\{?HOME\}?(?![\w])")
-TEXT_SPLIT = re.compile(r"[\s;&|<>()`$\"'{}\\]+")
-
-
-def text_words(line):
-    """The words of a line that is not plain, for R11: split at blanks, operators, quotes and expansions ($HOME and
-    ${HOME} read as the home folder)."""
-    return [w for w in TEXT_SPLIT.split(HOME_VAR.sub(lambda _m: os.path.expanduser("~"), line or "")) if w]
-
-
-def protected_word(words, cwd, tops):
-    """The first word (or the part after an = in it) that names a protected path, relative words taken from cwd;
-    None if there is none. With the folder unknown, a relative word counts when it has a .git part."""
-    seen = {}
-    for word in words:
-        for part in [word] + word.split("=")[1:]:
-            if not part or part in seen:
-                continue
-            path = os.path.expanduser(part)
-            if os.path.isabs(path):
-                hit = protected(os.path.normpath(path), tops)
-            elif cwd is None:
-                hit = ".git" in os.path.normpath(path).lower().split(os.sep)
-            else:
-                hit = protected(os.path.normpath(os.path.join(cwd, path)), tops)
-            seen[part] = hit
-            if hit:
-                return word
-    return None
-
-
 def check_edit(path, spaces_dir, cwd=None, home=None):
     """None when Edit/Write/MultiEdit/NotebookEdit may write path; else the refusal message.
 
     Refused, both for the path as written and after resolving links: anything inside a .git folder or a worktree's
-    .git file; anything in <spaces_dir> except a space's evidence folder (<spaces_dir>/<space>/evidence/...), so
-    decisions/, ledger.json, journal.jsonl, rules.json, agent.json (STATE_FILES) and the rest of the state; and,
-    when home (the Project Agent's home) is given, anything else under it (profiles, core texts, tools).
-    Names are compared without case (the Mac's file system ignores it).
+    .git file; a task record or hook settings file (.claude/pa-task.json, .claude/settings.local.json); anything in
+    <spaces_dir> except a space's evidence folder (<spaces_dir>/<space>/evidence/...), so decisions/, ledger.json,
+    journal.jsonl, rules.json, agent.json (STATE_FILES) and the rest of the state; and, when home (the Project Agent's
+    home) is given, anything else under it (profiles, core texts, tools). Names are compared without case (the Mac's
+    file system ignores it). cwd may be several folders; a relative path is refused when it is protected from any.
     """
     if not path:
         return None
-    given = os.path.normpath(os.path.join(cwd or os.getcwd(), os.path.expanduser(path)))
-    return OFF_TABLE.format(shown(path)) if protected(given, (forms(spaces_dir), forms(home))) else None
+    tops = (forms(spaces_dir), forms(home))
+    REAL.clear()
+    for start in starts_of(cwd):
+        given = os.path.normpath(os.path.join(start, os.path.expanduser(path)))
+        if protected(given, tops):
+            return OFF_TABLE.format(shown(path))
+    return None
