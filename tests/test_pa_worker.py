@@ -1655,19 +1655,35 @@ class Describe(Base):
         self.profile_kind(repos=repos)
         real = shutil.which("git")
         bin_dir = os.path.join(self.tmp, "bin")
-        write(os.path.join(bin_dir, "git"), '#!/bin/sh\nfor a in "$@"; do [ "$a" = log ] && exec sleep 5; done\nexec "{}" "$@"\n'.format(real))
+        # As in d11: the slow stand-in waits until it is killed, and only the slow call gets the short cap
+        # (here the one describe_repo gives it from the 1.5 s deadline); the quick calls keep GIT_TIMEOUT.
+        write(os.path.join(bin_dir, "git"), '#!/bin/sh\nfor a in "$@"; do [ "$a" = log ] && exec sleep 600; done\nexec "{}" "$@"\n'.format(real))
         os.chmod(os.path.join(bin_dir, "git"), 0o755)
-        saved = os.environ["PATH"], pa_hooks.GIT_TIMEOUT, pa_hooks.DESCRIBE_DEADLINE
+        real_git, slow = pa_hooks.git, []
+
+        def git(path, *args, timeout=None):
+            if "log" not in args:
+                return real_git(path, *args, timeout=pa_hooks.GIT_TIMEOUT)
+            slow.append(timeout)  # the cap describe_repo gave the call, from the deadline
+            return real_git(path, *args, timeout=timeout)
+        saved = os.environ["PATH"], pa_hooks.DESCRIBE_DEADLINE
         os.environ["PATH"] = bin_dir + os.pathsep + saved[0]
-        pa_hooks.GIT_TIMEOUT, pa_hooks.DESCRIBE_DEADLINE = 1, 1.5
+        pa_hooks.git, pa_hooks.DESCRIBE_DEADLINE = git, 1.5
         try:
             began = time.time()
             card = self.open_card(worktree=kind)
             took = time.time() - began
         finally:
-            os.environ["PATH"], pa_hooks.GIT_TIMEOUT, pa_hooks.DESCRIBE_DEADLINE = saved
-        self.assertLess(took, 4)
-        self.assertIn("Not described (time limit of 1.5 s): r", self.md())
+            (os.environ["PATH"], pa_hooks.DESCRIBE_DEADLINE), pa_hooks.git = saved, real_git
+        self.assertLess(took, 60)  # the stand-in alone would take 600 s
+        # r0's log call runs until the deadline has passed (its cap is what is left of 1.5 s, at least 0.2 s), so r1, r2 wait
+        self.assertEqual(len(slow), 1, slow)
+        self.assertTrue(slow[0] and 0 < slow[0] <= 1.5 < pa_hooks.GIT_TIMEOUT, slow)
+        self.assertEqual([r["name"] for r in card["changes"]["repos"]], ["r0"])
+        self.assertEqual(card["changes"]["repos"][0]["error"], "git log timed out after {} s".format(slow[0]))
+        self.assertEqual(card["changes"]["repos"][0]["branch"], "feat")  # quick calls got through
+        self.assertEqual(card["changes"]["repos"][0]["head"], sh(repos[0], "git", "rev-parse", "HEAD"))
+        self.assertIn("Not described (time limit of 1.5 s): r1, r2", self.md())
         self.assertIn("more repositories (WORKTREE.md)", card["context"])
 
     def test_d16_merged_into_any_main_branch(self):  # mg-all
