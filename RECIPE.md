@@ -128,11 +128,16 @@ A new space opens with a 600 x 440 dialog: a Project Agent card (`Set up for <fo
   used unless a newer load of its space has already been. The last load of each space (8 at most, in
   memory, also one that ends after a switch away) shows at once when the space is shown again, and
   refreshes. A read that times out, fails or is not valid JSON (the ledger, the profile, the
-  schedule, the pass request, the card listing, one card, rules, evidence) never counts as "none":
-  the panel keeps the last value known for the space and shows the error, and the shared keys that
-  value feeds (worktrees, workers, Files shortcuts, main branches, the open-card count) and any note
-  typed on a card stay as they were. Only a read that answered (a missing file or an empty
-  decisions folder included) replaces them. When agent.json does not answer, what is shown stays,
+  schedule, the pass request, the card listing, one card, rules; evidence and stale instructions
+  only when they time out) never counts as "none": the panel shows the last value known for the
+  space, with the error, and writes nothing from it: the shared keys that part feeds (worktrees,
+  workers, Files shortcuts, main branches, the open-card count), the kept load's copy of it and any
+  note typed on a card stay as they were, so a newer value a hidden refresh wrote is not rolled
+  back. Only a read that answered (a missing file or an empty decisions folder included) replaces
+  them. Known limits: an evidence or stale-instructions call that fails rather than times out counts
+  as none (the Files view loses the evidence shortcuts until the next answer); a decisions or
+  evidence folder that cannot be read (permissions) counts as a missing one, not as unanswered, and
+  a file that cannot be read may too (that depends on Herdr's file read). When agent.json does not answer, what is shown stays,
   with the error. Of a full load and a hidden refresh of a space, the one started later writes the
   shared keys; an older one ending later writes none. A typed note belongs to its space's card.
 - While the panel is not the side panel's shown view (the `layout()` test the tabs mod uses, over
