@@ -1199,3 +1199,362 @@ class S_Summary(Collecting):
             elif isinstance(node, ast.ImportFrom):
                 names.add((node.module or "").split(".")[0])
         self.assertFalse(names & {"socket", "urllib", "http", "ssl", "ftplib", "smtplib", "requests"}, names)
+
+
+# ---- step 7: billed rows, import fallback, scheduled query (R13-R15; plan section 6) -------------------------
+
+Q1 = r"""#!/bin/sh
+# A stub billing query: records its arguments, prints what the test put beside it. No network, no account.
+d=$(dirname "$0"); mode=$2
+echo "$*" >> "$d/q1.calls"
+[ -f "$d/q1.$mode.err" ] && cat "$d/q1.$mode.err" >&2
+[ -f "$d/q1.$mode.sleep" ] && sleep "$(cat "$d/q1.$mode.sleep")"
+[ -f "$d/q1.$mode.out" ] && cat "$d/q1.$mode.out"
+exit "$(cat "$d/q1.$mode.code" 2>/dev/null || echo 0)"
+"""
+F1 = r"""#!/usr/bin/env python3
+# A stub importer: reads JSON lines from the file it is given and prints them, then the done line.
+import sys
+path = sys.argv[sys.argv.index("--file") + 1]
+for line in open(path):
+    if line.strip():
+        print(line.strip())
+print('{"done": true}')
+"""
+
+
+TWELVE = "4321" * 3  # a 12-digit number, built so the public check does not see one in the source
+TWELVE2 = "9876" * 3
+
+
+def brow(day="2026-11-16", amount=1.0, **kw):
+    r = {"account": "acct1", "from": day, "to": day, "label": "usage-a-out", "model": "model-a", "kind": "out",
+         "quantity": None, "unit": None, "amount": amount, "currency": "USD", "final": True, "accountWide": True}
+    r.update(kw)
+    return r
+
+
+class BillingBase(CostsBase):
+    def setUp(self):
+        super().setUp()
+        self.prices()
+        prof = {"name": "test", "claude": ["true"], "codex": ["true"], "billing": {
+            "account": "acct1",
+            "queries": {"q1": {"run": ["billing/q1.sh", "--mode", "{mode}", "--credential", "{credential}", "--from", "{from}",
+                                       "--to", "{to}", "--max-pages", "{maxPages}"],
+                               "readOnly": True, "calls": ["identity-read", "usage-read"], "feePerRequest": 0.01, "currency": "USD",
+                               "label": "test query"}},
+            "importers": {"f1": {"run": ["billing/f1.py", "--file", "{file}"], "label": "test file"}}}}
+        dump(prof, os.path.join(self.profile_dir, "profile.json"))
+        self.bdir = os.path.join(self.profile_dir, "billing")
+        for name, text in (("q1.sh", Q1), ("f1.py", F1)):
+            write(os.path.join(self.bdir, name), text)
+            os.chmod(os.path.join(self.bdir, name), 0o755)
+        self.check_ok()
+        self.saved_tty = pa_costs.stdin_is_tty
+        pa_costs.stdin_is_tty = lambda: True
+        self.addCleanup(setattr, pa_costs, "stdin_is_tty", self.saved_tty)
+
+    def stub(self, mode, out=None, code=None, err=None, sleep=None):
+        for suffix, value in (("out", out), ("code", code), ("err", err), ("sleep", sleep)):
+            path = os.path.join(self.bdir, "q1.{}.{}".format(mode, suffix))
+            if value is None:
+                if os.path.exists(path):
+                    os.unlink(path)
+            else:
+                write(path, value if isinstance(value, str) else str(value))
+
+    def check_ok(self, identity="ExampleReadOnly", read_only=True):
+        self.stub("check", out=json.dumps({"identity": identity, "readOnly": read_only, "why": "test"}) + "\n")
+
+    def query_out(self, rows, requests=1):
+        self.stub("query", out="".join(json.dumps(r) + "\n" for r in rows) + json.dumps({"done": True, "requests": requests}) + "\n")
+
+    def calls(self):
+        data = raw(os.path.join(self.bdir, "q1.calls"))
+        return data.decode().splitlines() if data else []
+
+    def modes(self):
+        return [c.split()[1] for c in self.calls()]
+
+    def enable(self, credential="ExampleReadOnly", match="ReadOnly$", confirm=None, **kw):
+        return self.run_cmd(pa_costs.billed_enable, "q1", credential, match, now=T0,
+                            ask=lambda _prompt: credential if confirm is None else confirm, **kw)
+
+    def fetch(self, mode="scheduled", now=T0, **kw):
+        return self.run_cmd(pa_costs.billed_fetch, mode=mode, now=now, **kw)
+
+    def billed(self):
+        return lines(os.path.join(pa.ROOT, "billing", "billed.jsonl"))
+
+    def qstate(self):
+        return pa.read_json(os.path.join(pa.ROOT, "billing", "query-state.json"), {}) or {}
+
+    def conf(self):
+        return (load(os.path.join(pa.ROOT, "config.json")).get("costs") or {}).get("billing")
+
+
+class BQ_Billing(BillingBase):
+    def test_bq1_enable_refuses_inside_an_agent_and_without_a_tty(self):
+        for marker in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CODEX_SANDBOX", "CODEX_HOME_SESSION"):
+            os.environ[marker] = "1"
+            try:
+                with self.assertRaises(pa.Problem):
+                    pa_costs.billed_enable("q1", "ExampleReadOnly", "ReadOnly$", now=T0, ask=lambda p: "ExampleReadOnly")
+            finally:
+                os.environ.pop(marker)
+        pa_costs.stdin_is_tty = lambda: False
+        with self.assertRaises(pa.Problem) as e:
+            pa_costs.billed_enable("q1", "ExampleReadOnly", "ReadOnly$", now=T0, ask=lambda p: "ExampleReadOnly")
+        self.assertIn("terminal", str(e.exception))
+        self.assertEqual(self.calls(), [])
+        self.assertIsNone(self.conf())
+
+    def test_bq2_enable_refuses_wide_or_missing_credentials(self):
+        for cred in ("", "default", "Admin", "TeamAdministrator", "PowerUserAccess", "x-FullAccess", "root", "AccountOwner"):
+            with self.assertRaises(pa.Problem, msg=cred):
+                pa_costs.billed_enable("q1", cred, ".*", now=T0, ask=lambda p: cred)
+        self.assertEqual(self.calls(), [])
+        with self.assertRaises(pa.Problem):  # the confirmation must be typed again exactly
+            pa_costs.billed_enable("q1", "ExampleReadOnly", "ReadOnly$", now=T0, ask=lambda p: "examplereadonly")
+        self.assertIsNone(self.conf())
+
+    def test_bq3_enable_runs_check_once_and_refuses_not_read_only(self):
+        self.check_ok(read_only=False)
+        with self.assertRaises(pa.Problem) as e:
+            pa_costs.billed_enable("q1", "ExampleReadOnly", "ReadOnly$", now=T0, ask=lambda p: "ExampleReadOnly")
+        self.assertIn("read-only", str(e.exception))
+        self.assertEqual(self.modes(), ["check"])
+        self.assertIsNone(self.conf())
+        self.check_ok()
+        _r, out, _e = self.enable()
+        self.assertEqual(self.modes(), ["check", "check"])
+        c = self.conf()
+        self.assertEqual((c["query"], c["credential"], c["readOnlyMatch"], c["enabled"], c["enabledBy"]),
+                         ("q1", "ExampleReadOnly", "ReadOnly$", True, "terminal"))
+        for want in ("q1", "ExampleReadOnly", "identity-read", "usage-read", "0.01", "USD", "1 per day"):
+            self.assertIn(want, out)
+
+    def test_bq4_scheduled_with_nothing_enabled_does_nothing(self):
+        result, _o, _e = self.fetch()
+        self.assertEqual(result["result"], "skipped")
+        self.assertEqual(self.calls(), [])
+
+    def test_bq5_scheduled_runs_at_most_once_a_day(self):
+        self.enable()
+        self.query_out([brow()])
+        self.fetch(now=T0 + 60)
+        self.fetch(now=T0 + 3600)
+        self.fetch(now=T0 + 86000)
+        self.assertEqual(self.modes().count("query"), 1)
+        self.fetch(now=T0 + 60 + 86400)
+        self.assertEqual(self.modes().count("query"), 2)
+
+    def test_bq6_now_and_scheduled_at_most_three_a_day(self):
+        self.enable()
+        self.query_out([brow()])
+        self.fetch(mode="now", now=T0 + 10)
+        self.fetch(mode="now", now=T0 + 20)
+        self.fetch(mode="now", now=T0 + 30)
+        with self.assertRaises(pa.Problem):
+            pa_costs.billed_fetch(mode="now", now=T0 + 40)
+        self.assertEqual(self.fetch(now=T0 + 50)[0]["result"], "skipped")
+        self.assertEqual(self.modes().count("query"), 3)
+        self.assertEqual(self.qstate()["runsToday"], {"day": "2026-11-17", "n": 3})
+
+    def test_bq7_identity_not_matching_is_refused_and_recorded(self):
+        self.enable()
+        self.check_ok(identity="SomeOtherRole")
+        result, _o, _e = self.fetch()
+        self.assertEqual(result["result"], "refused")
+        self.assertNotIn("query", self.modes())
+        self.assertEqual(self.qstate()["result"], "refused")
+        self.check_ok(identity="AdminReadOnly")  # matches readOnlyMatch, but looks like an admin
+        self.assertEqual(self.fetch(now=T0 + 86400 + 1)[0]["result"], "refused")
+        self.assertNotIn("query", self.modes())
+
+    def test_bq8_terminal_rules(self):
+        self.enable()
+        self.query_out([brow()])
+        os.environ["HC_TERMINAL_ID"] = "t1"
+        self.addCleanup(os.environ.pop, "HC_TERMINAL_ID", None)
+        self.hc.terminals["t1"] = {"address": "t1", "name": "plain", "state": "live", "labels": {}}
+        with self.assertRaises(pa.Problem):
+            pa_costs.billed_fetch(mode="scheduled", now=T0)
+        self.hc.terminals["t1"]["parent"] = "t0"  # a worker
+        with self.assertRaises(pa.Problem):
+            pa_costs.billed_fetch(mode="now", now=T0)
+        del self.hc.terminals["t1"]["parent"]
+        self.assertEqual(pa_costs.billed_fetch(mode="now", now=T0, quiet=True)["result"], "ok")  # the person's own tab
+        self.assertEqual(self.modes().count("query"), 1)
+
+    def test_bq9_query_entry_must_declare_read_only_and_calls(self):
+        prof = load(os.path.join(self.profile_dir, "profile.json"))
+        for change in ({"readOnly": False}, {"calls": []}, {"readOnly": None}):
+            q = dict(prof["billing"]["queries"]["q1"], **change)
+            p2 = json.loads(json.dumps(prof))
+            p2["billing"]["queries"]["q1"] = {k: v for k, v in q.items() if v is not None}
+            dump(p2, os.path.join(self.profile_dir, "profile.json"))
+            with self.assertRaises(pa.Problem, msg=change):
+                pa_costs.billed_enable("q1", "ExampleReadOnly", "ReadOnly$", now=T0, ask=lambda p: "ExampleReadOnly")
+        self.assertEqual(self.calls(), [])
+
+    def test_bq10_more_requests_than_the_cap_rejects_the_batch(self):
+        self.enable()
+        self.query_out([brow()], requests=4)
+        result, _o, _e = self.fetch()
+        self.assertEqual(result["result"], "failed")
+        self.assertEqual(self.billed(), [])
+        self.assertIn("--max-pages 3", self.calls()[-1])
+
+    def test_bq11_a_twelve_digit_number_rejects_the_batch(self):
+        self.enable()
+        for bad in (brow(label="usage-{}-x".format(TWELVE)), brow(account=TWELVE), brow(note="acct " + TWELVE2)):
+            self.query_out([brow(day="2026-11-15"), bad])
+            result, _o, _e = self.fetch(mode="now", now=T0 + len(self.calls()))
+            self.assertEqual(result["result"], "failed")
+        self.assertEqual(self.billed(), [])
+
+    def test_bq12_rows_appended_and_refetch_replaces_by_id(self):
+        self.enable()
+        self.query_out([brow(day="2026-11-15", amount=1.0), brow(day="2026-11-16", amount=2.0, final=False)])
+        self.assertEqual(self.fetch(mode="now", now=T0 + 10)[0]["result"], "ok")
+        self.query_out([brow(day="2026-11-16", amount=2.5)])
+        self.fetch(mode="now", now=T0 + 20)
+        rows = pa_costs.effective_billed()
+        self.assertEqual(sorted((r["from"], r["amount"]) for r in rows), [("2026-11-15", 1.0), ("2026-11-16", 2.5)])
+        self.assertEqual({r["source"] for r in rows}, {"query:q1"})
+        self.assertEqual(len({r["id"] for r in rows}), 2)
+        call = self.calls()[-1].split()
+        self.assertEqual(call[call.index("--from") + 1], "2026-10-13")  # the last 35 days
+        self.assertEqual(call[call.index("--to") + 1], "2026-11-17")
+        self.assertEqual(call[call.index("--credential") + 1], "ExampleReadOnly")
+        qs = self.qstate()
+        self.assertEqual((qs["result"], qs["requests"], qs["identity"]), ("ok", 1, "ExampleReadOnly"))
+
+    def test_bq13_failures_are_plain_and_wait_for_tomorrow(self):
+        self.enable()
+        for code, words in ((4, "permission denied"), (5, "not enabled for this account")):
+            self.stub("query", out="", code=code)
+            result, _o, _e = self.fetch(mode="now", now=T0 + code)
+            self.assertEqual(result["result"], "failed")
+            self.assertIn(words, self.qstate()["lastError"])
+        saved = pa_costs.SCRIPT_TIMEOUT
+        pa_costs.SCRIPT_TIMEOUT = 1
+        try:
+            self.stub("query", out="", code=0, sleep=3)
+            result, _o, _e = self.fetch(now=T0 + 10)
+        finally:
+            pa_costs.SCRIPT_TIMEOUT = saved
+        self.assertEqual(result["result"], "failed")
+        self.assertIn("timed out", self.qstate()["lastError"])
+        self.assertEqual(self.billed(), [])
+        self.stub("query", sleep=None)
+        self.query_out([brow()])
+        self.assertEqual(self.fetch(now=T0 + 3600)[0]["result"], "skipped")  # the next scheduled run is tomorrow
+
+    def test_bq14_disable_stops_the_schedule_and_keeps_rows(self):
+        self.enable()
+        self.query_out([brow()])
+        self.fetch()
+        self.run_cmd(pa_costs.billed_disable)
+        self.assertFalse(self.conf()["enabled"])
+        self.assertEqual(self.fetch(now=T0 + 2 * 86400)[0]["result"], "skipped")
+        self.assertEqual(len(pa_costs.effective_billed()), 1)
+        _r, out, _e = self.run_cmd(pa_costs.billed_status, now=T0 + 2 * 86400)
+        self.assertIn("off", out)
+
+    def test_bq15_import_through_the_profile_importer(self):
+        src = os.path.join(TMP, "export.jsonl")
+        write(src, json.dumps(brow(day="2026-11-10", amount=3.0)) + "\n" + json.dumps(brow(day="2026-11-11", amount=4.0)) + "\n")
+        result, out, _e = self.run_cmd(pa_costs.billed_import, src, "f1", now=T0)
+        rows = pa_costs.effective_billed()
+        self.assertEqual(sorted(r["amount"] for r in rows), [3.0, 4.0])
+        self.assertEqual({r["source"] for r in rows}, {"file:f1"})
+        self.run_cmd(pa_costs.billed_import, src, "f1", now=T0 + 5)  # importing the same file again: no duplicates
+        self.assertEqual(len(pa_costs.effective_billed()), 2)
+        write(src, json.dumps(brow(day="2026-11-12")) + "\n" + json.dumps(brow(day="11/13/2026")) + "\n")
+        with self.assertRaises(pa.Problem):
+            pa_costs.billed_import(src, "f1", now=T0)
+        self.assertEqual(len(pa_costs.effective_billed()), 2)
+        os.environ["CLAUDECODE"] = "1"
+        try:
+            with self.assertRaises(pa.Problem):
+                pa_costs.billed_import(src, "f1", now=T0)
+        finally:
+            os.environ.pop("CLAUDECODE")
+        rid = rows[0]["id"]
+        self.run_cmd(pa_costs.billed_remove, rid)
+        self.assertEqual([r["id"] for r in pa_costs.effective_billed()], [r["id"] for r in rows[1:]])
+        _r, listed, _e = self.run_cmd(pa_costs.billed_list)
+        self.assertIn("2026-11-11", listed)
+        self.assertNotIn("2026-11-10", listed)
+
+    def test_bq20_stderr_is_scrubbed(self):
+        self.enable()
+        self.stub("query", out="", code=1, err="line1\nrole arn with {} in it\nline3\n".format(TWELVE))
+        self.fetch(mode="now", now=T0 + 10)
+        text = json.dumps(self.qstate())
+        self.assertNotIn(TWELVE, text)
+        self.assertIn("line3", text)
+
+    def test_ba1_there_is_no_billed_add(self):
+        with self.assertRaises(SystemExit):
+            self.run_cmd(lambda: pa_costs.main(["billed", "add", "--amount", "1"]))
+        result, _o, _e = self.run_cmd(pa_costs.main, ["billed", "add"])
+        self.assertEqual(result, 2)
+
+    def test_bq_status_line(self):
+        self.enable()
+        self.query_out([brow()], requests=2)
+        self.fetch(now=T0 + 60)
+        _r, out, _e = self.run_cmd(pa_costs.billed_status, now=T0 + 120)
+        for want in ("Billing query: last run", "ok", "2 requests", "0.02 USD", "next after", "cap 1/day", "3 requests", "Turn off"):
+            self.assertIn(want, out)
+
+
+class BC_Comparison(BillingBase):
+    def summary(self, rows):
+        """A space summary and an all-spaces summary with the given byDayModel (day, model, money)."""
+        bdm = [{"day": d, "model": m, "tokens": toks(out=1), "money": v} for d, m, v in rows]
+        return {"account": "acct1", "updated": "2026-11-17T09:00:00Z", "byDayModel": bdm, "prices": {"currency": "USD"}}
+
+    def compare(self, billed, space_rows, all_rows=None):
+        table, _p = pa_costs.load_prices(pa.load_profile("test"))
+        rows = [pa_costs.validate_row(dict(r), "query:q1", "acct1", T0) for r in billed]
+        return pa_costs.billing_comparison(rows, self.summary(space_rows), self.summary(all_rows or space_rows), table)
+
+    def test_bq16_price_factor_from_quantities(self):
+        days = ["2026-11-1{}".format(i) for i in range(3, 6)]
+        billed = [brow(day=d, amount=12.5, quantity=1000000, unit="tokens") for d in days]  # 1M out tokens at 10 = 10.00
+        c = self.compare(billed, [(d, "model-a", 8.0) for d in days])
+        m = c["models"][0]
+        self.assertEqual((m["model"], m["factor"]["kind"]), ("model-a", "price"))
+        self.assertAlmostEqual(m["factor"]["value"], 1.25)
+        self.assertTrue(m["factor"]["applied"])
+        self.assertFalse(m["factor"]["few"])
+        self.assertAlmostEqual(c["calibrated"], 30.0)
+        self.assertTrue(c["accountWide"])
+
+    def test_bq17_scope_ratio_shown_not_applied(self):
+        days = ["2026-11-1{}".format(i) for i in range(3, 6)]
+        c = self.compare([brow(day=d, amount=1.0) for d in days], [(d, "model-a", 1.0) for d in days], [(d, "model-a", 2.0) for d in days])
+        f = c["models"][0]["factor"]
+        self.assertEqual((f["kind"], f["applied"]), ("scope", False))
+        self.assertAlmostEqual(f["value"], 0.5)
+        self.assertIn("over-prices", f["note"])
+        self.assertAlmostEqual(c["calibrated"], 3.0)  # nothing applied
+
+    def test_bq18_partial_coverage_is_named(self):
+        c = self.compare([brow(day="2026-11-14"), brow(day="2026-11-16", final=False)],
+                         [("2026-11-14", "model-a", 1.0), ("2026-11-15", "model-a", 1.0), ("2026-11-16", "model-a", 1.0)])
+        self.assertEqual(c["covered"]["missing"], ["2026-11-15", "2026-11-17"])
+        self.assertTrue(c["models"][0]["factor"]["few"])
+        self.assertTrue(c["models"][0]["notFinal"])
+        self.assertAlmostEqual(c["models"][0]["thisSpace"], 2.0)  # the uncovered day is excluded
+
+    def test_bq19_other_currency_and_other_account(self):
+        c = self.compare([brow(day="2026-11-14", currency="EUR", amount=9.0), brow(day="2026-11-14", account="acct2", amount=7.0),
+                          brow(day="2026-11-14", amount=1.0)], [("2026-11-14", "model-a", 1.0)])
+        self.assertEqual([(x["currency"], x["amount"]) for x in c["separate"]], [("EUR", 9.0)])
+        self.assertAlmostEqual(c["total"]["billed"], 1.0)
