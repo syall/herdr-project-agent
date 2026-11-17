@@ -1490,6 +1490,48 @@ cases["A7-default-tasks-view"] = async () => { // V1.1: the Tasks view shown by 
   check(deletes().length === 1, `the second click deletes (got ${JSON.stringify(deletes())})`);
 };
 
+// ---- t-011: quiet hours "Set" with untouched fields; messages that say what is wrong ----
+const SCHED = `:${DIR}/schedule.json`;
+async function quietWorld(from = "", to = "") {
+  world();
+  g.__files[SCHED] = JSON.stringify({ everyMinutes: 15, quietHours: null });
+  const v = await mount();
+  await click(v, "sched-summary");
+  v.schedule.quietFrom.set(from); v.schedule.quietTo.set(to);
+  await click(v, "quiet-set"); await settle();
+  return { v, quiet: JSON.parse(g.__files[SCHED]).quietHours, text: look(v).text, error: v.schedule.error };
+}
+
+cases["Q1-untouched-sets-shown"] = async () => { // V2.1: both fields untouched set the times they show
+  const { quiet, error } = await quietWorld();
+  check(!error, `no error (got ${error})`);
+  check(JSON.stringify(quiet) === '{"from":"19:00","to":"08:00"}', `19:00 to 08:00 written (got ${JSON.stringify(quiet)})`);
+};
+cases["Q2-one-typed"] = async () => { // V2.2: one typed, the other untouched: the typed one and the shown default
+  const a = await quietWorld("22:00", "");
+  check(!a.error && JSON.stringify(a.quiet) === '{"from":"22:00","to":"08:00"}', `22:00 to 08:00 (got ${JSON.stringify(a.quiet)}, ${a.error})`);
+  const b = await quietWorld("", "06:30");
+  check(!b.error && JSON.stringify(b.quiet) === '{"from":"19:00","to":"06:30"}', `19:00 to 06:30 (got ${JSON.stringify(b.quiet)}, ${b.error})`);
+};
+cases["Q3-bad-start"] = async () => { // V2.3: the message names the field and the value; nothing written
+  const { quiet, error, text } = await quietWorld("7pm", "");
+  check(quiet === null, `nothing written (got ${JSON.stringify(quiet)})`);
+  check(/start/i.test(error ?? "") && /7pm/.test(error ?? "") && /HH:MM/.test(error ?? ""), `names the start, "7pm" and the form (got ${error})`);
+  check(text.includes(error), "the message is shown");
+};
+cases["Q4-bad-end"] = async () => { // V2.4
+  const { quiet, error } = await quietWorld("", "25:00");
+  check(quiet === null && /end/i.test(error ?? "") && /25:00/.test(error ?? "") && !/start/i.test(error ?? ""), `names the end and "25:00" (got ${error}, ${JSON.stringify(quiet)})`);
+};
+cases["Q5-same-time"] = async () => { // V2.5
+  const { quiet, error } = await quietWorld("08:00", "");
+  check(quiet === null && /same/i.test(error ?? "") && /08:00/.test(error ?? ""), `says both are 08:00 (got ${error}, ${JSON.stringify(quiet)})`);
+};
+cases["Q6-short-hour"] = async () => { // V2.6: 7:30 is a time, written as 07:30
+  const { quiet, error } = await quietWorld("7:30", "21:15");
+  check(!error && JSON.stringify(quiet) === '{"from":"07:30","to":"21:15"}', `07:30 to 21:15 (got ${JSON.stringify(quiet)}, ${error})`);
+};
+
 const pick = process.argv.slice(2);
 let failed = 0;
 for (const [name, fn] of Object.entries(cases)) {
