@@ -1159,6 +1159,78 @@ class Split_CdTracking(Split):
         self.assertIsNotNone(self.at("cd ~ && git checkout a.py"))  # a.py exists in ~: a file restore
 
 
+class R2b_UnknownFolderAndQuotes(Round2):
+    """Put back (VERIFY-4 V4-1, REVIEW-7 M2): the cd tracking for git checkout, which the split keeps."""
+
+    def test_known_cd_then_or_makes_the_folder_unknown(self):  # VERIFY-2 F3 (mutation M31)
+        self.assertIsNotNone(self.r2("cd src && git status || git checkout feature"))
+        self.assertIsNotNone(self.r2("cd src && git status ; git checkout feature"))
+        self.assertIsNone(self.r2("cd src && git status && git checkout feature"))
+
+
+class SplitFix_WrapperVariables(Split):
+    """REVIEW-7 I1: R12 applies inside an eval or shell -c text too, as it did at ca7adf8."""
+
+    def test_refused(self):
+        for line, word in [("eval 'export GIT_DIR=/tmp/x' && git status", "GIT_DIR=/tmp/x"),
+                           ("eval 'export GIT_CONFIG_GLOBAL=/tmp/x'; git status", "GIT_CONFIG_GLOBAL=/tmp/x"),
+                           ("eval 'export GIT_SSH_COMMAND=x' && git fetch origin", "GIT_SSH_COMMAND=x"),
+                           ("eval 'export GIT_WORK_TREE=/tmp/o GIT_DIR=/tmp/o/.git'", "GIT_WORK_TREE=/tmp/o"),
+                           ("eval 'export GIT_DIR' && git status", "GIT_DIR"),
+                           ("bash -c 'export GH_TOKEN=x; make'", "GH_TOKEN=x"),
+                           ("env -S 'GIT_DIR=x make'", "GIT_DIR=x")]:
+            with self.subTest(line=line):
+                self.assertEqual(self.at(line), VARIABLE.format(word))
+
+    def test_allowed(self):
+        for line in ["eval 'make'", "sh -c 'make test'", "bash -c 'export FOO=1; make'", "eval 'echo hi' && git status"]:
+            with self.subTest(line=line):
+                self.assertIsNone(self.at(line))
+
+
+class SplitFix_HiddenNames(Split):
+    """REVIEW-7 I2: a program word built from an expansion or substitution whose text spells git, gh or hc."""
+
+    def test_refused_not_plain(self):
+        for line in ["${X:-git} push origin HEAD > /dev/null", "${X-git} push > /dev/null", "gi`:`t push > /dev/null",
+                     "gi$(:)t push > /dev/null", "gi$(true)t push > /dev/null", "${X:+gh} pr create > /dev/null",
+                     "${X:=hc} send a b > /dev/null", "${X=git} push > /dev/null", "${X:-gi}t push > /dev/null",
+                     "gi$(echo $(true))t push > /dev/null"]:
+            with self.subTest(line=line):
+                self.assertEqual(self.at(line), NOT_PLAIN)
+
+    def test_inside_a_wrapper_text(self):
+        for line in ["sh -c 'gi$(:)t push'", "eval '${X:-git} push'"]:
+            with self.subTest(line=line):
+                self.assertIsNotNone(self.at(line))
+
+    def test_ordinary_not_plain_lines_stay_allowed(self):
+        for line in ["echo ${X:-default} > /tmp/x", "echo $(date) > /tmp/d", "echo `date` > /tmp/d", "make -j$(nproc) > log",
+                     "echo ${HOME:-/tmp}/x > /tmp/y", "sh -c 'make test'"]:
+            with self.subTest(line=line):
+                self.assertIsNone(self.at(line))
+
+
+class SplitFix_PipeIntoShell(Split):
+    """REVIEW-7 Minor (M1): only the program word after the pipe counts; source and . read the pipe too."""
+
+    def test_allowed(self):
+        for line in ["git log | grep bash", "git ls-files | grep -c watch", "git log | grep -w sh", "git diff | grep eval",
+                     "git log --oneline | grep -e source"]:
+            with self.subTest(line=line):
+                self.assertIsNone(self.at(line))
+
+    def test_refused(self):
+        for line, shown_part in [("git show HEAD:x.sh | source /dev/stdin", "source /dev/stdin"),
+                                 ("git show HEAD:x.sh | . /dev/stdin", ". /dev/stdin"),
+                                 ("git show HEAD:x.sh | env bash", "env bash"),
+                                 ("git show HEAD:x.sh | exec sh", "exec sh"),
+                                 ("git show HEAD:x.sh | xargs -0 bash -c", "xargs -0 bash -c"),
+                                 ("git show HEAD:x.sh | /bin/bash", "/bin/bash")]:
+            with self.subTest(line=line):
+                self.assertEqual(self.at(line), OFF_TABLE.format(shown_part))
+
+
 class Split_Texts(GuardTest):
     """VERIFY-3 N1: the R12 text is pinned."""
 

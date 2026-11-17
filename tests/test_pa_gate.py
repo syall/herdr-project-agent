@@ -340,5 +340,28 @@ class G5NoSideEffects(Base):
             self.assertEqual(result[key], written[key], key)
 
 
+class G6NoOptionalLocks(Base):
+    def test_g6_gate_commits_runs_status_without_optional_locks(self):  # REVIEW-6 M6
+        proj = self.repo()
+        wt = self.linked(proj, "t-1-x", os.path.join(self.tmp, "wt"))
+        calls = []
+        real = pa_hooks.git
+
+        def recording(path, *args, **kw):
+            calls.append(args)
+            return real(path, *args, **kw)
+
+        pa_hooks.git = recording
+        try:
+            commits = pa_hooks.gate_commits(wt)
+        finally:
+            pa_hooks.git = real
+        self.assertEqual(commits[0]["branch"], "t-1-x")
+        status = [a for a in calls if "status" in a]
+        self.assertTrue(status, calls)
+        for args in status:
+            self.assertEqual(args[0], "--no-optional-locks", args)
+
+
 if __name__ == "__main__":
     unittest.main()
