@@ -1443,7 +1443,7 @@ class BQ_Billing(BillingBase):
         pa_costs.SCRIPT_TIMEOUT = 1
         try:
             self.stub("query", out="", code=0, sleep=3)
-            result, _o, _e = self.fetch(now=T0 + 10)
+            result, _o, _e = self.fetch(mode="now", now=T0 + 10)
         finally:
             pa_costs.SCRIPT_TIMEOUT = saved
         self.assertEqual(result["result"], "failed")
@@ -1499,10 +1499,10 @@ class BQ_Billing(BillingBase):
         self.assertIn("line3", text)
 
     def test_ba1_there_is_no_billed_add(self):
-        with self.assertRaises(SystemExit):
-            self.run_cmd(lambda: pa_costs.main(["billed", "add", "--amount", "1"]))
-        result, _o, _e = self.run_cmd(pa_costs.main, ["billed", "add"])
-        self.assertEqual(result, 2)
+        for argv in (["billed", "add"], ["billed", "add", "--amount", "1"]):
+            result, _o, err = self.run_cmd(pa_costs.main, argv)
+            self.assertEqual(result, 2)  # argparse: invalid choice
+            self.assertIn("invalid choice", err)
 
     def test_bq_status_line(self):
         self.enable()
