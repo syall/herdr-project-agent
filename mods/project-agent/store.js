@@ -65,7 +65,9 @@ export const READ_LIMIT = 10000;
 export const TIMED_OUT = Object.freeze({ timedOut: true });
 // `p`, or TIMED_OUT after `ms` on the cx of the task that waits (cx.sleep: mods have no setTimeout).
 // Without a cx it is just `p`. When it settles either way, `cx.progress()` (if given) is called: the
-// panel's load counts it as progress, so a slow but working load is never given up.
+// panel's load counts it as progress, so a slow but working load is never given up. The losing
+// sleep is not cancelled (mods cannot cancel one): it runs out on its own, at most READ_LIMIT later,
+// one per capped read (up to 200 on the card fallback); a pending sleep holds no call to the machine.
 export function withTimeout(cx, p, ms = READ_LIMIT) {
   if (!cx?.sleep) return p;
   return Promise.race([p, cx.sleep(ms).then(() => TIMED_OUT, () => TIMED_OUT)]).then((v) => { cx.progress?.(); return v; }, (e) => { cx.progress?.(); throw e; });
@@ -98,25 +100,36 @@ export async function loadProfile(space, profileProp, cx) {
   return bad(profile) ? { answered: false } : { answered: true, profile: profile.value };
 }
 
-// { agent, ledger, profile, errors } for a space; agent is null when it has no Project Agent
+// { agent, ledger, profile, errors, unknown } for a space; agent is null when it has no Project Agent
 // (timedOut: agent.json did not answer). With `cx`, each read gives up after READ_LIMIT. After
-// agent.json, the other reads run at the same time; the error lines keep their order.
+// agent.json, the other reads run at the same time; the error lines keep their order. unknown: the
+// parts ("ledger", "profile", "schedule", "request") whose read did not answer with content (it timed
+// out or was not valid JSON; for the profile, also config.json when it was needed): their value is
+// null here, and the caller must not take it for "none". A missing file is an answer. A thrown read
+// rejects the load, as before.
 export async function loadSpace(space, profileProp, cx) {
   const on = space.machine, dir = stateDir(space), root = paHome(on);
   const errors = [];
   const agent = await readJson(`${dir}/agent.json`, on, cx);
   if (agent.error) errors.push(`agent.json: ${agent.error}`);
   if (!agent.value) return { agent: null, ledger: null, profile: null, errors, dir, ...(agent.timedOut ? { timedOut: true } : {}) };
-  let name = agent.value.profile || profileProp;
+  let name = agent.value.profile || profileProp, nameUnknown = false;
   const profileRead = async () => {
-    if (!name) name = (await readJson(`${root}/config.json`, on, cx)).value?.defaultProfile;
+    if (!name) {
+      const config = await readJson(`${root}/config.json`, on, cx);
+      if (config.timedOut || config.error) nameUnknown = config.timedOut ? "timed out" : true;
+      name = config.value?.defaultProfile;
+    }
     return name ? readJson(`${root}/profiles/${name}/profile.json`, on, cx) : { value: null };
   };
   const [ledger, profile, schedule, request] = await Promise.all([readJson(`${dir}/ledger.json`, on, cx), profileRead(), readJson(`${dir}/schedule.json`, on, cx), readJson(`${dir}/pass-request.json`, on, cx)]);
   if (ledger.error) errors.push(`ledger.json: ${ledger.error}`);
   if (schedule.error) errors.push(`schedule.json: ${schedule.error}`);
   if (profile.error) errors.push(`profile ${name}: ${profile.error}`);
-  return { agent: agent.value, ledger: ledger.value, profile: profile.value, schedule: schedule.value, request: request.value, profileDir: `${root}/profiles/${name}`, errors, dir };
+  if (nameUnknown === "timed out") errors.push("config.json: timed out");
+  const unanswered = (r) => Boolean(r.timedOut || r.error);
+  const unknown = [["ledger", unanswered(ledger)], ["profile", Boolean(nameUnknown) || unanswered(profile)], ["schedule", unanswered(schedule)], ["request", unanswered(request)]].filter(([, u]) => u).map(([part]) => part);
+  return { agent: agent.value, ledger: ledger.value, profile: profile.value, schedule: schedule.value, request: request.value, profileDir: `${root}/profiles/${name}`, errors, dir, unknown };
 }
 
 // Fills "{a.b}" from the task. Returns null when a field is missing or unsafe: a value
@@ -254,9 +267,13 @@ const byteOrder = (a, b) => (a < b ? -1 : a > b ? 1 : 0); // names are ASCII: co
 // in parallel (as before, but not in sequence). On this computer the files are read directly.
 // Options: cx (each call gives up after READ_LIMIT), batchOnly (no fallback: null when the call
 // fails), live() (false: the caller no longer wants the result; the fallback is skipped and the
-// result is null, which the caller must not take for "no cards"). Only exit 0 is a whole batch
-// (exit 3 with no output: no folder); a call killed part way can print whole-looking pairs.
-export async function loadDecisions(space, { cx, batchOnly = false, live } = {}) {
+// result is null, which the caller must not take for "no cards"), known (the last known cards,
+// [{ path, text }]: a card whose own read times out or fails on the fallback path is that copy, else
+// left out). Only exit 0 is a whole batch (exit 3 with no output: no folder); a call killed part way
+// can print whole-looking pairs. null also when the listing never answered (the batch gave no whole
+// answer and `ls` timed out or failed): unknown, not "no cards". A listing that answered (no folder,
+// an empty one) is [].
+export async function loadDecisions(space, { cx, batchOnly = false, live, known = [] } = {}) {
   const on = space.machine ?? null, dir = `${stateDir(space)}/decisions`;
   if (on) {
     let r = null;
@@ -269,13 +286,15 @@ export async function loadDecisions(space, { cx, batchOnly = false, live } = {})
   let names = [];
   try {
     const r = await withTimeout(cx, exec("ls", ["-1", dir], { on, timeout: READ_LIMIT }));
-    if (r === TIMED_OUT) return batchOnly ? null : [];
+    if (r === TIMED_OUT) return null;
     if (r.code === 0) names = r.stdout.split("\n").filter((n) => CARD_NAME.test(n));
-  } catch { return batchOnly ? null : []; }
+  } catch { return null; }
   const picked = names.slice(0, MAX_CARDS);
+  const last = new Map((known ?? []).filter((c) => c?.path && typeof c.text === "string").map((c) => [c.path, c.text]));
   const texts = await Promise.all(picked.map(async (name) => {
-    const text = await withTimeout(cx, readTextFile(`${dir}/${name}`, { on }));
-    return text === TIMED_OUT ? null : text; // a read that hangs is left out
+    let text;
+    try { text = await withTimeout(cx, readTextFile(`${dir}/${name}`, { on })); } catch { text = TIMED_OUT; }
+    return text === TIMED_OUT ? last.get(`${dir}/${name}`) ?? null : text; // a read that hangs or fails: its last known copy, else left out
   }));
   return parseCards(picked.map((name, i) => ({ name, path: `${dir}/${name}`, text: texts[i] })));
 }

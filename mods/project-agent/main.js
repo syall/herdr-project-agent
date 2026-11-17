@@ -24,6 +24,10 @@ const CACHE_MAX = 8; // spaces whose last load is kept (in memory), the least re
 const CACHE_OLD = 60000; // a kept load older than this says "updating…" while its refresh runs
 const COUNT_EVERY = 10000; // while hidden: at most one card read and one ledger read per space this often
 const PROFILE_RETRY = 60000; // while hidden: a profile read that failed is tried again no sooner than this
+// A part of loadSpace's result that did not answer (its `unknown`), and the fields it fills.
+const PARTS = { ledger: ["ledger"], profile: ["profile", "profileDir"], schedule: ["schedule"], request: ["request"] };
+const NOTE = "Note for the Project Agent (optional)";
+const noteKey = (spaceId, cardId) => `${spaceId}\0${cardId}`; // note fields are per space: two spaces can have the same card id
 
 // Whether this panel is on screen: a block showing it in the shown layout with no hidden node above
 // it, and the selected child of each stack above it (how the tabs mod reads the side panel; the
@@ -69,7 +73,8 @@ export default class ProjectAgent extends View {
     this.committed = {}; // space id -> the token of its last load that committed; an older one commits nothing
     this.seq = 0;
     this.hidden = {}; // space id -> { at, busy, seq }: the hidden panel's last count and ledger read
-    this.hiddenDone = {}; // space id -> the seq of its last hidden read that wrote; an older one writes nothing
+    this.wrote = {}; // space id -> the seq (start order) of the last read, full load or hidden, whose data went to its shared keys; an older one writes none
+    this.again = {}; // space id -> a reload came while its load was in flight: one more when it ends (if the space is still shown)
     this.profiles = {}; // space id -> { at, busy, done, profile }: its profile, read once per session (a full load's counts)
     this.asleep = false; // not on screen: only the open-card count is read
     this.view = null; // "decisions" | "tasks" | "rules"; null: decisions when any is open
@@ -80,7 +85,7 @@ export default class ProjectAgent extends View {
     this.output = {}; // `${task}:${label}` -> { text, code, running }
     this.armedTask = null; // task id armed for delete (second click deletes)
     this.taskError = {}; // task id -> why the last change failed
-    this.notes = {}; // card id -> InputState (the optional note)
+    this.notes = {}; // noteKey(space id, card id) -> InputState (the optional note)
     this.choice = {}; // card id -> the option picked, not yet submitted
     this.cardScroll = ScrollHandle.new(); // the Decisions list, to bring one card into view
     this.spotlight = null; // card id reached from its task: drawn with an accent border
@@ -129,11 +134,17 @@ export default class ProjectAgent extends View {
     const kept = this.cache.get(space.id);
     if (!kept) return;
     this.cache.delete(space.id); this.cache.set(space.id, kept); // now the most recently shown
-    this.data = kept.data; this.cards = kept.cards; this.cardsFor = space.id; this.rules.data = kept.rules; this.space = space.id; this.dataAt = kept.at;
-    cx.spawn(async (cx) => {
-      for (const c of kept.cards) if (c.card?.status === "open") this.notes[c.id] ??= InputState.new({ placeholder: "Note for the Project Agent (optional)" });
-      cx.notify();
-    });
+    this.data = kept.data; this.cards = kept.cards; this.cardsFor = kept.cardsUnknown ? null : space.id; this.rules.data = kept.rules; this.space = space.id; this.dataAt = kept.at;
+    cx.spawn(async (cx) => { this.syncNotes(space, kept.cards, false); cx.notify(); });
+  }
+
+  // One note field per open card of the space, made in a task (never in render). release: the
+  // space's fields whose card is not open in `cards` are dropped (only from a list that answered).
+  syncNotes(space, cards, release) {
+    const open = new Set((cards ?? []).filter((c) => c.card?.status === "open").map((c) => noteKey(space.id, c.id)));
+    if (release) for (const k of Object.keys(this.notes)) if (k.startsWith(noteKey(space.id, "")) && !open.has(k)) { this.notes[k].release?.(); delete this.notes[k]; }
+    for (const k of open) this.notes[k] ??= InputState.new({ placeholder: NOTE });
+    return open.size;
   }
 
   // Shown again after a time off screen: what it has shows at once; one full reload starts.
@@ -156,13 +167,14 @@ export default class ProjectAgent extends View {
     const mine = { at: now, busy: true, seq: ++this.seq };
     this.hidden[space.id] = mine;
     cx.spawn(async (cx) => {
+      const rcx = { sleep: (ms) => cx.sleep(ms) }; // only what the store's cap uses
       const [cards, ledger] = await Promise.all([
-        loadDecisions(space, { cx, batchOnly: true }).catch(() => null),
-        loadLedger(space, cx).catch(() => null),
+        loadDecisions(space, { cx: rcx, batchOnly: true }).catch(() => null),
+        loadLedger(space, rcx).catch(() => null),
       ]);
       mine.busy = false;
-      if (!this.asleep || mine.seq < (this.hiddenDone[space.id] ?? 0)) return;
-      this.hiddenDone[space.id] = mine.seq;
+      if (!this.asleep || mine.seq < (this.wrote[space.id] ?? 0)) return;
+      this.wrote[space.id] = mine.seq;
       if (cards) {
         const open = cards.filter((x) => x.card?.status === "open").length;
         const counts = { ...(shared("project-agent.open") ?? {}) };
@@ -183,7 +195,7 @@ export default class ProjectAgent extends View {
     p.at = now; p.busy = true;
     cx.spawn(async (cx) => {
       let r = { answered: false };
-      try { r = await loadProfile(space, props()?.profile, cx); } catch {}
+      try { r = await loadProfile(space, props()?.profile, { sleep: (ms) => cx.sleep(ms) }); } catch {}
       p.busy = false;
       if (!r.answered || p.done) return;
       p.done = true; p.profile = r.profile;
@@ -198,18 +210,20 @@ export default class ProjectAgent extends View {
   }
 
   // Loads the shown space: agent.json, then the header's reads together (first paint), then the
-  // cards, rules, evidence and stale instructions together; then commits. One load per space in
-  // flight; one with no progress for LOAD_LIMIT is given up and a new one may start. A load that
-  // ends commits unless a newer load of its space has committed (this.committed): for the shown
-  // space it draws and writes the shared keys; for another, it is only kept. The last finished
-  // load of each space is kept and shown at once when the space is shown again.
+  // cards, rules, evidence and stale instructions together; then commits (commit()). One load per
+  // space in flight; one with no progress for LOAD_LIMIT is given up and a new one may start. A load
+  // that ends commits unless a newer load of its space has committed (this.committed). The last
+  // finished load of each space is kept and shown at once when the space is shown again. A read
+  // that times out or fails never stands for "none": its part keeps the last known value (the kept
+  // entry's, else what is shown for the space), or stays unknown, and an unknown part writes none of
+  // the shared keys it feeds.
   reload(cx) {
     const space = spaces().find((s) => s.active);
     if (!space) { this.data = null; this.space = null; cx.notify(); return; }
     if (space.id !== this.space) this.adopt(space, cx);
     if (!onScreen()) { this.asleep = true; this.hiddenRead(cx, space); return; }
     this.asleep = false;
-    if (this.inFlight(space.id)) { this.again = true; return; }
+    if (this.inFlight(space.id)) { this.again[space.id] = true; return; }
     const token = ++this.seq, load = { token, at: Date.now() };
     this.loads[space.id] = load;
     const current = () => this.loads[space.id] === load;
@@ -218,9 +232,15 @@ export default class ProjectAgent extends View {
       const rcx = { sleep: (ms) => cx.sleep(ms), progress: () => { load.at = Date.now(); } }; // the store's reads move `at`
       let data, cards = [], rules = null;
       const kept = this.cache.get(space.id);
-      const shownNow = () => (this.space === space.id ? this.data : null); // what is shown for this space, if it is
+      const shownNow = () => (this.space === space.id && this.data?.agent ? this.data : null); // what is shown for this space, if it is
+      const lastKnown = (part) => [kept?.data, shownNow()].find((d) => d?.agent && !(d.unknown ?? []).includes(part)) ?? null;
       try {
         data = await loadSpace(space, props()?.profile, rcx);
+        if (data.agent) { // a part that did not answer: its last known value, else it stays unknown (its error line stays)
+          const unknown = [];
+          for (const part of data.unknown ?? []) { const src = lastKnown(part); if (src) for (const f of PARTS[part]) data[f] = src[f]; else unknown.push(part); }
+          data.unknown = unknown;
+        }
         if (data.agent && current() && shown()) { // first paint: the header and the tasks
           const same = this.space === space.id;
           this.data = { ...data, evidence: same ? this.data?.evidence : undefined, stale: same ? this.data?.stale : undefined };
@@ -230,11 +250,12 @@ export default class ProjectAgent extends View {
           cx.notify();
         }
         if (data.agent) {
-          // A read that times out keeps the last known value: the kept load's, else what is shown for the space.
-          const cap = (p, fallback) => withTimeout(rcx, p).then((v) => (v === TIMED_OUT ? fallback() : v));
+          // A read that times out or fails keeps the last known value: the kept load's, else what is shown for the space.
+          const cap = (p, fallback) => withTimeout(rcx, p).then((v) => (v === TIMED_OUT ? fallback() : v), () => fallback());
+          const known = [...(kept && !kept.cardsUnknown ? kept.cards : []), ...(this.space === space.id && this.cardsFor === space.id ? this.cards : [])];
           let evidence, stale;
           [cards, rules, evidence, stale] = await Promise.all([
-            loadDecisions(space, { cx: rcx, live: current }),
+            loadDecisions(space, { cx: rcx, live: current, known }),
             cap(loadRules(space), () => kept?.rules ?? (this.space === space.id && this.cardsFor === space.id ? this.rules.data : null) ?? null), // null: the Rules view says Loading…
             cap(evidenceTasks(space), () => kept?.data?.evidence ?? shownNow()?.evidence), // undefined: unknown
             cap(staleInstructions(space, data.agent.profile), () => kept?.data?.stale ?? shownNow()?.stale ?? []),
@@ -242,34 +263,54 @@ export default class ProjectAgent extends View {
           data.evidence = evidence; data.stale = stale;
         }
       }
-      catch (e) { data = { agent: null, errors: [String(e.message ?? e)] }; }
+      catch (e) { data = { agent: null, errors: [String(e.message ?? e)], failed: true }; } // a read in the first round threw
       const wasCurrent = current();
       if (wasCurrent) delete this.loads[space.id];
-      const follow = () => { if (wasCurrent && this.again) { this.again = false; this.reload(cx); } };
       // Given up with its card fallback skipped (no result), or a newer load of this space has committed.
-      if (cards === null || token < (this.committed[space.id] ?? 0)) { follow(); return; }
-      // agent.json did not answer: keep what is kept for this space, with the error; the kept entry stays.
-      const timedOut = Boolean(data.timedOut);
-      if (timedOut && kept) { data = { ...kept.data, errors: [...data.errors] }; cards = kept.cards; rules = kept.rules; }
-      if (!shown()) { // its space is no longer shown: keep it for the way back; draw and write nothing
-        if (!timedOut) { this.committed[space.id] = token; this.keep(space.id, { data, cards, rules: rules ?? kept?.rules ?? null, at: Date.now() }); }
-      } else if (timedOut && !kept) { // nothing kept: say so; the shared entries stay as they are
-        this.data = data; this.cards = []; this.cardsFor = null; this.space = space.id; this.dataAt = Date.now();
-        cx.notify();
-      } else {
-        this.data = data; this.cards = cards; this.space = space.id; this.cardsFor = space.id; this.dataAt = timedOut ? kept.at : Date.now();
-        if (rules) this.rules.data = rules;
-        if (!timedOut) { this.committed[space.id] = token; this.keep(space.id, { data, cards, rules: rules ?? this.rules.data, at: this.dataAt }); }
-        if (!timedOut && data.agent) this.profiles[space.id] = { done: true, profile: data.profile ?? null }; // read once per session
-        // One note field per open card, made here (never in render) and dropped with its card.
-        const open = new Set(cards.filter((c) => c.card?.status === "open").map((c) => c.id));
-        for (const id of Object.keys(this.notes)) if (!open.has(id)) { this.notes[id].release?.(); delete this.notes[id]; }
-        for (const id of open) this.notes[id] ??= InputState.new({ placeholder: "Note for the Project Agent (optional)" });
-        this.share(space, data.agent ? data : { ...data, evidence: new Map() }, { open: open.size });
-        cx.notify();
-      }
-      follow();
+      if (!((cards === null && !wasCurrent) || token < (this.committed[space.id] ?? 0))) this.commit(space, token, data, cards, rules, cx);
+      if (wasCurrent && this.again[space.id]) { delete this.again[space.id]; if (shown()) this.reload(cx); }
     });
+  }
+
+  // A finished load of `space` (newest so far). Branches:
+  // - nothing answered (agent.json timed out, or a first-round read threw): if shown, what is kept or
+  //   shown for the space stays, with the error ("did not answer" with neither); nothing is kept,
+  //   committed or written;
+  // - cards null (the listing never answered): the last known cards, else unknown (no count written,
+  //   no note field dropped, "Loading decisions…");
+  // - not shown: only kept (for the way back); nothing drawn or written;
+  // - shown: drawn, kept, and the shared keys written unless a newer read of the space wrote them.
+  commit(space, token, data, cards, rules, cx) {
+    const kept = this.cache.get(space.id), same = this.space === space.id;
+    const shown = spaces().find((s) => s.active)?.id === space.id;
+    if (data.timedOut || data.failed) {
+      if (!shown) return;
+      const prior = kept ?? (same && this.data?.agent ? { data: this.data, cards: this.cards, cardsUnknown: this.cardsFor !== space.id, rules: this.rules.data, at: this.dataAt } : null);
+      if (prior) {
+        this.data = { ...prior.data, errors: [...data.errors] }; this.cards = prior.cards; this.cardsFor = prior.cardsUnknown ? null : space.id; this.dataAt = prior.at;
+        if (prior.rules) this.rules.data = prior.rules;
+        this.syncNotes(space, prior.cards, false);
+      } else { this.data = data; this.cards = []; this.cardsFor = null; this.dataAt = Date.now(); }
+      this.space = space.id;
+      cx.notify();
+      return;
+    }
+    let cardsUnknown = false;
+    if (cards === null) {
+      const src = kept && !kept.cardsUnknown ? kept.cards : same && this.cardsFor === space.id ? this.cards : null;
+      if (src) cards = src; else { cards = []; cardsUnknown = true; }
+      data.errors = [...(data.errors ?? []), src ? "decision cards: did not answer; the last known are shown" : "decision cards: did not answer"];
+    }
+    this.committed[space.id] = token;
+    if (!shown) { this.keep(space.id, { data, cards, cardsUnknown, rules: rules ?? kept?.rules ?? null, at: Date.now() }); return; }
+    this.data = data; this.cards = cards; this.space = space.id; this.cardsFor = cardsUnknown ? null : space.id; this.dataAt = Date.now();
+    if (rules) this.rules.data = rules;
+    this.keep(space.id, { data, cards, cardsUnknown, rules: rules ?? this.rules.data, at: this.dataAt });
+    if (data.agent && !(data.unknown ?? []).includes("profile")) this.profiles[space.id] = { done: true, profile: data.profile ?? null }; // read once per session
+    const open = cardsUnknown ? null : this.syncNotes(space, cards, true);
+    if (cardsUnknown) this.syncNotes(space, cards, false);
+    if (token > (this.wrote[space.id] ?? 0)) { this.wrote[space.id] = token; this.share(space, data.agent ? data : { ...data, evidence: new Map() }, { open }); }
+    cx.notify();
   }
 
   // The shared keys other views read, for one space, each written only when it changed: its
@@ -282,7 +323,20 @@ export default class ProjectAgent extends View {
     if (JSON.stringify(allMains[space.id] ?? []) !== JSON.stringify(mains)) { if (mains.length) allMains[space.id] = mains; else delete allMains[space.id]; setShared("project-agent.mainBranches", allMains); }
   }
 
+  // A part of `data` that is unknown (data.unknown: its read did not answer and nothing was known)
+  // writes none of the keys it feeds: the ledger feeds the worktrees, the Files shortcuts and the
+  // workers; the profile, the main branches.
   share(space, data, { open = null, mains: writeMains = true } = {}) {
+    const unknown = data.unknown ?? [];
+    if (writeMains && !unknown.includes("profile")) this.shareMains(space, data.profile);
+    if (!unknown.includes("ledger")) this.shareLedger(space, data);
+    if (open !== null) {
+      const counts = { ...(shared("project-agent.open") ?? {}) };
+      if ((counts[space.id] ?? 0) !== open) { if (open) counts[space.id] = open; else delete counts[space.id]; setShared("project-agent.open", counts); }
+    }
+  }
+
+  shareLedger(space, data) {
     // Tell other mods (a Changes view, say) which worktrees this space's tasks use.
     const trees = (data.ledger?.tasks ?? []).filter((x) => x.worktree && x.id).map((x) => ({ task: x.id, path: String(x.worktree), title: String(x.title ?? "") }));
     const allTrees = { ...(shared("project-agent.worktrees") ?? {}) };
@@ -302,17 +356,11 @@ export default class ProjectAgent extends View {
     }
     const allSpots = { ...(shared("my-files.places") ?? {}) };
     if (JSON.stringify(allSpots[space.id] ?? []) !== JSON.stringify(spots)) { if (spots.length) allSpots[space.id] = spots; else delete allSpots[space.id]; setShared("my-files.places", allSpots); }
-    // The profile's main-branch names, for views that compare a branch with its base.
-    if (writeMains) this.shareMains(space, data.profile);
     // And which task each worker belongs to (an Agents view can link a worker back to its task).
     const crew = {};
     for (const x of data.ledger?.tasks ?? []) for (const w of x.workers ?? []) if (w.address) crew[space.machine ? `${space.machine}/${w.address}` : w.address] = { task: x.id, title: String(x.title ?? ""), role: w.role ?? null, state: x.state ?? null };
     const allCrew = { ...(shared("project-agent.workers") ?? {}) };
     if (JSON.stringify(allCrew[space.id] ?? {}) !== JSON.stringify(crew)) { if (Object.keys(crew).length) allCrew[space.id] = crew; else delete allCrew[space.id]; setShared("project-agent.workers", allCrew); }
-    if (open !== null) {
-      const counts = { ...(shared("project-agent.open") ?? {}) };
-      if ((counts[space.id] ?? 0) !== open) { if (open) counts[space.id] = open; else delete counts[space.id]; setShared("project-agent.open", counts); }
-    }
   }
 
   // "Open Project Agent": asks the keeper (shared request), which opens a new tab running the
@@ -350,7 +398,7 @@ export default class ProjectAgent extends View {
     if (this.busy[entry.id] || !label) return;
     delete this.choice[entry.id];
     this.busy[entry.id] = true; delete this.failed[entry.id];
-    const note = (this.notes[entry.id]?.value() ?? "").trim();
+    const note = (this.notes[noteKey(space.id, entry.id)]?.value() ?? "").trim();
     cx.notify();
     cx.spawn(async (cx) => {
       try {
@@ -627,7 +675,7 @@ export default class ProjectAgent extends View {
           .child(div().flex_1().min_w(0).text_size(12).text_color(t.muted).child(String(o.detail ?? "")))
           .when(recommended, (el) => el.child(div().flex_none().text_size(10.5).text_color(t.dim).child("recommended")));
       }))
-      .when(open && Boolean(this.notes[entry.id]), (el) => el.child(Input.new(this.notes[entry.id]).h(30).px(8).rounded(6).border_1().border_color(t.input).bg(t.background).text_size(12).text_color(t.foreground))
+      .when(open && Boolean(this.notes[noteKey(space.id, entry.id)]), (el) => el.child(Input.new(this.notes[noteKey(space.id, entry.id)]).h(30).px(8).rounded(6).border_1().border_color(t.input).bg(t.background).text_size(12).text_color(t.foreground))
         .child(h_flex().gap(8).items_center()
           .child(div().id(`submit-${entry.id}`).flex_none().px(12).h(28).flex().items_center().rounded(7).text_size(12.5).font_semibold()
             .bg(picked && !busy ? t.solid : t.raised).text_color(picked && !busy ? t.solid_foreground : t.dim)
@@ -655,7 +703,7 @@ export default class ProjectAgent extends View {
     if (!space) return root.child(head("Project Agent")).child(note("No space open."));
     const data = space.id === this.space ? this.data : null;
     if (!data) return root.child(head("Project Agent")).child(note("Loading…"));
-    if (!data.agent && data.timedOut) return root.child(head("Project Agent")).child(note("This space's Project Agent did not answer. Trying again shortly.")).children((data.errors ?? []).map((e) => note(e)));
+    if (!data.agent && (data.timedOut || data.failed)) return root.child(head("Project Agent")).child(note("This space's Project Agent did not answer. Trying again shortly.")).children((data.errors ?? []).map((e) => note(e)));
     if (!data.agent) {
       const tabs = new Set(space.tabs.map((x) => x.id));
       const folder = panes().find((p) => tabs.has(p.tab) && p.cwd)?.cwd || space.folder;
