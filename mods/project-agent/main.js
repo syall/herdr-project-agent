@@ -7,7 +7,7 @@
 import { View, div } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, ScrollHandle } from "gpui-base";
 import { spaces, panes, agents, terminals, machines, theme, run, exec, props, home, watchFolder, notify, shared, setShared, closeOverlay, openOverlay, window, layout } from "herdr";
-import { loadSpace, loadDecisions, loadRules, withTimeout, TIMED_OUT, READ_LIMIT, answerDecision, notifyOrchestrator, changeRules, touched, localId, paHome, stateDir, taskActions, taskLinks, evidenceTasks, cardEvidence, staleInstructions, liveTarget, lookAlike, OPEN_REQUESTS, keeperJudging, startingLabels } from "./store.js";
+import { loadSpace, loadLedger, loadDecisions, loadRules, withTimeout, TIMED_OUT, READ_LIMIT, answerDecision, notifyOrchestrator, changeRules, touched, localId, paHome, stateDir, taskActions, taskLinks, evidenceTasks, cardEvidence, staleInstructions, liveTarget, lookAlike, OPEN_REQUESTS, keeperJudging, startingLabels } from "./store.js";
 import { RulesPane } from "./rules.js";
 import { SetupPane } from "./setup.js";
 import { Keeper, idleShell } from "./keeper.js";
@@ -19,21 +19,25 @@ const ORDER = [...ACTIVE, "parked", "done"];
 const OPEN_WAIT = 30000; // an Open request with nothing started by then: say why, offer the button again
 const OPEN_SLOW = 180000; // its new tab is recorded but its launcher has not started by then: say so
 const paRecords = (spaceId) => Object.values(shared("project-agent.tabs") ?? {}).filter((r) => r?.space === spaceId);
-const LOAD_LIMIT = READ_LIMIT + 1000; // a load still pending after this is given up: a new one may start
+const LOAD_LIMIT = READ_LIMIT + 1000; // a load with no read settled or timed out for this long is given up: a new one may start
 const CACHE_MAX = 8; // spaces whose last load is kept (in memory), the least recently shown dropped first
 const CACHE_OLD = 60000; // a kept load older than this says "updating…" while its refresh runs
-const COUNT_EVERY = 10000; // while hidden: at most one card read per space this often
+const COUNT_EVERY = 10000; // while hidden: at most one card read and one ledger read per space this often
 
 // Whether this panel is on screen: a block showing it in the shown layout with no hidden node above
 // it, and the selected child of each stack above it (how the tabs mod reads the side panel; the
-// Changes view uses the same test). The always-on timer copy does not count. A copy the layout does
-// not hold (a pane mod, a window) counts as shown. A hidden copy stays alive and its timers run.
+// Changes view uses the same test). Only blocks with this copy's props are this copy's (a block
+// does not name the copy it runs); the always-on timer copy never counts. A copy with no such block
+// (a pane mod or a window with other props) counts as shown. Two blocks with the same props are
+// one copy to this test: either shown counts. A hidden copy stays alive and its timers run.
+const sameProps = (a, b) => { const flat = (o) => JSON.stringify(Object.keys(o ?? {}).sort().map((k) => [k, o[k]])); return flat(a) === flat(b); };
 function onScreen(name = "project-agent") {
   let found = false, shown = false;
+  const mine = props() ?? {};
   const walk = (n, ok) => {
     if (!n || typeof n !== "object") return;
     ok = ok && !n.hidden;
-    if (n.content?.mod === name && !n.content?.props?.timer) { found = true; shown ||= ok; }
+    if (n.content?.mod === name && !n.content?.props?.timer && sameProps(n.content?.props, mine)) { found = true; shown ||= ok; }
     const kids = Array.isArray(n.children) ? n.children : [], pick = n.type === "stack" ? n.active ?? kids[0]?.id : null;
     for (const c of kids) walk(c, ok && (pick === null || c?.id === pick));
   };
@@ -54,15 +58,17 @@ export default class ProjectAgent extends View {
       });
       return;
     }
-    this.data = null; // loadSpace() result for this.space (partial: the cards and the rest are still coming)
+    this.data = null; // loadSpace() result for this.space (after the first paint, the cards and the rest are still coming)
     this.cards = []; // loadDecisions() result
     this.space = null;
     this.cardsFor = null; // the space this.cards belong to
     this.dataAt = 0; // when the data shown was loaded
     this.cache = new Map(); // space id -> { data, cards, rules, at }: its last finished load (most recently shown last)
-    this.loads = {}; // space id -> { token, at }: the load in flight; only it may commit
+    this.loads = {}; // space id -> { token, at }: the load in flight (at: its last progress)
+    this.committed = {}; // space id -> the token of its last load that committed; an older one commits nothing
     this.seq = 0;
-    this.counting = {}; // space id -> { at, busy }: the hidden panel's card count reads
+    this.hidden = {}; // space id -> { at, busy, seq }: the hidden panel's last count and ledger read
+    this.hiddenDone = {}; // space id -> the seq of its last hidden read that wrote; an older one writes nothing
     this.asleep = false; // not on screen: only the open-card count is read
     this.view = null; // "decisions" | "tasks" | "rules"; null: decisions when any is open
     this.rules = new RulesPane();
@@ -111,7 +117,8 @@ export default class ProjectAgent extends View {
     });
   }
 
-  // A load in flight for this space that is not yet given up.
+  // A load in flight for this space that is not yet given up: one of its reads settled or reached its
+  // limit within LOAD_LIMIT. Every read is capped, so only a load whose read ignores its cap is given up.
   inFlight(id) { const l = this.loads[id]; return Boolean(l && Date.now() - l.at < LOAD_LIMIT); }
 
   // Shows a space's kept load at once (from reload, before anything is read). Note fields are made
@@ -134,114 +141,155 @@ export default class ProjectAgent extends View {
     this.reload(cx);
   }
 
-  // While hidden: only the open-card count on the panel's button (shared "project-agent.open"),
-  // from one card read per space at most every 10 s. A failed read leaves the count as it was.
-  countCards(cx, space) {
-    const c = this.counting[space.id], now = Date.now();
-    if (c && (now - c.at < COUNT_EVERY || (c.busy && now - c.at < LOAD_LIMIT))) return;
-    const mine = { at: now, busy: true };
-    this.counting[space.id] = mine;
+  // While hidden: the open-card count on the panel's button (shared "project-agent.open") from one
+  // card read, and the ledger, read together, per space at most every 10 s (d-039). From the ledger
+  // the shared keys other views use are refreshed (share(): the worktrees, the workers, the Files
+  // shortcuts with the evidence of the last full load); not the main branches unless a full load of
+  // the space is kept. A failed read changes nothing; one that ends after a newer one wrote, nothing.
+  hiddenRead(cx, space) {
+    const h = this.hidden[space.id], now = Date.now();
+    if (h && (now - h.at < COUNT_EVERY || (h.busy && now - h.at < LOAD_LIMIT))) return;
+    const mine = { at: now, busy: true, seq: ++this.seq };
+    this.hidden[space.id] = mine;
     cx.spawn(async (cx) => {
-      let cards = null;
-      try { cards = await loadDecisions(space, { cx, batchOnly: true }); } catch {}
+      const [cards, ledger] = await Promise.all([
+        loadDecisions(space, { cx, batchOnly: true }).catch(() => null),
+        loadLedger(space, cx).catch(() => null),
+      ]);
       mine.busy = false;
-      if (!cards) return;
-      const open = cards.filter((x) => x.card?.status === "open").length;
-      const counts = { ...(shared("project-agent.open") ?? {}) };
-      if ((counts[space.id] ?? 0) !== open) { if (open) counts[space.id] = open; else delete counts[space.id]; setShared("project-agent.open", counts); }
+      if (!this.asleep || mine.seq < (this.hiddenDone[space.id] ?? 0)) return;
+      this.hiddenDone[space.id] = mine.seq;
+      if (cards) {
+        const open = cards.filter((x) => x.card?.status === "open").length;
+        const counts = { ...(shared("project-agent.open") ?? {}) };
+        if ((counts[space.id] ?? 0) !== open) { if (open) counts[space.id] = open; else delete counts[space.id]; setShared("project-agent.open", counts); }
+      }
+      if (ledger && !ledger.timedOut && !ledger.error && ledger.value && typeof ledger.value === "object") {
+        const known = this.cache.get(space.id)?.data ?? (this.space === space.id ? this.data : null);
+        this.share(space, { ledger: ledger.value, evidence: known?.evidence, profile: known?.profile }, { mains: Boolean(known?.agent) });
+      }
     });
+  }
+
+  // Keeps a finished load of a space (the most recently shown last; at most CACHE_MAX).
+  keep(id, entry) {
+    this.cache.delete(id); this.cache.set(id, entry);
+    while (this.cache.size > CACHE_MAX) this.cache.delete(this.cache.keys().next().value);
   }
 
   // Loads the shown space: agent.json, then the header's reads together (first paint), then the
   // cards, rules, evidence and stale instructions together; then commits. One load per space in
-  // flight (a token: only the latest may commit); one pending over LOAD_LIMIT is given up. The
-  // last finished load of each space is kept and shown at once when the space is shown again.
+  // flight; one with no progress for LOAD_LIMIT is given up and a new one may start. A load that
+  // ends commits unless a newer load of its space has committed (this.committed): for the shown
+  // space it draws and writes the shared keys; for another, it is only kept. The last finished
+  // load of each space is kept and shown at once when the space is shown again.
   reload(cx) {
     const space = spaces().find((s) => s.active);
     if (!space) { this.data = null; this.space = null; cx.notify(); return; }
     if (space.id !== this.space) this.adopt(space, cx);
-    if (!onScreen()) { this.asleep = true; this.countCards(cx, space); return; }
+    if (!onScreen()) { this.asleep = true; this.hiddenRead(cx, space); return; }
     this.asleep = false;
     if (this.inFlight(space.id)) { this.again = true; return; }
-    const token = ++this.seq;
-    this.loads[space.id] = { token, at: Date.now() };
-    const current = () => this.loads[space.id]?.token === token;
+    const token = ++this.seq, load = { token, at: Date.now() };
+    this.loads[space.id] = load;
+    const current = () => this.loads[space.id] === load;
     const shown = () => spaces().find((s) => s.active)?.id === space.id;
     cx.spawn(async (cx) => {
+      const rcx = { sleep: (ms) => cx.sleep(ms), progress: () => { load.at = Date.now(); } }; // the store's reads move `at`
       let data, cards = [], rules = null;
       const kept = this.cache.get(space.id);
+      const shownNow = () => (this.space === space.id ? this.data : null); // what is shown for this space, if it is
       try {
-        data = await loadSpace(space, props()?.profile, cx);
+        data = await loadSpace(space, props()?.profile, rcx);
         if (data.agent && current() && shown()) { // first paint: the header and the tasks
           const same = this.space === space.id;
-          this.data = { ...data, partial: true, evidence: same ? this.data?.evidence : undefined, stale: same ? this.data?.stale : undefined };
+          this.data = { ...data, evidence: same ? this.data?.evidence : undefined, stale: same ? this.data?.stale : undefined };
           if (this.cardsFor !== space.id) { this.cards = []; this.cardsFor = null; this.rules.data = null; }
           if (!same) this.dataAt = Date.now();
           this.space = space.id;
           cx.notify();
         }
         if (data.agent) {
-          const cap = (p, fallback) => withTimeout(cx, p).then((v) => (v === TIMED_OUT ? fallback : v));
+          // A read that times out keeps the last known value: the kept load's, else what is shown for the space.
+          const cap = (p, fallback) => withTimeout(rcx, p).then((v) => (v === TIMED_OUT ? fallback() : v));
           let evidence, stale;
           [cards, rules, evidence, stale] = await Promise.all([
-            loadDecisions(space, { cx, live: current }),
-            cap(loadRules(space), kept?.rules ?? null), // null: the Rules view says Loading… until a load answers
-            cap(evidenceTasks(space), kept?.data?.evidence ?? new Map()),
-            cap(staleInstructions(space, data.agent.profile), kept?.data?.stale ?? []),
+            loadDecisions(space, { cx: rcx, live: current }),
+            cap(loadRules(space), () => kept?.rules ?? (this.space === space.id && this.cardsFor === space.id ? this.rules.data : null) ?? null), // null: the Rules view says Loading…
+            cap(evidenceTasks(space), () => kept?.data?.evidence ?? shownNow()?.evidence), // undefined: unknown
+            cap(staleInstructions(space, data.agent.profile), () => kept?.data?.stale ?? shownNow()?.stale ?? []),
           ]);
           data.evidence = evidence; data.stale = stale;
         }
       }
       catch (e) { data = { agent: null, errors: [String(e.message ?? e)] }; }
-      if (!current()) return; // given up: a newer load of this space owns it now
-      delete this.loads[space.id];
+      const wasCurrent = current();
+      if (wasCurrent) delete this.loads[space.id];
+      const follow = () => { if (wasCurrent && this.again) { this.again = false; this.reload(cx); } };
+      // Given up with its card fallback skipped (no result), or a newer load of this space has committed.
+      if (cards === null || token < (this.committed[space.id] ?? 0)) { follow(); return; }
       // agent.json did not answer: keep what is kept for this space, with the error; the kept entry stays.
       const timedOut = Boolean(data.timedOut);
       if (timedOut && kept) { data = { ...kept.data, errors: [...data.errors] }; cards = kept.cards; rules = kept.rules; }
-      if (timedOut && !kept && shown()) { // nothing kept: say so; the shared entries stay as they are
+      if (!shown()) { // its space is no longer shown: keep it for the way back; draw and write nothing
+        if (!timedOut) { this.committed[space.id] = token; this.keep(space.id, { data, cards, rules: rules ?? kept?.rules ?? null, at: Date.now() }); }
+      } else if (timedOut && !kept) { // nothing kept: say so; the shared entries stay as they are
         this.data = data; this.cards = []; this.cardsFor = null; this.space = space.id; this.dataAt = Date.now();
         cx.notify();
-      } else if (shown()) {
+      } else {
         this.data = data; this.cards = cards; this.space = space.id; this.cardsFor = space.id; this.dataAt = timedOut ? kept.at : Date.now();
         if (rules) this.rules.data = rules;
-        if (!timedOut) {
-          this.cache.delete(space.id); this.cache.set(space.id, { data, cards, rules: rules ?? this.rules.data, at: this.dataAt });
-          while (this.cache.size > CACHE_MAX) this.cache.delete(this.cache.keys().next().value);
-        }
+        if (!timedOut) { this.committed[space.id] = token; this.keep(space.id, { data, cards, rules: rules ?? this.rules.data, at: this.dataAt }); }
         // One note field per open card, made here (never in render) and dropped with its card.
         const open = new Set(cards.filter((c) => c.card?.status === "open").map((c) => c.id));
         for (const id of Object.keys(this.notes)) if (!open.has(id)) { this.notes[id].release?.(); delete this.notes[id]; }
         for (const id of open) this.notes[id] ??= InputState.new({ placeholder: "Note for the Project Agent (optional)" });
-        // Tell other mods (a Changes view, say) which worktrees this space's tasks use.
-        const trees = (data.ledger?.tasks ?? []).filter((x) => x.worktree && x.id).map((x) => ({ task: x.id, path: String(x.worktree), title: String(x.title ?? "") }));
-        const allTrees = { ...(shared("project-agent.worktrees") ?? {}) };
-        if (JSON.stringify(allTrees[space.id] ?? []) !== JSON.stringify(trees)) { if (trees.length) allTrees[space.id] = trees; else delete allTrees[space.id]; setShared("project-agent.worktrees", allTrees); }
-        // Folders worth a shortcut in a Files view (shared "my-files.places": { space: [{ label, path, group }] }):
-        // all evidence, each task's evidence (newest task first), each task's worktree.
-        const dir = stateDir(space), byNewest = [...(data.ledger?.tasks ?? [])].sort((x, y) => String(y.updated ?? y.created ?? "").localeCompare(String(x.updated ?? x.created ?? "")));
-        const spots = data.evidence?.size ? [{ label: "All evidence", path: `${dir}/evidence`, group: "Project Agent" }] : [];
-        for (const x of byNewest.slice(0, 15)) {
-          const files = data.evidence?.get(x.id);
-          if (files) spots.push({ label: `${x.id} evidence · ${files.length} ${files.length === 1 ? "file" : "files"}`, detail: String(x.title ?? ""), path: `${dir}/evidence/${x.id}`, group: "Project Agent", task: x.id });
-          if (x.worktree) spots.push({ label: `${x.id} worktree`, detail: String(x.title ?? ""), path: String(x.worktree), group: "Project Agent", task: x.id });
-        }
-        const allSpots = { ...(shared("my-files.places") ?? {}) };
-        if (JSON.stringify(allSpots[space.id] ?? []) !== JSON.stringify(spots)) { if (spots.length) allSpots[space.id] = spots; else delete allSpots[space.id]; setShared("my-files.places", allSpots); }
-        // The profile's main-branch names, for views that compare a branch with its base.
-        const mains = Array.isArray(data.profile?.mainBranches) ? data.profile.mainBranches : [];
-        const allMains = { ...(shared("project-agent.mainBranches") ?? {}) };
-        if (JSON.stringify(allMains[space.id] ?? []) !== JSON.stringify(mains)) { if (mains.length) allMains[space.id] = mains; else delete allMains[space.id]; setShared("project-agent.mainBranches", allMains); }
-        // And which task each worker belongs to (an Agents view can link a worker back to its task).
-        const crew = {};
-        for (const x of data.ledger?.tasks ?? []) for (const w of x.workers ?? []) if (w.address) crew[space.machine ? `${space.machine}/${w.address}` : w.address] = { task: x.id, title: String(x.title ?? ""), role: w.role ?? null, state: x.state ?? null };
-        const allCrew = { ...(shared("project-agent.workers") ?? {}) };
-        if (JSON.stringify(allCrew[space.id] ?? {}) !== JSON.stringify(crew)) { if (Object.keys(crew).length) allCrew[space.id] = crew; else delete allCrew[space.id]; setShared("project-agent.workers", allCrew); }
-        const counts = { ...(shared("project-agent.open") ?? {}) };
-        if ((counts[space.id] ?? 0) !== open.size) { if (open.size) counts[space.id] = open.size; else delete counts[space.id]; setShared("project-agent.open", counts); }
+        this.share(space, data.agent ? data : { ...data, evidence: new Map() }, { open: open.size });
         cx.notify();
       }
-      if (this.again) { this.again = false; this.reload(cx); }
+      follow();
     });
+  }
+
+  // The shared keys other views read, for one space, each written only when it changed: its
+  // tasks' worktrees, the Files shortcuts, the profile's main branches (writeMains), its workers,
+  // and the open-card count (open; null leaves it). From a full load of the shown space, or from the
+  // ledger alone while hidden (hiddenRead).
+  share(space, data, { open = null, mains: writeMains = true } = {}) {
+    // Tell other mods (a Changes view, say) which worktrees this space's tasks use.
+    const trees = (data.ledger?.tasks ?? []).filter((x) => x.worktree && x.id).map((x) => ({ task: x.id, path: String(x.worktree), title: String(x.title ?? "") }));
+    const allTrees = { ...(shared("project-agent.worktrees") ?? {}) };
+    if (JSON.stringify(allTrees[space.id] ?? []) !== JSON.stringify(trees)) { if (trees.length) allTrees[space.id] = trees; else delete allTrees[space.id]; setShared("project-agent.worktrees", allTrees); }
+    // Folders worth a shortcut in a Files view (shared "my-files.places": { space: [{ label, path, group }] }):
+    // all evidence, each task's evidence (newest task first), each task's worktree.
+    const dir = stateDir(space), byNewest = [...(data.ledger?.tasks ?? [])].sort((x, y) => String(y.updated ?? y.created ?? "").localeCompare(String(x.updated ?? x.created ?? "")));
+    // Evidence unknown (its read timed out, or not read while hidden): the evidence shortcuts the key has stay.
+    const had = (shared("my-files.places") ?? {})[space.id] ?? [], known = data.evidence instanceof Map;
+    const hadAt = (path) => (Array.isArray(had) ? had : []).find((x) => x?.path === path);
+    const spots = known ? (data.evidence.size ? [{ label: "All evidence", path: `${dir}/evidence`, group: "Project Agent" }] : []) : [hadAt(`${dir}/evidence`)].filter(Boolean);
+    for (const x of byNewest.slice(0, 15)) {
+      const files = known && data.evidence.get(x.id);
+      if (files) spots.push({ label: `${x.id} evidence · ${files.length} ${files.length === 1 ? "file" : "files"}`, detail: String(x.title ?? ""), path: `${dir}/evidence/${x.id}`, group: "Project Agent", task: x.id });
+      else if (!known && hadAt(`${dir}/evidence/${x.id}`)) spots.push(hadAt(`${dir}/evidence/${x.id}`));
+      if (x.worktree) spots.push({ label: `${x.id} worktree`, detail: String(x.title ?? ""), path: String(x.worktree), group: "Project Agent", task: x.id });
+    }
+    const allSpots = { ...(shared("my-files.places") ?? {}) };
+    if (JSON.stringify(allSpots[space.id] ?? []) !== JSON.stringify(spots)) { if (spots.length) allSpots[space.id] = spots; else delete allSpots[space.id]; setShared("my-files.places", allSpots); }
+    // The profile's main-branch names, for views that compare a branch with its base.
+    if (writeMains) {
+      const mains = Array.isArray(data.profile?.mainBranches) ? data.profile.mainBranches : [];
+      const allMains = { ...(shared("project-agent.mainBranches") ?? {}) };
+      if (JSON.stringify(allMains[space.id] ?? []) !== JSON.stringify(mains)) { if (mains.length) allMains[space.id] = mains; else delete allMains[space.id]; setShared("project-agent.mainBranches", allMains); }
+    }
+    // And which task each worker belongs to (an Agents view can link a worker back to its task).
+    const crew = {};
+    for (const x of data.ledger?.tasks ?? []) for (const w of x.workers ?? []) if (w.address) crew[space.machine ? `${space.machine}/${w.address}` : w.address] = { task: x.id, title: String(x.title ?? ""), role: w.role ?? null, state: x.state ?? null };
+    const allCrew = { ...(shared("project-agent.workers") ?? {}) };
+    if (JSON.stringify(allCrew[space.id] ?? {}) !== JSON.stringify(crew)) { if (Object.keys(crew).length) allCrew[space.id] = crew; else delete allCrew[space.id]; setShared("project-agent.workers", allCrew); }
+    if (open !== null) {
+      const counts = { ...(shared("project-agent.open") ?? {}) };
+      if ((counts[space.id] ?? 0) !== open) { if (open) counts[space.id] = open; else delete counts[space.id]; setShared("project-agent.open", counts); }
+    }
   }
 
   // "Open Project Agent": asks the keeper (shared request), which opens a new tab running the
