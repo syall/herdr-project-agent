@@ -215,22 +215,40 @@ def wrapped_text(word):
     return re.sub(r"^(-[A-Za-z]*S|--split-string=)", "", word)
 
 
-# REVIEW-7 M1: a program that runs what it reads on a pipe, and programs that start the next word as a program.
+# REVIEW-7 M1, REVIEW-8 I-1, I-2: after a |, the program word decides. A shell, eval, source or . runs what it reads; a
+# known text filter does not, whatever its arguments; a launcher is judged by the program it starts; any other program
+# refuses when a later word names a shell (as at b43e3e5: caffeinate sh, ! bash, setsid bash).
 PIPE_READERS = WRAPPERS + ("source", ".")
+FILTERS = ("grep", "rg", "head", "tail", "wc", "sort", "uniq", "cut", "tr", "tee", "cat", "less", "jq", "column")
 LAUNCHERS = ("env", "xargs", "exec", "sudo", "command", "builtin", "nohup", "nice", "time", "timeout", "stdbuf")
+# A launcher's options that take the next word as their value (BSD and GNU); timeout also takes a duration.
+LAUNCHER_VALUES = {"xargs": ("-I", "-J", "-L", "-P", "-R", "-S", "-E", "-a", "-d", "-n", "-s"), "env": ("-u", "-C", "-P"),
+                   "nice": ("-n",), "timeout": ("-s", "-k"), "exec": ("-a",), "time": ("-f", "-o"),
+                   "stdbuf": ("-i", "-o", "-e"), "sudo": ("-u", "-g", "-h", "-p", "-C", "-U", "-r", "-t", "-D", "-R", "-T")}
 
 
 def runs_input(words):
-    """A command after a | runs what it reads: its program word is a shell, eval, source or . ; or it is a launcher
-    (env, xargs, exec, ...) with such a word anywhere after it, or env -S. Leading NAME=value words are skipped. Only
-    the program word counts otherwise, so `grep bash` does not."""
+    """A command after a | runs what it reads. Leading NAME=value words are skipped. A launcher's options (and their
+    values) are skipped and the program it starts is judged the same way."""
     k = 0
     while k < len(words) - 1 and ASSIGN.match(words[k]):
         k += 1
     first = program(words[k])
     if first in PIPE_READERS:
         return True
-    return first in LAUNCHERS and (any(program(w) in PIPE_READERS for w in words[k + 1:]) or wraps([words[k:]]))
+    if first in FILTERS:
+        return False
+    if first in LAUNCHERS:
+        if first == "env" and any(SPLIT_STRING.match(a) for a in words[k + 1:]):
+            return True
+        j = k + 1
+        while j < len(words) and words[j].startswith("-") and words[j] != "-":
+            j += 2 if words[j] in LAUNCHER_VALUES.get(first, ()) else 1
+            if words[j - 1] == "--":
+                break
+        j += first == "timeout"
+        return j < len(words) and runs_input(words[j:])
+    return wraps([words[k:]])
 
 
 # ---- R6: the table -------------------------------------------------------------------------------
