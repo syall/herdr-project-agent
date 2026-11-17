@@ -25,6 +25,11 @@ OFF_TABLE = ("Refused by the Project Agent's allowlist: {}. Workers run only the
 NOT_PLAIN = ("Refused by the Project Agent's allowlist: this line uses git, gh or hc beyond plain commands joined by "
              "; && || |. Write the command plainly and run it again. If it cannot be written plainly, stop and "
              "report to the Project Agent with hc send. There is no override.")
+# R11 (card d-042): a Bash command that names a protected path (the editor rule's paths), reads included.
+PROTECTED_PATH = ("Refused by the Project Agent's allowlist: {} names a path inside a .git folder or the Project Agent's "
+                  "home. Read git state with git commands (git status, git log, git show, git config --get), and write "
+                  "only into your evidence folder. If that is not enough, stop and report this to the Project Agent "
+                  "with hc send. There is no override.")
 SHOWN = 300  # longest command or path quoted back in a message
 
 
@@ -563,19 +568,32 @@ def folders(commands, ops, start):
     return result
 
 
-def check_command(line, pa_address=None, own_address=None, extra_rows=(), cwd=None):
+def check_command(line, pa_address=None, own_address=None, extra_rows=(), cwd=None, spaces_dir=None, home=None):
     """None when the Bash line may run; else the refusal message (spec section 6).
 
     extra_rows: the profile's added rows, or a function that returns them; it is called only when a
     command involves git, gh or hc and no row of ALLOWLIST allows it (so its notes come only then).
+    home (the Project Agent's home) and spaces_dir turn on R11, as pa-hook guard always does: a word that names a
+    path inside a .git folder, or under home other than a space's evidence folder, refuses the line.
     """
+    start = cwd if cwd is not None else os.getcwd()
+    tops = (forms(spaces_dir), forms(home)) if home is not None else None
     scanned = split_plain_ops(line or "")
     if scanned is None:
+        if tops:
+            word = protected_word(text_words(line), start, tops)
+            if word is not None:
+                return PROTECTED_PATH.format(shown(word))
         return NOT_PLAIN if involves_text(line) else None
     commands, ops = scanned
     extra = None
     wrapped = wraps(commands)
-    places = folders(commands, ops, cwd if cwd is not None else os.getcwd())
+    places = folders(commands, ops, start)
+    if tops:
+        for words, here in zip(commands, places):
+            word = protected_word(words, here, tops)
+            if word is not None:
+                return PROTECTED_PATH.format(shown(word))
     for words, here in zip(commands, places):
         # With a shell or eval in the line, git, gh or hc named inside any word's text counts too (it may be run).
         if involves(words) or (wrapped and any(involves_text(w) for w in words)):
@@ -593,6 +611,67 @@ def check_command(line, pa_address=None, own_address=None, extra_rows=(), cwd=No
 STATE_FILES = ("ledger.json", "journal.jsonl", "rules.json", "agent.json")
 
 
+def forms(folder):
+    """A folder as written and with links resolved, in lower case (the Mac's file system ignores case)."""
+    if not folder:
+        return set()
+    return {os.path.normpath(os.path.abspath(folder)).lower(), os.path.realpath(folder).lower()}
+
+
+def protected(full, tops, resolve=True):
+    """An absolute path is inside a .git folder (or is a worktree's .git file), or inside the spaces folder other than
+    <space>/evidence/..., or anywhere else under the home. tops: (forms(spaces_dir), forms(home)). Checked as written
+    and, with resolve, after resolving links."""
+    spaces, homes = tops
+    candidates = {full.lower()}
+    if resolve:
+        candidates.add(os.path.realpath(full).lower())
+    for low in candidates:
+        if ".git" in low.split(os.sep):
+            return True
+        for top in spaces:
+            if low == top or low.startswith(top + os.sep):
+                parts = low[len(top) + 1:].split(os.sep)
+                if len(parts) < 3 or parts[1] != "evidence":
+                    return True
+                break
+        else:
+            if any(low == top or low.startswith(top + os.sep) for top in homes):
+                return True
+    return False
+
+
+HOME_VAR = re.compile(r"\$\{?HOME\}?(?![\w])")
+TEXT_SPLIT = re.compile(r"[\s;&|<>()`$\"'{}\\]+")
+
+
+def text_words(line):
+    """The words of a line that is not plain, for R11: split at blanks, operators, quotes and expansions ($HOME and
+    ${HOME} read as the home folder)."""
+    return [w for w in TEXT_SPLIT.split(HOME_VAR.sub(lambda _m: os.path.expanduser("~"), line or "")) if w]
+
+
+def protected_word(words, cwd, tops):
+    """The first word (or the part after an = in it) that names a protected path, relative words taken from cwd;
+    None if there is none. With the folder unknown, a relative word counts when it has a .git part."""
+    seen = {}
+    for word in words:
+        for part in [word] + word.split("=")[1:]:
+            if not part or part in seen:
+                continue
+            path = os.path.expanduser(part)
+            if os.path.isabs(path):
+                hit = protected(os.path.normpath(path), tops)
+            elif cwd is None:
+                hit = ".git" in os.path.normpath(path).lower().split(os.sep)
+            else:
+                hit = protected(os.path.normpath(os.path.join(cwd, path)), tops)
+            seen[part] = hit
+            if hit:
+                return word
+    return None
+
+
 def check_edit(path, spaces_dir, cwd=None, home=None):
     """None when Edit/Write/MultiEdit/NotebookEdit may write path; else the refusal message.
 
@@ -605,22 +684,4 @@ def check_edit(path, spaces_dir, cwd=None, home=None):
     if not path:
         return None
     given = os.path.normpath(os.path.join(cwd or os.getcwd(), os.path.expanduser(path)))
-    refused = OFF_TABLE.format(shown(path))
-
-    def forms(folder):
-        return {os.path.normpath(os.path.abspath(folder)).lower(), os.path.realpath(folder).lower()}
-
-    spaces, homes = forms(spaces_dir), forms(home) if home else set()
-    for low in {given.lower(), os.path.realpath(given).lower()}:
-        if ".git" in low.split(os.sep):
-            return refused
-        for top in spaces:
-            if low == top or low.startswith(top + os.sep):
-                parts = low[len(top) + 1:].split(os.sep)
-                if len(parts) < 3 or parts[1] != "evidence":
-                    return refused
-                break
-        else:
-            if any(low == top or low.startswith(top + os.sep) for top in homes):
-                return refused
-    return None
+    return OFF_TABLE.format(shown(path)) if protected(given, (forms(spaces_dir), forms(home))) else None

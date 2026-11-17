@@ -13,7 +13,9 @@ the address to report to.
   and nowhere else in that folder. Never edit the ledger, the journal, decisions or rules.
 - Commands that involve git, gh or hc are limited to the allowlist in `pa_guard.py`;
   anything else is refused: report it to the Project Agent. If the guard says it is
-  unavailable, nothing runs: stop, and say so as your last message.
+  unavailable, nothing runs: stop, and say so as your last message. Commands that
+  name a path inside `.git` or the Project Agent's home are refused, reads included:
+  read git state with git commands, and write only into your evidence folder.
 - Report with `hc send <address from the handoff> "<result or blocker, with file paths>"`
   when you are done or stuck. Long answers go in a file; send its path.
 - You are started for one job. After your report the orchestrator reads your evidence
