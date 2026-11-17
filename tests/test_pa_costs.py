@@ -593,3 +593,145 @@ class G_Gone(Collecting):
         self.assertEqual(self.rows(), rows)
         state = load(self.costs("state.json"))
         self.assertTrue(any("gone before" in p for p in state.get("problems", [])), state.get("problems"))
+
+
+# ---- step 3: launch records (R1) --------------------------------------------------------------------
+
+class StopLaunch(Exception):
+    pass
+
+
+class L_LaunchRecords(Base):
+    """pa-claude / pa-codex under the Project Agent t0 of space sp1, in worker terminal t5 (t-010-build)."""
+
+    def setUp(self):
+        super().setUp()
+        dump({"name": "test", "claude": ["true"], "codex": ["true"], "models": {"worker": "model-a"}},
+             os.path.join(self.profile_dir, "profile.json"))
+        self.ledger({"version": 1, "tasks": [{"id": "t-01", "state": "done"}, {"id": "t-010", "state": "in-progress", "workers": []}]})
+        self.hc.terminals["t5"] = {"address": "t5", "name": "t-010-build", "parent": "t0", "state": "live", "labels": {"herdr.space": "sp1"}}
+        self.hc.terminals["t9"] = {"address": "t9", "name": "plain", "state": "live", "labels": {"herdr.space": "other"}}
+        os.environ["HC_TERMINAL_ID"] = "t5"
+        os.environ["PA_PRINT"] = "1"
+        self.addCleanup(os.environ.pop, "HC_TERMINAL_ID", None)
+        self.addCleanup(os.environ.pop, "PA_PRINT", None)
+
+    def launch(self, kind, *argv):
+        result, out, err = self.run_cmd(pa.cmd_launch, kind, list(argv))
+        self.assertEqual(err, "")
+        return json.loads(out.strip().splitlines()[-1])
+
+    def records(self):
+        return lines(self.costs("sessions.jsonl"))
+
+    def test_l1_worker_gets_a_session_id_and_one_start_record(self):
+        before = time.time()
+        argv = self.launch("claude", "do the job")
+        i = argv.index("--session-id")
+        sid = argv[i + 1]
+        self.assertRegex(sid, r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
+        recs = self.records()
+        self.assertEqual(len(recs), 1)
+        r = recs[0]
+        self.assertEqual((r["v"], r["ev"], r["session"], r["program"], r["kind"], r["space"]), (1, "start", sid, "claude", "worker", "sp1"))
+        self.assertEqual((r["task"], r["name"], r["terminal"], r["parent"], r["model"]), ("t-010", "t-010-build", "t5", "t0", "model-a"))
+        self.assertEqual((r["resumed"], r["bind"], r["source"], r["role"]), (False, None, "recorded", None))
+        self.assertEqual(r["cwd"], os.getcwd())
+        self.assertGreaterEqual(pa_costs_time(r["at"]), int(before) - 1)
+        self.assertNotIn("argv", r)
+
+    def test_l2_given_ids_are_recorded_not_replaced(self):
+        cases = [(["--resume", "abc-1"], "abc-1", True, None), (["-r", "abc-2"], "abc-2", True, None),
+                 (["--session-id", "abc-3"], "abc-3", False, None), (["--session-id=abc-4"], "abc-4", False, None),
+                 (["--continue"], None, True, "launch-window"), (["-c"], None, True, "launch-window"),
+                 (["--resume", "abc-5", "--fork-session"], None, True, "launch-window")]
+        for args, sid, resumed, bind in cases:
+            os.unlink(self.costs("sessions.jsonl")) if os.path.exists(self.costs("sessions.jsonl")) else None
+            argv = self.launch("claude", *args)
+            self.assertEqual(argv.count("--session-id") + sum(a.startswith("--session-id=") for a in argv),
+                             1 if any(a.startswith("--session-id") for a in args) else 0, args)
+            r = self.records()
+            self.assertEqual(len(r), 1, args)
+            self.assertEqual((r[0]["session"], r[0]["resumed"], r[0]["bind"]), (sid, resumed, bind), args)
+        self.assertTrue(r[0]["fork"])
+
+    def test_l3_passthrough_and_plain_tabs_write_nothing(self):
+        self.launch("claude", "--version")
+        self.launch("claude", "mcp", "list")
+        os.environ["HC_TERMINAL_ID"] = "t9"
+        self.launch("claude", "hello")
+        os.environ.pop("HC_TERMINAL_ID")
+        self.launch("claude", "hello")
+        self.assertFalse(os.path.exists(os.path.join(self.dir, "costs")))
+
+    def test_l4_record_holds_no_argument_text(self):
+        argv = self.launch("claude", "--settings", "/x/{}/s.json".format(fx.CANARY), "the handoff {}".format(fx.CANARY))
+        self.assertIn("--session-id", argv)
+        for name in os.listdir(os.path.join(self.dir, "costs")):
+            self.assertNotIn(fx.CANARY.encode(), raw(os.path.join(self.dir, "costs", name)) or b"", name)
+
+    def test_l5_held_append_lock_does_not_hold_the_launch(self):
+        import fcntl
+        os.makedirs(os.path.join(self.dir, "costs"), exist_ok=True)
+        with open(self.costs(".append.lock"), "a") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            began = time.time()
+            argv = self.launch("claude", "job")
+            took = time.time() - began
+        self.assertIn("--session-id", argv)
+        self.assertLess(took, 1.2)
+        self.assertEqual(self.records(), [])
+
+    def test_l6_codex_records_the_launch_only(self):
+        argv = self.launch("codex", "--some-flag", "job")
+        self.assertEqual(argv[1:], ["--some-flag", "job"])
+        r = self.records()
+        self.assertEqual(len(r), 1)
+        self.assertEqual((r[0]["program"], r[0]["session"], r[0]["bind"], r[0]["task"]), ("codex", None, "launch-window", "t-010"))
+
+    def test_l7_run_agent_records_each_start_and_resume(self):
+        import argparse as ap
+        import types
+        directory = self.dir
+        agent = load(os.path.join(directory, "agent.json"))
+        p = pa.load_profile("test")
+        calls = []
+
+        def fake_call(argv, cwd=None):
+            calls.append(argv)
+            raise StopLaunch()
+        saved = pa.subprocess
+        pa.subprocess = types.SimpleNamespace(call=fake_call, run=saved.run, PIPE=saved.PIPE, DEVNULL=saved.DEVNULL)
+        try:
+            for fresh in (True, False):
+                agent = load(os.path.join(directory, "agent.json"))
+                if not fresh:
+                    agent["sessionStarted"] = True
+                    dump(agent, os.path.join(directory, "agent.json"))
+                with self.assertRaises(StopLaunch):
+                    pa.run_agent(ap.Namespace(fresh=fresh), "t0", self.project, p, directory, agent, {"beat": True, "previous": None}, time.time())
+        finally:
+            pa.subprocess = saved
+        recs = self.records()
+        self.assertEqual([(r["kind"], r["resumed"]) for r in recs], [("pa", False), ("pa", True)])
+        sid = load(os.path.join(directory, "agent.json"))["sessionId"]
+        self.assertEqual([r["session"] for r in recs], [sid, sid])
+        self.assertEqual([r["cwd"] for r in recs], [self.project, self.project])
+        self.assertEqual({(r["task"], r["name"], r["terminal"]) for r in recs}, {(None, None, "t0")})
+
+    def test_l8_a_broken_pa_costs_never_stops_a_launch(self):
+        broken = os.path.join(TMP, "broken_costs.py")
+        write(broken, "raise RuntimeError('broken on purpose')\n")
+        saved = pa.COSTS_FILE
+        pa.COSTS_FILE = broken
+        pa._COSTS.clear()
+        try:
+            argv = self.launch("claude", "job")
+        finally:
+            pa.COSTS_FILE = saved
+            pa._COSTS.clear()
+        self.assertEqual(argv[0], shutil.which("true"))
+
+
+def pa_costs_time(text):
+    return int(time.mktime(time.strptime(text, "%Y-%m-%dT%H:%M:%SZ")) - time.timezone)
