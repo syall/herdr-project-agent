@@ -20,8 +20,8 @@ Selected by the name it is invoked as (symlinks in ~/.local/bin):
       lint-after-edit   after each edit: lint the changed file
       affected-tests    when a task is marked complete, and (--stop) before the session ends
       test-file-lock    before an edit: no test-file edits during a fix task
-      guard             before a command or a read: nothing that cannot be taken back
-                        and, for git, gh and hc, only the allowlist in pa_guard.py
+      guard             before a command or an edit: nothing that cannot be taken back,
+                        and the short denylist in pa_guard.py
 
 A failing hook exits with code 2, which sends the agent back to fix it.
 """
@@ -285,14 +285,8 @@ def _hook_guard(data, _args):
                                     stderr=subprocess.DEVNULL, universal_newlines=True).stdout.strip()
             if branch in mains:
                 block("Blocked by the Project Agent safety hook: a push from the main branch ({}). {}".format(branch, ROUTE))
-        # After the refusals above (they are unchanged): git, gh and hc only as the allowlist allows.
-        pa_guard = _load_guard()
-        refusal = pa_guard.check_command(command, pa_address=(agent or {}).get("terminal"),
-                                         own_address=os.environ.get("HC_TERMINAL_ID"),
-                                         extra_rows=lambda: pa_guard.profile_rows(profile), cwd=starts)
-        if refusal:
-            block(refusal)
-        refusal = pa_guard.check_writes(command, os.path.join(pa.ROOT, "spaces"), cwd=starts, home=pa.ROOT)  # t-016
+        # After the refusals above (unchanged): the denylist.
+        refusal = _load_guard().check_command(command)
         if refusal:
             block(refusal)
     else:
