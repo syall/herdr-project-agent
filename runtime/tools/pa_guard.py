@@ -168,6 +168,10 @@ ASSIGN = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)(\[[^\]]*\])?\+?=")
 ANSI_ESCAPE = re.compile(r"\\(x[0-9A-Fa-f]{1,2}|u[0-9A-Fa-f]{1,4}|U[0-9A-Fa-f]{1,8}|[0-7]{1,3}|.)", re.DOTALL)
 # An expansion that may be empty: ${...}, $NAME, $1, $@, an empty $( ) or ` `.
 MAY_BE_EMPTY = re.compile(r"\$\{[^{}]*\}|\$\(\s*\)|`\s*`|\$[A-Za-z_][A-Za-z0-9_]*|\$[0-9@*#?$!-]")
+# REVIEW-7 I2: a default or alternative value the guard can see (${X:-git}, ${X-git}, ${X:=gi}, ${X:+gh}) is that value;
+# a command substitution with no substitution inside it ($(:), $(true), `:`) is taken out whatever it prints.
+DEFAULT_VALUE = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*:?[-=+]([^{}]*)\}")
+SUBSTITUTION = re.compile(r"\$\([^()]*\)|`[^`]*`")
 
 
 def ansi_c(m):
@@ -184,10 +188,16 @@ def ansi_c(m):
 
 def involves_text(line):
     """git, gh or hc appears as a whole word, in any case, once quotes and backslashes are taken out: as written, and
-    with $'...' decoded and each expansion that may be empty taken out (gi$''t, $'\\x67it', gi${X}t are git).
+    with $'...' decoded and each expansion that may be empty taken out (gi$''t, $'\\x67it', gi${X}t are git), and with a
+    visible default value put in and command substitutions taken out (${X:-git}, gi$(:)t, gi`:`t are git).
     Used for a line that is not plain, and for each word of a plain line that starts a shell or eval."""
     decoded = re.sub(r"\$'((?:[^'\\]|\\.)*)'", ansi_c, line, flags=re.DOTALL).replace('$"', '"')
-    texts = (line, decoded, MAY_BE_EMPTY.sub("", decoded))
+    valued = DEFAULT_VALUE.sub(lambda m: m.group(1), decoded)
+    for _ in range(8):  # innermost first: gi$(echo $(true))t
+        valued, found = SUBSTITUTION.subn("", valued)
+        if not found:
+            break
+    texts = (line, decoded, MAY_BE_EMPTY.sub("", decoded), MAY_BE_EMPTY.sub("", valued))
     return any(WHOLE_WORD.search(re.sub(r"[\"'\\]", "", t)) for t in texts)
 
 
@@ -203,6 +213,24 @@ def wraps(commands):
 def wrapped_text(word):
     """The text a wrapper runs, without an env -S prefix (-S'git push' is the text 'git push')."""
     return re.sub(r"^(-[A-Za-z]*S|--split-string=)", "", word)
+
+
+# REVIEW-7 M1: a program that runs what it reads on a pipe, and programs that start the next word as a program.
+PIPE_READERS = WRAPPERS + ("source", ".")
+LAUNCHERS = ("env", "xargs", "exec", "sudo", "command", "builtin", "nohup", "nice", "time", "timeout", "stdbuf")
+
+
+def runs_input(words):
+    """A command after a | runs what it reads: its program word is a shell, eval, source or . ; or it is a launcher
+    (env, xargs, exec, ...) with such a word anywhere after it, or env -S. Leading NAME=value words are skipped. Only
+    the program word counts otherwise, so `grep bash` does not."""
+    k = 0
+    while k < len(words) - 1 and ASSIGN.match(words[k]):
+        k += 1
+    first = program(words[k])
+    if first in PIPE_READERS:
+        return True
+    return first in LAUNCHERS and (any(program(w) in PIPE_READERS for w in words[k + 1:]) or wraps([words[k:]]))
 
 
 # ---- R6: the table -------------------------------------------------------------------------------
@@ -720,6 +748,13 @@ def check_command(line, pa_address=None, own_address=None, extra_rows=(), cwd=No
     wrapped = wraps(commands)
     places = folders(commands, ops, starts_of(cwd))
     variable = git_variable(commands)
+    if variable is None and wrapped:
+        # REVIEW-7 I1: an eval or shell -c text is a line of its own; R12 applies to it (message texts aside).
+        for words in commands:
+            skip = message_skips(words)
+            for i, w in enumerate(words):
+                if i not in skip and variable is None:
+                    variable = git_variable(text_commands(wrapped_text(w)))
     if variable is not None:
         return VARIABLE.format(shown(variable))
     for words, here in zip(commands, places):
@@ -734,7 +769,7 @@ def check_command(line, pa_address=None, own_address=None, extra_rows=(), cwd=No
     if any(involves(words) for words in commands):
         # What git, gh or hc printed is not run by a shell reading the pipe (git show HEAD:x.sh | bash).
         for k in range(1, len(commands)):
-            if ops[k - 1] == "|" and wraps([commands[k]]):
+            if ops[k - 1] == "|" and runs_input(commands[k]):
                 return OFF_TABLE.format(shown(" ".join(shlex.quote(w) for w in commands[k])))
     return None
 

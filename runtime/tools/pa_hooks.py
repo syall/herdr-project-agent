@@ -402,7 +402,7 @@ def gate_commits(worktree):
             common = os.path.join(path, common) if not code and common else None
         _c, branch, _ = git(path, "symbolic-ref", "--short", "-q", "HEAD")
         code, commit, _ = git(path, "rev-parse", "--verify", "-q", "HEAD")
-        _c, status, _ = git(path, "status", "--porcelain", "--untracked-files=no")
+        _c, status, _ = git(path, "--no-optional-locks", "status", "--porcelain", "--untracked-files=no")
         # "XY path" (git() strips the output, so the first line may have lost a leading space)
         changed = [l for l in status.splitlines() if l.strip() and not l.split(None, 1)[-1].strip('"').startswith(".claude/")]
         return {"repo": path, "common": os.path.realpath(common) if common else None, "branch": branch or None,
