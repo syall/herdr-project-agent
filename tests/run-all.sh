@@ -12,7 +12,7 @@
 # failing tests (lines starting FAIL or ERROR), else its last 40 lines. The last line names the folder.
 # Each part's TMPDIR is its own folder in there (<n>.tmp), so no part sees another's temp files, nor another
 # suite's running beside it.
-# Exit: 0 all passed, 1 a part failed, 2 a usage error or no temp folder, 130/143 interrupted.
+# Exit: 0 all passed, 1 a part failed, 2 a usage error or no temp folder, 130/143/129 interrupt, terminate, hangup.
 # Node: $NODE, else `node` on PATH, else the newest mise install.
 set -u
 # Never reach the person's hc core from a test: drop every variable that names it.
@@ -79,7 +79,8 @@ show() { cat "$1"; [ -s "$1" ] && [ -n "$(tail -c 1 "$1")" ] && echo; return 0; 
 # the temp folder then sees no other part's, nor those of another suite running beside this one.
 inpart() { TMPDIR="$out/$1.tmp"; export TMPDIR; mkdir "$TMPDIR" || return 1; "$2"; }
 
-# Ctrl-C or TERM: stop every part still running (each is its own process group), then exit.
+# Ctrl-C, TERM or a hangup (the pane is closed): stop every part still running (each is its own process group,
+# in PA_SERIAL=1 mode too), then exit 130, 143 or 129.
 pids=
 stop() {
   for p in $pids; do kill -TERM -- "-$p" 2>/dev/null || kill -TERM "$p" 2>/dev/null; done
@@ -88,13 +89,21 @@ stop() {
 }
 trap 'stop 130' INT
 trap 'stop 143' TERM
+trap 'stop 129' HUP
 
 i=1
 if [ "${PA_SERIAL:-}" = 1 ]; then
   while [ "$i" -le "$count" ]; do
     eval "p=\$part_$i; name=\$name_$i"
     echo "=== $name"
-    { (inpart "$i" "$p") 2>&1; echo $? > "$out/$i.code"; } </dev/null | tee "$(log "$i")"
+    # In the background in its own process group, and waited for: a signal then runs the trap at once (it
+    # would wait for a foreground pipeline to end), and stop() can end the part, tee and its children.
+    set -m 2>/dev/null
+    ( { (inpart "$i" "$p") 2>&1; echo $? > "$out/$i.code"; } </dev/null | tee "$(log "$i")" ) &
+    pids=$!
+    set +m 2>/dev/null
+    wait "$pids"
+    pids=
     code=$(cat "$out/$i.code" 2>/dev/null) || code=1
     eval "code_$i=\${code:-1}"
     [ "$code" = 0 ] && echo "--- $name: ok" || echo "--- $name: FAILED"
