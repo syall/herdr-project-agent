@@ -2228,6 +2228,76 @@ class FR5_BillingRound5(BillingBase):
         self.assertNotIn("no price", "\n".join(out))
 
 
+# ---- t-021: follow-ups to the cost collector ---------------------------------------------------------------
+
+class F1_ContinueBind(Collecting):
+    """Item 1 (REVIEW L4): a --continue / --fork-session file that starts with copied old history is still bound."""
+
+    def binds(self):
+        return [r for r in lines(self.costs("sessions.jsonl")) if r.get("ev") == "bind"]
+
+    def copied(self, sid, at, old_out=500, new_out=11):
+        self.add(self.prompt(T0 + 10, sid=sid), self.call(T0 + 11, "old-" + sid[:4], sid=sid, lines=1, out=old_out),
+                 self.prompt(at + 3, sid=sid), self.call(at + 4, "new-" + sid[:4], sid=sid, lines=1, out=new_out), sid=sid)
+        os.utime(self.transcript(sid), (at + 4, at + 4))
+
+    def old_session(self):
+        # the session that was continued: unrecorded here, last written before the launch
+        self.add(self.prompt(T0 + 10), self.call(T0 + 11, "old-" + SID[:4], lines=1, out=500))
+        os.utime(self.transcript(SID), (T0 + 20, T0 + 20))
+
+    def test_f1_continue_with_copied_history_is_bound_and_counts_new_calls_only(self):
+        at = T0 + 1000
+        self.old_session()
+        self.record(program="claude", bind="launch-window", resumed=True, at=iso(at), terminal="t6", task="t-002")
+        self.copied(SID3, at)
+        self.collect(T0 + 3000)
+        self.assertEqual([(x["session"], x["confidence"], x["match"]) for x in self.binds()],
+                         [(SID3, "medium", "launch-window-copied")])
+        self.assertEqual(self.totals()["out"], 11)
+        self.assertEqual({r["task"] for r in self.rows()}, {"t-002"})
+
+    def test_f1_fork_session_with_copied_history_is_bound(self):
+        at = T0 + 1000
+        self.record(program="claude", bind="launch-window", resumed=True, fork=True, at=iso(at), terminal="t6", task="t-002")
+        self.copied(SID3, at)
+        self.collect(T0 + 3000)
+        self.assertEqual([x["session"] for x in self.binds()], [SID3])
+        self.assertEqual(self.totals()["out"], 11)
+
+    def test_f1_a_plain_launch_window_record_keeps_the_first_time_rule(self):
+        at = T0 + 1000
+        self.record(program="claude", bind="launch-window", resumed=False, fork=False, at=iso(at), terminal="t6", task="t-002")
+        self.copied(SID3, at)
+        self.collect(T0 + 3000)
+        self.assertEqual(self.binds(), [])
+
+    def test_f1_a_file_not_written_since_before_the_launch_is_not_bound(self):
+        at = T0 + 1000
+        self.old_session()
+        self.record(program="claude", bind="launch-window", resumed=True, at=iso(at), terminal="t6", task="t-002")
+        self.collect(T0 + 3000)
+        self.assertEqual(self.binds(), [])
+        self.collect(at + 3700)
+        self.assertIn("claude session for t6 not found", load(self.costs("state.json"))["problems"])
+
+    def test_f1_a_file_starting_in_the_window_is_still_picked_first(self):
+        at = T0 + 1000
+        self.record(program="claude", bind="launch-window", resumed=True, at=iso(at), terminal="t6", task="t-002")
+        self.copied(SID3, at)
+        self.add(self.prompt(at + 2, sid=SID4), self.call(at + 3, "m4", sid=SID4, lines=1, out=7), sid=SID4)
+        self.collect(T0 + 3000)
+        self.assertEqual([(x["session"], x["match"]) for x in self.binds()], [(SID4, "launch-window")])
+
+    def test_f1_reconstruct_leaves_the_copied_file_to_its_launch_record(self):
+        at = T0 + 1000
+        self.record(program="claude", bind="launch-window", resumed=True, at=iso(at), terminal="t6", task="t-002")
+        self.copied(SID3, at)
+        result = pa_costs.reconstruct(self.dir, dry_run=True, now=at + 60, quiet=True)
+        self.assertNotIn(SID3, [m["session"] for m in result["matches"]])
+        self.assertNotIn(SID3[:8], result["unmatched"]["ids"])
+
+
 ABSENT = object()
 
 
