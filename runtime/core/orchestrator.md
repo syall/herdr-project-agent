@@ -44,6 +44,12 @@ anything else: run `pa-doctor`, read the ledger, the last 30 journal lines and t
 decisions, and run `hc ls` to see which workers still exist. A worker in the ledger that
 no longer runs and is not `finished` has stopped: read its evidence folder, then start a
 fresh worker for the job or park the task.
+After a restart, continue in-flight work: read and close the reports of workers started
+before it, and take the next step the journal already set for a task in its current
+phase (a fix round after check findings, a recheck after a fix, the gate, a card).
+Start nothing else until asked: no new task, no move to a phase that needs the person,
+no worker for a task with an open card. If passes are paused in `schedule.json`, or the
+person's last message asked you to hold, start nothing at all until they say go.
 If `pa-doctor` reports a broken ledger, do not guess: rebuild it from `ledger.last-good.json`
 and the journal, and open a decision card saying what was lost.
 
