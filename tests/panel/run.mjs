@@ -43,7 +43,7 @@ function world({ agent = true, agentTerminal = "t30", records = {}, extraPanes =
   // A keeper ("K", in another copy) holds the lease and has judged the records.
   g.__shared = { "project-agent.tabs": records, "project-agent.timer": { id: "K", at: T0 }, "project-agent.keeper": { id: "K", at: T0 } };
   g.__files = {}; g.__fail = []; g.__hang = [];
-  g.__remoteDelay = 0; g.__execHang = []; g.__batchFail = {}; g.__issued = []; g.__timers = []; g.__layout = {}; g.__execs = []; g.__execOut = {}; g.__sleepHang = false;
+  g.__remoteDelay = 0; g.__execHang = []; g.__batchFail = {}; g.__issued = []; g.__timers = []; g.__layout = {}; g.__execs = []; g.__execOut = {}; g.__sleepHang = false; g.__execFail = [];
   if (agent) {
     const dir = machine ? `${machine}:.config/herdr-pa/spaces/${S}` : `:${DIR}`, home = machine ? `${machine}:.config/herdr-pa` : ":/home/u/.config/herdr-pa";
     g.__files[`${dir}/agent.json`] = JSON.stringify({ space: S, project: "/proj", profile: "test", name: "proj", terminal: agentTerminal });
@@ -1081,6 +1081,207 @@ cases["P-hidden-profile-retry"] = async () => { // AC8.5: a profile read that ti
   check(reads("agent.json").length === 2 && JSON.stringify(g.__shared["project-agent.mainBranches"]?.[RS]) === '["trunk"]', `retried at 60 s and written (agent.json at ${reads("agent.json").map((x) => x.at - T0)}; ${JSON.stringify(g.__shared["project-agent.mainBranches"])})`);
   for (let i = 0; i < 9; i++) { await step(10000); await fire(10000); }
   check(reads("agent.json").length === 2, `never again once answered (agent.json reads ${reads("agent.json").length})`);
+};
+
+// ---- fix round 2 (REVIEW-2 I1, M1-M3, N3; VERIFY-2 M14, M17) ----
+const KEYS = ["project-agent.worktrees", "my-files.places", "project-agent.workers", "project-agent.mainBranches", "project-agent.open"];
+const snap = (keys = KEYS) => JSON.stringify(keys.map((k) => g.__shared[k] ?? null));
+const LEDGER = `${M}:${RDIR}/ledger.json`;
+function goodRemote() {
+  world({ machine: M });
+  g.__files[LEDGER] = tasksWith([hiddenTask]);
+  g.__files[PROFILE] = JSON.stringify({ name: "test", mainBranches: ["trunk"] });
+  remoteCards(2);
+}
+const noteOf = (v, id) => Object.entries(v.notes).find(([k]) => k === id || k.endsWith(`:${id}`) || k.endsWith(`\0${id}`))?.[1];
+
+cases["P-full-ledger-timeout"] = async () => { // I1 (AC4.6): a ledger or profile read that times out, fails or is not JSON in a full load keeps what is shown, the kept entry and every shared key
+  for (const [how, error] of [["hung", /ledger\.json: timed out/], ["invalid", /ledger\.json: /], ["thrown", /read failed/]]) {
+    goodRemote();
+    const v = await mount(); await settle();
+    check(/Tasks · 1/.test(look(v).text) && g.__shared["project-agent.worktrees"]?.[RS]?.length === 1 && JSON.stringify(g.__shared["project-agent.mainBranches"]?.[RS]) === '["trunk"]', `${how}: loaded`);
+    noteOf(v, "d-01").set("typed");
+    const before = snap();
+    if (how === "hung") g.__hang = [LEDGER, PROFILE];
+    if (how === "invalid") { g.__files[LEDGER] = "{bad"; g.__files[PROFILE] = "{bad"; }
+    if (how === "thrown") g.__fail = [LEDGER];
+    advance(12000); v.reload(cx); await settle();
+    for (let t = 0; t < 12; t++) await step(1000);
+    check(!v.loads[RS], `${how}: the load ended`);
+    const { text } = look(v);
+    check(snap() === before, `${how}: every shared key as it was (before ${before}, after ${snap()})`);
+    check(/Tasks · 1/.test(text) && /1 active of 1 tasks/.test(text) && /Decisions · 2/.test(text), `${how}: the last known tasks and cards are shown (got ${text.slice(0, 400)})`);
+    check(error.test(text), `${how}: the error is shown (got ${text.slice(0, 400)})`);
+    check(v.cache.get(RS)?.data?.ledger?.tasks?.length === 1, `${how}: the kept entry keeps the ledger (got ${JSON.stringify(v.cache.get(RS)?.data?.ledger)})`);
+    check(JSON.stringify(v.cache.get(RS)?.data?.profile?.mainBranches) === '["trunk"]', `${how}: the kept entry keeps the profile`);
+    check(noteOf(v, "d-01")?.value() === "typed", `${how}: the typed note is kept`);
+  }
+  // A missing ledger did answer: it replaces the tasks and clears the keys, as today.
+  goodRemote();
+  const v = await mount(); await settle();
+  delete g.__files[LEDGER];
+  advance(12000); v.reload(cx); await settle();
+  check(!(RS in (g.__shared["project-agent.worktrees"] ?? {})) && !(RS in (g.__shared["project-agent.workers"] ?? {})) && /0 active of 0 tasks/.test(look(v).text), `a missing ledger clears (got ${JSON.stringify(g.__shared["project-agent.worktrees"])}, ${look(v).text.slice(0, 300)})`);
+};
+
+cases["P-full-profile-config-timeout"] = async () => { // I1: config.json (needed for the profile name) timing out keeps the main branches
+  goodRemote();
+  g.__files[`${M}:${RDIR}/agent.json`] = JSON.stringify({ space: S, project: "/proj", name: "proj" });
+  g.__files[`${M}:.config/herdr-pa/config.json`] = JSON.stringify({ defaultProfile: "test" });
+  const v = await mount(); await settle();
+  check(JSON.stringify(g.__shared["project-agent.mainBranches"]?.[RS]) === '["trunk"]', "loaded through config.json");
+  const before = snap();
+  g.__hang = [`${M}:.config/herdr-pa/config.json`];
+  advance(12000); v.reload(cx); await settle();
+  for (let t = 0; t < 12; t++) await step(1000);
+  check(!v.loads[RS] && snap() === before, `the keys as they were (before ${before}, after ${snap()})`);
+  check(JSON.stringify(v.data?.profile?.mainBranches) === '["trunk"]' && JSON.stringify(v.cache.get(RS)?.data?.profile?.mainBranches) === '["trunk"]', `the profile shown and kept (got ${JSON.stringify(v.data?.profile)})`);
+};
+
+cases["P-full-schedule-timeout"] = async () => { // I1 / M3: schedule.json and pass-request.json timing out keep the schedule bar
+  goodRemote();
+  g.__files[`${M}:${RDIR}/schedule.json`] = JSON.stringify({ everyMinutes: 15 });
+  g.__files[`${M}:${RDIR}/pass-request.json`] = JSON.stringify({ pending: true, at: "2026-11-16T10:00:00Z" });
+  const v = await mount(); await settle();
+  check(!/schedule\.json is missing/.test(look(v).text) && /Pass queued/.test(look(v).text), `loaded (got ${look(v).text.slice(0, 400)})`);
+  g.__hang = [`${M}:${RDIR}/schedule.json`, `${M}:${RDIR}/pass-request.json`];
+  advance(12000); v.reload(cx); await settle();
+  for (let t = 0; t < 12; t++) await step(1000);
+  const { text } = look(v);
+  check(!v.loads[RS] && !/schedule\.json is missing/.test(text) && /Pass queued/.test(text), `the schedule and the queued pass are kept (got ${text.slice(0, 400)})`);
+  check(v.cache.get(RS)?.data?.schedule?.everyMinutes === 15 && v.cache.get(RS)?.data?.request?.pending === true, "and kept");
+};
+
+cases["P-full-nothing-known"] = async () => { // I1: a ledger timing out on a space's first load (nothing kept or shown) writes none of the keys it feeds
+  goodRemote();
+  const others = { "project-agent.worktrees": { [RS]: [{ task: "t-0", path: "/wt/0", title: "" }] }, "my-files.places": { [RS]: [evSpots[0]] }, "project-agent.workers": { [RS]: { "m1/w0": { task: "t-0" } } }, "project-agent.mainBranches": { [RS]: ["kept"] } };
+  Object.assign(g.__shared, others); // written by another copy
+  const keys = Object.keys(others), before = snap(keys);
+  g.__hang = [LEDGER, PROFILE];
+  const v = await mount(); await settle();
+  for (let t = 0; t < 12; t++) await step(1000);
+  check(!v.loads[RS] && snap(keys) === before, `the keys as they were (before ${before}, after ${snap(keys)})`);
+  check(/ledger\.json: timed out/.test(look(v).text), `the error is shown (got ${look(v).text.slice(0, 300)})`);
+  check((g.__shared["project-agent.open"] ?? {})[RS] === 2, "the cards answered: the count is written");
+  g.__hang = [];
+  advance(12000); v.reload(cx); await settle();
+  check(JSON.stringify(g.__shared["project-agent.worktrees"]?.[RS]) === JSON.stringify([{ task: "t-9", path: "/elsewhere/wt-9", title: "new" }]) && JSON.stringify(g.__shared["project-agent.mainBranches"]?.[RS]) === '["trunk"]', `the next load that answers writes them (got ${snap()})`);
+};
+
+cases["P-cards-timeout"] = async () => { // I1 / M3: the batch and the fallback listing both timing out or failing keep the cards, the count and the typed notes
+  for (const how of ["hung", "thrown"]) {
+    goodRemote();
+    const v = await mount(); await settle();
+    check(/Decisions · 2/.test(look(v).text), `${how}: loaded`);
+    noteOf(v, "d-01").set("typed");
+    if (how === "hung") g.__execHang = [`${M}:batch`, `${M}:ls`];
+    else { g.__batchFail = { [M]: { code: 1 } }; g.__execFail = [`${M}:ls`]; }
+    advance(12000); v.reload(cx); await settle();
+    for (let t = 0; t < 25; t++) await step(1000);
+    check(!v.loads[RS], `${how}: the load ended`);
+    const { text } = look(v);
+    check(/Decisions · 2/.test(text) && /Question d-01/.test(text), `${how}: the cards are kept (got ${text.slice(0, 400)})`);
+    check((g.__shared["project-agent.open"] ?? {})[RS] === 2, `${how}: the count is kept (got ${JSON.stringify(g.__shared["project-agent.open"])})`);
+    check(noteOf(v, "d-01")?.value() === "typed", `${how}: the typed note is kept`);
+    check(v.cache.get(RS)?.cards?.length === 2, `${how}: the kept entry keeps the cards (got ${v.cache.get(RS)?.cards?.length})`);
+    check(/decision cards/i.test(text), `${how}: the error is shown (got ${text.slice(0, 400)})`);
+  }
+  // Nothing known: "Loading decisions…", never "No open decisions"; the count another copy wrote stays.
+  goodRemote();
+  g.__shared["project-agent.open"] = { [RS]: 5 };
+  g.__execHang = [`${M}:batch`, `${M}:ls`];
+  const v = await mount(); await settle();
+  for (let t = 0; t < 25; t++) await step(1000);
+  await click(v, "view-decisions");
+  const { text } = look(v);
+  check(!v.loads[RS] && /Loading decisions…/.test(text) && !/No open decisions/.test(text), `nothing known: still loading (got ${text.slice(0, 400)})`);
+  check((g.__shared["project-agent.open"] ?? {})[RS] === 5, `nothing known: the count as it was (got ${JSON.stringify(g.__shared["project-agent.open"])})`);
+  g.__execHang = [];
+  advance(12000); v.reload(cx); await settle();
+  check(/Decisions · 2/.test(look(v).text) && (g.__shared["project-agent.open"] ?? {})[RS] === 2, "the next load that answers shows and counts them");
+};
+
+cases["P-card-hang-keeps-note"] = async () => { // M2: a card read that hangs on the fallback path keeps its last known copy, its typed note and the count
+  goodRemote();
+  const v = await mount(); await settle();
+  noteOf(v, "d-01").set("typed");
+  g.__batchFail = { [M]: { code: 1 } }; g.__hang = [`${M}:${RDIR}/decisions/d-01.json`];
+  advance(12000); v.reload(cx); await settle();
+  for (let t = 0; t < 15; t++) await step(1000);
+  check(!v.loads[RS] && v.cards.map((c) => c.id).sort().join() === "d-01,d-02", `both cards (got ${v.cards.map((c) => c.id)})`);
+  check((g.__shared["project-agent.open"] ?? {})[RS] === 2 && noteOf(v, "d-01")?.value() === "typed", `count and note kept (got ${JSON.stringify(g.__shared["project-agent.open"])})`);
+};
+
+cases["P-hidden-vs-full"] = async () => { // M1: a hidden read and a full load of a space write the shared keys in start order: the older never overwrites the newer
+  const trees = () => JSON.stringify((g.__shared["project-agent.worktrees"] ?? {})[RS] ?? null);
+  const newTrees = JSON.stringify([{ task: "t-9", path: "/elsewhere/wt-9", title: "new" }]);
+  // 1. A hidden read (slow card batch, old ledger) ends after the full load that followed it committed.
+  world({ machine: M }); remoteCards(1);
+  g.__files[LEDGER] = tasksWith([t1]);
+  g.__layout = panelLayout("changes");
+  g.__execHang = [`${M}:batch`];
+  const v = await mount(); await settle(); // hidden read H: ledger read now (old), batch hung (ends at 10 s)
+  g.__execHang = []; g.__files[LEDGER] = tasksWith([hiddenTask]);
+  g.__layout = panelLayout("project-agent"); await step(1000); await fire(1000); // shown: the full load commits the new ledger
+  check(trees() === newTrees, `the full load wrote the new ledger (got ${trees()})`);
+  g.__layout = panelLayout("changes"); v.reload(cx); await settle(); // hidden again (H still busy: no new read)
+  for (let t = 0; t < 10; t++) await step(1000); // H ends
+  check(trees() === newTrees, `the older hidden read wrote nothing (got ${trees()})`);
+  // 2. A full load (slow card batch, old ledger) commits after a newer hidden read wrote.
+  world({ machine: M }); remoteCards(1);
+  g.__files[LEDGER] = tasksWith([t1]);
+  g.__layout = panelLayout("project-agent");
+  const w = await mount(); await settle();
+  g.__execHang = [`${M}:batch`];
+  advance(12000); w.reload(cx); await settle(); // full load L: old ledger read now, batch hung
+  g.__execHang = []; g.__files[LEDGER] = tasksWith([hiddenTask]);
+  g.__layout = panelLayout("changes"); w.reload(cx); await settle(); // hidden read H: the new ledger
+  check(trees() === newTrees, `the hidden read wrote the new ledger (got ${trees()})`);
+  for (let t = 0; t < 15; t++) await step(1000); // L ends and commits
+  check(!w.loads[RS] && trees() === newTrees, `the older full load did not write over it (got ${trees()})`);
+};
+
+cases["P-given-up-keeps-successor"] = async () => { // VERIFY-2 M17 (AC5.3a, AC5.4): a given-up load that ends never clears its successor's in-flight entry
+  world({ machine: M }); g.__files[LEDGER] = ledgerOf(2); remoteCards(3);
+  const v = await mount(); await settle();
+  const AJ = `${M}:${RDIR}/agent.json`;
+  g.__sleepHang = true; g.__delay[AJ] = 20000;
+  v.reload(cx); await settle(); // load 1: agent.json answers at 20 s
+  await step(12000); v.reload(cx); await settle(); // 12 s: load 1 given up; load 2 (answers at 32 s)
+  for (let t = 0; t < 10; t++) await step(1000); // 22 s: load 1 has ended
+  v.reload(cx); await settle();
+  check(reads("agent.json").length === 3, `no duplicate load (agent.json reads ${reads("agent.json").length}: the mount's, load 1, load 2)`);
+};
+
+cases["P-hung-agent-json-after-switch"] = async () => { // VERIFY-2 M14 (AC4.6): a timed-out agent.json that ends after a switch away writes no kept entry
+  const v = await twoSpaces();
+  show(`${M}/sp2`); look(v); await settle();
+  show(RS); look(v); await settle();
+  const before = v.cache.get(RS);
+  g.__hang = [`${M}:${RDIR}/agent.json`];
+  advance(12000); v.reload(cx); await settle(); // A's load: agent.json hung
+  show(`${M}/sp2`); look(v); await settle(); // B shown before it ends
+  await step(10000); await settle();
+  check(!v.loads[RS], "A's load has ended");
+  check(v.cache.get(RS) === before, `A's kept entry is the last good load (errors ${JSON.stringify(v.cache.get(RS)?.data?.errors)})`);
+};
+
+cases["P-notes-per-space"] = async () => { // REVIEW-2 N3: a note typed on one space's card never shows on, or goes with, another space's card of the same id
+  world({ machine: M });
+  g.__files[LEDGER] = ledgerOf(1, "a");
+  remoteCards(2, { prefix: "dc" });
+  addRemoteSpace("sp2", "other", ledgerOf(1, "b"));
+  remoteCards(1, { id: "sp2", prefix: "dc" }); // B also has dc-01
+  const v = await mount(); await settle();
+  noteOf(v, "dc-01").set("for A");
+  show(`${M}/sp2`); look(v); await settle();
+  check(/PA: other/.test(look(v).text), "B shown");
+  await answerCard(v, "dc-01"); await settle();
+  const b = JSON.parse(g.__files[`${M}:.config/herdr-pa/spaces/sp2/decisions/dc-01.json`]);
+  check(b.status === "answered" && b.note === null, `B's card got no note of A's (got ${JSON.stringify(b.note)})`);
+  show(RS); look(v); await settle();
+  const a = Object.entries(v.notes).filter(([k]) => k.endsWith("dc-01")).map(([, n]) => n.value());
+  check(a.includes("for A"), `A's note is still there (got ${JSON.stringify(a)})`);
 };
 
 const pick = process.argv.slice(2);

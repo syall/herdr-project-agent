@@ -12,6 +12,7 @@
 //   __issued       [{ at, on, kind, path? }]  every readTextFile and exec, when it was called
 //   __execOut      { "<machine>:<kind>": { code?, stdout } }  what an exec of that kind (evidence, stale) prints
 //   __sleepHang    true: cx.sleep never settles (a read that ignores its 10 s limit)
+//   __execFail     ["<machine>:<kind>"]  exec of that kind throws (a failed call)
 // The batched card read (`sh -c <script with "for f in *.json"> sh <dir>`) answers from __ls and __files:
 // each listed name the card-name filter takes that has a file, in byte order, as "name\0text\0". No __ls entry: exit 3 (no folder).
 // cx / makeCx(): the keeper stubs' spawn (flush() awaits it) plus sleep(ms) on the __now clock and a timer that
@@ -42,6 +43,7 @@ export const exec = async (command, args = [], options = {}) => {
   drained();
   const on = options?.on ?? null, kind = execKind(command, args);
   if (!(command === "python3" && args[0] === "-c")) (g.__issued ??= []).push({ at: g.__now, on, kind });
+  if ((g.__execFail ?? []).includes(`${on ?? ""}:${kind}`)) throw new Error("exec failed");
   if ((g.__execHang ?? []).includes(`${on ?? ""}:${kind}`)) { (g.__execs ??= []).push([command, args, on]); return new Promise(() => {}); }
   if (on && g.__remoteDelay && !(g.__offline ?? []).includes(on)) await waitFor(g.__remoteDelay);
   const canned = (g.__execOut ?? {})[`${on ?? ""}:${kind}`];

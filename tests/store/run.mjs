@@ -34,7 +34,7 @@ function world() {
   g.__now = T0; g.__gen = (g.__gen ?? 0) + 1;
   g.__files = {}; g.__ls = {}; g.__fail = []; g.__hang = []; g.__delay = {}; g.__offline = [];
   g.__reads = []; g.__execs = []; g.__writes = []; g.__issued = [];
-  g.__remoteDelay = 0; g.__execHang = []; g.__batchFail = {}; g.__timers = []; g.__execOut = {}; g.__sleepHang = false;
+  g.__remoteDelay = 0; g.__execHang = []; g.__batchFail = {}; g.__timers = []; g.__execOut = {}; g.__sleepHang = false; g.__execFail = [];
   g.__shared = {};
 }
 // Cards for both a remote and a local copy of the same space: { name: text | null (listed, file gone) }.
@@ -278,6 +278,58 @@ cases["S-load-profile"] = async () => { // AC8.5: the hidden panel's profile rea
   check(h.done && h.value.answered === false, `hung agent.json: not answered within 10 s (got ${JSON.stringify(h.value)})`);
   world(); agentFiles(remote); g.__files[`${M}:.config/herdr-pa/profiles/test/profile.json`] = "{bad";
   check((await store.loadProfile(remote, undefined, cx)).answered === false, "an invalid profile is not an answer");
+};
+
+// ---- fix round 2 (REVIEW-2 I1, M2): unknown is not empty ----
+cases["S-unknown"] = async () => { // I1: loadSpace names the parts whose read did not answer with content; a missing file is an answer
+  const P = `${M}:.config/herdr-pa/profiles/test/profile.json`;
+  const runs = [
+    ["ledger hung", () => { g.__hang = [keyOf(remote, "/ledger.json")]; }, ["ledger"]],
+    ["ledger invalid", () => { g.__files[keyOf(remote, "/ledger.json")] = "{bad"; }, ["ledger"]],
+    ["ledger missing", () => { delete g.__files[keyOf(remote, "/ledger.json")]; }, []],
+    ["profile hung", () => { g.__hang = [P]; }, ["profile"]],
+    ["profile invalid", () => { g.__files[P] = "{bad"; }, ["profile"]],
+    ["profile missing", () => { delete g.__files[P]; }, []],
+    ["config.json hung", () => { agentFiles(remote, { profile: "" }); g.__hang = [`${M}:.config/herdr-pa/config.json`]; }, ["profile"]],
+    ["schedule hung", () => { g.__hang = [keyOf(remote, "/schedule.json")]; }, ["schedule"]],
+    ["pass-request hung", () => { g.__hang = [keyOf(remote, "/pass-request.json")]; }, ["request"]],
+    ["all answered", () => {}, []],
+  ];
+  for (const [what, set, want] of runs) {
+    world(); agentFiles(remote); set();
+    const r = await within(store.loadSpace(remote, undefined, cx), 10000);
+    check(r.done && r.value?.agent, `${what}: settles within 10 s`);
+    check(JSON.stringify([...(r.value.unknown ?? [])].sort()) === JSON.stringify(want), `${what}: unknown ${JSON.stringify(r.value.unknown)} (want ${JSON.stringify(want)})`);
+  }
+};
+
+cases["S-cards-unknown"] = async () => { // I1: a listing that never answered is null (unknown), not "no cards"; one that answered stays []
+  const m = { "d-1.json": card("d-1") };
+  const runs = [
+    ["batch and ls hung", () => { cards(m); g.__execHang = [`${M}:batch`, `${M}:ls`]; }, remote, null],
+    ["batch failed, ls threw", () => { cards(m); g.__batchFail = { [M]: { code: 1 } }; g.__execFail = [`${M}:ls`]; }, remote, null],
+    ["batch and ls threw", () => { cards(m); g.__execFail = [`${M}:batch`, `${M}:ls`]; }, remote, null],
+    ["local ls threw", () => { cards(m); g.__execFail = [":ls"]; }, local, null],
+    ["batch failed, no folder (ls exit 1)", () => { g.__batchFail = { [M]: { code: 1 } }; }, remote, []],
+    ["no folder (batch exit 3)", () => {}, remote, []],
+  ];
+  for (const [what, set, space, want] of runs) {
+    world(); set();
+    const r = await within(store.loadDecisions(space, { cx }), 20000, 2);
+    check(r.done && JSON.stringify(r.value) === JSON.stringify(want), `${what}: ${JSON.stringify(want)} (got ${r.value instanceof Error ? r.value.message : JSON.stringify(r.value)})`);
+  }
+};
+
+cases["S-card-known"] = async () => { // M2: a fallback card read that hangs takes the card's last known copy; one that throws is left out, never failing the rest
+  world(); cards({ "d-1.json": card("d-1"), "d-2.json": card("d-2") }); g.__batchFail = { [M]: { code: 1 } };
+  g.__hang = [keyOf(remote, "/decisions/d-2.json")];
+  const known = [{ id: "d-2", path: `${rdir}/decisions/d-2.json`, text: card("d-2", { question: "known copy?" }) }];
+  let r = await within(store.loadDecisions(remote, { cx, known }), 10000);
+  check(r.done && Array.isArray(r.value) && r.value.map((c) => c.id).sort().join() === "d-1,d-2" && r.value.find((c) => c.id === "d-2")?.card?.question === "known copy?", `the known copy (got ${JSON.stringify(r.value?.map?.((c) => [c.id, c.card?.question]))})`);
+  world(); cards({ "d-1.json": card("d-1"), "d-2.json": card("d-2") }); g.__batchFail = { [M]: { code: 1 } };
+  g.__fail = [keyOf(remote, "/decisions/d-2.json")];
+  r = await within(store.loadDecisions(remote, { cx }), 10000);
+  check(r.done && Array.isArray(r.value) && r.value.map((c) => c.id).join() === "d-1", `a thrown read is left out (got ${r.value instanceof Error ? r.value.message : JSON.stringify(r.value?.map?.((c) => c.id))})`);
 };
 
 const pick = process.argv.slice(2);
