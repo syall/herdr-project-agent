@@ -34,7 +34,7 @@ function world() {
   g.__now = T0; g.__gen = (g.__gen ?? 0) + 1;
   g.__files = {}; g.__ls = {}; g.__fail = []; g.__hang = []; g.__delay = {}; g.__offline = [];
   g.__reads = []; g.__execs = []; g.__writes = []; g.__issued = [];
-  g.__remoteDelay = 0; g.__execHang = []; g.__batchFail = {}; g.__timers = [];
+  g.__remoteDelay = 0; g.__execHang = []; g.__batchFail = {}; g.__timers = []; g.__execOut = {}; g.__sleepHang = false;
   g.__shared = {};
 }
 // Cards for both a remote and a local copy of the same space: { name: text | null (listed, file gone) }.
@@ -217,6 +217,47 @@ cases["S-timeout"] = async () => { // AC5.1: a hung agent.json ends after 10 s w
   world(); agentFiles(remote); g.__hang = [keyOf(remote, "/ledger.json")];
   const r2 = await within(store.loadSpace(remote, undefined, cx), 10000);
   check(r2.done && r2.value.agent && r2.value.errors.includes("ledger.json: timed out") && r2.value.schedule, `ledger timed out, others read (got ${JSON.stringify(r2.value?.errors)})`);
+};
+
+// ---- t-012 Part P fix round ----
+const batchOut = (ids) => ids.map((id) => `${id}.json\0${card(id)}\0`).join("");
+cases["S-batch-nonzero"] = async () => { // AC2.4 (review P-M1): a batch that exits non-zero is not taken, even with whole-looking output
+  const m = {}; for (const id of ["d-1", "d-2", "d-3"]) m[`${id}.json`] = card(id);
+  world(); cards(m); g.__batchFail = { [M]: { code: 143, stdout: batchOut(["d-1"]) } }; // killed after one card
+  const list = await store.loadDecisions(remote, { cx });
+  check(list.length === 3 && remoteCalls("ls").length === 1 && cardReads().length === 3, `fell back: 3 cards from ls and reads (got ${list.map((c) => c.id)}; ${JSON.stringify(remoteCalls().map((x) => x.kind))})`);
+  world(); cards(m); g.__batchFail = { [M]: { code: 1, stdout: batchOut(["d-1"]) } };
+  check(await store.loadDecisions(remote, { cx, batchOnly: true }) === null, "batchOnly: a non-zero exit gives null");
+  world(); cards(m); g.__batchFail = { [M]: { code: 3, stdout: "" } };
+  const none = await store.loadDecisions(remote, { cx });
+  check(Array.isArray(none) && none.length === 0 && remoteCalls().length === 1, "exit 3 with no output: still no folder, no fallback");
+};
+
+cases["S-not-live-null"] = async () => { // AC5.3a: a load no longer wanted gets null (no result), not an empty list it could commit
+  world(); cards({ "d-1.json": card("d-1") }); g.__batchFail = { [M]: { code: 1, stdout: "" } };
+  const r = await store.loadDecisions(remote, { cx, live: () => false });
+  check(r === null && remoteCalls().length === 1, `null after the batch, no fallback (got ${JSON.stringify(r)}, ${remoteCalls().length} calls)`);
+};
+
+cases["S-progress"] = async () => { // AC5.3: a read settling or reaching its limit counts as progress for the load that made it
+  world(); cards({ "d-1.json": card("d-1") });
+  let n = 0; const rcx = { sleep: (ms) => cx.sleep(ms), progress: () => { n++; } };
+  await store.loadDecisions(remote, { cx: rcx });
+  check(n === 1, `one progress for the batch (got ${n})`);
+  world(); g.__hang = [keyOf(remote, "/agent.json")]; n = 0;
+  const r = await within(store.loadSpace(remote, undefined, rcx), 10000);
+  check(r.done && n === 1, `a read that times out is progress too (got ${n})`);
+};
+
+cases["S-load-ledger"] = async () => { // AC8.5: the hidden refresh's ledger read: one read, capped at 10 s
+  world(); g.__files[keyOf(remote, "/ledger.json")] = '{"tasks":[{"id":"t-1"}]}';
+  const r = await store.loadLedger(remote, cx);
+  check(r.value?.tasks?.[0]?.id === "t-1" && !r.error && remoteCalls().length === 1, `the ledger (got ${JSON.stringify(r)})`);
+  world(); g.__files[keyOf(remote, "/ledger.json")] = "{bad";
+  check((await store.loadLedger(remote, cx)).error && true, "invalid JSON: an error");
+  world(); g.__hang = [keyOf(remote, "/ledger.json")];
+  const h = await within(store.loadLedger(remote, cx), 10000);
+  check(h.done && h.value.timedOut === true, `hung: timed out within 10 s (got ${JSON.stringify(h.value)})`);
 };
 
 const pick = process.argv.slice(2);

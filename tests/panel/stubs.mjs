@@ -10,6 +10,8 @@
 //   __execHang     ["<machine>:<kind>"]  exec of that kind never settles (kind: batch, evidence, stale, ls, or the command)
 //   __batchFail    { "<machine>": { code, stdout } }  what the batched card read returns instead
 //   __issued       [{ at, on, kind, path? }]  every readTextFile and exec, when it was called
+//   __execOut      { "<machine>:<kind>": { code?, stdout } }  what an exec of that kind (evidence, stale) prints
+//   __sleepHang    true: cx.sleep never settles (a read that ignores its 10 s limit)
 // The batched card read (`sh -c <script with "for f in *.json"> sh <dir>`) answers from __ls and __files:
 // each listed name the card-name filter takes that has a file, in byte order, as "name\0text\0". No __ls entry: exit 3 (no folder).
 // cx / makeCx(): the keeper stubs' spawn (flush() awaits it) plus sleep(ms) on the __now clock and a timer that
@@ -42,6 +44,8 @@ export const exec = async (command, args = [], options = {}) => {
   if (!(command === "python3" && args[0] === "-c")) (g.__issued ??= []).push({ at: g.__now, on, kind });
   if ((g.__execHang ?? []).includes(`${on ?? ""}:${kind}`)) { (g.__execs ??= []).push([command, args, on]); return new Promise(() => {}); }
   if (on && g.__remoteDelay && !(g.__offline ?? []).includes(on)) await waitFor(g.__remoteDelay);
+  const canned = (g.__execOut ?? {})[`${on ?? ""}:${kind}`];
+  if (canned && kind !== "batch") { if ((g.__offline ?? []).includes(on)) throw new Error(`machine ${on} is unreachable`); return { code: 0, stderr: "", ...canned }; }
   if (kind !== "batch") return baseExec(command, args, options);
   if ((g.__offline ?? []).includes(on)) throw new Error(`machine ${on} is unreachable`);
   (g.__execs ??= []).push([command, args, on]);
@@ -63,7 +67,7 @@ export function makeCx(extra = {}) {
   const gen = g.__gen;
   const c = {
     spawn(f) { if (gen !== undefined && g.__gen !== gen) return Promise.resolve(); return baseCx.spawn(() => f(c)); },
-    sleep: (ms) => waitFor(ms ?? 0),
+    sleep: (ms) => (g.__sleepHang ? new Promise(() => {}) : waitFor(ms ?? 0)),
     timer: { every(ms, fn) { if (gen === undefined || g.__gen === gen) (g.__timers ??= []).push({ ms, fn }); }, after() {} },
     notify() {},
     ...extra,
