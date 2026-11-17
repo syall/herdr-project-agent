@@ -8,6 +8,13 @@ import { v_flex, h_flex, InputState, Input } from "gpui-base";
 import { home } from "herdr";
 import { loadRules, changeRules, touched, reorder, newRuleId, exportRules, importRules } from "./store.js";
 
+// A two-click Delete (a task's in main.js, a rule's here): the first click arms it, { id, space, at }.
+// The arm holds while its space is shown, its item is expanded and it is under ARM_WAIT old; a
+// press anywhere else in the panel, a Cancel beside it, or another view or space drops it (main.js).
+export const ARM_WAIT = 10000;
+export const arm = (id, spaceId) => ({ id, space: spaceId, at: Date.now() });
+export const armHolds = (a, spaceId, shown) => Boolean(a && a.space === spaceId && shown && Date.now() - a.at < ARM_WAIT);
+
 const FIELDS = [["title", "Title"], ["text", "The rule, in plain language"], ["why", "Why (so later edits keep the intent)"], ["appliesTo", "Applies to: all, a phase, a task type or a worker role"]];
 
 export class RulesPane {
@@ -15,11 +22,18 @@ export class RulesPane {
     this.data = null; // loadRules() result
     this.open = new Set(); // expanded rule ids
     this.form = null; // { id | null, approve, inputs: { title, text, why, appliesTo } }
-    this.armed = null; // rule id armed for delete
+    this.armed = null; // arm(): the rule whose Delete was clicked once (a second click deletes); see armedRule()
     this.pressed = null; // rule id being dragged
     this.declined = false; // declined rules shown
     this.message = null; this.error = null;
     this.importPath = null; // InputState, made on first use (never in render)
+  }
+
+  // The rule id whose Delete is armed, if the arm still holds (armHolds); one that does not is dropped.
+  armedRule(spaceId) {
+    if (armHolds(this.armed, spaceId, this.armed && this.open.has(this.armed.id))) return this.armed.id;
+    this.armed = null;
+    return null;
   }
 
   async load(space) { this.data = await loadRules(space); }
@@ -63,10 +77,12 @@ export class RulesPane {
     this.save(space, cx, (rules) => rules.map((r) => (r.id === id ? touched({ ...r, status }, what) : r)), onDecided ? () => onDecided(id, what) : null);
   }
 
-  button(t, id, label, onClick, tone) {
+  // These buttons stop the press (so it never reaches the panel's root), so each one but the armed
+  // Delete and its Cancel (keepArm) drops the arm itself.
+  button(t, id, label, onClick, tone, keepArm) {
     return div().id(id).flex_none().px(8).h(24).flex().items_center().rounded(6).border(1).border_color(t.border).text_size(11.5)
       .text_color(tone ?? t.foreground).cursor_pointer().hover((s) => s.bg(t.hover))
-      .on_mouse_down("left", (_e, cx) => cx.stop_propagation()).on_click(onClick).child(label);
+      .on_mouse_down("left", (_e, cx) => cx.stop_propagation()).on_click((e, cx) => { if (!keepArm && this.armed) { this.armed = null; cx.notify(); } onClick(e, cx); }).child(label);
   }
 
   chip(t, text, color) {
@@ -84,6 +100,7 @@ export class RulesPane {
   }
 
   row(t, space, rule, onDecided, movable) {
+    const armed = this.armedRule(space.id) === rule.id;
     const open = this.open.has(rule.id), proposed = rule.status === "proposed", on = rule.status === "active";
     const tone = { proposed: t.blocked, active: t.done, off: t.dim, declined: t.dim }[rule.status];
     return v_flex().id(`rule-${rule.id}`).flex_none().rounded(7).border(1).border_color(proposed ? t.input : t.border).bg(t.surface)
@@ -95,14 +112,14 @@ export class RulesPane {
       .child(h_flex().id(`rule-head-${rule.id}`).h(32).px(8).gap(7).items_center().cursor_pointer().hover((s) => s.bg(t.hover))
         .on_click((_e, cx) => { open ? this.open.delete(rule.id) : this.open.add(rule.id); this.armed = null; cx.notify(); })
         .when(movable, (el) => el.child(div().id(`rule-grip-${rule.id}`).flex_none().w(14).text_size(11).text_color(t.dim).tooltip("Drag onto another rule to place this one above it")
-          .on_mouse_down("left", (_e, cx) => { cx.stop_propagation(); this.pressed = rule.id; cx.notify(); }).child("⋮⋮")))
+          .on_mouse_down("left", (_e, cx) => { cx.stop_propagation(); this.pressed = rule.id; this.armed = null; cx.notify(); }).child("⋮⋮")))
         .child(div().flex_none().text_size(11).text_color(t.dim).child(open ? "▾" : "▸"))
         .child(div().flex_1().min_w(0).truncate().text_size(12.5).text_color(rule.status === "off" || rule.status === "declined" ? t.muted : t.foreground).child(String(rule.title ?? rule.id)))
         .when(Boolean(rule.needsAttention), (el) => el.child(this.chip(t, "needs attention", t.blocked)))
         .child(div().flex_none().text_size(10.5).text_color(t.dim).child(String(rule.appliesTo ?? "all")))
         .when(on || rule.status === "off", (el) => el.child(div().id(`rule-toggle-${rule.id}`).flex_none().px(7).h(20).flex().items_center().rounded(10).text_size(10.5).font_semibold().cursor_pointer()
           .bg(on ? t.done + "33" : t.raised).text_color(on ? t.done : t.dim).on_mouse_down("left", (_e, cx) => cx.stop_propagation())
-          .on_click((_e, cx) => { cx.stop_propagation(); this.setStatus(space, cx, rule.id, on ? "off" : "active", on ? "turned off" : "turned on"); }).child(on ? "On" : "Off")))
+          .on_click((_e, cx) => { cx.stop_propagation(); this.armed = null; this.setStatus(space, cx, rule.id, on ? "off" : "active", on ? "turned off" : "turned on"); }).child(on ? "On" : "Off")))
         .when(!on && rule.status !== "off", (el) => el.child(this.chip(t, rule.status, tone))))
       .when(open, (el) => el.child(v_flex().px(10).pb(9).gap(6).text_size(12).text_color(t.muted)
         .child(div().text_color(t.foreground).child(String(rule.text ?? "")))
@@ -115,11 +132,13 @@ export class RulesPane {
             .child(this.button(t, `rule-editapprove-${rule.id}`, "Edit, then approve", (_e, cx) => { this.edit(rule, true); cx.notify(); }))
             .child(this.button(t, `rule-decline-${rule.id}`, "Decline", (_e, cx) => this.setStatus(space, cx, rule.id, "declined", "declined", onDecided), t.muted)))
           .when(!proposed, (e) => e.child(this.button(t, `rule-edit-${rule.id}`, "Edit", (_e, cx) => { this.edit(rule, false); cx.notify(); })))
-          .child(this.button(t, `rule-delete-${rule.id}`, this.armed === rule.id ? "Delete for good?" : "Delete", (_e, cx) => {
-            if (this.armed !== rule.id) { this.armed = rule.id; cx.notify(); return; }
+          // Two clicks on the same button (ARM_WAIT; Cancel, a press elsewhere, another view or space disarm).
+          .child(this.button(t, `rule-delete-${rule.id}`, armed ? "Delete for good?" : "Delete", (_e, cx) => {
+            if (!armed) { this.armed = arm(rule.id, space.id); cx.notify(); return; }
             this.armed = null;
             this.save(space, cx, (rules) => rules.filter((r) => r.id !== rule.id));
-          }, this.armed === rule.id ? t.blocked : t.muted)))));
+          }, armed ? t.blocked : t.muted, true))
+          .when(armed, (e) => e.child(this.button(t, `rule-delete-cancel-${rule.id}`, "Cancel", (_e, cx) => { this.armed = null; cx.notify(); }, t.muted, true))))));
   }
 
   render(t, space, onDecided) {

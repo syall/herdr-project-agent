@@ -70,7 +70,8 @@ A new space opens with a 600 x 440 dialog: a Project Agent card (`Set up for <fo
   nobody else uses it (not ticked when it holds unsaved work), and optionally its task.
   (Changed 2026-11-16, t-008: workers used to stay until you closed them.)
 - **Rules:** proposals first (Approve, Edit then approve, Decline), then your rules in precedence
-  order with an On/Off pill, Edit and a two-click Delete; drag a rule by its grip onto another
+  order with an On/Off pill, Edit and a two-click Delete ("Delete for good?" with a Cancel beside it; it
+  goes back to Delete the same ways a task's Delete does); drag a rule by its grip onto another
   to place it above. Add, Export, Import. An invalid `rules.json` is shown as an error and never
   written over.
 - **Passes:** every 15 s one copy of the mod checks each live agent's `schedule.json` and sends

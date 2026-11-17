@@ -8,7 +8,7 @@ import { View, div } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, ScrollHandle } from "gpui-base";
 import { spaces, panes, agents, terminals, machines, theme, run, exec, props, home, watchFolder, notify, shared, setShared, closeOverlay, openOverlay, window, layout } from "herdr";
 import { loadSpace, loadLedger, loadProfile, loadDecisions, loadRules, withTimeout, TIMED_OUT, READ_LIMIT, answerDecision, notifyOrchestrator, changeRules, touched, localId, paHome, stateDir, taskActions, taskLinks, evidenceTasks, cardEvidence, staleInstructions, liveTarget, lookAlike, OPEN_REQUESTS, keeperJudging, startingLabels } from "./store.js";
-import { RulesPane } from "./rules.js";
+import { RulesPane, arm, armHolds } from "./rules.js"; // arm, armHolds: the two-click Delete (ARM_WAIT, 10 s)
 import { SetupPane } from "./setup.js";
 import { Keeper, idleShell } from "./keeper.js";
 import { WorkerPane } from "./worker.js";
@@ -30,7 +30,6 @@ const NOTE = "Note for the Project Agent (optional)";
 const QUIET = { from: "19:00", to: "08:00" }; // what the quiet-hours fields show while empty, and what Set takes for an empty one
 // A quiet-hours field's time as HH:MM (24-hour; "7:30" is 07:30), or null when it is not one.
 const hhmm = (v) => { const m = /^(\d{1,2}):(\d{2})$/.exec(v); return m && Number(m[1]) <= 23 && Number(m[2]) <= 59 ? `${m[1].padStart(2, "0")}:${m[2]}` : null; };
-const ARM_WAIT = 10000; // an armed Delete (its first click) not clicked again within this is disarmed by itself
 const noteKey = (spaceId, cardId) => `${spaceId}\0${cardId}`; // note fields are per space: two spaces can have the same card id
 
 // Whether this panel is on screen: a block showing it in the shown layout with no hidden node above
@@ -88,7 +87,7 @@ export default class ProjectAgent extends View {
     this.folded = new Set(["done", "parked"]); // task sections folded away (finished work starts folded)
     this.older = false; // answered cards shown
     this.output = {}; // `${task}:${label}` -> { text, code, running }
-    this.armed = null; // { task, space, at }: the task whose Delete was clicked once (a second click deletes); see armedTask()
+    this.armed = null; // arm() (rules.js): the task whose Delete was clicked once (a second click deletes); see armedTask()
     this.taskError = {}; // task id -> why the last change failed
     this.notes = {}; // noteKey(space id, card id) -> InputState (the optional note)
     this.choice = {}; // card id -> the option picked, not yet submitted
@@ -120,7 +119,7 @@ export default class ProjectAgent extends View {
     if (props()?.timer) return; // the always-on copy only keeps time; it shows nothing
     this.reload(cx);
     cx.timer.every(10000, (cx) => { this.reload(cx); this.resend(cx); });
-    cx.timer.every(1000, (cx) => { this.wake(cx); if (this.armed && !this.armedTask(this.space)) cx.notify(); }); // shown again (render may not run for a hidden copy); an armed Delete timed out
+    cx.timer.every(1000, (cx) => { this.wake(cx); if ((this.armed && !this.armedTask(this.space)) || (this.rules.armed && !this.rules.armedRule(this.space))) cx.notify(); }); // shown again (render may not run for a hidden copy); an armed Delete timed out
     cx.spawn(async (cx) => {
       for (;;) {
         try { await watchFolder(`${paHome(null)}/spaces`); } catch { return; }
@@ -544,13 +543,13 @@ export default class ProjectAgent extends View {
   // expanded, under ARM_WAIT old (the view the last render drew: a new open card can switch it). One that no longer holds is dropped (it never comes back).
   armedTask(spaceId) {
     const a = this.armed;
-    if (!a) return null;
-    if (a.space === spaceId && this.viewShown === "tasks" && this.open.has(a.task) && Date.now() - a.at < ARM_WAIT) return a.task;
+    if (armHolds(a, spaceId, a && this.viewShown === "tasks" && this.open.has(a.id))) return a.id;
     this.armed = null;
     return null;
   }
 
-  disarm() { this.armed = null; }
+  // Drops every armed Delete: the task's and the Rules view's.
+  disarm() { this.armed = null; this.rules.armed = null; }
 
   // Opens a link on this computer (wherever the space lives).
   openLink(url, cx) {
@@ -626,7 +625,7 @@ export default class ProjectAgent extends View {
     const tone = { "needs-decision": t.blocked, review: t.done, "in-progress": t.working, investigating: t.working, queued: t.muted, parked: t.dim, done: t.dim }[task.state] ?? t.muted;
     return v_flex().id(`task-${task.id}`).flex_none().rounded(7).border(1).border_color(t.border).bg(t.surface)
       .child(h_flex().id(`task-head-${task.id}`).h(32).px(9).gap(7).items_center().cursor_pointer().hover((s) => s.bg(t.hover))
-        .on_click((_e, cx) => { if (open) { this.open.delete(task.id); if (this.armed?.task === task.id) this.disarm(); } else this.open.add(task.id); cx.notify(); })
+        .on_click((_e, cx) => { if (open) { this.open.delete(task.id); if (this.armed?.id === task.id) this.armed = null; } else this.open.add(task.id); cx.notify(); })
         .child(div().flex_none().text_size(11).text_color(t.dim).child(open ? "▾" : "▸"))
         .child(div().flex_none().text_size(11.5).text_color(t.dim).child(String(task.id ?? "?")))
         .child(div().flex_1().min_w(0).truncate().text_size(12.5).text_color(t.foreground).child(String(task.title ?? "(untitled)")))
@@ -671,7 +670,7 @@ export default class ProjectAgent extends View {
           // Two clicks on the same button: the first arms it (ARM_WAIT; Cancel, a press elsewhere, collapsing, another view or space disarm).
           .child(keep(div().id(`delete-${task.id}`)).flex_none().px(8).h(24).flex().items_center().rounded(6).border(1).border_color(armed ? t.blocked : t.border)
             .text_size(11.5).text_color(armed ? t.blocked : t.muted).cursor_pointer().hover((s) => s.bg(t.hover))
-            .on_click((_e, cx) => { cx.stop_propagation(); if (armed) this.changeTask(space, task, "delete", cx); else { this.armed = { task: task.id, space: space.id, at: Date.now() }; cx.notify(); } })
+            .on_click((_e, cx) => { cx.stop_propagation(); if (armed) this.changeTask(space, task, "delete", cx); else { this.armed = arm(task.id, space.id); cx.notify(); } })
             .child(armed ? "Delete the task, its evidence and its cards?" : "Delete…"))
           .when(armed, (e) => e.child(keep(this.button(t, `delete-cancel-${task.id}`, "Cancel", (_e, cx) => { cx.stop_propagation(); this.disarm(); cx.notify(); })))))
         .when(Boolean(this.taskError[task.id]), (e) => e.child(div().text_size(11.5).text_color(t.blocked).child(this.taskError[task.id])))));
@@ -737,7 +736,7 @@ export default class ProjectAgent extends View {
     if (space?.id !== this.space && space && !this.inFlight(space.id)) this.reload(cx);
     // A press anywhere in the panel but the armed Delete and its Cancel (they stop it) disarms the Delete.
     const root = v_flex().id("project-agent").size_full().min_h(0).bg(t.chrome).text_color(t.foreground)
-      .on_mouse_down("left", (_e, cx) => { if (this.armed) { this.disarm(); cx.notify(); } });
+      .on_mouse_down("left", (_e, cx) => { if (this.armed || this.rules.armed) { this.disarm(); cx.notify(); } });
     const head = (title, right) => h_flex().h(34).px(12).gap(8).flex_none().items_center().border_b(1).border_color(t.border)
       .child(div().flex_1().min_w(0).truncate().text_size(13).font_semibold().child(title)).when(Boolean(right), (el) => el.child(right));
     const note = (text) => div().p(12).text_size(12).text_color(t.dim).child(text);
