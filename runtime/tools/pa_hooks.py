@@ -1091,13 +1091,7 @@ def identity_refusal(address, task, entry, info):
     return None
 
 
-def status_word(info):
-    """hc's status of a terminal as a word. `hc ls` gives a word; `hc get` gives an object
-    {app, state, msg}. '' when there is none, or it is in neither shape."""
-    status = (info or {}).get("status")
-    if isinstance(status, dict):
-        status = status.get("state")
-    return status if isinstance(status, str) else ""
+status_word = pa.status_word  # one reading of hc status, shared with pa-pass
 
 
 def status_refusal(address, entry, info):

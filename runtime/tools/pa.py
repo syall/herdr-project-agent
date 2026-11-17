@@ -138,6 +138,15 @@ def hc_get(address):
         return {}
 
 
+def status_word(info):
+    """hc's status of a terminal as a word. `hc ls` gives a word; `hc get` gives an object
+    {app, state, msg}. '' when there is none, or it is in neither shape."""
+    status = (info or {}).get("status")
+    if isinstance(status, dict):
+        status = status.get("state")
+    return status if isinstance(status, str) else ""
+
+
 def space_dir(space):
     return os.path.join(ROOT, "spaces", ident(local_id(space), "space id"))
 
@@ -898,7 +907,7 @@ def cmd_pass(args):
         return
     if not launcher_alive(directory, agent["terminal"]):  # a labelled terminal can be a bare shell its launcher left
         raise Problem("the Project Agent for {} is not running (its launcher's heartbeat is missing or old)".format(agent.get("name")))
-    if term.get("status") in ("working", "blocked"):
+    if status_word(term) in ("working", "blocked"):
         old = read_json(request_path, {}) or {}
         write_json(request_path, {"pending": True, "retro": bool(args.retro or (old.get("pending") and old.get("retro"))), "at": now(), "by": "pa-pass"})
         print("The Project Agent is mid-turn: the pass is queued and runs when the turn ends (Herdr's window must be open).")
