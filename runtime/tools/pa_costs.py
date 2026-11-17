@@ -1000,9 +1000,12 @@ def _collect(directory, folder, now, quiet, resummarize):
     if text != old_text:
         pa.write_text(state_path, text)
     written = [r for r in out if "seq" in r]
+    failed = os.path.join(folder, FAILED_MARK)
     if (written or resummarize or ctx["events"] or state["problems"] != old_problems
-            or not os.path.exists(os.path.join(folder, "summary.json"))):
+            or not os.path.exists(os.path.join(folder, "summary.json")) or os.path.exists(failed)):
         write_summary(directory, state, now, ctx["records"] + ctx["events"])
+        if os.path.exists(failed):
+            os.unlink(failed)
     if not quiet:
         print("collected {} new segment(s) from {} session(s)".format(len(written), len(sessions)))
     return {"rows": len(written), "sessions": len(sessions)}
@@ -1620,6 +1623,33 @@ def summarize(directory, rows, records, table, price_problem, profile_name, now,
         "unmatched": {"sessions": um[-1].get("sessions", 0), "tokens": um[-1].get("tokens", 0)} if um else {"sessions": 0, "tokens": 0},
         "problems": problems[:20],
     }
+
+
+FAILED_MARK = ".collect-failed"  # in costs/: the next good collect rewrites summary.json, which clears the entry
+
+
+def note_collect_failure(directory, why, now=None):
+    """`pa-costs collect` refused or failed: summary.json says why (REVIEW-2 RL3), keeping the last good figures. With
+    no summary yet, a short one without totals (so nothing reads as 0). Never raises."""
+    try:
+        now = time.time() if now is None else now
+        folder = costs_dir(directory)
+        if not os.path.isdir(folder):
+            return
+        path = os.path.join(folder, "summary.json")
+        try:
+            s = pa.read_json(path, None)
+        except (OSError, ValueError):
+            s = None
+        if not isinstance(s, dict):
+            s = {"v": 1, "space": os.path.basename(os.path.normpath(directory)), "updated": iso(now), "account": costs_account()}
+        s["collect"] = {"ok": False, "at": iso(now), "why": why}
+        rest = [p for p in s.get("problems") or [] if isinstance(p, str) and not p.startswith("collect failed: ")]
+        s["problems"] = (["collect failed: " + why] + rest)[:20]
+        pa.write_text(path, compact(s))
+        pa.write_text(os.path.join(folder, FAILED_MARK), iso(now) + "\n")
+    except Exception:  # noqa: BLE001 - the failure itself is what is reported
+        pass
 
 
 def compact(value):
@@ -2649,8 +2679,16 @@ def main(argv=None):
     add_billed_parser(sub)
     args = parser.parse_args(argv)
     if args.cmd == "collect":
-        result = collect(space_directory(args.space), quiet=args.quiet, resummarize=args.resummarize)
-        return 0 if result is not None else 0
+        directory = space_directory(args.space)
+        try:
+            collect(directory, quiet=args.quiet, resummarize=args.resummarize)
+        except pa.Problem as e:  # our own text: shown to the panel, scrubbed and short
+            note_collect_failure(directory, scrub(str(e))[:200])
+            raise
+        except Exception as e:  # noqa: BLE001 - any other error: its type only, never its text
+            note_collect_failure(directory, type(e).__name__)
+            raise
+        return 0
     if args.cmd == "report":
         if args.account_wide:
             return report(None, account_wide=True)
