@@ -7,7 +7,7 @@
 import { View, div } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, ScrollHandle } from "gpui-base";
 import { spaces, panes, agents, terminals, machines, theme, run, exec, props, home, watchFolder, notify, shared, setShared, closeOverlay, openOverlay, window, layout } from "herdr";
-import { loadSpace, loadDecisions, answerDecision, notifyOrchestrator, changeRules, touched, localId, paHome, stateDir, taskActions, taskLinks, evidenceTasks, cardEvidence, staleInstructions, liveTarget, lookAlike, OPEN_REQUESTS, keeperJudging, startingLabels } from "./store.js";
+import { loadSpace, loadDecisions, loadRules, withTimeout, TIMED_OUT, READ_LIMIT, answerDecision, notifyOrchestrator, changeRules, touched, localId, paHome, stateDir, taskActions, taskLinks, evidenceTasks, cardEvidence, staleInstructions, liveTarget, lookAlike, OPEN_REQUESTS, keeperJudging, startingLabels } from "./store.js";
 import { RulesPane } from "./rules.js";
 import { SetupPane } from "./setup.js";
 import { Keeper, idleShell } from "./keeper.js";
@@ -19,6 +19,27 @@ const ORDER = [...ACTIVE, "parked", "done"];
 const OPEN_WAIT = 30000; // an Open request with nothing started by then: say why, offer the button again
 const OPEN_SLOW = 180000; // its new tab is recorded but its launcher has not started by then: say so
 const paRecords = (spaceId) => Object.values(shared("project-agent.tabs") ?? {}).filter((r) => r?.space === spaceId);
+const LOAD_LIMIT = READ_LIMIT + 1000; // a load still pending after this is given up: a new one may start
+const CACHE_MAX = 8; // spaces whose last load is kept (in memory), the least recently shown dropped first
+const CACHE_OLD = 60000; // a kept load older than this says "updating…" while its refresh runs
+const COUNT_EVERY = 10000; // while hidden: at most one card read per space this often
+
+// Whether this panel is on screen: a block showing it in the shown layout with no hidden node above
+// it, and the selected child of each stack above it (how the tabs mod reads the side panel; the
+// Changes view uses the same test). The always-on timer copy does not count. A copy the layout does
+// not hold (a pane mod, a window) counts as shown. A hidden copy stays alive and its timers run.
+function onScreen(name = "project-agent") {
+  let found = false, shown = false;
+  const walk = (n, ok) => {
+    if (!n || typeof n !== "object") return;
+    ok = ok && !n.hidden;
+    if (n.content?.mod === name && !n.content?.props?.timer) { found = true; shown ||= ok; }
+    const kids = Array.isArray(n.children) ? n.children : [], pick = n.type === "stack" ? n.active ?? kids[0]?.id : null;
+    for (const c of kids) walk(c, ok && (pick === null || c?.id === pick));
+  };
+  walk(layout(), true);
+  return shown || !found;
+}
 const when = (iso) => { const d = new Date(iso); return Number.isNaN(d.getTime()) ? "" : d.toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }); };
 
 export default class ProjectAgent extends View {
@@ -33,9 +54,16 @@ export default class ProjectAgent extends View {
       });
       return;
     }
-    this.data = null; // loadSpace() result for this.space
+    this.data = null; // loadSpace() result for this.space (partial: the cards and the rest are still coming)
     this.cards = []; // loadDecisions() result
     this.space = null;
+    this.cardsFor = null; // the space this.cards belong to
+    this.dataAt = 0; // when the data shown was loaded
+    this.cache = new Map(); // space id -> { data, cards, rules, at }: its last finished load (most recently shown last)
+    this.loads = {}; // space id -> { token, at }: the load in flight; only it may commit
+    this.seq = 0;
+    this.counting = {}; // space id -> { at, busy }: the hidden panel's card count reads
+    this.asleep = false; // not on screen: only the open-card count is read
     this.view = null; // "decisions" | "tasks" | "rules"; null: decisions when any is open
     this.rules = new RulesPane();
     this.open = new Set(); // expanded task ids
@@ -74,6 +102,7 @@ export default class ProjectAgent extends View {
     if (props()?.timer) return; // the always-on copy only keeps time; it shows nothing
     this.reload(cx);
     cx.timer.every(10000, (cx) => { this.reload(cx); this.resend(cx); });
+    cx.timer.every(1000, (cx) => this.wake(cx)); // shown again (render may not run for a hidden copy)
     cx.spawn(async (cx) => {
       for (;;) {
         try { await watchFolder(`${paHome(null)}/spaces`); } catch { return; }
@@ -82,18 +111,103 @@ export default class ProjectAgent extends View {
     });
   }
 
+  // A load in flight for this space that is not yet given up.
+  inFlight(id) { const l = this.loads[id]; return Boolean(l && Date.now() - l.at < LOAD_LIMIT); }
+
+  // Shows a space's kept load at once (from reload, before anything is read). Note fields are made
+  // in a task, never in render.
+  adopt(space, cx) {
+    const kept = this.cache.get(space.id);
+    if (!kept) return;
+    this.cache.delete(space.id); this.cache.set(space.id, kept); // now the most recently shown
+    this.data = kept.data; this.cards = kept.cards; this.cardsFor = space.id; this.rules.data = kept.rules; this.space = space.id; this.dataAt = kept.at;
+    cx.spawn(async (cx) => {
+      for (const c of kept.cards) if (c.card?.status === "open") this.notes[c.id] ??= InputState.new({ placeholder: "Note for the Project Agent (optional)" });
+      cx.notify();
+    });
+  }
+
+  // Shown again after a time off screen: what it has shows at once; one full reload starts.
+  wake(cx) {
+    if (!this.asleep || !onScreen()) return;
+    this.asleep = false;
+    this.reload(cx);
+  }
+
+  // While hidden: only the open-card count on the panel's button (shared "project-agent.open"),
+  // from one card read per space at most every 10 s. A failed read leaves the count as it was.
+  countCards(cx, space) {
+    const c = this.counting[space.id], now = Date.now();
+    if (c && (now - c.at < COUNT_EVERY || (c.busy && now - c.at < LOAD_LIMIT))) return;
+    const mine = { at: now, busy: true };
+    this.counting[space.id] = mine;
+    cx.spawn(async (cx) => {
+      let cards = null;
+      try { cards = await loadDecisions(space, { cx, batchOnly: true }); } catch {}
+      mine.busy = false;
+      if (!cards) return;
+      const open = cards.filter((x) => x.card?.status === "open").length;
+      const counts = { ...(shared("project-agent.open") ?? {}) };
+      if ((counts[space.id] ?? 0) !== open) { if (open) counts[space.id] = open; else delete counts[space.id]; setShared("project-agent.open", counts); }
+    });
+  }
+
+  // Loads the shown space: agent.json, then the header's reads together (first paint), then the
+  // cards, rules, evidence and stale instructions together; then commits. One load per space in
+  // flight (a token: only the latest may commit); one pending over LOAD_LIMIT is given up. The
+  // last finished load of each space is kept and shown at once when the space is shown again.
   reload(cx) {
     const space = spaces().find((s) => s.active);
     if (!space) { this.data = null; this.space = null; cx.notify(); return; }
-    if (this.loading === space.id) { this.again = true; return; }
-    this.loading = space.id;
+    if (space.id !== this.space) this.adopt(space, cx);
+    if (!onScreen()) { this.asleep = true; this.countCards(cx, space); return; }
+    this.asleep = false;
+    if (this.inFlight(space.id)) { this.again = true; return; }
+    const token = ++this.seq;
+    this.loads[space.id] = { token, at: Date.now() };
+    const current = () => this.loads[space.id]?.token === token;
+    const shown = () => spaces().find((s) => s.active)?.id === space.id;
     cx.spawn(async (cx) => {
-      let data, cards = [];
-      try { data = await loadSpace(space, props()?.profile); if (data.agent) { cards = await loadDecisions(space); await this.rules.load(space); data.evidence = await evidenceTasks(space); data.stale = await staleInstructions(space, data.agent.profile); } }
+      let data, cards = [], rules = null;
+      const kept = this.cache.get(space.id);
+      try {
+        data = await loadSpace(space, props()?.profile, cx);
+        if (data.agent && current() && shown()) { // first paint: the header and the tasks
+          const same = this.space === space.id;
+          this.data = { ...data, partial: true, evidence: same ? this.data?.evidence : undefined, stale: same ? this.data?.stale : undefined };
+          if (this.cardsFor !== space.id) { this.cards = []; this.cardsFor = null; this.rules.data = null; }
+          if (!same) this.dataAt = Date.now();
+          this.space = space.id;
+          cx.notify();
+        }
+        if (data.agent) {
+          const cap = (p, fallback) => withTimeout(cx, p).then((v) => (v === TIMED_OUT ? fallback : v));
+          let evidence, stale;
+          [cards, rules, evidence, stale] = await Promise.all([
+            loadDecisions(space, { cx, live: current }),
+            cap(loadRules(space), kept?.rules ?? null), // null: the Rules view says Loading… until a load answers
+            cap(evidenceTasks(space), kept?.data?.evidence ?? new Map()),
+            cap(staleInstructions(space, data.agent.profile), kept?.data?.stale ?? []),
+          ]);
+          data.evidence = evidence; data.stale = stale;
+        }
+      }
       catch (e) { data = { agent: null, errors: [String(e.message ?? e)] }; }
-      this.loading = null;
-      if (spaces().find((s) => s.active)?.id === space.id) {
-        this.data = data; this.cards = cards; this.space = space.id;
+      if (!current()) return; // given up: a newer load of this space owns it now
+      delete this.loads[space.id];
+      // agent.json did not answer: keep what is kept for this space, with the error; the kept entry stays.
+      const timedOut = Boolean(data.timedOut);
+      if (timedOut && kept) { data = { ...kept.data, errors: [...data.errors] }; cards = kept.cards; rules = kept.rules; }
+      if (timedOut && !kept && shown()) { // nothing kept: say so; the shared entries stay as they are
+        this.data = data; this.cards = []; this.cardsFor = null; this.space = space.id; this.dataAt = Date.now();
+        cx.notify();
+      } else if (shown()) {
+        this.data = data; this.cards = cards; this.space = space.id; this.cardsFor = space.id; this.dataAt = timedOut ? kept.at : Date.now();
+        if (rules) this.rules.data = rules;
+        if (!timedOut) {
+          this.cache.delete(space.id); this.cache.set(space.id, { data, cards, rules: rules ?? this.rules.data, at: this.dataAt });
+          while (this.cache.size > CACHE_MAX) this.cache.delete(this.cache.keys().next().value);
+        }
         // One note field per open card, made here (never in render) and dropped with its card.
         const open = new Set(cards.filter((c) => c.card?.status === "open").map((c) => c.id));
         for (const id of Object.keys(this.notes)) if (!open.has(id)) { this.notes[id].release?.(); delete this.notes[id]; }
@@ -461,7 +575,8 @@ export default class ProjectAgent extends View {
     if (props()?.timer) return div();
     const t = theme();
     const space = spaces().find((s) => s.active);
-    if (space?.id !== this.space && space && this.loading !== space.id) this.reload(cx);
+    this.wake(cx);
+    if (space?.id !== this.space && space && !this.inFlight(space.id)) this.reload(cx);
     const root = v_flex().id("project-agent").size_full().min_h(0).bg(t.chrome).text_color(t.foreground);
     const head = (title, right) => h_flex().h(34).px(12).gap(8).flex_none().items_center().border_b(1).border_color(t.border)
       .child(div().flex_1().min_w(0).truncate().text_size(13).font_semibold().child(title)).when(Boolean(right), (el) => el.child(right));
@@ -469,6 +584,7 @@ export default class ProjectAgent extends View {
     if (!space) return root.child(head("Project Agent")).child(note("No space open."));
     const data = space.id === this.space ? this.data : null;
     if (!data) return root.child(head("Project Agent")).child(note("Loading…"));
+    if (!data.agent && data.timedOut) return root.child(head("Project Agent")).child(note("This space's Project Agent did not answer. Trying again shortly.")).children((data.errors ?? []).map((e) => note(e)));
     if (!data.agent) {
       const tabs = new Set(space.tabs.map((x) => x.id));
       const folder = panes().find((p) => tabs.has(p.tab) && p.cwd)?.cwd || space.folder;
@@ -550,7 +666,7 @@ export default class ProjectAgent extends View {
       .when(known === "down" && Boolean(this.openMsg[space.id]), (el) => el.child(div().px(12).py(6).border_b(1).border_color(t.border).text_size(11.5).text_color(t.blocked).child(this.openMsg[space.id] ?? "")))
       .child(v_flex().px(12).py(8).gap(2).flex_none().border_b(1).border_color(t.border).text_size(11.5).text_color(t.dim)
         .child(div().truncate().child(String(a.project ?? "").replace(home(), "~")))
-        .child(div().child(`profile ${a.profile ?? "?"} · ${active} active of ${tasks.length} tasks · pass ${data.ledger?.passCount ?? 0}`)))
+        .child(div().child(`profile ${a.profile ?? "?"} · ${active} active of ${tasks.length} tasks · pass ${data.ledger?.passCount ?? 0}${this.inFlight(space.id) && now - this.dataAt > CACHE_OLD ? " · updating…" : ""}`)))
       // The agent reads its instructions when its session starts; say when they have changed since.
       .when((data.stale ?? []).length > 0 && Boolean(live), (el) => el.child(div().px(12).py(6).border_b(1).border_color(t.border).bg(t.working + "1a").text_size(11.5).text_color(t.foreground)
         .child(`Its instructions changed since this agent started (${data.stale.slice(0, 3).join(", ")}). Type /exit in its tab: it restarts in place, keeps the conversation and loads them.`)))
@@ -581,7 +697,8 @@ export default class ProjectAgent extends View {
         }))))
       .when(view === "rules", (el) => el.child(this.rules.render(t, space, (id, what) => new Promise((done) => cx.spawn(async (cx) => { try { await this.ruleDecided(space, id, what, cx); } finally { done(); } })))))
       .when(view === "decisions", (el) => el.child(v_flex().id("pa-decisions").flex_1().min_h(0).p(8).gap(8).overflow_y_scrollbar().track_scroll(this.cardScroll)
-        .when(!openCards.length, (e) => e.child(note("No open decisions. The Project Agent opens a card here when it needs you.")))
+        .when(!openCards.length && this.cardsFor !== space.id, (e) => e.child(note("Loading decisions…")))
+        .when(!openCards.length && this.cardsFor === space.id, (e) => e.child(note("No open decisions. The Project Agent opens a card here when it needs you.")))
         .children(openCards.map((c) => this.card(t, c, space)))
         .when(answered.length > 0, (e) => e.child(div().id("pa-older").px(4).py(4).text_size(11.5).text_color(t.dim).cursor_pointer().hover((s) => s.text_color(t.foreground))
           .on_click((_e, cx) => { this.older = !this.older; cx.notify(); }).child(`${this.older ? "▾" : "▸"} ${answered.length} answered`)))
