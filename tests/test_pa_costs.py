@@ -321,3 +321,275 @@ class P_Prices(CostsBase):
                "long": dict(ZERO), "money": 999.0, "calls": 4}
         self.assertAlmostEqual(pa_costs.row_money(row, table), 1.0 + 10.0 + 2.0 + 4.0 + 0.5)
         self.assertIsNone(pa_costs.row_money(dict(row, model="model-c"), table))
+
+
+# ---- step 2: reading, dedupe, offsets, crash safety (R2, R5) -----------------------------------------
+
+SID = "11111111-2222-4333-8444-5555abcd5555"
+SID2 = "66666666-7777-4888-8999-aaaa0000aaaa"
+
+
+class CountingFile:
+    """A file proxy that counts the bytes read through it."""
+
+    def __init__(self, f, counter):
+        self.f, self.counter = f, counter
+
+    def read(self, *a):
+        data = self.f.read(*a)
+        self.counter[0] += len(data)
+        return data
+
+    def __getattr__(self, name):
+        return getattr(self.f, name)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        self.f.close()
+
+    def __iter__(self):
+        for line in self.f:
+            self.counter[0] += len(line)
+            yield line
+
+
+class Collecting(CostsBase):
+    """Helpers: a recorded Claude worker session SID in the project folder, collect at a fixture time."""
+
+    def setUp(self):
+        super().setUp()
+        self.opened = []
+        self.read_bytes = [0]
+        real_open = open
+
+        def counting_open(path, *a, **kw):
+            self.opened.append(str(path))
+            return CountingFile(real_open(path, *a, **kw), self.read_bytes)
+        pa_costs.open = counting_open
+        self.addCleanup(lambda: delattr(pa_costs, "open") if "open" in vars(pa_costs) else None)
+
+    def transcript(self, sid=SID, cwd=None):
+        return fx.claude_path(pa.CLAUDE_HOME, cwd or self.project, sid)
+
+    def add(self, *chunks, sid=SID):
+        out = []
+        for c in chunks:
+            out.extend(c if isinstance(c, list) else [c])
+        fx.append(self.transcript(sid), out)
+
+    def prompt(self, t, sid=SID):
+        return fx.claude_user(isoms(t), sid, self.project)
+
+    def call(self, t, mid, sid=SID, **kw):
+        return fx.claude_call(isoms(t), sid, self.project, mid, **kw)
+
+    def collect(self, now, **kw):
+        result, out, err = self.run_cmd(pa_costs.collect, self.dir, now=now, **kw)
+        return result
+
+    def rows(self):
+        """The ledger's rows that count: void lines drop the earlier rows of their session."""
+        rows = lines(self.costs("turns.jsonl"))
+        kept = []
+        for r in rows:
+            if r.get("ev") == "void":
+                kept = [k for k in kept if not (k["session"] == r["session"] and k["seq"] <= r["upTo"])]
+            else:
+                kept.append(r)
+        return kept
+
+    def totals(self):
+        t = dict(ZERO)
+        for r in self.rows():
+            for k in t:
+                t[k] += r["tokens"][k]
+        return t
+
+    def costs_bytes(self):
+        folder = os.path.join(self.dir, "costs")
+        return {n: raw(os.path.join(folder, n)) for n in sorted(os.listdir(folder))}
+
+
+class D_Dedupe(Collecting):
+    def test_d1_three_lines_per_call_count_once_with_the_largest_output(self):
+        self.record(session=SID, task="t-001", name="t-001-build", terminal="t5")
+        self.add(self.prompt(T0 + 1), self.call(T0 + 2, "m1", lines=3, out=90, inp=5, cr=1000, cw5m=100),
+                 self.call(T0 + 3, "m2", lines=2, out=40, inp=3, cr=2000))
+        self.collect(T0 + 2000)
+        rows = self.rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["calls"], 2)
+        self.assertEqual(rows[0]["tokens"], {"in": 8, "out": 130, "cw5m": 100, "cw1h": 0, "cr": 3000})
+        self.assertEqual(rows[0]["model"], "model-a")
+        self.assertEqual(rows[0]["day"], "2026-11-17")
+
+    def test_d2_a_calls_lines_split_across_two_collects(self):
+        self.record(session=SID, task="t-001")
+        lines3 = self.call(T0 + 2, "m1", lines=3, out=90)
+        self.add(self.prompt(T0 + 1), lines3[:2])
+        self.collect(T0 + 3)
+        self.assertEqual(self.rows(), [])  # the turn is still open
+        self.add(lines3[2:], self.prompt(T0 + 10), self.call(T0 + 11, "m2", lines=1, out=7))
+        self.collect(T0 + 12)
+        rows = self.rows()
+        self.assertEqual([r["tokens"]["out"] for r in rows], [90])  # first turn settled by the next prompt
+        self.collect(T0 + 2000)
+        self.assertEqual([r["tokens"]["out"] for r in self.rows()], [90, 7])
+        self.assertEqual(sum(r["calls"] for r in self.rows()), 2)
+
+    def test_d3_id_fallback_request_id_then_uuid(self):
+        self.record(session=SID, task="t-001")
+        a = fx.claude_assistant(isoms(T0 + 2), SID, self.project, None, request_id="r1", out=5)
+        b = fx.claude_assistant(isoms(T0 + 2), SID, self.project, None, request_id="r1", out=9)
+        c = fx.claude_assistant(isoms(T0 + 3), SID, self.project, None, uuid="u9", out=4)
+        self.add(self.prompt(T0 + 1), a, b, c)
+        self.collect(T0 + 2000)
+        rows = self.rows()
+        self.assertEqual(rows[0]["calls"], 2)
+        self.assertEqual(rows[0]["tokens"]["out"], 13)
+
+    def test_d4_codex_cumulative_deltas_with_a_repeated_total(self):
+        self.record(session=None, program="codex", bind="launch-window", at=iso(T0), task="t-002", cwd=self.project, terminal="t6")
+        with open(self.costs("sessions.jsonl"), "a") as f:  # binding itself is step 5's; here the bind is given
+            f.write(json.dumps({"v": 1, "ev": "bind", "at": iso(T0 + 30), "session": SID2, "program": "codex",
+                                "for": iso(T0) + " t6", "match": "launch-window", "confidence": "high"}) + "\n")
+        path = fx.codex_path(_HOMES["CODEX_HOME"], "2026-11-17", SID2)
+        fx.append(path, [fx.codex_meta(isoms(T0 + 1), SID2, self.project), fx.codex_turn(isoms(T0 + 2), "model-b"),
+                         fx.codex_user(isoms(T0 + 2)),
+                         fx.codex_tokens(isoms(T0 + 3), inp=1000, cached=600, cw=100, out=50, reasoning=20),
+                         fx.codex_tokens(isoms(T0 + 4), inp=1000, cached=600, cw=100, out=50, reasoning=20),  # repeated total
+                         fx.codex_tokens(isoms(T0 + 5), inp=1500, cached=1000, cw=100, out=80)])
+        self.collect(T0 + 2000)
+        self.assertEqual(self.totals(), {"in": 400, "out": 80, "cw5m": 100, "cw1h": 0, "cr": 1000})
+        rows = self.rows()
+        self.assertEqual({r["model"] for r in rows}, {"model-b"})
+        self.assertEqual({r["program"] for r in rows}, {"codex"})
+        self.assertEqual(sum(r["calls"] for r in rows), 2)
+
+    def test_d5_forked_or_resumed_record_skips_copied_older_calls(self):
+        self.record(session=SID, resumed=True, at=iso(T0 + 100), task="t-001")
+        self.add(self.prompt(T0 + 1), self.call(T0 + 10, "old", lines=1, out=1000),
+                 self.prompt(T0 + 150), self.call(T0 + 200, "new", lines=1, out=7))
+        self.collect(T0 + 3000)
+        self.assertEqual(self.totals()["out"], 7)
+
+    def test_d6_turn_rules_and_day_split(self):
+        self.record(session=SID, task="t-001")
+        day_end = T0 + 86400
+        self.add(self.prompt(day_end - 100), self.call(day_end - 50, "m1", lines=1, out=3),
+                 fx.claude_user(isoms(day_end - 40), SID, self.project, text=False, tool_result=True),  # tool result: same turn
+                 fx.claude_user(isoms(day_end - 30), SID, self.project, meta=True),  # meta: same turn
+                 fx.claude_user(isoms(day_end - 20), SID, self.project, sidechain=True),  # sidechain: same turn
+                 self.call(day_end + 10, "m2", lines=1, out=4))  # same turn, next UTC day: a second segment
+        self.collect(day_end + 2000)
+        rows = self.rows()
+        self.assertEqual([(r["day"], r["tokens"]["out"]) for r in rows], [("2026-11-17", 3), ("2026-11-18", 4)])
+        self.assertEqual(rows[0]["from"][:10], "2026-11-17")
+        self.assertEqual(rows[0]["turn"], rows[1]["turn"])
+
+
+class O_Offsets(Collecting):
+    def base_session(self):
+        self.record(session=SID, task="t-001")
+        self.add(self.prompt(T0 + 1), self.call(T0 + 2, "m1", out=30), self.prompt(T0 + 5), self.call(T0 + 6, "m2", out=60))
+
+    def test_o1_second_collect_reads_only_new_bytes(self):
+        self.base_session()
+        self.collect(T0 + 7)
+        size = os.path.getsize(self.transcript())
+        self.read_bytes[0] = 0
+        extra = [self.prompt(T0 + 9)] + self.call(T0 + 10, "m3", out=9)
+        self.add(extra)
+        self.opened[:] = []
+        self.collect(T0 + 11)
+        grown = os.path.getsize(self.transcript()) - size
+        transcript_reads = [p for p in self.opened if p == self.transcript()]
+        self.assertEqual(len(transcript_reads), 1)
+        # Bytes read: the new part of the transcript, plus the costs/ files and the space's small state files.
+        others = sum(os.path.getsize(p) for p in set(self.opened) if p != self.transcript() and os.path.exists(p))
+        self.assertLessEqual(self.read_bytes[0], grown + others)
+
+    def test_o2_half_line_is_not_consumed(self):
+        self.record(session=SID, task="t-001")
+        line = self.call(T0 + 2, "m1", lines=1, out=30)[0]
+        self.add(self.prompt(T0 + 1), line[:40])
+        self.collect(T0 + 3)
+        self.add(line[40:])
+        self.collect(T0 + 2000)
+        self.assertEqual(self.totals()["out"], 30)
+        self.assertEqual(sum(r["calls"] for r in self.rows()), 1)
+
+    def test_o3_replaced_file_voids_and_rereads_with_equal_totals(self):
+        self.base_session()
+        self.collect(T0 + 2000)
+        before = self.totals()
+        path = self.transcript()
+        data = raw(path)
+        tmp = path + ".new"
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, path)  # same bytes, new inode
+        self.collect(T0 + 2100)
+        self.assertTrue(any(r.get("ev") == "void" for r in lines(self.costs("turns.jsonl"))))
+        self.assertEqual(self.totals(), before)
+
+    def test_o4_rerun_with_nothing_new_changes_no_byte(self):
+        self.base_session()
+        self.collect(T0 + 2000)
+        before = self.costs_bytes()
+        self.collect(T0 + 2000)
+        self.collect(T0 + 2050)
+        self.assertEqual(self.costs_bytes(), before)
+
+    def test_o5_killed_between_ledger_append_and_state_write(self):
+        self.base_session()
+        real = pa.write_text
+        fail = [True]
+
+        def flaky(path, text):
+            if fail[0] and path.endswith(os.path.join("costs", "state.json")):
+                fail[0] = False
+                raise OSError("killed here")
+            return real(path, text)
+        pa.write_text = flaky
+        try:
+            with self.assertRaises(OSError):
+                pa_costs.collect(self.dir, now=T0 + 2000)
+        finally:
+            pa.write_text = real
+        self.assertTrue(raw(self.costs("turns.jsonl")))  # the rows were appended before the kill
+        self.collect(T0 + 2000)
+        self.assertEqual(self.totals(), {"in": 4, "out": 90, "cw5m": 0, "cw1h": 0, "cr": 0})
+        self.assertEqual(sum(r["calls"] for r in self.rows()), 2)
+        seqs = [r["seq"] for r in lines(self.costs("turns.jsonl")) if "seq" in r]
+        self.assertEqual(len(seqs), len(set(seqs)))
+
+    def test_o6_second_collector_is_refused_while_one_runs(self):
+        import fcntl
+        self.base_session()
+        os.makedirs(os.path.join(self.dir, "costs"), exist_ok=True)
+        with open(self.costs(".collect.lock"), "a") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            result, out, _err = self.run_cmd(pa_costs.collect, self.dir, now=T0 + 2000, quiet=False)
+        self.assertEqual(result.get("busy"), True)
+        self.assertIn("already running", out)
+        self.assertIsNone(raw(self.costs("turns.jsonl")))
+
+
+class G_Gone(Collecting):
+    def test_g1_deleted_file_marks_gone_and_keeps_rows(self):
+        self.record(session=SID, task="t-001")
+        self.record(session=SID2, task="t-002")
+        self.add(self.prompt(T0 + 1), self.call(T0 + 2, "m1", out=30))
+        self.collect(T0 + 2000)
+        rows = self.rows()
+        os.unlink(self.transcript())
+        self.collect(T0 + 2100)
+        self.collect(T0 + 2200)
+        gone = [r for r in lines(self.costs("sessions.jsonl")) if r.get("ev") == "gone"]
+        self.assertEqual(sorted(g["session"] for g in gone), sorted([SID, SID2]))  # one gone event each, not repeated
+        self.assertEqual(self.rows(), rows)
+        state = load(self.costs("state.json"))
+        self.assertTrue(any("gone before" in p for p in state.get("problems", [])), state.get("problems"))
