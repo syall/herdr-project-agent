@@ -2478,6 +2478,62 @@ class F4_Partial(Collecting):
         self.assertTrue(c["total"]["allSpacesPartial"])
 
 
+class F5_Comparison(FR5_BillingRound5):
+    """Item 5 (VERIFY-5 RL5-1, RL5-3; REVIEW-4 RL4-2): the billed comparison's calibrated line, scope ratio and currency."""
+    test_fr5_no_price_table_no_estimate_reads_zero = test_fr5_every_price_empty_no_estimate_reads_zero = None
+    test_fr5_some_models_priced_the_estimate_says_partial = test_fr5_fully_priced_real_zero_still_reads_zero = None
+
+    def test_f5_unbilled_unpriced_use_is_not_a_bare_zero(self):
+        # case 10: this space used only model-c (no price, not billed); the account was billed only for model-b
+        billed = [brow(amount=1.5, model="model-b", label="usage-b-out")]
+        use = [("2026-11-16", "model-c", None)]
+        c = self.compare(billed, use)
+        self.assertEqual((c["calibrated"], c["calibratedPartial"]), (0.0, True))
+        out = self.text(billed, use)
+        cal = self.line(out, "calibrated")
+        self.assertFalse(cal.endswith("this space 0.00"), cal)
+        self.assertIn("+ unpriced", cal)
+        self.assertIn("no price for model-c", "\n".join(out))
+
+    def test_f5_a_scope_ratio_from_a_partial_estimate_is_marked(self):
+        days = ["2026-11-1{}".format(i) for i in range(3, 6)]
+        billed = [brow(day=d, amount=9.0) for d in days]
+        use = [(d, "model-a", 1.0) for d in days]
+        mixed = use + [("2026-11-14", "model-a-x", None)]
+        c = self.compare(billed, use, mixed)
+        f = c["models"][0]["factor"]
+        self.assertEqual((f["kind"], f["applied"], f["partial"]), ("scope", False, True))
+        self.assertIn("(from a partial estimate)", self.line(self.text(billed, use, mixed), "model-a"))
+        whole = self.compare(billed, use)["models"][0]["factor"]
+        self.assertFalse(whole.get("partial"))
+        self.assertNotIn("partial", self.line(self.text(billed, use), "model-a"))
+
+    def test_f5_rows_only_in_another_currency_are_named(self):
+        billed = [brow(amount=9.0, currency="EUR")]
+        out = self.text(billed, [("2026-11-16", "model-a", 1.0)])
+        self.assertNotIn("  no billed rows for account acct1", out)
+        self.assertIn("  no billed rows in USD for account acct1", out)
+        self.assertIn("in EUR (not compared)", "\n".join(out))
+
+    def test_f5_rows_with_no_price_table_are_named(self):
+        os.unlink(os.path.join(self.profile_dir, "prices.json"))
+        billed = [brow(amount=9.0)]
+        rows = [pa_costs.validate_row(dict(r), "query:q1", "acct1", T0) for r in billed]
+        space = dict(self.summary([("2026-11-16", "model-a", None)]), prices={"profile": "test", "currency": None})
+        saved = (pa_costs.effective_billed, pa_costs.account_wide_summary)
+        pa_costs.effective_billed, pa_costs.account_wide_summary = (lambda: rows), (lambda _a, _n: space)
+        try:
+            out = pa_costs.billed_lines(space, T0)
+        finally:
+            pa_costs.effective_billed, pa_costs.account_wide_summary = saved
+        self.assertNotIn("  no billed rows for account acct1", out)
+        self.assertTrue(any("no price table" in x and "acct1" in x for x in out), out)
+
+    def test_f5_no_rows_at_all_reads_as_before(self):
+        out = self.text([], [("2026-11-16", "model-a", 1.0)])
+        self.assertIn("  no billed rows for account acct1", out)
+
+
 ABSENT = object()
 
 
