@@ -1,4 +1,5 @@
-"""Unit tests for pa-costs, the launch records and the closed event (t-009 part A).
+"""Unit tests for pa-costs, the launch records and the closed event (t-009 part A), and Claude Code's own
+per-session cost beside est. (t-029: the statusline command, the launcher's --settings, the summary and report).
 
 Run: python3 -m unittest -v tests/test_pa_costs.py
 No hc calls, no network, no real homes: HERDR_PA_HOME, CLAUDE_CONFIG_DIR, CODEX_HOME and HERDR_APP_HOME point at a
@@ -12,7 +13,9 @@ import io
 import json
 import os
 import re
+import shlex
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -2765,6 +2768,756 @@ class I1_Install(unittest.TestCase):
             text = f.read()
         self.assertRegex(text, r'for n in pa-costs; do ln -sfn "\$PA/tools/pa_costs.py" "\$HOME/.local/bin/\$n"; done')
         self.assertIn("chmod +x \"$PA\"/tools/*.py", text)  # pa_costs.py is made runnable with the others
+
+
+# ---- t-029 Job 1: Claude Code's own per-session cost (CC) beside est. (spec R1-R6, R8; tests T1-T8) ----------
+
+CC_SID = "cc0a1b2c-3d4e-4f50-8a6b-7c8d9e0f1a2b"
+CC_STUBS = os.path.join(TMP, "cc-stubs")
+CC_SCRIPTS = {
+    "ok": "#!/bin/sh\ncat > /dev/null\nprintf 'STATUS-LINE ok'\n",
+    "copy": "#!/bin/sh\ncat > \"$1\"\nprintf copied\n",
+    "slow": "#!/bin/sh\ncat > /dev/null\nsleep 5\nprintf late\n",
+    "fail": "#!/bin/sh\ncat > /dev/null\nprintf 'partial line'\necho oops >&2\nexit 1\n",
+    "big": "#!/bin/sh\ncat > /dev/null\nhead -c 2097152 /dev/zero | tr '\\000' x\n",
+    "noread": "#!/bin/sh\nprintf 'no-read'\n",
+    "my-status": "#!/bin/sh\ncat > /dev/null\nprintf 'MY-STATUS %s' \"$*\"\n",
+}
+
+
+def cc_stub(name):
+    path = os.path.join(CC_STUBS, name)
+    if not os.path.exists(path):
+        write(path, CC_SCRIPTS[name])
+        os.chmod(path, 0o755)
+    return path
+
+
+def cc_input(sid=CC_SID, cost=1.25, dur=60000, api=30000, model="model-a", version="2.1.999", **over):
+    """A status line input with every field EXPERIMENT.md lists (and two later ones); every text field holds the canary."""
+    c = fx.CANARY
+    obj = {"session_id": sid, "transcript_path": "/home/{0}/.claude/projects/{0}/{1}.jsonl".format(c, sid), "cwd": "/work/" + c,
+           "prompt_id": c, "effort": {"level": c}, "session_name": c + " session title",
+           "model": {"id": model, "display_name": c},
+           "workspace": {"current_dir": "/w/" + c, "project_dir": "/w/" + c, "git_worktree": c, "added_dirs": ["/a/" + c],
+                         "repo": {"host": c, "owner": c, "name": c}},
+           "version": version, "output_style": {"name": c},
+           "cost": {"total_cost_usd": cost, "total_duration_ms": dur, "total_api_duration_ms": api,
+                    "total_lines_added": 12, "total_lines_removed": 3},
+           "context_window": {"total_input_tokens": 1000, "total_output_tokens": 200, "context_window_size": 200000,
+                              "current_usage": {"input_tokens": 10, "output_tokens": 20, "cache_creation_input_tokens": 30,
+                                                "cache_read_input_tokens": 40},
+                              "used_percentage": 5, "remaining_percentage": 95},
+           "exceeds_200k_tokens": False,
+           "prompt_cache": {"warm": True, "caching_observed": True, "ttl": c, "expires_at": 1, "requests": 2, "misses": 0,
+                            "expected_rebuilds": 0, "hit_ratio": 0.5, "cache_write_tokens": 1, "miss_recache_tokens": 0,
+                            "last_miss_at": None, "last_miss_cause": None, "miss_causes": {c: 1}, "recache_tokens_if_cold": 0},
+           "fast_mode": False, "thinking": {"enabled": True}, "agent": {"name": c}, "a_later_field": c}
+    obj.update(over)
+    return obj
+
+
+def cc_bytes(**kw):
+    return json.dumps(cc_input(**kw)).encode()
+
+
+def all_files(root):
+    out = set()
+    for folder, _dirs, names in os.walk(root):
+        for n in names:
+            out.add(os.path.relpath(os.path.join(folder, n), root))
+    return out
+
+
+class CCBase(CostsBase):
+    def setUp(self):
+        super().setUp()
+        os.environ["HC_TERMINAL_ID"] = "t5"
+        self.addCleanup(os.environ.pop, "HC_TERMINAL_ID", None)
+        self.addCleanup(os.environ.pop, "PA_NO_CC_STATUSLINE", None)
+
+    def cc_path(self, sid=CC_SID):
+        return os.path.join(self.dir, "costs", "cc", sid + ".json")
+
+    def cc_record(self, sid=CC_SID):
+        data = raw(self.cc_path(sid))
+        return json.loads(data.decode()) if data else None
+
+    def run_sl(self, data, then=("ok",), space="sp1", now=T0, extra=()):
+        argv = (["--space", space] if space is not None else []) + list(extra)
+        if then:
+            argv += ["--then", cc_stub(then[0]) if then[0] in CC_SCRIPTS else then[0]] + list(then[1:])
+        result, out, err = self.run_cmd(pa_costs.statusline, argv, data, now=now)
+        self.assertEqual(out, "")  # it returns the bytes; the script writes them
+        self.assertEqual(err, "")
+        return result
+
+
+class CC_StatusLine(CCBase):
+    """R1, R2, R8 in process: pa_costs.statusline(argv, stdin bytes, now) returns the bytes to print."""
+
+    def test_cc1_record_has_the_allowlisted_fields_only(self):
+        out = self.run_sl(cc_bytes())
+        self.assertEqual(out, b"STATUS-LINE ok")
+        self.assertEqual(self.cc_record(), {"v": 1, "session": CC_SID, "cost": 1.25, "base": 0, "segments": 1, "durationMs": 60000,
+                                            "apiDurationMs": 30000, "model": "model-a", "version": "2.1.999", "terminal": "t5",
+                                            "first": iso(T0), "at": iso(T0)})
+        names = sorted(n for n in os.listdir(os.path.join(self.dir, "costs", "cc")) if not n.startswith("."))
+        self.assertEqual(names, [CC_SID + ".json"])  # the temp file was replaced into place
+
+    def test_cc2_privacy_no_text_field_reaches_a_file_or_the_output(self):
+        before = all_files(pa.ROOT)
+        out = self.run_sl(cc_bytes())
+        self.assertEqual(out, b"STATUS-LINE ok")
+        new = all_files(pa.ROOT) - before
+        self.assertTrue(new)
+        self.assertFalse([n for n in new if not n.startswith(os.path.join("spaces", "sp1", "costs", "cc") + os.sep)], new)
+        for n in all_files(pa.ROOT):
+            self.assertNotIn(fx.CANARY.encode(), raw(os.path.join(pa.ROOT, n)) or b"", n)
+        # allowlisted fields with canary-shaped invalid values are dropped, not kept
+        self.run_sl(cc_bytes(model="{} ../x".format(fx.CANARY), version="1 " + fx.CANARY), now=T0 + 400)
+        rec = self.cc_record()
+        self.assertIsNone(rec["model"])
+        self.assertIsNone(rec["version"])
+        self.assertNotIn(fx.CANARY.encode(), raw(self.cc_path()))
+        # a session id that is not an id: nothing is written anywhere
+        before = all_files(pa.ROOT)
+        out = self.run_sl(cc_bytes(sid="../../" + fx.CANARY))
+        self.assertEqual(out, b"STATUS-LINE ok")
+        self.assertFalse([n for n in all_files(pa.ROOT) - before if not n.endswith(".lock")])
+        for bad in (b"[1, 2]", ("\"" + fx.CANARY + "\"").encode(), b"\xff\xfe" + fx.CANARY.encode(), b"{\"session_id\": " + fx.CANARY.encode()):
+            self.assertEqual(self.run_sl(bad), b"STATUS-LINE ok")
+        for n in all_files(pa.ROOT):
+            self.assertNotIn(fx.CANARY.encode(), raw(os.path.join(pa.ROOT, n)) or b"", n)
+
+    def test_cc3_each_field_is_validated(self):
+        cases = [("cost", {"cost": {"total_cost_usd": -1}}), ("cost", {"cost": {"total_cost_usd": "1.0"}}),
+                 ("cost", {"cost": {"total_cost_usd": True}}), ("cost", {"cost": {"total_cost_usd": 1e6}}),
+                 ("cost", {"cost": {"total_cost_usd": float("nan")}}), ("cost", {"cost": {"total_cost_usd": float("inf")}})]
+        for i, (field, over) in enumerate(cases):
+            sid = "dddd000{}-0000-4000-8000-abcdef000000".format(i)
+            self.run_sl(cc_bytes(sid=sid, **over))
+            self.assertIsNone(self.cc_record(sid)[field], over)
+        self.run_sl(cc_bytes(sid="eeee0000-0000-4000-8000-abcd00000001", cost={"total_cost_usd": 2.5, "total_duration_ms": -5,
+                                                                              "total_api_duration_ms": "x"}))
+        rec = self.cc_record("eeee0000-0000-4000-8000-abcd00000001")
+        self.assertEqual((rec["cost"], rec["durationMs"], rec["apiDurationMs"]), (2.5, None, None))
+        os.environ["HC_TERMINAL_ID"] = "t5; rm -rf /"
+        self.run_sl(cc_bytes(sid="eeee0000-0000-4000-8000-abcd00000002", model={"id": "x" * 81}))
+        rec = self.cc_record("eeee0000-0000-4000-8000-abcd00000002")
+        self.assertEqual((rec["terminal"], rec["model"]), (None, None))
+        for sid in ("short", "x" * 65, "a/b-0000-0000", "abc_def_ghi"):
+            self.run_sl(cc_bytes(sid=sid))
+        self.assertEqual(len([n for n in os.listdir(os.path.join(self.dir, "costs", "cc")) if n.endswith(".json")]), 8)
+
+    def test_cc4_writes_only_on_change_or_every_300_s(self):
+        self.run_sl(cc_bytes(), now=T0)
+        first = raw(self.cc_path())
+        self.run_sl(cc_bytes(dur=61000), now=T0 + 100)
+        self.assertEqual(raw(self.cc_path()), first)  # same cost, model, segment: no write
+        self.run_sl(cc_bytes(dur=62000), now=T0 + 300)
+        rec = self.cc_record()
+        self.assertEqual((rec["at"], rec["first"], rec["durationMs"]), (iso(T0 + 300), iso(T0), 62000))
+        self.run_sl(cc_bytes(cost=1.5, dur=63000), now=T0 + 310)
+        self.assertEqual((self.cc_record()["cost"], self.cc_record()["at"]), (1.5, iso(T0 + 310)))
+        self.run_sl(cc_bytes(cost=1.5, dur=63000, model="model-b"), now=T0 + 320)
+        self.assertEqual((self.cc_record()["model"], self.cc_record()["at"]), ("model-b", iso(T0 + 320)))
+        self.run_sl(cc_bytes(cost=1.5, dur=64000, model="model-b"), now=T0 + 330)
+        self.assertEqual(self.cc_record()["at"], iso(T0 + 320))
+
+    def test_cc5_segments_on_a_drop_with_a_lower_duration(self):
+        self.run_sl(cc_bytes(cost=5.0, dur=100000), now=T0)
+        self.run_sl(cc_bytes(cost=5.0, dur=90000), now=T0 + 10)  # a restore: equal is a continuation
+        self.assertEqual((self.cc_record()["base"], self.cc_record()["segments"]), (0, 1))
+        self.run_sl(cc_bytes(cost=4.995, dur=80000), now=T0 + 20)  # a drop of 0.01 or less is not a new segment
+        self.assertEqual((self.cc_record()["base"], self.cc_record()["segments"]), (0, 1))
+        self.run_sl(cc_bytes(cost=5.0, dur=100000), now=T0 + 25)
+        self.run_sl(cc_bytes(cost=0.4, dur=200000), now=T0 + 30)  # lower cost, higher duration: a continuation
+        self.assertEqual((self.cc_record()["base"], self.cc_record()["segments"]), (0, 1))
+        self.run_sl(cc_bytes(cost=5.0, dur=200000), now=T0 + 35)
+        self.run_sl(cc_bytes(cost=0.4, dur=1000), now=T0 + 40)  # a resume after a crash
+        rec = self.cc_record()
+        self.assertEqual((rec["base"], rec["cost"], rec["segments"]), (5.0, 0.4, 2))
+        self.assertAlmostEqual(rec["base"] + rec["cost"], 5.4)
+        self.run_sl(cc_bytes(cost=0.9, dur=2000), now=T0 + 50)
+        rec = self.cc_record()
+        self.assertEqual((rec["base"], rec["cost"], rec["segments"]), (5.0, 0.9, 2))
+
+    def test_cc6_busy_lock_records_nothing_and_still_prints(self):
+        import fcntl
+        os.makedirs(os.path.join(self.dir, "costs", "cc"), exist_ok=True)
+        with open(os.path.join(self.dir, "costs", "cc", ".lock"), "a") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            began = time.time()
+            out = self.run_sl(cc_bytes())
+            took = time.time() - began
+        self.assertEqual(out, b"STATUS-LINE ok")
+        self.assertIsNone(self.cc_record())
+        self.assertLess(took, 1.0)
+
+    def test_cc7_no_then_missing_then_bad_space_and_bad_input(self):
+        self.assertEqual(self.run_sl(cc_bytes(), then=()), b"")
+        self.assertEqual(self.cc_record()["cost"], 1.25)  # recorded anyway
+        sid2 = "cc000000-0000-4000-8000-abcd00000002"
+        self.assertEqual(self.run_sl(cc_bytes(sid=sid2), then=("/nonexistent/status-cmd",)), b"")
+        self.assertIsNotNone(self.cc_record(sid2))
+        plain = os.path.join(CC_STUBS, "not-executable")
+        write(plain, "#!/bin/sh\necho hi\n")
+        sid3 = "cc000000-0000-4000-8000-abcd00000003"
+        self.assertEqual(self.run_sl(cc_bytes(sid=sid3), then=(plain,)), b"")
+        self.assertIsNotNone(self.cc_record(sid3))
+        before = all_files(pa.ROOT)
+        for space in ("../sp1", "nosuch", "", None):
+            self.assertEqual(self.run_sl(cc_bytes(sid="cc000000-0000-4000-8000-abcd00000004"), space=space), b"STATUS-LINE ok")
+        self.assertEqual(all_files(pa.ROOT), before)
+        self.assertFalse(os.path.exists(os.path.join(pa.ROOT, "spaces", "nosuch")))
+        for data in (b"", b"not json{", b"null", b"{}", b"{\"session_id\": 5}"):
+            self.assertEqual(self.run_sl(data), b"STATUS-LINE ok")
+        self.assertEqual(all_files(pa.ROOT), before)
+        self.assertEqual(self.run_sl(cc_bytes(), extra=["--refresh", "30", "--unknown", "x"]), b"STATUS-LINE ok")
+
+    def test_cc8_inner_gets_the_stdin_bytes_and_more_than_1_mb_is_cut(self):
+        copy = os.path.join(TMP, "cc-copy.bin")
+        data = cc_bytes()
+        self.assertEqual(self.run_sl(data, then=("copy", copy)), b"copied")
+        self.assertEqual(raw(copy), data)
+        sid = "cc000000-0000-4000-8000-abcd000000bb"
+        big = cc_bytes(sid=sid, pad="x" * (1 << 20))
+        self.assertEqual(self.run_sl(big, then=("copy", copy)), b"copied")
+        self.assertEqual(raw(copy), big[:1 << 20])
+        self.assertIsNone(self.cc_record(sid))  # cut: nothing recorded
+
+    def test_cc9_inner_failing_slow_and_large(self):
+        self.assertEqual(self.run_sl(cc_bytes(), then=("fail",)), b"partial line")
+        self.assertEqual(len(self.run_sl(cc_bytes(), then=("big",))), 2097152)
+        self.assertEqual(self.run_sl(cc_bytes(pad="y" * 900000), then=("noread",)), b"no-read")
+        sid = "cc000000-0000-4000-8000-abcd000000aa"
+        began = time.time()
+        self.assertEqual(self.run_sl(cc_bytes(sid=sid), then=("slow",)), b"")
+        self.assertLess(time.time() - began, 2.5)
+        self.assertIsNotNone(self.cc_record(sid))  # recorded while the inner command ran
+        self.assertEqual((pa_costs.INNER_TIMEOUT, pa_costs.RECORD_BUDGET), (2.0, 0.3))
+
+
+class CC_Script(CCBase):
+    """R2 as a real process: `python3 pa_costs.py statusline ...`, as Claude Code runs it."""
+
+    def script(self, tail, data):
+        env = dict(os.environ)
+        env.update(_HOMES)
+        env["HC_TERMINAL_ID"] = "t5"
+        began = time.time()
+        r = subprocess.run([sys.executable, os.path.join(TOOLS, "pa_costs.py"), "statusline"] + list(tail), input=data,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, timeout=30)
+        took = time.time() - began
+        OUTPUT_SEEN.append(r.stdout.decode(errors="replace")[:4096] + r.stderr.decode(errors="replace"))
+        self.assertEqual((r.returncode, r.stderr), (0, b""), tail)
+        return r.stdout, took
+
+    def test_cs1_prints_the_inner_bytes_and_records(self):
+        out, _t = self.script(["--space", "sp1", "--then", cc_stub("ok")], cc_bytes())
+        self.assertEqual(out, b"STATUS-LINE ok")
+        self.assertEqual(self.cc_record()["cost"], 1.25)
+        self.assertEqual(self.cc_record()["terminal"], "t5")
+
+    def test_cs2_slow_inner_is_killed_at_2_s_and_nothing_printed(self):
+        sid = "cc000000-0000-4000-8000-abcd000000cc"
+        out, took = self.script(["--space", "sp1", "--then", cc_stub("slow")], cc_bytes(sid=sid))
+        self.assertEqual(out, b"")
+        self.assertLess(took, 2.5)
+        self.assertGreaterEqual(took, 1.9)
+        self.assertIsNotNone(self.cc_record(sid))
+
+    def test_cs3_missing_failing_large_and_no_reader(self):
+        self.assertEqual(self.script(["--space", "sp1", "--then", "/nonexistent/x"], cc_bytes())[0], b"")
+        self.assertEqual(self.script(["--space", "sp1", "--then", cc_stub("fail")], cc_bytes())[0], b"partial line")
+        self.assertEqual(len(self.script(["--space", "sp1", "--then", cc_stub("big")], cc_bytes())[0]), 2097152)
+        self.assertEqual(self.script(["--space", "sp1", "--then", cc_stub("noread")], cc_bytes(pad="z" * 900000))[0], b"no-read")
+        self.assertEqual(self.script([], b"garbage")[0], b"")
+        self.assertEqual(self.script(["--space"], b"")[0], b"")
+        self.assertEqual(self.script(["--space", "sp1", "--then"], cc_bytes())[0], b"")
+
+    def test_cs4_overhead_is_at_most_150_ms(self):
+        noop = shutil.which("true")
+        best = min(self.script(["--space", "sp1", "--then", noop], cc_bytes())[1] for _ in range(5))
+        self.assertLessEqual(best, 0.15)
+
+
+class CC_Launch(Base):
+    """R3, R4: pa-claude and pa-session add one --settings with the recording status line, last, or nothing."""
+
+    def setUp(self):
+        super().setUp()
+        self.bin = os.path.join(TMP, "cc-bin")
+        os.makedirs(self.bin, exist_ok=True)
+        self.inner = os.path.join(self.bin, "my-status")
+        write(self.inner, CC_SCRIPTS["my-status"])
+        os.chmod(self.inner, 0o755)
+        self.set_profile({"command": ["my-status", "--flag", "a b"], "refreshInterval": 15})
+        self.ledger({"version": 1, "tasks": [{"id": "t-010", "state": "in-progress", "workers": []}]})
+        self.hc.terminals["t5"] = {"address": "t5", "name": "t-010-build", "parent": "t0", "state": "live", "labels": {"herdr.space": "sp1"}}
+        self.hc.terminals["t9"] = {"address": "t9", "name": "plain", "state": "live", "labels": {"herdr.space": "other"}}
+        os.environ["HC_TERMINAL_ID"] = "t5"
+        os.environ.pop("PA_PRINT", None)
+        self.addCleanup(os.environ.pop, "HC_TERMINAL_ID", None)
+        self.addCleanup(os.environ.pop, "PA_NO_CC_STATUSLINE", None)
+        self.addCleanup(os.environ.pop, "PA_PRINT", None)
+
+    def set_profile(self, status=ABSENT):
+        p = {"name": "test", "claude": ["true"], "codex": ["true"], "models": {"worker": "model-a"}, "path": [self.bin]}
+        if status is not ABSENT:
+            p["statusLine"] = status
+        dump(p, os.path.join(self.profile_dir, "profile.json"))
+
+    def launch(self, kind, *argv):
+        seen = []
+
+        def fake_execv(path, args):
+            seen.append(list(args))
+            raise StopLaunch()
+        saved = os.execv
+        os.execv = fake_execv
+        out, err = io.StringIO(), io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                try:
+                    pa.cmd_launch(kind, list(argv))
+                except StopLaunch:
+                    pass
+        finally:
+            os.execv = saved
+        if os.environ.get("PA_PRINT"):
+            return json.loads(out.getvalue().strip().splitlines()[-1])
+        self.assertEqual(err.getvalue(), "")
+        self.assertEqual(len(seen), 1)
+        return seen[0]
+
+    def settings_count(self, cmd):
+        return sum(1 for a in cmd if a == "--settings" or a.startswith("--settings="))
+
+    def ours(self, cmd):
+        self.assertEqual(cmd[-2], "--settings")
+        js = json.loads(cmd[-1])
+        self.assertEqual(sorted(js), ["statusLine"])
+        sl = js["statusLine"]
+        self.assertEqual(sorted(sl), ["command", "refreshInterval", "type"])
+        self.assertEqual(sl["type"], "command")
+        return sl
+
+    def mask(self, cmd):
+        return [re.sub(r"^[0-9a-f]{8}-[0-9a-f-]{27}$", "<sid>", a) for a in cmd]
+
+    def test_cl1_worker_gets_the_recording_status_line_last(self):
+        cmd = self.launch("claude", "do the job")
+        sl = self.ours(cmd)
+        self.assertEqual(sl["refreshInterval"], 15)
+        self.assertEqual(shlex.split(sl["command"]), [sys.executable, pa.COSTS_FILE, "statusline", "--space", "sp1", "--then",
+                                                    self.inner, "--flag", "a b"])
+        self.assertTrue(os.path.isabs(pa.COSTS_FILE) and os.path.isfile(pa.COSTS_FILE))
+        self.assertEqual(self.settings_count(cmd), 1)
+        self.assertIn("--session-id", cmd[:-2])
+        self.set_profile()
+        plain = self.launch("claude", "do the job")
+        self.assertEqual(self.mask(cmd[:-2]), self.mask(plain))  # everything else as without the key
+
+    def test_cl2_default_refresh_is_30(self):
+        self.set_profile({"command": ["my-status"]})
+        self.assertEqual(self.ours(self.launch("claude", "job"))["refreshInterval"], 30)
+
+    def test_cl3_no_key_malformed_key_or_inner_not_found_add_nothing(self):
+        cases = [ABSENT, None, "my-status", [], {"command": []}, {"command": "my-status"}, {"command": ["my-status", 3]},
+                 {"command": [""]}, {"command": ["my-status"], "refreshInterval": 0}, {"command": ["my-status"], "refreshInterval": 301},
+                 {"command": ["my-status"], "refreshInterval": True}, {"command": ["my-status"], "refreshInterval": "30"},
+                 {"command": ["no-such-status-command"]}]
+        for status in cases:
+            self.set_profile(status)
+            cmd = self.launch("claude", "job")
+            self.assertEqual(self.settings_count(cmd), 0, status)
+            self.assertEqual(cmd[0], shutil.which("true"), status)
+
+    def test_cl4_caller_settings_off_switch_passthrough_plain_tab_and_codex(self):
+        for args in (["--settings", "/x/s.json", "job"], ["--settings=/x/s.json", "job"]):
+            cmd = self.launch("claude", *args)
+            self.assertEqual(self.settings_count(cmd), 1, args)
+            self.assertNotIn("statusline", " ".join(cmd))
+        os.environ["PA_NO_CC_STATUSLINE"] = "1"
+        self.assertEqual(self.settings_count(self.launch("claude", "job")), 0)
+        os.environ["PA_NO_CC_STATUSLINE"] = "0"
+        self.assertEqual(self.settings_count(self.launch("claude", "job")), 1)
+        os.environ.pop("PA_NO_CC_STATUSLINE")
+        self.assertEqual(self.settings_count(self.launch("claude", "mcp", "list")), 0)
+        self.assertEqual(self.settings_count(self.launch("codex", "job")), 0)
+        os.environ["HC_TERMINAL_ID"] = "t9"
+        self.assertEqual(self.settings_count(self.launch("claude", "hello")), 0)
+        os.environ.pop("HC_TERMINAL_ID")
+        self.assertEqual(self.settings_count(self.launch("claude", "hello")), 0)
+
+    def test_cl5_pa_print_shows_it(self):
+        os.environ["PA_PRINT"] = "1"
+        shown = self.launch("claude", "job")
+        self.assertEqual(shown[-2], "--settings")
+        self.assertTrue(shown[-1].startswith('{"statusLine"'))
+
+    def test_cl6_the_command_runs_end_to_end(self):
+        sl = self.ours(self.launch("claude", "job"))
+        env = dict(os.environ)
+        env.update(_HOMES)
+        env["HC_TERMINAL_ID"] = "t5"
+        r = subprocess.run(["sh", "-c", sl["command"]], input=cc_bytes(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, timeout=30)
+        self.assertEqual((r.returncode, r.stdout, r.stderr), (0, b"MY-STATUS --flag a b", b""))
+        rec = load(os.path.join(self.dir, "costs", "cc", CC_SID + ".json"))
+        self.assertEqual((rec["session"], rec["cost"], rec["terminal"]), (CC_SID, 1.25, "t5"))
+
+    def test_cl7_a_failure_building_it_never_stops_a_launch(self):
+        saved = pa.cc_statusline
+
+        def broken(p):
+            raise RuntimeError("broken on purpose")
+        pa.cc_statusline = broken
+        try:
+            cmd = self.launch("claude", "job")
+        finally:
+            pa.cc_statusline = saved
+        self.assertEqual(self.settings_count(cmd), 0)
+        self.assertEqual(cmd[0], shutil.which("true"))
+
+    def test_cl8_run_agent_adds_it_on_start_and_resume(self):
+        import argparse as ap
+        import types
+        directory = self.dir
+        p = pa.load_profile("test")
+        calls = []
+
+        def fake_call(argv, cwd=None):
+            calls.append(argv)
+            raise StopLaunch()
+        saved = pa.subprocess
+        pa.subprocess = types.SimpleNamespace(call=fake_call, run=saved.run, PIPE=saved.PIPE, DEVNULL=saved.DEVNULL)
+        try:
+            for fresh in (True, False, True):
+                if len(calls) == 2:
+                    os.environ["PA_NO_CC_STATUSLINE"] = "1"
+                agent = load(os.path.join(directory, "agent.json"))
+                if not fresh:
+                    agent["sessionStarted"] = True
+                    dump(agent, os.path.join(directory, "agent.json"))
+                with self.assertRaises(StopLaunch):
+                    pa.run_agent(ap.Namespace(fresh=fresh), "t0", self.project, p, directory, agent, {"beat": True, "previous": None}, time.time())
+        finally:
+            pa.subprocess = saved
+        self.assertIn("--session-id", calls[0])
+        self.assertIn("--resume", calls[1])
+        for argv in calls[:2]:
+            sl = self.ours(argv)
+            self.assertEqual(shlex.split(sl["command"])[2:6], ["statusline", "--space", "sp1", "--then"])
+            self.assertEqual(self.settings_count(argv), 1)
+        self.assertEqual(self.settings_count(calls[2]), 0)
+
+    def test_cl9_exec_plain_adds_nothing(self):
+        seen = []
+
+        def fake_execv(path, args):
+            seen.append(list(args))
+            raise StopLaunch()
+        saved = os.execv
+        os.execv = fake_execv
+        try:
+            with self.assertRaises(StopLaunch):
+                pa.exec_plain(pa.load_profile("test"))
+        finally:
+            os.execv = saved
+        self.assertEqual(self.settings_count(seen[0]), 0)
+
+
+class CC_Doctor(Base):
+    def doctor(self):
+        import argparse
+        return self.run_cmd(pa.cmd_doctor, argparse.Namespace(space="sp1"))
+
+    def test_cd1_a_malformed_key_is_a_note(self):
+        code0, out0, _e = self.doctor()
+        self.assertNotIn("statusLine", out0)
+        dump({"name": "test", "claude": ["true"], "codex": ["true"], "statusLine": {"command": "not a list"}},
+             os.path.join(self.profile_dir, "profile.json"))
+        code1, out1, _e = self.doctor()
+        self.assertEqual(code0, code1)
+        note = [l for l in out1.splitlines() if "statusLine" in l]
+        self.assertEqual(len(note), 1, out1)
+        self.assertNotIn("PROBLEM", note[0])
+        dump({"name": "test", "claude": ["true"], "codex": ["true"], "statusLine": {"command": ["x"], "refreshInterval": 30}},
+             os.path.join(self.profile_dir, "profile.json"))
+        _c, out2, _e = self.doctor()
+        self.assertNotIn("malformed", out2)
+
+
+def cc_sid(n):
+    return "{:08x}-0000-4000-8000-abcd{:08x}".format(n, n)
+
+
+class CCFixture(CostsBase):
+    """Ledger rows, start records and costs/cc/ records written directly (no session files)."""
+
+    SA, SB, SC, SD, SE, SF, SG = (cc_sid(0xa1), cc_sid(0xb2), cc_sid(0xc3), cc_sid(0xd4), cc_sid(0xe5), cc_sid(0xf6), cc_sid(0x97))
+
+    def row(self, seq, sid, task, day=T0, split=None, program="claude", model="model-a", out=1000):
+        return {"v": 1, "seq": seq, "session": sid, "program": program, "kind": "worker", "model": model, "from": iso(day),
+                "to": iso(day + 60), "day": iso(day)[:10], "calls": 1, "tokens": toks(out=out, cr=1000), "long": dict(ZERO),
+                "rebuild": {"calls": 0, "cw5m": 0, "cw1h": 0, "gapS": 0}, "turn": iso(day), "task": task, "phase": "build",
+                "activity": "build", "role": "build", "pass": None, "trigger": None, "split": split, "reason": None,
+                "source": "recorded", "match": "launch-record", "confidence": "high"}
+
+    def start(self, sid, terminal, at=T0, program="claude", task=None):
+        return {"v": 1, "ev": "start", "at": iso(at), "session": sid, "program": program, "kind": "worker", "task": task,
+                "terminal": terminal, "host": "h1"}
+
+    def cc(self, sid, cost, base=0, segments=1, terminal="t5", first=T0, at=None, **over):
+        rec = {"v": 1, "session": sid, "cost": cost, "base": base, "segments": segments, "durationMs": 1000, "apiDurationMs": 500,
+               "model": "model-a", "version": "2.1.999", "terminal": terminal, "first": iso(first), "at": iso(at or first + 60)}
+        rec.update(over)
+        dump(rec, os.path.join(self.dir, "costs", "cc", sid + ".json"))
+        return rec
+
+    def fixture(self, with_cc=True, prices=True):
+        if prices:
+            self.prices()
+        split = [{"task": "t-001", "w": 0.5}, {"task": "t-002", "w": 0.5}]
+        rows = [self.row(1, self.SA, "t-001"), self.row(2, self.SA, "t-001", day=T0 + 100),
+                self.row(3, self.SB, "t-001", split=split), self.row(4, self.SC, "t-002", day=T0 - 3 * 86400),
+                self.row(5, self.SF, "t-003", program="codex")]
+        recs = [self.start(self.SA, "t5"), self.start(self.SB, "t6"), self.start(self.SC, "t7", at=T0 - 3 * 86400),
+                self.start(self.SF, "t8", program="codex"), self.start(self.SG, "t9")]
+        os.makedirs(os.path.join(self.dir, "costs"), exist_ok=True)
+        write(self.costs("sessions.jsonl"), "".join(json.dumps(r) + "\n" for r in recs))
+        write(self.costs("turns.jsonl"), "".join(json.dumps(r) + "\n" for r in rows))
+        if with_cc:
+            self.cc(self.SA, 1.5)
+            self.cc(self.SB, 2.0, terminal="t6")
+            self.cc(self.SC, 0.5, base=3.0, segments=2, terminal="t7", first=T0 - 3 * 86400)
+            self.cc(self.SD, 0.25, terminal="t5", first=T0 + 600, at=T0 + 900)  # a /clear in t5: SA's continuation
+            self.cc(self.SE, 0.75, terminal="t77")  # no session, no terminal: unmatched
+            self.cc(self.SG, 9.0, terminal="t9")  # a recorded session with no rows yet: not shown, not unmatched
+        pa_costs.write_summary(self.dir, now=T0 + 5000)
+        return load(self.costs("summary.json"))
+
+
+
+class CC_Summary(CCFixture):
+    """R5: collect and the summary carry CC per session, per single-task session's task, and in totals.cc."""
+
+    def test_cs1_per_session_task_and_totals(self):
+        s = self.fixture()
+        by = {e["key"]: e for e in s["sessions"]}
+        a, b, c, f = by[self.SA[:8]], by[self.SB[:8]], by[self.SC[:8]], by[self.SF[:8]]
+        self.assertAlmostEqual(a["cc"], 1.75)
+        self.assertEqual(a["ccAt"], iso(T0 + 900))
+        self.assertEqual(a.get("ccCleared"), 1)
+        self.assertNotIn("ccSegments", a)
+        self.assertAlmostEqual(b["cc"], 2.0)
+        self.assertAlmostEqual(c["cc"], 3.5)
+        self.assertEqual(c["ccSegments"], 2)
+        self.assertNotIn("cc", f)
+        tc = s["totals"]["cc"]
+        self.assertAlmostEqual(tc.pop("money"), 7.25)
+        self.assertAlmostEqual(tc["unmatched"].pop("money"), 0.75)
+        self.assertEqual(tc, {"sessions": 3, "claudeSessions": 3, "allSessions": 4, "unmatched": {"sessions": 1}, "ccCurrency": "USD"})
+        tasks = {e["key"]: e for e in s["byTask"]}
+        self.assertAlmostEqual(tasks["t-001"]["cc"], 1.75)  # SA alone; SB is split
+        self.assertEqual((tasks["t-001"]["ccSessions"], tasks["t-001"]["ccOf"]), (1, 2))
+        self.assertAlmostEqual(tasks["t-002"]["cc"], 3.5)
+        self.assertEqual((tasks["t-002"]["ccSessions"], tasks["t-002"]["ccOf"]), (1, 2))
+        self.assertNotIn("cc", tasks["t-003"])
+        for key in ("byActivity", "byPhase", "byKind", "byDay", "byDayModel", "passes", "hours", "prices", "unmatched"):
+            self.assertNotIn('"cc', json.dumps(s[key]), key)
+
+    def test_cs2_est_is_unchanged_and_no_cc_means_no_cc_field(self):
+        with_cc = self.fixture()
+        shutil.rmtree(os.path.join(self.dir, "costs", "cc"))
+        without = self.fixture(with_cc=False)
+        self.assertEqual(with_cc["totals"]["money"], without["totals"]["money"])
+        self.assertEqual([(e["key"], e["money"]) for e in with_cc["byTask"]], [(e["key"], e["money"]) for e in without["byTask"]])
+        self.assertEqual([e["key"] for e in with_cc["sessions"]], [e["key"] for e in without["sessions"]])
+        self.assertNotIn('"cc', raw(self.costs("summary.json")).decode())
+        os.makedirs(os.path.join(self.dir, "costs", "cc"))
+        write(os.path.join(self.dir, "costs", "cc", ".lock"), "")
+        pa_costs.write_summary(self.dir, now=T0 + 5000)
+        self.assertNotIn('"cc', raw(self.costs("summary.json")).decode())
+
+    def test_cs3_no_cc_figure_money_is_null(self):
+        self.fixture(with_cc=False)
+        self.cc(self.SE, 0.75, terminal="t77")
+        pa_costs.write_summary(self.dir, now=T0 + 5000)
+        tc = load(self.costs("summary.json"))["totals"]["cc"]
+        self.assertEqual((tc["money"], tc["sessions"], tc["claudeSessions"], tc["unmatched"]["sessions"]), (None, 0, 3, 1))
+
+    def test_cs4_bad_files_are_skipped_and_counted(self):
+        self.fixture()
+        folder = os.path.join(self.dir, "costs", "cc")
+        write(os.path.join(folder, "junk.json"), "not json")
+        dump({"v": 1, "session": self.SB, "cost": 1.0}, os.path.join(folder, self.SA[:-1] + "0.json"))  # name and id differ
+        dump({"v": 2, "session": cc_sid(0x55), "cost": 1.0}, os.path.join(folder, cc_sid(0x55) + ".json"))
+        dump([1, 2], os.path.join(folder, cc_sid(0x56) + ".json"))
+        write(os.path.join(folder, "." + cc_sid(0x57) + ".json.tmp"), "half")  # a temp file is not a record
+        pa_costs.write_summary(self.dir, now=T0 + 5000)
+        s = load(self.costs("summary.json"))
+        self.assertAlmostEqual(s["totals"]["cc"]["money"], 7.25)
+        self.assertTrue([p for p in s["problems"] if "costs/cc" in p and "4" in p], s["problems"])
+
+    def test_cs5_bad_values_in_a_stored_record_are_dropped(self):
+        self.fixture()
+        self.cc(self.SB, "2.0", terminal="t6")  # not a number: no figure
+        self.cc(self.SC, 0.5, base=-3, segments=2, terminal="t7", first=T0 - 3 * 86400)  # a bad base: no figure
+        pa_costs.write_summary(self.dir, now=T0 + 5000)
+        s = load(self.costs("summary.json"))
+        by = {e["key"]: e for e in s["sessions"]}
+        self.assertNotIn("cc", by[self.SB[:8]])
+        self.assertNotIn("cc", by[self.SC[:8]])
+        self.assertAlmostEqual(s["totals"]["cc"]["money"], 1.75)
+
+    def test_cs6_at_most_cc_max_files_newest_first(self):
+        self.fixture()
+        folder = os.path.join(self.dir, "costs", "cc")
+        for i, sid in enumerate(sorted(os.listdir(folder))):
+            os.utime(os.path.join(folder, sid), (T0 + i, T0 + i))
+        os.utime(os.path.join(folder, self.SA + ".json"), (T0 + 100, T0 + 100))
+        os.utime(os.path.join(folder, self.SB + ".json"), (T0 + 99, T0 + 99))
+        saved = pa_costs.CC_MAX_FILES
+        pa_costs.CC_MAX_FILES = 2
+        try:
+            pa_costs.write_summary(self.dir, now=T0 + 5000)
+        finally:
+            pa_costs.CC_MAX_FILES = saved
+        s = load(self.costs("summary.json"))
+        self.assertAlmostEqual(s["totals"]["cc"]["money"], 3.5)  # SA 1.5 and SB 2.0 only
+        self.assertTrue([p for p in s["problems"] if "costs/cc" in p and "4" in p], s["problems"])
+        self.assertEqual(saved, 5000)
+
+    def test_cs7_summary_stays_under_64_kb_with_totals_cc_intact(self):
+        rows, recs = [], []
+        os.makedirs(os.path.join(self.dir, "costs", "cc"), exist_ok=True)
+        for i in range(1000):
+            sid = cc_sid(i + 1)
+            day = T0 - (i % 120) * 86400
+            recs.append(self.start(sid, "t{}".format(i), at=day, task="t-{:03d}".format(i % 300)))
+            rows.append(self.row(i + 1, sid, "t-{:03d}".format(i % 300), day=day, out=1000 + i))
+            self.cc(sid, 0.5, terminal="t{}".format(i), first=day)
+        write(self.costs("sessions.jsonl"), "".join(json.dumps(r) + "\n" for r in recs))
+        write(self.costs("turns.jsonl"), "".join(json.dumps(r) + "\n" for r in rows))
+        self.prices()
+        pa_costs.write_summary(self.dir, now=T0)
+        s = load(self.costs("summary.json"))
+        self.assertLessEqual(len(raw(self.costs("summary.json"))), 65536)
+        self.assertTrue(s.get("truncated"))
+        self.assertAlmostEqual(s["totals"]["cc"]["money"], 500.0)
+        self.assertEqual((s["totals"]["cc"]["sessions"], s["totals"]["cc"]["allSessions"]), (1000, 1000))
+
+    def test_cs8_folded_tasks_keep_their_cc(self):
+        entries = [{"key": "t-{}".format(i), "tokens": 10, "money": 1.0, "calls": 1, "phases": [], "sessions": [],
+                    "cc": 0.5, "ccSessions": 1, "ccOf": 1} for i in range(5)]
+        folded = pa_costs.fold_tasks(entries, 2)
+        other = folded[-1]
+        self.assertEqual(other["key"], "(other tasks)")
+        self.assertAlmostEqual(other["cc"], 1.5)
+        self.assertEqual((other["ccSessions"], other["ccOf"]), (3, 3))
+
+
+class CC_Collect(Collecting):
+    def test_cc_collect_rewrites_the_summary_when_only_cc_changed(self):
+        self.record(session=SID, task="t-001", terminal="t5")
+        self.add(self.prompt(T0 + 1), self.call(T0 + 2, "m1", out=30))
+        self.collect(T0 + 2000)
+        self.assertNotIn("cc", load(self.costs("summary.json"))["totals"])
+        self.collect(T0 + 2005)
+        dump({"v": 1, "session": SID, "cost": 0.42, "base": 0, "segments": 1, "durationMs": 1, "apiDurationMs": 1, "model": "model-a",
+              "version": "2.1.999", "terminal": "t5", "first": iso(T0), "at": iso(T0 + 60)}, os.path.join(self.dir, "costs", "cc", SID + ".json"))
+        self.collect(T0 + 2010)
+        s = load(self.costs("summary.json"))
+        self.assertAlmostEqual(s["totals"]["cc"]["money"], 0.42)
+        self.assertAlmostEqual(s["sessions"][0]["cc"], 0.42)
+        before = raw(self.costs("summary.json"))
+        self.collect(T0 + 2020)
+        self.assertEqual(raw(self.costs("summary.json")), before)  # nothing new: not rewritten
+
+
+class CC_Report(CCFixture):
+    """R6: report shows CC beside est., est. first; CC never in shares, sorting or est."""
+
+    def text(self, **kw):
+        _r, out, _e = self.run_cmd(pa_costs.report, self.dir, now=T0 + 5000, **kw)
+        return out
+
+    def total_line(self, out):
+        return next(l for l in out.splitlines() if l.startswith("Total"))
+
+    def test_cr1_total_line_with_prices(self):
+        self.fixture()
+        line = self.total_line(self.text())
+        self.assertIn("Claude Code 7.25 USD list price (3 of 3 Claude sessions)", line)
+        self.assertLess(line.index("est."), line.index("Claude Code"))
+        self.assertRegex(line, r"^Total\s+\d+\.\d\d est\.")
+
+    def test_cr2_total_line_without_prices(self):
+        self.fixture(prices=False)
+        line = self.total_line(self.text())
+        self.assertRegex(line, r"^Total\s+— est\. \(no price\)")
+        self.assertIn("Claude Code 7.25 USD list price (3 of 3 Claude sessions)", line)
+
+    def test_cr3_session_and_task_tables_get_a_cc_column_and_a_legend(self):
+        self.fixture()
+        out = self.text(by="session")
+        head = next(l for l in out.splitlines() if "est." in l and "tokens" in l)
+        self.assertLess(head.index("est."), head.index(" CC "))
+        self.assertIn("CC/est.", head)
+        rows = {l.split()[0]: l for l in out.splitlines() if l.startswith("  ") and l.split()[0] in (self.SA[:8], self.SF[:8])}
+        self.assertIn("1.75", rows[self.SA[:8]])
+        self.assertIn("—", rows[self.SF[:8]])
+        self.assertIn("CC = Claude Code's own list-price estimate (USD), per session; not the bill", out)
+        out = self.text(by="task")
+        head = next(l for l in out.splitlines() if "est." in l and "tokens" in l)
+        self.assertIn(" CC ", head)
+        self.assertNotIn("CC/est.", head)
+        t1 = next(l for l in out.splitlines() if l.startswith("  t-001"))
+        self.assertIn("1.75", t1)
+        self.assertIn("CC = Claude Code's own list-price estimate (USD), per session; not the bill", out)
+
+    def test_cr4_no_ratio_without_a_usd_price_and_unmatched_line(self):
+        t = json.loads(json.dumps(PRICES))
+        t["currency"] = "EUR"
+        self.prices(t)
+        self.fixture(prices=False)
+        out = self.text(by="session")
+        self.assertNotIn("CC/est.", out)
+        out = self.text()
+        line = [l for l in out.splitlines() if "matching no session" in l]
+        self.assertEqual(len(line), 1, out)
+        self.assertIn("1", line[0])
+        self.assertIn("0.75", line[0])
+
+    def test_cr5_json_and_since(self):
+        self.fixture()
+        _r, out, _e = self.run_cmd(pa_costs.report, self.dir, as_json=True, now=T0 + 5000)
+        j = json.loads(out)
+        self.assertAlmostEqual(j["totals"]["cc"]["money"], 7.25)
+        _r, out, _e = self.run_cmd(pa_costs.report, self.dir, as_json=True, since=iso(T0)[:10], now=T0 + 5000)
+        j = json.loads(out)
+        self.assertAlmostEqual(j["totals"]["cc"]["money"], 3.75)  # SC's rows are before --since
+        self.assertEqual(j["totals"]["cc"]["allSessions"], 3)
+
+    def test_cr6_without_cc_the_report_is_as_before(self):
+        self.fixture(with_cc=False)
+        out = self.text()
+        self.assertNotIn("Claude Code", out)
+        self.assertNotIn("(no price)", out)
+        out = self.text(by="session")
+        self.assertNotIn(" CC", out)
+
+
+class CC_Docs(unittest.TestCase):
+    def test_cdoc1_readme_and_docstring(self):
+        with open(os.path.join(HERE, "..", "README.md")) as f:
+            readme = f.read()
+        for want in ("statusLine", "pa-" + "costs statusline", "PA_NO_CC_STATUSLINE", "list price", "refreshInterval", "Codex"):
+            self.assertIn(want, readme)
+        self.assertIn("statusline", pa_costs.__doc__)
 
 
 class ZZ_V1_Privacy(unittest.TestCase):
