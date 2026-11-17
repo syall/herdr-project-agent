@@ -3207,6 +3207,112 @@ cases["T26-copy-costs"] = async () => { // the totals, a section (with its open 
   check(g.__execs.length === execs, "Copy runs nothing");
 };
 
+// ---- t-026 Job 2: text with no click handler is selectable (a TextView with .selectable(true)); option rows,
+// buttons and anything inside a click handler stay plain. The stub keeps a TextView's text as its wrapper's. ----
+// Every TextView in a tree: { id, text, html, selectable, underClick (an ancestor or itself has a click), inOption }.
+function textViews(root) {
+  const out = [];
+  const walk = (x, underClick, inOption) => {
+    if (!x || typeof x !== "object") return;
+    const click = underClick || Boolean(x.click), opt = inOption || /^opt-/.test(String(x.key ?? ""));
+    if (x.kind === "textview") out.push({ id: x.key, text: x.text, html: x.html, selectable: JSON.stringify(x.style?.selectable) === "[true]", underClick: click, inOption: opt });
+    for (const k of x.kids ?? []) walk(k, click, opt);
+  };
+  walk(root, false, false);
+  return out;
+}
+const tvText = (root) => textViews(root).map((x) => x.text);
+const safeViews = (root, what) => {
+  const all = textViews(root);
+  const bad = all.filter((x) => x.underClick || x.inOption || !x.selectable);
+  check(!bad.length, `${what}: no TextView under a click handler or in an option row, each selectable (bad ${JSON.stringify(bad)})`);
+  return all;
+};
+
+cases["T26-sel-card"] = async () => { // the question, context rows and notes are selectable; option rows and the id row are not
+  const v = await copyCardWorld(openCopyCard);
+  const tree = v.render(cx);
+  const all = safeViews(tree, "open card");
+  for (const want of ["Q?", "line one", "indented"]) check(tvText(tree).includes(want), `"${want}" is selectable (have ${JSON.stringify(tvText(tree))})`);
+  for (const not of ["A", "B", "do a", "d-c", "Submit answer"]) check(!tvText(tree).includes(not), `"${not}" is not a TextView`);
+  const ind = stubs.findText(tree, "indented");
+  check(ind.length === 1 && ind[0].kind === "div" && JSON.stringify(ind[0].style?.pl) === "[12]", `the indented row is still the styled div (got ${JSON.stringify(ind.map((x) => [x.kind, x.style]))})`);
+  check(new Set(all.map((x) => x.id)).size === all.length, `ids are unique (got ${JSON.stringify(all.map((x) => x.id))})`);
+  const again = textViews(v.render(cx)).map((x) => x.id);
+  check(JSON.stringify(again) === JSON.stringify(all.map((x) => x.id)), "ids are the same on the next render");
+  await click(v, "opt-d-c-1");
+  check(v.choice["d-c"] === "B" && JSON.parse(g.__files[`:${DIR}/decisions/d-c.json`]).status === "open", "an option click still only picks");
+};
+
+cases["T26-sel-answered"] = async () => { // an answered card's "Answered by" and note lines are selectable
+  const v = await copyCardWorld({ ...openCopyCard, status: "answered", answer: "B", note: "because", answeredBy: "conversation", answered: "2026-11-16T11:00:00Z" });
+  await click(v, "pa-older");
+  const tree = v.render(cx);
+  safeViews(tree, "answered card");
+  for (const want of ["Q?", "Answered by the conversation", "You said: “because”"]) check(tvText(tree).includes(want), `"${want}" is selectable (have ${JSON.stringify(tvText(tree))})`);
+};
+
+cases["T26-sel-escape"] = async () => { // text is escaped into the TextView's html, never read as markup
+  const v = await copyCardWorld({ ...openCopyCard, question: `a <b>bold</b> & "q"`, context: "<script>x</script>" });
+  const tree = v.render(cx);
+  const q = textViews(tree).find((x) => x.text === `a <b>bold</b> & "q"`);
+  check(q && q.html === "<span>a &lt;b&gt;bold&lt;/b&gt; &amp; &quot;q&quot;</span>", `escaped html (got ${JSON.stringify(q)})`);
+  const c = textViews(tree).find((x) => x.text === "<script>x</script>");
+  check(c && !/<script>/.test(c.html), `the context is escaped too (got ${JSON.stringify(c)})`);
+};
+
+cases["T26-sel-push"] = async () => { // the push card's facts are selectable; its options and Check again are not
+  const { v } = await pushWorld();
+  const tree = v.render(cx);
+  safeViews(tree, "push card");
+  for (const want of ["Repository: /repo", "Commits (2):", "cc11000 the task's change — A <a@x>", "No force, no tags, no other branches.", "This panel may push: yes"])
+    check(tvText(tree).includes(want), `"${want}" is selectable (have ${JSON.stringify(tvText(tree))})`);
+  check(!tvText(tree).includes("Check again") && !tvText(tree).some((x) => /^Push exactly/.test(x)), "Check again and the options stay plain");
+  await click(v, `opt-${PID}-0`); await settle();
+  await click(v, `submit-${PID}`); await settle();
+  check(pushExecs("run").length === 1, "Push then Submit still runs once");
+};
+
+cases["T26-sel-task"] = async () => { // a task's goal and kind line are selectable; its head and worker chips are not
+  world();
+  g.__files[`:${DIR}/ledger.json`] = JSON.stringify({ tasks: [{ id: "t-1", title: "One", goal: "Goal text", type: "build", tier: "low", state: "in-progress", workers: [{ address: "t50", role: "build" }] }] });
+  const v = await mount(); await settle();
+  await click(v, "view-tasks"); await click(v, "task-head-t-1");
+  const tree = v.render(cx);
+  safeViews(tree, "task");
+  check(tvText(tree).includes("Goal text") && tvText(tree).includes("build · low tier"), `goal and kind selectable (have ${JSON.stringify(tvText(tree))})`);
+  check(!tvText(tree).some((x) => /One|t50/.test(x)), "the head and worker chips stay plain");
+};
+
+cases["T26-sel-rule"] = async () => { // an open rule's text and its id line are selectable; its head is not
+  const v = await ruleWorld();
+  const tree = v.render(cx);
+  safeViews(tree, "rules");
+  check(tvText(tree).includes("One text") && tvText(tree).includes("r-one · from person · order 10 · 0 changes"), `rule text selectable (have ${JSON.stringify(tvText(tree))})`);
+  check(!tvText(tree).includes("One"), "the head stays plain");
+  await press(v, "rule-delete-r-one");
+  check(ruleArmed(v), "Delete still arms");
+};
+
+cases["T26-sel-costs"] = async () => { // the Costs figures are selectable; the section rows (clickable drill) are not
+  const { v } = await costsWorld({ tool: { "billed compare": () => json0(withRows()) } });
+  await settle();
+  await click(v, "costs-activity-0");
+  const tree = v.render(cx);
+  const all = safeViews(tree, "costs");
+  const texts = all.map((x) => x.text);
+  for (const want of ["Total", "Today", "Billed (account-wide: includes use outside this space and outside Herdr)", "Tasks:", "model-a"]) check(texts.includes(want), `"${want}" is selectable (have ${JSON.stringify(texts)})`);
+  check(texts.some((x) => /^Estimated from test table prices/.test(x)) && texts.some((x) => /^XTS 12\.50 est\.$/.test(x)) && texts.some((x) => /^Billing query: on · /.test(x)), `the header, a figure and the status (have ${JSON.stringify(texts)})`);
+  check(!texts.includes("By activity") || all.find((x) => x.text === "By activity"), "heads may be selectable");
+  check(new Set(all.map((x) => x.id)).size === all.length, `ids unique (got ${JSON.stringify(all.map((x) => x.id))})`);
+};
+
+cases["T26-sel-every-view"] = async () => { // no TextView under a click anywhere: decisions, tasks, rules and costs of one world
+  const v = await copyCardWorld(openCopyCard);
+  for (const view of ["decisions", "tasks", "rules", "costs"]) { await click(v, `view-${view}`); await settle(); safeViews(v.render(cx), view); }
+  safeViews(v.render(cx), "root");
+};
+
 const pick = process.argv.slice(2);
 let failed = 0;
 for (const [name, fn] of Object.entries(cases)) {

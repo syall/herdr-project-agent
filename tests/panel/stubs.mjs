@@ -121,13 +121,19 @@ export const h_flex = () => make("h_flex");
 export const InputState = { new: (o = {}) => { let v = o.value ?? ""; return { value: () => v, set: (x) => { v = x; }, release() {} }; } };
 export const Input = { new: () => make("input") };
 export const ScrollHandle = { new: () => ({ scroll_to_item() {} }) };
+// TextView (t-026): selectable text. Its html is kept, its text is the html without the one <span> and with
+// & < > " decoded, and .selectable(v) is recorded as style.selectable. inspect() and findText() read its
+// text as its wrapper's own: a row found by its text is still the styled div around it.
+const unhtml = (h) => String(h).replace(/^<span>/, "").replace(/<\/span>$/, "").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&amp;/g, "&");
+const textView = (id, html) => { const el = make("textview"); el.key = id; el.html = html; el.text = unhtml(html); return el; };
+export const TextView = { html: textView, markdown: textView };
 
 // Every element whose own children include the string `text`, depth first.
 export function findText(root, text) {
   const found = [];
   const walk = (x) => {
     if (x === null || typeof x !== "object") return;
-    if ((x.kids ?? []).some((k) => typeof k !== "object" && String(k) === text)) found.push(x);
+    if ((x.kids ?? []).some((k) => (typeof k !== "object" && String(k) === text) || (k?.kind === "textview" && k.text === text))) found.push(x);
     for (const k of x.kids ?? []) walk(k);
   };
   walk(root);
@@ -140,6 +146,7 @@ export function inspect(root) {
   const walk = (x) => {
     if (x === null || x === undefined) return;
     if (typeof x !== "object") { text.push(String(x)); return; }
+    if (x.kind === "textview") text.push(x.text);
     if (x.key !== null && x.click) clicks[x.key] = x.click;
     for (const k of x.kids ?? []) walk(k);
   };
