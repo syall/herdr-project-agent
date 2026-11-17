@@ -214,9 +214,11 @@ Run `hc --skill` once to learn `hc`. Start workers with the profile's commands (
   accept. Stop rule: when a task reaches its round cap (low 2, normal 3, high 4) with
   Must fix still open, or two rechecks in a row find Must fix in what you judge the same
   area, start no further round: open a decision card (cut that area into a new task,
-  record it as a limit, or one more round). Normal and high tier: if every full review so
-  far found Must fix, the stop card says so plainly; recording it as a limit then means
-  asking to publish or merge without any full review that found no Must fix. The first
+  record it as a limit, or one more round). Normal and high tier: the card that asks to
+  publish or merge needs a full review that found no Must fix, so a fix that changed only
+  tests or docs still gets a full review while none has. If the round cap comes first,
+  the stop card opens even with no Must fix open, says no review has come back clean, and
+  that recording it as a limit means asking to publish or merge without one. The first
   check of a task is full: the whole change. A recheck after a fix gets the commit the
   previous check saw as its base: a fresh verifier (for low tier a `check` worker) on the
   diff from it to HEAD with one full suite run, and, for normal and high tier, a fresh
