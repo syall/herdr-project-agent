@@ -27,6 +27,9 @@ const PROFILE_RETRY = 60000; // while hidden: a profile read that failed is trie
 // A part of loadSpace's result that did not answer (its `unknown`), and the fields it fills.
 const PARTS = { ledger: ["ledger"], profile: ["profile", "profileDir"], schedule: ["schedule"], request: ["request"] };
 const NOTE = "Note for the Project Agent (optional)";
+const QUIET = { from: "19:00", to: "08:00" }; // what the quiet-hours fields show while empty, and what Set takes for an empty one
+// A quiet-hours field's time as HH:MM (24-hour; "7:30" is 07:30), or null when it is not one.
+const hhmm = (v) => { const m = /^(\d{1,2}):(\d{2})$/.exec(v); return m && Number(m[1]) <= 23 && Number(m[2]) <= 59 ? `${m[1].padStart(2, "0")}:${m[2]}` : null; };
 const ARM_WAIT = 10000; // an armed Delete (its first click) not clicked again within this is disarmed by itself
 const noteKey = (spaceId, cardId) => `${spaceId}\0${cardId}`; // note fields are per space: two spaces can have the same card id
 
@@ -484,8 +487,8 @@ export default class ProjectAgent extends View {
             st.open = !st.open;
             if (st.open && !st.custom) {
               st.custom = InputState.new({ placeholder: "min", value: PRESETS.includes(every) || !every ? "" : String(every) });
-              st.quietFrom = InputState.new({ placeholder: "19:00", value: s.quietHours?.from ?? "" });
-              st.quietTo = InputState.new({ placeholder: "08:00", value: s.quietHours?.to ?? "" });
+              st.quietFrom = InputState.new({ placeholder: QUIET.from, value: s.quietHours?.from ?? "" });
+              st.quietTo = InputState.new({ placeholder: QUIET.to, value: s.quietHours?.to ?? "" });
             }
             cx.notify();
           }).child(`${st.open ? "▾" : "▸"} ${summary}`))
@@ -509,8 +512,13 @@ export default class ProjectAgent extends View {
           .child(div().px(4).text_size(11.5).text_color(t.dim).child("Quiet hours"))
           .child(field(st.quietFrom, 62)).child(div().text_size(11.5).text_color(t.dim).child("to")).child(field(st.quietTo, 62))
           .child(pill("quiet-set", "Set", false, (_e, cx) => {
-            const from = st.quietFrom.value().trim(), to = st.quietTo.value().trim(), ok = (v) => /^([01]\d|2[0-3]):[0-5]\d$/.test(v);
-            if (!ok(from) || !ok(to) || from === to) { st.error = "Quiet hours are two different times like 19:00 and 08:00."; cx.notify(); return; }
+            // An empty field stands for the time it shows (QUIET); a typed one must be a 24-hour time.
+            const typed = { from: st.quietFrom.value().trim(), to: st.quietTo.value().trim() };
+            const from = hhmm(typed.from || QUIET.from), to = hhmm(typed.to || QUIET.to);
+            const why = !from ? `Quiet hours start "${typed.from}" is not a time: use 24-hour HH:MM, like ${QUIET.from}.`
+              : !to ? `Quiet hours end "${typed.to}" is not a time: use 24-hour HH:MM, like ${QUIET.to}.`
+              : from === to ? `Quiet hours start and end are the same time (${from}): pick two different times.` : null;
+            if (why) { st.error = why; cx.notify(); return; }
             this.scheduleChange(space, cx, (dir, on) => setSchedule(dir, on, { quietHours: { from, to } }));
           }))
           .child(pill("quiet-clear", "None", !s.quietHours, (_e, cx) => this.scheduleChange(space, cx, (dir, on) => setSchedule(dir, on, { quietHours: null }))))

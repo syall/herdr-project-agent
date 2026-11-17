@@ -13,7 +13,9 @@ A right-panel view on the theme's `chrome` background, text 11 to 13 px, top to 
 3. The schedule bar: a one-line summary (`Passes every 5 min · next 14:32`, or paused, off,
    `no active tasks`, `quiet hours until 08:00`), then `Pause passes`, `Run pass now` and
    `Run retrospective now`. Clicking the summary opens cadence presets (5, 10, 15, 30, 60), a
-   custom number, Off, quiet hours and "Only while tasks are active".
+   custom number, Off, quiet hours and "Only while tasks are active". Quiet hours' Set takes an
+   empty field as the time it shows (19:00 to 08:00); a typed time is 24-hour H:MM or HH:MM, and
+   one that is not gets a message naming the field and what was typed.
 4. Three view pills: `Decisions · n`, `Tasks · n`, `Rules · n`.
 5. The chosen view, scrolling: cards with a 1 px border and 7 px corners on `surface`.
 
