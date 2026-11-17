@@ -355,6 +355,65 @@ cases["S-push-refuse"] = async () => { // AC5.3 (t-007b): answerDecision refuses
   check(JSON.parse(g.__files[keyOf(local, "/decisions/d-1.json")]).status === "answered", "a plain card is still answered");
 };
 
+// ---- t-009 Costs view, step 9b: loadCosts reads only costs/summary.json (and lists costs/ when it is missing) ----
+const SUMMARY = JSON.stringify({ v: 1, space: S, updated: "2026-11-17T09:00:00Z", account: "default", totals: { tokens: { all: 10 }, money: 1.5, unpricedTokens: 0 } });
+const costsCalls = () => g.__issued.filter((x) => (x.kind === "read" && /\/costs\//.test(x.path ?? "")) || x.kind === "ls");
+cases["S-costs-paths"] = async () => { // R6, AC6.2: the summary on the space's machine, at its state folder, nothing else
+  for (const space of [remote, local]) {
+    world();
+    g.__files[keyOf(space, "/costs/summary.json")] = SUMMARY;
+    check(store.costsDir(space) === `${space.machine ? rdir : ldir}/costs`, `costsDir (got ${store.costsDir(space)})`);
+    const r = await store.loadCosts(space, cx);
+    check(r.summary?.totals?.money === 1.5 && !r.error && !r.timedOut && r.missing === null, `${space.machine ?? "local"}: the summary (got ${JSON.stringify(r)})`);
+    const calls = g.__issued.map((x) => `${x.on ?? ""}:${x.kind}:${x.path ?? ""}`);
+    check(JSON.stringify(calls) === JSON.stringify([`${space.machine ?? ""}:read:${space.machine ? rdir : ldir}/costs/summary.json`]), `one read, of summary.json (got ${JSON.stringify(calls)})`);
+  }
+};
+cases["S-costs-missing"] = async () => { // §5.5 (D4): no summary: one ls of costs/ tells none from pending
+  for (const space of [remote, local]) {
+    world();
+    let r = await store.loadCosts(space, cx);
+    check(r.summary === null && r.missing === "none" && !r.error, `${space.machine ?? "local"}: no folder is none (got ${JSON.stringify(r)})`);
+    const ls = g.__execs.filter(([c]) => c === "ls");
+    check(ls.length === 1 && JSON.stringify(ls[0][1]) === JSON.stringify(["-1", `${space.machine ? rdir : ldir}/costs`]) && ls[0][2] === (space.machine ?? null), `one ls of costs/ on the machine (got ${JSON.stringify(ls)})`);
+    world();
+    g.__ls[keyOf(space, "/costs")] = ["sessions.jsonl"];
+    r = await store.loadCosts(space, cx);
+    check(r.summary === null && r.missing === "pending", `records but no summary: pending (got ${JSON.stringify(r)})`);
+    world();
+    g.__ls[keyOf(space, "/costs")] = [".collect.lock"];
+    r = await store.loadCosts(space, cx);
+    check(r.missing === "none", `a folder without records: none (got ${JSON.stringify(r)})`);
+  }
+};
+cases["S-costs-invalid"] = async () => { // §5.5: not JSON is an error, never "none"
+  world();
+  g.__files[keyOf(remote, "/costs/summary.json")] = "{ not json";
+  const r = await store.loadCosts(remote, cx);
+  check(r.summary === null && typeof r.error === "string" && r.error.length > 0 && r.missing === null && !r.timedOut, `an error (got ${JSON.stringify(r)})`);
+  check(!g.__execs.some(([c]) => c === "ls"), "no ls for an invalid file");
+  world();
+  g.__files[keyOf(remote, "/costs/summary.json")] = "[1,2]";
+  const r2 = await store.loadCosts(remote, cx);
+  check(r2.summary === null && /not a summary/.test(r2.error ?? ""), `not an object: an error (got ${JSON.stringify(r2)})`);
+};
+cases["S-costs-timeout"] = async () => { // D3: a hung read is given up after READ_LIMIT, timedOut, and no ls
+  world();
+  g.__hang = [keyOf(remote, "/costs/summary.json")];
+  let done = false, value;
+  store.loadCosts(remote, cx).then((v) => { done = true; value = v; }, (e) => { done = true; value = e; });
+  await moveOn(store.READ_LIMIT - 1000);
+  check(!done, "not before READ_LIMIT");
+  await moveOn(1000);
+  check(done && value.timedOut === true && value.summary === null && value.missing === null, `timed out (got ${JSON.stringify(value)})`);
+  check(!g.__execs.some(([c]) => c === "ls") && costsCalls().length === 1, `only the one read (got ${JSON.stringify(costsCalls())})`);
+  // A hung ls (summary missing): timedOut too, never "none".
+  world();
+  g.__execHang = [`${M}:ls`];
+  const r = await within(store.loadCosts(remote, cx), store.READ_LIMIT, 2);
+  check(r.done && r.value.timedOut === true && r.value.missing === null, `a hung ls times out (got ${JSON.stringify(r.value)})`);
+};
+
 const pick = process.argv.slice(2);
 let failed = 0;
 for (const [name, fn] of Object.entries(cases)) {
