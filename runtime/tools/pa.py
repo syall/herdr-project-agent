@@ -1182,6 +1182,72 @@ def folder_size(path):
     return total
 
 
+def job_slug(text):
+    """A job's short name: lower case, every run of other characters one '-', at most 40 characters; 'job' if nothing is left."""
+    slug = re.sub(r"[^a-z0-9]+", "-", str(text or "").lower()).strip("-")[:40].strip("-")
+    return slug or "job"
+
+
+def legacy_job(task_id, path):
+    """The job of a worktree recorded with no job (extraWorktrees): its folder's name, without the task id in front.
+    The folder is the container in <project>/worktrees/<container>/<repo>, else the worktree's own name."""
+    path = os.path.normpath(os.path.expanduser(str(path)))
+    parent = os.path.dirname(path)
+    name = os.path.basename(parent) if os.path.basename(os.path.dirname(parent)) == "worktrees" else os.path.basename(path)
+    prefix = "{}-".format(task_id)
+    if task_id and name.startswith(prefix):
+        name = name[len(prefix):]
+    return job_slug(name)
+
+
+def task_worktrees(task):
+    """Every worktree a ledger task records, main first: [{path (realpath), given (as written), job, keep, main,
+    jobRecorded, created}]. Sources, in order: `worktree` (the main one), `worktrees` entries, the old `extraWorktrees`
+    strings (job from the folder). Merged by realpath, the first one wins; an entry with `removed` is skipped and hides
+    the same path in later sources, unless it is the `worktree` field itself (that field wins). Reads only."""
+    if not isinstance(task, dict):
+        return []
+    tid = str(task.get("id") or "")
+    entries = [e for e in task.get("worktrees") or [] if isinstance(e, dict)] if isinstance(task.get("worktrees"), list) else []
+    extras = task.get("extraWorktrees") if isinstance(task.get("extraWorktrees"), list) else []
+    real = lambda p: os.path.realpath(os.path.expanduser(p))
+    usable = lambda e: isinstance(e.get("path"), str) and e["path"].strip() != ""
+    out, seen, jobs = [], set(), set()
+
+    def add(path, given, job, recorded, keep, main, created):
+        if job in jobs:
+            n = 2
+            while "{}-{}".format(job, n) in jobs:
+                n += 1
+            job = "{}-{}".format(job, n)
+        jobs.add(job)
+        seen.add(path)
+        out.append({"path": path, "given": given, "job": job, "keep": bool(keep is True or task.get("keepWorktree")), "main": main,
+                    "jobRecorded": recorded, "created": created if isinstance(created, str) else None})
+
+    def entry_job(e):
+        if isinstance(e.get("job"), str) and e["job"].strip():
+            return job_slug(e["job"]), True
+        return legacy_job(tid, e["path"]), False
+
+    main = task.get("worktree") if isinstance(task.get("worktree"), str) and task.get("worktree").strip() else None
+    if main:
+        path = real(main)
+        own = next((e for e in entries if usable(e) and real(e["path"]) == path), None)
+        job, recorded = entry_job(own) if own else ("main", True)
+        add(path, main, job, recorded, (own or {}).get("keep"), True, (own or {}).get("created"))
+    seen.update(real(e["path"]) for e in entries if usable(e) and e.get("removed"))
+    for e in entries:
+        if not usable(e) or e.get("removed") or real(e["path"]) in seen:
+            continue
+        job, recorded = entry_job(e)
+        add(real(e["path"]), e["path"], job, recorded, e.get("keep"), False, e.get("created"))
+    for given in extras:
+        if isinstance(given, str) and given.strip() and real(given) not in seen:
+            add(real(given), given, legacy_job(tid, given), False, None, False, None)
+    return out
+
+
 def cmd_task(args):
     """The person's own changes to tasks, from the panel or a terminal. The orchestrator is told,
     so it re-reads the ledger instead of writing an old copy over the change.
@@ -1262,8 +1328,11 @@ def cmd_task(args):
                         os.rename(os.path.join(decisions, name), os.path.join(target, "decisions", name))
                 ledger["tasks"] = [t for t in ledger["tasks"] if t.get("id") != args.task]
                 after = "deleted"
-                if task.get("worktree"):
-                    note = "Its worktree {} was left in place.".format(task["worktree"])
+                trees = task_worktrees(task)
+                if len(trees) == 1:
+                    note = "Its worktree {} was left in place.".format(trees[0]["given"])
+                elif trees:
+                    note = "Its worktrees were left in place: {}.".format(", ".join("{} ({})".format(w["given"], w["job"]) for w in trees))
             else:
                 after = {"done": "done", "park": "parked", "reopen": "queued"}[args.action]
                 if before == after:

@@ -458,13 +458,15 @@ def evaluate_gate(directory, task, phase, rules=None, runner=None):
         else:
             checks.append({"check": name, "ok": True})
     if phase == "review":
-        workers = task.get("workers") or []
-        authors = {w.get("address") for w in workers if w.get("role") in ("build", "design")}
+        # Only a worker with an address is a reviewing worker or an author; roles are compared in lower case (card d-077).
+        workers = [w for w in task.get("workers") or [] if isinstance(w, dict) and isinstance(w.get("address"), str) and w["address"].strip()]
+        role = lambda w: str(w.get("role") or "").lower()
+        authors = {w["address"] for w in workers if role(w) in ("build", "design")}
         # A `check` worker (verifier and reviewer in one) counts as the reviewer for low tier only (t-017 R4,
         # AC4.3); at any tier, a reviewer or check worker that is also an author fails.
         counted = ("reviewer", "check") if tier == "low" else ("reviewer",)
-        reviewers = {w.get("address") for w in workers if w.get("role") in counted}
-        both = [w for w in workers if w.get("role") in ("reviewer", "check") and w.get("address") in authors]
+        reviewers = {w["address"] for w in workers if role(w) in counted}
+        both = [w for w in workers if role(w) in ("reviewer", "check") and w["address"] in authors]
         separate = bool(reviewers) and not both
         if both:
             why = "{} is recorded as {} and as a build or design worker".format(both[0].get("address"), both[0].get("role"))
@@ -567,27 +569,45 @@ def inside(path, folder):
     return path == folder or path.startswith(folder + os.sep)
 
 
+def worker_tree(task, entry=None):
+    """The realpath of the worktree a task's worker works in: its ledger entry's `worktree` (the folder it was
+    started in), else the task's main worktree, else None."""
+    given = (entry or {}).get("worktree") if isinstance(entry, dict) else None
+    if isinstance(given, str) and given.strip():
+        return os.path.realpath(os.path.expanduser(given))
+    main = next((t for t in pa.task_worktrees(task) if t["main"]), None)
+    return main["path"] if main else None
+
+
 def worktree_state(directory, agent, profile=None):
-    """Per worktree in the ledger: its tasks (with their states and titles), its workers' fates, and anyone
-    else working inside it. A worker's fate: live, closed (its ledger entry is finished), killed, removed or exited."""
+    """Per worktree in the ledger (every one a task records, pa.task_worktrees): its tasks (with their states,
+    titles and the job it is for each), its workers' fates, and anyone else working inside it. A task's worker
+    belongs to the row of its own worktree (worker_tree). A worker's fate: live, closed (its ledger entry is
+    finished), killed, removed or exited."""
     ledger = pa.read_json(os.path.join(directory, "ledger.json"), {}) or {}
     live = pa.live_terminals() or {}
     rows = {}
     for task in ledger.get("tasks", []):
-        if not task.get("worktree") or not task.get("id"):
+        if not task.get("id"):
             continue
-        path = os.path.realpath(os.path.expanduser(task["worktree"]))
-        row = rows.setdefault(path, {"path": path, "tasks": [], "states": {}, "titles": {}, "keep": False, "workers": []})
-        row["tasks"].append(task["id"])
-        row["states"][task["id"]] = task.get("state")
-        row["titles"][task["id"]] = task.get("title") or ""
-        row["keep"] = row["keep"] or bool(task.get("keepWorktree"))
-        for w in task.get("workers") or []:
-            info = pa.hc_get(w.get("address"))
-            fate = "live" if info.get("state") == "live" else ("closed" if w.get("finished") else
-                                                              "killed" if info.get("reason") == "killed" else
-                                                              "removed" if not info else "exited")
-            row["workers"].append({"address": w.get("address"), "name": w.get("name") or info.get("name"), "fate": fate})
+        for tree in pa.task_worktrees(task):
+            path = tree["path"]
+            row = rows.setdefault(path, {"path": path, "tasks": [], "states": {}, "titles": {}, "jobs": {}, "mains": {}, "jobRecorded": {},
+                                         "keep": False, "workers": []})
+            row["tasks"].append(task["id"])
+            row["states"][task["id"]] = task.get("state")
+            row["titles"][task["id"]] = task.get("title") or ""
+            row["jobs"][task["id"]], row["mains"][task["id"]] = tree["job"], tree["main"]
+            row["jobRecorded"][task["id"]] = tree["jobRecorded"]
+            row["keep"] = row["keep"] or tree["keep"]
+            for w in task.get("workers") or []:
+                if worker_tree(task, w) != path:
+                    continue
+                info = pa.hc_get(w.get("address"))
+                fate = "live" if info.get("state") == "live" else ("closed" if w.get("finished") else
+                                                                  "killed" if info.get("reason") == "killed" else
+                                                                  "removed" if not info else "exited")
+                row["workers"].append({"address": w.get("address"), "name": w.get("name") or info.get("name"), "fate": fate})
     for row in rows.values():
         mine = {w["address"] for w in row["workers"]}
         row["others"] = sorted(a for a, info in live.items() if a not in mine and a != agent.get("terminal") and (
@@ -912,7 +932,12 @@ def cmd_worktree(args):
     rows = worktree_state(directory, agent, profile)
     if args.action == "check":
         for row in rows.values():
-            task, facts = row["tasks"][0], row["facts"]
+            mains = [t for t in row["tasks"] if row["mains"].get(t)]
+            if not mains:  # another job's worktree: its own card comes with per-job cards (t-020 J2)
+                task = row["tasks"][0]
+                print("{}: {} (job {}) is not the task's main worktree; not offered yet".format(task, row["path"], clean(row["jobs"][task])))
+                continue
+            task, facts = mains[0], row["facts"]
             card = pa.read_json(card_path(directory, task))
             if card and card.get("status") == "withdrawn":
                 card = None  # asked again once every task is done or parked
@@ -997,10 +1022,11 @@ def cmd_worktree(args):
             print("No task in the ledger has a worktree.")
         return
     # remove: only what an answered card allows, re-checked now.
-    row = next((r for r in rows.values() if args.task in r["tasks"]), None)
+    row = next((r for r in rows.values() if r["mains"].get(args.task)), None)
     if not row:
         raise pa.Problem("task {} has no worktree in the ledger".format(args.task))
-    card = pa.read_json(card_path(directory, row["tasks"][0])) or {}
+    owner = next(t for t in row["tasks"] if row["mains"].get(t))  # the task whose card is d-wt-<task> (check's choice)
+    card = pa.read_json(card_path(directory, owner)) or {}
     if card.get("status") != "answered" or not str(card.get("answer", "")).lower().startswith("delete"):
         raise pa.Problem("no answered \"Delete\" decision card for this worktree (run `pa-worktree check --open-cards`; the person answers it)")
     if os.path.realpath(card.get("worktree") or "") != row["path"]:
@@ -1036,8 +1062,8 @@ def cmd_worktree(args):
         why = "the worktree changed since the person answered {!r}: {}".format(card.get("answer"), changed)
         card.update(status="withdrawn", previousAnswer=card.get("answer"), answer=None, answered=pa.now(),
                     answeredBy="pa-worktree remove: withdrawn", note="Withdrawn by pa-worktree remove: " + why)
-        pa.write_json(card_path(directory, row["tasks"][0]), card)
-        append_journal(directory, {"by": "agent" if by_an_agent() else "person", "trigger": "worktree", "task": row["tasks"][0],
+        pa.write_json(card_path(directory, owner), card)
+        append_journal(directory, {"by": "agent" if by_an_agent() else "person", "trigger": "worktree", "task": owner,
                                    "why": "withdrew card {}: {}".format(card["id"], why)})
         raise pa.Problem(changed + "; the card is withdrawn and the next `pa-worktree check --open-cards` asks again. Nothing was removed")
     print(remove_worktree(row["path"], facts) + " (card {})".format(card["id"]))
@@ -1110,7 +1136,7 @@ def worker_facts(directory, agent, profile, address):
     entry = next(w for w in crew if w.get("address") == address)
     out.update(task=task.get("id"), title=task.get("title"), taskState=task.get("state"), role=entry.get("role"),
                onlyWorker=len(crew) == 1, keep=bool(entry.get("keep")), finished=bool(entry.get("finished")), closed=entry.get("closed"))
-    row = next((r for r in worktree_state(directory, agent, profile).values() if task.get("id") in r["tasks"]), None)
+    row = worktree_state(directory, agent, profile).get(worker_tree(task, entry))  # its own worktree only, never a sibling job's
     if row and row["facts"] and not row["facts"].get("main") and not row["facts"].get("unreadable"):
         others = [w["address"] for w in row["workers"] if w["fate"] == "live" and w["address"] != address] + row["others"]
         out["worktree"] = {"path": row["path"], "kind": row["facts"].get("kind", "worktree"), "uncommitted": row["facts"]["uncommitted"],
@@ -1126,6 +1152,11 @@ def worker_facts(directory, agent, profile, address):
 CLOSABLE = ("idle", "done")  # hc statuses a worker may be closed in (also: exited, or already gone)
 ORCHESTRATOR_FILES = ("intent.md",)  # the orchestrator's own artefact (sdlc.md); spec.md and plan.md are workers'
 TOOL_FILES = ("GATE.json", "WORKTREE.md")  # written by pa-gate and pa-worktree, never a worker's report
+
+
+def tool_file(name):
+    """True for a file the tools write into a task's evidence folder: TOOL_FILES, and a job's WORKTREE-<job>.md."""
+    return name in TOOL_FILES or re.fullmatch(r"WORKTREE-[a-z0-9-]+\.md", name) is not None
 
 
 @contextlib.contextmanager
@@ -1262,12 +1293,13 @@ def uncommitted_refusal(path, names_known=True, count=None):
     return None
 
 
-def worktree_refusal(task, profile, info=None):
-    """(refusal or None, what was checked, what could not be seen). It looks at the task's worktree
-    (each repository a profile kind lists, too) and at the git checkout the worker's terminal runs in.
+def worktree_refusal(task, profile, info=None, entry=None):
+    """(refusal or None, what was checked, what could not be seen). It looks at the worker's own worktree
+    (worker_tree: its entry's `worktree`, else the task's main one; never a sibling job's), each repository a
+    profile kind lists, too, and at the git checkout the worker's terminal runs in.
     A worktree that is gone (or none) is fine: there is nothing in it to lose."""
     checked, unseen = [], []
-    path = os.path.realpath(os.path.expanduser(task["worktree"])) if task.get("worktree") else None
+    path = worker_tree(task, entry)
     if path and os.path.exists(path):
         facts = worktree_facts(path, profile)
         custom = (profile or {}).get("worktree") or {}
@@ -1319,7 +1351,7 @@ def report_problem(folder, rel, given, address, start):
     """Why a file in the evidence folder cannot stand for this worker's report, or None."""
     if rel in ORCHESTRATOR_FILES:
         return "{} is the orchestrator's own file, not a worker's report; name the file that holds this worker's report".format(given)
-    if os.path.basename(rel) in TOOL_FILES:
+    if tool_file(os.path.basename(rel)):
         return "{} is written by the Project Agent's tools, not a worker's report; name the file that holds this worker's report".format(given)
     if start is not None:
         written = os.path.getmtime(os.path.join(folder, rel))
@@ -1415,7 +1447,7 @@ def close_worker(directory, agent, profile, address, evidence, card_id=None):
     refusal = status_refusal(address, entry, info)
     if refusal:
         raise pa.Problem(refusal[1])
-    refusal, checked, unseen = worktree_refusal(task, profile, info)
+    refusal, checked, unseen = worktree_refusal(task, profile, info, entry)
     if refusal:
         raise pa.Problem(refusal[1])
     by = "agent" if by_an_agent() else "person"
@@ -1517,11 +1549,12 @@ def idle_for(info, now=None):
     return "{} s".format(seconds)
 
 
-def uncommitted_in(task, profile):
-    """(worktree path or None, uncommitted count or None when it cannot be read, file names)."""
-    if not task.get("worktree"):
+def uncommitted_in(task, profile, entry=None):
+    """(worktree path or None, uncommitted count or None when it cannot be read, file names), for the worker's
+    own worktree (worker_tree)."""
+    path = worker_tree(task, entry)
+    if not path:
         return None, 0, []
-    path = os.path.realpath(os.path.expanduser(task["worktree"]))
     if not os.path.exists(path):
         return path, 0, []
     facts = worktree_facts(path, profile)
@@ -1557,7 +1590,7 @@ def leftover_list(directory, agent, profile, ledger):
                        "working": "working", "blocked": "blocked"}.get(refusal[0], "status {}".format(clean(status_word(info) or "none")))
                 held.append(dict(base, why=why))
                 continue
-            path, count, files = uncommitted_in(task, profile)
+            path, count, files = uncommitted_in(task, profile, entry)
             last = None
             for line in journal:
                 if any(re.search(w, line_text(line)) for w in worker_words(address, entry.get("name"))):
@@ -1740,6 +1773,25 @@ def close_by_card(directory, agent, profile, card_id):
             print("skipped {} ({}, {}): {}".format(w.get("address"), w.get("name") or "unnamed", w.get("task"), e))
 
 
+def mark_removed(task, path, when):
+    """Records in a ledger task that the worktree at path (a realpath) was removed: its `worktrees` entry gets
+    `removed`, or one is added (path as recorded, its job) when it came from `worktree` or `extraWorktrees`;
+    `worktree` becomes null only if it was that one. History is kept; nothing else changes."""
+    tree = next((w for w in pa.task_worktrees(task) if w["path"] == path), None)
+    real = lambda p: os.path.realpath(os.path.expanduser(p))
+    entries = task.get("worktrees")
+    marked = False
+    if isinstance(entries, list):
+        for e in entries:
+            if isinstance(e, dict) and isinstance(e.get("path"), str) and e["path"].strip() and real(e["path"]) == path:
+                e["removed"] = e.get("removed") or when
+                marked = True
+    if not marked and tree and (entries is None or isinstance(entries, list)):
+        task["worktrees"] = (entries or []) + [{"path": tree["given"], "job": tree["job"], "removed": when}]
+    if isinstance(task.get("worktree"), str) and task["worktree"].strip() and real(task["worktree"]) == path:
+        task["worktree"] = None
+
+
 def cmd_worker(args):
     given = args.space or space_from_terminal() or ""
     space = pa.local_id(given)
@@ -1794,7 +1846,7 @@ def cmd_worker(args):
                 if t.get("id") == facts["task"]:
                     t["workers"] = [w for w in t.get("workers") or [] if w.get("address") != facts["address"]]
                     if tree and tree.get("removed"):
-                        t["worktree"] = None
+                        mark_removed(t, tree["path"], pa.now())
                     t["updated"] = pa.now()
             if ledger:
                 pa.write_json(path, ledger)
