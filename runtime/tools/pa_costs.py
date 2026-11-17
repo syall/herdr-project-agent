@@ -636,6 +636,7 @@ def state_problems(state):
             never += 1
     if never:
         out.append("{} sessions' files were gone before they were read".format(never))
+    out.extend(state.get("pending") or [])
     out.extend(state.get("notes") or [])
     return out
 
@@ -760,6 +761,7 @@ def _collect(directory, folder, now, quiet, resummarize):
         state["turnsBytes"] = os.path.getsize(turns_path)
     for event in ctx["events"]:
         append_line(os.path.join(folder, "sessions.jsonl"), event)
+    state["pending"] = ctx.get("pending") or []
     state["problems"] = state_problems(state)
     text = json.dumps(state, sort_keys=True, separators=(",", ":")) + "\n"
     if text != old_text:
@@ -774,9 +776,288 @@ def _collect(directory, folder, now, quiet, resummarize):
     return {"rows": len(written), "sessions": len(sessions)}
 
 
+def first_last(path, program):
+    """(first time, last time, cwd) of a session file, from its first and last 64 KB; times and cwd only."""
+    first = last = cwd = None
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            head = fh.read(65536)
+            fh.seek(max(0, size - 65536))
+            tail = fh.read(65536)
+    except OSError:
+        return None, None, None
+    for chunk, pick in ((head, "first"), (tail, "last")):
+        parts = chunk.split(b"\n")
+        if pick == "last":
+            parts = parts[::-1]
+        for raw_line in parts:
+            if b'"timestamp"' not in raw_line:
+                continue
+            try:
+                obj = json.loads(raw_line.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                continue
+            if not isinstance(obj, dict):
+                continue
+            payload = obj.get("payload") if isinstance(obj.get("payload"), dict) else {}
+            ts = payload.get("timestamp") if program == "codex" and obj.get("type") == "session_meta" else obj.get("timestamp")
+            epoch = parse_ts(ts) if isinstance(ts, str) else None
+            if epoch is None:
+                continue
+            if pick == "first":
+                first = epoch
+                c = payload.get("cwd") if program == "codex" else obj.get("cwd")
+                cwd = c if isinstance(c, str) else None
+            else:
+                last = epoch
+            del obj, payload
+            break
+    return first, last, cwd
+
+
+def codex_rollouts(days=None):
+    """(path, session id) of Codex rollout files; only the given UTC days' folders when days is set."""
+    root = os.path.join(CODEX_HOME, "sessions")
+    folders = [os.path.join(root, *d.split("-")) for d in sorted(days)] if days else None
+    out = []
+    if folders is None:
+        folders = [folder for folder, _dirs, _names in os.walk(root)] if os.path.isdir(root) else []
+    for folder in folders:
+        try:
+            names = sorted(os.listdir(folder))
+        except OSError:
+            continue
+        for name in names:
+            m = re.match(r"^rollout-.*?([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$", name)
+            if m:
+                out.append((os.path.join(folder, name), m.group(1)))
+    return out
+
+
+def claude_files(folder):
+    """(path, session id) of the Claude transcripts of one working folder (not subagent files)."""
+    base = os.path.join(CLAUDE_HOME, "projects", pa.claude_slug(folder))
+    try:
+        names = sorted(os.listdir(base))
+    except OSError:
+        return []
+    return [(os.path.join(base, n), n[:-6]) for n in names if n.endswith(".jsonl") and not n.startswith("agent-")]
+
+
+def record_key(r):
+    return "{} {}".format(r.get("at"), r.get("terminal"))
+
+
 def bind_pending(ctx):
-    """Binds start records that have no session id yet (Codex, Claude --continue): step 5."""
-    return None
+    """Binds start records that have no session id yet (Codex; Claude --continue / --fork-session): the first unbound
+    file in the record's folder whose start lies in [start - 5 s, start + 120 s]; the earlier start gets the earlier
+    file. Unbound after an hour: a problem."""
+    records, now = ctx["records"], ctx["now"]
+    done = {r.get("for") for r in records if r.get("ev") == "bind" and r.get("for")}
+    pending = [r for r in records if r.get("ev") == "start" and not r.get("session") and r.get("bind") == "launch-window"
+               and record_key(r) not in done]
+    ctx["pending"] = []
+    if not pending:
+        return
+    known = {r.get("session") for r in records if r.get("session")}
+    events = []
+    for program in ("codex", "claude"):
+        recs = sorted((r for r in pending if (r.get("program") or "claude") == program), key=lambda r: r.get("at") or "")
+        if not recs:
+            continue
+        cands = []
+        if program == "codex":
+            days = set()
+            for r in recs:
+                at = parse_ts(r.get("at") or "") or now
+                days.update(iso(at + d)[:10] for d in (-86400, 0, 86400))
+            files = codex_rollouts(days)
+        else:
+            files = [f for folder in sorted({r.get("cwd") for r in recs if r.get("cwd")}) for f in claude_files(folder)]
+        for path, sid in files:
+            if sid in known:
+                continue
+            first, _last, cwd = first_last(path, program)
+            if first is not None:
+                if program == "claude":
+                    cwd = next((r.get("cwd") for r in recs if os.path.dirname(path).endswith(pa.claude_slug(r.get("cwd") or ""))), cwd)
+                cands.append((first, sid, cwd))
+        cands.sort()
+        options = {}
+        for r in recs:
+            at = parse_ts(r.get("at") or "") or 0
+            options[record_key(r)] = [c for c in cands if c[2] == r.get("cwd") and at - FORK_SLACK <= c[0] <= at + 120]
+        used = set()
+        for r in recs:
+            key = record_key(r)
+            free = [c for c in options[key] if c[1] not in used]
+            if not free:
+                if now - (parse_ts(r.get("at") or "") or now) > 3600:
+                    ctx["pending"].append("{} session for {} not found".format(program, r.get("terminal") or "?"))
+                continue
+            pick = free[0]
+            used.add(pick[1])
+            shared = len(options[key]) > 1 or any(pick in v for k, v in options.items() if k != key)
+            events.append({"v": 1, "ev": "bind", "at": iso(now), "session": pick[1], "program": program, "for": key,
+                           "match": "launch-window", "confidence": "medium" if shared else "high"})
+    if events:
+        ctx["events"].extend(events)
+        ctx["records"] = records + events
+        ctx["sessions"] = sessions_of(ctx["records"])
+
+
+# ---- reconstruct ----------------------------------------------------------------------------------
+
+START = re.compile(r"(?<![A-Za-z0-9_-])(t[0-9a-z]{1,6})\s+\(([A-Za-z]+-\d+-[A-Za-z0-9_-]+)\)")
+
+
+def scan_tokens(path, program):
+    """Total tokens of a whole file, read like the collector reads it (counters only); nothing is kept."""
+    f, settled = {"offset": 0}, []
+    try:
+        reader = read_new({"session": "scan", "program": program}, f, path, os.path.getsize(path), settled)
+        reader.settle()
+    except OSError:
+        return 0
+    return sum(total_tokens(seg["tokens"]) for seg in settled)
+
+
+def reconstruct(directory, dry_run=False, now=None, quiet=False):
+    """Bind the space's sessions from before launch records existed (spec 3.8), then collect them."""
+    now = time.time() if now is None else now
+    agent = pa.read_json(os.path.join(directory, "agent.json"), {}) or {}
+    created = parse_ts(agent.get("created") or "") or 0
+    folder = costs_dir(directory)
+    records, _bad = read_lines(os.path.join(folder, "sessions.jsonl"))
+    known = {r.get("session") for r in records if r.get("session")}
+    ctx = {"directory": directory, "now": now}
+    ledger, journal = space_facts(ctx)
+    tasks = {t.get("id"): t for t in ledger.get("tasks", []) or [] if t.get("id")}
+    worktrees = {}
+    for t in list(tasks.values()) + [pa.read_json(p, {}) or {} for p in sorted(
+            os.path.join(directory, "trash", n, "task.json") for n in (os.listdir(os.path.join(directory, "trash"))
+                                                                       if os.path.isdir(os.path.join(directory, "trash")) else []))]:
+        wt = t.get("worktree") if isinstance(t.get("worktree"), str) else None
+        if wt:
+            worktrees.setdefault(t.get("id"), set()).add(os.path.normpath(wt))
+            src = os.path.join(wt, "src")
+            for name in sorted(os.listdir(src)) if os.path.isdir(src) else []:
+                worktrees[t.get("id")].add(os.path.normpath(os.path.join(src, name)))
+    project = os.path.normpath(agent["project"]) if agent.get("project") else None
+    folders = sorted({x for x in [project] + [w for ws in worktrees.values() for w in ws] if x})
+    logged = set(re.findall(r"\bsession=([0-9a-f-]{36})\b", pa.read_text(os.path.join(directory, "session.log"))))
+    cands = {}
+    for f_ in folders:
+        for path, sid in claude_files(f_):
+            cands.setdefault(sid, {"sid": sid, "path": path, "program": "claude", "cwd": f_})
+    for sid in sorted(logged - set(cands)):
+        path = find_file({"session": sid, "program": "claude", "cwd": project}, None)
+        if path:
+            cands[sid] = {"sid": sid, "path": path, "program": "claude", "cwd": project}
+    for path, sid in codex_rollouts():
+        if sid not in cands:
+            cands[sid] = {"sid": sid, "path": path, "program": "codex", "cwd": None}
+    found = []
+    for sid, c in sorted(cands.items()):
+        if sid in known:
+            continue
+        first, last, cwd = first_last(c["path"], c["program"])
+        if c["program"] == "codex":
+            if not cwd or os.path.normpath(cwd) not in folders:
+                continue
+            c["cwd"] = os.path.normpath(cwd)
+        if first is None or first < created - 60:
+            continue
+        c.update(first=first, last=last or first)
+        found.append(c)
+    found.sort(key=lambda c: (c["first"], c["sid"]))
+    matches, rest = [], []
+    mine = set(agent.get("terminals") or []) | {agent.get("terminal")}
+    recorded = {w.get("address") for t in tasks.values() for w in t.get("workers") or []}
+    live = {}
+    for address, info in sorted((pa.live_terminals() or {}).items()):
+        pid = (info or {}).get("pid")
+        if isinstance(pid, int) and (info.get("parent") in mine or address in recorded):
+            pidfile = pa.read_json(os.path.join(CLAUDE_HOME, "sessions", "{}.json".format(pid)), {}) or {}
+            if isinstance(pidfile.get("sessionId"), str):
+                live[pidfile["sessionId"]] = (address, info.get("name") if isinstance(info.get("name"), str) else None)
+
+    def match(c, how, confidence, **who):
+        m = {"v": 1, "ev": "bind", "at": iso(now), "session": c["sid"], "program": c["program"], "kind": "worker", "task": None,
+             "name": None, "role": None, "terminal": None, "cwd": c["cwd"], "startedAt": iso(c["first"]),
+             "source": "reconstructed", "match": how, "confidence": confidence}
+        m.update(who)
+        matches.append(m)
+    for c in found:
+        if c["sid"] in logged:
+            match(c, "session-log", "high", kind="pa", terminal=agent.get("terminal"))
+        elif c["sid"] in live:
+            address, name = live[c["sid"]]
+            match(c, "live-pid", "high", name=name, terminal=address, task=task_for(directory, name))
+        else:
+            rest.append(c)
+    starts = []
+    for e in journal:
+        if re.search(r"(?i)\bstart", e["why"]):
+            for address, name in START.findall(e["why"]):
+                starts.append({"at": e["at"], "address": address, "name": name, "task": task_for(directory, name) or e["task"]})
+    used = {m["terminal"] for m in matches if m["terminal"]}
+
+    def entries_for(c):
+        out = []
+        for s in starts:
+            if s["address"] in used or not (c["first"] - 120 <= s["at"] <= c["first"]):
+                continue
+            if c["cwd"] == project or c["cwd"] in worktrees.get(s["task"], set()):
+                out.append(s)
+        return out
+
+    def reported(address, after):
+        token = re.compile(r"(?<![A-Za-z0-9_-])" + re.escape(address) + r"(?![A-Za-z0-9_-])")
+        times = [e["at"] for e in journal if e["at"] > after and e["trigger"] == "report" and token.search(e["why"])]
+        return max(times) if times else None
+    unmatched, taken = [], set()
+    for c in rest:
+        if c["sid"] in taken:
+            continue
+        ents = entries_for(c)
+        if len(ents) == 1:
+            s = ents[0]
+            match(c, "cwd+start", "medium", name=s["name"], terminal=s["address"], task=s["task"])
+            used.add(s["address"])
+            continue
+        if len(ents) == 2:
+            peers = [p for p in rest if p is not c and p["sid"] not in taken and abs(p["first"] - c["first"]) <= 2 and p["cwd"] == c["cwd"]]
+            if len(peers) == 1 and {s["address"] for s in entries_for(peers[0])} == {s["address"] for s in ents}:
+                pair = sorted([c, peers[0]], key=lambda x: x["last"])
+                ends = sorted(ents, key=lambda s: reported(s["address"], s["at"]) or 0)
+                if all(reported(s["address"], s["at"]) for s in ends):
+                    for sess_, s in zip(pair, ends):
+                        match(sess_, "end-time-pair", "low", name=s["name"], terminal=s["address"], task=s["task"])
+                        taken.add(sess_["sid"])
+                        used.add(s["address"])
+                    continue
+        unmatched.append(c)
+    um = {"v": 1, "ev": "unmatched", "at": iso(now), "sessions": len(unmatched),
+          "tokens": sum(scan_tokens(c["path"], c["program"]) for c in unmatched), "ids": sorted(short(c["sid"]) for c in unmatched)}
+    if not quiet:
+        for m in matches:
+            print("{:<14} {} {:<6} {} {}".format(m["match"], short(m["session"]), m["kind"], m["terminal"] or "-", m["task"] or "(no task)"))
+        print("unmatched: {} session(s), {} tokens (not added to totals)".format(um["sessions"], um["tokens"]))
+        if dry_run:
+            print("dry run: nothing written")
+    if dry_run:
+        return {"matches": matches, "unmatched": um}
+    for m in matches:
+        append_line(os.path.join(folder, "sessions.jsonl"), m)
+    last = [r for r in records if r.get("ev") == "unmatched"]
+    if (um["sessions"] or last) and (not last or (last[-1].get("sessions"), last[-1].get("tokens"), last[-1].get("ids")) !=
+                                     (um["sessions"], um["tokens"], um["ids"])):
+        append_line(os.path.join(folder, "sessions.jsonl"), um)
+    if matches or os.path.exists(os.path.join(folder, "sessions.jsonl")):
+        collect(directory, now=now, quiet=True)
+    return {"matches": matches, "unmatched": um}
 
 
 # ---- launch records (called by pa.py: pa-claude, pa-codex, pa-session) ---------------------------
