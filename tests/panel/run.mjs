@@ -1800,10 +1800,16 @@ cases["P-push-pick-checks"] = async () => { // AC6.1: picking Push checks again;
   check(pushExecs("run").length === 0, "no run");
 };
 
-cases["P-push-run-once"] = async () => { // AC6.2, AC5.3: Submit Push runs pa-push-main run once per click; the card file is never written by the panel
+// The card as pa-push-main run writes it on a push (plan §4.7, Job A): answered, with push.done and push.result.
+const answeredByTool = (over = {}) => { const base = JSON.parse(pushCardText()); return JSON.stringify({ ...base, status: "answered", answer: "Push", note: null,
+  answered: "2026-11-16T10:01:00Z", answeredBy: "person, in the panel", push: { ...base.push, done: true, result: { ...runPushed.result, how: "pushed", output: "To file:///tmp/pa-scratch/origin.git\n   aa22000..cc11000  cc11 -> main" } }, ...over }); };
+
+cases["P-push-run-once"] = async () => { // AC6.2, AC5.3: Submit Push runs pa-push-main run once per click; the card file is written by the tool only
   const gate = deferred();
-  const { v, file } = await pushWorld({ tool: { run: () => gate.promise } });
-  const before = g.__files[file];
+  let file;
+  // As the real tool does: the run writes the card answered, then prints its JSON.
+  const { v, file: f } = await pushWorld({ tool: { run: () => gate.promise.then((reply) => { g.__files[file] = answeredByTool(); return reply; }) } });
+  file = f;
   await click(v, `opt-${PID}-0`); await settle();
   await click(v, `submit-${PID}`); await settle();
   const { text, clicks } = look(v);
@@ -1812,13 +1818,68 @@ cases["P-push-run-once"] = async () => { // AC6.2, AC5.3: Submit Push runs pa-pu
   check(runs.length === 1, `one run (got ${runs.length})`);
   check(JSON.stringify(runs[0][1]) === JSON.stringify(["run", PID, "--answer", "Push", "--space", S, "--seen", "seen-token-1", "--json"]), `its argv (got ${JSON.stringify(runs[0][1])})`);
   check(runs[0][2] === null && runs[0][3]?.timeout === 600000, `on null, timeout 600 s (got ${JSON.stringify(runs[0][3])})`);
-  gate.resolve(json(0, runPushed)); await settle();
+  const writes = (g.__writes ?? []).length, checks = pushExecs("check").length;
+  gate.resolve(json(0, runPushed)); await settle(); await settle();
   check(pushExecs("run").length === 1, "still one run");
-  check(g.__files[file] === before && !(g.__writes ?? []).some((k) => k.includes("/decisions/")), "the panel wrote no card file");
-  check(look(v).text.includes(`Pushed ${PURL} main aa22000..cc11000`) && look(v).text.includes("Done"), `the result and the output tail (got ${look(v).text.slice(0, 1500)})`);
-  // The card file still reads open (the stand-in wrote nothing): this copy offers no second Push.
+  check(!(g.__writes ?? []).slice(writes).some((k) => String(k).includes("/decisions/")), "the panel wrote no card file");
+  // The panel's own reload has read the card answered: the result and the output tail stay on screen (spec §8.2, AC6.2).
+  check(v.cards.some((c) => c.id === PID && c.card?.status === "answered"), "the reload read the card answered");
+  const after = look(v);
+  check(v.viewShown === "decisions" && after.text.includes(PID), `still the Decisions view with the card (view ${v.viewShown}, got ${after.text.slice(0, 600)})`);
+  check(after.text.includes(`Pushed ${PURL} main aa22000..cc11000`) && after.text.includes("cc11 -> main"), `the result and the output tail after the reload (got ${after.text.slice(0, 1500)})`);
+  check(after.text.includes("answered: Push"), "the card says answered");
+  // Answered now: no option to pick, no second Push, no new check.
+  check(!after.clicks[`opt-${PID}-0`] && !after.clicks[`submit-${PID}`] && pushExecs("run").length === 1, "pushed: no option, no Submit");
+  for (let i = 0; i < 3; i++) { advance(10000); await fire(10000); }
+  check(pushExecs("check").length === checks, `no check for the answered card (got ${pushExecs("check").length - checks} more)`);
+  check(look(v).text.includes(`Pushed ${PURL} main aa22000..cc11000`), "still shown after more reloads");
+};
+
+cases["P-push-result-kept-until-left"] = async () => { // §8.2: the pushed card's result stays until the person leaves it (another view, or Done)
+  let file;
+  const { v, file: f } = await pushWorld({ tool: { run: () => { g.__files[file] = answeredByTool(); return json(0, runPushed); } } });
+  file = f;
   await click(v, `opt-${PID}-0`); await settle();
-  check(!look(v).clicks[`submit-${PID}`] && pushExecs("run").length === 1, "pushed from here already: no Submit Push");
+  await click(v, `submit-${PID}`); await settle(); await settle();
+  check(look(v).text.includes("cc11 -> main"), `shown after the reload (got ${look(v).text.slice(0, 1200)})`);
+  await click(v, "view-tasks"); await click(v, "view-decisions");
+  let t = look(v).text;
+  check(!t.includes("cc11 -> main") && t.includes("No open decisions") && t.includes("1 answered"), `left: no longer kept, the card is with the answered ones (got ${t.slice(0, 1200)})`);
+  // The same with its Done link.
+  const { v: w, file: f2 } = await pushWorld({ tool: { run: () => { g.__files[file] = answeredByTool(); return json(0, runPushed); } } });
+  file = f2;
+  await click(w, `opt-${PID}-0`); await settle();
+  await click(w, `submit-${PID}`); await settle(); await settle();
+  check(look(w).text.includes("cc11 -> main"), "shown after the reload");
+  await click(w, `push-done-${PID}`);
+  t = look(w).text;
+  check(!t.includes("cc11 -> main") && t.includes("1 answered"), `Done: no longer kept (got ${t.slice(0, 1200)})`);
+};
+
+cases["P-push-click-stale"] = async () => { // C-D5: Submit drawn while the check was fresh, clicked after 120 s with no redraw: no run
+  const { v } = await pushWorld();
+  await click(v, `opt-${PID}-0`); await settle();
+  const { clicks } = look(v);
+  check(Boolean(clicks[`submit-${PID}`]), "Submit drawn while fresh");
+  advance(121000); // no render between
+  clicks[`submit-${PID}`]({}, cx); await settle();
+  check(pushExecs("run").length === 0, `no run (got ${JSON.stringify(pushExecs("run").map((x) => x[1]))})`);
+  check(look(v).text.includes("Push needs a check that passed, under 2 minutes old: Check again."), `says Check again (got ${look(v).text.slice(0, 1500)})`);
+};
+
+cases["P-push-run-crash"] = async () => { // a run that exits non-zero with no JSON from the tool (it crashed, maybe after the push): result unknown, one check
+  for (const [code, stderr] of [[1, "Traceback (most recent call last):\n  File \"pa_push.py\", line 900, in finish\nOSError: [Errno 28] No space left on device"], [2, ""]]) {
+    const { v } = await pushWorld({ opts: { records: alive() }, tool: { run: () => ({ code, stdout: "", stderr }) } });
+    await click(v, `opt-${PID}-0`); await settle();
+    const checks = pushExecs("check").length;
+    await click(v, `submit-${PID}`); await settle();
+    const { text } = look(v);
+    check(/The result is unknown \(.*\); checking the card again\./.test(text) && !text.includes("Not pushed"), `exit ${code}: result unknown, not "Not pushed" (got ${text.slice(0, 1500)})`);
+    check(pushExecs("check").length === checks + 1, `exit ${code}: one check after it (got ${pushExecs("check").length - checks})`);
+    check(pushExecs("run").length === 1, `exit ${code}: one run`);
+    const said = sends().map((x) => x[2]);
+    check(said.length === 1 && said[0].startsWith(`decision ${PID} answered Push; result unknown (`) && !said[0].includes("refused"), `exit ${code}: the orchestrator is told the result is unknown (got ${JSON.stringify(said)})`);
+  }
 };
 
 cases["P-push-note-passed"] = async () => { // the note goes with --note
@@ -1839,11 +1900,12 @@ cases["P-push-refused"] = async () => { // §8.2: a refusal is shown on the card
   check(text.includes(`Not pushed: ${msg}`), `the refusal (got ${text.slice(0, 1500)})`);
   check(text.includes("open") && !text.includes("answered: Push"), "the card stays open");
   check(pushExecs("check").length === 3, `a fresh check after the refusal (got ${pushExecs("check").length})`);
-  // A tool that prints no JSON: its stderr is shown.
-  const { v: w } = await pushWorld({ tool: { run: () => ({ code: 1, stdout: "", stderr: "pa-push-main: refused: pa-push-main run is the person's command (HC_TERMINAL_ID is set)" }) } });
+  // The tool's C0 refusal, as its JSON (with --json every refusal prints one): its message is shown.
+  const c0 = "pa-push-main run is the person's command (HC_TERMINAL_ID is set)";
+  const { v: w } = await pushWorld({ tool: { run: () => json(1, { ok: false, done: false, answer: "Push", refusal: { check: "C0", message: c0 }, result: null, message: c0 }) } });
   await click(w, `opt-${PID}-0`); await settle();
   await click(w, `submit-${PID}`); await settle();
-  check(look(w).text.includes("Not pushed: pa-push-main: refused: pa-push-main run is the person's command (HC_TERMINAL_ID is set)"), `stderr shown (got ${look(w).text.slice(0, 1500)})`);
+  check(look(w).text.includes(`Not pushed: ${c0}`), `C0 shown (got ${look(w).text.slice(0, 1500)})`);
 };
 
 cases["P-push-notnow"] = async () => { // AC6.3: Not now runs run --answer "Not now" (no --seen), even when the check refused
