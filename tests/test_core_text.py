@@ -183,7 +183,7 @@ class Docs(unittest.TestCase):  # AC6.1
         self.assertNotIn("Workers stay until you close them", text)
         self.assertIn("A worktree's Delete/Keep card comes only once every task using it is done or parked", text)
         done_when = flat(section(read("RECIPE.md"), "## Done when"))
-        self.assertIn("is closed in the pass that reads its report (journal trigger `close`, its chip reads \"(closed)\")", done_when)
+        self.assertIn("is closed in the pass that reads its report (journal trigger `close`, its chip leaves the task card)", done_when)
         self.assertIn("`WORKTREE.md ↗` opens the full list", done_when)
 
     def test_mod_comments(self):
