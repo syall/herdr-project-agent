@@ -503,6 +503,335 @@ class AC10Unchanged(unittest.TestCase):
                       "else is refused: report it to the Project Agent.", flat)
 
 
+# ---- Allowlist guard fix round: each case makes the guard stricter -------------------------------------
+# Finding ids: reviewer 1 #n (REVIEW.md), reviewer 2 In/Mn (REVIEW-2.md), verifier Fn (VERIFY.md).
+
+GUARD_UNAVAILABLE_WORDS = ["guard unavailable", "report", "Project Agent", "There is no override"]
+
+
+def load_hooks_copy(folder):
+    """pa_hooks.py copied into folder (with whatever pa_guard.py the test put there), loaded with the temp pa."""
+    shutil.copy(os.path.join(TOOLS, "pa_hooks.py"), os.path.join(folder, "pa_hooks.py"))
+    saved = sys.modules.get("pa")
+    sys.modules["pa"] = pa
+    try:
+        spec = importlib.util.spec_from_file_location("pa_hooks_copy", os.path.join(folder, "pa_hooks.py"))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        if saved is None:
+            del sys.modules["pa"]
+        else:
+            sys.modules["pa"] = saved
+
+
+def call_hook(hooks, function, tool, tool_input, cwd):
+    err = io.StringIO()
+    data = {"tool_name": tool, "tool_input": tool_input, "cwd": cwd}
+    with mock.patch.dict(os.environ, {"HC_TERMINAL_ID": OWN}), contextlib.redirect_stderr(err):
+        try:
+            code = function(data, [])
+        except SystemExit as e:
+            code = e.code
+    return code, err.getvalue()
+
+
+class FixA_FailClosed(unittest.TestCase):
+    """(a) card d-038 'Block'; reviewer 1 #1, reviewer 2 I2: a guard that cannot load or that raises refuses the call."""
+
+    @classmethod
+    def setUpClass(cls):
+        HookGuard.setUpClass.__func__(cls)
+
+    def copy(self, guard_text=None):
+        folder = tempfile.mkdtemp(dir=TMP)
+        if guard_text is not None:
+            with open(os.path.join(folder, "pa_guard.py"), "w") as f:
+                f.write(guard_text)
+        try:
+            return load_hooks_copy(folder)
+        except Exception as e:  # noqa: BLE001 - before the fix the import itself dies
+            self.fail("pa_hooks.py must load without a working pa_guard.py (the other hooks keep working): {!r}".format(e))
+
+    def assert_unavailable(self, code, err):
+        self.assertEqual(code, 2, err)
+        for words in GUARD_UNAVAILABLE_WORDS:
+            self.assertIn(words, err)
+
+    def test_missing_guard_blocks_bash_and_edits_and_other_hooks_work(self):
+        hooks = self.copy()
+        self.assert_unavailable(*call_hook(hooks, hooks.hook_guard, "Bash", {"command": "git status"}, self.wt))
+        self.assert_unavailable(*call_hook(hooks, hooks.hook_guard, "Bash", {"command": "ls"}, self.bare))
+        self.assert_unavailable(*call_hook(hooks, hooks.hook_guard, "Edit", {"file_path": os.path.join(self.wt, "a.py")}, self.wt))
+        self.assertEqual(call_hook(hooks, hooks.hook_guard, "Read", {"file_path": os.path.join(self.wt, "a.py")}, self.wt)[0], 0)
+        self.assertEqual(call_hook(hooks, hooks.hook_test_lock, "Edit", {"file_path": os.path.join(self.wt, "a.py")}, self.wt)[0], 0)
+        # the older refusals still come first, with their own message
+        code, err = call_hook(hooks, hooks.hook_guard, "Bash", {"command": "git stash drop"}, self.wt)
+        self.assertEqual(code, 2)
+        self.assertIn("Blocked by the Project Agent safety hook", err)
+
+    def test_broken_guard_blocks(self):
+        hooks = self.copy("raise RuntimeError('half-installed')\n")
+        self.assert_unavailable(*call_hook(hooks, hooks.hook_guard, "Bash", {"command": "git status"}, self.wt))
+        self.assertEqual(call_hook(hooks, hooks.hook_test_lock, "Edit", {"file_path": os.path.join(self.wt, "a.py")}, self.wt)[0], 0)
+
+    def test_a_check_that_raises_blocks(self):
+        def boom(*_a, **_k):
+            raise RuntimeError("boom")
+        broken = mock.Mock(check_command=boom, check_edit=boom, profile_rows=boom)
+        with mock.patch.object(pa_hooks, "_load_guard", return_value=broken):
+            self.assert_unavailable(*call_hook(pa_hooks, pa_hooks.hook_guard, "Bash", {"command": "git status"}, self.wt))
+            self.assert_unavailable(*call_hook(pa_hooks, pa_hooks.hook_guard, "Write", {"file_path": os.path.join(self.wt, "a.py")}, self.wt))
+        with mock.patch.object(pa_hooks, "hook_context", side_effect=OSError("gone")):
+            self.assert_unavailable(*call_hook(pa_hooks, pa_hooks.hook_guard, "Bash", {"command": "git status"}, self.wt))
+
+    def test_a_malformed_profile_does_not_open_the_table(self):  # reviewer 2 I2
+        for n, allow in enumerate([5, [{"command": ["git", "lfs"], "args": ["any"]}], "rows", [{"command": ["git", "push"], "args": {}}]]):
+            with self.subTest(allow=allow):
+                space = "spbad{}".format(n)
+                state = pa.space_dir(space)
+                write_json(os.path.join(state, "agent.json"), {"terminal": PA, "profile": "badp{}".format(n), "space": space})
+                write_json(os.path.join(pa.ROOT, "profiles", "badp{}".format(n), "profile.json"),
+                           {"name": "badp{}".format(n), "claude": ["true"], "codex": ["true"], "guardAllow": allow})
+                wt = os.path.join(TMP, "wt-bad{}".format(n))
+                write_json(os.path.join(wt, ".claude", "pa-task.json"), {"task": "t-x", "space": space, "fix": False})
+                code, err = call_hook(pa_hooks, pa_hooks.hook_guard, "Bash", {"command": "git push origin t-x"}, wt)
+                self.assertEqual(code, 2)
+                self.assertIn(OFF_TABLE.format("git push origin t-x"), err)
+                self.assertEqual(call_hook(pa_hooks, pa_hooks.hook_guard, "Bash", {"command": "git status"}, wt)[0], 0)
+
+
+class FixB_CheckoutBranchOnly(GuardTest):
+    """(b) reviewer 1 #2, reviewer 2 I1, verifier F1: git checkout takes a branch name only."""
+
+    def test_pathspec_words_are_refused(self):
+        for line in ["git checkout '*.py'", "git checkout ':/'", "git checkout ':(glob)**'", "git checkout 'a?b'",
+                     "git checkout '[ab]c'", "git checkout ':!x'", "git checkout -b x '*.py'", "git checkout -b ':x'",
+                     "git checkout -b x ':/'", "git checkout -b 'n*'", "git --no-pager checkout '*.md'"]:
+            with self.subTest(line=line):
+                self.assertTrue((self.check(line) or "").startswith("Refused by the Project Agent's allowlist: git"), line)
+
+    def test_branch_words_still_allowed(self):
+        for line in ["git checkout some-branch", "git checkout HEAD~1", "git checkout -b new-x", "git checkout -b new-x main",
+                     "git checkout feature/x"]:
+            with self.subTest(line=line):
+                self.assertIsNone(self.check(line))
+
+    def test_a_cd_that_may_not_run_leaves_the_folder_unknown(self):  # reviewer 2 I1, the cd blind spot
+        os.makedirs(os.path.join(self.cwd, "sub"))
+        open(os.path.join(self.cwd, "a.py"), "w").close()
+        open(os.path.join(self.cwd, "sub", "b.py"), "w").close()
+        for line in ["cd /nonexistent || true; git checkout a.py", "cd sub; git checkout a.py", "true || cd sub && git checkout a.py",
+                     "ls | cd sub && git checkout a.py", "pushd sub && git checkout a.py", "popd && git checkout x",
+                     "cd sub || true && git checkout a.py"]:
+            with self.subTest(line=line):
+                self.assertIsNotNone(self.check(line))
+        for line in ["cd sub && git checkout a.py", "git status; cd sub && git checkout x", "cd sub && cd .. && git checkout x"]:
+            with self.subTest(line=line):
+                self.assertIsNone(self.check(line))
+
+
+class FixC_ConfigReadOnly(GuardTest):
+    """(c) reviewer 1 #3, reviewer 2 I4: git config reads only (a key containing a dot, list, get <key>)."""
+
+    def test_refused(self):
+        for line in ["git config edit", "git config set", "git config unset", "git config rename-section",
+                     "git config remove-section", "git config foo", "git config get", "git config get a.b c",
+                     "git config get edit", "git config --get edit", "git config --get-all x", "git config list x",
+                     "git config set user.name x", "git config get --all a.b", "git config .", "git config -e"]:
+            with self.subTest(line=line):
+                self.assertIsNotNone(self.check(line))
+
+    def test_allowed(self):
+        for line in ["git config user.email", "git config list", "git config get user.name", "git config --get user.name",
+                     "git config --get-all remote.origin.fetch", "git config --list", "git config -l", "git config branch.x.remote"]:
+            with self.subTest(line=line):
+                self.assertIsNone(self.check(line))
+
+
+class FixD_ProfileOptionRows(AC8ProfileRows):
+    """(d) reviewer 1 #4, verifier F4: guardAllow rows whose words after the program start with - are ignored, with a note."""
+
+    def test_option_rows_are_ignored(self):
+        for command, line in [(["git", "-c"], "git -c a=b push origin x"), (["git", "-C"], "git -C . push origin x"),
+                              (["git", "--no-pager"], "git --no-pager --no-pager push origin x"),
+                              (["gh", "--repo"], "gh --repo x pr create"), (["git", "-c", "a=b", "push"], "git -c a=b push origin x"),
+                              (["git", "lfs", "--x"], "git lfs --x"), (["hc", "-v"], "hc -v kill w2")]:
+            with self.subTest(command=command):
+                rows, note = self.rows([{"command": command, "args": "any"}])
+                self.assertEqual(rows, [])
+                self.assertIn(" ".join(command), note)
+                self.assertIsNotNone(self.check(line, extra_rows=rows))
+
+    def test_profile_rows_are_total(self):  # reviewer 2 I2
+        for allow in [5, "rows", {"command": ["git", "gc"]}, [{"command": ["git", "gc"], "args": ["any"]}],
+                      [{"command": ["git", "gc"], "args": {"x": 1}}], [{"command": ["git", 5], "args": "any"}], [None]]:
+            with self.subTest(allow=allow):
+                rows, note = self.rows(allow)
+                self.assertEqual(rows, [])
+                self.assertTrue(note)
+        for profile in ["x", 5, ["guardAllow"]]:
+            with self.subTest(profile=profile):
+                self.assertEqual(guard.profile_rows(profile, err=io.StringIO()), [])
+
+
+class FixE_ShellWrappers(GuardTest):
+    """(e) reviewer 2 I3: a shell -c wrapper or eval whose text names git, gh or hc as a whole word involves them."""
+
+    def test_refused(self):
+        for line in ['sh -c "git push origin x"', 'bash -c "gh pr create"', 'zsh -c "hc send x y"', "dash -c 'git push'",
+                     "ksh -c 'git push'", "eval 'git push'", 'eval "gh api x"', "bash -lc 'git push'", "/bin/sh -c 'git push'",
+                     "env bash -c 'git push'", "echo 'git push' | sh", "sh -c 'GIT push'", "bash -c 'git status'",
+                     "xargs sh -c 'git push' _", "sh -c 'cd x; git push'", "BASH -c 'git push'", "sh -c 'x=1 /usr/bin/git push'"]:
+            with self.subTest(line=line):
+                message = self.check(line)
+                self.assertIsNotNone(message, line)
+                self.assertTrue(message.startswith("Refused by the Project Agent's allowlist: "), message)
+
+    def test_ordinary_uses_stay_allowed(self):
+        for line in ["sh -c 'make test'", "bash tests/run-all.sh", "sh -c 'echo github.com'", "grep 'git push' notes.md",
+                     "echo 'use git push here'", "echo 'git'' notes'", "eval 'make'", "bash -c 'ls .git'", "sh -c 'cat x.git'"]:
+            with self.subTest(line=line):
+                self.assertIsNone(self.check(line))
+
+
+class FixF_ProgramCase(GuardTest):
+    """(f) verifier F2: git, gh and hc are recognised without regard to case; only the exact lowercase word matches a row."""
+
+    def test_case_variants_are_refused(self):
+        for line in ["GIT push origin x", "Gh pr create", "HC send x y", "GIT status", "Git log", "/usr/bin/GIT push",
+                     "xargs GIT push", "gIt diff", "HC read w1"]:
+            with self.subTest(line=line):
+                self.assertEqual(self.check(line), OFF_TABLE.format(line))
+        for line in ["GIT diff > x", "echo $(Git rev-parse HEAD)"]:
+            with self.subTest(line=line):
+                self.assertEqual(self.check(line), NOT_PLAIN)
+
+    def test_other_words_stay_allowed(self):
+        for line in ["echo GITHUB", "ls Git.log", "cat .GIT/HEAD", "make > GIT.log", "grep -rn gitignore ."]:
+            with self.subTest(line=line):
+                self.assertIsNone(self.check(line))
+
+
+class FixG_ArchiveRemote(GuardTest):
+    """(g) reviewer 1 #6, reviewer 2 M5, verifier F3: git archive refuses --remote and --exec and their abbreviations."""
+
+    def test_refused(self):
+        for line in ["git archive --remote=. HEAD", "git archive --remote . HEAD", "git archive --exec=x --remote=. HEAD",
+                     "git archive --rem=. HEAD", "git archive --r=. HEAD", "git archive --e=x HEAD", "git archive --ex x HEAD",
+                     "git archive --format=tar --exec=./x --remote=. HEAD", "git archive HEAD --remote=."]:
+            with self.subTest(line=line):
+                self.assertIsNotNone(self.check(line))
+
+    def test_allowed(self):
+        for line in ["git archive --format=tar HEAD", "git archive HEAD runtime", "git archive --prefix=x/ HEAD"]:
+            with self.subTest(line=line):
+                self.assertIsNone(self.check(line))
+
+
+class FixH_NeverAdd(AC8ProfileRows):
+    """(h) reviewer 1 #5, reviewer 2 M1: NEVER_ADD covers git lfs push and the missing gh groups."""
+
+    def test_more_rows_are_ignored(self):
+        for command in [["git", "lfs"], ["git", "lfs", "push"], ["git", "svn"], ["git", "p4"], ["git", "daemon"],
+                        ["git", "instaweb"], ["git", "imap-send"], ["git", "http-push"], ["git", "send-pack"],
+                        ["gh", "run"], ["gh", "run", "rerun"], ["gh", "run", "cancel"], ["gh", "run", "delete"],
+                        ["gh", "issue", "delete"], ["gh", "issue", "transfer"], ["gh", "issue", "reopen"],
+                        ["gh", "issue", "develop"], ["gh", "issue", "lock"], ["gh", "issue", "pin"],
+                        ["gh", "pr", "update-branch"], ["gh", "pr", "revert"], ["gh", "pr", "lock"], ["gh", "label"],
+                        ["gh", "cache"], ["gh", "project"], ["gh", "ssh-key"], ["gh", "gpg-key"], ["gh", "codespace"],
+                        ["gh", "org"]]:
+            with self.subTest(command=command):
+                rows, note = self.rows([{"command": command, "args": "any"}])
+                self.assertEqual(rows, [])
+                self.assertIn(" ".join(command), note)
+
+    def test_lfs_pull_still_added(self):
+        rows, note = self.rows([{"command": ["git", "lfs", "pull"], "args": "any"}])
+        self.assertEqual((len(rows), note), (1, ""))
+
+
+class FixH_Restore(GuardTest):
+    """(h) reviewer 1 #9, reviewer 2 M4: git restore names files, not folders."""
+
+    def test_folders_are_refused(self):
+        os.makedirs(os.path.join(self.cwd, "sub", "deeper"))
+        for line in ["git restore ../..", "git restore ..//..", "git restore sub", "git restore sub/", "git restore sub/deeper/..",
+                     "git restore " + self.cwd, "git restore /", "git restore --staged sub", "git restore -- sub",
+                     "cd - && git restore a.py", "cd /nonexistent; git restore a.py", "git restore '~'"]:
+            with self.subTest(line=line):
+                self.assertIsNotNone(self.check(line))
+
+    def test_files_still_allowed(self):
+        os.makedirs(os.path.join(self.cwd, "sub"))
+        for line in ["git restore a.py", "git restore --staged sub/a.py", "git restore ../a.py", "cd sub && git restore a.py",
+                     "git restore " + os.path.join(self.cwd, "a.py")]:
+            with self.subTest(line=line):
+                self.assertIsNone(self.check(line))
+
+
+class FixH_EditorRule(GuardTest):
+    """(h) reviewer 1 #7, verifier F4 (profiles folder), reviewer 2 M2 (.git reached through a link)."""
+
+    run_hook = HookGuard.run_hook
+
+    @classmethod
+    def setUpClass(cls):
+        HookGuard.setUpClass.__func__(cls)
+
+    def setUp(self):
+        super().setUp()
+        self.home = os.path.join(TMP, "home-fix")
+        self.spaces = os.path.join(self.home, "spaces")
+        self.state = os.path.join(self.spaces, "sp1")
+        self.repo = os.path.join(TMP, "repo-fix")
+        for d in [os.path.join(self.state, "evidence", "t-x"), os.path.join(self.home, "profiles", "p"),
+                  os.path.join(self.home, "core"), os.path.join(self.repo, "sub"), os.path.join(self.repo, "realgit")]:
+            os.makedirs(d, exist_ok=True)
+        link = os.path.join(self.repo, "sub", ".git")
+        if not os.path.lexists(link):
+            os.symlink(os.path.join(self.repo, "realgit"), link)
+
+    def edit(self, path):
+        return guard.check_edit(path, self.spaces, cwd=self.repo, home=self.home)
+
+    def test_refused(self):
+        for name in ["pass-request.json", "schedule.json", "ledger.last-good.json", "agent.json.bak-t1", "heartbeat",
+                     "session.log", ".ledger.lock", os.path.join("other", "x.json")]:
+            with self.subTest(name=name):
+                self.assertIsNotNone(self.edit(os.path.join(self.state, name)))
+        for path in [os.path.join(self.spaces, "registry.json"), os.path.join(self.home, "profiles", "p", "profile.json"),
+                     os.path.join(self.home, "core", "worker.md"), os.path.join(self.home, "config.json"),
+                     os.path.join(self.repo, "sub", ".git", "config"), "sub/.git/hooks/pre-commit"]:
+            with self.subTest(path=path):
+                self.assertEqual(self.edit(path), OFF_TABLE.format(path))
+
+    def test_allowed(self):
+        for path in [os.path.join(self.state, "evidence", "t-x", "x.md"), os.path.join(self.state, "evidence", "t-y", "build.log"),
+                     os.path.join(self.repo, "realgit", "notes.txt"), os.path.join(self.repo, "sub", "a.py")]:
+            with self.subTest(path=path):
+                self.assertIsNone(self.edit(path))
+
+    def test_through_the_hook(self):
+        profile = os.path.join(pa.ROOT, "profiles", "guardp", "profile.json")
+        code, err = self.run_hook("Edit", {"file_path": profile})
+        self.assertEqual(code, 2)
+        self.assertIn(profile, err)
+        self.assertEqual(self.run_hook("Write", {"file_path": os.path.join(pa.space_dir("spguard"), "schedule.json")})[0], 2)
+        self.assertEqual(self.run_hook("Write", {"file_path": os.path.join(pa.space_dir("spguard"), "evidence", "t-x", "a.md")})[0], 0)
+
+
+class FixH_HcSendText(GuardTest):
+    """(h) reviewer 2 nit: the hc send text is a word, not an option."""
+
+    def test_refused(self):
+        for line in ["hc send pa1 --force", "hc send pa1 -", "hc send pa1 -x", "hc send --force pa1"]:
+            with self.subTest(line=line):
+                self.assertIsNotNone(self.check(line))
+        self.assertIsNone(self.check("hc send pa1 'done - see evidence'"))
+
+
 def tearDownModule():
     shutil.rmtree(TMP, ignore_errors=True)
 
