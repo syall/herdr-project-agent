@@ -160,7 +160,8 @@ LONG = 200000  # a call whose prompt (in + cache write + cache read) is above th
 REBUILD_MIN = 20000  # a cache write after idle counts as a rebuild from this many tokens
 TAIL = 256  # message ids remembered per session for the dedupe
 FORK_SLACK = 5  # seconds: a resumed or forked session skips calls older than its start record minus this
-GONE_UNSEEN = 600  # a recorded session whose file was never found is gone after this many seconds
+GONE_UNSEEN = 7 * 86400  # a recorded session whose file was never found is gone after this many seconds (a transcript
+# is written at the first message, which can come hours after the start)
 DONE_AFTER = 86400  # a closed or gone session, fully read, is not looked at again after this many seconds
 MODEL = re.compile(r"^[\w.:@/\[\]+-]{1,80}$")
 
@@ -246,7 +247,10 @@ def sessions_of(records):
                 out[sid] = dict(base, starts=[base])
     for r in records:
         sid, ev = r.get("session"), r.get("ev")
-        if ev == "role" and sid in out and r.get("role"):
+        if ev == "start" and sid in out:  # a later start (a resume) opens a closed or gone session again
+            out[sid]["gone"] = False
+            out[sid].pop("closed", None)
+        elif ev == "role" and sid in out and r.get("role"):
             out[sid]["role"], out[sid]["rolePinned"] = r["role"], True
         elif ev == "gone" and sid in out:
             out[sid]["gone"] = True
@@ -348,9 +352,12 @@ class Reader:
     def __init__(self, sess, f, settled):
         self.sess, self.f, self.settled = sess, f, settled
         first = min(sess.get("starts") or [sess], key=lambda r: r.get("at") or "")
-        guarded = first.get("resumed") or first.get("bind") or first.get("fork")
+        copies = first.get("bind") or first.get("fork")  # a new file that may hold copies of another session's calls
         at = parse_ts(first.get("at") or "")
-        self.guard = (at - FORK_SLACK) if guarded and at else None
+        self.guard = (at - FORK_SLACK) if copies and at else None
+        # A resume with the session's own id writes into its own file: the calls before the first record are this
+        # session's past (from before launch records existed). They count, marked reconstructed (R7).
+        self.before = (at - FORK_SLACK) if first.get("resumed") and not copies and at else None
 
     def settle(self, until=None):
         if self.f.get("open"):
@@ -386,12 +393,15 @@ class Reader:
         last = parse_ts(f.get("lastCall") or "")
         seg = f.get("open")
         model = model or f.get("model")
-        if seg and (seg["day"] != ts[:10] or seg["model"] != model
+        pre = self.before is not None and epoch < self.before
+        if seg and (seg["day"] != ts[:10] or seg["model"] != model or bool(seg.get("pre")) != pre
                     or (self.sess.get("program") == "codex" and last is not None and epoch - last > IDLE)):
             self.settle()
             seg = None
         if not seg:
             seg = f["open"] = new_segment(ts, f.get("turn") or ts, model)
+            if pre:
+                seg["pre"] = True
         for k in KINDS:
             seg["tokens"][k] += tokens[k]
         if tokens["in"] + tokens["cw5m"] + tokens["cw1h"] + tokens["cr"] > LONG:
@@ -478,13 +488,15 @@ def short(sid):
 
 def make_row(sess, seg):
     """A ledger row from a settled segment: tokens only, attributed by attribute() (step 4 rules)."""
+    pre = seg.get("pre")  # calls of a resumed session from before its first record: its past, best effort (R7)
     return {"v": 1, "seq": None, "session": sess["session"], "program": sess.get("program") or "claude",
             "kind": sess.get("kind") or "unknown", "model": seg["model"], "from": seg["from"], "to": seg["to"],
             "day": seg["day"], "calls": seg["calls"], "tokens": seg["tokens"], "long": seg["long"], "rebuild": seg["rebuild"],
             "turn": seg["turn"], "task": sess.get("task"), "phase": None, "activity": None, "role": sess.get("role"),
-            "pass": None, "trigger": None, "split": None, "reason": None, "source": sess.get("source") or "recorded",
-            "match": sess.get("match") or "launch-record", "confidence": sess.get("confidence") or "high",
-            "until": seg.get("until")}
+            "pass": None, "trigger": None, "split": None, "reason": None,
+            "source": "reconstructed" if pre else (sess.get("source") or "recorded"),
+            "match": "resumed-history" if pre else (sess.get("match") or "launch-record"),
+            "confidence": sess.get("confidence") or "high", "until": seg.get("until")}
 
 
 PA_TRIGGERS = ("report", "message", "decision", "scheduled", "manual", "conversation")
@@ -661,22 +673,66 @@ def collect(directory, now=None, quiet=True, resummarize=False):
         os.close(fd)
 
 
-def _collect(directory, folder, now, quiet, resummarize):
-    state_path, turns_path = os.path.join(folder, "state.json"), os.path.join(folder, "turns.jsonl")
+STATE_V = 1
+
+
+def load_state(state_path, turns_path, now, quiet):
+    """(state, the text it was read from). A missing or unreadable state.json never truncates turns.jsonl: the state
+    is rebuilt from the ledger (AC5.3). A state of a version this code does not know is refused, and nothing changes."""
+    why, text = None, ""
     try:
         with open(state_path) as fh:
-            old_text = fh.read()
-        state = json.loads(old_text)
-    except (OSError, ValueError):
-        old_text, state = "", {}
-    if not isinstance(state, dict) or state.get("v") != 1:
-        state = {"v": 1, "lastSeq": 0, "turnsBytes": 0, "files": {}}
+            text = fh.read()
+        state = json.loads(text)
+    except FileNotFoundError:
+        why, state = "missing", None
+    except (OSError, ValueError, UnicodeDecodeError):
+        why, state = "unreadable", None
+    if why is None and isinstance(state, dict) and state.get("v") != STATE_V:
+        raise pa.Problem("costs/state.json has version {!r}, which this pa-costs does not know: refused, nothing was "
+                         "changed (update pa-costs, or move state.json aside to rebuild it from turns.jsonl)".format(state.get("v"))[:300])
+    if why is None and not (isinstance(state, dict) and isinstance(state.get("turnsBytes"), int)
+                            and not isinstance(state.get("turnsBytes"), bool) and isinstance(state.get("files"), dict)):
+        why = "unreadable"
+    if why is None:
+        state.setdefault("lastSeq", 0)
+        return state, text
+    if why == "unreadable":  # kept for the person to look at
+        os.replace(state_path, "{}.bad-{}".format(state_path, time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(now))))
+    state = {"v": STATE_V, "lastSeq": 0, "turnsBytes": 0, "files": {}}
+    size = os.path.getsize(turns_path) if os.path.exists(turns_path) else 0
+    if not size:
+        return state, ""
+    with open(turns_path, "rb") as fh:
+        data = fh.read()
+    end = data.rfind(b"\n") + 1
+    if end < len(data):  # a half row from a crash: its session is read again below
+        with open(turns_path, "r+b") as fh:
+            fh.truncate(end)
+    rows, _bad = read_lines(turns_path)
+    seqs = [r["seq"] for r in rows if isinstance(r.get("seq"), int)]
+    state["lastSeq"] = max(seqs) if seqs else 0
+    state["turnsBytes"] = end
+    for r in rows:
+        if "seq" in r and isinstance(r.get("session"), str):
+            state["files"][r["session"]] = {"offset": 0, "rebuilt": True}
+    note = ("state.json was {} at {}: rebuilt from turns.jsonl (sessions with rows are voided and read again; rows of "
+            "sessions whose files are gone are kept)").format(why, iso(now))
+    state["notes"] = [note]
+    if not quiet:
+        print("pa-costs: " + note, file=sys.stderr)
+    return state, ""
+
+
+def _collect(directory, folder, now, quiet, resummarize):
+    state_path, turns_path = os.path.join(folder, "state.json"), os.path.join(folder, "turns.jsonl")
+    state, old_text = load_state(state_path, turns_path, now, quiet)
     notes = state.setdefault("notes", [])
     size = os.path.getsize(turns_path) if os.path.exists(turns_path) else 0
-    if size > state.get("turnsBytes", 0):  # the last run died between its two writes: drop its rows, they are read again
+    if size > state["turnsBytes"]:  # the last run died between its two writes: drop its rows, they are read again
         with open(turns_path, "r+b") as fh:
-            fh.truncate(state.get("turnsBytes", 0))
-    elif size < state.get("turnsBytes", 0):
+            fh.truncate(state["turnsBytes"])
+    elif size < state["turnsBytes"]:
         state["turnsBytes"] = size
         if "turns.jsonl is shorter than recorded" not in notes:
             notes.append("turns.jsonl is shorter than recorded")
@@ -709,31 +765,42 @@ def _collect(directory, folder, now, quiet, resummarize):
     for sid in sorted(sessions):
         sess = sessions[sid]
         f = files.setdefault(sid, {"offset": 0})
+        latest = max((r.get("at") or "") for r in sess.get("starts") or [sess])
         if f.get("done"):
-            continue
+            f.setdefault("doneAt", iso(now))
+            if not latest or latest <= f["doneAt"]:
+                continue
+            for k in ("done", "doneAt", "neverRead"):  # started again after it was done (a resume): read it again
+                f.pop(k, None)
         settled = []
         path = find_file(sess, f.get("path"))
+        rebuilt = f.pop("rebuilt", False)
         if not path:
-            started = parse_ts(sess.get("at") or "") or now
-            if f.get("path") or sess.get("gone") or now - started >= GONE_UNSEEN:
+            started = parse_ts(latest) or now
+            if f.get("path") or rebuilt or sess.get("gone") or now - started >= GONE_UNSEEN:
                 reader = Reader(sess, f, settled)
                 reader.settle()
                 if not sess.get("gone"):
                     ctx["events"].append({"v": 1, "ev": "gone", "at": iso(now), "session": sid, "readTo": f.get("lastCall")})
-                if not f.get("offset"):
+                if not f.get("offset") and not rebuilt:
                     f["neverRead"] = True
-                f["done"] = True
+                f["done"], f["doneAt"] = True, iso(now)
             settle_rows(sess, settled)
             continue
         st = os.stat(path)
-        if (f.get("ino") is not None and (st.st_ino != f["ino"] or st.st_dev != f["dev"])) or st.st_size < f.get("offset", 0):
-            out.extend(rows)
+        if rebuilt or (f.get("ino") is not None and (st.st_ino != f["ino"] or st.st_dev != f["dev"])) or st.st_size < f.get("offset", 0):
+            # Its earlier rows are dropped by the void and read again. Rows of it not written yet (held Project Agent
+            # turns, released in this run or still held) come back from the re-read too, so they are dropped here.
+            out.extend(r for r in rows if r["session"] != sid)
             rows = []
+            out[:] = [r for r in out if not ("seq" in r and r["session"] == sid)]
+            state["held"] = [r for r in state["held"] if r["session"] != sid]
             out.append({"v": 1, "ev": "void", "session": sid, "upTo": state.get("lastSeq", 0)})
             for k in ("offset", "tail", "open", "turn", "cum", "lastCall", "seen", "model", "late", "bad"):
                 f.pop(k, None)
             f["offset"] = 0
-            f["voided"] = f.get("voided", 0) + 1
+            if not rebuilt:
+                f["voided"] = f.get("voided", 0) + 1
         f.update(path=path, dev=st.st_dev, ino=st.st_ino)
         reader = read_new(sess, f, path, st.st_size, settled) if st.st_size > f.get("offset", 0) else Reader(sess, f, settled)
         if f.get("open"):
@@ -743,7 +810,7 @@ def _collect(directory, folder, now, quiet, resummarize):
         settle_rows(sess, settled)
         seen = parse_ts(f.get("seen") or "") or 0
         if (sess.get("closed") or sess.get("gone")) and not f.get("open") and now - seen >= DONE_AFTER:
-            f["done"] = True
+            f["done"], f["doneAt"] = True, iso(now)
     out.extend(rows)
     for row in out:
         if "seq" in row:
@@ -906,6 +973,7 @@ def bind_pending(ctx):
 
 # ---- reconstruct ----------------------------------------------------------------------------------
 
+OWNED_WINDOW = 600  # seconds: a journal start entry this close to a launch record of the same terminal is that record's
 START = re.compile(r"(?<![A-Za-z0-9_-])(t[0-9a-z]{1,6})\s+\(([A-Za-z]+-\d+-[A-Za-z0-9_-]+)\)")
 
 
@@ -955,6 +1023,11 @@ def reconstruct(directory, dry_run=False, now=None, quiet=False):
     for path, sid in codex_rollouts():
         if sid not in cands:
             cands[sid] = {"sid": sid, "path": path, "program": "codex", "cwd": None}
+    # Launch records still waiting for their file (Codex, --continue): the collect binds those files, not this.
+    bound_for = {r.get("for") for r in records if r.get("ev") == "bind" and r.get("for")}
+    waiting = [(r.get("program") or "claude", os.path.normpath(r["cwd"]), parse_ts(r.get("at") or "") or 0) for r in records
+               if r.get("ev") == "start" and not r.get("session") and r.get("bind") == "launch-window"
+               and isinstance(r.get("cwd"), str) and record_key(r) not in bound_for]
     found = []
     for sid, c in sorted(cands.items()):
         if sid in known:
@@ -965,6 +1038,9 @@ def reconstruct(directory, dry_run=False, now=None, quiet=False):
                 continue
             c["cwd"] = os.path.normpath(cwd)
         if first is None or first < created - 60:
+            continue
+        if any(p == c["program"] and w == os.path.normpath(c["cwd"] or "") and at - FORK_SLACK <= first <= at + 120
+               for p, w, at in waiting):
             continue
         c.update(first=first, last=last or first)
         found.append(c)
@@ -1000,11 +1076,20 @@ def reconstruct(directory, dry_run=False, now=None, quiet=False):
             for address, name in START.findall(e["why"]):
                 starts.append({"at": e["at"], "address": address, "name": name, "task": task_for(directory, name) or e["task"]})
     used = {m["terminal"] for m in matches if m["terminal"]}
+    # A start entry of a worker that has its own launch record (or an earlier bind) belongs to that session.
+    owned = {}
+    for r in records:
+        if r.get("ev") in ("start", "bind") and isinstance(r.get("terminal"), str):
+            at = parse_ts(r.get("startedAt") or r.get("at") or "")
+            if at is not None:
+                owned.setdefault(r["terminal"], []).append(at)
 
     def entries_for(c):
         out = []
         for s in starts:
             if s["address"] in used or not (c["first"] - 120 <= s["at"] <= c["first"]):
+                continue
+            if any(abs(at - s["at"]) <= OWNED_WINDOW for at in owned.get(s["address"], [])):
                 continue
             if c["cwd"] == project or c["cwd"] in worktrees.get(s["task"], set()):
                 out.append(s)
