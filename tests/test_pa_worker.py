@@ -422,6 +422,58 @@ class WorktreeRule(Base):
         self.assertEqual(code, 0, err)
         self.assertFalse(os.path.isdir(self.wt))
 
+    # ---- review round 2 ----
+    def test_c6d_a_changed_worktree_is_asked_again(self):  # P11
+        self.add_task("t-003", "done", self.wt, [])
+        self.answered_delete()
+        self.commit(self.wt, "late.txt", "late\n", "a commit after the card")
+        code, _, err = self.remove()
+        self.assertEqual(code, 2)
+        self.assertIn("the card is withdrawn and the next `pa-worktree check --open-cards` asks again. Nothing was removed", err)
+        card = self.card()
+        self.assertEqual((card["status"], card["answer"], card["previousAnswer"]), ("withdrawn", None, "Delete"))
+        self.assertIn("has new commits since the card", card["note"])
+        self.assertIn("withdrew card d-wt-t-003", self.journal()[-1]["why"])
+        self.assertTrue(os.path.isdir(self.wt))
+        self.assertIn("opened card d-wt-t-003", self.check()[1])
+        self.assertEqual(self.card()["status"], "open")
+        self.assertIn("a commit after the card", self.card()["context"])
+
+    def test_c6e_more_uncommitted_files_also_ask_again(self):  # P11, the older count check
+        self.add_task("t-003", "done", self.wt, [])
+        card = self.answered_delete()
+        card["snapshot"] = {"uncommitted": 0, "unpushed": 0}  # a card from before round 1: counts only
+        dump(card, os.path.join(self.dir, "decisions", "d-wt-t-003.json"))
+        write(os.path.join(self.wt, "new.txt"), "x\n")
+        code, _, err = self.remove()
+        self.assertEqual(code, 2)
+        self.assertEqual(self.card()["status"], "withdrawn")
+
+    def failing_status(self):
+        real = shutil.which("git")
+        bin_dir = os.path.join(self.tmp, "bin")
+        write(os.path.join(bin_dir, "git"), '#!/bin/sh\nfor a in "$@"; do [ "$a" = status ] && {{ echo broken >&2; exit 1; }}; done\nexec "{}" "$@"\n'.format(real))
+        os.chmod(os.path.join(bin_dir, "git"), 0o755)
+        return bin_dir
+
+    def test_c7_git_status_failing_is_reported_as_a_failure(self):  # P16
+        self.add_task("t-003", "done", self.wt, [])
+        dump({"id": "d-wt-t-003", "task": "t-003", "worktree": os.path.realpath(self.wt), "status": "answered", "answer": "Delete",
+              "snapshot": {"uncommitted": 0, "unpushed": 0}}, os.path.join(self.dir, "decisions", "d-wt-t-003.json"))
+        saved = os.environ["PATH"]
+        os.environ["PATH"] = self.failing_status() + os.pathsep + saved
+        try:
+            out = self.run_cmd("pa-worktree", "check", "--space", "sp1")[1]
+            code, rout, err = self.remove()
+        finally:
+            os.environ["PATH"] = saved
+        self.assertIn("could not read {} (git status failed)".format(os.path.realpath(self.wt)), out)
+        self.assertNotIn("gone or not a git worktree", out)
+        self.assertEqual(code, 2)
+        self.assertIn("could not read {} (git status failed); nothing was removed".format(os.path.realpath(self.wt)), err)
+        self.assertNotIn("Already gone", rout)
+        self.assertTrue(os.path.isdir(self.wt))
+
     def test_c4b_remove_still_rechecks_uncommitted_files(self):
         self.add_task("t-003", "done", self.wt, [])
         dump({"id": "d-wt-t-003", "task": "t-003", "worktree": os.path.realpath(self.wt), "status": "answered", "answer": "Delete",
@@ -929,6 +981,15 @@ class Close(Base):
         finally:
             os.environ["PATH"] = saved
         self.refused(result, "cannot tell whether {} holds uncommitted work".format(os.path.realpath(self.wt)))
+
+    def test_w20c_the_later_start_wins(self):  # P14: an early `started` in the ledger cannot make an old file count
+        old = self.evidence("t-003", "OLD.md", "an earlier worker's report\n")
+        os.utime(old, (time.time() - 7200, time.time() - 7200))
+        led = self.ledger()
+        led["tasks"][0]["workers"][0]["started"] = "2020-01-01T00:00:00Z"
+        self.ledger(led)
+        self.terms["t31"]["created_ms"] = int((time.time() - 3600) * 1000)
+        self.refused(self.close("t31", "--evidence", "OLD.md"), "OLD.md was last written before t31 started")
 
 
 class Keep(Base):
