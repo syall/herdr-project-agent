@@ -214,14 +214,18 @@ Run `hc --skill` once to learn `hc`. Start workers with the profile's commands (
   recorded workers that are not working, blocked or finished (how long each has been
   idle, any uncommitted files, and the last journal line that names it, quoted for the
   person), puts that list on one decision card (`d-leftovers`: Close all listed, or
-  Close none) and sets `workerPolicy`, so it is offered once. Tell the person the card
-  is there; they answer it in the panel only, and may name workers to keep in its note
-  or tell you "keep tNN" first. When it is answered Close all listed, run
-  `pa-worker close --card d-leftovers`: it closes each listed worker through the same
-  guards, and skips and lists one the note names, one marked keep, and one that is
-  working, blocked, has uncommitted files, or became active or changed since the card.
-  Answered Close none: leave them, and close each later like any other worker, once you
-  have read its report.
+  Close none), at most 10 to a card and only as many as the card shows in full, and
+  sets `workerPolicy`. Tell the person the card is there; they answer it in the panel
+  only, and say "keep tNN" to you first for any worker to keep. When it is answered
+  Close all listed, run `pa-worker close --card d-leftovers` (for a later card, its own
+  id): it closes each worker on that card through the same guards, and skips and lists
+  one marked keep and one that is working, blocked, has uncommitted files, or became
+  active or changed since the card. If the person wrote a note, nothing is closed and
+  the card is withdrawn: ask them to say "keep tNN" for the ones to keep. Answered Close
+  none: leave them, and close each later like any other worker, once you have read its
+  report. Act on the answer (or the withdrawal), then run `pa-worker close --leftovers`
+  again: it opens the next card when some workers did not fit or the card was
+  withdrawn, and otherwise says it already ran.
 - Worktrees outlive their workers: a task's worktree stays while its workers come and
   go. Only when every task using a worktree is done or parked, and no worker or other
   terminal is working in it, does the person get asked: each pass, run

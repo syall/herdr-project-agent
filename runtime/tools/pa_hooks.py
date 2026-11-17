@@ -1353,6 +1353,7 @@ def keep_worker(directory, agent, address, quote, off):
 
 
 LEFTOVERS_CARD = "d-leftovers"
+LEFTOVERS_PER_CARD = 10  # workers on one leftovers card, at most; fewer when their lines pass CONTEXT_MAX
 CLOSE_ALL, CLOSE_NONE = "Close all listed", "Close none"
 
 
@@ -1457,72 +1458,109 @@ def leftover_line(w):
     return [head, quoted]
 
 
-def leftovers_context(listed, held):
-    lines = ["Workers recorded before one-worker-per-job, listed by `pa-worker close --leftovers`. Nothing has been closed."]
-    for w in listed:
-        lines += leftover_line(w)
-    if held:
-        lines.append("Not listed (the agent closes them later, after their reports): " + ", ".join(
-            "{} ({})".format(h["address"], h["why"]) for h in held))
-    text = "\n".join(lines)
-    if len(text) > CONTEXT_MAX:
-        tail_ = "… (every listed worker is in this card's workers field)"
-        keep = text[:CONTEXT_MAX - len(tail_) - 1]
-        text = keep[:keep.rfind("\n")] + "\n" + tail_
-    return text
+def leftovers_card_text(listed, held):
+    """(the workers on the card, its context). A card holds only the workers whose lines it shows in full:
+    at most LEFTOVERS_PER_CARD, and no more than fit in CONTEXT_MAX with the header and the footer. The
+    panel shows the whole context, so what "Close all listed" can close is exactly what the person saw."""
+    header = "Workers recorded before one-worker-per-job, listed by `pa-worker close --leftovers`. Nothing has been closed."
+    held_line = ("Not listed (the agent closes them later, after their reports): " + ", ".join(
+        "{} ({})".format(h["address"], h["why"]) for h in held)) if held else ""
+    held_line = cut(held_line, 400)
+    shown, body = [], []
+    for w in listed[:LEFTOVERS_PER_CARD]:
+        lines = leftover_line(w)
+        more = len(listed) - len(shown) - 1
+        footer = ([("{} more old-style workers did not fit on this card; they come on the next card, once this one is "
+                    "answered.").format(more)] if more else []) + ([held_line] if held_line else [])
+        if len("\n".join([header] + body + lines + footer)) > CONTEXT_MAX and shown:
+            break
+        shown.append(w)
+        body += lines
+    more = len(listed) - len(shown)
+    footer = ([("{} more old-style workers did not fit on this card; they come on the next card, once this one is "
+                "answered.").format(more)] if more else []) + ([held_line] if held_line else [])
+    return shown, "\n".join([header] + body + footer)[:CONTEXT_MAX]
+
+
+def shown_before(directory, policy):
+    """Workers on earlier leftovers cards that the person answered: they are not offered again."""
+    seen = set()
+    for card_id in (policy or {}).get("cards") or []:
+        card = pa.read_json(os.path.join(directory, "decisions", card_id + ".json")) or {}
+        if card.get("status") == "answered":
+            seen |= {(w.get("address"), w.get("task"), w.get("name")) for w in card.get("workers") or []}
+    return seen
 
 
 def close_leftovers(directory, agent, profile, dry_run):
-    """pa-worker close --leftovers [--dry-run], as the person decided on card d-031: list the recorded
-    workers from before one-worker-per-job that are idle and not finished on ONE decision card, and set
-    workerPolicy so it is offered once. It closes nothing; `pa-worker close --card` does, after the person
-    answers the card in the panel."""
-    policy = read_ledger(directory).get("workerPolicy")
+    """pa-worker close --leftovers [--dry-run], as the person decided on card d-031: put the recorded workers
+    from before one-worker-per-job that are idle and not finished on a decision card, one card at a time, and
+    close nothing; `pa-worker close --card` does that after the person answers it in the panel. The first run
+    sets workerPolicy. A later run opens the next card only when the last one is answered and some workers did
+    not fit on it, or when it was withdrawn (a note); else it says it already ran."""
+    ledger = read_ledger(directory)
+    policy = ledger.get("workerPolicy")
     if policy:
-        print("--leftovers already ran (workerPolicy since {}; card {}); nothing was done.".format(policy.get("since"), policy.get("card") or "none"))
-        return
+        last_id = policy.get("card")
+        last = pa.read_json(os.path.join(directory, "decisions", last_id + ".json")) if last_id else None
+        again = last and (last.get("status") == "withdrawn" or (last.get("status") == "answered" and last.get("more")))
+        if not again:
+            print("--leftovers already ran (workerPolicy since {}; card {}{}); nothing was done.".format(
+                policy.get("since"), last_id or "none",
+                " is open: the person answers it first" if last and last.get("status") == "open" else ""))
+            return
+    seen = shown_before(directory, policy)
+    listed, held = leftover_list(directory, agent, profile, ledger)
+    listed = [w for w in listed if (w["address"], w["task"], w["name"]) not in seen]
+    on_card, context = leftovers_card_text(listed, held)
+    cards = list((policy or {}).get("cards") or [])
+    card_id = LEFTOVERS_CARD if not cards else "{}-{}".format(LEFTOVERS_CARD, len(cards) + 1)
     if dry_run:
-        listed, held = leftover_list(directory, agent, profile, read_ledger(directory))
-        for w in listed:
+        for w in on_card:
             print("would list {} ({}, {}): {}".format(w["address"], w["name"] or "unnamed", w["task"], leftover_line(w)[0].split(": ", 1)[1]))
+        if len(listed) > len(on_card):
+            print("{} more would wait for the next card".format(len(listed) - len(on_card)))
         for h in held:
             print("not listed {} ({}, {}): {}".format(h["address"], h.get("name") or "unnamed", h["task"], h["why"]))
         if not listed:
             print("No old-style workers to list.")
         return
     by = "agent" if by_an_agent() else "person"
-    path = os.path.join(directory, "decisions", LEFTOVERS_CARD + ".json")
+    path = os.path.join(directory, "decisions", card_id + ".json")
     with ledger_lock(directory):
         ledger = read_ledger(directory)
-        listed, held = leftover_list(directory, agent, profile, ledger)
-        opened = bool(listed) and not os.path.exists(path)
+        opened = bool(on_card) and not os.path.exists(path)
         if opened:
             pa.write_json(path, {
-                "id": LEFTOVERS_CARD, "kind": "leftovers", "task": None,
-                "question": "Close the {} worker(s) left from before one-worker-per-job?".format(len(listed)),
-                "context": leftovers_context(listed, held),
-                "options": [{"label": CLOSE_ALL, "detail": "The agent closes each listed worker with `pa-worker close --card {}`. It skips a worker "
-                             "you name in the note (or told it to keep), and one that is working, blocked, has uncommitted files, or became "
-                             "active or changed since this card. Worktrees, branches, tasks and evidence stay.".format(LEFTOVERS_CARD)},
-                            {"label": CLOSE_NONE, "detail": "Leave them all. The agent closes each later, once it has read its report."}],
+                "id": card_id, "kind": "leftovers", "task": None,
+                "question": "Close the {} worker(s) left from before one-worker-per-job that are listed here?".format(len(on_card)),
+                "context": context,
+                "options": [{"label": CLOSE_ALL, "detail": "The agent closes each worker listed here with `pa-worker close --card {}`. It skips "
+                             "one marked keep (tell the agent \"keep tNN\" first), and one that is working, blocked, has uncommitted files, or "
+                             "became active or changed since this card. Leave the note empty: a note means nothing on this card is closed. "
+                             "Worktrees, branches, tasks and evidence stay.".format(card_id)},
+                            {"label": CLOSE_NONE, "detail": "Leave them. The agent closes each later, once it has read its report."}],
                 "evidence": [], "recommendation": None, "status": "open", "answer": None, "note": None,
-                "workers": listed, "notListed": held, "created": pa.now(), "answered": None})
-        ledger["workerPolicy"] = {"style": "per-job", "since": pa.now(), "card": LEFTOVERS_CARD if listed else None}
+                "workers": on_card, "more": len(listed) - len(on_card), "notListed": held, "created": pa.now(), "answered": None})
+        ledger["workerPolicy"] = dict(policy or {"style": "per-job", "since": pa.now()},
+                                      card=card_id if opened else (policy or {}).get("card"), cards=cards + ([card_id] if opened else []))
         pa.write_json(os.path.join(directory, "ledger.json"), ledger)
-        append_journal(directory, {"by": by, "trigger": "leftovers", "why": "listed {} old-style worker(s) on card {} for the person: {}; not listed: {}; "
-                                   "nothing was closed".format(len(listed), LEFTOVERS_CARD if listed else "(none)",
-                                                               ", ".join(w["address"] for w in listed) or "none",
-                                                               ", ".join("{} ({})".format(h["address"], h["why"]) for h in held) or "none")})
-    for w in listed:
+        append_journal(directory, {"by": by, "trigger": "leftovers", "why": "listed {} old-style worker(s) on card {} for the person: {}; {} wait for "
+                                   "the next card; not listed: {}; nothing was closed".format(
+                                       len(on_card), card_id if opened else "(none)", ", ".join(w["address"] for w in on_card) or "none",
+                                       len(listed) - len(on_card), ", ".join("{} ({})".format(h["address"], h["why"]) for h in held) or "none")})
+    for w in on_card:
         print("listed {} ({}, {}): {}".format(w["address"], w["name"] or "unnamed", w["task"], leftover_line(w)[0].split(": ", 1)[1]))
+    if len(listed) > len(on_card):
+        print("{} more wait for the next card: once {} is answered, run pa-worker close --leftovers again".format(len(listed) - len(on_card), card_id))
     for h in held:
         print("not listed {} ({}, {}): {}".format(h["address"], h.get("name") or "unnamed", h["task"], h["why"]))
-    if not listed:
+    if not on_card:
         print("No old-style workers to list; no card opened. workerPolicy is set (per-job).")
     elif opened:
-        print("opened card {} for the person; nothing was closed. workerPolicy is set (per-job).".format(LEFTOVERS_CARD))
+        print("opened card {} for the person; nothing was closed. workerPolicy is set (per-job).".format(card_id))
     else:
-        print("card {} exists already; nothing was closed. workerPolicy is set (per-job).".format(LEFTOVERS_CARD))
+        print("card {} exists already; nothing was closed.".format(card_id))
 
 
 def leftovers_card(directory, card_id):
@@ -1538,6 +1576,16 @@ def leftovers_card(directory, card_id):
         raise pa.Problem("card {} is answered in the panel only; nothing was closed".format(card_id))
     if card.get("answer") != CLOSE_ALL:
         raise pa.Problem("card {} was answered {!r}; nothing was closed".format(card_id, card.get("answer")))
+    if str(card.get("note") or "").strip():
+        # A note is never parsed: it could name a worker to keep in any words. Close nothing and ask again.
+        card.update(status="withdrawn", previousAnswer=card.get("answer"), answer=None, answeredBy="pa-worker close: withdrawn",
+                    withdrawnAt=pa.now())
+        pa.write_json(os.path.join(directory, "decisions", card_id + ".json"), card)
+        append_journal(directory, {"by": "agent" if by_an_agent() else "person", "trigger": "leftovers",
+                                   "why": "withdrew card {}: it was answered with a note ({}); nothing was closed".format(card_id, cut(clean(card["note"]), 200))})
+        raise pa.Problem('card {} has a note, so nothing was closed: "{}". The note is not read. Ask the person to say "keep tNN" for each '
+                         'worker to keep (pa-worker keep), then run pa-worker close --leftovers to ask again on a new card'.format(
+                             card_id, cut(clean(card["note"]), 200)))
     return card
 
 
@@ -1547,10 +1595,10 @@ def card_refusal(card, address, task, entry, info):
                    and w.get("name") == clean(entry.get("name"))), None)
     if not listed:
         return "{} is not on card {}; nothing was closed".format(address, card["id"])
-    if any(re.search(w, str(card.get("note") or "")) for w in worker_words(address, entry.get("name"))):
-        return "the person named {} in the card's note; not closed".format(address)
     created = pa.parse_time(str(card.get("created") or ""))
     changed = (info or {}).get("status_ms")
+    if info and not isinstance(changed, (int, float)):
+        return "activity since card {} opened is unknown (hc gives no status time); not closed".format(card["id"])
     if (listed.get("state") == "gone" and info) or (created and isinstance(changed, (int, float)) and changed / 1000.0 > created):
         return "{} has been active since card {} opened; not closed".format(address, card["id"])
     return None
