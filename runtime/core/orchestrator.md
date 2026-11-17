@@ -242,8 +242,9 @@ Run `hc --skill` once to learn `hc`. Start workers with the profile's commands (
   reviewer; high a verifier and two reviewers when its review is full, one on a diff
   review. Size the verifier's brief by tier: low, the full suite once, the diff, at most
   5 mutations on changed logic; normal, add a failing-first run for each fix commit, at
-  most 15 mutations; high, what the plan's verification points ask. Until the gate
-  accepts the `check` role, record a `check` worker in the ledger with role `reviewer`.
+  most 15 mutations; high, what the plan's verification points ask. Record a `check`
+  worker in the ledger with role `check`; the gate counts it as the reviewer for low
+  tier only.
 - One git worktree per code task. Parallel workers only when they touch different files.
 - Before starting the first worker in a worktree, install the verification hooks there:
   `pa-hooks install <worktree> --task <task-id>` (add `--fix` for a bug fix: it locks test

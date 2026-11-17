@@ -466,10 +466,19 @@ def evaluate_gate(directory, task, phase, rules=None, runner=None):
     if phase == "review":
         workers = task.get("workers") or []
         authors = {w.get("address") for w in workers if w.get("role") in ("build", "design")}
-        reviewers = {w.get("address") for w in workers if w.get("role") == "reviewer"}
-        separate = bool(reviewers) and not (reviewers & authors)
-        checks.append({"check": "reviewer is not the author", "ok": separate,
-                       **({} if separate else {"why": "the ledger lists no reviewer worker separate from the build workers"})})
+        # A `check` worker (verifier and reviewer in one) counts as the reviewer for low tier only (t-017 R4,
+        # AC4.3); at any tier, a reviewer or check worker that is also an author fails.
+        counted = ("reviewer", "check") if tier == "low" else ("reviewer",)
+        reviewers = {w.get("address") for w in workers if w.get("role") in counted}
+        both = [w for w in workers if w.get("role") in ("reviewer", "check") and w.get("address") in authors]
+        separate = bool(reviewers) and not both
+        if both:
+            why = "{} is recorded as {} and as a build or design worker".format(both[0].get("address"), both[0].get("role"))
+        elif tier == "low":
+            why = "the ledger lists no reviewer or check worker separate from the build workers"
+        else:
+            why = "the ledger lists no reviewer worker separate from the build workers (a check worker counts for low tier only)"
+        checks.append({"check": "reviewer is not the author", "ok": separate, **({} if separate else {"why": why})})
     ok = all(c["ok"] for c in checks)
     return {"task": task.get("id"), "phase": phase, "tier": tier, "passed": ok, "at": pa.now(), "checks": checks,
             "commits": gate_commits(task.get("worktree"), runner)}
