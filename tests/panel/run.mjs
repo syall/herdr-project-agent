@@ -1801,8 +1801,11 @@ cases["P-push-pick-checks"] = async () => { // AC6.1: picking Push checks again;
 };
 
 // The card as pa-push-main run writes it on a push (plan §4.7, Job A): answered, with push.done and push.result.
+// Its reply prints the same result it wrote (toolPushed).
+const toolResult = { ...runPushed.result, how: "pushed", output: "To file:///tmp/pa-scratch/origin.git\n   aa22000..cc11000  cc11 -> main" };
+const toolPushed = { ...runPushed, result: toolResult };
 const answeredByTool = (over = {}) => { const base = JSON.parse(pushCardText()); return JSON.stringify({ ...base, status: "answered", answer: "Push", note: null,
-  answered: "2026-11-16T10:01:00Z", answeredBy: "person, in the panel", push: { ...base.push, done: true, result: { ...runPushed.result, how: "pushed", output: "To file:///tmp/pa-scratch/origin.git\n   aa22000..cc11000  cc11 -> main" } }, ...over }); };
+  answered: "2026-11-16T10:01:00Z", answeredBy: "person, in the panel", push: { ...base.push, done: true, result: toolResult }, ...over }); };
 
 cases["P-push-run-once"] = async () => { // AC6.2, AC5.3: Submit Push runs pa-push-main run once per click; the card file is written by the tool only
   const gate = deferred();
@@ -1819,7 +1822,7 @@ cases["P-push-run-once"] = async () => { // AC6.2, AC5.3: Submit Push runs pa-pu
   check(JSON.stringify(runs[0][1]) === JSON.stringify(["run", PID, "--answer", "Push", "--space", S, "--seen", "seen-token-1", "--json"]), `its argv (got ${JSON.stringify(runs[0][1])})`);
   check(runs[0][2] === null && runs[0][3]?.timeout === 600000, `on null, timeout 600 s (got ${JSON.stringify(runs[0][3])})`);
   const writes = (g.__writes ?? []).length, checks = pushExecs("check").length;
-  gate.resolve(json(0, runPushed)); await settle(); await settle();
+  gate.resolve(json(0, toolPushed)); await settle(); await settle();
   check(pushExecs("run").length === 1, "still one run");
   check(!(g.__writes ?? []).slice(writes).some((k) => String(k).includes("/decisions/")), "the panel wrote no card file");
   // The panel's own reload has read the card answered: the result and the output tail stay on screen (spec §8.2, AC6.2).
@@ -1837,7 +1840,7 @@ cases["P-push-run-once"] = async () => { // AC6.2, AC5.3: Submit Push runs pa-pu
 
 cases["P-push-result-kept-until-left"] = async () => { // §8.2: the pushed card's result stays until the person leaves it (another view, or Done)
   let file;
-  const { v, file: f } = await pushWorld({ tool: { run: () => { g.__files[file] = answeredByTool(); return json(0, runPushed); } } });
+  const { v, file: f } = await pushWorld({ tool: { run: () => { g.__files[file] = answeredByTool(); return json(0, toolPushed); } } });
   file = f;
   await click(v, `opt-${PID}-0`); await settle();
   await click(v, `submit-${PID}`); await settle(); await settle();
@@ -1846,7 +1849,7 @@ cases["P-push-result-kept-until-left"] = async () => { // §8.2: the pushed card
   let t = look(v).text;
   check(!t.includes("cc11 -> main") && t.includes("No open decisions") && t.includes("1 answered"), `left: no longer kept, the card is with the answered ones (got ${t.slice(0, 1200)})`);
   // The same with its Done link.
-  const { v: w, file: f2 } = await pushWorld({ tool: { run: () => { g.__files[file] = answeredByTool(); return json(0, runPushed); } } });
+  const { v: w, file: f2 } = await pushWorld({ tool: { run: () => { g.__files[file] = answeredByTool(); return json(0, toolPushed); } } });
   file = f2;
   await click(w, `opt-${PID}-0`); await settle();
   await click(w, `submit-${PID}`); await settle(); await settle();
@@ -1874,7 +1877,7 @@ cases["P-push-run-crash"] = async () => { // a run that exits non-zero with no J
     const checks = pushExecs("check").length;
     await click(v, `submit-${PID}`); await settle();
     const { text } = look(v);
-    check(/The result is unknown \(.*\); checking the card again\./.test(text) && !text.includes("Not pushed"), `exit ${code}: result unknown, not "Not pushed" (got ${text.slice(0, 1500)})`);
+    check(/The result is unknown \([\s\S]*\); checking the card again\./.test(text) && !text.includes("Not pushed"), `exit ${code}: result unknown, not "Not pushed" (got ${text.slice(0, 1500)})`);
     check(pushExecs("check").length === checks + 1, `exit ${code}: one check after it (got ${pushExecs("check").length - checks})`);
     check(pushExecs("run").length === 1, `exit ${code}: one run`);
     const said = sends().map((x) => x[2]);
