@@ -1877,6 +1877,48 @@ class PC_Subagents(Collecting):
         self.assertEqual(self.totals(), before)
 
 
+# ---- fix round 2, P-d: long.above in the price table ------------------------------------------------------------
+
+class PD_LongAbove(Collecting):
+    def with_long(self, above):
+        t = json.loads(json.dumps(PRICES))
+        block = {"in": 2.0, "out": 20.0, "cw5m": 4.0, "cw1h": 8.0, "cr": 1.0}
+        if above is not ABSENT:
+            block["above"] = above
+        t["models"]["model-a"][0]["long"] = block
+        self.prices(t)
+        return pa_costs.load_prices(pa.load_profile("test"))
+
+    def test_pd1_a_bad_long_above_refuses_the_table(self):
+        for bad in (0, -5, 1.5, "200000", True, None, [200000]):
+            table, problem = self.with_long(bad)
+            self.assertIsNone(table, bad)
+            self.assertIn("long.above must be a positive whole number of prompt tokens", problem or "", bad)
+            self.assertIn("model-a", problem, bad)
+
+    def test_pd2_absent_or_a_positive_integer_is_accepted(self):
+        for good in (ABSENT, 200000):
+            table, problem = self.with_long(good)
+            self.assertIsNone(problem, good)
+            self.assertEqual(table.get("warnings"), [], good)
+
+    def test_pd3_another_threshold_is_named_not_silently_ignored(self):
+        table, problem = self.with_long(100000)
+        self.assertIsNone(problem)
+        self.assertEqual(len(table["warnings"]), 1)
+        self.assertIn("model-a", table["warnings"][0])
+        self.assertIn("200000", table["warnings"][0])
+        self.record(session=SID, task="t-001")
+        self.add(self.prompt(T0 + 1), self.call(T0 + 2, "m1", lines=1, out=10))
+        self.collect(T0 + 2000)
+        self.assertIn(table["warnings"][0], load(self.costs("summary.json"))["problems"])
+        _r, out, _e = self.run_cmd(pa_costs.cmd_prices, self.dir)
+        self.assertIn(table["warnings"][0], out)
+
+
+ABSENT = object()
+
+
 class I1_Install(unittest.TestCase):
     def test_i1_install_links_pa_costs(self):
         with open(os.path.join(HERE, "..", "install.sh")) as f:
