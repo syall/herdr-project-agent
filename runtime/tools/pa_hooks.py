@@ -287,8 +287,7 @@ def _hook_guard(data, _args):
         pa_guard = _load_guard()
         refusal = pa_guard.check_command(command, pa_address=(agent or {}).get("terminal"),
                                          own_address=os.environ.get("HC_TERMINAL_ID"),
-                                         extra_rows=lambda: pa_guard.profile_rows(profile), cwd=starts,
-                                         spaces_dir=os.path.join(pa.ROOT, "spaces"), home=pa.ROOT)
+                                         extra_rows=lambda: pa_guard.profile_rows(profile), cwd=starts)
         if refusal:
             block(refusal)
     else:
