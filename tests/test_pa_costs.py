@@ -2534,6 +2534,71 @@ class F5_Comparison(FR5_BillingRound5):
         self.assertIn("  no billed rows for account acct1", out)
 
 
+class F6_CollectFailure(Collecting):
+    """Item 6 (REVIEW-2 RL3): when collect refuses or fails, summary.json says why, and the next good collect clears it."""
+
+    def space(self):
+        self.prices()
+        self.record(session=SID, task="t-001")
+        self.add(self.prompt(T0 + 1), self.call(T0 + 2, "m1", out=30, inp=500))
+        self.collect(T0 + 2000)
+        return load(self.costs("summary.json"))
+
+    def set_version(self, v):
+        state = load(self.costs("state.json"))
+        state["v"] = v
+        dump(state, self.costs("state.json"))
+
+    def main_collect(self):
+        return self.run_cmd(pa_costs.main, ["collect", "--space", "sp1", "--quiet"])
+
+    def test_f6_a_refused_collect_is_in_the_summary_and_cleared_after(self):
+        before = self.space()
+        self.set_version(2)
+        turns = raw(self.costs("turns.jsonl"))
+        with self.assertRaises(pa.Problem):
+            self.main_collect()
+        s = load(self.costs("summary.json"))
+        self.assertEqual(s["collect"]["ok"], False)
+        self.assertIn("state.json has version 2", s["collect"]["why"])
+        self.assertTrue(s["problems"][0].startswith("collect failed: "))
+        self.assertEqual(s["totals"], before["totals"])  # the last good figures stay
+        self.assertEqual(raw(self.costs("turns.jsonl")), turns)
+        self.set_version(1)
+        self.main_collect()
+        s = load(self.costs("summary.json"))
+        self.assertNotIn("collect", s)
+        self.assertFalse(any(p.startswith("collect failed") for p in s["problems"]))
+        self.assertEqual(s["totals"], before["totals"])
+
+    def test_f6_an_unexpected_error_names_its_type_only(self):
+        self.space()
+        saved = pa_costs._collect
+
+        def boom(*a, **kw):
+            raise ValueError("{} some text".format(fx.CANARY))
+        pa_costs._collect = boom
+        try:
+            with self.assertRaises(ValueError):
+                self.main_collect()
+        finally:
+            pa_costs._collect = saved
+        s = load(self.costs("summary.json"))
+        self.assertEqual(s["collect"]["why"], "ValueError")
+        self.assertNotIn(fx.CANARY, raw(self.costs("summary.json")).decode())
+
+    def test_f6_with_no_summary_yet_a_short_one_without_totals(self):
+        self.space()
+        os.unlink(self.costs("summary.json"))
+        self.set_version(2)
+        with self.assertRaises(pa.Problem):
+            self.main_collect()
+        s = load(self.costs("summary.json"))
+        self.assertEqual((s["v"], s["space"], s["collect"]["ok"]), (1, "sp1", False))
+        self.assertNotIn("totals", s)
+        self.assertTrue(s["problems"][0].startswith("collect failed: "))
+
+
 ABSENT = object()
 
 
