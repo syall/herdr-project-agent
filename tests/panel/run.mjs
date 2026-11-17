@@ -2617,6 +2617,121 @@ cases["P-costs-currency-fallback"] = async () => { // K6: a currency code Intl d
   check(costsView(v).text.includes("12.50 XTSX est."), `the fallback (got ${costsView(v).text.slice(0, 800)})`);
 };
 
+// ---- t-009 Costs view (step 10): the timer's collection and the scheduled billing query (R6, R11, R15) ----
+const timerMod = async () => import(path.join(dst, "timer.js"));
+const fetchOk = () => ({ code: 0, stdout: "", stderr: "" });
+// A Project Agent record for sp1 (or m1/sp1) that the keeper ("K", the lease holder) has judged; alive: its launcher runs.
+function timerWorld({ machine = null, alive: on = false, tool = {} } = {}) {
+  world({ machine, records: { tb1: { space: machine ? `${machine}/${S}` : S, project: "/proj", profile: "test", name: "proj", terminal: "t4w", alive: on } },
+    extraTabs: [paTab], extraPanes: on ? [paPane()] : [], extraTerms: on ? [{ ...paTerm(), status: "idle" }] : [], agents: on ? [{ address: "t4w", status: "idle" }] : [] });
+  costsTool({ "billed fetch": fetchOk, ...tool });
+}
+const collects = () => costsExecs("collect");
+async function tickAt(tick, ms, id = "K") { g.__now = ms; for (const k of ["project-agent.timer", "project-agent.keeper"]) if (g.__shared[k]?.id === "K") g.__shared[k] = { id: "K", at: ms }; await tick(id); await settle(); }
+
+cases["K-costs-collect"] = async () => { // R11, D6: one collect --quiet per space, also for a record that is not alive; none again within 30 min
+  timerWorld();
+  const { tick } = await timerMod();
+  await tickAt(tick, T0);
+  const c = collects();
+  check(c.length === 1 && JSON.stringify(c[0][1]) === JSON.stringify(["collect", "--space", S, "--quiet"]) && c[0][2] === null, `one collect for the not-alive record (got ${JSON.stringify(c)})`);
+  for (let t = 15000; t < 1800000; t += 15000) await tickAt(tick, T0 + t);
+  check(collects().length === 1, `none again within COLLECT_SLOW (got ${collects().length})`);
+  await tickAt(tick, T0 + 1800000);
+  check(collects().length === 2, `again after 30 min (got ${collects().length})`);
+  check(!g.__hcs.some((a) => a[0] === "send"), "nothing typed into a terminal");
+};
+
+cases["K-costs-fast"] = async () => { // Q1 (b): while some copy shows this space's Costs view, every 120 s
+  timerWorld();
+  const { tick } = await timerMod();
+  for (let t = 0; t <= 240000; t += 15000) {
+    g.__shared["project-agent.costsShown"] = { [S]: T0 + t };
+    await tickAt(tick, T0 + t);
+    if (t === 105000) check(collects().length === 1, `not before 120 s (got ${collects().length})`);
+    if (t === 120000) check(collects().length === 2, `again at 120 s (got ${collects().length})`);
+  }
+  check(collects().length === 3, `every 120 s (got ${collects().length})`);
+  // A stamp older than 30 s does not count: back to 30 min.
+  g.__shared["project-agent.costsShown"] = { [S]: T0 + 240000 };
+  for (let t = 255000; t <= 600000; t += 15000) await tickAt(tick, T0 + t);
+  check(collects().length === 3, `a stale stamp: the slow cadence (got ${collects().length})`);
+};
+
+cases["K-costs-noawait"] = async () => { // R11, VP4: a hung collect never delays a pass, and no second one while it hangs (< 90 s)
+  timerWorld({ alive: true });
+  g.__files[`:${DIR}/schedule.json`] = JSON.stringify({ everyMinutes: 15, lastPass: isoAt(T0 - 20 * 60000), onlyWhileActive: false });
+  g.__execHang = [":pa-costs"];
+  const { tick } = await timerMod();
+  let done = false;
+  tick("K").then(() => { done = true; });
+  await settle();
+  check(done, "the tick ends while the collect hangs");
+  check(g.__hcs.some((a) => a[0] === "send" && a[1] === "t4w" && a[2] === "scheduled pass"), `the due pass is sent in the same tick (got ${JSON.stringify(g.__hcs)})`);
+  const hung = () => g.__execs.filter(([c, a]) => c === "pa-costs" && a[0] === "collect").length;
+  check(hung() === 1, `one collect (got ${hung()})`);
+  g.__files[`:${DIR}/schedule.json`] = JSON.stringify({ everyMinutes: 15, lastPass: isoAt(T0), onlyWhileActive: false });
+  g.__shared["project-agent.costsShown"] = { [S]: T0 + 75000 };
+  for (let t = 15000; t <= 75000; t += 15000) await tickAt(tick, T0 + t);
+  check(hung() === 1, `no second collect while the first hangs (got ${hung()})`);
+  for (let t = 90000; t <= 135000; t += 15000) { g.__shared["project-agent.costsShown"] = { [S]: T0 + t }; await tickAt(tick, T0 + t); }
+  check(hung() === 2, `one older than 90 s counts as gone (got ${hung()})`);
+};
+
+cases["K-costs-remote"] = async () => { // R6, AC6.1: a remote space's collect runs on its machine with its local id
+  timerWorld({ machine: M });
+  const { tick } = await timerMod();
+  await tickAt(tick, T0);
+  const c = collects();
+  check(c.length === 1 && c[0][2] === M && JSON.stringify(c[0][1]) === JSON.stringify(["collect", "--space", S, "--quiet"]), `on m1, --space sp1 (got ${JSON.stringify(c)})`);
+  const f = costsExecs("billed fetch");
+  check(f.length === 1 && f[0][2] === null, `the billing query only here (got ${JSON.stringify(f)})`);
+};
+
+cases["K-costs-error"] = async () => { // a failed collect: shared project-agent.costs says why, the view shows it; a missing tool: the install text
+  timerWorld({ tool: { collect: () => ({ code: 2, stdout: "", stderr: "pa-costs: the price table is not valid JSON\nmore\n" }) } });
+  const { tick } = await timerMod();
+  await tickAt(tick, T0);
+  const rec = (g.__shared["project-agent.costs"] ?? {})[S];
+  check(rec && rec.ok === false && rec.code === 2 && rec.error === "pa-costs: the price table is not valid JSON", `the record (got ${JSON.stringify(g.__shared["project-agent.costs"])})`);
+  g.__files[`:${DIR}/costs/summary.json`] = JSON.stringify(costsSummary());
+  const v = await mount(); await settle(); await click(v, "view-costs"); await settle();
+  check(/Collector: last run .* failed: pa-costs: the price table is not valid JSON/.test(costsView(v).text), `the view says so (got ${costsView(v).text.slice(0, 800)})`);
+  const before = JSON.stringify(g.__shared["project-agent.costs"]);
+  await tickAt(tick, T0 + 1800000);
+  check(JSON.stringify(g.__shared["project-agent.costs"]) === before, "the same outcome is not written again");
+  timerWorld({ tool: { collect: () => { throw new Error("spawn pa-costs ENOENT"); } } });
+  await tickAt(tick, T0 + 3600000 * 5);
+  check((g.__shared["project-agent.costs"] ?? {})[S]?.missing === true, `not installed (got ${JSON.stringify(g.__shared["project-agent.costs"])})`);
+  g.__files[`:${DIR}/costs/summary.json`] = JSON.stringify(costsSummary());
+  const w = await mount(); await settle(); await click(w, "view-costs"); await settle();
+  check(costsView(w).text.includes("pa-costs is not installed here; run ./install.sh."), `the install text (got ${costsView(w).text.slice(0, 800)})`);
+  timerWorld({ tool: { collect: () => ({ code: 0, stdout: "", stderr: "" }) } });
+  g.__shared["project-agent.costs"] = { [S]: { at: isoAt(T0), ok: false, code: 2, error: "x" } };
+  await tickAt(tick, T0 + 3600000 * 9);
+  check((g.__shared["project-agent.costs"] ?? {})[S]?.ok === true, "a good run clears it");
+};
+
+cases["K-billing-tick"] = async () => { // R15: the lease holder only, here, billed fetch --scheduled --quiet at most once an hour (a shared stamp)
+  timerWorld();
+  const { tick } = await timerMod();
+  await tickAt(tick, T0);
+  let f = costsExecs("billed fetch");
+  check(f.length === 1 && JSON.stringify(f[0][1]) === JSON.stringify(["billed", "fetch", "--scheduled", "--quiet"]) && f[0][2] === null, `one scheduled fetch here (got ${JSON.stringify(f)})`);
+  for (let t = 15000; t < 3600000; t += 15000) await tickAt(tick, T0 + t);
+  check(costsExecs("billed fetch").length === 1, `none again within the hour (got ${costsExecs("billed fetch").length})`);
+  await tickAt(tick, T0 + 3600000);
+  check(costsExecs("billed fetch").length === 2, "again after an hour");
+  // A copy without the lease runs none; one that takes the lease over inside the hour runs none either.
+  await tickAt(tick, T0 + 3600000 + 7200000 - 1, "X");
+  check(costsExecs("billed fetch").length === 2, "a copy without the lease: none");
+  g.__shared["project-agent.timer"] = { id: "K", at: T0 + 3600000 - 60000 };
+  g.__now = T0 + 3600000 + 1800000;
+  await tick("K2"); await settle();
+  check(g.__shared["project-agent.timer"]?.id === "K2", "K2 took the lease");
+  check(costsExecs("billed fetch").length === 2, `a takeover inside the hour runs none (got ${costsExecs("billed fetch").length})`);
+};
+
 const pick = process.argv.slice(2);
 let failed = 0;
 for (const [name, fn] of Object.entries(cases)) {
