@@ -1000,12 +1000,14 @@ def _collect(directory, folder, now, quiet, resummarize):
         append_line(os.path.join(folder, "sessions.jsonl"), event)
     state["pending"] = ctx.get("pending") or []
     state["problems"] = state_problems(state)
+    cc_sig = cc_signature(directory)  # Claude Code's figures change without new session bytes (t-029 R5)
+    cc_changed, state["ccSig"] = cc_sig != state.get("ccSig"), cc_sig
     text = json.dumps(state, sort_keys=True, separators=(",", ":")) + "\n"
     if text != old_text:
         pa.write_text(state_path, text)
     written = [r for r in out if "seq" in r]
     failed = os.path.join(folder, FAILED_MARK)
-    if (written or resummarize or ctx["events"] or state["problems"] != old_problems
+    if (written or resummarize or ctx["events"] or state["problems"] != old_problems or cc_changed
             or not os.path.exists(os.path.join(folder, "summary.json")) or os.path.exists(failed)):
         write_summary(directory, state, now, ctx["records"] + ctx["events"])
         if os.path.exists(failed):
@@ -1478,8 +1480,94 @@ def drill(buckets, keep=8):
     return [{k: v for k, v in e.items() if k in ("key", "tokens", "money", "unpricedTokens")} for e in by_money(buckets)[:keep]]
 
 
-def summarize(directory, rows, records, table, price_problem, profile_name, now, problems=()):
-    """The summary.json object (spec 2.3) for the given ledger rows."""
+def read_cc(directory):
+    """(records, problems): costs/cc/*.json, newest first by mtime, at most CC_MAX_FILES, each checked again (t-029 R5)."""
+    folder = os.path.join(costs_dir(directory), "cc")
+    entries = []
+    try:
+        for e in os.scandir(folder):
+            if e.name.startswith(".") or not e.name.endswith(".json"):
+                continue
+            try:
+                if e.is_file():
+                    entries.append((e.stat().st_mtime, e.name))
+            except OSError:
+                continue
+    except OSError:
+        return [], []
+    entries.sort(reverse=True)
+    problems = []
+    if len(entries) > CC_MAX_FILES:
+        problems.append("costs/cc: {} older file(s) beyond the {} newest were not read".format(len(entries) - CC_MAX_FILES, CC_MAX_FILES))
+    out, bad = [], 0
+    for _mtime, name in entries[:CC_MAX_FILES]:
+        try:
+            with open(os.path.join(folder, name), "rb") as f:
+                rec = cc_clean(json.loads(f.read().decode("utf-8")), name[:-len(".json")])
+        except (OSError, ValueError, UnicodeDecodeError):
+            rec = None
+        if rec is None:
+            bad += 1
+        else:
+            out.append(rec)
+    if bad:
+        problems.append("costs/cc: {} file(s) that are not Claude Code figure records were skipped".format(bad))
+    return out, problems
+
+
+def cc_signature(directory):
+    """[files, newest mtime in ns, bytes] of costs/cc/: a collect rewrites the summary when it changes."""
+    count, newest, size = 0, 0, 0
+    try:
+        for e in os.scandir(os.path.join(costs_dir(directory), "cc")):
+            if e.name.startswith(".") or not e.name.endswith(".json"):
+                continue
+            try:
+                st = e.stat()
+            except OSError:
+                continue
+            count, newest, size = count + 1, max(newest, st.st_mtime_ns), size + st.st_size
+    except OSError:
+        pass
+    return [count, newest, size]
+
+
+def cc_join(cc, records, sessions, sess_b, since=None, until=None):
+    """Claude Code figure records joined to the summary's sessions (AC5.2): (parts: sid -> [(record, cleared)],
+    unmatched count, unmatched money). By id; else, for an id no record names (a /clear), the latest start record of the
+    same terminal at or before the record's first reading; else unmatched. A known session without rows is left out."""
+    starts = {}
+    for x in records:
+        if x.get("ev") == "start" and isinstance(x.get("session"), str) and isinstance(x.get("terminal"), str):
+            starts.setdefault(x["terminal"], []).append((x.get("at") or "", x["session"]))
+    known = set(sessions) | set(sess_b)
+    parts, um_n, um_money = {}, 0, 0.0
+    for rec in cc:
+        sid, cleared = rec["session"], False
+        if sid not in sess_b:
+            if sid in known:
+                continue
+            found = [c for c in starts.get(rec.get("terminal") or "", []) if c[0] <= rec["first"]]
+            if not found:
+                day = rec["at"][:10]
+                if (not since or day >= since) and (not until or day <= until):
+                    um_n += 1
+                    um_money += cc_figure(rec) or 0.0
+                continue
+            sid, cleared = max(found)[1], True
+            if sid not in sess_b:
+                continue
+        parts.setdefault(sid, []).append((rec, cleared))
+    return parts, um_n, um_money
+
+
+def summarize(directory, rows, records, table, price_problem, profile_name, now, problems=(), cc=None, since=None, until=None):
+    """The summary.json object (spec 2.3) for the given ledger rows. cc: Claude Code's figure records (default: read
+    costs/cc/); they add cc fields beside est., never to it (t-029 R5)."""
+    problems = list(problems)
+    if cc is None:
+        cc, cc_problems = read_cc(directory)
+        problems.extend(cc_problems)
     sessions = sessions_of(records)
     try:
         ledger = pa.read_json(os.path.join(directory, "ledger.json"), {}) or {}
@@ -1492,6 +1580,7 @@ def summarize(directory, rows, records, table, price_problem, profile_name, now,
     act_tasks, reasons = {}, {}  # activity -> task -> Bucket (the Costs view's drill); unattributed's reasons
     dims = {d: {} for d in ("kind", "role", "program", "model", "machine")}
     days, day_acts, day_model, hours, passes, sess_b, sess_info = {}, {}, {}, {}, {}, {}, {}
+    sess_tasks, sess_split = {}, set()  # the tasks of each session's rows; sessions with a split row
     hour_floor = iso(now - HOURS * 3600)[:13]
     for r in rows:
         tokens = {k: num(r["tokens"].get(k)) for k in KINDS}
@@ -1523,6 +1612,9 @@ def summarize(directory, rows, records, table, price_problem, profile_name, now,
         # by task (split rows by their weights), phase, sessions per task
         split = r.get("split") if isinstance(r.get("split"), list) and r.get("split") else [{"task": r.get("task"), "w": 1.0}]
         wsum = sum(float(s.get("w") or 0) for s in split) or 1.0
+        if len(split) > 1:
+            sess_split.add(r["session"])
+        sess_tasks.setdefault(r["session"], set()).update(s.get("task") or "(no task)" for s in split)
         for s in split:
             w, key = float(s.get("w") or 0) / wsum, s.get("task") or "(no task)"
             group(act_tasks.setdefault(act, {}), key).add((t - rb_t) * w, None if m is None else (m - (rb_m or 0)) * w, calls * w, rec)
@@ -1572,6 +1664,18 @@ def summarize(directory, rows, records, table, price_problem, profile_name, now,
         info["tasks"][r.get("task")] = info["tasks"].get(r.get("task"), 0) + t
         info["role"] = r.get("role") or info["role"]
         info["row"] = r
+    cc_parts, um_n, um_money = cc_join(cc, records, sessions, sess_b, since, until) if cc else ({}, 0, 0.0)
+    cc_money, task_cc = {}, {}
+    for sid, parts in cc_parts.items():
+        figures = [cc_figure(rec) for rec, _cleared in parts if cc_figure(rec) is not None]
+        if not figures:
+            continue
+        cc_money[sid] = sum(figures)
+        tasks_of = sess_tasks.get(sid) or set()
+        if sid not in sess_split and len(tasks_of) == 1:  # a session of one task alone: its figure is that task's
+            t = task_cc.setdefault(next(iter(tasks_of)), [0.0, 0])
+            t[0] += cc_money[sid]
+            t[1] += 1
     task_extra = {}
     for key in task_b:
         t = tasks.get(key) or {}
@@ -1582,6 +1686,8 @@ def summarize(directory, rows, records, table, price_problem, profile_name, now,
             extra["title"] = t["title"][:80]
         if key in task_split:
             extra["split"] = True
+        if key in task_cc:
+            extra.update(cc=round(task_cc[key][0], 6), ccSessions=task_cc[key][1], ccOf=len(task_sessions.get(key, [])))
         task_extra[key] = extra
     day_list = sorted(days, reverse=True)
     older = Bucket()
@@ -1606,24 +1712,39 @@ def summarize(directory, rows, records, table, price_problem, profile_name, now,
         info, sess = sess_info[sid], sessions.get(sid) or {}
         r = info["row"]
         state = "gone" if sess.get("gone") else ("closed" if sess.get("closed") else "open")
-        sess_list.append(b.out(short(sid), kind=r.get("kind"), role=info["role"], program=r.get("program"),
-                               task=max(info["tasks"], key=lambda k: info["tasks"][k]),
-                               model=max(info["models"], key=lambda k: info["models"][k]), **{"from": info["from"]},
-                               to=info["to"], state=state, source=r.get("source"), match=r.get("match")))
+        entry = b.out(short(sid), kind=r.get("kind"), role=info["role"], program=r.get("program"),
+                      task=max(info["tasks"], key=lambda k: info["tasks"][k]),
+                      model=max(info["models"], key=lambda k: info["models"][k]), **{"from": info["from"]},
+                      to=info["to"], state=state, source=r.get("source"), match=r.get("match"))
+        if sid in cc_money:
+            parts = [(rec, cleared) for rec, cleared in cc_parts[sid] if cc_figure(rec) is not None]
+            entry["cc"], entry["ccAt"] = round(cc_money[sid], 6), max(rec["at"] for rec, _c in parts)
+            segments = sum(rec["segments"] for rec, cleared in parts if not cleared)
+            if segments > 1:
+                entry["ccSegments"] = segments
+            cleared = sum(1 for _rec, c in parts if c)
+            if cleared:
+                entry["ccCleared"] = cleared
+        sess_list.append(entry)
     sess_list.sort(key=lambda e: e["to"] or "", reverse=True)
     um = [x for x in records if x.get("ev") == "unmatched"]
-    problems = list(problems)
     if price_problem:
         problems.append(price_problem)
     problems.extend(w for w in (table or {}).get("warnings") or [] if w not in problems)
+    totals = {"tokens": {"in": kinds_total["in"], "out": kinds_total["out"], "cw": kinds_total["cw5m"] + kinds_total["cw1h"],
+                         "cr": kinds_total["cr"], "all": total_tokens(kinds_total)},
+              "money": round(total.money, 6) if total.priced else None, "unpricedTokens": unpriced,
+              "reconstructedMoney": round(recon_money, 6) if total.priced else None, "calls": total.calls}
+    if cc:  # only where the space has Claude Code figure records at all: older viewers and other spaces see no change
+        totals["cc"] = {"money": round(sum(cc_money.values()), 6) if cc_money else None, "sessions": len(cc_money),
+                        "claudeSessions": sum(1 for sid in sess_b if (sess_info[sid]["row"].get("program") or "claude") == "claude"),
+                        "allSessions": len(sess_b),
+                        "unmatched": {"sessions": um_n, "money": round(um_money, 6) if um_n else None}, "ccCurrency": "USD"}
     return {
         "v": 1, "space": os.path.basename(directory), "updated": iso(now), "account": costs_account(),
         "prices": {"profile": profile_name, "source": (table or {}).get("source"), "asOf": (table or {}).get("asOf"),
                    "currency": (table or {}).get("currency"), "missing": sorted(missing)},
-        "totals": {"tokens": {"in": kinds_total["in"], "out": kinds_total["out"], "cw": kinds_total["cw5m"] + kinds_total["cw1h"],
-                              "cr": kinds_total["cr"], "all": total_tokens(kinds_total)},
-                   "money": round(total.money, 6) if total.priced else None, "unpricedTokens": unpriced,
-                   "reconstructedMoney": round(recon_money, 6) if total.priced else None, "calls": total.calls},
+        "totals": totals,
         "hours": [[h, dict({"tokens": int(b.tokens), "money": round(b.money, 6) if b.priced else None},
                            **({"unpricedTokens": b.partial()} if b.partial() else {}))] for h, b in sorted(hours.items())],
         "byActivity": by_money(acts, **{k: dict({"tasks": drill(act_tasks.get(k, {}))}, **({"reasons": drill(reasons)} if k == "unattributed" else {}))
@@ -1689,6 +1810,10 @@ def fold_tasks(entries, keep):
     recon = sum(e.get("reconstructed", 0) for e in rest)
     if recon:
         other["reconstructed"] = round(recon, 6)
+    with_cc = [e for e in rest if e.get("cc") is not None]
+    if with_cc:
+        other.update(cc=round(sum(e["cc"] for e in with_cc), 6), ccSessions=sum(e.get("ccSessions", 0) for e in with_cc),
+                     ccOf=sum(e.get("ccOf", 0) for e in with_cc))
     return entries[:keep] + [other]
 
 
@@ -1757,27 +1882,41 @@ def report_lines(s, by=None):
         head = "No price table in profile {}: tokens only".format(p.get("profile") or "?")
     out.append("Space {} · {} · updated {}".format(s["space"], head, s["updated"]))
     share = (100.0 * tot["tokens"]["cr"] / tot["tokens"]["all"]) if tot["tokens"]["all"] else 0
-    line = "Total     {} est.   {} tokens (cache read {:.0f}%)".format(fmt_money(tot["money"]), fmt_tokens(tot["tokens"]["all"]), share)
+    cc = tot.get("cc") if isinstance(tot.get("cc"), dict) else None  # Claude Code's own figure: beside est., never in it
+    line = "Total     {} est.{}   {} tokens (cache read {:.0f}%)".format(fmt_money(tot["money"]), " (no price)" if cc and tot["money"] is None else "",
+                                                                     fmt_tokens(tot["tokens"]["all"]), share)
     if tot.get("reconstructedMoney"):
         line += "   includes {} est. reconstructed (best effort)".format(fmt_money(tot["reconstructedMoney"]))
     if tot.get("unpricedTokens"):
         line += "   + {} unpriced tokens".format(fmt_tokens(tot["unpricedTokens"]))
+    if cc:
+        line += "   Claude Code {} ({} of {} Claude sessions)".format(
+            "{} USD list price".format(fmt_money(cc["money"])) if cc.get("money") is not None else "no figure",
+            cc.get("sessions", 0), cc.get("claudeSessions", 0))
     if by is None:
         out.append(line)
         days = [e for e in s["byDay"] if e["key"] == s["updated"][:10]]
         today = days[0]["money"] if days else (0.0 if p.get("source") or p.get("currency") else None)
         out.append("Today     {}{} est. (UTC day)".format(fmt_money(today), "+" if days and days[0].get("unpricedTokens") else ""))
 
-    def table(title, entries, label=lambda e: str(e["key"])):
-        total = sum(e["money"] or 0 for e in entries) or 0
-        out.append("{:<28} {:>10} {:>6} {:>10}".format(title, "est.", "share", "tokens"))
+    def table(title, entries, label=lambda e: str(e["key"]), with_cc=False, ratio=False):
+        total = sum(e["money"] or 0 for e in entries) or 0  # shares are of est. only, never of CC (AC6.4)
+        cc_head = " {:>10}".format("CC") if with_cc else ""
+        out.append("{:<28} {:>10}{} {:>6} {:>10}{}".format(title, "est.", cc_head, "share", "tokens", " {:>8}".format("CC/est.") if ratio else ""))
         for e in entries:
             pct = "{:.0f}%".format(100.0 * (e["money"] or 0) / total) if total and e["money"] is not None else ""
             mark = " ◌" if e.get("reconstructed") else ""
             plus = "+" if e["money"] is not None and e.get("unpricedTokens") else ""
-            out.append("  {:<26} {:>10} {:>6} {:>10}{}".format(label(e)[:26], fmt_money(e["money"]) + plus, pct, fmt_tokens(e["tokens"]), mark))
+            cc_cell = " {:>10}".format(fmt_money(e.get("cc"))) if with_cc else ""
+            rate = ""
+            if ratio:
+                rate = " {:>8}".format("{:.2f}".format(e["cc"] / e["money"]) if e.get("cc") is not None and e["money"] else "")
+            out.append("  {:<26} {:>10}{} {:>6} {:>10}{}{}".format(label(e)[:26], fmt_money(e["money"]) + plus, cc_cell, pct,
+                                                               fmt_tokens(e["tokens"]), rate, mark))
         if any(e["money"] is not None and e.get("unpricedTokens") for e in entries):
             out.append("  + marks an estimate of the priced part only (some of its use has no price)")
+        if with_cc:
+            out.append("  CC = Claude Code's own list-price estimate (USD), per session; not the bill")
     sections = [("activity", "By activity", s["byActivity"], None), ("task", "By task", s["byTask"], None),
                 ("phase", "By phase", s["byPhase"], None)]
     sections += [(d, "By " + d, s["byKind"].get(d, []), None) for d in ("kind", "role", "program", "model", "machine")]
@@ -1790,11 +1929,15 @@ def report_lines(s, by=None):
             continue
         if by is not None and key != by:
             continue
-        table(title, entries, label or (lambda e: str(e["key"])))
+        with_cc = bool(cc) and key in ("session", "task")
+        table(title, entries, label or (lambda e: str(e["key"])), with_cc, with_cc and key == "session" and p.get("currency") == "USD")
     if by is None:
         out.append("No price: {}".format(", ".join(p.get("missing") or []) or "(none)"))
         if s.get("unmatched", {}).get("sessions"):
             out.append("Unmatched sessions (not in the totals): {}, {} tokens".format(s["unmatched"]["sessions"], fmt_tokens(s["unmatched"]["tokens"])))
+        if cc and (cc.get("unmatched") or {}).get("sessions"):
+            out.append("Claude Code figures matching no session (not in the totals): {}, {} USD list price".format(
+                cc["unmatched"]["sessions"], fmt_money(cc["unmatched"].get("money"))))
         for prob in s.get("problems") or []:
             out.append("Problem: " + prob)
     return out
@@ -1844,7 +1987,7 @@ def report(directory, by=None, since=None, until=None, as_json=False, account_wi
     records, _bad = read_lines(os.path.join(folder, "sessions.jsonl"))
     table, problem, name = space_prices(directory)
     state = pa.read_json(os.path.join(folder, "state.json"), {}) or {}
-    s = summarize(directory, rows, records, table, problem, name, now, state.get("problems") or [])
+    s = summarize(directory, rows, records, table, problem, name, now, state.get("problems") or [], since=since, until=until)
     if as_json:
         print(json.dumps(s, indent=2))
         return 0
