@@ -1780,5 +1780,238 @@ class StatusShapes(Base):
         self.assertTrue(self.entry("t-002", "t32")["finished"])
 
 
+class TaskWorktrees(Base):
+    """t-020 J1 (R1, R7, AC3.5): a task's worktrees read as a list, each with its job; the single field keeps working."""
+
+    def setUp(self):
+        super().setUp()
+        self.proj = self.repo()
+        self.wt = self.worktree(self.proj, "t-003-x")
+        self.wt2 = self.worktree(self.proj, "t-003-billing")
+        self.evidence("t-003")
+
+    def task(self, **fields):
+        return dict({"id": "t-003", "title": "T", "state": "in-progress", "worktree": self.wt, "workers": []}, **fields)
+
+    def trees(self, task):
+        return [(w["path"], w["job"], w["main"]) for w in pa.task_worktrees(task)]
+
+    def test_tw1_single_field_reads_as_main(self):
+        self.assertEqual(pa.task_worktrees(self.task()), [{"path": os.path.realpath(self.wt), "given": self.wt, "job": "main", "keep": False,
+                                                           "main": True, "jobRecorded": True, "created": None}])
+        self.assertEqual(pa.task_worktrees(self.task(worktree=None)), [])
+        self.assertEqual(pa.task_worktrees(self.task(worktree="")), [])
+        self.assertEqual(pa.task_worktrees({"id": "t-1"}), [])
+
+    def test_tw2_main_listed_in_worktrees_counted_once(self):
+        task = self.task(worktrees=[{"path": self.wt + "/", "job": "tool", "created": "2026-11-17T00:00:00Z"},
+                                    {"path": self.wt2, "job": "billing-script", "created": "2026-11-17T01:00:00Z"}])
+        got = pa.task_worktrees(task)
+        self.assertEqual([(w["path"], w["job"], w["main"], w["jobRecorded"]) for w in got],
+                         [(os.path.realpath(self.wt), "tool", True, True), (os.path.realpath(self.wt2), "billing-script", False, True)])
+        self.assertEqual(got[0]["created"], "2026-11-17T00:00:00Z")
+        self.assertEqual(got[1]["given"], self.wt2)
+        # no `worktree`: no main, the list alone
+        self.assertEqual(self.trees(self.task(worktree=None, worktrees=[{"path": self.wt2, "job": "b"}])), [(os.path.realpath(self.wt2), "b", False)])
+
+    def test_tw3_legacy_extra_worktrees_job_from_folder(self):
+        tool = os.path.join(self.tmp, "Herdr", "worktrees", "t-007b-tool", "herdr-project-agent")
+        guard = os.path.join(self.tmp, "Herdr", "worktrees", "t-007-guard", "herdr-project-agent")
+        ws_tree = os.path.join(self.tmp, "Ws", "worktrees", "t-007-billing-script")
+        plain = os.path.join(self.tmp, "elsewhere", "t-007-notes")
+        task = self.task(id="t-007", worktree=None, extraWorktrees=[tool, guard, ws_tree, plain])
+        got = pa.task_worktrees(task)
+        self.assertEqual([(w["path"], w["job"], w["main"], w["jobRecorded"]) for w in got],
+                         [(os.path.realpath(tool), "t-007b-tool", False, False), (os.path.realpath(guard), "guard", False, False),
+                          (os.path.realpath(ws_tree), "billing-script", False, False), (os.path.realpath(plain), "notes", False, False)])
+        self.assertEqual(pa.legacy_job("t-009", "/w/HerdrPaProfile/worktrees/t-009-billing-script"), "billing-script")
+        self.assertEqual(pa.legacy_job("t-007", "/w/Herdr/worktrees/t-007b-tool/herdr-project-agent"), "t-007b-tool")
+        self.assertEqual(pa.legacy_job("t-017", "/w/Herdr/worktrees/t-017-timing-test/herdr-project-agent/"), "timing-test")
+        # a legacy path that is also the main one is counted once, as the main one
+        self.assertEqual(self.trees(self.task(extraWorktrees=[self.wt, self.wt2])),
+                         [(os.path.realpath(self.wt), "main", True), (os.path.realpath(self.wt2), pa.legacy_job("t-003", self.wt2), False)])
+
+    def test_tw4_removed_entries_skipped_main_field_wins(self):
+        task = self.task(worktrees=[{"path": self.wt, "job": "tool", "removed": "2026-11-17T02:00:00Z"},
+                                    {"path": self.wt2, "job": "billing-script", "removed": "2026-11-17T02:00:00Z"}],
+                         extraWorktrees=[self.wt2])
+        self.assertEqual(self.trees(task), [(os.path.realpath(self.wt), "tool", True)])
+        self.assertEqual(self.trees(dict(task, worktree=None)), [])
+
+    def test_tw5_entry_keep_and_task_keep(self):
+        task = self.task(worktrees=[{"path": self.wt2, "job": "b", "keep": True}])
+        self.assertEqual([w["keep"] for w in pa.task_worktrees(task)], [False, True])
+        task = self.task(worktrees=[{"path": self.wt, "job": "a", "keep": True}, {"path": self.wt2, "job": "b", "keep": "yes"}])
+        self.assertEqual([w["keep"] for w in pa.task_worktrees(task)], [True, False])
+        task["keepWorktree"] = True
+        self.assertEqual([w["keep"] for w in pa.task_worktrees(task)], [True, True])
+
+    def test_tw6_bad_entries_and_duplicate_jobs(self):
+        c, d, e, f = (os.path.join(self.tmp, n) for n in ("t-003-c", "wt-d", "wt-e", "wt-f"))
+        task = self.task(worktrees=["a string", {"job": "x"}, {"path": 5}, {"path": ""}, None, {"path": c},
+                                    {"path": d, "job": "Billing Script!"}, {"path": e, "job": "billing-script"}, {"path": f, "job": 7}],
+                         extraWorktrees=[7, None, "", self.wt])
+        self.assertEqual(self.trees(task), [(os.path.realpath(self.wt), "main", True), (os.path.realpath(c), "c", False),
+                                            (os.path.realpath(d), "billing-script", False), (os.path.realpath(e), "billing-script-2", False),
+                                            (os.path.realpath(f), "wt-f", False)])
+        self.assertEqual([w["jobRecorded"] for w in pa.task_worktrees(task)], [True, False, True, True, False])
+        self.assertEqual(self.trees(self.task(worktrees="garbage", extraWorktrees={"a": 1})), [(os.path.realpath(self.wt), "main", True)])
+        self.assertEqual(pa.job_slug("Billing Script!"), "billing-script")
+        self.assertEqual(pa.job_slug("--x__y--"), "x-y")
+        self.assertEqual(pa.job_slug(""), "job")
+        self.assertEqual(pa.job_slug("%%%"), "job")
+        self.assertEqual(pa.job_slug("a" * 50), "a" * 40)
+        # a recorded job named `main` beside the implicit main one gets the next free name
+        self.assertEqual(self.trees(self.task(worktrees=[{"path": self.wt2, "job": "main"}])),
+                         [(os.path.realpath(self.wt), "main", True), (os.path.realpath(self.wt2), "main-2", False)])
+
+    def test_tw7_state_one_row_per_worktree_with_jobs(self):
+        self.add_task("t-003", "done", self.wt, [{"address": "t31", "role": "build", "name": "t-003-main"},
+                                                 {"address": "t32", "role": "build", "name": "t-003-billing", "worktree": self.wt2}],
+                      worktrees=[{"path": self.wt2, "job": "billing", "keep": True}])
+        self.add_task("t-004", "review", self.wt, [{"address": "t41", "role": "build", "name": "t-004-fix"}])
+        self.term("t32", "t-003-billing")
+        rows = pa_hooks.worktree_state(self.dir, {"terminal": "t0"})
+        main, other = rows[os.path.realpath(self.wt)], rows[os.path.realpath(self.wt2)]
+        self.assertEqual(sorted(rows), sorted([os.path.realpath(self.wt), os.path.realpath(self.wt2)]))
+        self.assertEqual(main["tasks"], ["t-003", "t-004"])
+        self.assertEqual(main["jobs"], {"t-003": "main", "t-004": "main"})
+        self.assertEqual(main["mains"], {"t-003": True, "t-004": True})
+        self.assertEqual(main["jobRecorded"], {"t-003": True, "t-004": True})
+        self.assertFalse(main["keep"])
+        self.assertEqual([w["address"] for w in main["workers"]], ["t31", "t41"])
+        self.assertEqual(other["tasks"], ["t-003"])
+        self.assertEqual(other["jobs"], {"t-003": "billing"})
+        self.assertEqual(other["mains"], {"t-003": False})
+        self.assertTrue(other["keep"])
+        self.assertEqual([(w["address"], w["fate"]) for w in other["workers"]], [("t32", "live")])
+        self.assertEqual(main["others"], [])
+        # rule (a) across the two tasks sharing the main row; the other job's row opens nothing in J1
+        code, out, err = self.run_cmd("pa-worktree", "check", "--open-cards", "--space", "sp1")
+        self.assertEqual(code, 0, err)
+        self.assertIn("t-003: tasks still t-004 review; asked once every task using it is done or parked", out)
+        led = self.ledger()
+        led["tasks"][1]["state"] = "done"
+        led["tasks"][0]["worktrees"][0]["keep"] = False
+        self.ledger(led)
+        del self.terms["t32"]
+        code, out, err = self.run_cmd("pa-worktree", "check", "--open-cards", "--space", "sp1")
+        self.assertEqual(code, 0, err)
+        self.assertIn("opened card d-wt-t-003", out)
+        self.assertIn("t-003: {} (job billing) is not the task's main worktree; not offered yet".format(os.path.realpath(self.wt2)), out)
+        card = pa.read_json(os.path.join(self.dir, "decisions", "d-wt-t-003.json"))
+        self.assertEqual(card["worktree"], os.path.realpath(self.wt))
+        self.assertEqual(sorted(os.listdir(os.path.join(self.dir, "decisions"))), ["d-wt-t-003.json"])
+
+    def close_setup(self, dirty):
+        self.add_task("t-003", "in-progress", self.wt, [{"address": "t31", "role": "build", "name": "t-003-main"},
+                                                        {"address": "t32", "role": "build", "name": "t-003-billing", "worktree": self.wt2}],
+                      worktrees=[{"path": self.wt2, "job": "billing"}])
+        self.term("t31", "t-003-main")
+        self.term("t32", "t-003-billing")
+        write(os.path.join(dirty, "unsaved.txt"), "x\n")
+        pa_hooks.by_an_agent = lambda: True
+
+    def test_tw8_close_ignores_a_dirty_sibling_job_worktree(self):
+        self.close_setup(self.wt2)
+        code, out, err = self.worker("close", "t31", "--evidence", "FINDINGS.md")
+        self.assertEqual(code, 0, err)
+        self.assertIn("Checked for uncommitted work: {}".format(os.path.realpath(self.wt)), out)
+        self.assertNotIn(os.path.realpath(self.wt2), out)
+        task = self.ledger()["tasks"][0]
+        self.assertEqual(pa_hooks.uncommitted_in(task, None, task["workers"][0]), (os.path.realpath(self.wt), 0, []))
+
+    def test_tw8b_close_refuses_its_own_dirty_worktree(self):
+        self.close_setup(self.wt2)
+        before = self.snapshot()
+        self.assertRefused(self.worker("close", "t32", "--evidence", "FINDINGS.md"),
+                           "{} has 1 uncommitted file(s) (unsaved.txt)".format(os.path.realpath(self.wt2)))
+        self.assertEqual(self.snapshot(), before)
+        task = self.ledger()["tasks"][0]
+        self.assertEqual(pa_hooks.uncommitted_in(task, None, task["workers"][1]), (os.path.realpath(self.wt2), 1, ["unsaved.txt"]))
+        # the main worktree being dirty does not stop the billing worker
+        os.unlink(os.path.join(self.wt2, "unsaved.txt"))
+        write(os.path.join(self.wt, "unsaved.txt"), "x\n")
+        code, out, err = self.worker("close", "t32", "--evidence", "FINDINGS.md")
+        self.assertEqual(code, 0, err)
+        self.assertIn("Checked for uncommitted work: {}".format(os.path.realpath(self.wt2)), out)
+
+    def test_tw9_close_without_worker_worktree_checks_main(self):
+        self.close_setup(self.wt)
+        self.assertRefused(self.worker("close", "t31", "--evidence", "FINDINGS.md"),
+                           "{} has 1 uncommitted file(s) (unsaved.txt)".format(os.path.realpath(self.wt)))
+        task = self.ledger()["tasks"][0]
+        self.assertEqual(pa_hooks.uncommitted_in(task, None), (os.path.realpath(self.wt), 1, ["unsaved.txt"]))
+        self.assertEqual(pa_hooks.uncommitted_in(task, None, task["workers"][0]), (os.path.realpath(self.wt), 1, ["unsaved.txt"]))
+        refusal, _checked, _unseen = pa_hooks.worktree_refusal(task, None, {}, task["workers"][1])
+        self.assertIsNone(refusal)
+
+    def test_tw10_worker_delete_takes_only_its_own_worktree_and_marks_removed(self):
+        self.add_task("t-003", "done", self.wt, [{"address": "t31", "role": "build", "name": "t-003-main"},
+                                                 {"address": "t32", "role": "build", "name": "t-003-billing", "worktree": self.wt2}],
+                      worktrees=[{"path": self.wt2, "job": "billing", "created": "2026-11-17T00:00:00Z"}])
+        self.term("t31", "t-003-main")  # live, but in the main worktree: the billing one is not its
+        facts, _row = pa_hooks.worker_facts(self.dir, {"terminal": "t0"}, None, "t32")
+        self.assertEqual(facts["worktree"]["path"], os.path.realpath(self.wt2))
+        self.assertEqual(facts["worktree"]["sharedWith"], [])
+        code, out, err = self.worker("delete", "t32")
+        self.assertEqual(code, 0, err)
+        self.assertIn("Removed the worktree {}".format(os.path.realpath(self.wt2)), out)
+        self.assertFalse(os.path.exists(self.wt2))
+        self.assertTrue(os.path.isdir(self.wt))
+        task = self.ledger()["tasks"][0]
+        self.assertEqual(task["worktree"], self.wt)
+        self.assertEqual([w["address"] for w in task["workers"]], ["t31"])
+        self.assertEqual(task["worktrees"][0]["job"], "billing")
+        self.assertRegex(task["worktrees"][0]["removed"], r"^\d{4}-\d\d-\d\dT")
+        self.assertEqual(self.trees(task), [(os.path.realpath(self.wt), "main", True)])
+        # the main worker: its worktree is the main one; it goes, `worktree` becomes null, an entry records it
+        del self.terms["t31"]
+        facts, _row = pa_hooks.worker_facts(self.dir, {"terminal": "t0"}, None, "t31")
+        self.assertEqual(facts["worktree"]["path"], os.path.realpath(self.wt))
+        code, out, err = self.worker("delete", "t31")
+        self.assertEqual(code, 0, err)
+        self.assertFalse(os.path.exists(self.wt))
+        task = self.ledger()["tasks"][0]
+        self.assertIsNone(task["worktree"])
+        self.assertEqual([(e["path"], e["job"]) for e in task["worktrees"]], [(self.wt2, "billing"), (self.wt, "main")])
+        self.assertTrue(task["worktrees"][1]["removed"])
+        self.assertEqual(pa.task_worktrees(task), [])
+
+    def test_tw10b_worker_delete_shared_worktree_kept_legacy_marked(self):
+        legacy = self.worktree(self.proj, "t-003-legacy")
+        self.add_task("t-003", "done", self.wt, [{"address": "t31", "role": "build", "name": "t-003-main"},
+                                                 {"address": "t32", "role": "build", "name": "t-003-legacy", "worktree": legacy},
+                                                 {"address": "t33", "role": "build", "name": "t-003-legacy-2", "worktree": legacy}],
+                      extraWorktrees=[legacy])
+        self.term("t33", "t-003-legacy-2")
+        code, out, err = self.worker("delete", "t32")
+        self.assertEqual(code, 0, err)
+        self.assertIn("Kept the worktree: still used by t33.", out)
+        self.assertTrue(os.path.isdir(legacy))
+        del self.terms["t33"]
+        code, out, err = self.worker("delete", "t33")
+        self.assertEqual(code, 0, err)
+        self.assertFalse(os.path.exists(legacy))
+        task = self.ledger()["tasks"][0]
+        self.assertEqual(task["worktree"], self.wt)
+        self.assertEqual(task["extraWorktrees"], [legacy])
+        self.assertEqual([(e["path"], e["job"]) for e in task["worktrees"]], [(legacy, pa.legacy_job("t-003", legacy))])
+        self.assertTrue(task["worktrees"][0]["removed"])
+        self.assertEqual(self.trees(task), [(os.path.realpath(self.wt), "main", True)])
+
+    def test_tw11_worktree_job_md_is_never_a_report(self):
+        for name, tool in (("WORKTREE.md", True), ("GATE.json", True), ("WORKTREE-billing-script.md", True), ("WORKTREE-t-007b-tool.md", True),
+                           ("FINDINGS.md", False), ("WORKTREE-.md", False), ("WORKTREE-x.txt", False), ("MY-WORKTREE-x.md", False)):
+            with self.subTest(name=name):
+                self.assertIs(pa_hooks.tool_file(name), tool)
+        self.add_task("t-003", "in-progress", None, [{"address": "t31", "role": "build", "name": "t-003-main"}])
+        self.term("t31", "t-003-main")
+        self.evidence("t-003", "WORKTREE-billing-script.md", "card text\n")
+        pa_hooks.by_an_agent = lambda: True
+        self.assertRefused(self.worker("close", "t31", "--evidence", "WORKTREE-billing-script.md"),
+                           "WORKTREE-billing-script.md is written by the Project Agent's tools, not a worker's report")
+
+
 if __name__ == "__main__":
     unittest.main()

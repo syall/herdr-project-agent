@@ -665,5 +665,36 @@ class LiveLauncherOnly(Base):
         self.assertEqual(self.sends()[0][2], "t1")
 
 
+class TaskDeleteWorktrees(LiveLauncherOnly):  # t-020 J1, AC7.4: the delete note names every worktree left in place
+    def delete(self, task):
+        dump({"tasks": [task]}, os.path.join(self.dir, "ledger.json"))
+        shutil.rmtree(os.path.join(self.dir, "trash"), ignore_errors=True)  # one trash folder per second
+        pa.live_terminals = lambda: {}
+        self.heartbeat(time.time() - 3600, "t1")
+        saved = {k: os.environ.pop(k) for k in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CODEX_SANDBOX") if k in os.environ}
+        try:
+            return self.run_quiet(pa.cmd_task, types.SimpleNamespace(action="delete", task="t-1", space="sp1"))
+        finally:
+            os.environ.update(saved)
+
+    def test_task_delete_names_every_worktree(self):
+        out = self.delete({"id": "t-1", "state": "queued", "workers": [], "worktree": "/x/worktrees/t-1-tool/repo",
+                           "worktrees": [{"path": "/x/worktrees/t-1-tool/repo", "job": "tool"},
+                                         {"path": "/x/ws/worktrees/t-1-billing-script", "job": "billing-script"},
+                                         {"path": "/x/worktrees/t-1-old/repo", "job": "old", "removed": "2026-11-17T00:00:00Z"}],
+                           "extraWorktrees": ["/x/worktrees/t-1-timing/repo"]})
+        self.assertIn("t-1: queued -> deleted. Its worktrees were left in place: /x/worktrees/t-1-tool/repo (tool), "
+                      "/x/ws/worktrees/t-1-billing-script (billing-script), /x/worktrees/t-1-timing/repo (timing).", out)
+        self.assertNotIn("t-1-old", out)
+
+    def test_task_delete_one_worktree_keeps_the_old_sentence(self):
+        out = self.delete({"id": "t-1", "state": "queued", "workers": [], "worktree": "/x/a"})
+        self.assertIn("t-1: queued -> deleted. Its worktree /x/a was left in place.", out)
+        out = self.delete({"id": "t-1", "state": "queued", "workers": [], "worktree": None, "worktrees": [{"path": "/x/b", "job": "b"}]})
+        self.assertIn("t-1: queued -> deleted. Its worktree /x/b was left in place.", out)
+        out = self.delete({"id": "t-1", "state": "queued", "workers": []})
+        self.assertIn("t-1: queued -> deleted.\n", out)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -427,5 +427,44 @@ class J5CheckRole(Base):  # t-017 J5: R4 AC4.3, G3. The gate's tier is the task'
         self.assertEqual(check["why"], "the ledger lists no reviewer or check worker separate from the build workers")
 
 
+class D077ReviewerAddresses(Base):  # t-020 J1, card d-077 limit 2: only workers with an address count; roles in lower case
+    def review_check(self, workers, tier="normal"):
+        dump({"version": 1, "tasks": []}, os.path.join(self.dir, "ledger.json"))
+        task = self.add_task("t-1", type="docs", tier=tier, workers=workers)
+        self.evidence("t-1")
+        result = pa_hooks.evaluate_gate(self.dir, task, "review")
+        found = [c for c in result["checks"] if c["check"] == "reviewer is not the author"]
+        self.assertEqual(len(found), 1, result["checks"])
+        return found[0]
+
+    def test_d077_a_reviewer_with_no_address_does_not_count(self):
+        for reviewer in ({"role": "reviewer"}, {"address": "", "role": "reviewer"}, {"address": None, "role": "reviewer"}):
+            with self.subTest(reviewer=reviewer):
+                check = self.review_check([{"address": "t31", "role": "build"}, reviewer])
+                self.assertFalse(check["ok"], check)
+                self.assertEqual(check["why"], "the ledger lists no reviewer worker separate from the build workers "
+                                               "(a check worker counts for low tier only)")
+        check = self.review_check([{"address": "t31", "role": "build"}, {"role": "check"}], tier="low")
+        self.assertFalse(check["ok"], check)
+
+    def test_d077_an_author_recorded_as_build_in_capitals_is_still_an_author(self):
+        for role in ("Build", "BUILD", "Design"):
+            with self.subTest(role=role):
+                check = self.review_check([{"address": "t31", "role": role}, {"address": "t31", "role": "reviewer"}])
+                self.assertFalse(check["ok"], check)
+                self.assertEqual(check["why"], "t31 is recorded as reviewer and as a build or design worker")
+        check = self.review_check([{"address": "t31", "role": "build"}, {"address": "t31", "role": "Reviewer"}])
+        self.assertFalse(check["ok"], check)
+        self.assertEqual(check["why"], "t31 is recorded as Reviewer and as a build or design worker")
+
+    def test_d077_a_reviewer_recorded_in_capitals_counts(self):
+        self.assertTrue(self.review_check([{"address": "t31", "role": "build"}, {"address": "t32", "role": "Reviewer"}])["ok"])
+        self.assertTrue(self.review_check([{"address": "t31", "role": "build"}, {"address": "t33", "role": "CHECK"}], tier="low")["ok"])
+
+    def test_d077_an_author_with_no_address_is_no_author(self):
+        # a build entry without an address cannot make an addressed reviewer its own author
+        self.assertTrue(self.review_check([{"role": "build"}, {"address": "t32", "role": "reviewer"}])["ok"])
+
+
 if __name__ == "__main__":
     unittest.main()
