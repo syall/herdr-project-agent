@@ -367,6 +367,16 @@ class Allowlist(Repo):
         self.assertEqual(code, 0, err)
         self.assertTrue(json.loads(out)["valid"])
 
+    def test_a06b_allow_change_refuses_an_orphaned_caller(self):
+        """C0 cannot tell who an orphaned process is (its only ancestor is the system's first process): refused."""
+        before = snapshot(pa.ROOT)
+        args = pa_push.allow_parser().parse_args(["off"])
+        for tree in ([{"pid": 1, "comm": "/sbin/launchd", "args": "/sbin/launchd"}], [{"pid": 1, "comm": "/sbin/init", "args": "/sbin/init"}]):
+            code, _o, err = self.quiet(pa_push.allow_change, args, env=PERSON_ENV, ancestors=tree)
+            self.assertEqual(code, 1, err)
+            self.assertIn("the caller is unknown (an orphaned process)", err)
+        self.assertEqual(snapshot(pa.ROOT), before)
+
     def test_a07_add_remove_on_off_write_valid_json_and_backup(self):
         os.remove(self.allow)
         parse = pa_push.allow_parser().parse_args
@@ -496,6 +506,55 @@ class Plan(Planned):
         # plan pushed and merged nothing
         self.assertEqual(self.head(self.main), earlier)
         self.assertNotEqual(self.origin_head(), commit)
+
+    def test_p10_fromtask_by_task_branch_when_main_already_at_commit(self):
+        """Local main was fast-forwarded to the gated commit before plan: the task's commit is still from this task,
+        and an earlier task's commit is still marked (spec 6.1: on local main before this task)."""
+        earlier = self.commit_on(self.main, "e.txt", "earlier task")
+        sh(self.wt, "git", "rebase", "-q", "main")
+        self.assertEqual(self.gate(), 0)
+        commit = self.head(self.wt)
+        sh(self.main, "git", "merge", "-q", "--ff-only", "t-1-x")
+        code, out, err = self.plan()
+        self.assertEqual(code, 0, err)
+        c = self.card()
+        p = c["push"]
+        self.assertEqual((p["localBefore"], p["merge"], p["commit"]), (commit, False, commit))
+        self.assertEqual([(x["subject"], x["fromTask"]) for x in p["commits"]], [("task work", True), ("earlier task", False)])
+        lines = c["context"].splitlines()
+        self.assertTrue(any(l.startswith("- " + earlier[:7]) and l.endswith("(not from this task)") for l in lines), lines)
+        self.assertFalse(any(l.startswith("- " + commit[:7]) and "not from this task" in l for l in lines), lines)
+
+    def test_p11_fromtask_main_at_commit_no_earlier_commit(self):
+        sh(self.main, "git", "merge", "-q", "--ff-only", "t-1-x")
+        code, out, err = self.plan()
+        self.assertEqual(code, 0, err)
+        c = self.card()
+        self.assertEqual(c["push"]["localBefore"], self.task_commit)
+        self.assertEqual([(x["subject"], x["fromTask"]) for x in c["push"]["commits"]], [("task work", True)])
+        self.assertNotIn("not from this task", c["context"])
+
+    def test_p12_fromtask_merged_in_commit_is_not_the_tasks(self):
+        """An earlier task's commit that the task branch merged in (not on its own first-parent line) is marked."""
+        self.commit_on(self.main, "e.txt", "earlier task")
+        sh(self.wt, "git", "merge", "-q", "--no-ff", "-m", "merge main", "main")
+        self.assertEqual(self.gate(), 0)
+        code, out, err = self.plan()
+        self.assertEqual(code, 0, err)
+        marks = {x["subject"]: x["fromTask"] for x in self.card()["push"]["commits"]}
+        self.assertEqual(marks, {"merge main": True, "task work": True, "earlier task": False})
+
+    def test_p13_fromtask_unknown_without_the_branch_record(self):
+        """Where the task branch started cannot be read (no reflog): fromTask is null, and the card says so."""
+        sh(self.main, "git", "merge", "-q", "--ff-only", "t-1-x")
+        log = os.path.join(self.main, ".git", "logs", "refs", "heads", "t-1-x")
+        self.assertTrue(os.path.isfile(log))
+        os.remove(log)
+        code, out, err = self.plan()
+        self.assertEqual(code, 0, err)
+        c = self.card()
+        self.assertEqual([(x["subject"], x["fromTask"]) for x in c["push"]["commits"]], [("task work", None)])
+        self.assertIn("which of these commits are this task's cannot be told", c["context"])
 
     def test_p02_plan_refuses_without_allowlist(self):
         os.remove(self.allow)
@@ -766,6 +825,18 @@ class RunChecks(Runs):
 
     def test_r_c0_hc_terminal(self):
         self.assertRefused(self.run_push(env=dict(PERSON_ENV, HC_TERMINAL_ID="t7")), "C0", "Herdr terminal", attempts=0)
+
+    def test_r_c0_orphan(self):
+        """A process whose parent chain holds nothing but the system's first process: the caller is unknown."""
+        for tree in ([{"pid": 1, "comm": "/sbin/launchd", "args": "/sbin/launchd"}], [{"pid": 1, "comm": "launchd", "args": "launchd"}],
+                     [{"pid": 1, "comm": "/sbin/init", "args": "/sbin/init splash"}], [{"pid": 1, "comm": "systemd", "args": "/sbin/init"}]):
+            self.assertRefused(self.run_push(tree=tree), "C0", "the caller is unknown (an orphaned process)", attempts=0)
+        self.assertEqual(self.calls, [])
+        tree = pa_push.ancestors(pid=5, table={5: (1, "python3", "python3 pa_push.py"), 1: (0, "/sbin/launchd", "/sbin/launchd")})
+        self.assertEqual([a["pid"] for a in tree], [1])
+        self.assertIn("orphaned", pa_push.caller_refusal(PERSON_ENV, tree) or "")
+        self.assertIn("orphaned", pa_push.caller_refusal(PERSON_ENV, tree, strict=False) or "")
+        self.assertIsNone(pa_push.caller_refusal(PERSON_ENV, PERSON_TREE))
 
     def test_r_c0_cli_refuses_in_this_session(self):
         """The real command line, started from this agent session: refused by C0, with the JSON contract."""
@@ -1173,6 +1244,86 @@ class Act(Runs):
         self.calls[:] = []
         self.assertPushed(*self.run_push(), merged=False, how="already on the remote")
         self.assertEqual(git_calls(self.calls, "push"), [])
+
+
+# ---- fix round 2: the gate's git in the task worktree is the tool's hardened git ----------------------
+
+class GateGit(Runs):
+    """The task worktree is the agent's: nothing its git settings name may run inside plan, check or run."""
+
+    def program(self, name):
+        self.mark = os.path.join(self.tmp, "RAN-" + name)
+        prog = os.path.join(self.tmp, name + ".sh")
+        write(prog, "#!/bin/sh\necho ran >> '{}'\ncat >/dev/null\nexit 1\n".format(self.mark))
+        os.chmod(prog, 0o755)
+        return prog
+
+    def worktree_scope(self):
+        """extensions.worktreeConfig on, as a Bash append would turn it on (not a risky key), with an empty main file."""
+        sh(self.main, "git", "config", "--local", "extensions.worktreeConfig", "true")
+        write(os.path.join(self.main, ".git", "config.worktree"), "")
+
+    def assertNeverRan(self):
+        self.assertFalse(os.path.exists(self.mark), "a program from the task worktree's git settings ran")
+
+    def test_g01_worktree_fsmonitor_check_and_run(self):
+        prog = self.program("fsmonitor")
+        self.worktree_scope()
+        sh(self.wt, "git", "config", "--worktree", "core.fsmonitor", prog)
+        r = self.check()
+        self.assertNeverRan()
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["refusal"]["check"], "C8a", r["refusal"])
+        self.assertIn("core.fsmonitor", r["refusal"]["message"])
+        r = self.assertRefused(self.run_push(), "C8a", "core.fsmonitor")
+        self.assertIn("worktree", r["refusal"]["message"])
+        self.assertNeverRan()
+        # and plan refuses a new card the same way
+        os.remove(self.card_path())
+        code, _o, err = self.plan()
+        self.assertEqual(code, 1)
+        self.assertIn("core.fsmonitor", err)
+        self.assertNeverRan()
+
+    def test_g02_redirected_git_file(self):
+        prog = self.program("redirect")
+        other = os.path.join(self.tmp, "other")
+        sh(self.tmp, "git", "init", "-q", other)
+        sh(other, "git", "config", "core.fsmonitor", prog)
+        write(os.path.join(self.wt, ".git"), "gitdir: {}/.git\n".format(other))
+        self.assertRefused(self.run_push(), "C8a", "core.fsmonitor")
+        self.assertNeverRan()
+
+    def test_g03_worktree_filter(self):
+        prog = self.program("filter")
+        self.worktree_scope()
+        sh(self.wt, "git", "config", "--worktree", "filter.planted.clean", prog)
+        write(os.path.join(self.main, ".git", "info", "attributes"), "* filter=planted\n")
+        later = time.time() + 5
+        os.utime(os.path.join(self.wt, "b.txt"), (later, later))
+        self.assertRefused(self.run_push(), "C8a", "filter.planted.clean")
+        self.assertNeverRan()
+
+    def test_g04_gate_reads_only_through_git_call(self):
+        """plan, check and run evaluate the gate with git_call's git (hooks and fsmonitor off, no GIT_*), never pa_hooks.git."""
+        def forbidden(*a, **k):
+            raise AssertionError("pa_hooks.git ran in pa-push-main: {}".format(a))
+        real = pa_push.pa_hooks.git
+        pa_push.pa_hooks.git = forbidden
+        try:
+            os.remove(self.card_path())
+            code, _o, err = self.plan()
+            self.assertEqual(code, 0, err)
+            self.calls[:] = []
+            code, r = self.run_push(seen=FRESH)
+        finally:
+            pa_push.pa_hooks.git = real
+        self.assertEqual(code, 0, r)
+        self.assertEqual(self.origin_head(), self.task_commit)
+        wt = os.path.realpath(self.wt)
+        status = [a for a in self.calls if a[:3] == ["git", "-C", wt] and "status" in a]
+        self.assertGreaterEqual(len(status), 2, self.calls)  # the gate's and the live pin's, in check and run
+        self.assertTrue(all("core.fsmonitor=false" in a and any(x.startswith("core.hooksPath=") for x in a) for a in status), status)
 
 
 # ---- A5: links --------------------------------------------------------------------------------
