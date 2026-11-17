@@ -151,14 +151,17 @@ def space_dir(space):
     return os.path.join(ROOT, "spaces", ident(local_id(space), "space id"))
 
 
-def profile_for_terminal(explicit=None):
-    """--profile, else the Project Agent this terminal is or was started by, else the default."""
+def profile_for_terminal(explicit=None, walked=None):
+    """--profile, else the Project Agent this terminal is or was started by, else the default.
+    walked: a list that receives each `hc get` record read on the way (this terminal's first)."""
     if explicit:
         return load_profile(explicit), None
     seen, address, space = set(), os.environ.get("HC_TERMINAL_ID"), None
     while address and address not in seen and len(seen) < 6:
         seen.add(address)
         info = hc_get(address)
+        if walked is not None:
+            walked.append(dict(info, address=info.get("address") or address))
         labels = info.get("labels") or {}
         if labels.get("herdr.pa.profile"):
             return load_profile(labels["herdr.pa.profile"]), (labels.get("herdr.pa") if len(seen) > 1 else None)
@@ -736,6 +739,12 @@ def run_agent(args, address, project, p, directory, agent, ctx, started):
         session_log(directory, "start resume={} session={} reason={}".format(resume, agent["sessionId"], why))
         began = time.time()
         running.update(since=began, session=agent["sessionId"], marked=False)
+        costs = costs_module()
+        if costs:
+            try:
+                costs.record_agent_start(directory, agent, address, project, model, resume)
+            except Exception:  # noqa: BLE001 - never stops the Project Agent
+                pass
         code = subprocess.call(argv, cwd=project)
         running["since"] = None
         lasted = time.time() - began
@@ -799,11 +808,45 @@ def cmd_start(args):
         raise Problem("run pa-start in a Herdr tab's shell on this machine")
 
 
+COSTS_FILE = os.path.join(os.path.dirname(os.path.realpath(__file__)), "pa_costs.py")
+_COSTS = {}
+
+
+def costs_module():
+    """pa_costs.py beside this file, loaded once, or None when it is missing or broken: cost records are never
+    allowed to stop a launch (t-009 R1 AC1.5)."""
+    if COSTS_FILE in _COSTS:
+        return _COSTS[COSTS_FILE]
+    module = None
+    try:
+        import importlib.util
+        me = sys.modules.get(__name__)
+        me = me if me is not None and getattr(me, "__dict__", None) is globals() else None
+        saved = sys.modules.get("pa")
+        if me is not None:
+            sys.modules["pa"] = me  # pa_costs imports pa: give it this one, not a second copy
+        try:
+            spec = importlib.util.spec_from_file_location("pa_costs", COSTS_FILE)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+        finally:
+            if me is not None:
+                if saved is None:
+                    sys.modules.pop("pa", None)
+                else:
+                    sys.modules["pa"] = saved
+    except Exception:  # noqa: BLE001 - any failure here only means: no cost record
+        module = None
+    _COSTS[COSTS_FILE] = module
+    return module
+
+
 def cmd_launch(kind, argv):
     explicit = None
     if len(argv) >= 2 and argv[0] == "--profile":
         explicit, argv = argv[1], argv[2:]
-    p, pa_space = profile_for_terminal(explicit)
+    walked = []
+    p, pa_space = profile_for_terminal(explicit, walked)
     command = list(p[kind]) + list(argv)
     # Subcommands and one-shot flags (`claude mcp list`, `--version`) pass through untouched.
     passthrough = bool(argv) and argv[0] in (
@@ -824,6 +867,14 @@ def cmd_launch(kind, argv):
             command += ["--append-system-prompt", text]
         if "--mcp-config" not in argv:
             command += mcp_args(p)
+    if pa_space and ID.match(pa_space) and not passthrough:
+        # A worker of a Project Agent: its session id and one start record, for the space's costs (t-009 R1).
+        costs = costs_module()
+        if costs:
+            try:
+                command = costs.record_launch(space_dir(pa_space), pa_space, kind, argv, command, walked)
+            except Exception:  # noqa: BLE001 - never stops a launch
+                pass
     command = resolve(command, p)
     if os.environ.get("PA_PRINT"):  # show what would run, for checking a setup
         print(json.dumps([a if len(a) < 80 else a[:77] + "..." for a in command]))

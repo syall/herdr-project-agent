@@ -629,6 +629,116 @@ def bind_pending(ctx):
     return None
 
 
+# ---- launch records (called by pa.py: pa-claude, pa-codex, pa-session) ---------------------------
+
+APPEND_WAIT = 1.0  # seconds a launcher waits for the append lock before it gives up (the launch goes on)
+TASK_NAME = re.compile(r"^([A-Za-z]+-\d+)-")
+
+
+def append_session(directory, record, wait=APPEND_WAIT):
+    """Append one record to costs/sessions.jsonl under costs/.append.lock. True when written; never raises."""
+    try:
+        folder = costs_dir(directory)
+        os.makedirs(folder, exist_ok=True)
+        fd = os.open(os.path.join(folder, ".append.lock"), os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            deadline = time.time() + wait
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError:
+                    if time.time() >= deadline:
+                        return False
+                    time.sleep(0.05)
+            append_line(os.path.join(folder, "sessions.jsonl"), record)
+            return True
+        finally:
+            os.close(fd)
+    except Exception:  # noqa: BLE001 - a launch never fails because of costs
+        return False
+
+
+def task_for(directory, name):
+    """The longest ledger task id that prefixes name + '-' (as pa-cleanup matches), else t-NNN from the name."""
+    if not name:
+        return None
+    try:
+        tasks = [t.get("id") for t in (pa.read_json(os.path.join(directory, "ledger.json"), {}) or {}).get("tasks", []) if t.get("id")]
+    except (OSError, ValueError, AttributeError):
+        tasks = []
+    for tid in sorted(tasks, key=len, reverse=True):
+        if name.startswith(tid + "-"):
+            return tid
+    m = TASK_NAME.match(name)
+    return m.group(1) if m else None
+
+
+def option_value(argv, *names):
+    """(present, value) of an option given as `--x v`, `-x v` or `--x=v`."""
+    for i, a in enumerate(argv):
+        for n in names:
+            if a == n:
+                nxt = argv[i + 1] if i + 1 < len(argv) else None
+                return True, (nxt if nxt is not None and not nxt.startswith("-") else None)
+            if n.startswith("--") and a.startswith(n + "="):
+                return True, a[len(n) + 1:] or None
+    return False, None
+
+
+def launch_plan(kind, argv):
+    """What the session id is: {"session", "resumed", "bind", "fork", "add"} (add: pa-claude adds --session-id)."""
+    if kind != "claude":
+        return {"session": None, "resumed": False, "bind": "launch-window", "fork": False, "add": False}
+    fork = "--fork-session" in argv
+    has_id, given = option_value(argv, "--session-id")
+    has_resume, resumed_id = option_value(argv, "--resume", "-r")
+    cont = "--continue" in argv or "-c" in argv
+    if has_id:
+        return {"session": given, "resumed": has_resume or cont, "bind": None if given else "launch-window", "fork": fork, "add": False}
+    if has_resume and resumed_id and not fork:
+        return {"session": resumed_id, "resumed": True, "bind": None, "fork": False, "add": False}
+    if has_resume or cont or fork:
+        return {"session": None, "resumed": has_resume or cont, "bind": "launch-window", "fork": fork, "add": False}
+    return {"session": None, "resumed": False, "bind": None, "fork": False, "add": True}
+
+
+def host():
+    try:
+        return socket.gethostname().split(".")[0][:64]
+    except OSError:
+        return None
+
+
+def record_launch(directory, space, kind, argv, command, walked):
+    """pa-claude / pa-codex under a Project Agent: the command with --session-id added when it is ours to choose,
+    after appending one start record (counters' context only: never an argument other than --model's value)."""
+    import uuid
+    plan = launch_plan(kind, argv)
+    session = plan["session"]
+    if plan["add"]:
+        session = str(uuid.uuid4())
+        command = list(command) + ["--session-id", session]
+    me = walked[0] if walked else {}
+    _has, model = option_value(command, "--model")
+    name = me.get("name") if isinstance(me.get("name"), str) else None
+    append_session(directory, {
+        "v": 1, "ev": "start", "at": pa.now(), "session": session, "program": kind, "kind": "worker", "space": space,
+        "task": task_for(directory, name), "name": name, "role": None, "terminal": os.environ.get("HC_TERMINAL_ID"),
+        "parent": me.get("parent"), "model": model, "host": host(), "cwd": os.getcwd(), "pid": os.getpid(),
+        "resumed": plan["resumed"], "bind": plan["bind"], "fork": plan["fork"], "source": "recorded"})
+    return command
+
+
+def record_agent_start(directory, agent, address, project, model, resume):
+    """pa-session: one start record per start and resume of the Project Agent's own session."""
+    return append_session(directory, {
+        "v": 1, "ev": "start", "at": pa.now(), "session": agent.get("sessionId"), "program": "claude", "kind": "pa",
+        "space": agent.get("space") or os.path.basename(directory), "task": None, "name": None, "role": None,
+        "terminal": address, "parent": None, "model": model, "host": host(), "cwd": project, "pid": os.getpid(),
+        "resumed": bool(resume), "bind": None, "fork": False, "source": "recorded"})
+
+
 # ---- command line ------------------------------------------------------------------------------
 
 def main(argv=None):
