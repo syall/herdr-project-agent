@@ -243,7 +243,9 @@ profile lists its own terms in `profile.json` (`"coreCheck": ["..."]`), so this 
 `tests/test_*.py`, a keeper harness, a panel render harness and a store harness under Node (the last two
 simulate a slow or hung remote machine), and a `pa-session` check
 against a private hc core); `--affected` runs only the
-fast set. After updating, run `pa-sync --on <machine>` before installing the mod, so remote launchers
+fast set. The parts run at the same time (each unit test module is its own part), and each part's whole
+output is kept in a run folder that the last line names, after a summary of every part and failing test;
+`PA_SERIAL=1` runs the parts one after another, each streamed as it runs. After updating, run `pa-sync --on <machine>` before installing the mod, so remote launchers
 get the new `pa-session` (see the install order above).
 
 ## Licence

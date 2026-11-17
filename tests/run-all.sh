@@ -1,6 +1,6 @@
 #!/bin/sh
 # All of this repo's tests. Exits non-zero if any part fails.
-#   tests/run-all.sh             full suite: Python 3.7 parse check, unit tests (tests/test_*.py),
+#   tests/run-all.sh             full suite: Python 3.7 parse check, unit tests (each tests/test_*.py its own part),
 #                                keeper harness, panel harness, store harness, and the pa-session integration check
 #                                against a private hc core
 #   tests/run-all.sh --affected  the fast set only (no integration check). With PA_CHANGED_FILES
@@ -49,7 +49,7 @@ fi
 
 parse37() { "$PY" -c "import ast,sys
 for f in sys.argv[1:]: ast.parse(open(f).read(), feature_version=(3,7)); print(f, 'parses as Python 3.7')" runtime/tools/pa.py runtime/tools/pa_hooks.py runtime/tools/pa_guard.py runtime/tools/pa_costs.py runtime/tools/pa_push.py; }
-units() { "$PY" -m unittest discover -s tests -p 'test_*.py' -v; }
+units() { "$PY" -m unittest discover -s tests -p "$1.py" -v; }  # one module: the same loader and top folder
 keeper() { [ -n "$NODE" ] || { echo "no node found (set NODE)"; return 1; }; "$NODE" tests/keeper/run.mjs; }
 panel() { [ -n "$NODE" ] || { echo "no node found (set NODE)"; return 1; }; "$NODE" tests/panel/run.mjs; }
 store() { [ -n "$NODE" ] || { echo "no node found (set NODE)"; return 1; }; "$NODE" tests/store/run.mjs; }
@@ -61,10 +61,19 @@ integration() {
   return $code
 }
 
-# The parts to run, in the order they are printed: part_<i> is the function, name_<i> its name.
+# The parts to run, in the order they are printed: part_<i> is the function, name_<i> its name, arg_<i> its
+# argument. Each unit test module is its own part (they share no state: each makes its own temp folder and
+# homes), so they run at once; every tests/test_*.py, as discover found them, so each test runs once.
 count=0
-add() { count=$((count + 1)); eval "part_$count=\$1; name_$count=\$2"; }
-if [ "$want_py" = 1 ]; then add parse37 "python 3.7 parse"; add units "unit tests"; fi
+add() { count=$((count + 1)); eval "part_$count=\$1; name_$count=\$2; arg_$count=\${3:-}"; }
+if [ "$want_py" = 1 ]; then
+  add parse37 "python 3.7 parse"
+  for f in tests/test_*.py; do
+    [ -f "$f" ] || continue
+    m=${f#tests/}; m=${m%.py}
+    add units "unit tests: $m" "$m"
+  done
+fi
 [ "$want_keeper" = 1 ] && add keeper "keeper harness"
 [ "$want_panel" = 1 ] && add panel "panel harness"
 [ "$want_store" = 1 ] && add store "store harness"
@@ -72,12 +81,12 @@ if [ "$want_py" = 1 ]; then add parse37 "python 3.7 parse"; add units "unit test
 
 tmp=${TMPDIR:-/tmp}
 out=$(mktemp -d "${tmp%/}/run-all.XXXXXX") || { echo "run-all.sh: cannot make a temp folder under $tmp" >&2; exit 2; }
-log() { eval "echo \"\$out/\$1-\$part_$1.log\""; }
+log() { eval "echo \"\$out/\$1-\$part_$1\${arg_$1:+-\$arg_$1}.log\""; }
 # Print a file whole, ending in a newline.
 show() { cat "$1"; [ -s "$1" ] && [ -n "$(tail -c 1 "$1")" ] && echo; return 0; }
 # Run part $1 (function $2) with its own TMPDIR in the run folder: a test that looks for its own leftovers in
 # the temp folder then sees no other part's, nor those of another suite running beside this one.
-inpart() { TMPDIR="$out/$1.tmp"; export TMPDIR; mkdir "$TMPDIR" || return 1; "$2"; }
+inpart() { TMPDIR="$out/$1.tmp"; export TMPDIR; mkdir "$TMPDIR" || return 1; "$2" "$3"; }
 
 # Ctrl-C, TERM or a hangup (the pane is closed): stop every part still running (each is its own process group,
 # in PA_SERIAL=1 mode too), then exit 130, 143 or 129.
@@ -94,12 +103,12 @@ trap 'stop 129' HUP
 i=1
 if [ "${PA_SERIAL:-}" = 1 ]; then
   while [ "$i" -le "$count" ]; do
-    eval "p=\$part_$i; name=\$name_$i"
+    eval "p=\$part_$i; a=\$arg_$i; name=\$name_$i"
     echo "=== $name"
     # In the background in its own process group, and waited for: a signal then runs the trap at once (it
     # would wait for a foreground pipeline to end), and stop() can end the part, tee and its children.
     set -m 2>/dev/null
-    ( { (inpart "$i" "$p") 2>&1; echo $? > "$out/$i.code"; } </dev/null | tee "$(log "$i")" ) &
+    ( { (inpart "$i" "$p" "$a") 2>&1; echo $? > "$out/$i.code"; } </dev/null | tee "$(log "$i")" ) &
     pids=$!
     set +m 2>/dev/null
     wait "$pids"
@@ -112,8 +121,8 @@ if [ "${PA_SERIAL:-}" = 1 ]; then
 else
   set -m 2>/dev/null  # each part in its own process group, so stop() can end all of it
   while [ "$i" -le "$count" ]; do
-    eval "p=\$part_$i"
-    inpart "$i" "$p" </dev/null >"$(log "$i")" 2>&1 &
+    eval "p=\$part_$i; a=\$arg_$i"
+    inpart "$i" "$p" "$a" </dev/null >"$(log "$i")" 2>&1 &
     eval "pid_$i=\$!"
     pids="$pids $!"
     i=$((i + 1))
