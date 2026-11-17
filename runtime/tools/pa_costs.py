@@ -553,6 +553,20 @@ def subagent_files(parent_path, sid, owners, listing):
     return out
 
 
+def unknown_subagent_files(parent_path, sid):
+    """Relative paths of the .jsonl files under <folder>/<sid>/ that no P-c layout rule reads (VERIFY-2 M-1): they
+    count nothing and are named in problems. Names only; no file is opened."""
+    top = os.path.join(os.path.dirname(parent_path), sid)
+    found = []
+    for folder, dirs, names in os.walk(top):
+        dirs.sort()
+        for n in sorted(names):
+            rel = os.path.relpath(os.path.join(folder, n), top)
+            if n.endswith(".jsonl") and not (os.path.dirname(rel) == "subagents" and re.match(r"^[\w.-]{1,120}$", n)):
+                found.append(rel)
+    return found
+
+
 def short(sid):
     return (sid or "?")[:8]
 
@@ -646,7 +660,10 @@ def attribute_pa(row, ctx):
 
 
 def worker_entry(ledger, terminal, name):
-    found = [(t, w) for t in ledger.get("tasks", []) or [] for w in t.get("workers") or [] if w.get("address") == terminal]
+    """(task, worker) ledger entries of this address. A named session skips entries of another named worker: the
+    address may have been reused after an earlier worker closed (spec 2.1)."""
+    found = [(t, w) for t in ledger.get("tasks", []) or [] for w in t.get("workers") or [] if w.get("address") == terminal
+             and not (name and w.get("name") and w.get("name") != name)]
     found.sort(key=lambda tw: not (name and tw[1].get("name") == name))
     return found
 
@@ -660,9 +677,12 @@ def attribute_worker(row, sess, ctx):
     if terminal and (task is None or len({t.get("id") for t, _w in entries}) > 1):
         token = re.compile(r"(?<![A-Za-z0-9_-])" + re.escape(terminal) + r"(?![A-Za-z0-9_-])")
         handoff = None
+        since = parse_ts(sess.get("at") or "")  # entries from before this session started are not its handoffs
         for e in journal:
             if e["at"] > start + HANDOFF_SLACK:
                 break
+            if since is not None and e["at"] < since - HANDOFF_SLACK:
+                continue
             if e["task"] and token.search(e["why"]):
                 handoff = e
         if handoff:
@@ -717,6 +737,13 @@ def state_problems(state):
             out.append("{} re-read from the start {} time(s) (file replaced or shrunk)".format(short(sid), f["voided"]))
         if f.get("neverRead"):
             never += 1
+        if f.get("unknown"):
+            out.append("{}: {} file(s) under its folder not read (unknown layout): {}".format(
+                short(sid), len(f["unknown"]), ", ".join(f["unknown"][:5]) + (", ..." if len(f["unknown"]) > 5 else "")))
+    unowned = sorted(k.split("/", 1)[-1] for k, v in (state.get("owners") or {}).items() if v == "")
+    if unowned:
+        out.append("{} agent-*.jsonl file(s) beside the sessions name no session, not read (unknown layout): {}".format(
+            len(unowned), ", ".join(unowned[:5]) + (", ..." if len(unowned) > 5 else "")))
     if never:
         out.append("{} sessions' files were gone before they were read".format(never))
     out.extend(state.get("pending") or [])
@@ -800,6 +827,7 @@ def load_state(state_path, turns_path, now, quiet):
 def _collect(directory, folder, now, quiet, resummarize):
     state_path, turns_path = os.path.join(folder, "state.json"), os.path.join(folder, "turns.jsonl")
     state, old_text = load_state(state_path, turns_path, now, quiet)
+    old_problems = list(state.get("problems") or [])
     notes = state.setdefault("notes", [])
     size = os.path.getsize(turns_path) if os.path.exists(turns_path) else 0
     if size > state["turnsBytes"]:  # the last run died between its two writes: drop its rows, they are read again
@@ -914,6 +942,11 @@ def _collect(directory, folder, now, quiet, resummarize):
                     continue
                 others = [f.setdefault("tail", [])] + [o.setdefault("tail", []) for k, o in subs.items() if k != key]
                 read_one(dict(sess, sub=sub), sid, sub, sf, sub_path, sf.pop("rebuilt", False), others)
+            unknown = unknown_subagent_files(path, sid)
+            if unknown:
+                f["unknown"] = unknown
+            else:
+                f.pop("unknown", None)
         seen = parse_ts(f.get("seen") or "") or 0
         if ((sess.get("closed") or sess.get("gone")) and not f.get("open") and not any(sf.get("open") for sf in subs.values())
                 and now - seen >= DONE_AFTER):
@@ -940,7 +973,8 @@ def _collect(directory, folder, now, quiet, resummarize):
     if text != old_text:
         pa.write_text(state_path, text)
     written = [r for r in out if "seq" in r]
-    if written or resummarize or not os.path.exists(os.path.join(folder, "summary.json")):
+    if (written or resummarize or ctx["events"] or state["problems"] != old_problems
+            or not os.path.exists(os.path.join(folder, "summary.json"))):
         write_summary(directory, state, now, ctx["records"] + ctx["events"])
     if not quiet:
         print("collected {} new segment(s) from {} session(s)".format(len(written), len(sessions)))
@@ -1973,7 +2007,7 @@ def validate_row(row, source, account, now):
     out["source"] = source
     out["fetchedAt"] = iso(now)
     out["id"] = hashlib.sha1("|".join(str(out[k]) for k in ("source", "account", "from", "to", "label", "kind")).encode()).hexdigest()[:16]
-    if TWELVE.search(json.dumps(out)):
+    if TWELVE.search(json.dumps(out)) or TWELVE.search(json.dumps(dict(row, amount=out["amount"]), default=str)):
         raise ValueError("a row holds a 12-digit number (an account id?)")
     return out
 
