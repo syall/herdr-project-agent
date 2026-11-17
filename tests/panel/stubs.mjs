@@ -27,13 +27,17 @@ export const execKind = (command, args = []) => {
   const script = String(args[1] ?? "");
   return /for f in \*\.json/.test(script) ? "batch" : /session\.log/.test(script) ? "stale" : /ls -t/.test(script) ? "evidence" : "sh";
 };
+// __draining: set between cases; every call fails at once, so work left over from a case ends there.
+const drained = () => { if (g.__draining) throw new Error("an old world"); };
 export const readTextFile = async (path, options = {}) => {
+  drained();
   const on = options?.on ?? null;
   (g.__issued ??= []).push({ at: g.__now, on, kind: "read", path });
   if (on && g.__remoteDelay && !(g.__offline ?? []).includes(on)) await waitFor(g.__remoteDelay);
   return baseRead(path, options);
 };
 export const exec = async (command, args = [], options = {}) => {
+  drained();
   const on = options?.on ?? null, kind = execKind(command, args);
   if (!(command === "python3" && args[0] === "-c")) (g.__issued ??= []).push({ at: g.__now, on, kind });
   if ((g.__execHang ?? []).includes(`${on ?? ""}:${kind}`)) { (g.__execs ??= []).push([command, args, on]); return new Promise(() => {}); }

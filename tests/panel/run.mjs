@@ -32,7 +32,7 @@ const check = (ok, what) => { if (!ok) throw new Failed(what); };
 // field names `agentTerminal`); records: project-agent.tabs; extra: more panes/terminals.
 function world({ agent = true, agentTerminal = "t30", records = {}, extraPanes = [], extraTerms = [], extraTabs = [], agents = [], machine = null } = {}) {
   g.__now = T0; g.__gen = (g.__gen ?? 0) + 1; g.__delay = {};
-  cx = stubs.makeCx({ stop_propagation() {} });
+  cx = stubs.makeCx({ stop_propagation() {} }); g.__draining = false;
   g.__runs = []; g.__notes = []; g.__reads = []; g.__writes = []; g.__overlays = []; g.__offline = []; g.__hcs = []; g.__hcFail = []; g.__ls = {};
   g.__machines = [{ name: null, layout: "ready" }, ...(machine ? [{ name: machine, layout: "ready" }] : [])];
   g.__spaces = [{ id: machine ? `${machine}/${S}` : S, name: "proj", machine, folder: "/proj", active: true, tabs: [{ id: "tb9", index: 1, name: "2", named: false }, ...extraTabs] }];
@@ -799,7 +799,8 @@ for (const [name, fn] of Object.entries(cases)) {
   if (pick.length && !pick.includes(name)) continue;
   try { await fn(); console.log(`PASS ${name}`); }
   catch (e) { failed++; console.log(`FAIL ${name}: ${e instanceof Failed ? e.message : e.stack}`); }
-  g.__gen = (g.__gen ?? 0) + 1; await settle(); // this case's views stop: their delayed reads end and they start nothing new
+  // This case's views stop: their delayed reads end, every call they still make fails, and they start nothing new.
+  g.__gen = (g.__gen ?? 0) + 1; g.__draining = true; await settle(); await settle();
 }
 fs.rmSync(dst, { recursive: true, force: true });
 console.log(failed ? `${failed} case(s) failed` : "all panel cases passed");
