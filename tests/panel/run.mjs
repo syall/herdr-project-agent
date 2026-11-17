@@ -2162,6 +2162,461 @@ cases["P-push-rules-invalid"] = async () => { // AC3.2: an invalid file says why
   check(look(w).text.includes("Push allowlist: could not read it (pa-push-allow: command not found)"), `a failed read says so (got ${look(w).text.slice(0, 1500)})`);
 };
 
+// ---- t-009 Costs view (step 9c): R9, R11, R12, R14; every pa-costs call is answered by costsTool (an unanswered one is recorded) ----
+const isoAt = (ms) => new Date(ms).toISOString().replace(/\.\d+Z$/, "Z");
+const CUR = "XTS"; // the ISO code kept for tests: generic code and tests name no real currency
+function costsSummary(over = {}) {
+  const from = isoAt(T0 - 7200000), to = isoAt(T0 - 3600000);
+  return {
+    v: 1, space: S, updated: isoAt(T0 - 120000), account: "acct1",
+    prices: { profile: "test", source: "test table", asOf: "2027-01-01", currency: CUR, missing: [] },
+    totals: { tokens: { in: 10, out: 20, cw: 30, cr: 940, all: 1000 }, money: 12.5, unpricedTokens: 0, reconstructedMoney: 2.5, calls: 7 },
+    hours: [[isoAt(T0).slice(0, 13), { tokens: 100, money: 1.25 }]],
+    byActivity: [
+      { key: "build", tokens: 600, money: 7.5, calls: 3, reconstructed: 2.5, tasks: [{ key: "t-1", tokens: 600, money: 7.5 }] },
+      { key: "cache-rebuild", tokens: 300, money: 4, calls: 0, tasks: [{ key: "t-1", tokens: 300, money: 4 }] },
+      { key: "unattributed", tokens: 100, money: 1, calls: 1, tasks: [{ key: "(no task)", tokens: 100, money: 1 }], reasons: [{ key: "pa-no-journal", tokens: 100, money: 1 }] }],
+    byTask: [
+      { key: "t-1", title: "One", state: "in-progress", tokens: 900, money: 11.5, calls: 5, phases: [{ key: "build", tokens: 900, money: 11.5 }], sessions: ["aaaa1111", "bbbb2222"], split: true },
+      { key: "t-0", title: "Gone", state: "deleted", tokens: 0, money: 0, calls: 0, phases: [], sessions: [] },
+      { key: "(no task)", state: null, tokens: 100, money: 1, calls: 1, phases: [], sessions: ["cccc3333"] }],
+    byPhase: [{ key: "build", tokens: 1000, money: 12.5, calls: 7 }],
+    byKind: {
+      kind: [{ key: "worker", tokens: 900, money: 11.5, calls: 5 }, { key: "pa", tokens: 100, money: 1, calls: 2 }],
+      role: [{ key: "build", tokens: 900, money: 11.5, calls: 5 }, { key: "(none)", tokens: 100, money: 1, calls: 2 }],
+      program: [{ key: "claude", tokens: 1000, money: 12.5, calls: 7 }],
+      model: [{ key: "model-a", tokens: 1000, money: 12.5, calls: 7 }],
+      machine: [{ key: "host-one.example", tokens: 600, money: 7, calls: 4 }, { key: "host-two.example", tokens: 400, money: 5.5, calls: 3 }] },
+    byDay: [{ key: isoAt(T0).slice(0, 10), tokens: 1000, money: 12.5, calls: 7, byActivity: { build: 7.5, "cache-rebuild": 4, unattributed: 1 } }],
+    byDayModel: [{ day: isoAt(T0).slice(0, 10), model: "model-a", tokens: { in: 10, out: 20, cw5m: 30, cw1h: 0, cr: 940 }, money: 12.5 }],
+    passes: [{ pass: 3, trigger: "report", from, money: 4, tokens: 300, rebuild: true }, { pass: 4, trigger: "message", from, money: null, tokens: 50, rebuild: false }],
+    sessions: [
+      { key: "aaaa1111", tokens: 600, money: 7.5, calls: 3, kind: "worker", role: "build", program: "claude", task: "t-1", model: "model-a", from, to, state: "closed", source: "reconstructed", match: "cwd+start" },
+      { key: "bbbb2222", tokens: 300, money: 4, calls: 2, kind: "worker", role: "build", program: "claude", task: "t-1", model: "model-a", from, to, state: "gone", source: "recorded", match: "launch-record" },
+      { key: "cccc3333", tokens: 100, money: 1, calls: 2, kind: "pa", role: null, program: "claude", task: null, model: "model-a", from, to, state: "open", source: "recorded", match: "launch-record" }],
+    unmatched: { sessions: 0, tokens: 0 }, problems: [], ...over };
+}
+const statusOff = { config: null, state: {}, line: "Billing query: off", feePerRequest: 0.01, feeCurrency: CUR, maxPages: 3, runsPerDay: 3 };
+const statusOn = (state = {}) => ({ ...statusOff, config: { query: "q1", enabled: true }, state, line: "Billing query: on [Turn off: pa-costs billed disable]" });
+const noRows = (status = statusOff) => ({ comparison: { account: "acct1", currency: CUR, accountWide: true, models: [], covered: null, other: 0, total: { thisSpace: null, allSpaces: null, billed: 0 }, calibrated: null, noPrice: [], separate: [], sources: [] }, status, rows: 0 });
+const withRows = (status = statusOn({ lastRun: "2027-01-15T06:00:00Z", result: "ok", requests: 1, nextAfter: "2027-01-16T06:00:00Z" })) => ({ status, rows: 4, comparison: {
+  account: "acct1", currency: CUR, accountWide: true, covered: { from: "2027-01-10", to: "2027-01-14", days: 5, of: 6, missing: ["2027-01-15"] }, sources: ["query:q1"], fetchedAt: "2027-01-15T06:00:00Z",
+  models: [
+    { model: "model-a", thisSpace: 10, allSpaces: 20, thisSpacePartial: false, allSpacesPartial: false, billed: 25, factor: { kind: "price", value: 1.25, applied: true, few: false, note: "from quantities" }, notFinal: false, days: 5 },
+    { model: "model-b", thisSpace: null, allSpaces: 3, thisSpacePartial: false, allSpacesPartial: true, billed: 2.4, factor: { kind: "scope", value: 0.8, applied: false, few: true, partial: true, note: "not applied; below 1.0: the table over-prices" }, notFinal: true, days: 2 }],
+  other: 1.5, total: { thisSpace: 10, allSpaces: 23, thisSpacePartial: true, allSpacesPartial: true, billed: 28.9 }, calibrated: 12.5, calibratedPartial: true, noPrice: ["model-b"],
+  separate: [{ currency: "XXX", amount: 3, rows: 1 }] } });
+// Answers every pa-costs call: replies { "<sub>": (args, on, options) => reply }; sub is the first word, or "billed <action>".
+function costsTool(replies = {}) {
+  g.__costsUnexpected = [];
+  const base = { collect: () => ({ code: 0, stdout: "", stderr: "" }), reconstruct: () => ({ code: 0, stdout: "", stderr: "" }), "billed compare": () => ({ code: 0, stdout: JSON.stringify(noRows()), stderr: "" }),
+    "billed disable": () => ({ code: 0, stdout: "Billing query: off. Billed rows are kept.\n", stderr: "" }), report: () => ({ code: 0, stdout: JSON.stringify({ v: 1, account: "acct1", spaces: [S], byDayModel: [] }), stderr: "" }) };
+  const all = { ...base, ...replies };
+  g.__execFn = (command, args, on, options) => {
+    if (command !== "pa-costs") return undefined;
+    const sub = args[0] === "billed" ? `billed ${args[1]}` : args[0];
+    if (!all[sub]) { g.__costsUnexpected.push(args); return { code: 9, stdout: "", stderr: "unexpected in the test" }; }
+    return all[sub](args, on, options);
+  };
+}
+const json0 = (v) => ({ code: 0, stdout: JSON.stringify(v), stderr: "" });
+const costsExecs = (sub) => g.__execs.filter(([c, a]) => c === "pa-costs" && (!sub || (a[0] === "billed" ? `billed ${a[1]}` : a[0]) === sub));
+const costsReads = () => g.__issued.filter((x) => (x.kind === "read" && /\/costs\//.test(x.path ?? "")) || (x.kind === "ls" && false));
+const costsLs = () => g.__execs.filter(([c, a]) => c === "ls" && /\/costs$/.test(String(a[1] ?? "")));
+function costsFiles(summary, { machine = null } = {}) {
+  const dir = machine ? `${machine}:${RDIR}` : `:${DIR}`;
+  if (summary !== undefined && summary !== null) g.__files[`${dir}/costs/summary.json`] = typeof summary === "string" ? summary : JSON.stringify(summary);
+  g.__files[`${dir}/ledger.json`] = JSON.stringify({ tasks: [{ id: "t-1", title: "One", state: "in-progress", updated: "2027-01-15T07:00:00Z" }] });
+  return `${dir}/costs/summary.json`;
+}
+async function costsWorld({ machine = null, summary = costsSummary(), tool = {}, open = true } = {}) {
+  world({ machine });
+  const file = costsFiles(summary, { machine });
+  costsTool(tool);
+  const v = await mount(); await settle();
+  if (open) { await click(v, "view-costs"); await settle(); }
+  return { v, file };
+}
+// The Costs view's own subtree (id pa-costs): its text and clicks.
+function costsView(v) {
+  let found = null;
+  const walk = (x) => { if (found || !x || typeof x !== "object") return; if (x.key === "pa-costs") { found = x; return; } for (const k of x.kids ?? []) walk(k); };
+  walk(v.render(cx));
+  return found ? inspect(found) : { text: "", clicks: {} };
+}
+// Every text segment of the view that holds a money amount says what it is: est., billed, a stated fee or a factor.
+function moneyLabelled(v) {
+  const segs = costsView(v).text.split(" | ");
+  return segs.filter((x) => /\d\.\d\d\b|<0\.01/.test(x) && !/est\.|billed|fee|factor|ratio/.test(x));
+}
+
+cases["P-costs-tab"] = async () => { // AC9.1: a 4th tab after Rules; "Costs" before any read, "Costs · <money> est." after; nothing read until it is clicked
+  const { v } = await costsWorld({ open: false });
+  let { text, clicks } = look(v);
+  check(Boolean(clicks["view-costs"]), `a Costs tab (have ${Object.keys(clicks)})`);
+  const order = ["| Decisions |", "| Tasks · 1 |", "| Rules", "| Costs |"].map((x) => text.indexOf(x));
+  check(order.every((x, i) => x >= 0 && (i === 0 || x > order[i - 1])), `Costs comes after Rules (got ${order}; ${text.slice(0, 600)})`);
+  check(text.includes("| Costs |"), `the label is Costs before any read (got ${text.slice(0, 600)})`);
+  check(costsReads().length === 0 && costsExecs().length === 0, `nothing read before the click (got ${JSON.stringify(costsReads())})`);
+  await click(v, "view-costs"); await settle();
+  ({ text } = look(v));
+  check(/Costs · [^|]*12\.50 est\. \|/.test(text), `the tab shows the total est. (got ${text.slice(0, 700)})`);
+  check(costsReads().length === 1, `one read on the click (got ${costsReads().length})`);
+};
+
+cases["P-costs-tabidle"] = async () => { // R11: another view shown: no costs read, no pa-costs exec; Costs shown: at most one read per 10 s
+  const { v } = await costsWorld({ open: false });
+  for (let s = 1; s <= 60; s++) { advance(1000); for (const tm of g.__timers) if (s * 1000 % tm.ms === 0) tm.fn(cx); if (s % 3 === 0) v.reload(cx); look(v); await settle(); }
+  check(costsReads().length === 0 && costsExecs().length === 0 && costsLs().length === 0, `Tasks/Decisions: nothing (got ${JSON.stringify(costsReads())}, ${JSON.stringify(costsExecs())})`);
+  await click(v, "view-costs"); await settle();
+  const start = g.__now;
+  for (let s = 1; s <= 60; s++) { advance(1000); for (const tm of g.__timers) if (s * 1000 % tm.ms === 0) tm.fn(cx); if (s % 3 === 0) v.reload(cx); look(v); await settle(); }
+  const reads = costsReads().filter((x) => x.at > start);
+  for (let w = 0; w < 6; w++) { const n = reads.filter((x) => x.at > start + w * 10000 && x.at <= start + (w + 1) * 10000).length; check(n <= 1, `at most one read per 10 s (window ${w}: ${n})`); }
+  check(reads.length >= 4, `but it does keep reading while shown (got ${reads.length})`);
+};
+
+cases["P-costs-hidden"] = async () => { // R11 (d-039): Costs selected and the panel hidden: no costs read or exec; P-hidden-one-call's 2 calls per 10 s still hold
+  const { v } = await costsWorld({ machine: M });
+  const before = { reads: costsReads().length, execs: costsExecs().length };
+  g.__layout = panelLayout("changes");
+  for (let s = 1; s <= 60; s++) { advance(1000); for (const tm of g.__timers) if (s * 1000 % tm.ms === 0) tm.fn(cx); if (s % 3 === 0) v.reload(cx); look(v); await settle(); }
+  check(costsReads().length === before.reads && costsExecs().length === before.execs && v.view === "costs", `hidden: nothing (reads ${before.reads} -> ${costsReads().length}, execs ${before.execs} -> ${costsExecs().length})`);
+  // P-hidden-one-call with view = "costs".
+  world({ machine: M });
+  remoteCards(4); costsFiles(costsSummary(), { machine: M }); costsTool();
+  g.__layout = panelLayout("changes");
+  const w = await mount();
+  w.view = "costs";
+  for (let s = 1; s <= 60; s++) { advance(1000); for (const tm of g.__timers) if (s * 1000 % tm.ms === 0) tm.fn(cx); if (s % 3 === 0) w.reload(cx); look(w); await settle(); }
+  const kinds = [...new Set(remoteCalls().filter((x) => x.at > T0).map((x) => (x.kind === "read" ? `read ${x.path.split("/").pop()}` : x.kind)))].sort();
+  check(JSON.stringify(kinds) === '["batch","read ledger.json"]', `only the batched card read and the ledger (got ${JSON.stringify(kinds)})`);
+  const per = []; for (let i = 0; i < 6; i++) per.push(remoteCalls().filter((x) => x.at > T0 + i * 10000 && x.at <= T0 + (i + 1) * 10000));
+  check(per.every((l) => l.length === 2), `2 calls in each 10 s interval (got ${per.map((l) => l.length)})`);
+  // Shown again: the view reads at once.
+  g.__layout = panelLayout("project-agent"); advance(1000); await fire(1000); await settle();
+  check(costsReads().length >= 1, "shown again: read");
+};
+
+cases["P-costs-timercopy"] = async () => { // R11: the timer copy (props.timer) reads no costs and runs no pa-costs view command
+  world(); costsFiles(costsSummary()); costsTool();
+  g.__props = { timer: true };
+  const v = await mount();
+  v.view = "costs";
+  for (let i = 0; i < 8; i++) { advance(15000); for (const t of [...g.__timers]) t.fn(cx); await settle(); v.render(cx); }
+  check(costsReads().length === 0 && costsLs().length === 0 && costsExecs().filter(([, a]) => a[0] !== "collect" && !(a[0] === "billed" && a[1] === "fetch")).length === 0, `nothing (got ${JSON.stringify(costsReads())}, ${JSON.stringify(costsExecs())})`);
+};
+
+cases["P-costs-empty"] = async () => { // AC9.3, §5.5: no costs/ folder: the text and Reconstruct
+  const { v } = await costsWorld({ summary: null });
+  const { text, clicks } = costsView(v);
+  check(text.includes("No cost records yet. Spend is recorded for sessions started from now on.") && Boolean(clicks["costs-reconstruct"]) && text.includes("Reconstruct from session files"), `empty state (got ${text})`);
+  check(costsLs().length === 1, `one ls of costs/ (got ${JSON.stringify(costsLs())})`);
+  check(!/0\.00/.test(text) && !/error/i.test(text), "no zero, no error");
+};
+
+cases["P-costs-pending"] = async () => { // §5.5: records but no summary yet
+  world(); costsFiles(undefined); costsTool();
+  g.__ls[`:${DIR}/costs`] = ["sessions.jsonl", ".collect.lock"];
+  const v = await mount(); await settle(); await click(v, "view-costs"); await settle();
+  const { text, clicks } = costsView(v);
+  check(text.includes("Collecting… (first run)") && Boolean(clicks["costs-refresh"]), `pending (got ${text})`);
+};
+
+cases["P-costs-invalid"] = async () => { // §5.5: an invalid summary: the error and Refresh
+  const { v } = await costsWorld({ summary: "{ not json" });
+  const { text, clicks } = costsView(v);
+  check(/costs\/summary\.json: .*JSON|costs\/summary\.json: Unexpected|costs\/summary\.json: Expected/.test(text) && Boolean(clicks["costs-refresh"]), `error and Refresh (got ${text})`);
+};
+
+cases["P-costs-notinstalled"] = async () => { // §5.5 (D5): the exec cannot start (rejects) or exits 127: install hints, local and remote
+  for (const [machine, want] of [[null, "pa-costs is not installed here; run ./install.sh."], [M, `pa-costs is not installed on ${M}; run pa-sync --on ${M}.`]]) {
+    const { v } = await costsWorld({ machine, tool: { collect: () => { throw new Error("spawn pa-costs ENOENT"); }, "billed compare": () => ({ code: 127, stdout: "", stderr: "pa-costs: command not found" }) } });
+    await click(v, "costs-refresh"); await settle();
+    const { text } = costsView(v);
+    check(text.includes(`Refresh failed: ${want}`), `${machine ?? "local"}: ${want} (got ${text.slice(0, 1500)})`);
+    check(text.includes("Billed amounts could not be read (pa-costs is not installed here; run ./install.sh.)"), `the local compare says so too (got ${text.slice(-600)})`);
+  }
+};
+
+cases["P-costs-full"] = async () => { // AC9.1, AC4.2, AC7.2: header, tiles, sections, marks; every money figure is labelled
+  const { v } = await costsWorld();
+  const { text } = costsView(v);
+  for (const want of ["Estimated from test table prices as of 2027-01-01 (XTS) · updated 2 min ago", "Refresh", "Total", "Today", "Last 7 days (UTC)", "1k tokens · 94% cache read",
+    "By activity", "build ◌", "cache rebuild after idle", "unattributed", "By task", "t-1 One ≈", "in-progress", "t-0 (deleted) Gone", "(no task)", "By session type", "By day (UTC)",
+    "◌ Includes", "est. reconstructed (best effort) from session files still on disk."]) check(text.includes(want), `shows "${want}" (got ${text.slice(0, 2500)})`);
+  check(/12\.50.* est\./.test(text), "the total est.");
+  const bad = moneyLabelled(v);
+  check(bad.length === 0, `every money figure says est. or billed (unlabelled: ${JSON.stringify(bad)})`);
+};
+
+cases["P-costs-noprice"] = async () => { // AC4.4: no price table: tokens only, never 0.00
+  const s = costsSummary({ prices: { profile: "test", source: null, asOf: null, currency: null, missing: ["model-a"] } });
+  s.totals = { ...s.totals, money: null, reconstructedMoney: null, unpricedTokens: 1000 };
+  for (const e of [...s.byActivity, ...s.byTask, ...s.byDay, ...s.sessions, ...s.byKind.machine, ...s.byKind.kind]) e.money = null;
+  for (const e of s.byActivity) for (const x of [...(e.tasks ?? []), ...(e.reasons ?? [])]) x.money = null;
+  s.hours = [[isoAt(T0).slice(0, 13), { tokens: 100, money: null }]]; s.passes[0].money = null;
+  for (const d of s.byDay) d.byActivity = {};
+  const { v } = await costsWorld({ summary: s });
+  await click(v, "costs-activity-0"); await click(v, "costs-dim-machine"); await settle();
+  const { text } = costsView(v);
+  check(text.includes("No price table in profile test: tokens only.") && text.includes("1k tokens") && !/\d\.\d\d/.test(text), `tokens only, no amount (got ${text.slice(0, 2000)})`);
+  check(look(v).text.includes("Costs · 1k tokens · no price"), "the tab says no price");
+};
+
+cases["P-costs-unpriced"] = async () => { // decision (2): a partial entry has a mark and is never complete; an unpriced one is "no price", never 0.00
+  const s = costsSummary({ prices: { profile: "test", source: "test table", asOf: "2027-01-01", currency: CUR, missing: ["model-z"] } });
+  s.totals = { ...s.totals, unpricedTokens: 77 };
+  s.byActivity[0].unpricedTokens = 77;
+  s.byActivity.push({ key: "review", tokens: 77, money: null, calls: 1, tasks: [{ key: "t-1", tokens: 77, money: null }] });
+  s.hours = [[isoAt(T0).slice(0, 13), { tokens: 100, money: null }]];
+  s.byTask = s.byTask.filter((x) => x.key !== "t-0"); // its real 0.00 is not what this case looks at
+  const { v } = await costsWorld({ summary: s });
+  await click(v, "costs-activity-3"); await settle();
+  const { text } = costsView(v);
+  check(text.includes("77 tokens of model-z have no price: shown as tokens only."), `the partial line (got ${text.slice(0, 1500)})`);
+  check(/12\.50 est\. \+ unpriced/.test(text.replace(/[^\x20-\x7e]+/g, " ").replace(/XTS ?/g, "")) || /est\. \+ unpriced/.test(text), "the total is partial");
+  check(text.includes("partly no price") && text.includes("— est.") && text.includes("no price"), `the marks (got ${text.slice(0, 2500)})`);
+  const segs = text.split(" | ");
+  const today = segs[segs.indexOf("Today") + 1];
+  check(today === "— est.", `Today with only unpriced use is — est. (got ${today})`);
+  check(!segs.some((x) => /^0\.00|\b0\.00 est/.test(x)), "nothing unpriced reads 0.00");
+  check(look(v).text.includes("+ unpriced"), "the tab marks the partial total");
+};
+
+cases["P-costs-problems"] = async () => { // §4: the count line, the expanded list (20), truncated, the collector's failure
+  const problems = Array.from({ length: 25 }, (_, i) => `problem ${i + 1}`);
+  const { v } = await costsWorld({ summary: costsSummary({ problems, truncated: true }) });
+  g.__shared["project-agent.costs"] = { [S]: { at: isoAt(T0), ok: false, code: 2, error: "pa-costs: the lock is busy\nsecond line" } };
+  let { text } = costsView(v);
+  check(text.includes("⚠ 25 problems reading the records ▸") && !text.includes("problem 1 |"), `the count line, folded (got ${text.slice(0, 800)})`);
+  check(text.includes("Lists shortened to fit; pa-costs report shows all."), "truncated");
+  check(/Collector: last run .* failed: pa-costs: the lock is busy/.test(text) && !text.includes("second line"), `the collector line (got ${text.slice(0, 1200)})`);
+  await click(v, "costs-problems");
+  ({ text } = costsView(v));
+  check(text.includes("problem 20") && !text.includes("problem 21"), `the first 20 (got ${text.slice(0, 1500)})`);
+};
+
+cases["P-costs-nototals"] = async () => { // decision (1): a summary without totals: "Nothing collected yet" and the reason, never an error or a zero
+  const s = { v: 1, space: S, updated: isoAt(T0 - 60000), account: "default", collect: { ok: false, at: isoAt(T0 - 60000), why: "prices.json is not valid JSON" }, problems: ["collect failed: prices.json is not valid JSON"] };
+  const { v } = await costsWorld({ summary: s });
+  const { text } = costsView(v);
+  check(text.includes("Nothing collected yet. prices.json is not valid JSON") && !/\d\.\d\d/.test(text) && !/costs\/summary\.json:/.test(text), `nothing collected and why (got ${text})`);
+  check(look(v).text.includes("| Costs |"), "the tab has no figure");
+};
+
+cases["P-costs-timeout"] = async () => { // D3: a hung read keeps the copy with a line; without one, "did not answer"; the rest of the panel still loads
+  const { v, file } = await costsWorld();
+  g.__hang = [file.replace(/^:/, ":")];
+  advance(11000); v.reload(cx); await settle();
+  advance(11000); await settle();
+  let { text } = costsView(v);
+  check(text.includes("summary.json did not answer; showing the copy read at") && text.includes("By activity"), `kept copy and the line (got ${text.slice(0, 600)})`);
+  check(/PA: proj/.test(look(v).text) && /Tasks · 1/.test(look(v).text), "the rest of the panel is there");
+  world(); costsFiles(costsSummary()); costsTool();
+  g.__hang = [`:${DIR}/costs/summary.json`];
+  const w = await mount(); await settle(); await click(w, "view-costs");
+  advance(11000); await settle();
+  ({ text } = costsView(w));
+  check(text.includes("Costs did not answer. Trying again shortly.") && Boolean(costsView(w).clicks["costs-refresh"]), `no copy (got ${text})`);
+  check(/Tasks · 1/.test(look(w).text), "the tasks still committed");
+};
+
+cases["P-costs-kept"] = async () => { // D2: switch space and back: the kept copy at once, no Loading, one new read
+  world({ machine: M });
+  costsFiles(costsSummary(), { machine: M }); costsTool();
+  addRemoteSpace("sp2", "other", ledgerOf(3, "b"));
+  g.__files[`${M}:.config/herdr-pa/spaces/sp2/costs/summary.json`] = JSON.stringify(costsSummary({ space: "sp2", totals: { ...costsSummary().totals, money: 99 } }));
+  const v = await mount(); await settle(); await click(v, "view-costs"); await settle();
+  check(costsView(v).text.includes("By activity"), "sp1 shown");
+  show(`${M}/sp2`); advance(11000); look(v); await settle(); look(v); await settle();
+  check(/99\.00/.test(costsView(v).text), `sp2 shown (got ${costsView(v).text.slice(0, 300)})`);
+  const n = costsReads().length;
+  show(RS); advance(11000);
+  const at = look(v), mine = costsView(v);
+  check(!/Loading/.test(at.text) && /12\.50/.test(mine.text) && !/99\.00/.test(mine.text), `sp1's kept copy at once (got ${mine.text.slice(0, 300)})`);
+  await settle();
+  check(costsReads().length === n + 1, `one new read (got ${costsReads().length - n})`);
+};
+
+cases["P-costs-remote"] = async () => { // R6, AC6.2, AC9.4: reads and execs on m1, except the billed compare (here); never a session file
+  const { v } = await costsWorld({ machine: M, tool: { "billed compare": (args) => json0(args.includes("--here-json") ? withRows() : { ...withRows(), comparison: null }) } });
+  await click(v, "costs-refresh"); await settle(); await click(v, "costs-reconstruct").catch(() => {});
+  const reads = costsReads();
+  check(reads.length >= 1 && reads.every((x) => x.on === M), `costs reads on m1 (got ${JSON.stringify(reads)})`);
+  check(!g.__issued.some((x) => /\/projects\/|\/sessions\/|\.claude|\.codex/.test(x.path ?? "")), "no session file read");
+  for (const [, a, on] of costsExecs()) {
+    const sub = a[0] === "billed" ? `billed ${a[1]}` : a[0];
+    check(sub === "billed compare" ? on === null : on === M, `${sub} on ${on}`);
+  }
+  check(costsExecs("collect").some(([, a]) => JSON.stringify(a) === JSON.stringify(["collect", "--space", S])), `collect --space sp1 (got ${JSON.stringify(costsExecs("collect"))})`);
+};
+
+cases["P-costs-refresh"] = async () => { // R12: Refresh runs collect on the space's machine, one at a time, Refreshing…, then one reread
+  let release; const held = new Promise((r) => { release = r; });
+  const { v } = await costsWorld({ machine: M, tool: { collect: () => held.then(() => ({ code: 0, stdout: "", stderr: "" })) } });
+  const n = costsReads().length;
+  await click(v, "costs-refresh"); await settle();
+  check(costsView(v).text.includes("Refreshing…"), "Refreshing…");
+  await click(v, "costs-refresh"); await settle();
+  check(costsExecs("collect").length === 1, `one at a time (got ${costsExecs("collect").length})`);
+  const [, args, on, opts] = costsExecs("collect")[0];
+  check(JSON.stringify(args) === JSON.stringify(["collect", "--space", S]) && on === M && opts?.timeout >= 30000, `its argv and machine (got ${JSON.stringify(costsExecs("collect")[0])})`);
+  release(); await settle();
+  check(costsReads().length === n + 1 && !costsView(v).text.includes("Refreshing…"), `one reread (got ${costsReads().length - n})`);
+};
+
+cases["P-costs-reconstruct"] = async () => { // AC9.3: Reconstruct runs reconstruct --space on the machine, a long timeout; exit 2 shows its stderr
+  const { v } = await costsWorld({ machine: M, summary: null, tool: { reconstruct: () => ({ code: 2, stdout: "", stderr: "pa-costs: no session files found for this space\n" }) } });
+  await click(v, "costs-reconstruct"); await settle();
+  const r = costsExecs("reconstruct");
+  check(r.length === 1 && JSON.stringify(r[0][1]) === JSON.stringify(["reconstruct", "--space", S]) && r[0][2] === M && r[0][3]?.timeout >= 120000, `its argv, machine, timeout (got ${JSON.stringify(r)})`);
+  check(costsView(v).text.includes("Reconstruct failed: pa-costs: no session files found for this space"), `stderr shown (got ${costsView(v).text})`);
+};
+
+cases["P-costs-drill"] = async () => { // AC9.2: task -> phases and sessions; activity -> tasks; unattributed -> reasons; cache rebuild -> passes; day -> activities; one open per section
+  const { v } = await costsWorld();
+  await click(v, "costs-task-0");
+  let { text } = costsView(v);
+  check(text.includes("Phases:") && text.includes("Sessions:") && /◌ aaaa1111 · worker · build · claude · model-a .* closed · reconstructed/.test(text) && /bbbb2222 .* gone · recorded/.test(text) && text.includes("≈ shared passes split by journal entries"), `task drill (got ${text.slice(0, 2500)})`);
+  await click(v, "costs-activity-0");
+  ({ text } = costsView(v));
+  check(text.includes("Tasks:") && /t-1 · 600 tokens · .*7\.50.* est\./.test(text), `activity -> tasks (got ${text.slice(0, 2500)})`);
+  await click(v, "costs-activity-2");
+  ({ text } = costsView(v));
+  check(text.includes("Reasons:") && text.includes("pa-no-journal") && !/t-1 · 600 tokens/.test(text), `unattributed -> reasons, the other closed (got ${text.slice(0, 2500)})`);
+  await click(v, "costs-activity-1");
+  ({ text } = costsView(v));
+  check(text.includes("Passes with a cache rebuild:") && /pass 3 · report .* cache rebuild/.test(text) && !text.includes("pass 4"), `cache rebuild -> passes (got ${text.slice(0, 2500)})`);
+  check(text.includes("Phases:"), "the task section keeps its own open row");
+  await click(v, "costs-day-0");
+  ({ text } = costsView(v));
+  check(/cache rebuild after idle · .*4\.00.* est\./.test(text) && /build · .*7\.50.* est\./.test(text), `day -> activities (got ${text.slice(0, 3000)})`);
+  await click(v, "costs-dim-role"); await click(v, "costs-kind-0");
+  ({ text } = costsView(v));
+  check(/aaaa1111/.test(text) && !/cccc3333 ·/.test(text.split("By day")[0].split("By session type")[1] ?? ""), `role build -> its sessions (got ${text.slice(0, 3000)})`);
+  check(moneyLabelled(v).length === 0, `labelled (${JSON.stringify(moneyLabelled(v))})`);
+};
+
+cases["P-costs-machine"] = async () => { // §5.1: the machine row is Herdr's machine name or "this computer", never a host key
+  for (const [machine, want] of [[null, "this computer"], [M, M]]) {
+    const { v } = await costsWorld({ machine });
+    await click(v, "costs-dim-machine"); await click(v, "costs-kind-0");
+    const { text } = costsView(v);
+    check(text.includes(`${want} |`) && /12\.50/.test(text.split("By session type")[1] ?? "") && !/host-(one|two)/.test(look(v).text), `${want}, one row, no host name (got ${text.slice(0, 2500)})`);
+  }
+};
+
+cases["P-costs-billed-off"] = async () => { // R14 state 1, R15: off and no rows: one line, no enable control
+  const { v } = await costsWorld();
+  const { text, clicks } = costsView(v);
+  check(text.includes("Billed amounts: none. The billing query is off; the person turns it on in their own terminal (pa-costs billed enable, see README)."), `state 1 (got ${text.slice(-500)})`);
+  check(!Object.keys(clicks).some((k) => /enable|billing-on/.test(k)) && !clicks["costs-billing-off"], `no enable control (got ${Object.keys(clicks)})`);
+  check(JSON.stringify(costsExecs("billed compare")[0]?.[1]) === JSON.stringify(["billed", "compare", "--json", "--space", S]) && costsExecs("billed compare")[0][2] === null, "the local compare of this space");
+};
+
+cases["P-costs-billed-enabled-empty"] = async () => { // R14 state 2: on, no rows: the status line with Turn off, and no rows yet
+  const { v } = await costsWorld({ tool: { "billed compare": () => json0(noRows(statusOn({ nextAfter: "2027-01-15T09:00:00Z" }))) } });
+  const { text, clicks } = costsView(v);
+  check(/Billing query: on · not run yet · next after .* · cap 1\/day \(≤ 3 requests, stated fee ≈ 0\.01 XTS each\)/.test(text) && Boolean(clicks["costs-billing-off"]), `status line and Turn off (got ${text.slice(-700)})`);
+  check(text.includes("No billed rows for account acct1 yet."), "no rows yet");
+};
+
+cases["P-costs-billed-data"] = async () => { // R14 state 3, AC14.1-14.4: the comparison; every billed figure says account-wide
+  const { v } = await costsWorld({ tool: { "billed compare": () => json0(withRows()) } });
+  const { text } = costsView(v);
+  for (const want of ["Billed (account-wide: includes use outside this space and outside Herdr)", "Covered 2027-01-10 – 2027-01-14 (5 of 6 days; not billed: 2027-01-15) · source query:q1, fetched",
+    "this space", "all spaces here", "model-a", "price factor 1.25 (from quantities)", "model-b", "— est. (no price)", "scope ratio 0.8 (not applied) below 1.0: the table over-prices",
+    "(from a partial estimate)", "(few days)", "(not final)", "other / unmapped labels", "total", "calibrated (est. × price factor, where one applies): this space", "+ unpriced",
+    "In XXX (not compared):", "No price for model-b"]) check(text.includes(want), `shows "${want}" (got ${text.slice(text.indexOf("Billed"), text.indexOf("Billed") + 2500)})`);
+  const segs = text.split(" | ").filter((x) => /billed/.test(x) && /\d\.\d\d/.test(x));
+  check(segs.length >= 4 && segs.every((x) => x.includes("billed · account-wide")), `every billed figure says account-wide (got ${JSON.stringify(segs)})`);
+  check(moneyLabelled(v).length === 0, `labelled (${JSON.stringify(moneyLabelled(v))})`);
+  check(/Billing query: on · last run .* \(ok, 1 requests\)/.test(text), "the status line when on");
+};
+
+cases["P-costs-billed-rejected"] = async () => { // R14 state 4: rejected rows, refused, other failure
+  for (const [state, want] of [
+    [{ result: "failed", lastError: "batch rejected: row 3 has no amount", lastRun: "2027-01-15T06:00:00Z", nextAfter: "2027-01-15T10:00:00Z" }, "The last query's rows were rejected; nothing was added: row 3 has no amount."],
+    [{ result: "refused", lastError: "refused: cannot show the configured identity is read-only (x)" }, "Billing query refused: refused: cannot show the configured identity is read-only (x)"],
+    [{ result: "failed", lastError: "the query script exited 4", nextAfter: "2027-01-15T10:00:00Z" }, "Billing query failed: the query script exited 4; next try after"]]) {
+    const { v } = await costsWorld({ tool: { "billed compare": () => json0(withRows(statusOn(state))) } });
+    const { text } = costsView(v);
+    check(text.includes(want) && text.includes("Billed (account-wide"), `${state.result}: ${want} (got ${text.slice(-1500)})`);
+  }
+};
+
+cases["P-costs-billed-refused"] = async () => { // R14 state 5: the compare call fails or times out: says so, keeps a copy
+  const { v } = await costsWorld({ tool: { "billed compare": () => ({ code: 2, stdout: "", stderr: "pa-costs: no Project Agent state for this space\n" }) } });
+  check(costsView(v).text.includes("Billed amounts could not be read (pa-costs: no Project Agent state for this space)"), `the error (got ${costsView(v).text.slice(-400)})`);
+  let mode = "ok";
+  const { v: w } = await costsWorld({ tool: { "billed compare": () => (mode === "ok" ? json0(withRows()) : new Promise(() => {})) } });
+  mode = "hang"; advance(61000); w.reload(cx); await settle(); advance(36000); await settle();
+  const { text } = costsView(w);
+  check(/Billed amounts could not be read \(pa-costs billed did not answer in 35 s\); showing the copy read earlier\./.test(text) && text.includes("price factor 1.25"), `kept copy (got ${text.slice(-1500)})`);
+};
+
+cases["P-costs-billed-currency"] = async () => { // AC14.4: rows only in another currency; no price table
+  const other = noRows(statusOn()); other.rows = 1; other.comparison.separate = [{ currency: "XXX", amount: 9, rows: 1 }];
+  const { v } = await costsWorld({ tool: { "billed compare": () => json0(other) } });
+  const { text } = costsView(v);
+  check(text.includes("No billed rows in XTS for account acct1.") && text.includes("In XXX (not compared):") && text.includes("billed · account-wide, 1 row(s)"), `other currency (got ${text.slice(-800)})`);
+  const none = JSON.parse(JSON.stringify(other)); none.comparison.currency = null;
+  const { v: w } = await costsWorld({ tool: { "billed compare": () => json0(none) } });
+  check(costsView(w).text.includes("No price table, so no currency to compare: billed rows for account acct1 are not compared."), "no table");
+};
+
+cases["P-costs-billed-remote"] = async () => { // D9: a remote space: the local compare with the trimmed summary; with rows, the remote's account-wide report, then the compare with it
+  const { v } = await costsWorld({ machine: M, tool: { "billed compare": (args) => json0(args.includes("--here-json") ? withRows() : { ...noRows(statusOn()), rows: 4 }),
+    report: () => json0({ v: 1, account: "acct1", spaces: [S, "sp7"], byDayModel: [{ day: "2027-01-14", model: "model-a", tokens: {}, money: 20 }] }) } });
+  const cmp = costsExecs("billed compare"), rep = costsExecs("report");
+  check(cmp.length === 2 && cmp.every(([, , on]) => on === null), `two local compares (got ${JSON.stringify(cmp.map((x) => [x[1].slice(0, 4), x[2]]))})`);
+  const arg = JSON.parse(cmp[0][1][cmp[0][1].indexOf("--summary-json") + 1]);
+  check(JSON.stringify(Object.keys(arg).sort()) === JSON.stringify(["account", "byDayModel", "prices", "space", "updated", "v"]), `the trimmed summary (got ${Object.keys(arg)})`);
+  check(rep.length === 1 && JSON.stringify(rep[0][1]) === JSON.stringify(["report", "--account-wide"]) && rep[0][2] === M, `the remote report (got ${JSON.stringify(rep)})`);
+  check(JSON.parse(cmp[1][1][cmp[1][1].indexOf("--here-json") + 1]).spaces.includes("sp7"), "the remote's figure passed on");
+  check(costsView(v).text.includes("price factor 1.25"), "the comparison shown");
+  // No rows: no remote report at all.
+  const { v: w } = await costsWorld({ machine: M });
+  check(costsExecs("report").length === 0 && costsExecs("billed compare").length === 1 && costsView(w).text.includes("Billed amounts: none."), "no rows: no report");
+};
+
+cases["P-costs-turnoff"] = async () => { // R15, d-066: Turn off is one click: billed disable here, then the status again
+  let off = false;
+  const { v } = await costsWorld({ machine: M, tool: { "billed compare": () => json0(off ? noRows() : noRows(statusOn())), "billed disable": () => { off = true; return { code: 0, stdout: "Billing query: off.", stderr: "" }; } } });
+  const n = costsExecs("billed compare").length;
+  await click(v, "costs-billing-off"); await settle();
+  const d = costsExecs("billed disable");
+  check(d.length === 1 && JSON.stringify(d[0][1]) === JSON.stringify(["billed", "disable"]) && d[0][2] === null, `one click, here (got ${JSON.stringify(d)})`);
+  check(costsExecs("billed compare").length === n + 1 && costsView(v).text.includes("The billing query is off"), `the status again (got ${costsView(v).text.slice(-400)})`);
+};
+
+cases["P-costs-lastquery"] = async () => { // R15: the visible last-queried line
+  const { v } = await costsWorld({ tool: { "billed compare": () => json0(withRows(statusOn({ lastRun: "2027-01-15T06:00:00Z", result: "ok", requests: 2, nextAfter: "2027-01-16T06:00:00Z" }))) } });
+  const line = costsView(v).text.split(" | ").find((x) => x.startsWith("Billing query: on"));
+  check(/^Billing query: on · last run .+ \(ok, 2 requests\) · next after .+ · cap 1\/day \(≤ 3 requests, stated fee ≈ 0\.01 XTS each\)$/.test(line ?? ""), `the line (got ${line})`);
+  check(!/\[Turn off/.test(costsView(v).text), "the tool's own [Turn off: …] text is not shown");
+};
+
+cases["P-costs-actions"] = async () => { // R12: across every click the only pa-costs commands are these; nothing is written
+  const { v } = await costsWorld({ machine: M, tool: { "billed compare": (args) => json0(args.includes("--here-json") ? withRows() : { ...noRows(statusOn()), rows: 4 }) } });
+  for (const id of Object.keys(costsView(v).clicks)) { const c = costsView(v).clicks[id]; if (c) { c({}, cx); await settle(); } }
+  await click(v, "costs-reconstruct").catch(() => {});
+  for (const id of Object.keys(costsView(v).clicks)) { const c = costsView(v).clicks[id]; if (c) { c({}, cx); await settle(); } }
+  const subs = [...new Set(costsExecs().map(([, a]) => (a[0] === "billed" ? `billed ${a[1]}` : a[0] === "report" ? `report ${a[1]}` : a[0])))].sort();
+  const allowed = ["billed compare", "billed disable", "collect", "reconstruct", "report --account-wide"];
+  check(subs.every((x) => allowed.includes(x)) && subs.includes("collect") && subs.includes("billed disable"), `only ${allowed} (got ${JSON.stringify(subs)})`);
+  check(!(g.__writes ?? []).length && !g.__execs.some(([c, a]) => c === "python3" && a[0] === "-c"), `nothing written (got ${JSON.stringify(g.__writes)})`);
+  check(!g.__costsUnexpected.length, `no unanswered pa-costs call (got ${JSON.stringify(g.__costsUnexpected)})`);
+  for (const [, a] of costsExecs()) for (const x of a) check(typeof x === "string" && (x.startsWith("{") || /^[a-z-]+$|^sp1$/.test(x)), `fixed argv words only (got ${x.slice(0, 80)})`);
+};
+
+cases["P-costs-currency-fallback"] = async () => { // K6: a currency code Intl does not take: "12.50 CODE"
+  const s = costsSummary({ prices: { profile: "test", source: "test table", asOf: "2027-01-01", currency: "XTSX", missing: [] } });
+  const { v } = await costsWorld({ summary: s });
+  check(costsView(v).text.includes("12.50 XTSX est."), `the fallback (got ${costsView(v).text.slice(0, 800)})`);
+};
+
 const pick = process.argv.slice(2);
 let failed = 0;
 for (const [name, fn] of Object.entries(cases)) {
