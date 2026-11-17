@@ -104,7 +104,9 @@ export class PushCards {
   // From Submit only (main.js answer()): `pa-push-main run`, once. `told(message)` gets the notice for
   // the orchestrator. Exit 0: done (or Not now saved); exit 1 or 2 with the tool's refusal JSON:
   // refused or failed, the card stays open; anything else (exit 1 or 2 without that JSON, as when the
-  // tool crashed, maybe after the push; another code, a throw or no answer): the result is unknown.
+  // tool crashed, maybe after the push; another code, a throw or no answer; a Push's exit 0 whose JSON
+  // does not say ok, done, with a result): the result is unknown, and the card stays shown (kept) with
+  // that line and the follow-up check's verdict until the person leaves it, as after a push.
   // After a refusal or an unknown result the card is checked again. Returns whether it started.
   run(space, entry, label, note, cx, told) {
     const st = this.of(space.id, entry.id);
@@ -117,9 +119,12 @@ export class PushCards {
       st.running = null;
       let notice;
       const out = error ? null : printed(r);
-      if (error || ![0, 1, 2].includes(r?.code) || (r.code !== 0 && out?.ok !== false)) {
-        st.unknown = error ?? `pa-push-main run exited with ${r?.code}${said(r) ? `: ${said(r)}` : ""}`;
+      // Exit 0 of a Push is done only when the tool's JSON says so (ok, done, and its result).
+      const pushedSaid = out?.ok === true && out.done === true && out.result !== null && typeof out.result === "object";
+      if (error || ![0, 1, 2].includes(r?.code) || (r.code !== 0 && out?.ok !== false) || (r.code === 0 && label === PUSH && !pushedSaid)) {
+        st.unknown = error ?? `pa-push-main run exited with ${r?.code}${r?.code === 0 ? " without a result that says it pushed" : ""}${said(r) ? `: ${said(r)}` : ""}`;
         st.check = null;
+        st.kept = true; // the tool may have saved the card answered before it failed: keep it shown with the check's verdict
         notice = `decision ${entry.id} answered ${label}; result unknown (${st.unknown}); the panel checks the card again`;
       } else {
         if (r.code === 0) {
@@ -150,6 +155,12 @@ export class PushCards {
     if (!open) {
       const r = c.push?.result;
       if (st?.result) this.shown(t, box, st, {});
+      if (st?.unknown) {
+        // A run whose result is unknown, after which the card was read answered: the one check's verdict.
+        box.child(line(`The result is unknown (${st.unknown}); checking the card again.`, t.blocked));
+        if (st.busy) box.child(line("Checking…", t.dim));
+        else if (st.check) box.child(line(st.check.ok === true ? "The check found the card open." : `The check found (${text(st.check.refusal?.check)}): ${text(st.check.refusal?.message)}`));
+      }
       box.child(small(r ? `Recorded on the card: pushed ${text(r.url)} ${text(r.branch)} ${short(r.from)}..${short(r.to)} at ${stamp(r.at)}` : "Nothing was pushed from this card."));
       if (st?.kept) box.child(div().id(`push-done-${entry.id}`).flex_none().text_size(11.5).text_color(t.accent).cursor_pointer().on_click(onDone).child("Done"));
       return box;
