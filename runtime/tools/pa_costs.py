@@ -2881,7 +2881,8 @@ def cc_number(value, top=None):
 
 
 def cc_text(value, pattern):
-    return value if isinstance(value, str) and pattern.match(value) else None
+    """value when the whole string is one the pattern takes (fullmatch: `$` alone would take a trailing newline)."""
+    return value if isinstance(value, str) and pattern.fullmatch(value) else None
 
 
 def cc_fields(obj, terminal, at):
@@ -2932,7 +2933,11 @@ CC_STOP = {"proc": None, "starting": False, "stopping": False, "write": threadin
 
 
 def statusline_kill(proc):
-    """Kill the inner command's whole process group (it runs in its own session), or the process alone."""
+    """Kill the inner command's whole process group (it runs in its own session), or the process alone. Nothing once it
+    has been reaped (returncode set by communicate or wait): its pid may since name another process (REVIEW-R2 R2-L1),
+    and Popen.kill on Python 3.7/3.8 would signal that pid without checking."""
+    if proc.returncode is not None:
+        return
     try:
         os.killpg(proc.pid, 9)  # its whole group: a shell's children hold its stdout open
     except OSError:
@@ -3049,7 +3054,7 @@ def statusline(argv, data, now=None):
         def work():
             try:
                 stamp = time.time() if now is None else now
-                if not record or not space or not pa.ID.match(space):
+                if not record or not space or not pa.ID.fullmatch(space):
                     return
                 fields = cc_fields(json.loads(data.decode("utf-8")), os.environ.get("HC_TERMINAL_ID"), iso(stamp))
                 if fields is not None:
