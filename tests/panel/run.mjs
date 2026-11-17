@@ -1816,6 +1816,9 @@ cases["P-push-run-once"] = async () => { // AC6.2, AC5.3: Submit Push runs pa-pu
   check(pushExecs("run").length === 1, "still one run");
   check(g.__files[file] === before && !(g.__writes ?? []).some((k) => k.includes("/decisions/")), "the panel wrote no card file");
   check(look(v).text.includes(`Pushed ${PURL} main aa22000..cc11000`) && look(v).text.includes("Done"), `the result and the output tail (got ${look(v).text.slice(0, 1500)})`);
+  // The card file still reads open (the stand-in wrote nothing): this copy offers no second Push.
+  await click(v, `opt-${PID}-0`); await settle();
+  check(!look(v).clicks[`submit-${PID}`] && pushExecs("run").length === 1, "pushed from here already: no Submit Push");
 };
 
 cases["P-push-note-passed"] = async () => { // the note goes with --note
@@ -1894,6 +1897,14 @@ cases["P-push-hidden"] = async () => { // AC6.4: a hidden copy reloading 10 time
   for (let i = 0; i < 10; i++) { advance(10000); await fire(10000); await fire(1000); v.resend(cx); await settle(); }
   check(g.__issued.some((x) => x.kind === "batch" || x.kind === "ls"), "the hidden copy did read the cards");
   check(allExecsOfTool().length === 0, `no pa-push-* exec (got ${JSON.stringify(allExecsOfTool().map((x) => x[1]))})`);
+  // Shown first (its card loaded and checked, Push picked), then hidden: the hidden reloads add nothing.
+  const { v: w } = await pushWorld({ layout: panelLayout("project-agent") });
+  await click(w, `opt-${PID}-0`); await settle();
+  const before = allExecsOfTool().length;
+  check(before === 2 && w.cards.length === 1, `shown: two checks, the card loaded (got ${before}, ${w.cards.length} cards)`);
+  g.__layout = panelLayout("changes");
+  for (let i = 0; i < 10; i++) { advance(10000); await fire(10000); await fire(1000); w.resend(cx); await settle(); }
+  check(w.asleep && allExecsOfTool().length === before, `hidden: no new pa-push-* exec (got ${JSON.stringify(allExecsOfTool().slice(before).map((x) => x[1]))})`);
 };
 
 cases["P-push-reloads"] = async () => { // AC6.4: a shown copy with Push picked, 10 reloads and resends: no run

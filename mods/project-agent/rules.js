@@ -1,12 +1,17 @@
 // The Rules view: the person's rules for one space (spec section 8). They can add, edit, turn
 // off, reorder and delete rules, and approve or decline the orchestrator's proposals. The file
 // stays theirs: every change is applied to what is on disk at that moment, and an invalid file
-// is flagged, never written over.
+// is flagged, never written over. Below them, a read-only view of the person's push allowlist
+// (t-007b), from `pa-push-allow show --json`: read when the view opens, on its Refresh, and on
+// reloads while it is shown, at most once per ALLOW_EVERY; never written here.
 
 import { div } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input } from "gpui-base";
 import { home } from "herdr";
 import { loadRules, changeRules, touched, reorder, newRuleId, exportRules, importRules } from "./store.js";
+import { readAllow } from "./push.js";
+
+export const ALLOW_EVERY = 30000; // the push allowlist is read at most this often, but for Refresh
 
 // A two-click Delete (a task's in main.js, a rule's here): the first click arms it, { id, space, at }.
 // The arm holds while its space is shown, its item is expanded and it is under ARM_WAIT old; a
@@ -27,6 +32,45 @@ export class RulesPane {
     this.declined = false; // declined rules shown
     this.message = null; this.error = null;
     this.importPath = null; // InputState, made on first use (never in render)
+    this.allow = {}; // space id -> { data, asked, busy }: the last pa-push-allow show --json (data: its report, or { error })
+  }
+
+  // Reads the push allowlist for the view (main.js: the view opening, a reload while it is shown;
+  // force: its Refresh link). At most once per ALLOW_EVERY unless forced; one read at a time.
+  wantAllow(space, cx, force = false) {
+    const a = (this.allow[space.id] ??= { data: null, asked: 0, busy: false });
+    if (a.busy || (!force && a.asked && Date.now() - a.asked < ALLOW_EVERY)) return;
+    a.busy = true; a.asked = Date.now();
+    cx.spawn(async (cx) => {
+      try { a.data = await readAllow(space, cx); } catch (e) { a.data = { error: String(e.message ?? e) }; }
+      a.busy = false;
+      cx.notify();
+    });
+  }
+
+  allowView(t, space) {
+    const a = this.allow[space.id], d = a?.data;
+    const line = (s, color) => div().px(4).text_size(11.5).text_color(color ?? t.muted).child(s);
+    const str = (v) => (v === null || v === undefined ? "" : String(v));
+    const box = v_flex().id("push-allow").flex_none().mt(8).p(10).gap(4).rounded(7).border(1).border_color(t.border).bg(t.surface)
+      .child(h_flex().gap(8).items_center()
+        .child(div().flex_1().min_w(0).text_size(12).font_semibold().text_color(t.foreground).child("Push allowlist"))
+        .child(div().id("push-allow-refresh").flex_none().text_size(11.5).text_color(t.accent).cursor_pointer().on_click((_e, cx) => { this.wantAllow(space, cx, true); cx.notify(); }).child(a?.busy ? "Reading…" : "Refresh")));
+    if (!d) box.child(line(a?.busy ? "Push allowlist: reading…" : "Push allowlist: not read yet."));
+    else if (d.error) box.child(line(`Push allowlist: could not read it (${str(d.error)})`, t.blocked));
+    else if (!d.exists) box.child(line("Push allowlist: off (the default): main-branch pushes are not possible.")).child(line(str(d.file).replace(home(), "~"), t.dim));
+    else if (!d.valid) box.child(line(`Push allowlist: not valid, so nothing is allowed: ${str(d.problem)}. Fix it by hand.`, t.blocked)).child(line(str(d.file).replace(home(), "~"), t.dim));
+    else {
+      box.child(line(`Push allowlist: ${d.enabled ? "on" : "off (enabled: false)"}`, d.enabled ? t.foreground : t.muted))
+        .child(line(`${str(d.file)} · changed ${str(d.mtime)}`, t.dim));
+      if (!(d.repos ?? []).length) box.child(line("No entries."));
+      for (const e of d.repos ?? []) {
+        box.child(div().px(4).pt(2).text_size(12).text_color(e?.enabled ? t.foreground : t.muted).child(`${str(e?.path)} → ${str(e?.url)} ${str(e?.branch)}`))
+          .child(div().px(4).pl(16).text_size(11).text_color(t.dim).child([e?.thisSpace ? "this space" : `space ${str(e?.space)}`, e?.enabled ? "on" : "off",
+            Array.isArray(e?.prePush) && e.prePush.length ? `prePush: ${e.prePush.map(str).join(" ")}` : null, e?.note ? str(e.note) : null].filter(Boolean).join(" · ")));
+      }
+    }
+    return box.child(line("Read only: change it in your own terminal with pa-push-allow, or by hand.", t.dim));
   }
 
   // The rule id whose Delete is armed, if the arm still holds (armHolds); one that does not is dropped.
@@ -150,7 +194,7 @@ export class RulesPane {
   render(t, space, onDecided) {
     const d = this.data;
     const note = (text, color) => div().px(4).py(4).text_size(12).text_color(color ?? t.dim).child(text);
-    if (!d) return v_flex().p(8).child(note("Loading…"));
+    if (!d) return v_flex().p(8).child(note("Loading…")).child(this.allowView(t, space));
     const proposed = d.rules.filter((r) => r.status === "proposed"), live = d.rules.filter((r) => r.status === "active" || r.status === "off"), declined = d.rules.filter((r) => r.status === "declined");
     return v_flex().id("pa-rules").flex_1().min_h(0).p(8).gap(6).overflow_y_scrollbar()
       .on_mouse_up("left", (_e, cx) => { if (this.pressed) { this.pressed = null; cx.notify(); } })
@@ -183,6 +227,7 @@ export class RulesPane {
         .children(live.map((r) => this.row(t, space, r, onDecided, true)))
         .when(declined.length > 0, (e) => e.child(div().id("rules-declined").px(4).py(4).text_size(11.5).text_color(t.dim).cursor_pointer().hover((s) => s.text_color(t.foreground))
           .on_click((_e, cx) => { this.declined = !this.declined; cx.notify(); }).child(`${this.declined ? "▾" : "▸"} ${declined.length} declined (kept so they aren't proposed again)`)))
-        .when(this.declined, (e) => e.children(declined.map((r) => this.row(t, space, r, onDecided, false)))));
+        .when(this.declined, (e) => e.children(declined.map((r) => this.row(t, space, r, onDecided, false)))))
+      .child(this.allowView(t, space));
   }
 }

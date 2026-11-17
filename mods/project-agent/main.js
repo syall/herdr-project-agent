@@ -2,7 +2,9 @@
 // and the buttons its profile declares. Generic: profiles add data and scripts, never code.
 // Reads ~/.config/herdr-pa (on the space's machine). Writes only decision answers and rule changes.
 // Runs a program only on a click: a profile action, `hc send` after an answer, or the
-// launcher that starts a Project Agent.
+// launcher that starts a Project Agent. Push cards (push.js, t-007b): a shown copy runs the
+// read-only `pa-push-main check` when one first appears and on a click, and the Rules view the
+// read-only `pa-push-allow show`; `pa-push-main run` runs only from a push card's Submit.
 
 import { View, div } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, ScrollHandle } from "gpui-base";
@@ -12,6 +14,7 @@ import { RulesPane, arm, armHolds } from "./rules.js"; // arm, armHolds: the two
 import { SetupPane } from "./setup.js";
 import { Keeper, idleShell } from "./keeper.js";
 import { WorkerPane } from "./worker.js";
+import { PushCards, isPush, PUSH, PUSH_OPTIONS } from "./push.js";
 import { tick, cadence, holdReason, setSchedule, requestPass, PRESETS, MIN_MINUTES } from "./timer.js";
 
 const ACTIVE = ["needs-decision", "review", "in-progress", "investigating", "queued"];
@@ -83,6 +86,7 @@ export default class ProjectAgent extends View {
     this.view = null; // "decisions" | "tasks" | "rules"; null: decisions when any is open
     this.viewShown = null; // the view the last render drew (this.view, or the one picked for null)
     this.rules = new RulesPane();
+    this.push = new PushCards(); // push cards: the last pa-push-main check and run of each (push.js)
     this.open = new Set(); // expanded task ids
     this.folded = new Set(["done", "parked"]); // task sections folded away (finished work starts folded)
     this.older = false; // answered cards shown
@@ -322,6 +326,8 @@ export default class ProjectAgent extends View {
     if (rules) this.rules.data = rules;
     this.keep(space.id, { data: keptData, ...keptCards, rules: rules ?? this.rules.data, at: this.dataAt });
     if (data.agent && !keptData.unknown.includes("profile")) this.profiles[space.id] = { done: true, profile: data.profile ?? null }; // read once per session
+    for (const c of cards) this.push.wantCheck(space, c, cx); // an open push card's first check (push.js)
+    if (this.view === "rules") this.rules.wantAllow(space, cx); // the Rules view's push allowlist, at most every 30 s
     const open = listed ? this.syncNotes(space, cards, true) : null; // cards that did not answer write no count
     if (!listed) this.syncNotes(space, cards, false);
     if (token > (this.wrote[space.id] ?? 0)) { this.wrote[space.id] = token; this.share(space, data.agent ? { ...data, unknown: [...(data.unknown ?? []), ...missed] } : { ...data, evidence: new Map() }, { open }); }
@@ -410,6 +416,7 @@ export default class ProjectAgent extends View {
   }
 
   answer(space, entry, label, cx) {
+    if (isPush(entry.card)) { this.answerPush(space, entry, label, cx); return; } // never answerDecision
     if (this.busy[entry.id] || !label) return;
     delete this.choice[entry.id];
     this.busy[entry.id] = true; delete this.failed[entry.id];
@@ -428,6 +435,19 @@ export default class ProjectAgent extends View {
       this.reload(cx);
       cx.notify();
     });
+  }
+
+  // A push card's Submit: pa-push-main run (push.js) records the answer and pushes; the panel shows
+  // its result, reloads and tells the orchestrator.
+  answerPush(space, entry, label, cx) {
+    const note = (this.notes[noteKey(space.id, entry.id)]?.value() ?? "").trim();
+    const started = this.push.run(space, entry, label, note, cx, (message) => {
+      this.unsent.push({ spaceId: space.id, message });
+      this.resend(cx);
+      this.reload(cx);
+    });
+    if (started) delete this.choice[entry.id];
+    cx.notify();
   }
 
   // Deliver what the orchestrator hasn't had yet, to the terminal its launcher runs in now. With
@@ -685,9 +705,11 @@ export default class ProjectAgent extends View {
         .child(div().text_size(11.5).text_color(t.blocked).child(entry.error ?? ""))
         .child(div().text_size(11).text_color(t.dim).truncate().child(entry.path.replace(home(), "~")));
     }
-    const open = c.status === "open", busy = Boolean(this.busy[entry.id]);
+    const push = isPush(c), running = push ? this.push.running(space.id, entry.id) : null;
+    const open = c.status === "open", busy = Boolean(this.busy[entry.id]) || Boolean(running);
     const task = c.task && (this.data?.ledger?.tasks ?? []).find((x) => x.id === c.task);
     const picked = open ? this.choice[entry.id] ?? null : null;
+    const ready = Boolean(picked) && !busy && (!push || picked !== PUSH || this.push.canSubmit(space.id, entry.id)); // Push: a fresh check that passed
     return v_flex().id(`card-${entry.id}`).flex_none().p(10).gap(7).rounded(7).border(1).border_color(this.spotlight === entry.id ? t.accent : open ? t.input : t.border).bg(t.surface)
       .child(h_flex().gap(7).items_center()
         .child(div().flex_none().text_size(11.5).text_color(t.dim).child(entry.id))
@@ -698,17 +720,24 @@ export default class ProjectAgent extends View {
         .child(div().flex_none().text_size(10.5).text_color(t.dim).child(when(open ? c.created : c.answered)))
         .child(this.chip(t, open ? "open" : c.status === "withdrawn" ? "withdrawn" : `answered: ${c.answer}`, open ? t.blocked : t.dim)))
       .child(div().text_size(13).font_semibold().text_color(t.foreground).child(String(c.question)))
+      // A push card: the facts pa-push-main check read now, never the card file's context (push.js).
+      .when(push, (el) => el.child(this.push.block(t, space, entry, (_e, cx) => { this.push.check(space, entry, cx); cx.notify(); })))
       // The context, one row per line; a line that starts with two spaces is indented (a worktree card's details).
-      .when(Boolean(c.context) && !String(c.context).includes("\n"), (el) => el.child(div().text_size(12).text_color(t.muted).child(String(c.context))))
-      .when(String(c.context ?? "").includes("\n"), (el) => el.child(v_flex().gap(2).children(String(c.context).split("\n").map((line) =>
+      .when(!push && Boolean(c.context) && !String(c.context).includes("\n"), (el) => el.child(div().text_size(12).text_color(t.muted).child(String(c.context))))
+      .when(!push && String(c.context ?? "").includes("\n"), (el) => el.child(v_flex().gap(2).children(String(c.context).split("\n").map((line) =>
         div().text_size(12).text_color(t.muted).when(line.startsWith("  "), (d) => d.pl(12)).child(line.startsWith("  ") ? line.trimStart() : line)))))
       .when(Boolean(task), (el) => el.children(this.actions(t, task, space)))
-      .children((c.options ?? []).map((o, i) => {
+      .children((push ? PUSH_OPTIONS : c.options ?? []).map((o, i) => {
         const recommended = c.recommendation === o.label, chosen = open ? picked === o.label : c.answer === o.label;
         return h_flex().id(`opt-${entry.id}-${i}`).gap(8).px(8).py(6).items_center().rounded(6).border(1)
           .border_color(chosen ? t.accent : recommended && open ? t.input : t.border).bg(chosen ? t.selected : t.background)
           // Picking an option only selects it; the Submit button below sends it, with the note.
-          .when(open && !busy, (el) => el.cursor_pointer().hover((s) => s.bg(t.hover)).on_click((_e, cx) => { this.choice[entry.id] = picked === o.label ? null : o.label; cx.notify(); }))
+          // On a push card, picking Push checks it again (push.js).
+          .when(open && !busy, (el) => el.cursor_pointer().hover((s) => s.bg(t.hover)).on_click((_e, cx) => {
+            this.choice[entry.id] = picked === o.label ? null : o.label;
+            if (push && this.choice[entry.id] === PUSH) this.push.check(space, entry, cx);
+            cx.notify();
+          }))
           .when(open, (el) => el.child(div().flex_none().size(12).rounded(6).border(1).border_color(chosen ? t.accent : t.input).bg(chosen ? t.accent : t.background)))
           .child(div().flex_none().min_w(18).text_size(12.5).font_semibold().text_color(t.foreground).child(String(o.label)))
           .child(div().flex_1().min_w(0).text_size(12).text_color(t.muted).child(String(o.detail ?? "")))
@@ -717,10 +746,11 @@ export default class ProjectAgent extends View {
       .when(open && Boolean(this.notes[noteKey(space.id, entry.id)]), (el) => el.child(Input.new(this.notes[noteKey(space.id, entry.id)]).h(30).px(8).rounded(6).border_1().border_color(t.input).bg(t.background).text_size(12).text_color(t.foreground))
         .child(h_flex().gap(8).items_center()
           .child(div().id(`submit-${entry.id}`).flex_none().px(12).h(28).flex().items_center().rounded(7).text_size(12.5).font_semibold()
-            .bg(picked && !busy ? t.solid : t.raised).text_color(picked && !busy ? t.solid_foreground : t.dim)
-            .when(Boolean(picked) && !busy, (b) => b.cursor_pointer().hover((s) => s.opacity(0.88)).on_click((_e, cx) => this.answer(space, entry, picked, cx)))
-            .child(busy ? "Saving…" : picked ? `Submit answer: ${picked}` : "Submit answer"))
-          .child(div().flex_1().min_w(0).text_size(10.5).text_color(t.dim).child(picked ? "Add a note above if you want; it is sent with the answer." : "Pick an option, add a note if you want, then submit."))))
+            .bg(ready ? t.solid : t.raised).text_color(ready ? t.solid_foreground : t.dim)
+            .when(ready, (b) => b.cursor_pointer().hover((s) => s.opacity(0.88)).on_click((_e, cx) => this.answer(space, entry, picked, cx)))
+            .child(running === PUSH ? "Pushing…" : busy ? "Saving…" : picked ? `Submit answer: ${picked}` : "Submit answer"))
+          .child(div().flex_1().min_w(0).text_size(10.5).text_color(t.dim).child(push && picked === PUSH && !ready && !busy ? "Push needs a check that passed, under 2 minutes old, that says this panel may push."
+            : picked ? "Add a note above if you want; it is sent with the answer." : "Pick an option, add a note if you want, then submit."))))
       // Closed from the conversation: say so, with the words that decided it (or why it was withdrawn).
       .when(!open && Boolean(c.answeredBy), (el) => el.child(div().text_size(11).text_color(t.dim).child(c.status === "withdrawn" ? "Closed by the Project Agent as no longer needed" : `Answered by the ${c.answeredBy}`)))
       .when(!open && Boolean(c.note), (el) => el.child(div().text_size(12).text_color(t.muted).child(c.status === "withdrawn" ? `Why: ${c.note}` : c.answeredBy ? `You said: “${c.note}”` : `Note: ${c.note}`)))
@@ -810,7 +840,7 @@ export default class ProjectAgent extends View {
     this.viewShown = view;
     const tab = (id, label) => div().id(`view-${id}`).px(9).h(24).flex().items_center().rounded(6).text_size(12).cursor_pointer()
       .bg(view === id ? t.selected : t.chrome).text_color(view === id ? t.foreground : t.muted).hover((s) => s.bg(t.hover))
-      .on_click((_e, cx) => { this.view = id; this.disarm(); cx.notify(); }).child(label);
+      .on_click((_e, cx) => { this.view = id; this.disarm(); if (id === "rules") this.rules.wantAllow(space, cx); cx.notify(); }).child(label);
     const unsent = this.unsent.filter((u) => u.spaceId === space.id);
     return root
       .child(head(`PA: ${a.name ?? space.name}`, h_flex().flex_none().gap(6).items_center()

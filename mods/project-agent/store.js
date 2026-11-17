@@ -320,13 +320,19 @@ export async function replaceFile(path, text, expected, on) {
   if (r.code !== 0) throw new Error(r.code === 3 ? "The file changed on disk while you were editing; reloaded, try again." : r.stderr || "Could not write the file.");
 }
 
-// Writes the person's answer into the card file. The only fields this mod ever changes.
+// A push card (t-007b): it has a push object, or kind "push". Its answer runs pa-push-main (push.js), which
+// writes the answer itself; answerDecision never writes one.
+export const isPush = (card) => Boolean(card && typeof card === "object" && ((card.push && typeof card.push === "object") || card.kind === "push"));
+
+// Writes the person's answer into the card file. The only fields this mod ever changes. A push card (as
+// read from disk now) is refused: only pa-push-main run, from its own Submit, answers it.
 export async function answerDecision(space, entry, label, note) {
   const on = space.machine ?? null;
   const now = await readTextFile(entry.path, { on });
   if (now === null) throw new Error("The card file is gone.");
   let card;
   try { card = JSON.parse(now); } catch { throw new Error("The card file is not valid JSON; fix it by hand."); }
+  if (isPush(card)) throw new Error("A push card is answered with its own Submit; its answer runs pa-push-main.");
   if (card.status !== "open") throw new Error("This card was already answered.");
   if (!(card.options ?? []).some((o) => o.label === label)) throw new Error("That option is no longer on the card.");
   const next = { ...card, status: "answered", answer: label, note: note || null, answered: new Date().toISOString().replace(/\.\d+Z$/, "Z") };
