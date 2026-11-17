@@ -570,12 +570,18 @@ def inside(path, folder):
 
 
 def worker_tree(task, entry=None):
-    """The realpath of the worktree a task's worker works in: its ledger entry's `worktree` (the folder it was
-    started in), else the task's main worktree, else None."""
+    """The realpath of the worktree a task's worker works in, always one its own task records (pa.task_worktrees):
+    the one its ledger entry's `worktree` (the folder it was started in) equals or lies inside, the deepest if
+    several do. A field that names no worktree of the task (another task's, stale, mistyped, relative) counts as
+    absent: the task's main worktree, else None."""
+    trees = pa.task_worktrees(task)
     given = (entry or {}).get("worktree") if isinstance(entry, dict) else None
     if isinstance(given, str) and given.strip():
-        return os.path.realpath(os.path.expanduser(given))
-    main = next((t for t in pa.task_worktrees(task) if t["main"]), None)
+        given = os.path.realpath(os.path.expanduser(given))
+        holding = [t["path"] for t in trees if inside(given, t["path"])]
+        if holding:
+            return max(holding, key=len)
+    main = next((t for t in trees if t["main"]), None)
     return main["path"] if main else None
 
 
@@ -1137,6 +1143,8 @@ def worker_facts(directory, agent, profile, address):
     out.update(task=task.get("id"), title=task.get("title"), taskState=task.get("state"), role=entry.get("role"),
                onlyWorker=len(crew) == 1, keep=bool(entry.get("keep")), finished=bool(entry.get("finished")), closed=entry.get("closed"))
     row = worktree_state(directory, agent, profile).get(worker_tree(task, entry))  # its own worktree only, never a sibling job's
+    if row and task["id"] not in row["tasks"]:  # never another task's worktree (worker_tree gives only its own; a second guard)
+        row = None
     if row and row["facts"] and not row["facts"].get("main") and not row["facts"].get("unreadable"):
         others = [w["address"] for w in row["workers"] if w["fate"] == "live" and w["address"] != address] + row["others"]
         out["worktree"] = {"path": row["path"], "kind": row["facts"].get("kind", "worktree"), "uncommitted": row["facts"]["uncommitted"],
