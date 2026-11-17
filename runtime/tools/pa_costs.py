@@ -8,10 +8,13 @@ Python standard library only (3.7+). Linked as pa-costs.
   pa-costs prices [--space ID]                               the price table in use, and models seen without a price
   pa-costs billed status|list|remove|disable|enable|fetch|import ...   billed amounts (the person's commands)
   pa-costs billed compare --json [--space ID] [--summary-json J] [--here-json J]   the Costs view's billed comparison
+  pa-costs statusline --space ID [--then ARGV...]   Claude Code's status line (pa-claude/pa-session add it): records
+                                                     the session's own cost figure, prints the inner line unchanged
 
 Files, in the space's state folder (costs/): sessions.jsonl (launch and other session records, append-only),
 turns.jsonl (the cost ledger: tokens per settled segment, append-only), state.json (read offsets), summary.json
-(what the panel reads). Billed rows: <HERDR_PA_HOME>/billing/. Counters and ids only: no session text is kept,
+(what the panel reads), cc/<session>.json (Claude Code's own per-session cost figure, list price, from its status
+line input: ids and numbers only). Billed rows: <HERDR_PA_HOME>/billing/. Counters and ids only: no session text is kept,
 printed or logged. Nothing here uses the network or reads any account; billed rows come only from a script the
 profile declares, which only the person turns on (pa-costs billed enable, in a terminal).
 """
@@ -2707,6 +2710,228 @@ def record_agent_start(directory, agent, address, project, model, resume):
         "resumed": bool(resume), "bind": None, "fork": False, "source": "recorded"})
 
 
+# ---- Claude Code's own per-session cost (t-029): the recording status line -----------------------------
+# Claude Code runs `pa-costs statusline --space ID --then <the profile's status line command>` (pa.py adds it with
+# --settings) every update, with a JSON object on stdin. It keeps ids and numbers only, in costs/cc/<session>.json,
+# and prints the inner command's output unchanged. It never fails, never writes to stderr and never waits long.
+
+INNER_TIMEOUT = 2.0  # seconds the inner status line command may run (from its start); past that: killed, nothing printed
+RECORD_BUDGET = 0.3  # seconds the record may take after it started; past that it is not waited for
+STDIN_MAX = 1 << 20  # bytes of stdin read; more is cut (passed on cut) and nothing is recorded
+CC_WRITE_EVERY = 300  # seconds: an unchanged record is rewritten at most this often (keeps `at` fresh)
+CC_DROP = 0.01  # a cost lower than the stored one by more than this, with a lower duration, starts a new segment
+CC_MAX_FILES = 5000  # costs/cc/ files a summary reads, newest first
+CC_SESSION = re.compile(r"^[0-9A-Za-z-]{8,64}$")
+CC_VERSION = re.compile(r"^[0-9A-Za-z.+-]{1,32}$")
+CC_KEYS = ("v", "session", "cost", "base", "segments", "durationMs", "apiDurationMs", "model", "version", "terminal",
+           "first", "at")
+
+
+def cc_number(value, top=None):
+    """value when it is a finite number >= 0 (and < top), else None. Never a bool or a string."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if value != value or value in (float("inf"), float("-inf")) or value < 0 or (top is not None and value >= top):
+        return None
+    return value
+
+
+def cc_text(value, pattern):
+    return value if isinstance(value, str) and pattern.match(value) else None
+
+
+def cc_fields(obj, terminal, at):
+    """The record's fields from a status line input: only the named ids and numbers, each checked (default deny: nothing
+    else of the input is read). None when there is no valid session id."""
+    if not isinstance(obj, dict):
+        return None
+    session = cc_text(obj.get("session_id"), CC_SESSION)
+    if session is None:
+        return None
+    cost = obj.get("cost") if isinstance(obj.get("cost"), dict) else {}
+    model = obj.get("model") if isinstance(obj.get("model"), dict) else {}
+    return {"session": session, "cost": cc_number(cost.get("total_cost_usd"), 1e6),
+            "durationMs": cc_number(cost.get("total_duration_ms")), "apiDurationMs": cc_number(cost.get("total_api_duration_ms")),
+            "model": cc_text(model.get("id"), MODEL), "version": cc_text(obj.get("version"), CC_VERSION),
+            "terminal": cc_text(terminal, pa.ID), "at": at}
+
+
+def cc_clean(rec, session=None):
+    """A stored record with every field checked again, or None when it is not one (or not the named session's)."""
+    if not isinstance(rec, dict) or rec.get("v") != 1:
+        return None
+    sid = cc_text(rec.get("session"), CC_SESSION)
+    if sid is None or (session is not None and sid != session):
+        return None
+    first, at = rec.get("first"), rec.get("at")
+    if not isinstance(at, str) or parse_ts(at) is None:
+        return None
+    segments = rec.get("segments")
+    return {"v": 1, "session": sid, "cost": cc_number(rec.get("cost"), 1e6), "base": cc_number(rec.get("base"), 1e9),
+            "segments": segments if isinstance(segments, int) and not isinstance(segments, bool) and segments >= 1 else None,
+            "durationMs": cc_number(rec.get("durationMs")), "apiDurationMs": cc_number(rec.get("apiDurationMs")),
+            "model": cc_text(rec.get("model"), MODEL), "version": cc_text(rec.get("version"), CC_VERSION),
+            "terminal": cc_text(rec.get("terminal"), pa.ID),
+            "first": first if isinstance(first, str) and parse_ts(first) is not None else at, "at": at}
+
+
+def cc_figure(rec):
+    """The session's figure (base + cost), or None when the record has no usable one."""
+    if rec is None or rec.get("cost") is None or rec.get("base") is None or rec.get("segments") is None:
+        return None
+    return rec["base"] + rec["cost"]
+
+
+def record_cc(directory, fields, now):
+    """Merge one status line reading into costs/cc/<session>.json (AC1.2-AC1.5). True when written. Only for an
+    existing space folder; a busy lock records nothing this run."""
+    if not os.path.isdir(directory):
+        return False
+    folder = os.path.join(costs_dir(directory), "cc")
+    os.makedirs(folder, exist_ok=True)
+    fd = os.open(os.path.join(folder, ".lock"), os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return False
+        path = os.path.join(folder, fields["session"] + ".json")
+        try:
+            with open(path, "rb") as f:
+                old = cc_clean(json.loads(f.read().decode("utf-8")), fields["session"])
+        except (OSError, ValueError, UnicodeDecodeError):
+            old = None
+        rec = dict(fields, v=1, base=0, segments=1, first=fields["at"])
+        if old is not None:
+            rec["base"] = old["base"] if old["base"] is not None else 0
+            rec["segments"] = old["segments"] or 1
+            rec["first"] = old["first"]
+            if rec["cost"] is None:  # a reading without a valid cost never takes the figure away; other fields are the latest
+                rec["cost"] = old["cost"]
+            if (fields["cost"] is not None and old["cost"] is not None and fields["cost"] < old["cost"] - CC_DROP
+                    and fields["durationMs"] is not None and old["durationMs"] is not None and fields["durationMs"] < old["durationMs"]):
+                rec["base"] += old["cost"]  # a resume after a crash restarted the totals: a new segment
+                rec["segments"] += 1
+            then = parse_ts(old["at"]) or 0
+            if (rec["cost"] == old["cost"] and rec["model"] == old["model"] and rec["segments"] == old["segments"]
+                    and now - then < CC_WRITE_EVERY):
+                return False
+        text = json.dumps({k: rec[k] for k in CC_KEYS}, separators=(",", ":")) + "\n"
+        tmp = os.path.join(folder, ".{}.{}.tmp".format(fields["session"], os.getpid()))
+        try:
+            with open(tmp, "w") as f:
+                f.write(text)
+            os.replace(tmp, path)  # atomic: a cancelled run leaves the old file whole
+        finally:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        return True
+    finally:
+        os.close(fd)
+
+
+def statusline_args(argv):
+    """(space, then) from `--space ID [--refresh N] [--then ARGV...]`. Unknown words before --then are ignored."""
+    space, then, i = None, [], 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--then":
+            then = list(argv[i + 1:])
+            break
+        if a == "--space":
+            space = argv[i + 1] if i + 1 < len(argv) else None
+            i += 2
+            continue
+        i += 2 if a == "--refresh" else 1  # --refresh N: accepted, not used (Claude Code's refreshInterval is set by pa.py)
+    return space, then
+
+
+def statusline(argv, data, now=None):
+    """One status line update: start the inner command on `data`, record while it runs, return its stdout bytes
+    unchanged (b"" when there is none, it failed to start, or it ran past INNER_TIMEOUT). Never raises."""
+    import subprocess as sp
+    import threading
+    out, proc = b"", None
+    try:
+        space, then = statusline_args(argv)
+        record = len(data) <= STDIN_MAX
+        data = data[:STDIN_MAX]
+        if then:
+            try:
+                proc = sp.Popen(then, stdin=sp.PIPE, stdout=sp.PIPE, stderr=sp.DEVNULL, close_fds=True, start_new_session=True)
+            except Exception:  # noqa: BLE001 - missing or not executable: an empty line
+                proc = None
+        started = time.monotonic()
+
+        def work():
+            try:
+                stamp = time.time() if now is None else now
+                if not record or not space or not pa.ID.match(space):
+                    return
+                fields = cc_fields(json.loads(data.decode("utf-8")), os.environ.get("HC_TERMINAL_ID"), iso(stamp))
+                if fields is not None:
+                    record_cc(os.path.join(pa.ROOT, "spaces", space), fields, stamp)
+            except Exception:  # noqa: BLE001 - never breaks the status line; its text is never shown
+                pass
+        worker = threading.Thread(target=work, daemon=True)
+        worker.start()
+        if proc is not None:
+            try:
+                out = proc.communicate(data, timeout=max(0.0, INNER_TIMEOUT - (time.monotonic() - started)))[0] or b""
+            except sp.TimeoutExpired:
+                out = b""
+                try:
+                    os.killpg(proc.pid, 9)  # its whole group: a shell's children hold its stdout open
+                except OSError:
+                    proc.kill()
+                for pipe in (proc.stdin, proc.stdout):
+                    try:
+                        pipe.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+                try:
+                    proc.wait(timeout=0.5)
+                except Exception:  # noqa: BLE001
+                    pass
+        worker.join(max(0.0, started + RECORD_BUDGET - time.monotonic()) if proc is not None else RECORD_BUDGET)
+    except Exception:  # noqa: BLE001 - whatever the inner command printed is still printed
+        pass
+    return out
+
+
+def read_stdin(fd=0, limit=STDIN_MAX, wait=INNER_TIMEOUT):
+    """At most limit + 1 bytes of fd, waiting at most `wait` s in all (Claude Code closes it after the JSON)."""
+    import select
+    chunks, size, deadline = [], 0, time.monotonic() + wait
+    try:
+        while size <= limit:
+            left = deadline - time.monotonic()
+            if left <= 0 or not select.select([fd], [], [], left)[0]:
+                break
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+    except (OSError, ValueError):
+        pass
+    return b"".join(chunks)[:limit + 1]
+
+
+def statusline_main(argv):
+    """`pa-costs statusline ...` as a process: nothing on stderr, the inner bytes on stdout, exit 0."""
+    try:
+        sys.stderr = open(os.devnull, "w")
+        out = statusline(argv, read_stdin())
+        view = memoryview(out)
+        while view:
+            n = os.write(1, view)
+            view = view[n:]
+    except BaseException:  # noqa: BLE001 - a status line never fails
+        pass
+    return 0
+
+
 # ---- command line ------------------------------------------------------------------------------
 
 def space_directory(explicit):
@@ -2786,6 +3011,9 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    if sys.argv[1:2] == ["statusline"]:  # Claude Code's status line: before argparse, always exit 0 (t-029 R2)
+        statusline_main(sys.argv[2:])
+        os._exit(0)
     try:
         sys.exit(main())
     except pa.Problem as e:

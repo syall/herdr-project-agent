@@ -31,6 +31,7 @@ import fcntl
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -508,6 +509,49 @@ def mcp_args(p):
     return ["--mcp-config", json.dumps({"mcpServers": servers})] if isinstance(servers, dict) and servers else []
 
 
+STATUSLINE_REFRESH = 30  # Claude Code's refreshInterval for the recording status line when the profile names none
+
+
+def cc_statusline(p):
+    """(config, problem) from the profile's "statusLine" key: the person's own status line command, which the recording
+    status line runs inside (t-029 R3). (None, None) when the profile has none; (None, why) when it is malformed."""
+    if "statusLine" not in p or p.get("statusLine") is None:
+        return None, None
+    v = p["statusLine"]
+    if not isinstance(v, dict):
+        return None, "statusLine must be an object"
+    command = v.get("command")
+    if not isinstance(command, list) or not command or not all(isinstance(a, str) and a for a in command):
+        return None, "statusLine.command must be a non-empty list of strings"
+    refresh = v.get("refreshInterval", STATUSLINE_REFRESH)
+    if isinstance(refresh, bool) or not isinstance(refresh, int) or not 1 <= refresh <= 300:
+        return None, "statusLine.refreshInterval must be a whole number from 1 to 300"
+    return {"command": list(command), "refreshInterval": refresh}, None
+
+
+def cc_settings_args(p, space, argv):
+    """["--settings", <json>] that makes Claude Code's status line `pa-costs statusline`, which records the session's
+    own cost figure and prints the profile's status line unchanged (t-029 R4); [] when the caller gave its own
+    --settings, the profile has no valid statusLine, PA_NO_CC_STATUSLINE is set, or anything is missing. Never raises:
+    a launch never fails because of it."""
+    try:
+        if os.environ.get("PA_NO_CC_STATUSLINE") not in (None, "", "0"):
+            return []
+        if any(a == "--settings" or a.startswith("--settings=") for a in argv):
+            return []
+        space = local_id(space or "")
+        cfg, _problem = cc_statusline(p)
+        if not cfg or not ID.match(space) or not sys.executable or not os.path.isfile(COSTS_FILE):
+            return []
+        inner = resolve(cfg["command"], p)  # as the profile's own commands are found; not found: no status line of ours
+        command = " ".join([shlex.quote(sys.executable), shlex.quote(COSTS_FILE), "statusline", "--space", space, "--then"]
+                           + [shlex.quote(a) for a in inner])
+        return ["--settings", json.dumps({"statusLine": {"type": "command", "command": command,
+                                                         "refreshInterval": cfg["refreshInterval"]}}, separators=(",", ":"))]
+    except Exception:  # noqa: BLE001 - the launch goes on without it
+        return []
+
+
 def exec_plain(p, extra=()):
     """A plain Claude tab: the profile's command with the worker steering, no Project Agent."""
     argv = resolve(list(p["claude"]) + mcp_args(p) + ["--append-system-prompt", plain_steering(p)] + list(extra), p)
@@ -744,6 +788,7 @@ def run_agent(args, address, project, p, directory, agent, ctx, started):
                      "orchestrator.md defines it under \"After a restart or a compaction\"; start nothing new "
                      "until asked, and nothing at all if passes are paused or the person's last message asked "
                      "you to hold."]
+        argv += cc_settings_args(p, agent.get("space") or os.path.basename(directory), [])  # last (t-029 R4)
         argv = resolve(argv, p)
         session_log(directory, "start resume={} session={} reason={}".format(resume, agent["sessionId"], why))
         began = time.time()
@@ -884,6 +929,8 @@ def cmd_launch(kind, argv):
                 command = costs.record_launch(space_dir(pa_space), pa_space, kind, argv, command, walked)
             except Exception:  # noqa: BLE001 - never stops a launch
                 pass
+        if kind == "claude":  # Claude Code's own cost figure, through its status line: the last --settings (t-029 R4)
+            command += cc_settings_args(p, pa_space, argv)
     command = resolve(command, p)
     if os.environ.get("PA_PRINT"):  # show what would run, for checking a setup
         print(json.dumps([a if len(a) < 80 else a[:77] + "..." for a in command]))
@@ -1106,6 +1153,12 @@ def cmd_doctor(args):
         notes.append("costs/: {:.1f} KB ({})".format(folder_size(costs) / 1024.0, "summary updated " + updated if updated else "no summary yet"))
     else:
         notes.append("costs/: none yet")
+    try:
+        _cfg, why = cc_statusline(load_profile(agent.get("profile")))
+    except Problem:
+        why = None
+    if why:  # a note only: the launches go on without the recording status line
+        notes.append("profile statusLine is malformed ({}): Claude Code's own cost figure is not recorded".format(why))
     term = hc_get(agent.get("terminal"))
     running = term.get("state") == "live" and (term.get("labels") or {}).get("herdr.pa") == agent.get("space")
     notes.append("agent {} in terminal {}".format("running" if running else "NOT running", agent.get("terminal")))
