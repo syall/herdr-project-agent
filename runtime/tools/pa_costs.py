@@ -1452,8 +1452,640 @@ def report(directory, by=None, since=None, until=None, as_json=False, account_wi
     return 0
 
 
+
+
+# ---- billed amounts (R13-R15): neutral rows; a profile script fetches or imports them ------------------
+
+SCRIPT_TIMEOUT = 120  # seconds a profile billing script may run
+STDOUT_MAX = 5 * 1024 * 1024
+MAX_PAGES = 3  # requests one query run may make
+RUNS_PER_DAY = 3  # query runs (scheduled and --now) per UTC day
+EVERY = 86400  # the scheduled query runs at most this often
+RANGE_DAYS = 35
+WIDE = re.compile(r"(?i)admin|poweruser|fullaccess|root|owner")
+TWELVE = re.compile(r"\d{12}")
+AGENT_MARKERS = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CODEX_SANDBOX", "CODEX_HOME_SESSION")
+CURRENCY = re.compile(r"^[A-Z]{3}$")
+
+
+def billing_dir():
+    return os.path.join(pa.ROOT, "billing")
+
+
+def stdin_is_tty():
+    try:
+        return sys.stdin.isatty()
+    except (AttributeError, ValueError):
+        return False
+
+
+def refuse_agent(what):
+    if any(os.environ.get(k) for k in AGENT_MARKERS):
+        raise pa.Problem("{} is the person's command and is refused inside an agent's session; nothing was run".format(what))
+
+
+def refuse_worker_terminal(what, scheduled):
+    """--scheduled: only the app's timer, which has no terminal. Otherwise: not in a Project Agent's or a worker's
+    terminal (a herdr.pa label, or a parent, on the terminal or above it)."""
+    address = os.environ.get("HC_TERMINAL_ID")
+    if not address:
+        return
+    if scheduled:
+        raise pa.Problem("{} --scheduled runs only from the panel's timer, not in a terminal".format(what))
+    seen = set()
+    while address and address not in seen and len(seen) < 6:
+        seen.add(address)
+        info = pa.hc_get(address)
+        if (info.get("labels") or {}).get("herdr.pa") or info.get("parent"):
+            raise pa.Problem("{} is refused in a Project Agent's or a worker's terminal; run it in your own tab".format(what))
+        address = info.get("parent")
+
+
+def billing_profile():
+    """The billing block of this machine's default profile (billing is per account, run where the panel is)."""
+    p = pa.load_profile()
+    block = p.get("billing") if isinstance(p.get("billing"), dict) else {}
+    return p, block
+
+
+def query_entry(block, name):
+    q = (block.get("queries") or {}).get(name) if isinstance(block.get("queries"), dict) else None
+    if not isinstance(q, dict):
+        raise pa.Problem("the profile declares no billing query {!r}".format(name))
+    if q.get("readOnly") is not True or not isinstance(q.get("calls"), list) or not q["calls"] \
+            or not all(isinstance(c, str) and c for c in q["calls"]):
+        raise pa.Problem("billing query {!r} must declare \"readOnly\": true and the read calls it makes (\"calls\"); refused".format(name))
+    if not isinstance(q.get("run"), list) or not q["run"] or not all(isinstance(x, str) for x in q["run"]):
+        raise pa.Problem("billing query {!r} has no run list".format(name))
+    return q
+
+
+def credential_problem(credential):
+    if not isinstance(credential, str) or not credential.strip():
+        return "no credential named: name a read-only credential profile with --credential"
+    if credential.strip().lower() == "default":
+        return "the credential 'default' is refused: name a read-only credential profile"
+    if WIDE.search(credential):
+        return "the credential {!r} looks like a wide one (admin, power user, full access, root, owner): refused".format(credential)
+    if not re.match(r"^[\w.@+=,-]{1,128}$", credential):
+        return "the credential name has characters that a profile name cannot have"
+    return None
+
+
+def scrub(text):
+    return TWELVE.sub("<number>", text or "")
+
+
+def run_script(profile, entry, values, timeout=None):
+    """Runs a profile billing script: argv from its run list with {placeholders} filled, no shell, path inside the
+    profile folder. (exit code or 'timeout', stdout text, last 5 stderr lines scrubbed)."""
+    folder = os.path.realpath(profile["_folder"])
+    argv = []
+    for i, word in enumerate(entry["run"]):
+        for k, v in values.items():
+            word = word.replace("{" + k + "}", str(v))
+        if i == 0:
+            word = os.path.realpath(os.path.join(folder, word))
+            if not word.startswith(folder + os.sep) or not os.path.isfile(word):
+                raise pa.Problem("billing script {} is not a file inside the profile folder".format(entry["run"][0]))
+        argv.append(word)
+    try:
+        r = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
+                           timeout=SCRIPT_TIMEOUT if timeout is None else timeout, cwd=folder)
+    except subprocess.TimeoutExpired:
+        return "timeout", "", []
+    except OSError as e:
+        return "oserror", "", [scrub(str(e))[:200]]
+    err = [scrub(x)[:200] for x in r.stderr.decode("utf-8", "replace").splitlines()[-5:]]
+    if len(r.stdout) > STDOUT_MAX:
+        return "toolarge", "", err
+    return r.returncode, r.stdout.decode("utf-8", "replace"), err
+
+
+def check_identity(profile, entry, credential, read_only_match, today):
+    """The script's check mode must show a read-only identity: (identity, None) or (identity or None, why refused)."""
+    code, out, err = run_script(profile, entry, {"mode": "check", "credential": credential, "from": today, "to": today, "maxPages": MAX_PAGES})
+    first = next((x for x in out.splitlines() if x.strip()), "")
+    try:
+        said = json.loads(first)
+    except ValueError:
+        said = None
+    identity = said.get("identity") if isinstance(said, dict) and isinstance(said.get("identity"), str) else None
+    why = None
+    if code != 0:
+        why = "the check exited {}".format(code)
+    elif not isinstance(said, dict) or said.get("readOnly") is not True:
+        why = "the check did not say readOnly: true"
+    elif not identity or TWELVE.search(identity):
+        why = "the check gave no usable identity name"
+    else:
+        try:
+            matched = re.search(read_only_match or "(?!)", identity)
+        except re.error:
+            matched = None
+        if not matched:
+            why = "identity {} does not match the read-only pattern".format(identity)
+        elif WIDE.search(identity):
+            why = "identity {} looks like a wide one".format(identity)
+    return (scrub(identity)[:128] if identity else None), why, err
+
+
+def query_state():
+    return pa.read_json(os.path.join(billing_dir(), "query-state.json"), {}) or {}
+
+
+def write_query_state(qs):
+    qs["v"] = 1
+    pa.write_json(os.path.join(billing_dir(), "query-state.json"), qs)
+
+
+def billing_config():
+    c = (pa.config().get("costs") or {}).get("billing")
+    return c if isinstance(c, dict) else None
+
+
+def set_billing_config(change):
+    path = os.path.join(pa.ROOT, "config.json")
+    conf = pa.read_json(path, {}) or {}
+    costs = conf.get("costs") if isinstance(conf.get("costs"), dict) else {}
+    billing = costs.get("billing") if isinstance(costs.get("billing"), dict) else {}
+    billing.update(change)
+    costs["billing"] = billing
+    conf["costs"] = costs
+    pa.write_json(path, conf)
+    return billing
+
+
+def billed_enable(query, credential, read_only_match, now=None, ask=input):
+    """The person's one-time switch, in their own terminal: shows what will run, asks for the credential name again,
+    runs one check, then turns the scheduled query on."""
+    now = time.time() if now is None else now
+    refuse_agent("pa-costs billed enable")
+    refuse_worker_terminal("pa-costs billed enable", False)
+    if not stdin_is_tty():
+        raise pa.Problem("pa-costs billed enable needs a terminal: the person runs it and confirms it")
+    problem = credential_problem(credential)
+    if problem:
+        raise pa.Problem(problem)
+    try:
+        re.compile(read_only_match or "")
+    except re.error as e:
+        raise pa.Problem("--read-only-match is not a regular expression ({})".format(e))
+    if not read_only_match:
+        raise pa.Problem("give --read-only-match: a pattern that the read-only identity's name matches")
+    profile, block = billing_profile()
+    entry = query_entry(block, query)
+    print("Billing query {} ({}) of profile {}".format(query, entry.get("label") or "no label", profile["name"]))
+    print("  read calls it makes: {}".format(", ".join(entry["calls"])))
+    print("  credential: {}   identity must match: {}".format(credential, read_only_match))
+    print("  runs: at most 1 per day from the panel's timer, at most {} per UTC day in all, at most {} requests each".format(RUNS_PER_DAY, MAX_PAGES))
+    print("  stated fee: {} {} per request".format(entry.get("feePerRequest", "?"), entry.get("currency", "")))
+    if (ask("Type the credential name again to turn it on: ") or "").strip() != credential:
+        raise pa.Problem("not confirmed; nothing was turned on")
+    today = iso(now)[:10]
+    identity, why, err = check_identity(profile, entry, credential, read_only_match, today)
+    if why:
+        qs = query_state()
+        qs.update(result="refused", lastError="refused: cannot show the configured identity is read-only ({})".format(why), stderr=err,
+                  identity=identity, checkedAt=iso(now))
+        write_query_state(qs)
+        raise pa.Problem("refused: cannot show the configured identity is read-only ({}); nothing was turned on".format(why))
+    conf = set_billing_config({"query": query, "credential": credential, "readOnlyMatch": read_only_match, "enabled": True,
+                               "enabledAt": iso(now), "enabledBy": "terminal"})
+    print("Turned on: identity {} is read-only. The panel's timer queries at most once a day; pa-costs billed disable turns it off.".format(identity))
+    return conf
+
+
+def billed_disable():
+    conf = billing_config()
+    if not conf:
+        print("Billing query: off (it was never turned on).")
+        return 0
+    set_billing_config({"enabled": False, "disabledAt": pa.now()})
+    print("Billing query: off. Billed rows are kept.")
+    return 0
+
+
+def billed_fetch(mode="scheduled", now=None, quiet=False, frm=None, to=None):
+    """mode scheduled (the panel's timer, hourly: runs at most once a day) or now (the person, within the daily cap)."""
+    now = time.time() if now is None else now
+    scheduled = mode == "scheduled"
+    refuse_agent("pa-costs billed fetch")
+    refuse_worker_terminal("pa-costs billed fetch", scheduled)
+    conf = billing_config()
+    say = (lambda *a: None) if quiet else print
+    if not conf or not conf.get("enabled"):
+        if scheduled:
+            return {"result": "skipped", "why": "off"}
+        raise pa.Problem("the billing query is off on this machine (pa-costs billed enable, in your terminal)")
+    qs = query_state()
+    today = iso(now)[:10]
+    runs = qs.get("runsToday") if isinstance(qs.get("runsToday"), dict) and qs["runsToday"].get("day") == today else {"day": today, "n": 0}
+    last = parse_ts(qs.get("lastRun") or "")
+    if scheduled and last is not None and now - last < EVERY:
+        return {"result": "skipped", "why": "ran in the last 24 h"}
+    if runs["n"] >= RUNS_PER_DAY:
+        if scheduled:
+            return {"result": "skipped", "why": "daily cap"}
+        raise pa.Problem("the billing query already ran {} times today (UTC); the cap is {}".format(runs["n"], RUNS_PER_DAY))
+    profile, block = billing_profile()
+
+    def finish(result, error=None, requests=0, identity=None, stderr=(), ran=True):
+        if ran:
+            runs["n"] += 1
+            qs.update(lastRun=iso(now), runsToday=runs, nextAfter=iso(now + EVERY))
+        qs.update(result=result, requests=requests, identity=identity or qs.get("identity"), lastError=error, stderr=list(stderr))
+        write_query_state(qs)
+        say("Billing query {}: {}{}".format(conf.get("query"), result, " ({})".format(error) if error else ""))
+        return {"result": result, "error": error, "requests": requests}
+    try:
+        entry = query_entry(block, conf.get("query"))
+    except pa.Problem as e:
+        return finish("refused", str(e), ran=False)
+    problem = credential_problem(conf.get("credential"))
+    if problem:
+        return finish("refused", problem, ran=False)
+    identity, why, err = check_identity(profile, entry, conf["credential"], conf.get("readOnlyMatch"), today)
+    if why:
+        return finish("refused", "refused: cannot show the configured identity is read-only ({})".format(why), identity=identity, stderr=err)
+    frm = frm or iso(now - RANGE_DAYS * 86400)[:10]
+    to = to or today
+    code, out, err = run_script(profile, entry, {"mode": "query", "credential": conf["credential"], "from": frm, "to": to, "maxPages": MAX_PAGES})
+    if code != 0:
+        words = {4: "permission denied", 5: "not enabled for this account", "timeout": "timed out after {} s".format(SCRIPT_TIMEOUT),
+                 "toolarge": "output over 5 MB"}.get(code, "failed (exit {})".format(code))
+        return finish("failed", words, identity=identity, stderr=err)
+    try:
+        rows, done = parse_script_rows(out, "query:" + conf["query"], now)
+        requests = done.get("requests")
+        if not isinstance(requests, int) or isinstance(requests, bool) or requests < 0:
+            raise ValueError("the done line has no request count")
+        if requests > MAX_PAGES:
+            raise ValueError("the script claims {} requests, more than the cap of {}".format(requests, MAX_PAGES))
+    except ValueError as e:
+        return finish("failed", "batch rejected: {}".format(e), identity=identity, stderr=err)
+    append_billed(rows)
+    result = finish("ok", None, requests=requests, identity=identity, stderr=err)
+    say("{} billed row(s) from {} to {}".format(len(rows), frm, to))
+    return dict(result, rows=len(rows))
+
+
+def default_account():
+    _p, block = billing_profile()
+    return (pa.config().get("costs") or {}).get("account") or block.get("account") or "default"
+
+
+def validate_row(row, source, account, now):
+    """A billed row in the neutral shape (spec 8.1), or ValueError naming the field."""
+    if not isinstance(row, dict):
+        raise ValueError("a row is not an object")
+    out = {"v": 1}
+    for k in ("from", "to"):
+        if not isinstance(row.get(k), str) or not DATE.match(row[k]):
+            raise ValueError("{} must be a date YYYY-MM-DD".format(k))
+        out[k] = row[k]
+    if out["from"] > out["to"]:
+        raise ValueError("from is after to")
+    amount = row.get("amount")
+    if isinstance(amount, bool) or not isinstance(amount, (int, float)) or amount != amount or abs(amount) > 1e9:
+        raise ValueError("amount must be a number")
+    out["amount"] = round(float(amount), 6)
+    if not isinstance(row.get("currency"), str) or not CURRENCY.match(row["currency"]):
+        raise ValueError("currency must be a three-letter code")
+    out["currency"] = row["currency"]
+    out["account"] = row.get("account") if row.get("account") is not None else account
+    if not isinstance(out["account"], str) or not out["account"] or len(out["account"]) > 64:
+        raise ValueError("account must be a short label")
+    out["label"] = row.get("label")
+    if not isinstance(out["label"], str) or not out["label"] or len(out["label"]) > 200:
+        raise ValueError("label must be a short text")
+    for k, allowed in (("model", None), ("kind", KINDS + ("other",)), ("unit", ("tokens",))):
+        v = row.get(k)
+        if v is not None and (not isinstance(v, str) or len(v) > 100 or (allowed and v not in allowed)):
+            raise ValueError("{} is not valid".format(k))
+        out[k] = v
+    q = row.get("quantity")
+    if q is not None and (isinstance(q, bool) or not isinstance(q, (int, float)) or q < 0):
+        raise ValueError("quantity must be a number >= 0")
+    out["quantity"] = q
+    for k in ("final", "accountWide"):
+        v = row.get(k, True)
+        if not isinstance(v, bool):
+            raise ValueError("{} must be true or false".format(k))
+        out[k] = v
+    note = row.get("note")
+    if note is not None and (not isinstance(note, str) or len(note) > 200):
+        raise ValueError("note must be a short text")
+    out["note"] = note
+    out["source"] = source
+    out["fetchedAt"] = iso(now)
+    out["id"] = hashlib.sha1("|".join(str(out[k]) for k in ("source", "account", "from", "to", "label", "kind")).encode()).hexdigest()[:16]
+    if TWELVE.search(json.dumps(out)):
+        raise ValueError("a row holds a 12-digit number (an account id?)")
+    return out
+
+
+def parse_script_rows(text, source, now):
+    """Rows from a script's stdout, ending with {"done": true, ...}. Any bad row rejects the whole batch."""
+    account = default_account()
+    rows, done = [], None
+    for n, line in enumerate(text.splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            raise ValueError("line {} is not JSON".format(n))
+        if done is not None:
+            raise ValueError("output after the done line")
+        if isinstance(obj, dict) and obj.get("done") is True:
+            done = obj
+            continue
+        try:
+            rows.append(validate_row(obj, source, account, now))
+        except ValueError as e:
+            raise ValueError("row {}: {}".format(n, e))
+    if done is None:
+        raise ValueError("no done line")
+    return rows, done
+
+
+def append_billed(rows):
+    if not rows:
+        return
+    path = os.path.join(billing_dir(), "billed.jsonl")
+    os.makedirs(billing_dir(), exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    try:
+        os.write(fd, "".join(json.dumps(r, separators=(",", ":")) + "\n" for r in rows).encode())
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def effective_billed():
+    """Billed rows in effect: the latest fetchedAt per id, minus voided ids."""
+    rows, _bad = read_lines(os.path.join(billing_dir(), "billed.jsonl"))
+    out = {}
+    for r in rows:
+        if r.get("ev") == "void":
+            out.pop(r.get("id"), None)
+        elif r.get("id") and (r.get("id") not in out or (r.get("fetchedAt") or "") >= (out[r["id"]].get("fetchedAt") or "")):
+            out[r["id"]] = r
+    return sorted(out.values(), key=lambda r: (r.get("from") or "", r.get("label") or "", r.get("id")))
+
+
+def billed_import(path, via, now=None, dry_run=False):
+    now = time.time() if now is None else now
+    refuse_agent("pa-costs billed import")
+    profile, block = billing_profile()
+    entry = (block.get("importers") or {}).get(via) if isinstance(block.get("importers"), dict) else None
+    if not isinstance(entry, dict) or not isinstance(entry.get("run"), list) or not entry["run"]:
+        raise pa.Problem("the profile declares no billing importer {!r}".format(via))
+    if not os.path.isfile(path):
+        raise pa.Problem("no such file: " + path)
+    code, out, err = run_script(profile, entry, {"file": os.path.abspath(path)})
+    if code != 0:
+        raise pa.Problem("importer {} failed (exit {}){}".format(via, code, ": " + err[-1] if err else ""))
+    try:
+        rows, _done = parse_script_rows(out, "file:" + via, now)
+    except ValueError as e:
+        raise pa.Problem("batch rejected, nothing added: {}".format(e))
+    if dry_run:
+        print("{} row(s) would be added (dry run)".format(len(rows)))
+        return rows
+    append_billed(rows)
+    print("{} billed row(s) added from {} via {}".format(len(rows), os.path.basename(path), via))
+    return rows
+
+
+def billed_list(as_json=False):
+    rows = effective_billed()
+    if as_json:
+        print(json.dumps(rows, indent=2))
+        return 0
+    if not rows:
+        print("No billed rows.")
+    for r in rows:
+        print("{}  {}..{}  {:<10} {:>12} {}  {} {}{}  ({}, {})".format(r["id"], r["from"], r["to"], r.get("account"), fmt_money(r.get("amount")),
+                                                                  r.get("currency"), r.get("label"), r.get("kind") or "",
+                                                                  "" if r.get("final", True) else " (not final)", r.get("source"), r.get("fetchedAt")))
+    return 0
+
+
+def billed_remove(row_id):
+    if not any(r["id"] == row_id for r in effective_billed()):
+        raise pa.Problem("no billed row {}".format(row_id))
+    append_billed([{"v": 1, "ev": "void", "id": row_id, "at": pa.now()}])
+    print("Removed billed row {} (a void line was appended).".format(row_id))
+    return 0
+
+
+def status_line(now=None):
+    now = time.time() if now is None else now
+    conf = billing_config()
+    if not conf or not conf.get("enabled"):
+        return "Billing query: off"
+    qs = query_state()
+    try:
+        _p, block = billing_profile()
+        entry = (block.get("queries") or {}).get(conf.get("query")) or {}
+    except pa.Problem:
+        entry = {}
+    fee, cur = entry.get("feePerRequest"), entry.get("currency") or ""
+    if qs.get("lastRun"):
+        n = qs.get("requests") or 0
+        cost = " ≈ {:.2f} {}".format(n * fee, cur) if isinstance(fee, (int, float)) else ""
+        last = "last run {} ({}, {} requests{})".format(qs["lastRun"], qs.get("result"), n, cost)
+        nxt = qs.get("nextAfter") or iso(now)
+    else:
+        last, nxt = "not run yet", iso(now)
+    return "Billing query: {} · next after {} · cap 1/day (≤ {} requests) · [Turn off: pa-costs billed disable]".format(last, nxt, MAX_PAGES)
+
+
+def billed_status(now=None, as_json=False):
+    if as_json:
+        print(json.dumps({"config": billing_config(), "state": query_state(), "line": status_line(now)}, indent=2))
+        return 0
+    print(status_line(now))
+    qs = query_state()
+    if qs.get("lastError"):
+        print("  last error: " + qs["lastError"])
+    return 0
+
+
+def day_range(a, b):
+    d0 = datetime.datetime.strptime(a, "%Y-%m-%d")
+    d1 = datetime.datetime.strptime(b, "%Y-%m-%d")
+    out = []
+    while d0 <= d1 and len(out) < 400:
+        out.append(d0.strftime("%Y-%m-%d"))
+        d0 += datetime.timedelta(days=1)
+    return out
+
+
+def billing_comparison(billed, space, here, table):
+    """Estimated (this space, all spaces here) beside billed (account-wide), per model, for the covered days (spec 8.2)."""
+    account = space.get("account") or "default"
+    currency = (table or {}).get("currency") or (space.get("prices") or {}).get("currency")
+    mine = [r for r in billed if r.get("account") == account]
+    rows = [r for r in mine if r.get("currency") == currency]
+    separate = {}
+    for r in mine:
+        if r.get("currency") != currency:
+            s = separate.setdefault(r.get("currency"), {"currency": r.get("currency"), "amount": 0.0, "rows": 0})
+            s["amount"] += r.get("amount") or 0
+            s["rows"] += 1
+    if not rows:
+        return {"account": account, "currency": currency, "accountWide": True, "models": [], "covered": None, "other": 0.0,
+                "total": {"thisSpace": 0.0, "allSpaces": 0.0, "billed": 0.0}, "calibrated": None,
+                "separate": sorted(separate.values(), key=lambda s: s["currency"] or ""), "sources": []}
+    covered = set()
+    for r in rows:
+        covered.update(day_range(r["from"], r["to"]))
+    first = min(covered)
+    end = max(max(covered), (space.get("updated") or "")[:10] or max(covered))
+    missing = [d for d in day_range(first, end) if d not in covered]
+
+    def est(summary):
+        out = {}
+        for e in summary.get("byDayModel") or []:
+            if e.get("day") in covered and e.get("money") is not None:
+                key = model_key(table, e.get("model")) or e.get("model")
+                out[key] = out.get(key, 0.0) + e["money"]
+        return out
+    this, alls = est(space), est(here)
+    models, other = {}, 0.0
+    for r in rows:
+        key = model_key(table, r.get("model")) if r.get("model") else None
+        if not key:
+            other += r.get("amount") or 0
+            continue
+        m = models.setdefault(key, {"model": key, "billed": 0.0, "num": 0.0, "den": 0.0, "notFinal": False, "days": set()})
+        m["billed"] += r.get("amount") or 0
+        m["notFinal"] = m["notFinal"] or not r.get("final", True)
+        m["days"].update(day_range(r["from"], r["to"]))
+        if r.get("quantity") is not None and r.get("unit") == "tokens" and r.get("kind") in KINDS:
+            price = price_for(table, key, r["from"])
+            p = price.get(r["kind"]) if price else None
+            if p:
+                m["num"] += r.get("amount") or 0
+                m["den"] += r["quantity"] * p / 1e6
+    out_models, calibrated = [], 0.0
+    for key in sorted(models):
+        m = models[key]
+        few = len(m["days"]) < 3 or m["notFinal"]
+        t, a = this.get(key, 0.0), alls.get(key, 0.0)
+        if m["den"] > 0:
+            factor = {"kind": "price", "value": round(m["num"] / m["den"], 4), "applied": True, "few": few, "note": "from quantities"}
+            calibrated += t * factor["value"]
+        elif a > 0:
+            value = round(m["billed"] / a, 4)
+            factor = {"kind": "scope", "value": value, "applied": False, "few": few,
+                      "note": "not applied" + ("; below 1.0: the table over-prices" if value < 1.0 else "")}
+            calibrated += t
+        else:
+            factor = {"kind": None, "value": None, "applied": False, "few": few, "note": "no estimate to compare"}
+            calibrated += t
+        out_models.append({"model": key, "thisSpace": round(t, 6), "allSpaces": round(a, 6), "billed": round(m["billed"], 6),
+                           "factor": factor, "notFinal": m["notFinal"], "days": len(m["days"])})
+    return {"account": account, "currency": currency, "accountWide": True,
+            "covered": {"from": first, "to": max(covered), "days": len(covered), "of": len(day_range(first, end)), "missing": missing},
+            "sources": sorted({r.get("source") for r in rows}), "fetchedAt": max(r.get("fetchedAt") or "" for r in rows),
+            "models": out_models, "other": round(other, 6),
+            "total": {"thisSpace": round(sum(this.values()), 6), "allSpaces": round(sum(alls.values()), 6),
+                      "billed": round(sum(r.get("amount") or 0 for r in rows), 6)},
+            "calibrated": round(calibrated, 6), "separate": sorted(separate.values(), key=lambda s: s["currency"] or "")}
+
+
 def billed_lines(s, now):
-    return ["Billed: (no billed rows)"]
+    table, _problem, _name = (None, None, None)
+    try:
+        profile = pa.load_profile(s["prices"].get("profile"))
+        table, _problem = load_prices(profile)
+    except pa.Problem:
+        pass
+    here = account_wide_summary(s.get("account") or "default", now)
+    c = billing_comparison(effective_billed(), s, here, table)
+    out = ["Billed (account-wide: includes use outside this space and outside Herdr)"]
+    if not c["covered"]:
+        out.append("  no billed rows for account {}".format(c["account"]))
+    else:
+        cov = c["covered"]
+        out.append("Covered {} – {} ({} of {} days{}) · source {}, fetched {}".format(
+            cov["from"], cov["to"], cov["days"], cov["of"], "; not billed: " + ", ".join(cov["missing"]) if cov["missing"] else "",
+            ", ".join(c["sources"]), c["fetchedAt"]))
+        out.append("  {:<22} {:>12} {:>16} {:>14}".format("", "this space", "all spaces here", "billed"))
+        out.append("  {:<22} {:>12} {:>16} {:>14}".format("", "est.", "est.", "account-wide"))
+        for m in c["models"]:
+            f = m["factor"]
+            fac = "" if f["kind"] is None else "{} factor {}{}".format("price" if f["kind"] == "price" else "scope ratio", f["value"],
+                                                                      " (not applied)" if not f["applied"] else "")
+            out.append("  {:<22} {:>12} {:>16} {:>14}  {}{}{}".format(m["model"][:22], fmt_money(m["thisSpace"]), fmt_money(m["allSpaces"]),
+                                                                    fmt_money(m["billed"]), fac, " (few days)" if f["few"] else "",
+                                                                    " (not final)" if m["notFinal"] else ""))
+        if c["other"]:
+            out.append("  {:<22} {:>12} {:>16} {:>14}".format("other / unmapped labels", "", "", fmt_money(c["other"])))
+        t = c["total"]
+        out.append("  {:<22} {:>12} {:>16} {:>14}".format("total", fmt_money(t["thisSpace"]), fmt_money(t["allSpaces"]), fmt_money(t["billed"])))
+        out.append("  calibrated (price factor applied where available): this space {}".format(fmt_money(c["calibrated"])))
+    for sep in c["separate"]:
+        out.append("  in {} (not compared): {} billed, account-wide, {} row(s)".format(sep["currency"], fmt_money(sep["amount"]), sep["rows"]))
+    out.append(status_line(now))
+    return out
+
+
+def add_billed_parser(sub):
+    b = sub.add_parser("billed", help="billed amounts: the person's commands (status, list, remove, disable, enable, fetch, import)")
+    bs = b.add_subparsers(dest="action")
+    s = bs.add_parser("status")
+    s.add_argument("--json", action="store_true")
+    s = bs.add_parser("list")
+    s.add_argument("--json", action="store_true")
+    s = bs.add_parser("remove")
+    s.add_argument("row_id")
+    bs.add_parser("disable")
+    s = bs.add_parser("enable")
+    s.add_argument("--query", required=True)
+    s.add_argument("--credential", required=True, help="a read-only credential profile name; never default or an admin one")
+    s.add_argument("--read-only-match", required=True, help="a pattern the read-only identity's name must match")
+    s = bs.add_parser("fetch")
+    g = s.add_mutually_exclusive_group(required=True)
+    g.add_argument("--scheduled", action="store_true", help="the panel's timer: at most once a day")
+    g.add_argument("--now", action="store_true", help="the person: one run now, within the daily cap")
+    s.add_argument("--quiet", action="store_true")
+    s.add_argument("--from", dest="frm")
+    s.add_argument("--to")
+    s = bs.add_parser("import")
+    s.add_argument("file")
+    s.add_argument("--via", required=True)
+    s.add_argument("--dry-run", action="store_true")
+    return b
+
+
+def cmd_billed(args):
+    a = args.action
+    if a == "status":
+        return billed_status(as_json=args.json)
+    if a == "list":
+        return billed_list(as_json=args.json)
+    if a == "remove":
+        return billed_remove(args.row_id)
+    if a == "disable":
+        return billed_disable()
+    if a == "enable":
+        billed_enable(args.query, args.credential, args.read_only_match)
+        return 0
+    if a == "fetch":
+        for d in (args.frm, args.to):
+            if d is not None and not DATE.match(d):
+                raise pa.Problem("dates are YYYY-MM-DD")
+        result = billed_fetch(mode="scheduled" if args.scheduled else "now", quiet=args.quiet, frm=args.frm, to=args.to)
+        return 0 if result.get("result") in ("ok", "skipped") else 1
+    if a == "import":
+        billed_import(args.file, args.via, dry_run=args.dry_run)
+        return 0
+    raise pa.Problem("billed: give status, list, remove, disable, enable, fetch or import")
 
 
 # ---- launch records (called by pa.py: pa-claude, pa-codex, pa-session) ---------------------------
@@ -1632,12 +2264,6 @@ def main(argv=None):
     return 2
 
 
-def add_billed_parser(sub):
-    return None
-
-
-def cmd_billed(args):
-    raise pa.Problem("billed: not available")
 
 
 if __name__ == "__main__":
