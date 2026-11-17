@@ -2379,6 +2379,105 @@ class F3_SubagentTurn(Collecting):
         self.assertEqual([(r["activity"], r["task"], r["pass"]) for r in self.sub_rows()], [("pass:decision", "t-002", 4)])
 
 
+class F4_Partial(Collecting):
+    """Item 4 (REVIEW-3 RL3-1, VERIFY-5 RL5-2): an entry that mixes priced and unpriced use is marked partial."""
+
+    def mixed_space(self):
+        self.prices()
+        self.ledger({"version": 1, "tasks": [{"id": "t-001", "state": "in-progress",
+                                              "workers": [{"address": "t5", "role": "build", "name": "t-001-build"}]}]})
+        self.record(session=SID, task="t-001", name="t-001-build", terminal="t5")
+        self.add(self.prompt(T0 + 1), self.call(T0 + 2, "m1", lines=1, out=300),
+                 self.call(T0 + 3, "m2", lines=1, out=2999998, model="model-c"))
+        self.record(session=SID2, kind="pa", terminal="t0", parent=None)
+        self.add(self.prompt(T0 + 10, sid=SID2), self.call(T0 + 12, "q1", sid=SID2, lines=1, out=8),
+                 self.call(T0 + 13, "q2", sid=SID2, lines=1, out=98, model="model-c"), sid=SID2)
+        self.journal({"at": iso(T0 + 14), "by": "agent", "trigger": "report", "task": "t-001", "pass": 3})
+        self.collect(T0 + 2000)
+        return load(self.costs("summary.json"))
+
+    def test_f4_every_mixed_breakdown_entry_carries_its_unpriced_tokens(self):
+        s = self.mixed_space()
+        self.assertEqual(s["totals"]["unpricedTokens"], 3000000 + 100)
+        build = [e for e in s["byActivity"] if e["key"] == "build"][0]
+        self.assertIsNotNone(build["money"])
+        self.assertEqual(build["unpricedTokens"], 3000000)
+        task = [e for e in s["byTask"] if e["key"] == "t-001"][0]
+        self.assertEqual(task["unpricedTokens"], 3000100)
+        self.assertEqual([p.get("unpricedTokens") for p in task["phases"]], [3000100])
+        self.assertEqual([e.get("unpricedTokens") for e in s["byPhase"]], [3000100])
+        for dim in ("kind", "role", "program", "machine"):
+            self.assertTrue(all(e.get("unpricedTokens") for e in s["byKind"][dim]), dim)
+        models = {e["key"]: e for e in s["byKind"]["model"]}
+        self.assertNotIn("unpricedTokens", models["model-a"])  # fully priced
+        self.assertNotIn("unpricedTokens", models["model-c"])  # fully unpriced: money is null
+        self.assertIsNone(models["model-c"]["money"])
+        self.assertEqual(s["byDay"][0]["unpricedTokens"], 3000100)
+        self.assertEqual(s["hours"][0][1]["unpricedTokens"], 3000100)
+        self.assertEqual(s["passes"][0]["unpricedTokens"], 100)
+        self.assertEqual(sorted(e.get("unpricedTokens") for e in s["sessions"]), [100, 3000000])
+        self.assertTrue(all("unpricedTokens" not in e for e in s["byDayModel"]))  # one model a day: priced or not
+
+    def test_f4_the_report_marks_a_partial_entry(self):
+        self.mixed_space()
+        _r, out, _e = self.run_cmd(pa_costs.report, self.dir, now=T0 + 2000)
+        build = [x for x in out.splitlines() if x.strip().startswith("build")][0]
+        self.assertRegex(build, r"\d\+")
+        self.assertIn("+ marks an estimate of the priced part only", out)
+        _r, out, _e = self.run_cmd(pa_costs.report, self.dir, by="pass", now=T0 + 2000)
+        self.assertRegex([x for x in out.splitlines() if "pass 3" in x][0], r"\d\+")
+
+    def test_f4_a_fully_priced_space_has_no_mark(self):
+        self.prices()
+        self.record(session=SID, task="t-001", name="t-001-build", terminal="t5")
+        self.add(self.prompt(T0 + 1), self.call(T0 + 2, "m1", lines=1, out=300))
+        self.collect(T0 + 2000)
+        self.assertNotIn("unpricedTokens\": 1", raw(self.costs("summary.json")).decode())
+        _r, out, _e = self.run_cmd(pa_costs.report, self.dir, now=T0 + 2000)
+        self.assertNotIn("+ marks", out)
+
+    def test_f4_folded_tasks_keep_the_unpriced_part(self):
+        entries = [{"key": "a", "tokens": 10, "money": 1.0, "calls": 1, "phases": [], "sessions": []},
+                   {"key": "b", "tokens": 10, "money": 1.0, "calls": 1, "unpricedTokens": 4, "phases": [], "sessions": []},
+                   {"key": "c", "tokens": 6, "money": None, "calls": 1, "phases": [], "sessions": []}]
+        other = pa_costs.fold_tasks(entries, 1)[-1]
+        self.assertEqual((other["money"], other["unpricedTokens"]), (1.0, 10))
+
+    def test_f4_all_spaces_here_sum_the_unpriced_part(self):
+        def summary(space, money, extra=None):
+            e = {"day": "2026-11-16", "model": "model-a", "tokens": toks(out=1000), "money": money}
+            e.update(extra or {})
+            dump({"account": "acct1", "updated": "2026-11-17T09:00:00Z", "byDayModel": [e]},
+                 os.path.join(pa.ROOT, "spaces", space, "costs", "summary.json"))
+        summary("sp1", 3.0)
+        summary("sp2", None)
+        summary("sp3", 1.0, {"unpricedTokens": 5})
+        here = pa_costs.account_wide_summary("acct1", T0)
+        self.assertEqual([(e["money"], e["unpricedTokens"]) for e in here["byDayModel"]], [(4.0, 1005)])
+        summary("sp2", 2.0)
+        summary("sp3", 1.0)
+        here = pa_costs.account_wide_summary("acct1", T0)
+        self.assertNotIn("unpricedTokens", here["byDayModel"][0])
+        summary("sp1", None)
+        summary("sp2", None)
+        summary("sp3", None)
+        here = pa_costs.account_wide_summary("acct1", T0)
+        self.assertEqual((here["byDayModel"][0]["money"], "unpricedTokens" in here["byDayModel"][0]), (None, False))
+
+    def test_f4_billed_comparison_sees_a_mixed_all_spaces_entry(self):
+        # VERIFY-5 RL5-2: one space priced vm-one, another did not; the all-spaces figure is partial.
+        self.prices()
+        row = pa_costs.validate_row(dict(brow(), model="model-a"), "query:q1", "acct1", T0)
+        space = {"account": "acct1", "updated": "2026-11-17T09:00:00Z", "prices": {"currency": "USD"},
+                 "byDayModel": [{"day": "2026-11-16", "model": "model-a", "tokens": toks(out=1000), "money": None}]}
+        here = {"byDayModel": [{"day": "2026-11-16", "model": "model-a", "tokens": toks(out=2000), "money": 3.0, "unpricedTokens": 1000}]}
+        table, _p = pa_costs.load_prices(pa.load_profile("test"))
+        c = pa_costs.billing_comparison([row], space, here, table)
+        m = c["models"][0]
+        self.assertEqual((m["allSpaces"], m["allSpacesPartial"]), (3.0, True))
+        self.assertTrue(c["total"]["allSpacesPartial"])
+
+
 ABSENT = object()
 
 
