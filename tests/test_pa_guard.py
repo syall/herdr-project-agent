@@ -1997,35 +1997,65 @@ class T016J2_Limits(T016J2):
                          FOLDER_UNKNOWN.format(word="cd build", target="notes.txt"))
         self.assertIsNone(self.w("cd build && echo x > notes.txt"))
 
-    def test_ac5_3_touch_truncate_reference(self):
-        self.assertIsNone(self.w("touch -r .git/HEAD build/stamp"))
-        self.assertIsNone(self.w("truncate -r .git/index build/x"))
-        self.assertIsNone(self.w("touch --reference .git/HEAD build/stamp"))
-        self.refused("touch -r build/a .git/x", ".git/x")
-
-    def test_ac5_3_reference_value_and_double_dash(self):  # REVIEW-J2-A M1: only the -r option's value is read
-        for line, target in [("touch -- -r .git/x", ".git/x"), ("touch -r -r .git/x", ".git/x"),
-                             ("truncate -r -r .git/index", ".git/index"),
-                             ("truncate --reference -r .git/config", ".git/config"),
-                             ("truncate -r --reference .git/config", ".git/config"),
-                             ("touch -r -- .git/x", ".git/x"), ("touch -r x -- -r .git/y", ".git/y"),
-                             ("truncate --reference=x -- -r .git/index", ".git/index"),
-                             ("touch --reference=build/a .git/x", ".git/x"), ("touch -r --reference .git/x", ".git/x"),
-                             ("rm -- -r .git/x", ".git/x")]:
+    # d-078: section 5 #7 (AC5.3) withdrawn; touch and truncate are back to a5edfb3, every file word a target.
+    def test_ac5_3_withdrawn_d078(self):
+        for line, target in [("touch -r .git/HEAD build/stamp", ".git/HEAD"), ("truncate -r .git/index build/x", ".git/index"),
+                             ("touch --reference .git/HEAD build/stamp", ".git/HEAD"), ("touch -r build/a .git/x", ".git/x"),
+                             ("touch -r .git/HEAD -r .git/index build/x", ".git/HEAD"),  # rounds 2 and 3: allowed
+                             ("touch -r .git/HEAD -- build/x", ".git/HEAD")]:  # round 2: allowed
             with self.subTest(line=line):
                 self.refused(line, target)
-        for line in ["touch --reference=.git/HEAD build/stamp", "truncate --reference=.git/index build/x",
-                     "touch -r .git/HEAD -r .git/index build/x", "touch -r .git/HEAD -- build/x"]:
-            with self.subTest(line=line):
+        for line in ["touch --reference=.git/HEAD build/stamp", "truncate --reference=.git/index build/x"]:
+            with self.subTest(line=line):  # one dash word, never a target (operands), as at a5edfb3
                 self.assertIsNone(self.w(line))
 
-    def test_ac5_3_bsd_first_operand(self):  # REVIEW-J2-R2 M1: BSD touch/truncate read no option after the first operand
-        for line, target in [("truncate -s 0 build/a -r .git/index", ".git/index"), ("touch build/a -r .git/x", ".git/x"),
-                             ("touch build/a --reference .git/config", ".git/config"), ("touch -- x -r .git/y", ".git/y"),
-                             ("rm -r .git/x", ".git/x"), ("rm -- a -/../.git/x", "-/../.git/x")]:  # the last three: VERIFY-J2-R2 pins
+    def test_ac5_3_finding_lines_refused(self):  # every line of REVIEW-J2-A/-R2/-R3 M1 and VERIFY-J2-R3 M1, M2
+        rows = [("touch -- -r .git/x", ".git/x"), ("touch -r -r .git/x", ".git/x"),  # REVIEW-J2-A M1
+                ("truncate -r -r .git/index", ".git/index"), ("truncate --reference -r .git/config", ".git/config"),
+                ("truncate -r --reference .git/config", ".git/config"),
+                ("truncate -s 0 build/a -r .git/index", ".git/index"), ("touch build/a -r .git/x", ".git/x"),  # -R2 M1
+                ("touch build/a --reference .git/config", ".git/config"),
+                ("touch - -r .git/x", ".git/x"), ("touch '' -r .git/x", ".git/x"),  # REVIEW-J2-R3 M1
+                ("truncate -s0 - -r .git/index", ".git/index"),
+                ("truncate -r build/a - --reference .git/index", ".git/index"),
+                ("truncate -s0 '' -r .git/index", ".git/index"),  # VERIFY-J2-R3 M1
+                ("truncate --size=0 - --reference .git/index", ".git/index"),
+                ("touch '' -r .git/x build/a", ".git/x"), ("touch - -r .git/x build/a", ".git/x"),
+                ("touch '' --reference .git/config", ".git/config"), ("touch - --reference .git/config", ".git/config"),
+                ("touch '' --reference .git/x", ".git/x"), ("touch - --reference .git/x", ".git/x"),
+                ("touch -cr -r .git/x", ".git/x"), ("touch -cr --reference .git/x", ".git/x"),  # VERIFY-J2-R3 M2
+                ("truncate -cr -r .git/x", ".git/x"), ("truncate -cr --reference .git/x", ".git/x"),
+                ("truncate -cr -r .git/index", ".git/index"), ("touch -mr -r .git/w", ".git/w"),
+                ("touch -ar -r .git/x", ".git/x"), ("touch -hr -r .git/x", ".git/x"), ("touch -fr -r .git/x", ".git/x"),
+                ("truncate -or -r .git/x", ".git/x"),
+                ("touch --ref -r .git/x", ".git/x"), ("touch --ref --reference .git/x", ".git/x"),  # class C
+                ("truncate --ref -r .git/index", ".git/index"), ("truncate --ref --reference .git/x", ".git/x"),
+                ("touch -d -r .git/x", ".git/x"), ("touch -d --reference .git/x", ".git/x"),  # class D (R2 L2)
+                ("touch -r x -- -r .git/y", ".git/y"), ("touch -r -- .git/x", ".git/x"),  # round 2 rows, still refused
+                ("truncate --reference=x -- -r .git/index", ".git/index"),
+                ("touch --reference=build/a .git/x", ".git/x"), ("touch -r --reference .git/x", ".git/x"),
+                ("rm -- -r .git/x", ".git/x"), ("rm -r .git/x", ".git/x"),  # pins of the other eight programs
+                ("rm -- a -/../.git/x", "-/../.git/x"), ("touch -- x -r .git/y", ".git/y")]
+        for line, target in rows:
             with self.subTest(line=line):
                 self.refused(line, target)
-        self.assertIsNone(self.w("touch -r .git/HEAD -r .git/index build/x"))
+
+    def test_ac5_3_targets_are_operands(self):  # for all ten programs file_targets == operands(args), as at a5edfb3
+        spread = [[], ["-r"], ["--reference"], ["-r", "a"], ["a", "-r"], ["-r", "a", "b"], ["a", "-r", "b"],
+                  ["a", "b", "-r"], ["--reference", "a", "b"], ["a", "--reference", "b"], ["--reference=a", "b"],
+                  ["b", "--reference=a"], ["-r", "-r", "a"], ["-r", "--reference", "a"], ["--reference", "-r", "a"],
+                  ["-r", "--", "a"], ["--", "-r", "a"], ["a", "--", "-r", "b"], ["-r", "a", "--", "-r", "b"],
+                  ["-", "-r", "a"], ["", "-r", "a"], ["-r", "", "a"], ["-r", "-", "a"], ["-cr", "-r", "a"],
+                  ["-cr", "a", "b"], ["-mr", "--reference", "a"], ["-ar", "a"], ["-s", "0", "-r", "a", "b"],
+                  ["-s0", "-", "-r", "a"], ["--ref", "-r", "a"], ["-d", "-r", "a"], ["-c", "a", "-", "b"],
+                  ["--", "--", "a"], ["--", "", "-", "a"], ["-rfoo", "a"], ["a", "", "-x", "b"]]
+        for p in ("rm", "rmdir", "unlink", "touch", "mkdir", "tee", "truncate", "chmod", "chown", "chgrp"):
+            for args in spread:
+                with self.subTest(program=p, args=args):
+                    self.assertEqual(guard.file_targets([p] + args), guard.operands(args))
+        self.assertEqual(guard.file_targets(["touch", "-r", ".git/HEAD", "build/stamp"]), [".git/HEAD", "build/stamp"])
+        self.assertEqual(guard.file_targets(["truncate", "-r", "a", "--", "-r", "b"]), ["a", "-r", "b"])
+        self.assertEqual(guard.file_targets(["touch", "-", "", "--reference=a", "b"]), ["b"])
 
     def test_ac5_4_command_options(self):
         self.assertEqual(self.w("command -p cd .git && echo x > config"),
