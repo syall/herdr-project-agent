@@ -18,6 +18,9 @@ One file, selected by the name it is invoked as (symlinks in ~/.local/bin):
   pa-decide <card> --withdraw --why TEXT         close a card the conversation made moot
   pa-sync --on MACHINE [--dry-run]               copy core/, tools/ and profiles/ to another Herdr machine
   pa-core-check                                  fail if the generic core names a profile's tools
+
+In pa_push.py (see its docstring): pa-push-main plan|check|run, the person's push card, and
+pa-push-allow show|add|remove|on|off, the person's push allowlist. pa-decide refuses a push card.
 """
 import argparse
 import datetime
@@ -1243,6 +1246,8 @@ def cmd_decide(args):
     else:
         if card.get("worktree"):
             raise Problem("a card that deletes a worktree is answered in the panel, not in conversation")
+        if card.get("push") or card.get("kind") == "push":
+            raise Problem("a push card is answered in the panel, not in conversation (its answer runs the push)")
         if card.get("kind") == "leftovers":
             raise Problem("a card that closes workers is answered in the panel, not in conversation")
         labels = [o.get("label") for o in card.get("options") or []]

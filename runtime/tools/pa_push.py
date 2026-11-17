@@ -3,6 +3,10 @@
 
 Selected by the name it is invoked as (symlinks in ~/.local/bin):
 
+  pa-push-main plan <task-id> --repo <main checkout> [--space ID]
+                                                 open a push card for a task that passed its full gate
+  pa-push-main check <card> [--space ID] [--json]
+                                                 the card's facts read now, the first failing check, the seen token
   pa-push-allow show [--json] [--space ID]       the push allowlist (<PA home>/push-allow.json): valid or why not,
                                                  on or off, its SHA-256 and time, each entry
   pa-push-allow add --path P --space S [--url U] [--branch B] [--note T] [--pre-push ARG...]
@@ -14,16 +18,22 @@ person-only commands refuse an agent's shell (its variables, a claude or codex a
 ps). That fence stops agents that follow their rules; it does not prove a human.
 """
 import argparse
+import contextlib
 import datetime
+import fcntl
 import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
+import time
 
 sys.dont_write_bytecode = True  # keep tools/ free of caches
 import pa  # noqa: E402
+import pa_hooks  # noqa: E402
 
 ALLOW_FILE = "push-allow.json"
 MAX_REPOS = 50
@@ -408,6 +418,506 @@ def default_branch(path):
     return out.strip() if not code else ""
 
 
+# ---- facts (C6-C11), shared by plan, check and run --------------------------------------------------
+
+FACT_KEYS = ("path", "url", "branch", "originUrl", "remoteNow", "localNow", "commit", "taskBranch", "branchTip", "merge",
+             "gate", "commits", "count", "allow", "commands", "checkedAt")
+COMMITS_MAX = 200  # commits recorded on a card
+CONTEXT_COMMITS = 20  # commits written into the card's context
+HEX = re.compile(r"^([0-9a-f]{40}|[0-9a-f]{64})$")
+RISKY = re.compile(r"^(core\.(hookspath|sshcommand|fsmonitor|gitproxy|askpass|editor|pager)|url\..*|credential\..*|include(if)?\..*"
+                   r"|remote\..*\.(receivepack|uploadpack|pushurl|vcs)|push\..*|gpg\..*|filter\..*|protocol\..*|http\..*\.proxy|http\.proxy)$",
+                   re.I)
+SHOWN_HOOKS = "<an empty folder>"
+SHOWN_CLONE = "<a temporary clone of the commit>"
+
+
+def short(sha):
+    return (sha or "")[:7] or "none"
+
+
+class Session:
+    """The git context of one plan, check or run: an empty hooks folder (removed by close) and a deadline."""
+
+    def __init__(self, deadline=None):
+        self.deadline = deadline
+        self.hooks = tempfile.mkdtemp(prefix="pa-push-hooks-")
+
+    def left(self):
+        return float("inf") if self.deadline is None else self.deadline - time.monotonic()
+
+    def git(self, path, args, timeout=30):
+        left = self.left()
+        if left < 2:
+            return 124, "", "ran out of time"
+        return git_call(base(path, self.hooks) + list(args), min(timeout, left))
+
+    def sha(self, path, ref):
+        code, out, _err = self.git(path, ["rev-parse", "--verify", "-q", ref + "^{commit}"])
+        out = out.strip()
+        return out if not code and HEX.match(out) else None
+
+    def is_ancestor(self, path, a, b):
+        return self.git(path, ["merge-base", "--is-ancestor", a, b])[0] == 0
+
+    def close(self):
+        shutil.rmtree(self.hooks, ignore_errors=True)
+
+
+def tracked_changes(s, path):
+    """Lines of `git status --porcelain --untracked-files=no`, without .claude/ (as the gate counts), or None."""
+    code, out, _err = s.git(path, ["--no-optional-locks", "status", "--porcelain", "--untracked-files=no"])
+    if code:
+        return None
+    return [l for l in out.splitlines() if l.strip() and not l[3:].strip('"').startswith(".claude/")]
+
+
+def live_pin(s, worktree, common):
+    """The task worktree's repository whose common dir is common, read now: {repo, commit, uncommitted}, or None.
+    The same places the gate looks: the worktree itself, else its src/<name> children."""
+    if not worktree or not os.path.isdir(worktree):
+        return None
+    root = os.path.realpath(worktree)
+    places = [root]
+    src = os.path.join(root, "src")
+    if os.path.isdir(src):
+        places += [os.path.join(src, n) for n in sorted(os.listdir(src)) if os.path.isdir(os.path.join(src, n))]
+    for place in places:
+        code, top, _ = s.git(place, ["rev-parse", "--show-toplevel"])
+        if code or os.path.realpath(top.strip()) != place:
+            continue
+        code, here, _ = s.git(place, ["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        if code or os.path.realpath(here.strip()) != common:
+            continue
+        changed = tracked_changes(s, place)
+        return {"repo": place, "commit": s.sha(place, "HEAD"), "uncommitted": None if changed is None else len(changed)}
+    return None
+
+
+def gather(s, directory, space, push, facts, plan=False):
+    """Checks C6-C11 in order, filling facts as it goes. Raises Refused at the first that fails. plan: the card does
+    not exist yet, so its fields are taken from what is read now (and push is filled in), instead of compared.
+    Returns "already" when the remote branch is at the commit already, else None."""
+    path = push["path"]
+    real = os.path.realpath(path)
+    facts["path"] = path
+    # C6: the allowlist
+    data, problem, sha, mtime = load_allow()
+    facts["allow"] = {"file": allow_path(), "sha": sha, "mtime": mtime,
+                      "changedSinceCard": bool(not plan and sha != push.get("allowSha")), "entry": None}
+    if data is None and problem is None:
+        raise Refused("C6a", "no push allowlist ({}); main-branch pushes are off".format(allow_path()))
+    if problem:
+        raise Refused("C6b", "the push allowlist is not valid: {}; fix it by hand".format(problem))
+    if not data["enabled"]:
+        raise Refused("C6c", "the push allowlist is turned off (enabled: false)")
+    mine = [e for e in data["repos"] if os.path.realpath(e["path"]) == real and e["space"] == space]
+    others = [e for e in data["repos"] if os.path.realpath(e["path"]) == real and e["space"] != space]
+    if not mine:
+        if others:
+            raise Refused("C6g", "the allowlist entry for {} names space {}, not this space {}".format(path, others[0]["space"], space))
+        raise Refused("C6d", "no allowlist entry for {}".format(path))
+    if len(mine) > 1:
+        raise Refused("C6d", "{} allowlist entries match {} for this space; keep one".format(len(mine), path))
+    entry = mine[0]
+    facts["allow"]["entry"] = entry
+    if plan:
+        push.update(url=entry["url"], branch=entry["branch"])
+    if entry["url"] != push["url"]:
+        raise Refused("C6e", "the allowlist entry for {} has URL {}, the card says {}".format(path, entry["url"], push["url"]))
+    if entry["branch"] != push["branch"]:
+        raise Refused("C6f", "the allowlist entry for {} has branch {}, the card says {}".format(path, entry["branch"], push["branch"]))
+    if not entry["enabled"]:
+        raise Refused("C6h", "the allowlist entry for {} is turned off".format(path))
+    if plan:
+        push.update(allowSha=sha, allowMtime=mtime)
+    if sha != push.get("allowSha"):
+        raise Refused("C6i", "the push allowlist changed since this card was made; ask for a new card")
+    url, branch = entry["url"], entry["branch"]
+    facts.update(url=url, branch=branch)
+    # C7: the main checkout and its settings
+    code, top, _ = s.git(real, ["rev-parse", "--show-toplevel"])
+    code2, common, _ = s.git(real, ["rev-parse", "--path-format=absolute", "--git-common-dir"])
+    common = os.path.realpath(common.strip()) if not code2 else None
+    if code or code2 or os.path.realpath(top.strip()) != real or common != os.path.realpath(os.path.join(real, ".git")):
+        raise Refused("C7a", "{} is not the main checkout of a git repository".format(path))
+    # The worktree scope exists only with extensions.worktreeConfig (git refuses --worktree otherwise, and then
+    # the local scope is the whole story).
+    code, wt_config, _ = s.git(real, ["config", "--local", "--bool", "--get", "extensions.worktreeConfig"])
+    for scope in ("local", "worktree") if wt_config.strip() == "true" else ("local",):
+        code, out, err = s.git(real, ["config", "--" + scope, "--list", "--name-only"])
+        if code:
+            raise Refused("C7b", "could not read the {} git settings of {} ({}); nothing was pushed".format(scope, path, err.strip()[-200:]))
+        for key in out.split():
+            if RISKY.match(key):
+                raise Refused("C7b", "{} has git setting {} ({}), which can run a program or redirect the push; remove it, "
+                                     "or push by hand".format(path, key, scope))
+    code, out, err = s.git(real, ["config", "--get-regexp", r"^url\..*\.(insteadof|pushinsteadof)$"])
+    if code not in (0, 1):
+        raise Refused("C7c", "could not read the URL rewrites of {} ({}); nothing was pushed".format(path, err.strip()[-200:]))
+    for line in out.splitlines() if code == 0 else []:
+        key, _sep, value = line.partition(" ")
+        if value and url.startswith(value):
+            raise Refused("C7c", "a URL rewrite ({} = {}) applies to {}; remove it, or put the rewritten URL on the allowlist".format(key, value, url))
+    code, origin, _ = s.git(real, ["config", "--get", "remote.origin.url"])
+    facts["originUrl"] = origin.strip() if not code else None
+    # C8: the gate, now and as recorded
+    task_id = push["task"]
+    ledger = pa.read_json(os.path.join(directory, "ledger.json"), {}) or {}
+    task = next((t for t in ledger.get("tasks", []) if isinstance(t, dict) and t.get("id") == task_id), None)
+    if not task:
+        raise Refused("C8a", "no task {} in this space's ledger".format(task_id))
+    now_gate = pa_hooks.evaluate_gate(directory, task, "review")
+    if not now_gate["passed"]:
+        failed = ["{} ({})".format(c["check"], c.get("why")) for c in now_gate["checks"] if not c["ok"]]
+        raise Refused("C8a", "the full gate for {} does not pass now: {}".format(task_id, "; ".join(failed)))
+    gate = pa.read_json(os.path.join(directory, "evidence", task_id, "GATE.json"))
+    if not isinstance(gate, dict):
+        raise Refused("C8b", "there is no GATE.json for {}; run pa-gate {}".format(task_id, task_id))
+    facts["gate"] = {"at": gate.get("at"), "phase": gate.get("phase"), "passed": gate.get("passed"), "commit": None, "uncommitted": None}
+    if gate.get("phase") != "review":
+        raise Refused("C8b", "GATE.json for {} is from phase {}; run pa-gate {} again".format(task_id, gate.get("phase"), task_id))
+    if gate.get("passed") is not True:
+        raise Refused("C8b", "GATE.json for {} did not pass".format(task_id))
+    pins = [c for c in gate.get("commits") or [] if isinstance(c, dict) and isinstance(c.get("common"), str)
+            and os.path.realpath(c["common"]) == common]
+    if len(pins) != 1:
+        raise Refused("C8c", "GATE.json pins {} for this repository; run pa-gate {} again".format(
+            "no commit" if not pins else "{} commits".format(len(pins)), task_id))
+    pin = pins[0]
+    facts["gate"].update(commit=pin.get("commit"), uncommitted=pin.get("uncommitted"))
+    if pin.get("uncommitted") != 0:
+        raise Refused("C8d", "the gate ran with {} uncommitted file(s) in the worktree; commit them and run the gate again".format(pin.get("uncommitted")))
+    if plan:
+        push.update(commit=pin.get("commit"), taskBranch=pin.get("branch"), gateAt=gate.get("at"))
+    commit = push.get("commit")
+    if pin.get("commit") != commit:
+        raise Refused("C8e", "the gate passed {}, the card says {}".format(short(pin.get("commit")), short(commit)))
+    task_branch = push.get("taskBranch")
+    facts.update(commit=commit, taskBranch=task_branch)
+    if not isinstance(task_branch, str) or branch_problem(task_branch):
+        raise Refused("C8f", "the gate ran on no branch in the worktree (a detached HEAD); check out the task branch and run pa-gate {} again".format(task_id))
+    tip = s.sha(real, "refs/heads/" + task_branch)
+    facts["branchTip"] = tip
+    if tip != commit:
+        raise Refused("C8f", "commits were added to {} after the gate (gate {}, branch now {}); run pa-gate again and ask for a new card".format(
+            task_branch, short(commit), short(tip)))
+    live = live_pin(s, task.get("worktree"), common)
+    if not live or live["commit"] != commit:
+        raise Refused("C8g", "the task's worktree is not at the gated commit now ({}); run pa-gate {} again and ask for a new card".format(
+            "not found" if not live else "it is at " + short(live["commit"]), task_id))
+    if live["uncommitted"] != 0:
+        raise Refused("C8g", "the task's worktree has {} uncommitted change(s) to tracked files now; commit them and run the gate again".format(live["uncommitted"]))
+    # C9: the commit itself
+    if not isinstance(commit, str) or not HEX.match(commit):
+        raise Refused("C9", "{} is not a full commit id".format(commit))
+    if s.sha(real, commit) != commit:
+        raise Refused("C9", "commit {} is not in {}".format(short(commit), path))
+    # C10: local branch
+    local = s.sha(real, "refs/heads/" + branch)
+    facts["localNow"] = local
+    if not local:
+        raise Refused("C10a", "{} has no local branch {}".format(path, branch))
+    if plan:
+        push["localBefore"] = local
+    if local == commit:
+        merge = False
+    elif local != push.get("localBefore"):
+        raise Refused("C10a", "local {} moved since the card (was {}, now {}); ask for a new card".format(branch, short(push.get("localBefore")), short(local)))
+    elif s.is_ancestor(real, local, commit):
+        merge = True
+    else:
+        raise Refused("C10a", "local {} ({}) is not an ancestor of {}; only a fast-forward is allowed".format(branch, short(local), short(commit)))
+    facts["merge"] = merge
+    if plan:
+        push["merge"] = merge
+    if merge:
+        code, head, _ = s.git(real, ["symbolic-ref", "-q", "HEAD"])
+        head = head.strip() if not code else ""
+        if head != "refs/heads/" + branch:
+            raise Refused("C10b", "{} is on {}, not {}; check out {} there first".format(
+                path, head[len("refs/heads/"):] if head.startswith("refs/heads/") else "a detached HEAD", branch, branch))
+        changed = tracked_changes(s, real)
+        if changed is None or changed:
+            raise Refused("C10b", "{} has {} uncommitted change(s) to tracked files; the local fast-forward needs a clean checkout".format(
+                path, "some" if changed is None else len(changed)))
+    # C11: the remote branch, read now
+    code, out, err = s.git(real, ["ls-remote", url, "refs/heads/" + branch], 30)
+    if code:
+        raise Refused("C11a", "could not read {} ({}); nothing was pushed".format(url, (err.strip().splitlines() or ["exit {}".format(code)])[-1][-200:]))
+    remote = next((l.split()[0] for l in out.splitlines() if l.split()[1:2] == ["refs/heads/" + branch]), None)
+    facts["remoteNow"] = remote
+    if not remote or not HEX.match(remote):
+        raise Refused("C11a", "{} has no branch {}; creating a main branch is not done here".format(url, branch))
+    if remote == commit:
+        if plan:
+            raise Refused("C11b", "nothing to push: {} {} is already at {}".format(url, branch, short(commit)))
+        facts.update(commits=[], count=0)
+        return "already"
+    if plan:
+        push["remoteBefore"] = remote
+    if remote != push.get("remoteBefore"):
+        raise Refused("C11b", "remote {} moved since the card (was {}, now {}); ask for a new card".format(branch, short(push.get("remoteBefore")), short(remote)))
+    if s.sha(real, remote) != remote:
+        code, _o, err = s.git(real, ["fetch", "--no-tags", url, "refs/heads/" + branch], 60)
+        if code or s.sha(real, remote) != remote:
+            raise Refused("C11c", "could not fetch {} {} to compare it ({}); nothing was pushed".format(url, branch, err.strip()[-200:]))
+    if not s.is_ancestor(real, remote, commit):
+        raise Refused("C11c", "remote {} ({}) is not an ancestor of {}; only a fast-forward is allowed, never a force push".format(
+            branch, short(remote), short(commit)))
+    facts["commits"], facts["count"] = commit_list(s, real, remote, commit, push.get("localBefore"))
+    if plan:
+        push["commits"] = facts["commits"]
+    return None
+
+
+def commit_list(s, path, remote, commit, local_before):
+    """([{sha, subject, author, fromTask}] of remote..commit, newest first, at most COMMITS_MAX; the full count).
+    fromTask is false for a commit that was on local main already when the card was made."""
+    code, out, _ = s.git(path, ["log", "-n", str(COMMITS_MAX), "--format=%H%x1f%s%x1f%an <%ae>", remote + ".." + commit])
+    rows = [l.split("\x1f") for l in out.splitlines() if l.count("\x1f") == 2] if not code else []
+    earlier = set()
+    if local_before and HEX.match(local_before) and local_before != remote:
+        code, mine, _ = s.git(path, ["log", "--format=%H", remote + ".." + local_before])
+        earlier = set(mine.split()) if not code else set()
+    code, count, _ = s.git(path, ["rev-list", "--count", remote + ".." + commit])
+    commits = [{"sha": r[0], "subject": pa_hooks.cut(pa_hooks.clean(r[1]), 200), "author": pa_hooks.cut(pa_hooks.clean(r[2]), 120),
+                "fromTask": r[0] not in earlier} for r in rows]
+    return commits, int(count.strip()) if not code and count.strip().isdigit() else len(commits)
+
+
+def commands(facts, entry):
+    """The argv lists run would start, in order, as the card shows them."""
+    path, url, branch, commit = facts["path"], facts["url"], facts["branch"], facts["commit"]
+    b = base(path, SHOWN_HOOKS)
+    out = []
+    if entry.get("prePush"):
+        out.append(["git", "-c", "core.hooksPath=" + SHOWN_HOOKS, "clone", "--quiet", "--shared", "--no-checkout", path, SHOWN_CLONE])
+        out.append(["git", "-C", SHOWN_CLONE, "-c", "core.hooksPath=" + SHOWN_HOOKS, "checkout", "--quiet", "--detach", commit])
+        out.append(fill(entry["prePush"], path=SHOWN_CLONE, repo=path, commit=commit, url=url, branch=branch))
+    if facts.get("merge"):
+        out.append(b + ["merge", "--ff-only", "--no-edit", commit])
+    out.append(b + ["push", "--porcelain", "--no-follow-tags", "--recurse-submodules=no", url, commit + ":refs/heads/" + branch])
+    out.append(b + ["ls-remote", url, "refs/heads/" + branch])
+    return out
+
+
+def seen_token(card_id, facts):
+    """What the person saw, as one SHA-256: run refuses when it differs (C12)."""
+    shas = [c["sha"] for c in facts.get("commits") or []]
+    value = [card_id, facts.get("path"), facts.get("url"), facts.get("branch"), facts.get("commit"), facts.get("localNow"),
+             facts.get("remoteNow"), (facts.get("allow") or {}).get("sha"), (facts.get("gate") or {}).get("at"), shas]
+    return hashlib.sha256(json.dumps(value).encode()).hexdigest()
+
+
+# ---- cards ----------------------------------------------------------------------------------------
+
+def card_file(directory, card_id):
+    return os.path.join(directory, "decisions", card_id + ".json")
+
+
+def load_card(directory, space, card_id):
+    """The push card (C3), or Refused."""
+    if not isinstance(card_id, str) or not pa.ID.match(card_id):
+        raise Refused("C3", "no decision card {}".format(card_id))
+    card = pa.read_json(card_file(directory, card_id))
+    if not isinstance(card, dict):
+        raise Refused("C3", "no decision card {}".format(card_id))
+    push = card.get("push")
+    if not isinstance(push, dict):
+        raise Refused("C3", "{} is not a push card".format(card_id))
+    if push.get("version") != 1:
+        raise Refused("C3", "{} has push version {}; this pa-push-main knows version 1".format(card_id, push.get("version")))
+    if push.get("space") != space:
+        raise Refused("C3", "{} belongs to space {}, not {}".format(card_id, push.get("space"), space))
+    for key in ("path", "url", "branch", "task", "commit"):
+        if not isinstance(push.get(key), str):
+            raise Refused("C3", "{} is not a push card (its {} is missing)".format(card_id, key))
+    if not pa.ID.match(push["task"]) or not os.path.isabs(push["path"]):
+        raise Refused("C3", "{} is not a push card (bad task or path)".format(card_id))
+    return card
+
+
+@contextlib.contextmanager
+def push_lock(directory, wait=5):
+    """<space>/.push.lock (C2): one plan or run at a time in a space."""
+    with open(os.path.join(directory, ".push.lock"), "a") as f:
+        end = time.monotonic() + wait
+        while True:
+            try:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() > end:
+                    raise Refused("C2", "another push for this space is running; try again in a minute")
+                time.sleep(0.1)
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
+def blank_facts():
+    return {k: None for k in FACT_KEYS}
+
+
+def check_card(directory, space, card_id, env, ancs):
+    """pa-push-main check: the facts, the first failing check and the seen token. Reads only: no lock, no write
+    in the space (git may fetch the remote branch into FETCH_HEAD to compare it)."""
+    why = caller_refusal(env, ancs)
+    report = {"card": card_id, "ok": False, "refusal": None, "caller": {"ok": why is None, "why": why, "ancestors": ancestor_names(ancs)},
+              "status": None, "done": False, "result": None, "facts": blank_facts(), "seen": None}
+    s = Session(deadline=time.monotonic() + 55)
+    try:
+        card = load_card(directory, space, card_id)
+        push = card["push"]
+        report.update(status=card.get("status"), done=bool(push.get("done")), result=push.get("result"))
+        if push.get("done"):
+            r = push.get("result") or {}
+            raise Refused("C4", "{} was already pushed at {} ({}..{}); nothing to do".format(card_id, r.get("at"), short(r.get("from")), short(r.get("to"))))
+        if card.get("status") != "open":
+            raise Refused("C4", "{} is {}; nothing was pushed".format(card_id, card.get("status")))
+        gather(s, directory, space, push, report["facts"])
+        report["facts"]["commands"] = commands(report["facts"], report["facts"]["allow"]["entry"])
+        report["ok"] = True
+        report["seen"] = seen_token(card_id, report["facts"])
+    except Refused as r:
+        report["refusal"] = {"check": r.check, "message": r.message}
+    finally:
+        s.close()
+        report["facts"]["checkedAt"] = pa.now()
+    return report
+
+
+def card_context(push, facts, entry):
+    """The card's context, written by the tool from what it read (never by an agent)."""
+    branch, c7 = push["branch"], short(push["commit"])
+    lines = ["Repository: {}".format(push["path"]),
+             "Push to: {} branch {} (on your push allowlist{}). The remote {} is at {} now.".format(
+                 push["url"], branch, ": " + pa_hooks.clean(entry["note"]) if entry.get("note") else "", branch, short(push["remoteBefore"])),
+             "Local {} is at {}; {}.".format(branch, short(push["localBefore"]),
+                                             "this card fast-forwards it to {} first".format(c7) if push["merge"] else "it is the gated commit"),
+             "Gated commit: {} on {} (pa-gate review passed at {}).".format(c7, push["taskBranch"], push["gateAt"]),
+             "Commits to push ({}):".format(facts["count"])]
+    for c in push["commits"][:CONTEXT_COMMITS]:
+        lines.append("- {} {} ({}){}".format(short(c["sha"]), c["subject"], c["author"], "" if c["fromTask"] else " (not from this task)"))
+    if facts["count"] > CONTEXT_COMMITS:
+        lines.append("- and {} more".format(facts["count"] - CONTEXT_COMMITS))
+    if facts.get("originUrl") != push["url"]:
+        lines.append("Note: origin of {} is {}, not the allowlist URL; the push goes to the allowlist URL.".format(
+            push["path"], pa_hooks.clean(facts.get("originUrl") or "not set")))
+    lines.append("Will run: " + "; ".join(" ".join(a) for a in commands(facts, entry)))
+    lines.append("The panel checks every fact again when you look, and the push runs only when you answer Push.")
+    return pa_hooks.cut("\n".join(lines), pa_hooks.CONTEXT_MAX)
+
+
+def next_card_id(directory, task_id):
+    n = 1
+    while os.path.exists(card_file(directory, "d-push-{}-{}".format(task_id, n))):
+        n += 1
+    return "d-push-{}-{}".format(task_id, n)
+
+
+def open_push_card(directory, task_id, path):
+    folder = os.path.join(directory, "decisions")
+    for name in sorted(os.listdir(folder)) if os.path.isdir(folder) else []:
+        if not (name.startswith("d-push-") and name.endswith(".json")):
+            continue
+        card = pa.read_json(os.path.join(folder, name))
+        push = card.get("push") if isinstance(card, dict) else None
+        if isinstance(push, dict) and card.get("status") == "open" and push.get("task") == task_id and \
+                isinstance(push.get("path"), str) and os.path.realpath(push["path"]) == path:
+            return name[:-5]
+    return None
+
+
+def space_of(args):
+    directory, agent = pa.space_for_command(args.space)
+    return directory, pa.local_id(agent.get("space") or os.path.basename(directory))
+
+
+def cmd_plan(args):
+    """Opens a push card for a task that passed its full gate, for a repository on the allowlist. The tool writes
+    every fact on the card. Workers are refused (a task record above this folder)."""
+    record = pa_hooks.find_task(os.getcwd())
+    if record:
+        print("pa-push-main: refused: workers do not open push cards (this folder is the worktree of task {}); "
+              "say in your report that the work is ready to release".format(record.get("task")), file=sys.stderr)
+        return 1
+    directory, space = space_of(args)
+    task_id = pa.ident(args.task, "task id")
+    path = os.path.realpath(args.repo)
+    push = {"version": 1, "space": space, "task": task_id, "path": path}
+    facts = blank_facts()
+    s = Session(deadline=time.monotonic() + 120)
+    try:
+        with push_lock(directory):
+            other = open_push_card(directory, task_id, path)
+            if other:
+                raise Refused("plan", "an open push card {} exists for {} and {}; withdraw {} first, with pa-decide --withdraw".format(
+                    other, task_id, path, other))
+            gather(s, directory, space, push, facts, plan=True)
+            entry = facts["allow"]["entry"]
+            card_id = next_card_id(directory, task_id)
+            push.update(done=False, result=None, attempts=[])
+            name, count = os.path.basename(path), facts["count"]
+            card = {"id": card_id, "task": task_id, "kind": "push",
+                    "question": "Push {} {} to {} ({} commit{})?".format(name, push["branch"], push["url"], count, "" if count == 1 else "s"),
+                    "context": card_context(push, facts, entry),
+                    "options": [{"label": "Push", "detail": "Fast-forward local {} to {} if needed, then push {}..{}. No force.".format(
+                                    push["branch"], short(push["commit"]), short(push["remoteBefore"]), short(push["commit"]))},
+                                {"label": "Not now", "detail": "Nothing is pushed. The card closes."}],
+                    "evidence": ["GATE.json", "REVIEW.md"], "recommendation": "Push", "status": "open", "answer": None, "note": None,
+                    "created": pa.now(), "answered": None, "push": push}
+            pa.write_json(card_file(directory, card_id), card)
+            pa_hooks.append_journal(directory, {"by": "agent" if pa_hooks.by_an_agent() else "person", "trigger": "push-plan", "task": task_id,
+                                                "decision": card_id, "why": "push card opened: {} {} {}..{} ({} commits)".format(
+                                                    push["url"], push["branch"], short(push["remoteBefore"]), short(push["commit"]), count),
+                                                "push": journal_push(push, push["remoteBefore"], push["merge"])})
+    except Refused as r:
+        print("pa-push-main: refused: " + r.message, file=sys.stderr)
+        return 1
+    finally:
+        s.close()
+    print("{} opened: {}. The person answers it in the panel.".format(card_id, card["question"]))
+    return 0
+
+
+def journal_push(push, frm, merged):
+    return {"path": push.get("path"), "url": push.get("url"), "branch": push.get("branch"), "from": frm, "to": push.get("commit"),
+            "merged": merged, "allowSha": push.get("allowSha"), "allowMtime": push.get("allowMtime"), "gateAt": push.get("gateAt")}
+
+
+def cmd_check(args):
+    directory, space = space_of(args)
+    report = check_card(directory, space, args.card, os.environ, ancestors())
+    if args.json:
+        print(json.dumps(report, indent=2))
+    else:
+        f = report["facts"]
+        print("{}: {}".format(args.card, "ready: Push would push {} {}..{} to {}".format(f["branch"], short(f["remoteNow"]), short(f["commit"]), f["url"])
+                              if report["ok"] else "refused ({}): {}".format(report["refusal"]["check"], report["refusal"]["message"])))
+        print("caller: {}".format("this caller may push" if report["caller"]["ok"] else "refused: " + report["caller"]["why"]))
+        if report["seen"]:
+            print("seen: " + report["seen"])
+    return 0 if report["ok"] else 1
+
+
+def main_parser():
+    parser = argparse.ArgumentParser(prog="pa-push-main", description="Push a main branch from a push card (the person's answer in the panel).")
+    sub = parser.add_subparsers(dest="action")
+    sub.required = True
+    plan = sub.add_parser("plan", help="open a push card for a task that passed its full gate")
+    plan.add_argument("task")
+    plan.add_argument("--repo", required=True, help="the repository's main checkout")
+    plan.add_argument("--space")
+    check = sub.add_parser("check", help="the card's facts, read now (read-only)")
+    check.add_argument("card")
+    check.add_argument("--space")
+    check.add_argument("--json", action="store_true")
+    return parser
+
+
 # ---- entry point ----------------------------------------------------------------------------------
 
 def main():
@@ -419,6 +929,11 @@ def main():
         if args.action == "show":
             return cmd_allow_show(args)
         return allow_change(args, os.environ, ancestors())
+    if kind == "pa-push-main":
+        args = main_parser().parse_args()
+        if args.action == "plan":
+            return cmd_plan(args)
+        return cmd_check(args)
     raise pa.Problem("invoke as pa-push-main or pa-push-allow")
 
 

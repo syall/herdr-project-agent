@@ -587,6 +587,7 @@ class Check(Planned):
         self.assertEqual(self.plan()[0], 0)
 
     def test_p07_check_writes_nothing(self):
+        os.remove(os.path.join(self.dir, ".push.lock"))  # made by plan; check takes no lock
         before = snapshot(pa.ROOT)
         refs = (self.head(self.main), self.origin_head(), self.head(self.main, "refs/heads/t-1-x"))
         report = self.check()
