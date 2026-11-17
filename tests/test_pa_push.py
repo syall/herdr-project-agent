@@ -72,6 +72,10 @@ _module_env = {}
 # What a person's plain terminal looks like to C0: no agent variable, no Herdr terminal, no agent ancestor.
 PERSON_ENV = {"HOME": TEST_ENV["HOME"], "PATH": os.environ.get("PATH", "")}
 PERSON_TREE = [{"pid": 11, "comm": "/bin/zsh", "args": "-zsh"}, {"pid": 1, "comm": "/sbin/launchd", "args": "/sbin/launchd"}]
+# What the panel's check and run look like to C0: started by Herdr's core under the Herdr app (as `ps` shows them).
+PANEL_TREE = [{"pid": 31, "comm": "/Users/p/.local/bin/herdr-core", "args": "/Users/p/.local/bin/herdr-core"},
+              {"pid": 30, "comm": "/Applications/Herdr.app/Contents/MacOS/Herdr", "args": "/Applications/Herdr.app/Contents/MacOS/Herdr"},
+              {"pid": 1, "comm": "/sbin/launchd", "args": "/sbin/launchd"}]
 SPACE = "sp1"
 TASK = "t-1"
 
@@ -459,7 +463,7 @@ class Planned(Repo):
         return load(self.card_path(card))
 
     def check(self, card=CARD, env=None, tree=None):
-        return pa_push.check_card(self.dir, SPACE, card, env if env is not None else PERSON_ENV, PERSON_TREE if tree is None else tree)
+        return pa_push.check_card(self.dir, SPACE, card, env if env is not None else PERSON_ENV, PANEL_TREE if tree is None else tree)
 
     def journal(self):
         path = os.path.join(self.dir, "journal.jsonl")
@@ -692,7 +696,7 @@ class Check(Planned):
 
     def test_p09_check_reports_caller(self):
         r = self.check()
-        self.assertEqual(r["caller"], {"ok": True, "why": None, "ancestors": ["zsh", "launchd"]})
+        self.assertEqual(r["caller"], {"ok": True, "why": None, "ancestors": ["herdr-core", "Herdr", "launchd"]})
         r = self.check(env=dict(PERSON_ENV, CLAUDECODE="1"))
         self.assertFalse(r["caller"]["ok"])
         self.assertIn("CLAUDECODE", r["caller"]["why"])
@@ -760,7 +764,7 @@ class Runs(Planned):
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             return pa_push.run_push(space, card, answer, note, seen, PERSON_ENV if env is None else env,
-                                    PERSON_TREE if tree is None else tree, deadline)
+                                    PANEL_TREE if tree is None else tree, deadline)
 
     def card_edit(self, **push_changes):
         c = self.card()
@@ -804,13 +808,13 @@ class RunChecks(Runs):
         self.assertEqual(self.calls, [])  # nothing was read
 
     def test_r_c0_ancestor_claude(self):
-        for tree in ([{"pid": 7, "comm": "/opt/bin/claude", "args": "claude --resume"}] + PERSON_TREE,
-                     PERSON_TREE[:1] + [{"pid": 8, "comm": "node", "args": "node /usr/lib/node_modules/@anthropic-ai/claude-code/cli.js"}]):
+        for tree in ([{"pid": 7, "comm": "/opt/bin/claude", "args": "claude --resume"}] + PANEL_TREE,
+                     PANEL_TREE[:1] + [{"pid": 8, "comm": "node", "args": "node /usr/lib/node_modules/@anthropic-ai/claude-code/cli.js"}]):
             self.assertRefused(self.run_push(tree=tree), "C0", "ancestor", attempts=0)
         self.assertEqual(self.calls, [])
 
     def test_r_c0_ancestor_codex(self):
-        for tree in ([{"pid": 7, "comm": "codex", "args": "codex"}] + PERSON_TREE,
+        for tree in ([{"pid": 7, "comm": "codex", "args": "codex"}] + PANEL_TREE,
                      [{"pid": 8, "comm": "/usr/bin/node", "args": "node /x/@openai/codex/bin/codex.js"}]):
             self.assertRefused(self.run_push(tree=tree), "C0", "codex", attempts=0)
 
@@ -1200,7 +1204,7 @@ class Act(Runs):
         seen = self.seen
 
         def one():
-            results.append(pa_push.run_push(SPACE, CARD, "Push", None, seen, PERSON_ENV, PERSON_TREE, None))
+            results.append(pa_push.run_push(SPACE, CARD, "Push", None, seen, PERSON_ENV, PANEL_TREE, None))
 
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             threads = [threading.Thread(target=one) for _ in range(2)]
