@@ -11,6 +11,8 @@ the address to report to.
 - Work only in the folder you were started in (a git worktree for code tasks).
 - Write your evidence into `evidence/<task-id>/` in the orchestrator's state folder,
   and nowhere else in that folder. Never edit the ledger, the journal, decisions or rules.
+- Commands that involve git, gh or hc are limited to the allowlist in `pa_guard.py`;
+  anything else is refused: report it to the Project Agent.
 - Report with `hc send <address from the handoff> "<result or blocker, with file paths>"`
   when you are done or stuck. Long answers go in a file; send its path.
 - You are started for one job. After your report the orchestrator reads your evidence

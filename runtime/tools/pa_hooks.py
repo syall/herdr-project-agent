@@ -21,6 +21,7 @@ Selected by the name it is invoked as (symlinks in ~/.local/bin):
       affected-tests    when a task is marked complete, and (--stop) before the session ends
       test-file-lock    before an edit: no test-file edits during a fix task
       guard             before a command or a read: nothing that cannot be taken back
+                        and, for git, gh and hc, only the allowlist in pa_guard.py
 
 A failing hook exits with code 2, which sends the agent back to fix it.
 """
@@ -37,6 +38,19 @@ import time
 
 sys.dont_write_bytecode = True  # keep tools/ free of caches
 import pa  # noqa: E402
+
+
+def _load_guard():
+    """pa_guard.py from this file's own folder, found the same way when run through a symlink or loaded by a test."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("pa_guard", os.path.join(os.path.dirname(os.path.realpath(__file__)), "pa_guard.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+pa_guard = _load_guard()
+EDIT_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
 
 TASK_FILE = os.path.join(".claude", "pa-task.json")
 SETTINGS = os.path.join(".claude", "settings.local.json")
@@ -238,11 +252,21 @@ def hook_guard(data, _args):
                                     stderr=subprocess.DEVNULL, universal_newlines=True).stdout.strip()
             if branch in mains:
                 block("Blocked by the Project Agent safety hook: a push from the main branch ({}). {}".format(branch, ROUTE))
+        # After the refusals above (they are unchanged): git, gh and hc only as the allowlist allows.
+        refusal = pa_guard.check_command(command, pa_address=(agent or {}).get("terminal"),
+                                         own_address=os.environ.get("HC_TERMINAL_ID"),
+                                         extra_rows=lambda: pa_guard.profile_rows(profile), cwd=data.get("cwd"))
+        if refusal:
+            block(refusal)
     else:
-        path = tool_input.get("file_path") or tool_input.get("path") or ""
+        path = tool_input.get("file_path") or tool_input.get("path") or tool_input.get("notebook_path") or ""
         for pattern, what in DENY_PATHS + extra_paths:
             if path and re.search(pattern, path):
                 block("Blocked by the Project Agent safety hook: {} ({}). {}".format(what, path, ROUTE))
+        if tool in EDIT_TOOLS:
+            refusal = pa_guard.check_edit(path, os.path.join(pa.ROOT, "spaces"), cwd=data.get("cwd"))
+            if refusal:
+                block(refusal)
     return 0
 
 
@@ -255,7 +279,7 @@ def hook_settings():
     run = lambda name: {"type": "command", "command": os.path.join("$HOME", ".local", "bin", "pa-hook") + " " + name}
     return {
         "PreToolUse": [{"matcher": "Edit|Write|MultiEdit", "hooks": [dict(run("test-file-lock"), timeout=10)]},
-                       {"matcher": "Bash|Read|Edit|Write|MultiEdit", "hooks": [dict(run("guard"), timeout=10)]}],
+                       {"matcher": "Bash|Read|Edit|Write|MultiEdit|NotebookEdit", "hooks": [dict(run("guard"), timeout=10)]}],
         "PostToolUse": [{"matcher": "Edit|Write|MultiEdit", "hooks": [dict(run("lint-after-edit"), timeout=150)]}],
         "TaskCompleted": [{"hooks": [dict(run("affected-tests"), timeout=930)]}],
         "Stop": [{"hooks": [dict(run("affected-tests --stop"), timeout=930)]}],
