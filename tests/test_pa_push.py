@@ -1093,15 +1093,19 @@ class Act(Runs):
         self.assertEqual(os.listdir(marks), [])
 
     def test_x09_git_env_dropped(self):
-        for k, v in (("GIT_DIR", "/nonexistent"), ("GIT_WORK_TREE", "/nonexistent"), ("GIT_SSH_COMMAND", "/bin/false")):
+        planted = (("GIT_DIR", "/nonexistent"), ("GIT_WORK_TREE", "/nonexistent"), ("GIT_SSH_COMMAND", "/bin/false"))
+        for k, v in planted:
             os.environ[k] = v
             self.addCleanup(os.environ.pop, k, None)
-        self.assertPushed(*self.run_push())
+        result = self.run_push()
+        for k, _v in planted:  # the fixture's own git calls below must not see them either
+            os.environ.pop(k, None)
+        self.assertPushed(*result)
         env = pa_push.clean_env({"GIT_DIR": "x", "git_dir": "y", "Git_Config_Parameters": "z", "PATH": "/bin", "HOME": "/h"})
         self.assertEqual(env, {"PATH": "/bin", "HOME": "/h", "GIT_TERMINAL_PROMPT": "0"})
 
     def test_x10_argv_never_forbidden(self):
-        self.replan(prePush=["/bin/true", "{path}"])
+        self.replan(prePush=[sys.executable, "-c", "pass", "{path}"])
         self.assertPushed(*self.run_push())
         self.assertTrue(self.calls)
         for a in self.calls:

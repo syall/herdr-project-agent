@@ -7,6 +7,10 @@ Selected by the name it is invoked as (symlinks in ~/.local/bin):
                                                  open a push card for a task that passed its full gate
   pa-push-main check <card> [--space ID] [--json]
                                                  the card's facts read now, the first failing check, the seen token
+  pa-push-main run <card> --answer Push|"Not now" --space ID [--seen TOKEN] [--note T] [--json]
+                                                 the person's answer, run by the Project panel on their click:
+                                                 every check again under a lock, then a fast-forward push of
+                                                 exactly the gated commit to the allowlist URL (never a force)
   pa-push-allow show [--json] [--space ID]       the push allowlist (<PA home>/push-allow.json): valid or why not,
                                                  on or off, its SHA-256 and time, each entry
   pa-push-allow add --path P --space S [--url U] [--branch B] [--note T] [--pre-push ARG...]
@@ -1015,16 +1019,83 @@ def record_attempt(directory, card, r, facts):
                                         "why": "push refused: " + r.message, "push": journal_push(push, facts.get("remoteNow"), facts.get("merge"))})
 
 
+def answered(card, label, note):
+    card.update(status="answered", answer=label, note=(note or "").strip() or None, answered=pa.now(), answeredBy="person, in the panel")
+
+
 def answer_not_now(directory, card, note):
-    raise Refused("C5", "Not now is not built yet")
+    """C5 Not now: the card closes, nothing is read or pushed."""
+    push = card["push"]
+    answered(card, "Not now", note)
+    save_card(directory, card)
+    pa_hooks.append_journal(directory, {"by": "person", "trigger": "panel", "task": card.get("task"), "decision": card["id"],
+                                        "why": "answered Not now", "push": journal_push(push, push.get("remoteBefore"), False)})
+    return 0, outcome(True, False, "Not now", message="{} answered Not now; nothing was pushed.".format(card["id"]))
+
+
+def local_fast_forward(s, facts):
+    """git merge --ff-only of the commit in the main checkout (C10 made sure it is a clean fast-forward)."""
+    path, branch, commit = facts["path"], facts["branch"], facts["commit"]
+    code, out, err = s.git(path, ["merge", "--ff-only", "--no-edit", commit], 30)
+    if code or s.sha(path, "refs/heads/" + branch) != commit:
+        raise Refused("merge", "failed: local fast-forward did not run: {}; nothing was pushed".format(tail(err + "\n" + out, 5) or "exit {}".format(code)))
+    return out
+
+
+def finish(s, directory, card, note, facts, how, merged, output):
+    """Success: the card is answered and done, the journal has the line, and remote-tracking refs are refreshed."""
+    push = card["push"]
+    result = {"at": pa.now(), "from": push.get("remoteBefore"), "to": facts["commit"], "url": facts["url"], "branch": facts["branch"],
+              "merged": merged, "how": how, "output": tail(output)}
+    push.update(done=True, result=result)
+    answered(card, "Push", note)
+    save_card(directory, card)
+    if how == "pushed":
+        why = "pushed {} {} {}..{} ({} commits)".format(facts["url"], facts["branch"], short(result["from"]), short(result["to"]), facts.get("count"))
+    else:
+        why = "already on the remote: {} {} is at {}".format(facts["url"], facts["branch"], short(result["to"]))
+    pa_hooks.append_journal(directory, {"by": "person", "trigger": "panel", "task": card.get("task"), "decision": card["id"],
+                                        "why": why, "push": journal_push(push, result["from"], merged)})
+    refresh_tracking(s, facts)
+    return 0, outcome(True, True, "Push", result=result, message="{}: {}{}.".format(
+        card["id"], why, "; local {} fast-forwarded".format(facts["branch"]) if merged else ""))
+
+
+def refresh_tracking(s, facts):
+    """Courtesy, failures ignored: fetch the branch for each remote whose URL is the allowlist URL, so that
+    refs/remotes/<name>/<branch> shows the push."""
+    code, out, _ = s.git(facts["path"], ["config", "--get-regexp", r"^remote\..*\.url$"])
+    for line in out.splitlines() if not code else []:
+        key, _sep, value = line.partition(" ")
+        name = key[len("remote."):-len(".url")]
+        if value.strip() == facts["url"] and name and not name.startswith("-"):
+            s.git(facts["path"], ["fetch", "--no-tags", name, facts["branch"]], 30)
 
 
 def already_there(s, directory, card, note, facts):
-    raise Refused("C11b", "already on the remote is not built yet")
+    """C11b: the remote branch is at the commit already (a push by hand, or a run killed after its push)."""
+    output = local_fast_forward(s, facts) if facts.get("merge") else ""
+    return finish(s, directory, card, note, facts, "already on the remote", bool(facts.get("merge")), output)
 
 
 def act(s, directory, card, note, facts):
-    raise Refused("act", "the push is not built yet; nothing was pushed")
+    """Every check passed: the local fast-forward if needed, the push of exactly the commit, and a read back."""
+    path, url, branch, commit = facts["path"], facts["url"], facts["branch"], facts["commit"]
+    merged = bool(facts.get("merge"))
+    output = local_fast_forward(s, facts) if merged else ""
+    code, out, err = s.git(path, ["push", "--porcelain", "--no-follow-tags", "--recurse-submodules=no", url, commit + ":refs/heads/" + branch], 120)
+    output += out + err
+    if code:
+        _c, now_remote, _e = s.git(path, ["ls-remote", url, "refs/heads/" + branch], 30)
+        raise Refused("push", "failed: git push was refused: {}. Local {} is at {}{}; the remote {} is at {}.".format(
+            tail(err + "\n" + out, 5) or "exit {}".format(code), branch, short(s.sha(path, "refs/heads/" + branch)),
+            ", fast-forwarded by this run" if merged else "", branch, short((now_remote.split() or [""])[0])))
+    code, now_remote, err = s.git(path, ["ls-remote", url, "refs/heads/" + branch], 30)
+    remote = next((l.split()[0] for l in now_remote.splitlines() if l.split()[1:2] == ["refs/heads/" + branch]), None)
+    if code or remote != commit:
+        raise Refused("verify", "failed: the push reported success but {} {} is {}, not {}; look at the remote".format(
+            url, branch, short(remote) if remote else "unreadable", short(commit)))
+    return finish(s, directory, card, note, facts, "pushed", merged, output)
 
 
 def cmd_run(args):
