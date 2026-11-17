@@ -1178,7 +1178,7 @@ class SplitFix_WrapperVariables(Split):
                            ("eval 'export GIT_WORK_TREE=/tmp/o GIT_DIR=/tmp/o/.git'", "GIT_WORK_TREE=/tmp/o"),
                            ("eval 'export GIT_DIR' && git status", "GIT_DIR"),
                            ("bash -c 'export GH_TOKEN=x; make'", "GH_TOKEN=x"),
-                           ("env -S 'GIT_DIR=x make'", "GIT_DIR=x")]:
+                           ("env -S 'FOO=1 GIT_DIR=x make'", "GIT_DIR=x")]:
             with self.subTest(line=line):
                 self.assertEqual(self.at(line), VARIABLE.format(word))
 
