@@ -101,8 +101,8 @@ export class PushCards {
     return Boolean(c && c.ok === true && !c.done && typeof c.seen === "string" && c.seen && c.caller?.ok === true && !st.busy && !st.running && !st.result && now - st.at < FRESH);
   }
 
-  // From Submit only (main.js answer()): `pa-push-main run`, once. `told(message)` gets the notice for
-  // the orchestrator. Exit 0: done (or Not now saved); exit 1 or 2 with the tool's refusal JSON:
+  // From Submit only (main.js answer()): `pa-push-main run`, once. `told(message, cx)` gets the notice for
+  // the orchestrator, with this task's live cx (the click's is gone by then). Exit 0: done (or Not now saved); exit 1 or 2 with the tool's refusal JSON:
   // refused or failed, the card stays open; anything else (exit 1 or 2 without that JSON, as when the
   // tool crashed, maybe after the push; another code, a throw or no answer; a Push's exit 0 whose JSON
   // does not say ok, done, with a result): the result is unknown, and the card stays shown (kept) with
@@ -138,7 +138,7 @@ export class PushCards {
           notice = `decision ${entry.id} answered ${label}; refused: ${st.error} (the card stays open)`;
         }
       }
-      told(notice);
+      told(notice, cx);
       if (st.check === null && !st.result) this.check(space, entry, cx);
       cx.notify();
     });

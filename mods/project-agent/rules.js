@@ -82,11 +82,12 @@ export class RulesPane {
 
   async load(space) { this.data = await loadRules(space); }
 
-  // Applies a change, then reloads. `after` runs once the file is written (telling the orchestrator, say).
+  // Applies a change, then reloads. `after(cx)` runs once the file is written (telling the orchestrator, say),
+  // with this task's live cx: the click's is gone by then.
   save(space, cx, change, after) {
     this.error = null; this.message = null;
     cx.spawn(async (cx) => {
-      try { await changeRules(space, change); if (after) await after(); }
+      try { await changeRules(space, change); if (after) await after(cx); }
       catch (e) { this.error = String(e.message ?? e); }
       try { await this.load(space); } catch {}
       cx.notify();
@@ -114,11 +115,11 @@ export class RulesPane {
         return [touched({ id: newRuleId(rules, v.title), ...v, status: "active", order: top + 10, source: "person" }, "created"), ...rules];
       }
       return rules.map((r) => (r.id === id ? touched({ ...r, ...v, ...(approve ? { status: "active" } : {}) }, approve ? "edited and approved" : "edited") : r));
-    }, approve ? () => onDecided(id, "approved") : null);
+    }, approve ? (cx) => onDecided(id, "approved", cx) : null);
   }
 
   setStatus(space, cx, id, status, what, onDecided) {
-    this.save(space, cx, (rules) => rules.map((r) => (r.id === id ? touched({ ...r, status }, what) : r)), onDecided ? () => onDecided(id, what) : null);
+    this.save(space, cx, (rules) => rules.map((r) => (r.id === id ? touched({ ...r, status }, what) : r)), onDecided ? (cx) => onDecided(id, what, cx) : null);
   }
 
   // These buttons stop the press (so it never reaches the panel's root), so each one but the armed

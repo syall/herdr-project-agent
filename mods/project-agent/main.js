@@ -460,7 +460,9 @@ export default class ProjectAgent extends View {
   // its result, reloads and tells the orchestrator.
   answerPush(space, entry, label, cx) {
     const note = (this.notes[noteKey(space.id, entry.id)]?.value() ?? "").trim();
-    const started = this.push.run(space, entry, label, note, cx, (message) => {
+    // told() runs when the tool's run has ended, long after this click: it gets the run task's cx
+    // (a cx is valid only for the call that gave it; this click's would throw "stale context").
+    const started = this.push.run(space, entry, label, note, cx, (message, cx) => {
       this.unsent.push({ spaceId: space.id, message });
       this.resend(cx);
       this.reload(cx);
@@ -472,21 +474,30 @@ export default class ProjectAgent extends View {
   // Deliver what the orchestrator hasn't had yet, to the terminal its launcher runs in now. With
   // none, nothing is sent and the notice waits; an undelivered notice is kept and retried. A
   // space's notices go out in order: one that waits holds back the ones after it.
+  // The sending mark is always cleared: when the task cannot start (the queue is untouched; the 10 s
+  // timer tries again) and when a step in it throws (every item not yet sent is put back).
   resend(cx) {
     if (!this.unsent.length || this.sending) return;
     this.sending = true;
-    cx.spawn(async (cx) => {
-      const left = [], held = new Set();
-      for (const item of this.unsent.splice(0)) {
-        const target = !held.has(item.spaceId) && liveTarget(item.spaceId);
-        if (!target) { held.add(item.spaceId); left.push(item); continue; }
-        try { await notifyOrchestrator(target.address, item.message); }
-        catch (e) { held.add(item.spaceId); left.push({ ...item, why: String(e.message ?? e) }); }
-      }
-      this.unsent = [...left, ...this.unsent]; // kept ones first: anything queued meanwhile comes after
-      this.sending = false;
-      cx.notify();
-    });
+    try {
+      cx.spawn(async (cx) => {
+        const left = [], held = new Set(), items = this.unsent.splice(0);
+        let at = 0;
+        try {
+          for (; at < items.length; at++) {
+            const item = items[at];
+            const target = !held.has(item.spaceId) && liveTarget(item.spaceId);
+            if (!target) { held.add(item.spaceId); left.push(item); continue; }
+            try { await notifyOrchestrator(target.address, item.message); }
+            catch (e) { held.add(item.spaceId); left.push({ ...item, why: String(e.message ?? e) }); }
+          }
+        } finally {
+          this.unsent = [...left, ...items.slice(at), ...this.unsent]; // kept ones first: anything queued meanwhile comes after
+          this.sending = false;
+        }
+        cx.notify();
+      });
+    } catch { this.sending = false; }
   }
 
   // A proposal approved or declined in the Rules view: answer its card too, and tell the orchestrator.
@@ -910,7 +921,7 @@ export default class ProjectAgent extends View {
           ];
         }))))
       .when(view === "costs", (el) => el.child(this.costs.render(t, space, (shared("project-agent.costs") ?? {})[space.id] ?? null)))
-      .when(view === "rules", (el) => el.child(this.rules.render(t, space, (id, what) => new Promise((done) => cx.spawn(async (cx) => { try { await this.ruleDecided(space, id, what, cx); } finally { done(); } })))))
+      .when(view === "rules", (el) => el.child(this.rules.render(t, space, (id, what, cx) => this.ruleDecided(space, id, what, cx))))
       .when(view === "decisions", (el) => el.child(v_flex().id("pa-decisions").flex_1().min_h(0).p(8).gap(8).overflow_y_scrollbar().track_scroll(this.cardScroll)
         .when(!listed.length && this.cardsFor !== space.id, (e) => e.child(note("Loading decisions…")))
         .when(!listed.length && this.cardsFor === space.id, (e) => e.child(note("No open decisions. The Project Agent opens a card here when it needs you.")))
