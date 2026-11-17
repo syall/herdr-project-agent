@@ -2298,6 +2298,45 @@ class F1_ContinueBind(Collecting):
         self.assertNotIn(SID3[:8], result["unmatched"]["ids"])
 
 
+class F2_SharedFolder(Collecting):
+    """Item 2 (VERIFY R-d): another space on the same project folder; its recorded sessions are not this space's."""
+    def setUp(self):
+        super().setUp()
+        self.wt = os.path.join(TMP, "wt-t-002")
+        self.ledger({"version": 1, "tasks": [{"id": "t-002", "state": "done", "worktree": self.wt,
+                                              "workers": [{"address": "t5", "role": "build", "name": "t-002-build"}]}]})
+
+    session, reconstruct, binds = R_Reconstruct.session, R_Reconstruct.reconstruct, R_Reconstruct.binds
+
+    def other_space(self, worker_sid, pa_sid):
+        other = os.path.join(pa.ROOT, "spaces", "sp2")
+        rec = {"v": 1, "ev": "start", "at": iso(T0 + 129), "session": worker_sid, "program": "claude", "kind": "worker",
+               "space": "sp2", "terminal": "t5", "cwd": self.project, "bind": None, "source": "recorded"}
+        write(os.path.join(other, "costs", "sessions.jsonl"), json.dumps(rec) + "\n")
+        write(os.path.join(other, "session.log"), "{} start resume=False session={} reason=new\n".format(iso(T0), pa_sid))
+        dump({"space": "sp2", "terminal": "t1", "project": self.project, "created": iso(T0 - 3600)}, os.path.join(other, "agent.json"))
+
+    def test_f2_reconstruct_skips_sessions_another_space_records(self):
+        self.other_space(SID2, SID3)
+        self.journal({"at": iso(T0 + 100), "trigger": "report", "task": "t-002", "why": "Started build worker t5 (t-002-build)"})
+        self.session(SID2, T0 + 130, out=2)  # sp2's recorded worker, in the shared project folder
+        self.session(SID3, T0 + 200, out=3)  # sp2's Project Agent (its session.log)
+        self.session(SID4, T0 + 3000, out=50)  # nobody's: still sp1's unmatched
+        _r, _out = self.reconstruct()
+        self.assertEqual(self.binds(), {})
+        um = [r for r in lines(self.costs("sessions.jsonl")) if r.get("ev") == "unmatched"][-1]
+        self.assertEqual((um["sessions"], um["tokens"], um["ids"]), (1, 52, [SID4[:8]]))
+
+    def test_f2_collect_does_not_bind_another_spaces_recorded_session(self):
+        self.other_space(SID2, SID3)
+        at = T0 + 1000
+        self.record(program="claude", bind="launch-window", resumed=True, at=iso(at), terminal="t6", task="t-002")
+        self.session(SID2, at + 3, out=2)  # recorded by sp2, starts in sp1's launch window
+        self.collect(at + 3700)
+        self.assertEqual(self.binds(), {})
+        self.assertIn("claude session for t6 not found", load(self.costs("state.json"))["problems"])
+
+
 ABSENT = object()
 
 
