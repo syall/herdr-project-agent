@@ -161,9 +161,10 @@ repositories you name, a **push card** lets you push it yourself with one click 
 - **`pa-push-allow`**: `show [--json]` (anyone, read-only); `add --path P --space S [--url U]
   [--branch B] [--pre-push ARG...]`, `remove --path P --space S`, `on` and `off` (you only: it
   refuses agent shells).
-- **The push card.** Once a task for a listed repository has passed its gate and nothing was
-  committed after it, the Project Agent may open a push card with `pa-push-main plan <task-id>
-  --repo <main checkout>`. The panel shows facts the tool works out when the card is shown
+- **The push card.** Once a task for a listed repository has passed its gate, you have approved
+  the card that asks to publish or merge it (the one that lists every Recorded limit), and nothing
+  was committed after the gate, the Project Agent may open a push card with `pa-push-main plan
+  <task-id> --repo <main checkout>`. The panel shows facts the tool works out when the card is shown
   (`pa-push-main check`): the repository, the URL from your allowlist, the remote and local heads,
   every commit that would go out (marked when not from this task), the gated commit and the exact
   commands. **Push** then **Submit** runs `pa-push-main run`; **Not now** pushes nothing.

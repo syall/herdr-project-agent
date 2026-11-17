@@ -88,9 +88,10 @@ push card can be made and nothing about pushing changes. Agents never push a mai
   remote URL, branch, space, on/off, an optional `prePush` check program). You write it by hand or
   with `pa-push-allow add|remove|on|off` in your own terminal; `pa-push-allow show` prints it and
   whether it is valid. README has the shape. No install or sync step writes it.
-- **The push card.** After a task for a listed repository passed its gate, the agent may open a
-  push card (`pa-push-main plan <task-id> --repo <main checkout>`), options **Push** and **Not
-  now**. When the card shows, the panel runs `pa-push-main check` and draws its facts: repository,
+- **The push card.** After a task for a listed repository passed its gate and you approved the
+  card that asks to publish or merge it (the one that lists every Recorded limit), the agent may
+  open a push card (`pa-push-main plan <task-id> --repo <main checkout>`), options **Push** and
+  **Not now**. When the card shows, the panel runs `pa-push-main check` and draws its facts: repository,
   URL "on your allowlist", remote and local heads, the commits that would go out ("not from this
   task" marked), the gated commit, the exact commands, and whether this panel may push. Push is
   disabled while the last check failed or is older than 120 s; "Check again" refreshes it.
