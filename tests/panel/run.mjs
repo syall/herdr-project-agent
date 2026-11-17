@@ -2611,6 +2611,59 @@ cases["P-costs-actions"] = async () => { // R12: across every click the only pa-
   for (const [, a] of costsExecs()) for (const x of a) check(typeof x === "string" && (x.startsWith("{") || /^[a-z-]+$|^sp1$/.test(x)), `fixed argv words only (got ${x.slice(0, 80)})`);
 };
 
+// ---- t-009 round 2 (MF-1): a run or a read that ends after the Costs view was left reads and runs nothing ----
+// Leaves the Costs view: "hide" hides the panel (the reloads see it off screen), "tasks" chooses the Tasks tab.
+async function leaveCosts(v, how) { if (how === "hide") g.__layout = panelLayout("changes"); else await click(v, "view-tasks"); await settle(); }
+async function backToCosts(v, how) {
+  if (how === "hide") { g.__layout = panelLayout("project-agent"); await fire(1000); await settle(); }
+  else { await click(v, "view-costs"); await settle(); }
+}
+const costsSeen = () => ({ reads: costsReads().length, ls: costsLs().length, execs: costsExecs().map(([, a]) => a.slice(0, 2).join(" ")) });
+async function runLeft(what, how, secs) {
+  let release; const held = new Promise((r) => { release = r; });
+  // Reconstruct is offered while there is no summary; it writes one (so a read after it would chain the compare).
+  const done = () => held.then(() => { if (what === "reconstruct") costsFiles(costsSummary(), { machine: M }); return { code: 0, stdout: "", stderr: "" }; });
+  g.__layout = panelLayout("project-agent");
+  const { v } = await costsWorld({ machine: M, summary: what === "reconstruct" ? null : costsSummary(), tool: { [what]: done } });
+  const button = what === "collect" ? "costs-refresh" : "costs-reconstruct";
+  await click(v, button); await settle();
+  await leaveCosts(v, how);
+  const left = costsSeen(), readAt = Math.max(...costsReads().map((x) => x.at));
+  for (let s = 1; s <= secs; s++) { advance(1000); v.reload(cx); look(v); await settle(); }
+  release(); await settle(); await settle();
+  for (let s = 1; s <= 2; s++) { advance(1000); v.reload(cx); look(v); await settle(); }
+  const after = costsSeen();
+  check(JSON.stringify(after) === JSON.stringify(left), `${what}, ${how}, ${secs} s: nothing read or run after it ends while the view is left (${JSON.stringify(left)} -> ${JSON.stringify(after)})`);
+  check(costsExecs("billed compare").length === left.execs.filter((x) => x === "billed compare").length, `${what}, ${how}, ${secs} s: no billed compare while left`);
+  const n = costsReads().length, at = g.__now;
+  await backToCosts(v, how);
+  check(costsReads().length === n + 1 && costsReads().at(-1).at === g.__now, `${what}, ${how}, ${secs} s: shown again, the summary is read at once (reads ${n} -> ${costsReads().length}; ${Math.round((at - readAt) / 1000)} s after the last read)`);
+  check(!g.__costsUnexpected.length, `no unanswered pa-costs call (got ${JSON.stringify(g.__costsUnexpected)})`);
+}
+
+cases["P-costs-run-hidden"] = async () => { // MF-1: Refresh/Reconstruct ends after the panel was hidden: no read, ls or exec until shown; then a read at once
+  for (const what of ["collect", "reconstruct"]) for (const secs of [3, 70]) await runLeft(what, "hide", secs);
+};
+
+cases["P-costs-run-othertab"] = async () => { // MF-1: the same with the Tasks tab chosen instead of the panel hidden
+  for (const what of ["collect", "reconstruct"]) for (const secs of [3, 70]) await runLeft(what, "tasks", secs);
+};
+
+cases["P-costs-read-hidden"] = async () => { // MF-1: a summary read in flight when the view is left ends and starts no billed compare
+  for (const how of ["hide", "tasks"]) {
+    g.__layout = panelLayout("project-agent");
+    const { v } = await costsWorld({ machine: M, open: false });
+    g.__remoteDelay = 5000;
+    await click(v, "view-costs"); await settle();
+    check(costsReads().length === 1 && costsExecs().length === 0, `${how}: the read is in flight (reads ${costsReads().length}, execs ${JSON.stringify(costsExecs())})`);
+    await leaveCosts(v, how);
+    for (let s = 1; s <= 8; s++) { advance(1000); await settle(); }
+    await settle();
+    check(costsExecs().length === 0, `${how}: the read ended while the view was left and ran nothing (got ${JSON.stringify(costsExecs().map(([, a]) => a.slice(0, 3)))})`);
+    g.__remoteDelay = 0;
+  }
+};
+
 cases["P-costs-currency-fallback"] = async () => { // K6: a currency code Intl does not take: "12.50 CODE"
   const s = costsSummary({ prices: { profile: "test", source: "test table", asOf: "2027-01-01", currency: "XTSX", missing: [] } });
   const { v } = await costsWorld({ summary: s });
