@@ -118,7 +118,9 @@ export class PushCards {
         const out = printed(r);
         if (r.code === 0) {
           st.result = { label, ...(out ?? {}) };
-          notice = label === PUSH ? `decision ${entry.id} answered Push; result: ${out?.message || resultLine(out?.result) || "pushed"}` : `decision ${entry.id} answered Not now`;
+          let what = String(out?.message || resultLine(out?.result) || "pushed");
+          if (what.startsWith(`${entry.id}: `)) what = what.slice(entry.id.length + 2); // the tool's message starts with the card id
+          notice = label === PUSH ? `decision ${entry.id} answered Push; result: ${what}` : `decision ${entry.id} answered Not now`;
         } else {
           st.error = text(out?.refusal?.message || out?.message) || said(r) || `pa-push-main run exited with ${r.code}`;
           st.check = null;
@@ -169,7 +171,10 @@ export class PushCards {
     // State: what this copy did last, then the check's verdict.
     if (st?.result) {
       const r = st.result.result;
-      box.child(line(st.result.label === PUSH ? `Pushed ${text(r?.url ?? f.url)} ${text(r?.branch ?? f.branch)} ${short(r?.from)}..${short(r?.to)} at ${clock(r?.at, false)}` : "Answered Not now: nothing was pushed.", t.done));
+      const where = `${text(r?.url ?? f.url)} ${text(r?.branch ?? f.branch)}`;
+      box.child(line(st.result.label !== PUSH ? "Answered Not now: nothing was pushed."
+        : r?.how && r.how !== "pushed" ? `Already on the remote: ${where} is at ${short(r?.to)} (recorded at ${clock(r?.at, false)})`
+        : `Pushed ${where} ${short(r?.from)}..${short(r?.to)} at ${clock(r?.at, false)}`, t.done));
       const out = Array.isArray(r?.output) ? r.output : text(r?.output).split("\n").filter(Boolean);
       for (const o of out.slice(-15)) box.child(div().pl(12).text_size(11).text_color(t.dim).child(text(o)));
     }
