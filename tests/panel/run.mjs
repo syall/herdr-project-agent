@@ -2664,6 +2664,112 @@ cases["P-costs-read-hidden"] = async () => { // MF-1: a summary read in flight w
   }
 };
 
+// ---- t-009 round 3 (MF-2): every step after an await asks again whether the view is shown ----
+const hold = () => { let release; const p = new Promise((r) => { release = r; }); return { p, release }; };
+// Reloads while the view is left (so the hidden copy is asleep), as the panel's timers would.
+async function whileLeft(v, secs) { for (let s = 1; s <= secs; s++) { advance(1000); v.reload(cx); look(v); await settle(); } }
+// A remote space whose first compare finds billed rows; `held` holds the first compare or the remote report.
+async function chainLeft(held, how) {
+  g.__layout = panelLayout("project-agent");
+  const h = hold(); let first = true;
+  const { v } = await costsWorld({ machine: M, open: false, tool: {
+    "billed compare": (args) => {
+      if (args.includes("--here-json")) return json0(withRows());
+      if (held === "compare" && first) { first = false; return h.p.then(() => json0({ ...noRows(statusOn()), rows: 4 })); }
+      return json0({ ...noRows(statusOn()), rows: 4 });
+    },
+    report: () => { const r = json0({ v: 1, account: "acct1", spaces: [S], byDayModel: [] }); if (held === "report" && first) { first = false; return h.p.then(() => r); } return r; } } });
+  await click(v, "view-costs"); await settle();
+  const inFlight = held === "compare" ? costsExecs("billed compare").length === 1 && costsExecs("report").length === 0 : costsExecs("report").length === 1 && costsExecs("billed compare").length === 1;
+  check(inFlight, `${held}, ${how}: the ${held} is in flight (got ${JSON.stringify(costsSeen())})`);
+  await leaveCosts(v, how);
+  const left = costsSeen();
+  await whileLeft(v, 2);
+  h.release(); await settle(); await settle();
+  await whileLeft(v, 3);
+  const after = costsSeen();
+  check(JSON.stringify(after) === JSON.stringify(left), `${held}, ${how}: no remote report or second compare after the ${held} ends while the view is left (${JSON.stringify(left)} -> ${JSON.stringify(after)})`);
+  const reads = costsReads().length, reps = costsExecs("report").length, here = costsExecs("billed compare").filter(([, a]) => a.includes("--here-json")).length;
+  await backToCosts(v, how); await settle(); await settle();
+  check(costsReads().length === reads + 1 && costsReads().at(-1).at === g.__now, `${held}, ${how}: shown again, the summary is read at once (reads ${reads} -> ${costsReads().length})`);
+  const here2 = costsExecs("billed compare").filter(([, a]) => a.includes("--here-json")).length;
+  check(costsExecs("report").length === reps + 1 && here2 === here + 1, `${held}, ${how}: then the full chain runs (reports ${reps} -> ${costsExecs("report").length}, --here-json compares ${here} -> ${here2})`);
+  check(/Billed \(account-wide/.test(costsView(v).text), `${held}, ${how}: the comparison is shown (got ${costsView(v).text.slice(-300)})`);
+  check(!g.__costsUnexpected.length, `no unanswered pa-costs call (got ${JSON.stringify(g.__costsUnexpected)})`);
+}
+
+cases["P-costs-chain-left"] = async () => { // MF-2 (a), A6: the first compare of a remote space ends after the view was left
+  for (const how of ["hide", "tasks"]) await chainLeft("compare", how);
+};
+
+cases["P-costs-chain-report-left"] = async () => { // MF-2 (a), A7: the remote report ends after the view was left: no second compare
+  for (const how of ["hide", "tasks"]) await chainLeft("report", how);
+};
+
+cases["P-costs-ls-left"] = async () => { // MF-2 (b), B1: no summary on a slow remote; the read ends after the view was left: no ls
+  for (const how of ["hide", "tasks"]) {
+    g.__layout = panelLayout("project-agent");
+    const { v } = await costsWorld({ machine: M, summary: null, open: false });
+    g.__remoteDelay = 3000;
+    await click(v, "view-costs"); await settle();
+    check(costsReads().length === 1 && costsLs().length === 0, `${how}: the read is in flight (reads ${costsReads().length}, ls ${costsLs().length})`);
+    await leaveCosts(v, how);
+    const left = costsSeen();
+    for (let s = 1; s <= 8; s++) { advance(1000); await settle(); }
+    await settle();
+    check(costsLs().length === 0 && JSON.stringify(costsSeen()) === JSON.stringify(left), `${how}: the null read ended while the view was left: no ls (${JSON.stringify(left)} -> ${JSON.stringify(costsSeen())})`);
+    g.__remoteDelay = 0;
+    await whileLeft(v, 1);
+    const reads = costsReads().length;
+    await backToCosts(v, how); await settle(); await settle();
+    check(costsReads().length === reads + 1 && costsLs().length === 1, `${how}: shown again, read and ls at once (reads ${reads} -> ${costsReads().length}, ls ${costsLs().length})`);
+    check(costsView(v).text.includes("No cost records yet"), `${how}: the empty state is drawn (got ${costsView(v).text.slice(0, 300)})`);
+  }
+};
+
+cases["P-costs-run-otherspace"] = async () => { // RL-V5 N11: Refresh on A ends while space B is active: no read of A; A active again: read at once
+  g.__layout = panelLayout("project-agent");
+  const h = hold();
+  const { v } = await costsWorld({ machine: M, tool: { collect: () => h.p.then(() => ({ code: 0, stdout: "", stderr: "" })) } });
+  await click(v, "costs-refresh"); await settle();
+  g.__spaces.push({ id: "sp2", name: "other", machine: null, folder: "/other", active: false, tabs: [{ id: "tbx", index: 1, name: "1", named: false }] });
+  show("sp2");
+  const aReads = () => costsReads().filter((x) => x.on === M).length, before = aReads(), cmp = costsExecs("billed compare").length;
+  h.release(); await settle(); await settle();
+  check(aReads() === before && costsExecs("billed compare").length === cmp, `no read or compare of A after its run ends while B is active (reads ${before} -> ${aReads()})`);
+  show(RS); v.reload(cx); await settle();
+  check(aReads() === before + 1, `A active again: read at once (reads ${before} -> ${aReads()})`);
+};
+
+cases["P-costs-stale-once"] = async () => { // RL-V5 N4: a stale space is reread once when shown, then at most once per COSTS_EVERY
+  g.__layout = panelLayout("project-agent");
+  const h = hold();
+  const { v } = await costsWorld({ tool: { collect: () => h.p.then(() => ({ code: 0, stdout: "", stderr: "" })) } });
+  await click(v, "costs-refresh"); await settle();
+  await leaveCosts(v, "hide"); await whileLeft(v, 1);
+  h.release(); await settle(); await settle();
+  const n = costsReads().length;
+  await backToCosts(v, "hide");
+  const n1 = costsReads().length;
+  await whileLeft(v, 8); // shown now: the same reloads, inside COSTS_EVERY of that read
+  check(n1 === n + 1 && costsReads().length === n1, `one reread when shown, then none inside COSTS_EVERY (${n} -> ${n1} -> ${costsReads().length})`);
+};
+
+cases["P-costs-turnoff-left"] = async () => { // RL-V5 N7: Turn off ends while Tasks is chosen: nothing while left; the Costs click compares at once
+  g.__layout = panelLayout("project-agent");
+  const h = hold(); let off = false;
+  const { v } = await costsWorld({ tool: { "billed compare": () => json0(off ? noRows() : noRows(statusOn())), "billed disable": () => h.p.then(() => { off = true; return { code: 0, stdout: "off", stderr: "" }; }) } });
+  await click(v, "costs-billing-off"); await settle();
+  await leaveCosts(v, "tasks");
+  const left = costsSeen();
+  h.release(); await settle(); await settle();
+  await whileLeft(v, 3);
+  check(JSON.stringify(costsSeen()) === JSON.stringify(left), `nothing while left (${JSON.stringify(left)} -> ${JSON.stringify(costsSeen())})`);
+  const n = costsExecs("billed compare").length;
+  await backToCosts(v, "tasks");
+  check(costsExecs("billed compare").length === n + 1 && costsView(v).text.includes("The billing query is off"), `Costs chosen again: the status compare at once (compares ${n} -> ${costsExecs("billed compare").length})`);
+};
+
 cases["P-costs-currency-fallback"] = async () => { // K6: a currency code Intl does not take: "12.50 CODE"
   const s = costsSummary({ prices: { profile: "test", source: "test table", asOf: "2027-01-01", currency: "XTSX", missing: [] } });
   const { v } = await costsWorld({ summary: s });

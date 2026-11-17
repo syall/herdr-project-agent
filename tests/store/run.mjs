@@ -397,6 +397,22 @@ cases["S-costs-invalid"] = async () => { // §5.5: not JSON is an error, never "
   const r2 = await store.loadCosts(remote, cx);
   check(r2.summary === null && /not a summary/.test(r2.error ?? ""), `not an object: an error (got ${JSON.stringify(r2)})`);
 };
+cases["S-costs-live"] = async () => { // MF-2 (b): the view left while the summary read was in flight: no ls of costs/
+  for (const space of [remote, local]) {
+    world();
+    const r = await store.loadCosts(space, cx, () => false);
+    check(r.summary === null && r.left === true && r.missing === null && !r.error && !r.timedOut, `${space.machine ?? "local"}: left, nothing known (got ${JSON.stringify(r)})`);
+    check(!g.__execs.some(([c]) => c === "ls"), `${space.machine ?? "local"}: no ls when the check fails (got ${JSON.stringify(g.__execs)})`);
+    world();
+    let asked = 0;
+    const r2 = await store.loadCosts(space, cx, () => { asked++; return true; });
+    check(r2.missing === "none" && !r2.left && asked === 1 && g.__execs.filter(([c]) => c === "ls").length === 1, `${space.machine ?? "local"}: shown: asked once, then the ls (got ${JSON.stringify(r2)}, asked ${asked})`);
+    world();
+    g.__files[keyOf(space, "/costs/summary.json")] = SUMMARY;
+    const r3 = await store.loadCosts(space, cx, () => false);
+    check(r3.summary?.totals?.money === 1.5 && !r3.left, `${space.machine ?? "local"}: a summary read is returned as read (got ${JSON.stringify(r3)})`);
+  }
+};
 cases["S-costs-timeout"] = async () => { // D3: a hung read is given up after READ_LIMIT, timedOut, and no ls
   world();
   g.__hang = [keyOf(remote, "/costs/summary.json")];
