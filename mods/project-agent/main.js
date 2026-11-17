@@ -7,7 +7,7 @@
 import { View, div } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, ScrollHandle } from "gpui-base";
 import { spaces, panes, agents, terminals, machines, theme, run, exec, props, home, watchFolder, notify, shared, setShared, closeOverlay, openOverlay, window, layout } from "herdr";
-import { loadSpace, loadLedger, loadDecisions, loadRules, withTimeout, TIMED_OUT, READ_LIMIT, answerDecision, notifyOrchestrator, changeRules, touched, localId, paHome, stateDir, taskActions, taskLinks, evidenceTasks, cardEvidence, staleInstructions, liveTarget, lookAlike, OPEN_REQUESTS, keeperJudging, startingLabels } from "./store.js";
+import { loadSpace, loadLedger, loadProfile, loadDecisions, loadRules, withTimeout, TIMED_OUT, READ_LIMIT, answerDecision, notifyOrchestrator, changeRules, touched, localId, paHome, stateDir, taskActions, taskLinks, evidenceTasks, cardEvidence, staleInstructions, liveTarget, lookAlike, OPEN_REQUESTS, keeperJudging, startingLabels } from "./store.js";
 import { RulesPane } from "./rules.js";
 import { SetupPane } from "./setup.js";
 import { Keeper, idleShell } from "./keeper.js";
@@ -23,6 +23,7 @@ const LOAD_LIMIT = READ_LIMIT + 1000; // a load with no read settled or timed ou
 const CACHE_MAX = 8; // spaces whose last load is kept (in memory), the least recently shown dropped first
 const CACHE_OLD = 60000; // a kept load older than this says "updating…" while its refresh runs
 const COUNT_EVERY = 10000; // while hidden: at most one card read and one ledger read per space this often
+const PROFILE_RETRY = 60000; // while hidden: a profile read that failed is tried again no sooner than this
 
 // Whether this panel is on screen: a block showing it in the shown layout with no hidden node above
 // it, and the selected child of each stack above it (how the tabs mod reads the side panel; the
@@ -69,6 +70,7 @@ export default class ProjectAgent extends View {
     this.seq = 0;
     this.hidden = {}; // space id -> { at, busy, seq }: the hidden panel's last count and ledger read
     this.hiddenDone = {}; // space id -> the seq of its last hidden read that wrote; an older one writes nothing
+    this.profiles = {}; // space id -> { at, busy, done, profile }: its profile, read once per session (a full load's counts)
     this.asleep = false; // not on screen: only the open-card count is read
     this.view = null; // "decisions" | "tasks" | "rules"; null: decisions when any is open
     this.rules = new RulesPane();
@@ -144,9 +146,11 @@ export default class ProjectAgent extends View {
   // While hidden: the open-card count on the panel's button (shared "project-agent.open") from one
   // card read, and the ledger, read together, per space at most every 10 s (d-039). From the ledger
   // the shared keys other views use are refreshed (share(): the worktrees, the workers, the Files
-  // shortcuts with the evidence of the last full load); not the main branches unless a full load of
-  // the space is kept. A failed read changes nothing; one that ends after a newer one wrote, nothing.
+  // shortcuts with the evidence of the last full load), and the main branches from the kept load's
+  // profile; with none kept, the profile is read once per session (readProfile). A failed read
+  // changes nothing; one that ends after a newer one wrote, nothing.
   hiddenRead(cx, space) {
+    if (!this.cache.get(space.id)?.data?.agent) this.readProfile(cx, space);
     const h = this.hidden[space.id], now = Date.now();
     if (h && (now - h.at < COUNT_EVERY || (h.busy && now - h.at < LOAD_LIMIT))) return;
     const mine = { at: now, busy: true, seq: ++this.seq };
@@ -168,6 +172,22 @@ export default class ProjectAgent extends View {
         const known = this.cache.get(space.id)?.data ?? (this.space === space.id ? this.data : null);
         this.share(space, { ledger: ledger.value, evidence: known?.evidence, profile: known?.profile }, { mains: Boolean(known?.agent) });
       }
+    });
+  }
+
+  // While hidden with no kept load: the space's profile, for "project-agent.mainBranches". Read once
+  // per session once it has answered; a failed or timed-out read is tried again after PROFILE_RETRY.
+  readProfile(cx, space) {
+    const p = this.profiles[space.id] ??= {}, now = Date.now();
+    if (p.done || p.busy || (p.at && now - p.at < PROFILE_RETRY)) return;
+    p.at = now; p.busy = true;
+    cx.spawn(async (cx) => {
+      let r = { answered: false };
+      try { r = await loadProfile(space, props()?.profile, cx); } catch {}
+      p.busy = false;
+      if (!r.answered || p.done) return;
+      p.done = true; p.profile = r.profile;
+      if (this.asleep && r.profile !== undefined && !this.cache.get(space.id)?.data?.agent) this.shareMains(space, r.profile);
     });
   }
 
@@ -240,6 +260,7 @@ export default class ProjectAgent extends View {
         this.data = data; this.cards = cards; this.space = space.id; this.cardsFor = space.id; this.dataAt = timedOut ? kept.at : Date.now();
         if (rules) this.rules.data = rules;
         if (!timedOut) { this.committed[space.id] = token; this.keep(space.id, { data, cards, rules: rules ?? this.rules.data, at: this.dataAt }); }
+        if (!timedOut && data.agent) this.profiles[space.id] = { done: true, profile: data.profile ?? null }; // read once per session
         // One note field per open card, made here (never in render) and dropped with its card.
         const open = new Set(cards.filter((c) => c.card?.status === "open").map((c) => c.id));
         for (const id of Object.keys(this.notes)) if (!open.has(id)) { this.notes[id].release?.(); delete this.notes[id]; }
@@ -255,6 +276,12 @@ export default class ProjectAgent extends View {
   // tasks' worktrees, the Files shortcuts, the profile's main branches (writeMains), its workers,
   // and the open-card count (open; null leaves it). From a full load of the shown space, or from the
   // ledger alone while hidden (hiddenRead).
+  shareMains(space, profile) {
+    const mains = Array.isArray(profile?.mainBranches) ? profile.mainBranches : [];
+    const allMains = { ...(shared("project-agent.mainBranches") ?? {}) };
+    if (JSON.stringify(allMains[space.id] ?? []) !== JSON.stringify(mains)) { if (mains.length) allMains[space.id] = mains; else delete allMains[space.id]; setShared("project-agent.mainBranches", allMains); }
+  }
+
   share(space, data, { open = null, mains: writeMains = true } = {}) {
     // Tell other mods (a Changes view, say) which worktrees this space's tasks use.
     const trees = (data.ledger?.tasks ?? []).filter((x) => x.worktree && x.id).map((x) => ({ task: x.id, path: String(x.worktree), title: String(x.title ?? "") }));
@@ -276,11 +303,7 @@ export default class ProjectAgent extends View {
     const allSpots = { ...(shared("my-files.places") ?? {}) };
     if (JSON.stringify(allSpots[space.id] ?? []) !== JSON.stringify(spots)) { if (spots.length) allSpots[space.id] = spots; else delete allSpots[space.id]; setShared("my-files.places", allSpots); }
     // The profile's main-branch names, for views that compare a branch with its base.
-    if (writeMains) {
-      const mains = Array.isArray(data.profile?.mainBranches) ? data.profile.mainBranches : [];
-      const allMains = { ...(shared("project-agent.mainBranches") ?? {}) };
-      if (JSON.stringify(allMains[space.id] ?? []) !== JSON.stringify(mains)) { if (mains.length) allMains[space.id] = mains; else delete allMains[space.id]; setShared("project-agent.mainBranches", allMains); }
-    }
+    if (writeMains) this.shareMains(space, data.profile);
     // And which task each worker belongs to (an Agents view can link a worker back to its task).
     const crew = {};
     for (const x of data.ledger?.tasks ?? []) for (const w of x.workers ?? []) if (w.address) crew[space.machine ? `${space.machine}/${w.address}` : w.address] = { task: x.id, title: String(x.title ?? ""), role: w.role ?? null, state: x.state ?? null };

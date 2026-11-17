@@ -82,6 +82,22 @@ async function readJson(path, on, cx) {
 // The space's ledger alone ({ value, text, error, timedOut? }), for the hidden panel's refresh.
 export const loadLedger = (space, cx) => readJson(`${stateDir(space)}/ledger.json`, space.machine, cx);
 
+// The space's profile alone, for the hidden panel's main branches: agent.json, then config.json when
+// neither it nor `profileProp` names one, then the profile. { answered, profile }: answered is false when
+// a read failed, timed out or was not valid JSON (try again later); no agent.json: answered, profile
+// undefined (nothing to write); a missing profile file: profile null.
+export async function loadProfile(space, profileProp, cx) {
+  const on = space.machine, root = paHome(on), bad = (r) => r.timedOut || r.error;
+  const agent = await readJson(`${stateDir(space)}/agent.json`, on, cx);
+  if (bad(agent)) return { answered: false };
+  if (!agent.value) return { answered: true, profile: undefined };
+  let name = agent.value.profile || profileProp;
+  if (!name) { const config = await readJson(`${root}/config.json`, on, cx); if (bad(config)) return { answered: false }; name = config.value?.defaultProfile; }
+  if (!name) return { answered: true, profile: null };
+  const profile = await readJson(`${root}/profiles/${name}/profile.json`, on, cx);
+  return bad(profile) ? { answered: false } : { answered: true, profile: profile.value };
+}
+
 // { agent, ledger, profile, errors } for a space; agent is null when it has no Project Agent
 // (timedOut: agent.json did not answer). With `cx`, each read gives up after READ_LIMIT. After
 // agent.json, the other reads run at the same time; the error lines keep their order.
