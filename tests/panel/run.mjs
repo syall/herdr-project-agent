@@ -2778,6 +2778,147 @@ cases["P-costs-currency-fallback"] = async () => { // K6: a currency code Intl d
   check(costsView(v).text.includes("12.50 XTSX est."), `the fallback (got ${costsView(v).text.slice(0, 800)})`);
 };
 
+// ---- t-029 Job 2 (R7): Claude Code's own figure (CC) beside est.; only where the summary carries totals.cc ----
+// The summary's CC fields as Job 1's summarize writes them: totals.cc, sessions[].cc/ccAt, byTask[].cc/ccSessions/ccOf.
+function ccSummary(base = costsSummary(), cc = {}) {
+  const s = JSON.parse(JSON.stringify(base));
+  s.totals.cc = { money: 9.4, sessions: 2, claudeSessions: 3, allSessions: 3, unmatched: { sessions: 0, money: null }, ccCurrency: "USD", ...cc };
+  if (s.totals.cc.money !== null) {
+    Object.assign(s.sessions[0], { cc: 7.8, ccAt: "2027-01-14T10:00:00Z" });
+    Object.assign(s.sessions[2], { cc: 1.6, ccAt: isoAt(T0 - 3600000) });
+    Object.assign(s.byTask[2], { cc: 1.6, ccSessions: 1, ccOf: 1 });
+  }
+  return s;
+}
+// The no-price shapes of P-costs-noprice: no price table (none), or a table without these models (missing).
+function noPriceSummary(shape) {
+  const s = costsSummary({ prices: shape === "none" ? { profile: "test", source: null, asOf: null, currency: null, missing: ["model-a"] } : { profile: "test", source: "test table", asOf: "2027-01-01", currency: CUR, missing: ["model-a"] } });
+  s.totals = { ...s.totals, money: null, reconstructedMoney: null, unpricedTokens: 1000 };
+  for (const e of [...s.byActivity, ...s.byTask, ...s.byDay, ...s.sessions, ...s.byKind.machine, ...s.byKind.kind]) e.money = null;
+  for (const e of s.byActivity) for (const x of [...(e.tasks ?? []), ...(e.reasons ?? [])]) x.money = null;
+  s.hours = [[isoAt(T0).slice(0, 13), { tokens: 100, money: null }]]; s.passes[0].money = null;
+  for (const d of s.byDay) d.byActivity = {};
+  return s;
+}
+const segsOf = (v) => costsView(v).text.split(" | ");
+// Every segment with an amount says what it is: est., billed, a fee, a factor, or Claude Code's (CC) figure.
+const ccLabelled = (v) => segsOf(v).filter((x) => /\d\.\d\d\b|<0\.01/.test(x) && !/est\.|billed|fee|factor|ratio|\bCC \d|Claude Code: \d[\d.]* USD \(list price\)|USD list price/.test(x));
+const LEGEND = "CC = Claude Code's own list-price estimate (USD), per session; not the bill";
+const COVER = "Claude Code's figure covers sessions started from 2027-01-14; older, Codex and killed-at-the-end sessions have none or a partial one.";
+
+cases["P-costs-cc-priced"] = async () => { // AC7.1, AC7.2, Q2: est. first; the CC line in the Total tile; CC on session lines and task rows; the legend
+  const { v } = await costsWorld({ summary: ccSummary() });
+  let segs = segsOf(v);
+  const total = segs.indexOf("Total");
+  check(total >= 0 && /^XTS\s12\.50 est\.$/.test(segs[total + 1]) && segs[total + 2] === "1k tokens · 94% cache read" && segs[total + 3] === "Claude Code: 9.40 USD (list price) · 2 of 3 Claude sessions",
+    `the Total tile: est., its tokens, then Claude Code's line (got ${JSON.stringify(segs.slice(total, total + 5))})`);
+  check(segs.includes(LEGEND), `the legend (got ${segs.join(" | ").slice(0, 2500)})`);
+  check(segs.includes("CC 1.60 (1 of 1 session)") && segs.filter((x) => /^CC /.test(x)).length === 1, `a CC cell on the (no task) row only (t-1 is split; got ${JSON.stringify(segs.filter((x) => /CC/.test(x)))})`);
+  const noTask = segs.indexOf("(no task)");
+  check(/^XTS\s1\.00 est\. · 8%$/.test(segs[noTask + 2]) && segs[noTask + 3] === "CC 1.60 (1 of 1 session)", `est. then CC on the row (got ${JSON.stringify(segs.slice(noTask, noTask + 4))})`);
+  await click(v, "costs-task-0"); await settle();
+  segs = segsOf(v);
+  check(segs.some((x) => /^◌ aaaa1111 · .* · XTS\s7\.50 est\. · CC 7\.80 · closed · reconstructed$/.test(x)), `a session line with CC after est. (got ${JSON.stringify(segs.filter((x) => /aaaa|bbbb/.test(x)))})`);
+  check(segs.some((x) => /^bbbb2222 · .* · XTS\s4\.00 est\. · gone · recorded$/.test(x)), `a session without a figure: no CC, no "CC —" (got ${JSON.stringify(segs.filter((x) => /bbbb/.test(x)))})`);
+  await click(v, "costs-dim-kind"); await click(v, "costs-kind-1"); await settle();
+  check(segsOf(v).some((x) => /^cccc3333 · .* · XTS\s1\.00 est\. · CC 1\.60 · open · recorded$/.test(x)), "the session-type drill too");
+  check(ccLabelled(v).length === 0, `every amount labelled (unlabelled: ${JSON.stringify(ccLabelled(v))})`);
+  check(/Costs · [^|]*12\.50 est\. \|/.test(look(v).text), "the tab still shows est.");
+  check(!segsOf(v).some((x) => /17\.20|21\.90|13\.90/.test(x)), "CC is never added to est. (12.50 + 9.40, 7.50 + 7.80, …)");
+};
+
+cases["P-costs-cc-noprice"] = async () => { // AC7.1, answer 2: no est. -> the Total tile's money is Claude Code's, never "est."; no price is never 0.00
+  for (const shape of ["none", "missing"]) {
+    const { v } = await costsWorld({ summary: ccSummary(noPriceSummary(shape)) });
+    await click(v, "costs-task-0"); await settle();
+    const segs = segsOf(v), total = segs.indexOf("Total");
+    check(segs[total + 1] === "Claude Code: 9.40 USD (list price)" && segs[total + 2] === "1k tokens · 94% cache read" && segs[total + 3] === "Claude Code's figure: 2 of 3 Claude sessions",
+      `${shape}: the tile's money is Claude Code's (got ${JSON.stringify(segs.slice(total, total + 5))})`);
+    check(!segs.some((x) => /\d\.\d\d/.test(x) && !/Claude Code|\bCC \d/.test(x)), `${shape}: no amount but Claude Code's (got ${JSON.stringify(segs.filter((x) => /\d\.\d\d/.test(x)))})`);
+    check(!segs.some((x) => /\b0\.00\b/.test(x)), `${shape}: nothing reads 0.00`);
+    check(segs.some((x) => /^◌ aaaa1111 · .* · — est\. · CC 7\.80 · closed/.test(x)), `${shape}: a session line (got ${JSON.stringify(segs.filter((x) => /aaaa/.test(x)))})`);
+    check(segs.includes(LEGEND) && ccLabelled(v).length === 0, `${shape}: legend, labelled (${JSON.stringify(ccLabelled(v))})`);
+    if (shape === "none") check(look(v).text.includes("Costs · 1k tokens · no price"), "the tab is today's");
+  }
+};
+
+cases["P-costs-cc-nofigure"] = async () => { // AC7.1: records but no figure joined yet: "no figure", never 0.00; no CC on rows
+  for (const base of [costsSummary(), noPriceSummary("none")]) {
+    const { v } = await costsWorld({ summary: ccSummary(base, { money: null, sessions: 0 }) });
+    const segs = segsOf(v), total = segs.indexOf("Total");
+    const figure = base.totals.money === null ? "1k tokens" : null;
+    check((figure ? segs[total + 1] === figure : /^XTS\s12\.50 est\.$/.test(segs[total + 1])) && segs[total + 3] === "Claude Code: no figure · 0 of 3 Claude sessions",
+      `the tile (got ${JSON.stringify(segs.slice(total, total + 5))})`);
+    check(!segs.some((x) => /\bCC \d|0\.00 USD/.test(x)), `no CC amount anywhere (got ${JSON.stringify(segs.filter((x) => /CC|USD/.test(x)))})`);
+    check(segs.includes("Claude Code's figure covers none of these sessions yet; older, Codex and killed-at-the-end sessions have none or a partial one."), `the coverage note (got ${segs.join(" | ").slice(0, 2500)})`);
+  }
+};
+
+cases["P-costs-cc-coverage"] = async () => { // AC7.3: the note only when fewer sessions have the figure than Claude sessions; from the first ccAt day
+  let { v } = await costsWorld({ summary: ccSummary() });
+  check(segsOf(v).includes(COVER), `the note (got ${segsOf(v).join(" | ").slice(0, 2500)})`);
+  ({ v } = await costsWorld({ summary: ccSummary(costsSummary(), { sessions: 3 }) }));
+  check(!segsOf(v).some((x) => /covers/.test(x)), `complete: no note (got ${JSON.stringify(segsOf(v).filter((x) => /covers/.test(x)))})`);
+  check(segsOf(v).includes("Claude Code: 9.40 USD (list price) · 3 of 3 Claude sessions"), "the count");
+};
+
+cases["P-costs-cc-unmatched"] = async () => { // AC7.4: unmatched figures: one dim line with count and sum; none at 0
+  let { v } = await costsWorld({ summary: ccSummary(costsSummary(), { unmatched: { sessions: 2, money: 3.1 } }) });
+  check(segsOf(v).includes("Claude Code figures matching no session (not in the totals): 2, 3.10 USD list price"), `the line (got ${segsOf(v).join(" | ").slice(0, 2500)})`);
+  check(segsOf(v).includes("Claude Code: 9.40 USD (list price) · 2 of 3 Claude sessions"), "not added to the total");
+  ({ v } = await costsWorld({ summary: ccSummary() }));
+  check(!segsOf(v).some((x) => /matching no session/.test(x)), "none: no line");
+};
+
+cases["P-costs-cc-absent"] = async () => { // AC7.5: without totals.cc nothing changes, even with stray cc fields on rows
+  const plain = await costsWorld();
+  await click(plain.v, "costs-task-2"); await settle();
+  const want = costsView(plain.v).text;
+  clipReset(); await press(plain.v, "costs-copy-totals"); const wantCopy = lastClip();
+  clipReset(); await press(plain.v, "costs-copy-task"); const wantTask = lastClip();
+  const s = costsSummary();
+  Object.assign(s.sessions[2], { cc: 1.6, ccAt: isoAt(T0) }); Object.assign(s.byTask[2], { cc: 1.6, ccSessions: 1, ccOf: 1 });
+  const { v } = await costsWorld({ summary: s });
+  await click(v, "costs-task-2"); await settle();
+  const got = costsView(v).text;
+  check(got === want, `the same text (got ${got.slice(0, 2500)})`);
+  check(!/Claude Code|\bCC\b/.test(got), "no CC text");
+  clipReset(); await press(v, "costs-copy-totals");
+  check(lastClip() === wantCopy && lastClip().split("\n").length === 4, `the totals Copy is today's (got ${JSON.stringify(lastClip())})`);
+  clipReset(); await press(v, "costs-copy-task");
+  check(lastClip() === wantTask, `the task Copy is today's (got ${JSON.stringify(lastClip())})`);
+};
+
+cases["P-costs-cc-copy"] = async () => { // the Copy of the totals and of the task section carry the CC figures as drawn; new text is selectable; Copy runs nothing
+  const { v } = await costsWorld({ summary: ccSummary(costsSummary(), { unmatched: { sessions: 2, money: 3.1 } }) });
+  await click(v, "costs-task-2"); await settle();
+  const execs = g.__execs.length;
+  clipReset(); await press(v, "costs-copy-totals");
+  let lines = lastClip().split("\n");
+  check(/^Total: XTS\s12\.50 est\. · 1k tokens · 94% cache read$/.test(lines[1]) && lines[2] === "Claude Code: 9.40 USD (list price) · 2 of 3 Claude sessions" && lines[3].startsWith("Today: ") && lines[4].startsWith("Last 7 days (UTC): "),
+    `the tiles with Claude Code's line (got ${JSON.stringify(lines)})`);
+  for (const want of [LEGEND, COVER, "Claude Code figures matching no session (not in the totals): 2, 3.10 USD list price"]) check(lines.includes(want), `"${want}" copied (got ${JSON.stringify(lines)})`);
+  const shown = costsView(v).text;
+  for (const l of lines.slice(2)) if (!/^(Today|Last 7)/.test(l)) check(shown.includes(l), `"${l}" is drawn`);
+  clipReset(); await press(v, "costs-copy-task");
+  lines = lastClip().split("\n");
+  check(lines.some((l) => /^\(no task\) · 100 tokens · XTS\s1\.00 est\. · 8% · CC 1\.60 \(1 of 1 session\)$/.test(l)), `the row with its CC cell (got ${JSON.stringify(lines)})`);
+  check(lines.some((l) => /^  cccc3333 · .* · XTS\s1\.00 est\. · CC 1\.60 · open · recorded$/.test(l)), `the open session line (got ${JSON.stringify(lines)})`);
+  check(g.__execs.length === execs, "Copy runs nothing");
+  const texts = safeViews(v.render(cx), "costs").map((x) => x.text);
+  for (const want of ["Claude Code: 9.40 USD (list price) · 2 of 3 Claude sessions", LEGEND, COVER]) check(texts.includes(want), `"${want}" is selectable (have ${JSON.stringify(texts)})`);
+  check(new Set(safeViews(v.render(cx), "costs").map((x) => x.id)).size === texts.length, "ids unique");
+};
+
+cases["P-costs-cc-hidden"] = async () => { // R11 holds with CC: hidden, nothing is read or run; the CC figures add no read and no exec
+  const { v } = await costsWorld({ summary: ccSummary() });
+  const before = { reads: costsReads().length, execs: costsExecs().length, ls: costsLs().length };
+  check(before.reads === 1 && costsReads().every((x) => /\/costs\/summary\.json$/.test(x.path)), `shown: the summary only (got ${JSON.stringify(costsReads())})`);
+  g.__layout = panelLayout("changes");
+  for (let s = 1; s <= 60; s++) { advance(1000); for (const tm of g.__timers) if (s * 1000 % tm.ms === 0) tm.fn(cx); if (s % 3 === 0) v.reload(cx); look(v); await settle(); }
+  check(costsReads().length === before.reads && costsExecs().length === before.execs && costsLs().length === before.ls, `hidden: nothing (${JSON.stringify(before)} -> ${costsReads().length}, ${costsExecs().length}, ${costsLs().length})`);
+};
+
 // ---- t-009 Costs view (step 10): the timer's collection and the scheduled billing query (R6, R11, R15) ----
 const timerMod = async () => import(path.join(dst, "timer.js"));
 const fetchOk = () => ({ code: 0, stdout: "", stderr: "" });
