@@ -1363,6 +1363,121 @@ cases["P3-filled-not-kept"] = async () => { // filled from what is shown (no kep
   check(k && k.cardsUnknown === true, `kept: the cards unknown (got ${k?.cardsUnknown})`);
 };
 
+// ---- t-011: the task card's Delete can be backed out of ----
+// A press: the mouse-down goes from the element with `id` up to the root, each "left" handler in
+// turn, until one stops it; then that element's click (if it has one). `id` null: a press on the
+// root itself (empty space in the panel).
+function pathTo(root, id) {
+  const walk = (x, trail) => {
+    if (x === null || typeof x !== "object") return null;
+    const here = [...trail, x];
+    if (x.key === id) return here;
+    for (const k of x.kids ?? []) { const f = walk(k, here); if (f) return f; }
+    return null;
+  };
+  return id === null ? [root] : walk(root, []);
+}
+async function press(v, id) {
+  const route = pathTo(v.render(cx), id);
+  check(Boolean(route), `an element ${id} to press`);
+  let stopped = false;
+  const ecx = { ...cx, stop_propagation() { stopped = true; } };
+  for (const el of [...route].reverse()) {
+    const h = el.style?.on_mouse_down;
+    if (h && h[0] === "left") h[1]({}, ecx);
+    if (stopped) break;
+  }
+  const target = route[route.length - 1];
+  if (id !== null && target.click) target.click({}, cx);
+  await flush();
+}
+const ARMED = "Delete the task, its evidence and its cards?";
+const deletes = () => (g.__execs ?? []).filter(([c, a]) => c === "pa-task" && a[0] === "delete");
+async function armWorld() {
+  world();
+  g.__files[`:${DIR}/ledger.json`] = JSON.stringify({ tasks: [
+    { id: "t-1", title: "One", state: "in-progress", updated: "2026-11-16T10:02:00Z" },
+    { id: "t-2", title: "Two", state: "in-progress", updated: "2026-11-16T10:01:00Z" }] });
+  g.__files[`:${DIR}/schedule.json`] = JSON.stringify({ everyMinutes: 15 });
+  const v = await mount();
+  await press(v, "view-tasks");
+  await press(v, "task-head-t-1");
+  return v;
+}
+const armedText = (v) => look(v).text.includes(ARMED);
+
+cases["A1-two-clicks-delete"] = async () => { // V1.1: one click arms (with a Cancel beside it); the second click on it deletes
+  const v = await armWorld();
+  check(/Delete…/.test(look(v).text) && !look(v).clicks["delete-cancel-t-1"], "unarmed: Delete…, no Cancel");
+  await press(v, "delete-t-1");
+  check(armedText(v), `one click arms (got ${look(v).text.slice(-300)})`);
+  check(Boolean(look(v).clicks["delete-cancel-t-1"]), `a Cancel button beside it (have ${Object.keys(look(v).clicks)})`);
+  check(deletes().length === 0, "one click deletes nothing");
+  await press(v, "delete-t-1");
+  check(deletes().length === 1 && deletes()[0][1][1] === "t-1", `the second click deletes t-1 once (got ${JSON.stringify(deletes())})`);
+};
+
+cases["A2-cancel"] = async () => { // V1.2, V1.7: Cancel disarms; one click after that only arms again
+  const v = await armWorld();
+  await press(v, "delete-t-1");
+  await press(v, "delete-cancel-t-1");
+  check(!armedText(v) && /Delete…/.test(look(v).text), "Cancel: back to Delete…");
+  check(!look(v).clicks["delete-cancel-t-1"], "no Cancel once disarmed");
+  await press(v, "delete-t-1");
+  check(armedText(v) && deletes().length === 0, "after a Cancel, one click arms again and deletes nothing");
+};
+
+cases["A3-press-elsewhere"] = async () => { // V1.3: a press anywhere else in the panel disarms
+  const v = await armWorld();
+  await press(v, "delete-t-1");
+  await press(v, null); // empty space in the panel
+  check(!armedText(v), "a press on empty space disarms");
+  await press(v, "delete-t-1");
+  await press(v, "sched-summary"); // another control
+  check(!armedText(v), "a press on another control disarms");
+  await press(v, "delete-t-1");
+  await press(v, "task-head-t-2"); // another task's header (expands it)
+  check(!armedText(v), "a press on another task disarms");
+  check(deletes().length === 0, "nothing deleted");
+};
+
+cases["A4-collapse"] = async () => { // V1.4: collapsing the task disarms; expanding it again shows Delete…
+  const v = await armWorld();
+  await press(v, "delete-t-1");
+  look(v).clicks["task-head-t-1"]({}, cx); await flush(); // the header's click alone (no press on the root)
+  look(v).clicks["task-head-t-1"]({}, cx); await flush();
+  check(!armedText(v), "collapse and expand: not armed");
+};
+
+cases["A5-view-and-space"] = async () => { // V1.5: a view switch or a space switch disarms
+  const v = await armWorld();
+  await click(v, "delete-t-1");
+  await click(v, "view-decisions"); await click(v, "view-tasks"); // the tabs' clicks alone
+  check(!armedText(v), "view switched and back: not armed");
+  await click(v, "delete-t-1");
+  check(armedText(v), "armed again");
+  const S2 = "sp2", D2 = "/home/u/.config/herdr-pa/spaces/sp2";
+  g.__spaces.push({ id: S2, name: "other", machine: null, folder: "/other", active: false, tabs: [{ id: "tb2", index: 1, name: "1", named: false }] });
+  g.__files[`:${D2}/agent.json`] = JSON.stringify({ space: S2, project: "/other", profile: "test", name: "other" });
+  g.__files[`:${D2}/ledger.json`] = JSON.stringify({ tasks: [] });
+  show(S2); v.reload(cx); await settle();
+  show(S); v.reload(cx); await settle();
+  check(look(v).text.includes("t-1"), "back on the first space with its task shown");
+  check(!armedText(v), "space switched and back: not armed");
+  check(deletes().length === 0, "nothing deleted");
+};
+
+cases["A6-times-out"] = async () => { // V1.6: by itself after 10 s; still armed at 9 s
+  const v = await armWorld();
+  await click(v, "delete-t-1");
+  advance(9000); await fire(1000);
+  check(armedText(v), "still armed at 9 s");
+  advance(1500); await fire(1000);
+  check(!armedText(v), "disarmed after 10 s");
+  await click(v, "delete-t-1");
+  check(armedText(v) && deletes().length === 0, "one click after the time-out arms again and deletes nothing");
+};
+
 const pick = process.argv.slice(2);
 let failed = 0;
 for (const [name, fn] of Object.entries(cases)) {
