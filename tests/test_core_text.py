@@ -143,6 +143,15 @@ class Orchestrator(unittest.TestCase):
                       "file the task changed, or follows a rebase with conflicts. The handoff names the base and "
                       "says full or diff.", self.rounds())
 
+    def test_t017_j2fix_m1_decide_from_report(self):  # REVIEW J2 M1, G4 d, e
+        self.assertIn("The handoff names the base and says full or diff. Decide the full cases from the build or "
+                      "fix worker's report (`worker.md`, build role); in round 2 the previous fix's diff is the diff "
+                      "of round 1's build.", self.rounds())
+
+    def test_t017_j2fix_m2_handoff_tier(self):  # REVIEW J2 M2, AC6.2
+        self.assertIn("- The handoff states the task id, goal and tier, the scope (what it may and may not touch),",
+                      self.text)
+
     def test_t017_r4_roles_and_tiers(self):  # AC4.1, AC4.2, AC4.4 (R10), L4, amendment B4
         self.assertIn("- Roles: `design`, `build`, `verifier` (reports, never fixes), `reviewer` (fresh context, "
                       "never the author of what it reviews) and `check` (low tier only: the verifier's and the "
@@ -201,6 +210,16 @@ class Worker(unittest.TestCase):
         self.assertIn("write `VERIFY.md`, and report. Never fix anything. On a diff recheck the handoff names a "
                       "base commit: check the diff from it to HEAD.", self.text)
         self.assertNotIn("On a recheck the handoff", self.text)
+
+    def test_t017_j2fix_m1_build_report(self):  # REVIEW J2 M1, G4 d, e
+        roles = flat(self.raw[self.raw.index("## Roles"):self.raw.index("## Verification")])
+        self.assertIn("and `DECISIONS.md` (each judgement call and why). A build or fix worker's report names the "
+                      "files it touched, any file of which it rewrote more than half, any file outside the plan or "
+                      "the previous round's diff, and whether a rebase conflicted. - **verifier:**", roles)
+
+    def test_t017_j2fix_m2_handoff_tier(self):  # REVIEW J2 M2, AC6.2
+        self.assertIn("Your handoff names the task id, the goal, the tier, your role, the scope, the evidence folder "
+                      "and the address to report to.", self.text)
 
     def test_t017_r4_check_role(self):  # AC4.1, L4
         roles = flat(self.raw[self.raw.index("## Roles"):self.raw.index("## Verification")])
