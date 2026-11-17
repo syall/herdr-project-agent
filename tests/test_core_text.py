@@ -245,7 +245,8 @@ class Sdlc(unittest.TestCase):  # t-017 J1 (R1)
     def test_t017_r4_tier_column(self):
         text = flat(read("runtime", "core", "sdlc.md"))
         self.assertIn("| Tier | Example | Plan approval | Human reviewers before publishing | Agent checks |", text)
-        self.assertIn("still a publish decision card | One `check` worker; rechecks on the diff; round cap 2 |", text)
+        self.assertIn("still a publish decision card | One `check` worker; rechecks on the diff unless Rounds asks "
+                      "for a full check; round cap 2 |", text)  # J2 RL1
         self.assertIn("| One | A verifier and a reviewer; reviews full until one is clean; round cap 3 |", text)
         self.assertIn("| Two | A verifier and two reviewers; the check before the first card that asks to publish "
                       "or merge is full; round cap 4 |", text)
