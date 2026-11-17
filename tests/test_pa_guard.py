@@ -2003,6 +2003,22 @@ class T016J2_Limits(T016J2):
         self.assertIsNone(self.w("touch --reference .git/HEAD build/stamp"))
         self.refused("touch -r build/a .git/x", ".git/x")
 
+    def test_ac5_3_reference_value_and_double_dash(self):  # REVIEW-J2-A M1: only the -r option's value is read
+        for line, target in [("touch -- -r .git/x", ".git/x"), ("touch -r -r .git/x", ".git/x"),
+                             ("truncate -r -r .git/index", ".git/index"),
+                             ("truncate --reference -r .git/config", ".git/config"),
+                             ("truncate -r --reference .git/config", ".git/config"),
+                             ("touch -r -- .git/x", ".git/x"), ("touch -r x -- -r .git/y", ".git/y"),
+                             ("truncate --reference=x -- -r .git/index", ".git/index"),
+                             ("touch --reference=build/a .git/x", ".git/x"), ("touch -r --reference .git/x", ".git/x"),
+                             ("rm -- -r .git/x", ".git/x")]:
+            with self.subTest(line=line):
+                self.refused(line, target)
+        for line in ["touch --reference=.git/HEAD build/stamp", "truncate --reference=.git/index build/x",
+                     "touch -r .git/HEAD -r .git/index build/x", "touch -r .git/HEAD -- build/x"]:
+            with self.subTest(line=line):
+                self.assertIsNone(self.w(line))
+
     def test_ac5_4_command_options(self):
         self.assertEqual(self.w("command -p cd .git && echo x > config"),
                          FOLDER_UNKNOWN.format(word="command -p cd .git", target="config"))
