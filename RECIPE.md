@@ -130,11 +130,14 @@ A new space opens with a 600 x 440 dialog: a Project Agent card (`Set up for <fo
   refreshes. A read that times out, fails or is not valid JSON (the ledger, the profile, the
   schedule, the pass request, the card listing, one card, rules; evidence and stale instructions
   only when they time out) never counts as "none": the panel shows the last value known for the
-  space, with the error, and writes nothing from it: the shared keys that part feeds (worktrees,
-  workers, Files shortcuts, main branches, the open-card count), the kept load's copy of it and any
-  note typed on a card stay as they were, so a newer value a hidden refresh wrote is not rolled
-  back. Only a read that answered (a missing file or an empty decisions folder included) replaces
-  them. Known limits: an evidence or stale-instructions call that fails rather than times out counts
+  space, with the error. Except for one card (below), it writes nothing from it: the shared keys
+  that part feeds (worktrees, workers, Files shortcuts, main branches, the open-card count), the
+  kept load's copy of it and any note typed on a card stay as they were, so a newer value a hidden
+  refresh wrote is not rolled back. Only a read that answered (a missing file or an empty decisions
+  folder included) replaces them. Known limits: when the one-call card read fails, the listing
+  answers and one card's own read does not, that card is shown from its last copy and the open-card
+  count is written with it, so the count can be off (a newer count a hidden refresh wrote can be
+  rolled back) until the next load whose reads answer; an evidence or stale-instructions call that fails rather than times out counts
   as none (the Files view loses the evidence shortcuts until the next answer); a decisions or
   evidence folder that cannot be read (permissions) counts as a missing one, not as unanswered, and
   a file that cannot be read may too (that depends on Herdr's file read). When agent.json does not answer, what is shown stays,
