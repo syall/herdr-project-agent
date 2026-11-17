@@ -2093,8 +2093,8 @@ class FR4_BillingRound4(BillingBase):
         out = [pa_costs.validate_row(dict(r), "query:q1", "acct1", T0) for r in rows]
         self.assertEqual(len(out), len(rows))
         self.assertTrue(any(re.search(r"\d{12}", o["id"]) for o in out))  # the case the review found is in the set
-        review = pa_costs.validate_row(brow(day="2026-01-08", label="usage-a-in", kind="in"), "query:q1", "acct1", T0)
-        self.assertTrue(re.search(r"\d{12}", review["id"]), review["id"])  # REVIEW-3's row: its id holds 12 digits
+        review = pa_costs.validate_row(brow(day="2026-01-08", label="usage-a-in", kind=None), "query:q1", "acct1", T0)
+        self.assertRegex(review["id"], r"\d{12}")  # REVIEW-3's row: its own id holds 12 digits in a row
 
     def test_fr4_mf1_a_twelve_digit_number_in_any_incoming_field_is_still_rejected(self):
         base = brow(model="model-a", note="n", quantity=5, unit="tokens")
@@ -2107,7 +2107,7 @@ class FR4_BillingRound4(BillingBase):
     def test_fr4_mf1_a_real_sized_batch_is_fetched(self):
         self.enable()
         rows = [brow(day="2026-11-{:02d}".format(1 + d % 15), label="usage-{}-in".format(m), kind="in") for d in range(15) for m in "abcdefghijklmnopqrst"]
-        rows.append(brow(day="2026-01-08", label="usage-a-in", kind="in"))
+        rows.append(brow(day="2026-01-08", label="usage-a-in", kind=None))
         self.query_out(rows)
         result, _o, _e = self.fetch(mode="now", now=T0)
         self.assertNotEqual(result["result"], "failed", result)
