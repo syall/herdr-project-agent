@@ -471,7 +471,7 @@ cases["P1-context-lines"] = async () => { // a multi-line context renders one ro
   check(one.length === 1 && one[0].kind === "div", `a one-line context is one row, as before (got ${one.length})`);
 };
 
-cases["P2-worker-chips"] = async () => { // a closed worker reads (closed), a kept one "· kept"; others unchanged
+cases["P2-worker-chips"] = async () => { // a closed worker is not drawn (t-011), a kept one "· kept"; others unchanged
   world({ extraTerms: [{ address: "t32", state: "live", argv: ["claude"], labels: {}, status: "idle", program: claude },
                        { address: "t33", state: "live", argv: ["claude"], labels: {}, status: "working", program: claude }] });
   g.__files[`:${DIR}/ledger.json`] = JSON.stringify({ tasks: [{ id: "t-003", title: "T", state: "in-progress", workers: [
@@ -483,7 +483,7 @@ cases["P2-worker-chips"] = async () => { // a closed worker reads (closed), a ke
   await click(v, "view-tasks");
   await click(v, "task-head-t-003");
   const { text } = look(v);
-  check(/build t31 \(closed\)/.test(text), `closed chip (got ${text.slice(0, 400)})`);
+  check(!/t31/.test(text), `no chip for the closed worker (got ${text.slice(0, 400)})`);
   check(/reviewer t32 · kept ↗/.test(text), `kept chip, still live (got ${text.slice(0, 400)})`);
   check(/verifier t33 ↗/.test(text) && !/verifier t33 · kept/.test(text), "a live worker unchanged");
   check(/build t34 \(ended\)/.test(text), "a gone worker that was not closed still reads (ended)");
@@ -1530,6 +1530,42 @@ cases["Q5-same-time"] = async () => { // V2.5
 cases["Q6-short-hour"] = async () => { // V2.6: 7:30 is a time, written as 07:30
   const { quiet, error } = await quietWorld("7:30", "21:15");
   check(!error && JSON.stringify(quiet) === '{"from":"07:30","to":"21:15"}', `07:30 to 21:15 (got ${JSON.stringify(quiet)}, ${error})`);
+};
+
+// ---- t-011: workers closed with pa-worker close leave the task card ----
+const closedW = (address) => ({ address, role: "build", name: `w-${address}`, finished: true, closed: "2026-11-16T10:00:00Z", closedBy: "agent", report: "FINDINGS.md" });
+cases["W1-closed-not-listed"] = async () => { // V3.1: closed ones go; working, blocked, kept and ended-not-closed stay, labels as before
+  world({ extraTerms: [{ address: "t41", state: "live", argv: ["claude"], labels: {}, status: "working", program: claude },
+                       { address: "t42", state: "live", argv: ["claude"], labels: {}, status: "blocked", program: claude },
+                       { address: "t43", state: "live", argv: ["claude"], labels: {}, status: "idle", program: claude }] });
+  g.__files[`:${DIR}/ledger.json`] = JSON.stringify({ tasks: [{ id: "t-5", title: "T", state: "in-progress", workers: [
+    closedW("t40"),
+    { address: "t41", role: "build", name: "a" }, { address: "t42", role: "reviewer", name: "b" },
+    { address: "t43", role: "verifier", name: "c", keep: true, keptAt: "2026-11-16T10:00:00Z" },
+    { address: "t44", role: "build", name: "d" }, closedW("t45")] }] });
+  const v = await mount();
+  await click(v, "view-tasks"); await click(v, "task-head-t-5");
+  const { text, clicks } = look(v);
+  check(!/t40/.test(text) && !/t45/.test(text) && !/\(closed\)/.test(text), `closed workers not drawn (got ${text.slice(-500)})`);
+  check(/build t41 ↗/.test(text) && /reviewer t42 ↗/.test(text) && /verifier t43 · kept ↗/.test(text) && /build t44 \(ended\)/.test(text), `the others as before (got ${text.slice(-500)})`);
+  const chips = Object.keys(clicks).filter((k) => k.startsWith("worker-x-t-5-"));
+  check(chips.length === 4, `four worker × (got ${chips})`);
+};
+cases["W2-all-closed-no-row"] = async () => { // V3.2, V3.3: every worker closed: no workers row at all; the ledger is not written
+  world();
+  const ledger = JSON.stringify({ tasks: [
+    { id: "t-6", title: "All closed", state: "in-progress", updated: "2026-11-16T10:02:00Z", workers: [closedW("t50"), closedW("t51")] },
+    { id: "t-7", title: "No workers", state: "in-progress", updated: "2026-11-16T10:01:00Z" }] });
+  g.__files[`:${DIR}/ledger.json`] = ledger;
+  const v = await mount();
+  await click(v, "view-tasks"); await click(v, "task-head-t-6"); await click(v, "task-head-t-7");
+  const tree = v.render(cx), body = (id) => pathTo(tree, `task-${id}`)?.at(-1)?.kids?.[1];
+  const a = body("t-6"), b = body("t-7");
+  check(a && b, "both tasks expanded");
+  const kinds = (x) => x.kids.map((k) => (typeof k === "object" ? `${k.kind}${k.key ? `#${k.key}` : ""}:${k.kids.length}` : "text")).join(",").replace(/t-[67]/g, "t");
+  check(kinds(a) === kinds(b), `the all-closed task's body is the no-workers body (got ${kinds(a)} vs ${kinds(b)})`);
+  check(!Object.keys(look(v).clicks).some((k) => k.startsWith("worker-")), "no worker chip");
+  check(g.__files[`:${DIR}/ledger.json`] === ledger && !(g.__writes ?? []).some((k) => k.endsWith("/ledger.json")), "ledger.json unchanged, never written");
 };
 
 const pick = process.argv.slice(2);
