@@ -652,6 +652,23 @@ cases["P-hung-agent-json-kept"] = async () => { // AC5.1: a hung agent.json with
   check((g.__shared["project-agent.open"] ?? {})[RS] === 2, `the count stays (got ${JSON.stringify(g.__shared["project-agent.open"])})`);
 };
 
+cases["P-abandoned-load"] = async () => { // AC5.3: a load given up after 11 s commits nothing when it ends; the newer one does
+  world({ machine: M });
+  g.__files[`${M}:${RDIR}/ledger.json`] = ledgerOf(2);
+  remoteCards(3);
+  const v = await mount(); await settle();
+  check(/Decisions · 3/.test(look(v).text), "loaded");
+  g.__execHang = [`${M}:batch`]; g.__remoteDelay = 1500; // the batch hangs, every other call takes 1.5 s
+  g.__files[`${M}:${RDIR}/decisions/d-04.json`] = openCard("d-04"); g.__ls[`${M}:${RDIR}/decisions`].push("d-04.json");
+  v.reload(cx); await settle(); // load 1: its batch times out at 13 s
+  for (let t = 0; t < 23; t++) await step(500);
+  v.reload(cx); await settle(); // 11.5 s: load 1 is given up, load 2 starts
+  for (let t = 0; t < 5; t++) await step(500);
+  check(/Decisions · 3/.test(look(v).text), `14 s: load 1 ended without committing (got ${look(v).text.slice(0, 300)})`);
+  for (let t = 0; t < 40; t++) await step(500);
+  check(/Decisions · 4/.test(look(v).text), `load 2 committed (got ${look(v).text.slice(0, 300)})`);
+};
+
 cases["P-cache-cap"] = async () => { // limits: at most 8 spaces kept, the least recently shown dropped
   world({ machine: M });
   for (let i = 2; i <= 9; i++) addRemoteSpace(`sp${i}`, `p${i}`, ledgerOf(i, `p${i}`));
