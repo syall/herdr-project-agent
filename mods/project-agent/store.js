@@ -81,6 +81,25 @@ async function readJson(path, on, cx) {
   catch (e) { return { value: null, text, error: String(e.message ?? e) }; }
 }
 
+// The Costs view (costs.js): the space's cost summary, written by `pa-costs` on the space's machine.
+// Only costs/summary.json is read (never a session file); when it is missing, one listing of costs/
+// tells "no records" from "records, first collect still running". Each call capped at READ_LIMIT.
+// { summary, error, timedOut, missing: "none" | "pending" | null }: a timed-out read is never "none".
+export const costsDir = (space) => `${stateDir(space)}/costs`;
+export async function loadCosts(space, cx) {
+  const on = space.machine ?? null, r = await readJson(`${costsDir(space)}/summary.json`, on, cx);
+  if (r.timedOut) return { summary: null, error: null, timedOut: true, missing: null };
+  if (r.error) return { summary: null, error: r.error, timedOut: false, missing: null };
+  if (r.text !== null) {
+    const ok = r.value && typeof r.value === "object" && !Array.isArray(r.value);
+    return ok ? { summary: r.value, error: null, timedOut: false, missing: null } : { summary: null, error: "not a summary (not a JSON object)", timedOut: false, missing: null };
+  }
+  const ls = await withTimeout(cx, exec("ls", ["-1", costsDir(space)], { on, timeout: READ_LIMIT }));
+  if (ls === TIMED_OUT) return { summary: null, error: null, timedOut: true, missing: null };
+  const names = ls.code === 0 ? String(ls.stdout ?? "").split("\n") : [];
+  return { summary: null, error: null, timedOut: false, missing: names.includes("sessions.jsonl") ? "pending" : "none" };
+}
+
 // The space's ledger alone ({ value, text, error, timedOut? }), for the hidden panel's refresh.
 export const loadLedger = (space, cx) => readJson(`${stateDir(space)}/ledger.json`, space.machine, cx);
 
