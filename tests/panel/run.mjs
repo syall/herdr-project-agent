@@ -1303,9 +1303,12 @@ cases["P-unknown-profile-hidden"] = async () => { // I1 with AC8.5: a full load 
   const v = await mount(); await settle();
   for (let t = 0; t < 12; t++) await step(1000);
   check(!v.loads[RS] && JSON.stringify(g.__shared["project-agent.mainBranches"]?.[RS]) === '["kept"]', `full load: left (got ${JSON.stringify(g.__shared["project-agent.mainBranches"])})`);
-  g.__hang = []; g.__layout = panelLayout("changes");
-  advance(12000); v.reload(cx); await settle(); await step(1000);
-  check(JSON.stringify(g.__shared["project-agent.mainBranches"]?.[RS]) === '["trunk"]', `hidden: the profile is read and written, never cleared (got ${JSON.stringify(g.__shared["project-agent.mainBranches"])})`);
+  g.__layout = panelLayout("changes");
+  advance(12000); v.reload(cx); await settle(); await step(1000); // hidden, the profile still hung: the ledger refresh leaves the main branches
+  check(JSON.stringify(g.__shared["project-agent.mainBranches"]?.[RS]) === '["kept"]', `hidden: not cleared from the unknown kept profile (got ${JSON.stringify(g.__shared["project-agent.mainBranches"])})`);
+  g.__hang = [];
+  advance(60000); await settle(); v.reload(cx); await settle(); await step(1000); // the profile read is tried again and answers
+  check(JSON.stringify(g.__shared["project-agent.mainBranches"]?.[RS]) === '["trunk"]', `hidden: the profile is read and written (got ${JSON.stringify(g.__shared["project-agent.mainBranches"])})`);
 };
 
 const pick = process.argv.slice(2);
