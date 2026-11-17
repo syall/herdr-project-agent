@@ -1845,8 +1845,11 @@ cases["P-push-result-kept-until-left"] = async () => { // §8.2: the pushed card
   await click(v, `opt-${PID}-0`); await settle();
   await click(v, `submit-${PID}`); await settle(); await settle();
   check(look(v).text.includes("cc11 -> main"), `shown after the reload (got ${look(v).text.slice(0, 1200)})`);
-  await click(v, "view-tasks"); await click(v, "view-decisions");
+  // While kept the card is not also in the answered fold (VERIFY-7b-C-recheck L1, the answered filter).
   let t = look(v).text;
+  check(!t.includes("1 answered") && t.split("cc11 -> main").length === 2, `kept: not in the answered fold, the tail drawn once (got ${t.slice(0, 1200)})`);
+  await click(v, "view-tasks"); await click(v, "view-decisions");
+  t = look(v).text;
   check(!t.includes("cc11 -> main") && t.includes("No open decisions") && t.includes("1 answered"), `left: no longer kept, the card is with the answered ones (got ${t.slice(0, 1200)})`);
   // The same with its Done link.
   const { v: w, file: f2 } = await pushWorld({ tool: { run: () => { g.__files[file] = answeredByTool(); return json(0, toolPushed); } } });
@@ -1871,8 +1874,11 @@ cases["P-push-click-stale"] = async () => { // C-D5: Submit drawn while the chec
 };
 
 cases["P-push-run-crash"] = async () => { // a run that exits non-zero with no JSON from the tool (it crashed, maybe after the push): result unknown, one check
-  for (const [code, stderr] of [[1, "Traceback (most recent call last):\n  File \"pa_push.py\", line 900, in finish\nOSError: [Errno 28] No space left on device"], [2, ""]]) {
-    const { v } = await pushWorld({ opts: { records: alive() }, tool: { run: () => ({ code, stdout: "", stderr }) } });
+  // Also JSON that is not the tool's refusal (VERIFY-7b-C-recheck L1, the refusal shape): only ok:false is a refusal.
+  for (const [code, stderr, stdout = ""] of [[1, "Traceback (most recent call last):\n  File \"pa_push.py\", line 900, in finish\nOSError: [Errno 28] No space left on device"], [2, ""],
+    [1, "", JSON.stringify({ ok: true, done: false, answer: "Push", refusal: null, result: null, message: "odd" })],
+    [1, "", JSON.stringify({ done: false, answer: "Push", refusal: { check: "C9", message: "no ok field" }, message: "no ok field" })]]) {
+    const { v } = await pushWorld({ opts: { records: alive() }, tool: { run: () => ({ code, stdout, stderr }) } });
     await click(v, `opt-${PID}-0`); await settle();
     const checks = pushExecs("check").length;
     await click(v, `submit-${PID}`); await settle();
@@ -1882,6 +1888,71 @@ cases["P-push-run-crash"] = async () => { // a run that exits non-zero with no J
     check(pushExecs("run").length === 1, `exit ${code}: one run`);
     const said = sends().map((x) => x[2]);
     check(said.length === 1 && said[0].startsWith(`decision ${PID} answered Push; result unknown (`) && !said[0].includes("refused"), `exit ${code}: the orchestrator is told the result is unknown (got ${JSON.stringify(said)})`);
+  }
+};
+
+// The tool's check of a card it has already pushed (check_card: exit 1, C4, done true, the recorded result).
+const C4_DONE = `${PID} was already pushed at 2026-11-16T10:01:00Z (aa22000..cc11000); nothing to do`;
+const checkDone = () => json(1, checkReply({ ok: false, refusal: { check: "C4", message: C4_DONE }, status: "answered", done: true, result: toolResult, seen: null }, { commands: [] }));
+
+cases["P-push-run-crash-after-save"] = async () => { // REVIEW-7b-C-recheck M1: the tool saved the card answered, then crashed (no JSON): result unknown and the check's verdict stay shown
+  let file, ran = false;
+  const crash = "Traceback (most recent call last):\n  File \"pa_push.py\", line 1174, in finish\nOSError: [Errno 28] No space left on device";
+  // As finish() can: save_card writes the card answered and done, then append_journal raises: exit 1, no JSON.
+  const { v, file: f } = await pushWorld({ opts: { records: alive() }, tool: {
+    check: () => (ran ? checkDone() : json(0, checkReply())),
+    run: () => { ran = true; g.__files[file] = answeredByTool(); return { code: 1, stdout: "", stderr: crash }; } } });
+  file = f;
+  await click(v, `opt-${PID}-0`); await settle();
+  const checks = pushExecs("check").length;
+  await click(v, `submit-${PID}`); await settle(); await settle();
+  check(v.cards.some((c) => c.id === PID && c.card?.status === "answered"), "the reload read the card answered");
+  let { text, clicks } = look(v);
+  check(v.viewShown === "decisions" && text.includes(PID), `still the Decisions view with the card (view ${v.viewShown}, got ${text.slice(0, 800)})`);
+  const unknownAt = text.search(/The result is unknown \([\s\S]*No space left on device[\s\S]*\); checking the card again\./), foundAt = text.indexOf(C4_DONE);
+  check(unknownAt >= 0, `the result unknown line (got ${text.slice(0, 1500)})`);
+  check(foundAt > unknownAt, `then the check's verdict (got ${text.slice(0, 1500)})`);
+  check(!text.includes("Not pushed") && !text.includes("Pushed "), "neither Not pushed nor Pushed");
+  check(pushExecs("check").length === checks + 1 && pushExecs("run").length === 1, `one check after it, one run (got ${pushExecs("check").length - checks} checks)`);
+  check(Boolean(clicks[`push-done-${PID}`]) && !clicks[`opt-${PID}-0`] && !clicks[`submit-${PID}`], "Done drawn; no option, no Submit");
+  const said = sends().map((x) => x[2]);
+  check(said.length === 1 && said[0].startsWith(`decision ${PID} answered Push; result unknown (`), `the orchestrator is told the result is unknown (got ${JSON.stringify(said)})`);
+  for (let i = 0; i < 3; i++) { advance(10000); await fire(10000); }
+  text = look(v).text;
+  check(text.includes(C4_DONE) && /The result is unknown/.test(text), "still shown after more reloads");
+  check(pushExecs("check").length === checks + 1 && pushExecs("run").length === 1, "no more checks or runs");
+  await click(v, "view-tasks"); await click(v, "view-decisions");
+  text = look(v).text;
+  check(!/The result is unknown/.test(text) && text.includes("No open decisions") && text.includes("1 answered"), `left: no longer kept (got ${text.slice(0, 1200)})`);
+  // The same, left with Done.
+  ran = false;
+  const { v: w, file: f2 } = await pushWorld({ tool: {
+    check: () => (ran ? checkDone() : json(0, checkReply())),
+    run: () => { ran = true; g.__files[file] = answeredByTool(); return { code: 1, stdout: "", stderr: crash }; } } });
+  file = f2;
+  await click(w, `opt-${PID}-0`); await settle();
+  await click(w, `submit-${PID}`); await settle(); await settle();
+  check(look(w).text.includes(C4_DONE), `shown (got ${look(w).text.slice(0, 1200)})`);
+  await click(w, `push-done-${PID}`);
+  text = look(w).text;
+  check(!text.includes(C4_DONE) && text.includes("1 answered"), `Done: no longer kept (got ${text.slice(0, 1200)})`);
+};
+
+cases["P-push-run-exit0-unknown"] = async () => { // REVIEW-7b-C-recheck RL-1: exit 0 without JSON that says the push happened is result unknown, one check, never Pushed
+  const shapes = [["no stdout", ""], ["broken JSON", "{\"ok\": tr"], ["a JSON array", "[1]"],
+    ["ok false", JSON.stringify({ ok: false, done: false, answer: "Push", refusal: null, result: null, message: "" })],
+    ["ok, not done", JSON.stringify({ ok: true, done: false, answer: "Push", refusal: null, result: null, message: "" })],
+    ["done, no result", JSON.stringify({ ok: true, done: true, answer: "Push", refusal: null, result: null, message: "" })]];
+  for (const [name, stdout] of shapes) {
+    const { v } = await pushWorld({ opts: { records: alive() }, tool: { run: () => ({ code: 0, stdout, stderr: "" }) } });
+    await click(v, `opt-${PID}-0`); await settle();
+    const checks = pushExecs("check").length;
+    await click(v, `submit-${PID}`); await settle();
+    const { text } = look(v);
+    check(/The result is unknown \([\s\S]*\); checking the card again\./.test(text) && !text.includes("Pushed ") && !text.includes("Not pushed"), `${name}: result unknown, never Pushed (got ${text.slice(0, 1500)})`);
+    check(pushExecs("check").length === checks + 1 && pushExecs("run").length === 1, `${name}: one check after it, one run (got ${pushExecs("check").length - checks})`);
+    const said = sends().map((x) => x[2]);
+    check(said.length === 1 && said[0].startsWith(`decision ${PID} answered Push; result unknown (`) && !said[0].includes("result: pushed"), `${name}: told result unknown (got ${JSON.stringify(said)})`);
   }
 };
 
