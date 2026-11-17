@@ -71,9 +71,12 @@ class Orchestrator(unittest.TestCase):
         self.assertIn("the full list is in `WORKTREE.md` in the task's evidence folder", self.text)
         self.assertNotIn("Worktrees outlive idle and finished workers", self.text)
 
-    def test_r5_first_pass_leftovers(self):  # AC5.4
-        self.assertIn("on the first pass where the ledger has no `workerPolicy`, run `pa-worker close --leftovers --dry-run`", self.text)
-        self.assertIn("It sets `workerPolicy`; do not run it again after that.", self.text)
+    def test_r5_first_pass_leftovers(self):  # AC5.4, as changed by the person on card d-031
+        self.assertIn("on the first pass where the ledger has no `workerPolicy`, run `pa-worker close --leftovers`. It closes nothing", self.text)
+        self.assertIn("puts that list on one decision card (`d-leftovers`", self.text)
+        self.assertIn("When it is answered Close all listed, run `pa-worker close --card d-leftovers`", self.text)
+        self.assertIn("Answered Close none: leave them", self.text)
+        self.assertNotIn("journal its list, then run `pa-worker close --leftovers` in the same pass", self.text)
 
     def test_close_is_not_a_delete(self):  # review round 1, M8 (in the Workers section, not Safety)
         workers = flat(self.raw[self.raw.index("## Workers"):self.raw.index("## Phases and gates")])
