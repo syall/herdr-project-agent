@@ -594,6 +594,38 @@ class LiveLauncherOnly(Base):
         self.run_quiet(pa.cmd_pass, args)
         self.assertEqual(self.sends(), [["hc", "send", "t1", "manual pass"]])
 
+    # t-015: hc get gives status as an object {app, state, msg}; hc ls as a word. pa-pass reads both.
+    def pass_with_status(self, status):
+        pa.hc_get = lambda address: {"state": "live", "status": status, "labels": {"herdr.pa": "sp1"}} if address else {}
+        request = os.path.join(self.dir, "pass-request.json")
+        if os.path.exists(request):
+            os.remove(request)
+        self.calls[:] = []
+        self.heartbeat(time.time() - 2, "t1")
+        self.run_quiet(pa.cmd_pass, types.SimpleNamespace(space="sp1", pause=False, resume=False, retro=False))
+        return self.sends(), (load(request) if os.path.exists(request) else None)
+
+    def test_u_pass_busy_agent_is_queued_in_both_shapes(self):
+        for status in ({"app": "claude-code", "state": "working", "msg": "x"}, {"app": "claude-code", "state": "blocked"},
+                       "working", "blocked"):
+            sends, request = self.pass_with_status(status)
+            self.assertEqual(sends, [], "status {!r}: the pass was sent to a busy Project Agent".format(status))
+            self.assertTrue(request and request.get("pending"), "status {!r}: no pass was queued".format(status))
+
+    def test_u_pass_free_agent_is_sent_in_both_shapes(self):
+        for status in ({"app": "claude-code", "state": "idle"}, {"app": "claude-code", "state": "done"}, "done", "idle"):
+            sends, request = self.pass_with_status(status)
+            self.assertEqual(sends, [["hc", "send", "t1", "manual pass"]], "status {!r}".format(status))
+            self.assertIsNone(request, "status {!r}".format(status))
+
+    def test_u_status_word_is_shared(self):
+        self.assertEqual(pa.status_word({"status": {"app": "claude-code", "state": "working"}}), "working")
+        self.assertEqual(pa.status_word({"status": "blocked"}), "blocked")
+        self.assertEqual(pa.status_word({"status": {"app": "x"}}), "")
+        self.assertEqual(pa.status_word({}), "")
+        self.assertEqual(pa.status_word(None), "")
+        self.assertIs(pa_hooks.status_word, pa.status_word)
+
     def test_u_task_stale_heartbeat_skips_the_notice(self):
         self.heartbeat(time.time() - 3600, "t1")
         out = self.run_quiet(pa.cmd_task, types.SimpleNamespace(action="done", task="t-1", space="sp1"))
