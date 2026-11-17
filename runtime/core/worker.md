@@ -49,8 +49,9 @@ folder and the address to report to.
   rejected). Then implement in one pass. If the work departs from the plan, update
   `plan.md` in the same commit. Keep `FINDINGS.md` (what was learned, approaches
   rejected) and `DECISIONS.md` (each judgement call and why). A build or fix worker's
-  report names the files it touched, any file of which it rewrote more than half, any
-  file outside the plan or the previous round's diff, and whether a rebase conflicted.
+  report, and its `FINDINGS.md`, name the files it touched, any file of which it rewrote
+  more than half, any file outside the plan or the previous round's diff, and whether a
+  rebase conflicted.
 - **verifier:** fresh context. Check the result against `plan.md` and the verification
   points, write `VERIFY.md`, and report. Never fix anything. On a diff recheck the
   handoff names a base commit: check the diff from it to HEAD.

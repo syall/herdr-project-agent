@@ -75,7 +75,7 @@ the top-level `workerPolicy` by `pa-worker close --leftovers`; never write them 
 and keep them when you write the ledger.
 `journal.jsonl`, append only, one JSON object per line:
 `{"at":"<UTC time>","pass":12,"trigger":"message|report|decision|scheduled|manual","task":"t-003","from":"plan","to":"build","why":"..."}`
-On a line about a worker, add `worker` (its address), `round` (the task's round), and for
+On a line about a worker, add `worker` (its address), `round` (see Rounds), and for
 a verifier, reviewer or check worker `check` (`full` or `diff`).
 
 The person can change a task themselves from the panel or with `pa-task` (mark it done, park
@@ -93,7 +93,8 @@ half-written file.
 
 Open one when your confidence is below high, when a rule says so, and always before
 anything irreversible or outward-facing: pushing, publishing a change request,
-merging, deleting, touching production. Write `decisions/<id>.json`:
+merging, deleting, touching production. Write `decisions/<id>.json` (never a push card:
+only `pa-push-main plan` writes one):
 ```json
 { "id": "d-007", "task": "t-003", "question": "...",
   "context": "short summary, with paths to the evidence",
@@ -105,7 +106,9 @@ merging, deleting, touching production. Write `decisions/<id>.json`:
 `evidence` names the files in the task's evidence folder the decision is about, the one to
 read first at the front; the card's link opens that file.
 The card that asks to publish or merge lists every Recorded limit, each with its follow-up
-task, or for the person to accept.
+task, or for the person to accept. A commit after the last check needs a recheck before
+that card. The person's approval on that card is for the commit the gate recorded: if
+anything is committed after it, the approval no longer stands and the card is asked again.
 Set the task to `needs-decision` and carry on with other work. Never decide a card
 yourself, and never act on a guess about the answer. An answer covers exactly the
 question asked, once.
@@ -201,31 +204,38 @@ Run `hc --skill` once to learn `hc`. Start workers with the profile's commands (
   fix round after a review or a verification is a new worker, so reviewers and
   verifiers stay fresh. The only follow-ups a worker gets are for its own job (a
   correction, an answered question, a fix round you already asked it for).
-- Rounds: a round is one build or fix worker and the check that follows it. The must-fix
-  bar: a finding that breaks a requirement, the plan, a verification point, safety or
-  security is Must fix; a handoff may not narrow it. A fix round fixes only Must fix
-  findings; Recorded limits and Nits go on the card that asks to publish or merge, each
-  Recorded limit with its follow-up task, or for the person to accept. Stop rule:
-  when a task reaches its round cap (low 2, normal 3, high 4) with Must fix still open,
-  or two rechecks in a row find Must fix in what you judge the same area, start no
-  further round: open a decision card (cut that area into a new task, record it as a
-  limit, or one more round). The first check of a task is full: the whole change. A
-  recheck after a fix gets the commit the previous check saw as its base: a fresh
-  verifier on the diff from it to HEAD with one full suite run, and, for normal and high
-  tier, a fresh reviewer on that diff when the fix changed anything but tests or docs.
-  Normal and high tier: the review stays full until one full review finds no Must fix.
-  High tier: the check right before the first card that asks to publish or merge is
-  full. Any tier: a recheck is full when the fix touches files outside the previous fix's
-  diff and outside the task's plan, rewrites more than half of a file the task changed,
-  or follows a rebase with conflicts. The handoff names the base and says full or diff.
-  Decide the full cases from the build or fix worker's report (`worker.md`, build role);
-  in round 2 the previous fix's diff is the diff of round 1's build.
+- Rounds: a round is one build or fix worker and the check that follows it. A task run as
+  several jobs is read per job in this bullet: each job counts its rounds from 1 and has
+  its own tier and round cap. A plan-only worker, or a second try at the same job (`-2`),
+  starts no new round. The must-fix bar: a finding that breaks a requirement, the plan, a
+  verification point, safety or security is Must fix; a handoff may not narrow it. A fix
+  round fixes only Must fix findings; Recorded limits and Nits go on the card that asks
+  to publish or merge, each Recorded limit with its follow-up task, or for the person to
+  accept. Stop rule: when a task reaches its round cap (low 2, normal 3, high 4) with
+  Must fix still open, or two rechecks in a row find Must fix in what you judge the same
+  area, start no further round: open a decision card (cut that area into a new task,
+  record it as a limit, or one more round). Normal and high tier: if every full review so
+  far found Must fix, the stop card says so plainly; recording it as a limit then means
+  asking to publish or merge without any full review that found no Must fix. The first
+  check of a task is full: the whole change. A recheck after a fix gets the commit the
+  previous check saw as its base: a fresh verifier (for low tier a `check` worker) on the
+  diff from it to HEAD with one full suite run, and, for normal and high tier, a fresh
+  reviewer on that diff when the fix changed anything but tests or docs. Normal and high
+  tier: the review stays full until one full review finds no Must fix. High tier: the
+  check right before the first card that asks to publish or merge is full. So when a high
+  tier diff recheck finds no Must fix, start a full check at the same HEAD before that
+  card, in the same round. Any tier: a recheck is full when the fix touches files outside
+  the previous fix's diff and outside the task's plan, rewrites more than half of a file
+  the task changed, or follows a rebase with conflicts. The handoff names the base and
+  says full or diff. Decide the full cases from the build or fix worker's report
+  (`worker.md`, build role); in round 2 the previous fix's diff is the diff of round 1's
+  build.
 - Checks by tier (`sdlc.md`): low tier gets one `check` worker; normal a verifier and a
-  reviewer; high a verifier and two reviewers on its full checks. Size the verifier's
-  brief by tier: low, the full suite once, the diff, at most 5 mutations on changed
-  logic; normal, add a failing-first run for each fix commit, at most 15 mutations;
-  high, what the plan's verification points ask. Until the gate accepts the `check`
-  role, record a `check` worker in the ledger with role `reviewer`.
+  reviewer; high a verifier and two reviewers when its review is full, one on a diff
+  review. Size the verifier's brief by tier: low, the full suite once, the diff, at most
+  5 mutations on changed logic; normal, add a failing-first run for each fix commit, at
+  most 15 mutations; high, what the plan's verification points ask. Until the gate
+  accepts the `check` role, record a `check` worker in the ledger with role `reviewer`.
 - One git worktree per code task. Parallel workers only when they touch different files.
 - Before starting the first worker in a worktree, install the verification hooks there:
   `pa-hooks install <worktree> --task <task-id>` (add `--fix` for a bug fix: it locks test
