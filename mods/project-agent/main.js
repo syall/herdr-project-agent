@@ -721,7 +721,7 @@ export default class ProjectAgent extends View {
         .child(this.chip(t, open ? "open" : c.status === "withdrawn" ? "withdrawn" : `answered: ${c.answer}`, open ? t.blocked : t.dim)))
       .child(div().text_size(13).font_semibold().text_color(t.foreground).child(String(c.question)))
       // A push card: the facts pa-push-main check read now, never the card file's context (push.js).
-      .when(push, (el) => el.child(this.push.block(t, space, entry, (_e, cx) => { this.push.check(space, entry, cx); cx.notify(); })))
+      .when(push, (el) => el.child(this.push.block(t, space, entry, (_e, cx) => { this.push.check(space, entry, cx); cx.notify(); }, (_e, cx) => { this.push.leave(space.id); this.view = "decisions"; cx.notify(); })))
       // The context, one row per line; a line that starts with two spaces is indented (a worktree card's details).
       .when(!push && Boolean(c.context) && !String(c.context).includes("\n"), (el) => el.child(div().text_size(12).text_color(t.muted).child(String(c.context))))
       .when(!push && String(c.context ?? "").includes("\n"), (el) => el.child(v_flex().gap(2).children(String(c.context).split("\n").map((line) =>
@@ -828,7 +828,10 @@ export default class ProjectAgent extends View {
       .map((state) => ({ state, tasks: tasks.filter((x) => x.state === state) })).filter((s) => s.tasks.length);
     const active = tasks.filter((x) => ACTIVE.includes(x.state)).length;
     const openCards = this.cards.filter((c) => !c.card || c.card.status === "open");
-    const answered = this.cards.filter((c) => c.card && c.card.status !== "open");
+    // A push card pushed from here stays with the open ones, answered, until the person leaves it (push.js kept).
+    const kept = (c) => Boolean(c.card) && c.card.status !== "open" && this.push.kept(space.id, c.id);
+    const listed = this.cards.filter((c) => !c.card || c.card.status === "open" || kept(c));
+    const answered = this.cards.filter((c) => c.card && c.card.status !== "open" && !kept(c));
     // Another mod asked to show a task (shared "project-agent.show": { space, task, at }): once.
     const ask = shared("project-agent.show");
     if (ask && ask.space === space.id && ask.at !== this.shownAt) {
@@ -836,11 +839,11 @@ export default class ProjectAgent extends View {
       const state = tasks.find((x) => x.id === ask.task)?.state;
       if (state) this.folded.delete(state);
     }
-    const view = this.view ?? (openCards.length || !tasks.length ? "decisions" : "tasks");
+    const view = this.view ?? (listed.length || !tasks.length ? "decisions" : "tasks");
     this.viewShown = view;
     const tab = (id, label) => div().id(`view-${id}`).px(9).h(24).flex().items_center().rounded(6).text_size(12).cursor_pointer()
       .bg(view === id ? t.selected : t.chrome).text_color(view === id ? t.foreground : t.muted).hover((s) => s.bg(t.hover))
-      .on_click((_e, cx) => { this.view = id; this.disarm(); if (id === "rules") this.rules.wantAllow(space, cx); cx.notify(); }).child(label);
+      .on_click((_e, cx) => { this.view = id; this.disarm(); if (id !== "decisions") this.push.leave(space.id); if (id === "rules") this.rules.wantAllow(space, cx); cx.notify(); }).child(label);
     const unsent = this.unsent.filter((u) => u.spaceId === space.id);
     return root
       .child(head(`PA: ${a.name ?? space.name}`, h_flex().flex_none().gap(6).items_center()
@@ -888,9 +891,9 @@ export default class ProjectAgent extends View {
         }))))
       .when(view === "rules", (el) => el.child(this.rules.render(t, space, (id, what) => new Promise((done) => cx.spawn(async (cx) => { try { await this.ruleDecided(space, id, what, cx); } finally { done(); } })))))
       .when(view === "decisions", (el) => el.child(v_flex().id("pa-decisions").flex_1().min_h(0).p(8).gap(8).overflow_y_scrollbar().track_scroll(this.cardScroll)
-        .when(!openCards.length && this.cardsFor !== space.id, (e) => e.child(note("Loading decisions…")))
-        .when(!openCards.length && this.cardsFor === space.id, (e) => e.child(note("No open decisions. The Project Agent opens a card here when it needs you.")))
-        .children(openCards.map((c) => this.card(t, c, space)))
+        .when(!listed.length && this.cardsFor !== space.id, (e) => e.child(note("Loading decisions…")))
+        .when(!listed.length && this.cardsFor === space.id, (e) => e.child(note("No open decisions. The Project Agent opens a card here when it needs you.")))
+        .children(listed.map((c) => this.card(t, c, space)))
         .when(answered.length > 0, (e) => e.child(div().id("pa-older").px(4).py(4).text_size(11.5).text_color(t.dim).cursor_pointer().hover((s) => s.text_color(t.foreground))
           .on_click((_e, cx) => { this.older = !this.older; cx.notify(); }).child(`${this.older ? "▾" : "▸"} ${answered.length} answered`)))
         .when(this.older, (e) => e.children(answered.slice(0, 50).map((c) => this.card(t, c, space))))));

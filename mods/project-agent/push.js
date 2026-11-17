@@ -59,13 +59,18 @@ export async function readAllow(space, cx) {
 
 export class PushCards {
   constructor() {
-    // `${space id}\0${card id}` -> { check, at, asked, busy, running, result, error, errorFor, unknown, stale }
-    //   check: the last check's JSON; at: when that check was asked for; running: the label being answered.
+    // `${space id}\0${card id}` -> { check, at, asked, busy, running, result, kept, error, errorFor, unknown, stale }
+    //   check: the last check's JSON; at: when that check was asked for; running: the label being answered;
+    //   kept: a push from here whose result stays in the Decisions list until the person leaves it.
     this.cards = {};
   }
 
   of(spaceId, id) { return (this.cards[`${spaceId}\0${id}`] ??= { check: null, at: 0, asked: 0, busy: false, running: null, result: null, error: null, unknown: null, stale: false }); }
   running(spaceId, id) { return this.cards[`${spaceId}\0${id}`]?.running ?? null; }
+  // A card pushed from this copy stays in the Decisions list, answered, with its result (spec §8.2),
+  // until the person leaves it: another view (main.js) or its Done link.
+  kept(spaceId, id) { return Boolean(this.cards[`${spaceId}\0${id}`]?.kept); }
+  leave(spaceId) { for (const [k, st] of Object.entries(this.cards)) if (k.startsWith(`${spaceId}\0`)) st.kept = false; }
 
   // From a shown copy's commit (main.js): the first check of an open push card, at most one per CHECK_EVERY.
   wantCheck(space, entry, cx) {
@@ -97,9 +102,10 @@ export class PushCards {
   }
 
   // From Submit only (main.js answer()): `pa-push-main run`, once. `told(message)` gets the notice for
-  // the orchestrator. Exit 0: done (or Not now saved); exit 1 or 2: refused or failed, the card stays
-  // open; anything else, a throw or no answer: the result is unknown. After a refusal or an unknown
-  // result the card is checked again. Returns whether it started.
+  // the orchestrator. Exit 0: done (or Not now saved); exit 1 or 2 with the tool's refusal JSON:
+  // refused or failed, the card stays open; anything else (exit 1 or 2 without that JSON, as when the
+  // tool crashed, maybe after the push; another code, a throw or no answer): the result is unknown.
+  // After a refusal or an unknown result the card is checked again. Returns whether it started.
   run(space, entry, label, note, cx, told) {
     const st = this.of(space.id, entry.id);
     if (st.running || st.busy || (label !== PUSH && label !== NOT_NOW)) return false;
@@ -110,14 +116,14 @@ export class PushCards {
       const { r, error } = await call(cx, space, "pa-push-main", args, RUN_TIMEOUT);
       st.running = null;
       let notice;
-      if (error || ![0, 1, 2].includes(r?.code)) {
+      const out = error ? null : printed(r);
+      if (error || ![0, 1, 2].includes(r?.code) || (r.code !== 0 && out?.ok !== false)) {
         st.unknown = error ?? `pa-push-main run exited with ${r?.code}${said(r) ? `: ${said(r)}` : ""}`;
         st.check = null;
         notice = `decision ${entry.id} answered ${label}; result unknown (${st.unknown}); the panel checks the card again`;
       } else {
-        const out = printed(r);
         if (r.code === 0) {
-          st.result = { label, ...(out ?? {}) };
+          st.result = { label, ...(out ?? {}) }; st.kept = label === PUSH;
           let what = String(out?.message || resultLine(out?.result) || "pushed");
           if (what.startsWith(`${entry.id}: `)) what = what.slice(entry.id.length + 2); // the tool's message starts with the card id
           notice = label === PUSH ? `decision ${entry.id} answered Push; result: ${what}` : `decision ${entry.id} answered Not now`;
@@ -136,14 +142,17 @@ export class PushCards {
 
   // The block drawn inside an open push card, above its options (spec §8.1, §8.2); for an answered one,
   // what this copy saw or what the card records.
-  block(t, space, entry, onCheck) {
+  block(t, space, entry, onCheck, onDone) {
     const c = entry.card, open = c.status === "open", st = this.cards[`${space.id}\0${entry.id}`];
     const line = (s, color) => div().text_size(12).text_color(color ?? t.muted).child(s);
     const small = (s, color) => div().text_size(11).text_color(color ?? t.dim).child(s);
     const box = v_flex().id(`push-${entry.id}`).gap(3).p(8).rounded(6).border(1).border_color(t.border).bg(t.background);
     if (!open) {
       const r = c.push?.result;
-      return box.child(small(r ? `Recorded on the card: pushed ${text(r.url)} ${text(r.branch)} ${short(r.from)}..${short(r.to)} at ${stamp(r.at)}` : "Nothing was pushed from this card."));
+      if (st?.result) this.shown(t, box, st, {});
+      box.child(small(r ? `Recorded on the card: pushed ${text(r.url)} ${text(r.branch)} ${short(r.from)}..${short(r.to)} at ${stamp(r.at)}` : "Nothing was pushed from this card."));
+      if (st?.kept) box.child(div().id(`push-done-${entry.id}`).flex_none().text_size(11.5).text_color(t.accent).cursor_pointer().on_click(onDone).child("Done"));
+      return box;
     }
     const chk = st?.check, f = chk?.facts ?? {}, busy = Boolean(st?.busy), now = Date.now();
     if (chk) box.child(small(`Read now by pa-push-main check (not from the card file), at ${clock(st.at)}`));
@@ -169,15 +178,7 @@ export class PushCards {
     }
     if (chk?.caller) box.child(line(chk.caller.ok ? "This panel may push: yes" : `This panel may push: no (${text(chk.caller.why)})`, chk.caller.ok ? t.muted : t.blocked));
     // State: what this copy did last, then the check's verdict.
-    if (st?.result) {
-      const r = st.result.result;
-      const where = `${text(r?.url ?? f.url)} ${text(r?.branch ?? f.branch)}`;
-      box.child(line(st.result.label !== PUSH ? "Answered Not now: nothing was pushed."
-        : r?.how && r.how !== "pushed" ? `Already on the remote: ${where} is at ${short(r?.to)} (recorded at ${clock(r?.at, false)})`
-        : `Pushed ${where} ${short(r?.from)}..${short(r?.to)} at ${clock(r?.at, false)}`, t.done));
-      const out = Array.isArray(r?.output) ? r.output : text(r?.output).split("\n").filter(Boolean);
-      for (const o of out.slice(-15)) box.child(div().pl(12).text_size(11).text_color(t.dim).child(text(o)));
-    }
+    if (st?.result) this.shown(t, box, st, f);
     if (st?.error) box.child(line(`${st.errorFor === NOT_NOW ? "Not saved" : "Not pushed"}: ${st.error}`, t.blocked));
     if (st?.unknown) box.child(line(`The result is unknown (${st.unknown}); checking the card again.`, t.blocked));
     if (busy) box.child(line("Checking…", t.dim));
@@ -189,6 +190,17 @@ export class PushCards {
     if (st?.stale && !busy) box.child(line("Push needs a check that passed, under 2 minutes old: Check again.", t.blocked));
     if (!st?.running && !busy) box.child(div().id(`push-check-${entry.id}`).flex_none().text_size(11.5).text_color(t.accent).cursor_pointer().on_click(onCheck).child("Check again"));
     return box;
+  }
+
+  // What this copy's run printed: the result line and the tail of git's output.
+  shown(t, box, st, f) {
+    const r = st.result.result;
+    const where = `${text(r?.url ?? f.url)} ${text(r?.branch ?? f.branch)}`;
+    box.child(div().text_size(12).text_color(t.done).child(st.result.label !== PUSH ? "Answered Not now: nothing was pushed."
+      : r?.how && r.how !== "pushed" ? `Already on the remote: ${where} is at ${short(r?.to)} (recorded at ${clock(r?.at, false)})`
+      : `Pushed ${where} ${short(r?.from)}..${short(r?.to)} at ${clock(r?.at, false)}`));
+    const out = Array.isArray(r?.output) ? r.output : text(r?.output).split("\n").filter(Boolean);
+    for (const o of out.slice(-15)) box.child(div().pl(12).text_size(11).text_color(t.dim).child(text(o)));
   }
 }
 
