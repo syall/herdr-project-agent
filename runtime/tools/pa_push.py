@@ -903,6 +903,142 @@ def cmd_check(args):
     return 0 if report["ok"] else 1
 
 
+# ---- run (C0-C13, then the act) ------------------------------------------------------------------
+
+RUN_MSG = ("pa-push-main run is the person's command; it runs when they answer a push card in the Project panel. "
+           "An agent opens the card with pa-push-main plan and stops. ({})")
+ANSWERS = ("Push", "Not now")
+BUDGET = 540  # seconds for one run (the panel's exec allows 600)
+PUSH_RESERVE = 150  # seconds that must be left before the push starts
+ATTEMPTS_KEPT = 20
+TAIL = 15  # lines of output kept
+
+
+def outcome(ok, done=False, answer=None, refusal=None, result=None, message=""):
+    return {"ok": ok, "done": done, "answer": answer, "refusal": refusal, "result": result, "message": message}
+
+
+def refused(r, answer=None):
+    return outcome(False, answer=answer, refusal={"check": r.check, "message": r.message}, message="pa-push-main: refused: " + r.message)
+
+
+def tail(text, lines=TAIL):
+    return "\n".join([l for l in str(text or "").splitlines() if l.strip()][-lines:])
+
+
+def run_push(space, card_id, answer, note, seen, env, ancs, deadline=None):
+    """pa-push-main run, as (exit code, outcome). env and ancs (ancestors()) decide C0; there is no other way past it.
+    deadline: time.monotonic() by which the run must end (default BUDGET from now)."""
+    deadline = deadline or time.monotonic() + BUDGET
+    why = caller_refusal(env, ancs)
+    if why:
+        return 1, refused(Refused("C0", RUN_MSG.format(why)), answer)
+    if not space:
+        return 1, refused(Refused("C1", "pa-push-main run needs --space <id>"), answer)
+    space = pa.local_id(space)
+    directory = os.path.join(pa.ROOT, "spaces", space) if pa.ID.match(space) else None
+    if not directory or not os.path.isfile(os.path.join(directory, "agent.json")):
+        return 1, refused(Refused("C1", "no Project Agent state for space {}".format(space)), answer)
+    try:
+        with push_lock(directory):
+            return run_locked(directory, space, card_id, answer, note, seen, deadline)
+    except Refused as r:
+        return 1, refused(r, answer)
+
+
+def run_locked(directory, space, card_id, answer, note, seen, deadline):
+    card = load_card(directory, space, card_id)  # C3 (Refused goes to run_push)
+    push = card["push"]
+    if push.get("done"):
+        r = push.get("result") or {}
+        return 0, outcome(True, True, card.get("answer"), result=r, message="{} was already pushed at {} ({}..{}); nothing to do.".format(
+            card_id, r.get("at"), short(r.get("from")), short(r.get("to"))))
+    if card.get("status") != "open":
+        raise Refused("C4", "{} is {}; nothing was pushed".format(card_id, card.get("status")))
+    if answer not in ANSWERS:
+        raise Refused("C5", "--answer must be one of: " + ", ".join(ANSWERS))
+    if answer == "Not now":
+        return answer_not_now(directory, card, note)
+    s = Session(deadline)
+    facts = blank_facts()
+    try:
+        state = gather(s, directory, space, push, facts)
+        if state == "already":
+            return already_there(s, directory, card, note, facts)
+        if not seen:
+            raise Refused("C12", "--seen is required (the token of the facts the person looked at)")
+        if seen != seen_token(card_id, facts):
+            raise Refused("C12", "the facts changed since you looked; look at the card again")
+        entry = facts["allow"]["entry"]
+        if entry.get("prePush"):
+            pre_push(s, entry, facts)
+        if s.left() < PUSH_RESERVE:
+            raise Refused("deadline", "ran out of time before pushing; nothing was pushed")
+        return act(s, directory, card, note, facts)
+    except Refused as r:
+        record_attempt(directory, card, r, facts)
+        return 1, refused(r, "Push")
+    finally:
+        s.close()
+
+
+def pre_push(s, entry, facts):
+    """C13: the entry's prePush, in a pristine temporary clone of the commit, before anything changes."""
+    path, commit = facts["path"], facts["commit"]
+    clone = tempfile.mkdtemp(prefix="pa-push-clone-")
+    try:
+        code, out, err = git_call(["git", "-c", "core.hooksPath=" + s.hooks, "clone", "--quiet", "--shared", "--no-checkout", path, clone],
+                                  min(60, s.left()))
+        if not code:
+            code, out, err = git_call(["git", "-C", clone, "-c", "core.hooksPath=" + s.hooks, "checkout", "--quiet", "--detach", commit],
+                                      min(60, s.left()))
+        if code:
+            raise Refused("C13", "could not make the temporary clone for the prePush check: {}; nothing was pushed".format(tail(err, 3)))
+        argv = fill(entry["prePush"], path=clone, repo=path, commit=commit, url=facts["url"], branch=facts["branch"])
+        code, out, err = git_call(argv, min(180, s.left()), cwd=clone)
+        if code:
+            raise Refused("C13", "the allowlist's prePush check failed (exit {}):\n{}".format(code, tail(out + "\n" + err)))
+    finally:
+        shutil.rmtree(clone, ignore_errors=True)
+
+
+def save_card(directory, card):
+    pa.write_json(card_file(directory, card["id"]), card)
+
+
+def record_attempt(directory, card, r, facts):
+    """A refusal or failure after C5: kept on the card (which stays open) and journaled."""
+    push = card["push"]
+    push["attempts"] = (list(push.get("attempts") or []) + [{"at": pa.now(), "check": r.check, "message": r.message}])[-ATTEMPTS_KEPT:]
+    save_card(directory, card)
+    pa_hooks.append_journal(directory, {"by": "person", "trigger": "panel", "task": card.get("task"), "decision": card["id"],
+                                        "why": "push refused: " + r.message, "push": journal_push(push, facts.get("remoteNow"), facts.get("merge"))})
+
+
+def answer_not_now(directory, card, note):
+    raise Refused("C5", "Not now is not built yet")
+
+
+def already_there(s, directory, card, note, facts):
+    raise Refused("C11b", "already on the remote is not built yet")
+
+
+def act(s, directory, card, note, facts):
+    raise Refused("act", "the push is not built yet; nothing was pushed")
+
+
+def cmd_run(args):
+    for k in list(os.environ):  # this process's own git reads (the gate's) see no GIT_* either
+        if k.upper().startswith("GIT_"):
+            del os.environ[k]
+    code, result = run_push(args.space, args.card, args.answer, args.note, args.seen, os.environ, ancestors())
+    if args.json:
+        print(json.dumps(result, indent=2))
+    else:
+        print(result["message"], file=sys.stdout if code == 0 else sys.stderr)
+    return code
+
+
 def main_parser():
     parser = argparse.ArgumentParser(prog="pa-push-main", description="Push a main branch from a push card (the person's answer in the panel).")
     sub = parser.add_subparsers(dest="action")
@@ -915,6 +1051,13 @@ def main_parser():
     check.add_argument("card")
     check.add_argument("--space")
     check.add_argument("--json", action="store_true")
+    run = sub.add_parser("run", help="the person's answer, from the panel: checks everything again, then pushes")
+    run.add_argument("card")
+    run.add_argument("--answer", required=True)
+    run.add_argument("--space")
+    run.add_argument("--note")
+    run.add_argument("--seen")
+    run.add_argument("--json", action="store_true")
     return parser
 
 
@@ -933,6 +1076,8 @@ def main():
         args = main_parser().parse_args()
         if args.action == "plan":
             return cmd_plan(args)
+        if args.action == "run":
+            return cmd_run(args)
         return cmd_check(args)
     raise pa.Problem("invoke as pa-push-main or pa-push-allow")
 
