@@ -137,6 +137,49 @@ A remote launcher must write the heartbeat
 (run `pa-sync --on <machine>`): one from before the heartbeat existed is never `alive`, so it gets
 no passes and no answer notices.
 
+## Pushing main from the panel
+
+Off by default. No agent pushes a main branch: not the Project Agent, not a worker. For the
+repositories you name, a **push card** lets you push it yourself with one click in the panel.
+
+- **The allowlist** is `~/.config/herdr-pa/push-allow.json` (under `HERDR_PA_HOME` when that is
+  set), one per machine; a remote space uses the one on its machine. Only you write it, by hand or
+  with `pa-push-allow` in your own terminal. `install.sh` and `pa-sync` never create, change or
+  copy it. A missing file means off. Shape (every key checked; an invalid file allows nothing):
+
+  ```json
+  { "version": 1, "enabled": true,
+    "repos": [ { "path": "/home/me/src/my-tool", "url": "git@example.com:me/my-tool.git",
+                 "branch": "main", "space": "<space id>", "enabled": true,
+                 "prePush": ["/home/me/bin/check-before-push.sh", "{path}"], "note": "optional" } ] }
+  ```
+
+  `path` is the main checkout; an entry matches only that path, that exact URL, that branch and
+  that space. `prePush` (optional) is a program run before the push, in a fresh temporary clone of
+  the commit; a non-zero exit refuses the push. Placeholders: `{path}` (that clone), `{repo}` (the
+  main checkout), `{commit}`, `{url}`, `{branch}`.
+- **`pa-push-allow`**: `show [--json]` (anyone, read-only); `add --path P --space S [--url U]
+  [--branch B] [--pre-push ARG...]`, `remove --path P --space S`, `on` and `off` (you only: it
+  refuses agent shells).
+- **The push card.** Once a task for a listed repository has passed its gate and nothing was
+  committed after it, the Project Agent may open a push card with `pa-push-main plan <task-id>
+  --repo <main checkout>`. The panel shows facts the tool works out when the card is shown
+  (`pa-push-main check`): the repository, the URL from your allowlist, the remote and local heads,
+  every commit that would go out (marked when not from this task), the gated commit and the exact
+  commands. **Push** then **Submit** runs `pa-push-main run`; **Not now** pushes nothing.
+  `pa-decide` cannot answer a push card.
+- **What `pa-push-main run` checks and runs.** It refuses any agent process (agent variables or an
+  agent among its parent processes, or a Herdr terminal: only the panel runs it). Under a lock it
+  checks the allowlist again (and that it did not change since the card), the gate and its commit
+  pin, that the local main and the remote main have not moved, that the push is a fast-forward, and
+  that the facts you saw are still true. It runs `prePush`, fast-forwards the local main if needed,
+  then pushes exactly the gated commit to the allowlist's URL (never a remote name), with the
+  repository's hooks off and no `GIT_*` variables. It never forces. A second run of the same card
+  pushes nothing. The result goes on the card and in the journal.
+- **Turning it off:** set `"enabled": false` on the file or on an entry, run `pa-push-allow off`,
+  or delete the file. It applies at the next check: open push cards show the refusal. Nothing
+  else needs undoing.
+
 ## Profiles
 
 A profile is a folder in `~/.config/herdr-pa/profiles/<name>/` (`profile.json`, `context.md`, `rules.json`,

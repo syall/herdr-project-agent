@@ -355,7 +355,7 @@ class PushText(unittest.TestCase):
 
     def test_orchestrator_push_paragraph(self):
         cards = flat(self.orchestrator[self.orchestrator.index("## Decision cards"):self.orchestrator.index("## Rules")])
-        self.assertIn(PUSH_CARD_BULLET + " " + PUSH_PARAGRAPH + " ## Rules", cards + " ## Rules")
+        self.assertIn(PUSH_CARD_BULLET + " " + PUSH_PARAGRAPH + " ## Rules", cards.rstrip() + " ## Rules")
         self.assertTrue(cards.rstrip().endswith(PUSH_PARAGRAPH), "the paragraph closes Decision cards, before ## Rules")
 
     def test_orchestrator_run_only_in_never_sentences(self):  # AC7.3

@@ -2,7 +2,9 @@
 
 A worker may run the ordinary build, file and text tools freely, and git, gh and hc only as the rows of
 ALLOWLIST below allow. Anything else that involves git, gh or hc is refused, so that publishing and
-repository settings stay with the person and the Project Agent. Edits inside a .git folder, to the
+repository settings stay with the person and the Project Agent. The person's own tools (PERSON_ONLY:
+pa-push-main, pa-push-allow and pa_push.py, t-007 part 7b) are refused for a worker in every form, and no row
+can allow them: a main branch is pushed only when the person answers a push card in the panel. Edits inside a .git folder, to the
 Project Agent's files and to the person's own git and gh settings are refused too. Everything here runs
 in-process: no subprocess, no files read except to resolve links and to see whether a `git checkout` /
 `git restore` word names an existing path.
@@ -32,6 +34,11 @@ NOT_PLAIN = ("Refused by the Project Agent's allowlist: this line uses git, gh o
 VARIABLE = ("Refused by the Project Agent's allowlist: {} sets a git or gh variable (GIT_*, GH_*), which changes what the "
             "allowed git and gh commands do. Run the command without it. If it is needed, stop and report this to the "
             "Project Agent with hc send. There is no override.")
+# t-007 part 7b: the person's own commands. A word whose last path part is one of these (any case) involves them.
+PERSON_ONLY = ("pa-push-main", "pa-push-allow", "pa_push.py")
+PERSON_MSG = ("Refused by the Project Agent's allowlist: {}. pa-push-main and pa-push-allow are the person's commands: a "
+              "main branch is pushed only when the person answers a push card in the panel. Say in your report that the "
+              "work is ready to release. There is no override.")
 SHOWN = 300  # longest command or path quoted back in a message
 
 
@@ -147,9 +154,14 @@ def program(word):
 DASHED = re.compile(r"^git-[a-z0-9][a-z0-9-]*$")  # git-push, git-lfs: git's own programs, run without git
 
 
+def person_only(word):
+    """The word names one of the person's own tools (PERSON_ONLY): its last path part, in any case."""
+    return program(word) in PERSON_ONLY
+
+
 def is_name(word):
     p = program(word)
-    return p in NAMES or bool(DASHED.match(p))
+    return p in NAMES or bool(DASHED.match(p)) or p in PERSON_ONLY
 
 
 def involves(words):
@@ -158,7 +170,9 @@ def involves(words):
     return any(is_name(w) or (ASSIGN.match(w) and involves_text(w.split("=", 1)[1])) for w in words)
 
 
-WHOLE_WORD = re.compile(r"(?<![\w.-])(git|gh|hc|git-[a-z0-9-]*[a-z0-9])(?![\w.-])", re.IGNORECASE)
+WHOLE_WORD = re.compile(r"(?<![\w.-])(git|gh|hc|git-[a-z0-9-]*[a-z0-9]|pa-push-main|pa-push-allow|pa_push\.py)(?![\w.-])",
+                        re.IGNORECASE)
+PERSON_WORD = re.compile(r"(?<![\w.-])(pa-push-main|pa-push-allow|pa_push\.py)(?![\w.-])", re.IGNORECASE)
 # A shell started with text to run, or eval: its quoted text is a command line of its own. env -S splits its text too.
 WRAPPERS = ("sh", "bash", "zsh", "dash", "ksh", "csh", "tcsh", "fish", "watch", "eval")
 SPLIT_STRING = re.compile(r"^(-[A-Za-z]*S|--sp)")
@@ -191,6 +205,15 @@ def involves_text(line):
     with $'...' decoded and each expansion that may be empty taken out (gi$''t, $'\\x67it', gi${X}t are git), and with a
     visible default value put in and command substitutions taken out (${X:-git}, gi$(:)t, gi`:`t are git).
     Used for a line that is not plain, and for each word of a plain line that starts a shell or eval."""
+    return names_in_text(line, WHOLE_WORD)
+
+
+def person_text(line):
+    """One of the person's own tools (PERSON_ONLY) appears in the text, read the way involves_text reads it."""
+    return names_in_text(line, PERSON_WORD)
+
+
+def names_in_text(line, pattern):
     decoded = re.sub(r"\$'((?:[^'\\]|\\.)*)'", ansi_c, line, flags=re.DOTALL).replace('$"', '"')
     valued = DEFAULT_VALUE.sub(lambda m: m.group(1), decoded)
     for _ in range(8):  # innermost first: gi$(echo $(true))t
@@ -198,7 +221,7 @@ def involves_text(line):
         if not found:
             break
     texts = (line, decoded, MAY_BE_EMPTY.sub("", decoded), MAY_BE_EMPTY.sub("", valued))
-    return any(WHOLE_WORD.search(re.sub(r"[\"'\\]", "", t)) for t in texts)
+    return any(pattern.search(re.sub(r"[\"'\\]", "", t)) for t in texts)
 
 
 def wraps(commands):
@@ -740,6 +763,8 @@ def check_command(line, pa_address=None, own_address=None, extra_rows=(), cwd=No
     """
     scanned = split_plain_ops(line or "")
     if scanned is None:
+        if person_text(line):
+            return PERSON_MSG.format(shown(line))
         variable = git_variable(text_commands(line))
         if variable is not None:
             return VARIABLE.format(shown(variable))
@@ -748,6 +773,13 @@ def check_command(line, pa_address=None, own_address=None, extra_rows=(), cwd=No
     extra = None
     wrapped = wraps(commands)
     places = folders(commands, ops, starts_of(cwd))
+    for words in commands:
+        # The person's own tools first, with their own message; message texts (git commit -m, hc send) aside.
+        skip = message_skips(words)
+        if any(i not in skip and (person_only(w) or (ASSIGN.match(w) and person_text(w.split("=", 1)[1]))
+                                  or (wrapped and (person_text(w) or person_text(wrapped_text(w)))))
+               for i, w in enumerate(words)):
+            return PERSON_MSG.format(shown(" ".join(shlex.quote(w) for w in words)))
     variable = git_variable(commands)
     if variable is None and wrapped:
         # REVIEW-7 I1: an eval or shell -c text is a line of its own; R12 applies to it (message texts aside).
