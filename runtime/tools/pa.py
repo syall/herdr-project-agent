@@ -19,6 +19,9 @@ One file, selected by the name it is invoked as (symlinks in ~/.local/bin):
   pa-sync --on MACHINE [--dry-run]               copy core/, tools/ and profiles/ to another Herdr machine
   pa-core-check                                  fail if the generic core names a profile's tools
 
+In pa_costs.py (see its docstring), linked as pa-costs: cost tracking per space (collect, report,
+reconstruct, prices, billed ...). Tokens are measured; money is an estimate from the profile's price table.
+
 In pa_push.py (see its docstring): pa-push-main plan|check|run, the person's push card, and
 pa-push-allow show|add|remove|on|off, the person's push allowlist. pa-decide refuses a push card.
 """
@@ -1096,6 +1099,13 @@ def cmd_doctor(args):
         elif card["status"] == "open":
             open_cards += 1
     notes.append("{} open decision(s)".format(open_cards))
+    costs = os.path.join(directory, "costs")
+    if os.path.isdir(costs):  # the Costs view's records (pa-costs); a note only, never a problem
+        summary = read_json(os.path.join(costs, "summary.json"), None) if os.path.isfile(os.path.join(costs, "summary.json")) else None
+        updated = summary.get("updated") if isinstance(summary, dict) and isinstance(summary.get("updated"), str) else None
+        notes.append("costs/: {:.1f} KB ({})".format(folder_size(costs) / 1024.0, "summary updated " + updated if updated else "no summary yet"))
+    else:
+        notes.append("costs/: none yet")
     term = hc_get(agent.get("terminal"))
     running = term.get("state") == "live" and (term.get("labels") or {}).get("herdr.pa") == agent.get("space")
     notes.append("agent {} in terminal {}".format("running" if running else "NOT running", agent.get("terminal")))

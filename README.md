@@ -6,9 +6,9 @@ company's tools; a profile maps its terms to real ones.
 
 | Folder | Installed to | What it is |
 |---|---|---|
-| `mods/project-agent/` | `~/.config/herdr-app/mods/project-agent/` | The panel (decisions, tasks, rules, schedule), the new-space setup dialog, the pass timer, and the keeper that tracks each Project Agent tab |
+| `mods/project-agent/` | `~/.config/herdr-app/mods/project-agent/` | The panel (decisions, tasks, rules, costs, schedule), the new-space setup dialog, the pass timer, and the keeper that tracks each Project Agent tab |
 | `runtime/core/` | `~/.config/herdr-pa/core/` | The orchestrator and worker prompts, the SDLC, default rules, hook wrappers |
-| `runtime/tools/` | `~/.config/herdr-pa/tools/` | The `pa-*` commands (`pa.py`, `pa_hooks.py`), linked into `~/.local/bin` |
+| `runtime/tools/` | `~/.config/herdr-pa/tools/` | The `pa-*` commands (`pa.py`, `pa_hooks.py`, `pa_costs.py`, `pa_push.py`), linked into `~/.local/bin` |
 | `runtime/profiles/personal/` | `~/.config/herdr-pa/profiles/personal/` | A profile for personal development |
 
 ## Install
@@ -180,6 +180,54 @@ repositories you name, a **push card** lets you push it yourself with one click 
 - **Turning it off:** set `"enabled": false` on the file or on an entry, run `pa-push-allow off`,
   or delete the file. It applies at the next check: open push cards show the refusal. Nothing
   else needs undoing.
+
+## Costs per space
+
+`pa-costs` adds up what each space spends, from the usage counters in the session files of the
+sessions started for it (never their text). Tokens are measured; **every money figure is an
+estimate** (`est.`) from the price table in the profile (`profiles/<name>/prices.json`; this repo
+ships none, so without one the figures are tokens only).
+
+- `pa-costs collect [--space ID] [--quiet]` reads the new bytes of the space's session files into
+  `spaces/<id>/costs/` and rewrites `costs/summary.json`. The panel's timer runs it on the space's
+  machine: every 120 s while that space's Costs view is shown, every 30 min otherwise.
+- `pa-costs report [--by KEY] [--json] [--billed]` prints the same figures as the Costs view;
+  `pa-costs report --account-wide` prints the estimates of every space on the machine with the
+  same account label.
+- `pa-costs reconstruct [--dry-run]` finds the space's sessions from before launch records existed,
+  best effort, marked `reconstructed` (◌ in the view). The view's `Reconstruct from session files` runs it.
+- `pa-costs prices` shows the table in use and the models seen without a price.
+
+A price table, in the profile:
+```json
+{"v": 1, "currency": "<code>", "unit": "per-1M-tokens", "source": "<where from>", "asOf": "2026-11-01",
+ "models": {"model-a": [{"validFrom": "2026-11-01", "in": 1.0, "out": 5.0, "cw5m": 1.25, "cw1h": 2.0, "cr": 0.1}]}}
+```
+A model with no price is shown as tokens with `no price`, never as 0.00; a total that leaves part of
+the use unpriced says `+ unpriced`.
+
+**The Costs view** (Project panel, fourth tab) reads only `costs/summary.json` on the space's machine,
+only while it is shown, at most every 10 s. It shows Total, Today and Last 7 days, then the spend by
+activity, task, session type and day, each with its drill-down, and `Refresh` (runs `pa-costs
+collect`). Nothing in it writes anything except those two buttons and `Turn off` below.
+
+**Billed amounts** (optional): rows in a neutral shape in `<HERDR_PA_HOME>/billing/billed.jsonl` on
+the panel's machine (`{account, from, to, label, model, kind, quantity, unit, amount, currency, final,
+accountWide, source}`), from a script the profile declares:
+- `pa-costs billed import <file> --via <importer>` takes rows from a file you exported;
+- the scheduled billing query: a read-only query script in the profile, run with a read-only
+  credential **you** name. Nothing runs until you turn it on, in your own terminal:
+  `pa-costs billed enable --query <name> --credential <read-only profile> --read-only-match <pattern>`.
+  Then the panel's timer asks it at most once an hour and it queries at most **once a day** (at most 3
+  runs a UTC day, at most 3 requests each); the profile states the fee per request, and the view shows
+  it with the last run. `pa-costs billed disable`, or `Turn off` in the Costs view, turns it off
+  (billed rows are kept). Agents and workers cannot run `enable`, `fetch` or `import`.
+- `pa-costs billed status`, `list`, `remove <id>`; `pa-costs billed compare --json` (read-only) is
+  what the view shows: estimated (this space, all spaces here) beside billed, per model.
+
+Billed figures are **account-wide**: they include use outside this space and outside Herdr, so they
+are never shown as this space's spend. A price factor (from billed quantities) gives a `calibrated`
+figure beside `est.`; a scope ratio is shown but never applied.
 
 ## Profiles
 

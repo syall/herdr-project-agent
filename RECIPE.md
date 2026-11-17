@@ -16,7 +16,8 @@ A right-panel view on the theme's `chrome` background, text 11 to 13 px, top to 
    custom number, Off, quiet hours and "Only while tasks are active". Quiet hours' Set takes an
    empty field as the time it shows (19:00 to 08:00); a typed time is 24-hour H:MM or HH:MM, and
    one that is not gets a message naming the field and what was typed.
-4. Three view pills: `Decisions · n`, `Tasks · n`, `Rules · n`.
+4. Four view pills: `Decisions · n`, `Tasks · n`, `Rules · n`, `Costs` (with the space's estimated
+   total once read, `Costs · 12.34 est.`).
 5. The chosen view, scrolling: cards with a 1 px border and 7 px corners on `surface`.
 
 A new space opens with a 600 x 440 dialog: a Project Agent card (`Set up for <folder>`,
@@ -78,6 +79,14 @@ A new space opens with a 600 x 440 dialog: a Project Agent card (`Set up for <fo
   `scheduled pass` when due, never while the agent is `working` or `blocked`. On-demand passes
   queue the same way.
 - **No agent in the space:** a short explanation and, outside the home folder, a start button.
+- **Costs:** the header names the price table (`Estimated from <source> prices as of <date>
+  (<currency>) · updated 2 min ago · Refresh`), then tiles Total, Today, Last 7 days, then By
+  activity, By task, By session type (kind, role, program, model, machine), By day; a row opens its
+  drill-down (one per section). Every money figure is an estimate and says `est.`; one with no price
+  says `no price`, a partial one `+ unpriced`. Billed amounts, when there are any, sit below,
+  labelled `billed · account-wide`. The timer collects every 120 s while a Costs view shows the
+  space, every 30 min otherwise; the view reads `costs/summary.json` only while it is shown.
+  With no records: `Reconstruct from session files`. The billing query's line has `Turn off`.
 
 ## Pushing main from the panel
 
@@ -183,6 +192,10 @@ push card can be made and nothing about pushing changes. Agents never push a mai
 - Scheduled passes need Herdr's window open. The minimum cadence is 5 minutes. Rule fields are
   single-line inputs.
 - Without the runtime in `~/.config/herdr-pa` every space shows "no Project Agent".
+- Costs are an estimate: tokens times the profile's price table, which can differ from the bill.
+  Billed figures are account-wide (other use of the account is in them). Reconstruction is best
+  effort, from the session files still on disk; the programs sweep old ones after their retention.
+  A remote space's billed comparison passes its summary (at most 100 KB) to the local `pa-costs`.
 
 ## Done when
 
