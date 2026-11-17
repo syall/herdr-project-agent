@@ -2019,6 +2019,14 @@ class T016J2_Limits(T016J2):
             with self.subTest(line=line):
                 self.assertIsNone(self.w(line))
 
+    def test_ac5_3_bsd_first_operand(self):  # REVIEW-J2-R2 M1: BSD touch/truncate read no option after the first operand
+        for line, target in [("truncate -s 0 build/a -r .git/index", ".git/index"), ("touch build/a -r .git/x", ".git/x"),
+                             ("touch build/a --reference .git/config", ".git/config"), ("touch -- x -r .git/y", ".git/y"),
+                             ("rm -r .git/x", ".git/x"), ("rm -- a -/../.git/x", "-/../.git/x")]:  # the last three: VERIFY-J2-R2 pins
+            with self.subTest(line=line):
+                self.refused(line, target)
+        self.assertIsNone(self.w("touch -r .git/HEAD -r .git/index build/x"))
+
     def test_ac5_4_command_options(self):
         self.assertEqual(self.w("command -p cd .git && echo x > config"),
                          FOLDER_UNKNOWN.format(word="command -p cd .git", target="config"))
