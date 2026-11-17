@@ -60,7 +60,7 @@ def split_plain(line):
     return None if scanned is None else scanned[0]
 
 
-def split_plain_ops(line, writes=False):
+def split_plain_ops(line, writes=False, bare=False):
     """(commands, operators) of a plain line: operators[i] is the ; && || | after commands[i] (None after the last).
     None when the line is not plain.
 
@@ -69,8 +69,9 @@ def split_plain_ops(line, writes=False):
     stash@{0} and HEAD@{1}), unquoted glob characters * ? [, a # or = starting a word, an unquoted line
     break or line continuation, an unterminated quote, an empty command between operators.
     writes=True (t-016): also plain are > >> < &> &>> (an fd's digits before them dropped), each followed by a word, and
-    >&N N>&M >&- <&N; $HOME or ${HOME} starting a word (bare or in double quotes) is the home. Returns (commands,
+    >&N N>&M >&- <&N; $HOME or ${HOME} starting a word (unquoted or in double quotes) is the home. Returns (commands,
     operators, targets): targets[i] the words after commands[i]'s output redirects (an input's word is a read).
+    bare=True (with writes, for check_writes): a command of redirects only (> x) is kept, with no words.
     """
     s = line.strip()
     commands, ops, words, word = [], [], [], []
@@ -175,9 +176,9 @@ def split_plain_ops(line, writes=False):
         return commands, ops
     targets = []
     for k, words in enumerate(commands):  # each mark takes the word after it out of the command's words
-        marks = [j for j, w in enumerate(words) if isinstance(w, tuple)]
-        if any(j + 1 == len(words) or j + 1 in marks for j in marks) or len(words) == 2 * len(marks):
-            return None  # a redirect without its word, or a command of redirects only
+        marks = dict.fromkeys(j for j, w in enumerate(words) if isinstance(w, tuple))  # in order; one lookup each
+        if any(j + 1 == len(words) or j + 1 in marks for j in marks) or not bare and len(words) == 2 * len(marks):
+            return None  # a redirect without its word, or (bare=False) a command of redirects only
         targets.append([words[j + 1] for j in marks if words[j] == (">",)])
         commands[k] = [w for j, w in enumerate(words) if j not in marks and j - 1 not in marks]
     return commands, ops, targets
@@ -284,16 +285,28 @@ PIPE_READERS = WRAPPERS + ("source", ".")
 FILTERS = ("grep", "rg", "head", "tail", "wc", "sort", "uniq", "cut", "tr", "tee", "cat", "less", "jq", "column")
 
 
+def from_program(words):
+    """The words from the program word on: leading NAME=value words skipped (the last word is always kept)."""
+    return words[next((k for k, w in enumerate(words) if k == len(words) - 1 or not ASSIGN.match(w)), 0):]
+
+
 def runs_input(words):
     """A command after a | runs what it reads. Leading NAME=value words are skipped. Launcher options are not parsed."""
-    k = 0
-    while k < len(words) - 1 and ASSIGN.match(words[k]):
-        k += 1
-    first = program(words[k])
+    words = from_program(words)
+    first = program(words[0])
     if first in FILTERS:
         return False
-    named = [w for w in words[k + 1:] if not w.startswith("-")]
-    return first in PIPE_READERS or wraps([words[k:]]) or bool(named) and program(named[0]) in ("source", ".")
+    named = [w for w in words[1:] if not w.startswith("-")]
+    return first in PIPE_READERS or wraps([words]) or bool(named) and program(named[0]) in ("source", ".")
+
+
+def filters_only(commands, ops, k):
+    """Every command piped after commands[k] is a known text filter (FILTERS; tee only when it names no file)."""
+    while ops[k] == "|":
+        k, words = k + 1, from_program(commands[k + 1])
+        if program(words[0]) not in FILTERS or program(words[0]) == "tee" and operands(words[1:]):
+            return False
+    return True
 
 
 # ---- R6: the table -------------------------------------------------------------------------------
@@ -812,17 +825,19 @@ def check_command(line, pa_address=None, own_address=None, extra_rows=(), cwd=No
     extra = None
     wrapped = wraps(commands)
     places = folders(commands, ops, starts_of(cwd))
-    for words, here in zip(commands, places):
+    for k, (words, here) in enumerate(zip(commands, places)):
         # The person's own tools first, with their own message; message texts (git commit -m, hc send) aside. A git line
-        # that a built-in row allows runs git, not them: its words are paths (git add pa_push.py; card d-067); one that no
-        # row allows gets the off-table refusal below. A line only a profile row allows is checked here as before.
-        ctx = {"pa_address": pa_address, "own_address": own_address, "cwd": here}
+        # that a built-in row allows runs git, not them: its words are paths (git add pa_push.py; card d-067), unless
+        # it is piped into anything but a text filter (git show HEAD:pa_push.py | python3). One that no row allows
+        # gets the off-table refusal below. A line only a profile row allows is checked here as before.
+        ctx, skip = {"pa_address": pa_address, "own_address": own_address, "cwd": here}, message_skips(words)
         if words[0] == "git" and not allowed(words, ALLOWLIST, ctx) and extra is None:
             extra = list((extra_rows() if callable(extra_rows) else extra_rows) or [])
-        if words[0] == "git" and (allowed(words, ALLOWLIST, ctx) or not allowed(words, extra, ctx)):
+        piped = words[0] == "git" and any(i not in skip and person_text(w) for i, w in enumerate(words)) \
+            and not filters_only(commands, ops, k)
+        if words[0] == "git" and not piped and (allowed(words, ALLOWLIST, ctx) or not allowed(words, extra, ctx)):
             continue
-        skip = message_skips(words)
-        if any(i not in skip and (person_only(w) or (ASSIGN.match(w) and person_text(w.split("=", 1)[1]))
+        if piped or any(i not in skip and (person_only(w) or (ASSIGN.match(w) and person_text(w.split("=", 1)[1]))
                                   or (wrapped and (person_text(w) or person_text(wrapped_text(w)))))
                for i, w in enumerate(words)):
             return PERSON_MSG.format(shown(" ".join(shlex.quote(w) for w in words)))
@@ -965,12 +980,12 @@ def folder_change(words, here, cdpath):
 
 def check_writes(line, spaces_dir, cwd=None, home=None):
     """None when a plain Bash line writes nothing check_edit protects; else WRITE or FOLDER_UNKNOWN (spec t-016)."""
-    scanned = split_plain_ops(line or "", writes=True) or ([], None, [])  # a line that is not plain is not judged
+    scanned = split_plain_ops(line or "", writes=True, bare=True) or ([], None, [])  # a line that is not plain is not judged
     tops = (forms(spaces_dir), forms(home), personal_settings())
     here, cdpath, unknown = list(starts_of(cwd)), bool(os.environ.get("CDPATH")), None
     for words, outs in zip(scanned[0], scanned[2]):
-        words = words[next(k for k, w in enumerate(words) if k == len(words) - 1 or not ASSIGN.match(w)):]
-        for t in [t for t in outs + file_targets(words) if t and (t[:1] != "~" or t == "~" or t.startswith("~/"))]:
+        words = from_program(words) or [""]  # [] when the command is redirects only (> x)
+        for t in [t for t in dict.fromkeys(outs + file_targets(words)) if t and (t[:1] != "~" or t == "~" or t.startswith("~/"))]:
             full = os.path.expanduser(t)  # ~x forms other than ~ and ~/ are skipped
             if not os.path.isabs(full) and unknown:
                 return FOLDER_UNKNOWN.format(word=shown(unknown), target=shown(t))
