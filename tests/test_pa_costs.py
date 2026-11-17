@@ -2684,9 +2684,10 @@ class T9_BilledCompare(BillingBase):
 
 class T9_SummaryDrill(Collecting):
     """T-b (plan-panel D10): byActivity entries carry their top tasks; unattributed carries its reasons."""
+    mixed = S_Summary.mixed
 
     def test_sumx1_activity_tasks_and_unattributed_reasons(self):
-        s = S_Summary.mixed(self)
+        s = self.mixed()
         for a in s["byActivity"]:
             self.assertIn("tasks", a, a["key"])
             self.assertLessEqual(len(a["tasks"]), 8)
@@ -2711,6 +2712,8 @@ class T9_SummaryDrill(Collecting):
         S_Summary.test_s2_summary_stays_under_64_kb(self)
         s = load(self.costs("summary.json"))
         self.assertTrue(all("tasks" in a for a in s["byActivity"]))
+
+    def test_sumx2b_s1_still_holds_with_the_drill_fields(self):
         S_Summary.test_s1_every_breakdown_sums_to_the_totals(self)
 
 
