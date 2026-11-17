@@ -329,24 +329,48 @@ def applies(rule, task, phase):
     return target in ("all", phase, str(task.get("type", "")).lower(), str(task.get("tier", "")).lower() + " tier")
 
 
-def cmd_gate(args):
-    record = find_task(os.getcwd())
-    space = pa.local_id(args.space or (record or {}).get("space") or space_from_terminal() or "")
-    if not space:
-        base = os.path.join(pa.ROOT, "spaces")
-        owners = [n for n in (os.listdir(base) if os.path.isdir(base) else [])
-                  if any(t.get("id") == args.task for t in (pa.read_json(os.path.join(base, n, "ledger.json"), {}) or {}).get("tasks", []))]
-        if len(owners) != 1:
-            raise pa.Problem("pass --space <id> ({} spaces have a task {})".format(len(owners), args.task))
-        space = owners[0]
-    directory, _agent, _profile = load_context(space)
-    ledger = pa.read_json(os.path.join(directory, "ledger.json"), {}) or {}
-    task = next((t for t in ledger.get("tasks", []) if t.get("id") == args.task), None)
-    if not task:
-        raise pa.Problem("no task {} in {}".format(args.task, os.path.join(directory, "ledger.json")))
-    phase = (args.phase or "review").lower()
-    if phase not in PHASES:
-        raise pa.Problem("unknown phase {!r}; one of {}".format(phase, ", ".join(PHASES)))
+def gate_commits(worktree):
+    """The pin: the commit(s) a gate run saw in a task's worktree. One entry when the folder is a git top level,
+    one for each src/<name> child that is (a folder of packages), else []. Never raises; records, never fails."""
+    if not worktree or not os.path.isdir(worktree):
+        return []
+    root = os.path.realpath(worktree)
+
+    def entry(path):
+        code, top, _ = git(path, "rev-parse", "--show-toplevel")
+        if code or not top or os.path.realpath(top) != path:
+            return None
+        code, common, _ = git(path, "rev-parse", "--path-format=absolute", "--git-common-dir")
+        if code or not common:  # git older than 2.31: no --path-format
+            code, common, _ = git(path, "rev-parse", "--git-common-dir")
+            common = os.path.join(path, common) if not code and common else None
+        _c, branch, _ = git(path, "symbolic-ref", "--short", "-q", "HEAD")
+        code, commit, _ = git(path, "rev-parse", "--verify", "-q", "HEAD")
+        _c, status, _ = git(path, "status", "--porcelain", "--untracked-files=no")
+        # "XY path" (git() strips the output, so the first line may have lost a leading space)
+        changed = [l for l in status.splitlines() if l.strip() and not l.split(None, 1)[-1].strip('"').startswith(".claude/")]
+        return {"repo": path, "common": os.path.realpath(common) if common else None, "branch": branch or None,
+                "commit": commit if not code and commit else None, "uncommitted": len(changed)}
+
+    one = entry(root)
+    if one:
+        return [one]
+    src = os.path.join(root, "src")
+    if not os.path.isdir(src):
+        return []
+    found = []
+    for name in sorted(os.listdir(src)):
+        path = os.path.join(src, name)
+        if os.path.isdir(path) and not os.path.islink(path):
+            e = entry(path)
+            if e:
+                found.append(e)
+    return found
+
+
+def evaluate_gate(directory, task, phase, rules=None):
+    """The gate's verdict for one ledger task, as GATE.json holds it. Reads only: writes and prints nothing.
+    rules: the space's rules list (default: read from rules.json in directory)."""
     tier = str(task.get("tier") or "normal").lower()
     code = bool(task.get("worktree")) or str(task.get("type", "")).lower() in ("feature", "bug", "chore", "code")
     # Leaving `review` (the default) needs every earlier phase's artifact too.
@@ -358,11 +382,12 @@ def cmd_gate(args):
             needed.append(name)
     if code and phase in ("test", "review"):
         needed.append("build.log")
-    rules = (pa.read_json(os.path.join(directory, "rules.json"), {}) or {}).get("rules", [])
+    if rules is None:
+        rules = (pa.read_json(os.path.join(directory, "rules.json"), {}) or {}).get("rules", [])
     for rule in rules:
         if rule.get("status") == "active" and applies(rule, task, phase):
             needed.extend(str(x) for x in rule.get("evidence", []) if isinstance(x, str))
-    evidence = os.path.join(directory, "evidence", args.task)
+    evidence = os.path.join(directory, "evidence", task.get("id"))
     checks, ok = [], True
     for name in dict.fromkeys(needed):
         path = os.path.normpath(os.path.join(evidence, name))
@@ -382,12 +407,35 @@ def cmd_gate(args):
         checks.append({"check": "reviewer is not the author", "ok": separate,
                        **({} if separate else {"why": "the ledger lists no reviewer worker separate from the build workers"})})
     ok = all(c["ok"] for c in checks)
-    result = {"task": args.task, "phase": phase, "tier": tier, "passed": ok, "at": pa.now(), "checks": checks}
+    return {"task": task.get("id"), "phase": phase, "tier": tier, "passed": ok, "at": pa.now(), "checks": checks,
+            "commits": gate_commits(task.get("worktree"))}
+
+
+def cmd_gate(args):
+    record = find_task(os.getcwd())
+    space = pa.local_id(args.space or (record or {}).get("space") or space_from_terminal() or "")
+    if not space:
+        base = os.path.join(pa.ROOT, "spaces")
+        owners = [n for n in (os.listdir(base) if os.path.isdir(base) else [])
+                  if any(t.get("id") == args.task for t in (pa.read_json(os.path.join(base, n, "ledger.json"), {}) or {}).get("tasks", []))]
+        if len(owners) != 1:
+            raise pa.Problem("pass --space <id> ({} spaces have a task {})".format(len(owners), args.task))
+        space = owners[0]
+    directory, _agent, _profile = load_context(space)
+    ledger = pa.read_json(os.path.join(directory, "ledger.json"), {}) or {}
+    task = next((t for t in ledger.get("tasks", []) if t.get("id") == args.task), None)
+    if not task:
+        raise pa.Problem("no task {} in {}".format(args.task, os.path.join(directory, "ledger.json")))
+    phase = (args.phase or "review").lower()
+    if phase not in PHASES:
+        raise pa.Problem("unknown phase {!r}; one of {}".format(phase, ", ".join(PHASES)))
+    result = evaluate_gate(directory, task, phase)
+    evidence, checks, ok = os.path.join(directory, "evidence", args.task), result["checks"], result["passed"]
     if os.path.isdir(evidence):
         pa.write_json(os.path.join(evidence, "GATE.json"), result)
     for c in checks:
         print("{}  {}{}".format("ok  " if c["ok"] else "FAIL", c["check"], "" if c["ok"] else "  ({})".format(c["why"])))
-    print("pa-gate {} ({} phase, {} tier): {}".format(args.task, phase, tier, "PASSED" if ok else "FAILED. The task does not move."))
+    print("pa-gate {} ({} phase, {} tier): {}".format(args.task, phase, result["tier"], "PASSED" if ok else "FAILED. The task does not move."))
     sys.exit(0 if ok else 1)
 
 
