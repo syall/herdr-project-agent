@@ -2602,6 +2602,118 @@ class F6_CollectFailure(Collecting):
 ABSENT = object()
 
 
+# ---- t-009 part A, second half, step 9a: what the Costs view reads (T-a billed compare --json, T-b drill fields) ----
+
+class T9_BilledCompare(BillingBase):
+    """T-a (plan-panel D9): `pa-costs billed compare --json` prints the comparison, the query status and the row count."""
+
+    def space_summary(self):
+        days = ["2026-11-1{}".format(i) for i in range(3, 6)]
+        bdm = [{"day": d, "model": "model-a", "tokens": toks(out=1000000), "money": 8.0} for d in days]
+        return {"v": 1, "space": "sp1", "updated": "2026-11-17T09:00:00Z", "account": "acct1",
+                "prices": {"profile": "test", "source": "test table", "asOf": "2026-11-01", "currency": "USD", "missing": []},
+                "byDayModel": bdm}
+
+    def setUp(self):
+        super().setUp()
+        self.s = self.space_summary()
+        dump(self.s, self.costs("summary.json"))
+        days = ["2026-11-1{}".format(i) for i in range(3, 6)]
+        rows = [pa_costs.validate_row(brow(day=d, amount=12.5, quantity=1000000, unit="tokens"), "query:q1", "acct1", T0) for d in days]
+        rows.append(pa_costs.validate_row(brow(day="2026-11-14", amount=7.0, account="acct2"), "query:q1", "acct2", T0))
+        pa_costs.append_billed(rows)
+
+    def compare_json(self, *argv):
+        result, out, err = self.run_cmd(pa_costs.main, ["billed", "compare", "--json"] + list(argv))
+        self.assertEqual(result, 0, err)
+        return json.loads(out)
+
+    def expected(self):
+        table, _p = pa_costs.load_prices(pa.load_profile("test"))
+        return pa_costs.billing_comparison(pa_costs.effective_billed(), self.s, pa_costs.account_wide_summary("acct1", T0), table)
+
+    def test_cmp1_local_space_gives_the_comparison(self):
+        j = self.compare_json("--space", "sp1")
+        self.assertEqual(j["comparison"], self.expected())
+        m = j["comparison"]["models"][0]
+        self.assertEqual((m["model"], m["factor"]["kind"]), ("model-a", "price"))
+        self.assertAlmostEqual(m["factor"]["value"], 1.25)
+        self.assertTrue(j["comparison"]["accountWide"])
+
+    def test_cmp2_summary_and_here_as_arguments_give_the_same(self):
+        here = pa_costs.account_wide_summary("acct1", T0)
+        j = self.compare_json("--summary-json", json.dumps(self.s), "--here-json", json.dumps(here))
+        self.assertEqual(j["comparison"], self.expected())
+        big = json.dumps(dict(self.s, pad="x" * (100 * 1024 + 1)))
+        with self.assertRaises(pa.Problem) as e:
+            pa_costs.main(["billed", "compare", "--json", "--summary-json", big])
+        self.assertIn("100 KB", str(e.exception))
+        with self.assertRaises(pa.Problem) as e:
+            pa_costs.main(["billed", "compare", "--json", "--summary-json", "{not json"])
+        self.assertIn("not JSON", str(e.exception))
+
+    def test_cmp3_status_fields_and_rows_of_this_account_only(self):
+        pa_costs.set_billing_config({"query": "q1", "credential": "ExampleReadOnly", "readOnlyMatch": "ReadOnly$", "enabled": True})
+        j = self.compare_json("--space", "sp1")
+        st = j["status"]
+        self.assertEqual((st["feePerRequest"], st["feeCurrency"], st["maxPages"], st["runsPerDay"]), (0.01, "USD", 3, 3))
+        self.assertTrue(st["config"]["enabled"])
+        self.assertIn("Billing query:", st["line"])
+        self.assertIn("state", st)
+        self.assertEqual(j["rows"], 3)
+
+    def test_cmp4_read_only_and_allowed_inside_an_agent(self):
+        os.environ["CLAUDECODE"] = "1"
+        try:
+            j = self.compare_json("--space", "sp1")
+        finally:
+            os.environ.pop("CLAUDECODE")
+        self.assertEqual(j["rows"], 3)
+        tool = "pa-" + "costs"
+        self.assertEqual(W_CloseAndGuard.guard(self, tool + " billed compare --json --space sp1")[0], 0)
+        self.assertEqual(W_CloseAndGuard.guard(self, tool + " billed fetch --now")[0], 2)
+        self.assertFalse(os.path.exists(os.path.join(pa.ROOT, "billing", "query-state.json")))
+
+    def test_cmp5_no_billed_file(self):
+        os.unlink(os.path.join(pa.ROOT, "billing", "billed.jsonl"))
+        j = self.compare_json("--space", "sp1")
+        self.assertEqual(j["rows"], 0)
+        self.assertIsNone(j["comparison"]["covered"])
+        self.assertIsNone(j["status"]["config"])
+
+
+class T9_SummaryDrill(Collecting):
+    """T-b (plan-panel D10): byActivity entries carry their top tasks; unattributed carries its reasons."""
+
+    def test_sumx1_activity_tasks_and_unattributed_reasons(self):
+        s = S_Summary.mixed(self)
+        for a in s["byActivity"]:
+            self.assertIn("tasks", a, a["key"])
+            self.assertLessEqual(len(a["tasks"]), 8)
+            for t in a["tasks"]:
+                self.assertEqual(sorted(k for k in t if k in ("key", "tokens", "money")), ["key", "money", "tokens"])
+                self.assertLessEqual(t["tokens"], a["tokens"])
+                if a["money"] is not None and t["money"] is not None:
+                    self.assertLessEqual(t["money"], a["money"] + 1e-6)
+            if len(a["tasks"]) < 8:
+                self.assertEqual(sum(t["tokens"] for t in a["tasks"]), a["tokens"], a["key"])
+        acts = {a["key"]: a for a in s["byActivity"]}
+        self.assertIn("t-001", [t["key"] for t in acts["cache-rebuild"]["tasks"]])
+        un = acts.get("unattributed")
+        self.assertIsNotNone(un, [a["key"] for a in s["byActivity"]])
+        self.assertTrue(un["reasons"])
+        self.assertEqual(sum(r["tokens"] for r in un["reasons"]), un["tokens"])
+        for a in s["byActivity"]:
+            if a["key"] != "unattributed":
+                self.assertNotIn("reasons", a)
+
+    def test_sumx2_still_under_64_kb_and_sums_hold(self):
+        S_Summary.test_s2_summary_stays_under_64_kb(self)
+        s = load(self.costs("summary.json"))
+        self.assertTrue(all("tasks" in a for a in s["byActivity"]))
+        S_Summary.test_s1_every_breakdown_sums_to_the_totals(self)
+
+
 class I1_Install(unittest.TestCase):
     def test_i1_install_links_pa_costs(self):
         with open(os.path.join(HERE, "..", "install.sh")) as f:
