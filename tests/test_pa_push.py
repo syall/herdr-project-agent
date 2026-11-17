@@ -1175,5 +1175,23 @@ class Act(Runs):
         self.assertEqual(git_calls(self.calls, "push"), [])
 
 
+# ---- A5: links --------------------------------------------------------------------------------
+
+class Links(unittest.TestCase):
+    def read(self, rel):
+        with open(os.path.join(REPO, rel)) as f:
+            return f.read()
+
+    def test_i01_install_links_both_names(self):
+        lines = [l for l in self.read("install.sh").splitlines() if "pa_push.py" in l]
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn("for n in pa-push-main pa-push-allow; do", lines[0])
+        self.assertIn('ln -sfn "$PA/tools/pa_push.py" "$HOME/.local/bin/$n"', lines[0])
+
+    def test_i02_parse37_lists_pa_push(self):
+        line = next(l for l in self.read("tests/run-all.sh").splitlines() if "parses as Python 3.7" in l)
+        self.assertIn("runtime/tools/pa_push.py", line)
+
+
 if __name__ == "__main__":
     unittest.main()
