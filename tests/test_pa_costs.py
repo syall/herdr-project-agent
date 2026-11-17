@@ -902,3 +902,129 @@ class C_CacheRebuild(Collecting):
         self.add(self.prompt(T0 + 1), self.call(T0 + 5000, "m1", lines=1, cw5m=90000))
         self.collect(T0 + 10000)
         self.assertEqual(self.rows()[0]["rebuild"]["calls"], 0)
+
+
+# ---- step 5: binding Codex and --continue sessions; reconstruction (R7) ---------------------------------
+
+SID3 = "77777777-8888-4999-8aaa-bbbb1111cccc"
+SID4 = "99999999-aaaa-4bbb-8ccc-dddd2222eeee"
+
+
+class B_Binding(Collecting):
+    def rollout(self, sid, t, cwd=None, out=10):
+        path = fx.codex_path(_HOMES["CODEX_HOME"], iso(t)[:10], sid)
+        fx.append(path, [fx.codex_meta(isoms(t), sid, cwd or self.project), fx.codex_turn(isoms(t + 1)),
+                         fx.codex_tokens(isoms(t + 2), inp=100, out=out)])
+        return path
+
+    def binds(self):
+        return [r for r in lines(self.costs("sessions.jsonl")) if r.get("ev") == "bind"]
+
+    def test_b1_codex_bound_in_the_launch_window(self):
+        self.record(program="codex", bind="launch-window", at=iso(T0), terminal="t6", task="t-002")
+        self.rollout(SID2, T0 + 3)
+        self.rollout(SID3, T0 + 500)  # outside the window
+        self.rollout(SID4, T0 + 3, cwd="/elsewhere")  # another folder
+        self.collect(T0 + 2000)
+        b = self.binds()
+        self.assertEqual([(x["session"], x["match"], x["confidence"], x["for"]) for x in b], [(SID2, "launch-window", "high", iso(T0) + " t6")])
+        self.assertEqual(self.totals()["out"], 10)
+        self.assertEqual({r["task"] for r in self.rows()}, {"t-002"})
+        self.collect(T0 + 2100)
+        self.assertEqual(len(self.binds()), 1)
+
+    def test_b2_two_candidates_in_start_order(self):
+        self.record(program="codex", bind="launch-window", at=iso(T0), terminal="t6", task="t-002")
+        self.record(program="codex", bind="launch-window", at=iso(T0 + 1), terminal="t7", task="t-003")
+        self.rollout(SID3, T0 + 4)
+        self.rollout(SID2, T0 + 2)
+        self.collect(T0 + 2000)
+        b = {x["for"]: x for x in self.binds()}
+        self.assertEqual((b[iso(T0) + " t6"]["session"], b[iso(T0 + 1) + " t7"]["session"]), (SID2, SID3))
+        self.assertEqual({x["confidence"] for x in b.values()}, {"medium"})
+
+    def test_b3_unbound_after_an_hour_is_a_problem(self):
+        self.record(program="codex", bind="launch-window", at=iso(T0), terminal="t6", task="t-002")
+        self.collect(T0 + 600)
+        self.assertFalse(any("t6" in p for p in load(self.costs("state.json")).get("problems", [])))
+        self.collect(T0 + 3700)
+        self.assertIn("codex session for t6 not found", load(self.costs("state.json"))["problems"])
+
+    def test_b4_claude_continue_bound_by_folder_and_start(self):
+        self.record(program="claude", bind="launch-window", resumed=True, at=iso(T0), terminal="t6", task="t-002")
+        self.add(self.prompt(T0 + 3, sid=SID3), self.call(T0 + 4, "m1", sid=SID3, lines=1, out=11), sid=SID3)
+        self.collect(T0 + 2000)
+        self.assertEqual([(x["session"], x["program"]) for x in self.binds()], [(SID3, "claude")])
+        self.assertEqual(self.totals()["out"], 11)
+
+
+class R_Reconstruct(Collecting):
+    def session(self, sid, first, last=None, cwd=None, out=10):
+        cwd = cwd or self.project
+        chunks = [fx.claude_user(isoms(first), sid, cwd)] + fx.claude_call(isoms(first + 1), sid, cwd, "m-" + sid[:4], lines=1, out=out)
+        if last:
+            chunks += [fx.claude_user(isoms(last - 1), sid, cwd)] + fx.claude_call(isoms(last), sid, cwd, "n-" + sid[:4], lines=1, out=out)
+        fx.append(fx.claude_path(pa.CLAUDE_HOME, cwd, sid), chunks)
+
+    def reconstruct(self, **kw):
+        result, out, err = self.run_cmd(pa_costs.reconstruct, self.dir, now=T0 + 5000, **kw)
+        return result, out
+
+    def binds(self):
+        return {r["session"]: r for r in lines(self.costs("sessions.jsonl")) if r.get("ev") == "bind"}
+
+    def setUp(self):
+        super().setUp()
+        self.wt = os.path.join(TMP, "wt-t-002")
+        self.ledger({"version": 1, "tasks": [{"id": "t-002", "state": "done", "worktree": self.wt, "workers": [{"address": "t5", "role": "build", "name": "t-002-build"}]},
+                                             {"id": "t-003", "state": "done", "workers": []}]})
+
+    def test_r1x_session_log_cwd_start_pairs_live_pid_and_unmatched(self):
+        write(os.path.join(self.dir, "session.log"), "{} start resume=False session={} reason=new\n".format(iso(T0), SID))
+        self.session(SID, T0 + 5, out=1)  # the Project Agent
+        self.journal({"at": iso(T0 + 100), "trigger": "report", "task": "t-002", "why": "Started build worker t5 (t-002-build)"},
+                     {"at": iso(T0 + 195), "trigger": "report", "task": "t-003", "why": "Started t7 (t-003-verify) and"},
+                     {"at": iso(T0 + 196), "trigger": "report", "task": "t-003", "why": "Started t8 (t-003-review)"},
+                     {"at": iso(T0 + 401), "trigger": "report", "task": "t-003", "why": "Read t8's report"},
+                     {"at": iso(T0 + 901), "trigger": "report", "task": "t-003", "why": "Read t7's report"})
+        self.session(SID2, T0 + 130, cwd=self.wt, out=2)  # t5 in the task's worktree
+        self.session(SID3, T0 + 200, last=T0 + 890, out=3)  # t7 (ends near its report)
+        self.session(SID4, T0 + 201, last=T0 + 395, out=4)  # t8
+        lone = "abababab-cdcd-4efe-8fef-0101abab0202"
+        self.session(lone, T0 + 3000, out=50)  # nothing names it
+        old = "cdcdcdcd-abab-4efe-8fef-0101abab0303"
+        self.session(old, T0 - 7200, out=500)  # before the space began
+        live = "efefefef-abab-4efe-8fef-0101abab0404"
+        self.session(live, T0 + 4000, out=5)
+        dump({"pid": 4242, "sessionId": live, "cwd": self.project}, os.path.join(pa.CLAUDE_HOME, "sessions", "4242.json"))
+        pa.live_terminals = lambda: {"t9": {"address": "t9", "pid": 4242, "name": "t-003-tests", "parent": "t0", "state": "live"}}
+        before = raw(self.costs("sessions.jsonl"))
+        _r, out = self.reconstruct(dry_run=True)
+        self.assertEqual(raw(self.costs("sessions.jsonl")), before)
+        self.assertFalse(os.path.exists(self.costs("turns.jsonl")))
+        self.assertIn("session-log", out)
+        self.reconstruct()
+        b = self.binds()
+        self.assertEqual((b[SID]["kind"], b[SID]["match"], b[SID]["confidence"]), ("pa", "session-log", "high"))
+        self.assertEqual((b[SID2]["task"], b[SID2]["terminal"], b[SID2]["match"], b[SID2]["confidence"]), ("t-002", "t5", "cwd+start", "medium"))
+        self.assertEqual((b[SID3]["terminal"], b[SID3]["match"], b[SID3]["confidence"]), ("t7", "end-time-pair", "low"))
+        self.assertEqual((b[SID4]["terminal"], b[SID4]["match"]), ("t8", "end-time-pair"))
+        self.assertEqual((b[live]["terminal"], b[live]["task"], b[live]["match"], b[live]["confidence"]), ("t9", "t-003", "live-pid", "high"))
+        self.assertNotIn(lone, b)
+        self.assertNotIn(old, b)
+        self.assertEqual({r["source"] for r in b.values()}, {"reconstructed"})
+        self.collect(T0 + 9000)
+        self.assertEqual(self.totals()["out"], 1 + 2 + 3 * 2 + 4 * 2 + 5)  # unmatched not in the totals
+        self.assertEqual({r["source"] for r in self.rows()}, {"reconstructed"})
+        um = [r for r in lines(self.costs("sessions.jsonl")) if r.get("ev") == "unmatched"]
+        self.assertEqual((um[-1]["sessions"], um[-1]["tokens"]), (1, 52))
+        after = raw(self.costs("sessions.jsonl"))
+        self.reconstruct()
+        self.assertEqual(raw(self.costs("sessions.jsonl")), after)  # a second run adds nothing
+
+    def test_r2x_recorded_sessions_are_not_reconstructed(self):
+        self.record(session=SID2, task="t-002", terminal="t5", name="t-002-build", cwd=self.wt)
+        self.journal({"at": iso(T0 + 100), "trigger": "report", "task": "t-002", "why": "Started build worker t5 (t-002-build)"})
+        self.session(SID2, T0 + 130, cwd=self.wt)
+        self.reconstruct()
+        self.assertEqual(self.binds(), {})
