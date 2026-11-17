@@ -981,8 +981,10 @@ def file_targets(words):
             named += [a[2:] for a in args if a.startswith("-t") and a != "-t"] + [b for a, b in zip(args, args[1:]) if a == "-t"]
         return named + operands(args) if p == "mv" or p == "install" and "-d" in args else named or operands(args)[-1:]
     if p in ("rm", "rmdir", "unlink", "touch", "mkdir", "tee", "truncate", "chmod", "chown", "chgrp"):
-        read = [j + 1 for j, a in enumerate(args) if p in ("touch", "truncate") and a in ("-r", "--reference")]
-        return operands([a for j, a in enumerate(args) if j not in read])  # touch/truncate -r <file> reads that file
+        s = [0]  # s[j], before args[j]: 0 options; 1 the value of touch/truncate -r or --reference (read, not an option); 2 after --
+        for a in args:
+            s.append(2 if s[-1] == 2 or not s[-1] and a == "--" else int(not s[-1] and p in ("touch", "truncate") and a in ("-r", "--reference")))
+        return [a for a, k in zip(args, s) if a and (k == 2 or k == 0 and not a.startswith("-"))]
     if p == "dd":
         return [a[3:] for a in args if a.startswith("of=")]
     sed = p == "sed" and any(a.startswith("--in-place") or short_cluster(a, "i") for a in args)  # -i, -Ei, -i.bak
