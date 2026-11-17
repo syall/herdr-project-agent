@@ -2013,5 +2013,89 @@ class TaskWorktrees(Base):
                            "WORKTREE-billing-script.md is written by the Project Agent's tools, not a worker's report")
 
 
+    # ---- J1 round 2 (REVIEW M1, M2; VERIFY F1): a worker's `worktree` field counts only inside its own task's worktrees ----
+    def test_tw12_worker_field_naming_another_tasks_worktree_takes_nothing_of_it(self):
+        other = self.worktree(self.proj, "t-009-other")
+        self.add_task("t-009", "in-progress", other, [{"address": "t91", "role": "build", "name": "t-009-other", "finished": True}])
+        self.add_task("t-003", "done", self.wt, [{"address": "t31", "role": "build", "name": "t-003-main", "worktree": other}])
+        t009 = json.dumps(self.ledger()["tasks"][0], sort_keys=True)
+        task = self.ledger()["tasks"][1]
+        self.assertEqual(pa_hooks.worker_tree(task, task["workers"][0]), os.path.realpath(self.wt))
+        facts, row = pa_hooks.worker_facts(self.dir, {"terminal": "t0"}, None, "t31")
+        self.assertEqual(facts["worktree"]["path"], os.path.realpath(self.wt))
+        self.assertIn("t-003", row["tasks"])
+        self.assertNotIn(os.path.realpath(other), [w["path"] for w in pa.task_worktrees(task)])
+        rows = pa_hooks.worktree_state(self.dir, {"terminal": "t0"})
+        self.assertEqual([w["address"] for w in rows[os.path.realpath(other)]["workers"]], ["t91"])
+        code, out, err = self.worker("delete", "t31")
+        self.assertEqual(code, 0, err)
+        self.assertNotIn(os.path.realpath(other), out)
+        self.assertTrue(os.path.isdir(other), "another task's worktree is never removed")
+        led = self.ledger()
+        self.assertEqual(json.dumps(led["tasks"][0], sort_keys=True), t009, "another task's ledger entry is untouched")
+        self.assertEqual([w["address"] for w in led["tasks"][1]["workers"]], [])
+
+    def stale_fields(self):
+        gone = os.path.join(self.tmp, "wt-t-003-gone")
+        os.makedirs(gone)
+        shutil.rmtree(gone)
+        return (("mistyped", self.wt + "-typo"), ("stale", gone), ("relative", "wt-t-003-x"))
+
+    def test_tw13_stale_or_mistyped_field_still_checks_main(self):
+        write(os.path.join(self.wt, "unsaved.txt"), "x\n")
+        main = os.path.realpath(self.wt)
+        for label, field in self.stale_fields():
+            with self.subTest(field=label):
+                self.ledger({"version": 1, "tasks": []})
+                self.terms.clear()
+                self.add_task("t-003", "done", self.wt, [{"address": "t31", "role": "build", "name": "t-003-main", "worktree": field}])
+                task = self.ledger()["tasks"][0]
+                entry = task["workers"][0]
+                self.assertEqual(pa_hooks.worker_tree(task, entry), main)
+                self.assertEqual(pa_hooks.uncommitted_in(task, None, entry), (main, 1, ["unsaved.txt"]))
+                refusal, _checked, _unseen = pa_hooks.worktree_refusal(task, None, {}, entry)
+                self.assertIsNotNone(refusal)
+                self.assertIn("{} has 1 uncommitted file(s) (unsaved.txt)".format(main), refusal[1])
+                # close: refused, the terminal live or already gone
+                self.term("t31", "t-003-main")
+                pa_hooks.by_an_agent = lambda: True
+                self.assertRefused(self.worker("close", "t31", "--evidence", "FINDINGS.md"),
+                                   "{} has 1 uncommitted file(s) (unsaved.txt)".format(main))
+                del self.terms["t31"]
+                self.assertRefused(self.worker("close", "t31", "--evidence", "FINDINGS.md"),
+                                   "{} has 1 uncommitted file(s) (unsaved.txt)".format(main))
+                # delete: the main worktree is kept for its uncommitted work
+                pa_hooks.by_an_agent = lambda: False
+                facts, _row = pa_hooks.worker_facts(self.dir, {"terminal": "t0"}, None, "t31")
+                self.assertEqual(facts["worktree"]["path"], main)
+                self.assertEqual(facts["worktree"]["uncommitted"], 1)
+                code, out, err = self.worker("delete", "t31")
+                self.assertEqual(code, 0, err)
+                self.assertIn("Kept the worktree: it has 1 uncommitted file(s)", out)
+                self.assertTrue(os.path.isfile(os.path.join(self.wt, "unsaved.txt")))
+
+    def test_tw14_field_inside_the_worktree_resolves_to_it(self):
+        pkg = os.path.join(self.wt2, "src", "Pkg")
+        os.makedirs(pkg)
+        self.add_task("t-003", "in-progress", self.wt, [{"address": "t31", "role": "build", "name": "t-003-main"},
+                                                        {"address": "t32", "role": "build", "name": "t-003-billing", "worktree": pkg}],
+                      worktrees=[{"path": self.wt2, "job": "billing"}])
+        task = self.ledger()["tasks"][0]
+        entry = task["workers"][1]
+        second = os.path.realpath(self.wt2)
+        self.assertEqual(pa_hooks.worker_tree(task, entry), second)
+        self.assertEqual(pa_hooks.worker_tree(task, dict(entry, worktree=os.path.join(self.wt2, "not", "yet"))), second)
+        self.assertEqual(pa_hooks.uncommitted_in(task, None, entry), (second, 0, []))
+        rows = pa_hooks.worktree_state(self.dir, {"terminal": "t0"})
+        self.assertEqual([w["address"] for w in rows[second]["workers"]], ["t32"])
+        self.assertEqual([w["address"] for w in rows[os.path.realpath(self.wt)]["workers"]], ["t31"])
+        facts, _row = pa_hooks.worker_facts(self.dir, {"terminal": "t0"}, None, "t32")
+        self.assertEqual(facts["worktree"]["path"], second)
+        write(os.path.join(self.wt2, "unsaved.txt"), "x\n")
+        self.term("t32", "t-003-billing")
+        pa_hooks.by_an_agent = lambda: True
+        self.assertRefused(self.worker("close", "t32", "--evidence", "FINDINGS.md"),
+                           "{} has 1 uncommitted file(s) (unsaved.txt)".format(second))
+
 if __name__ == "__main__":
     unittest.main()
