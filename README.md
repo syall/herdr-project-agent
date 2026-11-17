@@ -240,10 +240,39 @@ Billed figures are **account-wide**: they include use outside this space and out
 are never shown as this space's spend. A price factor (from billed quantities) gives a `calibrated`
 figure beside `est.`; a scope ratio is shown but never applied.
 
+**Claude Code's own figure** (`CC`, optional): Claude Code computes a cost per session itself, at list
+price, in USD, and hands it to its status line. When the profile declares `statusLine` (below),
+`pa-claude` (for a Project Agent's workers) and `pa-session` (for the Project Agent) add one
+`--settings` that makes the session's status line `pa-costs statusline --space <id> --then <your
+status line command>`. It records the session id, that figure, its durations, the requested model,
+Claude Code's version and the terminal in `spaces/<id>/costs/cc/<session>.json` (ids and numbers
+only, never text), then prints exactly what your own command prints. It never slows the line by more
+than its 2 s limit (a slower command shows nothing that update), and never fails. `collect` and
+`report` show it beside `est.`: est. leads wherever a price table gives one; CC is shown next to it,
+labelled "Claude Code ... USD list price (n of m Claude sessions)", and is the only money figure where
+there is no price. It is never added to est. and never called billed: it is Claude Code's estimate,
+not the bill (no provider tiers or discounts).
+- Not added when: the caller gave its own `--settings`, the profile has no valid `statusLine`, or
+  `PA_NO_CC_STATUSLINE=1` is set (the off switch; removing the key also turns it off). Your status
+  line command must be found when the session starts, or nothing is added.
+- Not covered: Codex sessions (no money figure; est. only); sessions started before this was
+  installed; the last seconds of a killed session (CC is as of its last status line update, at most
+  `refreshInterval` old); another machine until `pa-sync` and that machine's profile declare it; your
+  own Claude tabs; split tasks, activities, phases and passes (CC is per session, and per task only
+  for a session of that one task). After a model fallback the recorded model is the requested one.
+
 ## Profiles
 
 A profile is a folder in `~/.config/herdr-pa/profiles/<name>/` (`profile.json`, `context.md`, `rules.json`,
 `hooks/`). `pa-profile set <name>` makes it the machine's default. Profiles live in their own repos.
+
+`profile.json` may name the status line you normally see, so that Claude Code's own cost figure is
+recorded around it (see Costs per space): `"statusLine": {"command": ["<your status line command>",
+"<its args>"], "refreshInterval": 30}` (`command` a non-empty list of strings, found like the profile's
+other commands; `refreshInterval` 1-300 s, default 30). Sessions started by `pa-claude` and
+`pa-session` then show that command's output, from that command alone: the profile must name the
+status line your Claude command would otherwise set. A malformed key adds nothing and `pa-doctor`
+notes it.
 
 ## Checks
 
