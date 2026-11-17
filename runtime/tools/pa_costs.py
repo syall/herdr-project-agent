@@ -349,8 +349,9 @@ def new_segment(ts, turn, model):
 class Reader:
     """Turns new lines of one session file into settled segments. `f` is the file's state (state.json files[sid])."""
 
-    def __init__(self, sess, f, settled):
+    def __init__(self, sess, f, settled, others=()):
         self.sess, self.f, self.settled = sess, f, settled
+        self.others = others  # the dedupe tails of the session's other files (its subagent files, or the parent)
         first = min(sess.get("starts") or [sess], key=lambda r: r.get("at") or "")
         copies = first.get("bind") or first.get("fork")  # a new file that may hold copies of another session's calls
         at = parse_ts(first.get("at") or "")
@@ -390,6 +391,8 @@ class Reader:
                         if item[2]:  # its lines were already settled: added to the open segment, and said so
                             f["late"] = f.get("late", 0) + 1
                     return
+            if any(item[0] == ident for other in self.others for item in other):
+                return  # the same call, written in another file of this session: counted there
         last = parse_ts(f.get("lastCall") or "")
         seg = f.get("open")
         model = model or f.get("model")
@@ -464,9 +467,9 @@ class Reader:
             self.add_call(e["ts"], None, f.get("model"), tokens)
 
 
-def read_new(sess, f, path, size, settled):
+def read_new(sess, f, path, size, settled, others=()):
     """Read [offset, size) of the file, whole lines only; advance the offset past them."""
-    reader = Reader(sess, f, settled)
+    reader = Reader(sess, f, settled, others)
     with open(path, "rb") as fh:
         fh.seek(f.get("offset", 0))
         data = fh.read(size - f.get("offset", 0))
@@ -482,6 +485,61 @@ def read_new(sess, f, path, size, settled):
 
 # ---- collect --------------------------------------------------------------------------------------
 
+def agent_owner(path):
+    """The parent session id an agent-*.jsonl file beside the sessions names in its lines (sessionId); "" when its
+    first whole lines name none; None while it has no whole line yet. Only that field is looked at."""
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(65536)
+    except OSError:
+        return None
+    end = head.rfind(b"\n")
+    if end < 0:
+        return None
+    for raw_line in head[:end].split(b"\n"):
+        if b'"sessionId"' not in raw_line:
+            continue
+        try:
+            obj = json.loads(raw_line.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            continue
+        sid = obj.get("sessionId") if isinstance(obj, dict) else None
+        del obj
+        if isinstance(sid, str) and re.match(r"^[A-Za-z0-9-]{8,80}$", sid):
+            return sid
+    return ""
+
+
+def subagent_files(parent_path, sid, owners, listing):
+    """(name, path) of the subagent transcripts of Claude session sid, in two layouts (P-c; DECISIONS, unverified):
+    <folder>/<sid>/subagents/*.jsonl, and agent-*.jsonl in the session's own folder whose lines name sid. owners
+    (kept in state.json) remembers which session each agent-*.jsonl belongs to, so its head is read once."""
+    base = os.path.dirname(parent_path)
+    nested = os.path.join(base, sid, "subagents")
+    try:
+        names = sorted(os.listdir(nested))
+    except OSError:
+        names = []
+    out = [(n[:-6], os.path.join(nested, n)) for n in names if n.endswith(".jsonl") and re.match(r"^[\w.-]{1,120}$", n)]
+    if base not in listing:
+        try:
+            listing[base] = sorted(n for n in os.listdir(base) if n.startswith("agent-") and n.endswith(".jsonl"))
+        except OSError:
+            listing[base] = []
+    taken = {name for name, _p in out}
+    for n in listing[base]:
+        key = os.path.basename(base) + "/" + n
+        owner = owners.get(key)
+        if owner is None:
+            owner = agent_owner(os.path.join(base, n))
+            if owner is None:
+                continue
+            owners[key] = owner
+        if owner == sid and n[:-6] not in taken:
+            out.append((n[:-6], os.path.join(base, n)))
+    return out
+
+
 def short(sid):
     return (sid or "?")[:8]
 
@@ -496,7 +554,8 @@ def make_row(sess, seg):
             "pass": None, "trigger": None, "split": None, "reason": None,
             "source": "reconstructed" if pre else (sess.get("source") or "recorded"),
             "match": "resumed-history" if pre else (sess.get("match") or "launch-record"),
-            "confidence": sess.get("confidence") or "high", "until": seg.get("until")}
+            "confidence": sess.get("confidence") or "high", "until": seg.get("until"),
+            **({"sub": sess["sub"]} if sess.get("sub") else {})}
 
 
 PA_TRIGGERS = ("report", "message", "decision", "scheduled", "manual", "conversation")
@@ -715,7 +774,8 @@ def load_state(state_path, turns_path, now, quiet):
     state["turnsBytes"] = end
     for r in rows:
         if "seq" in r and isinstance(r.get("session"), str):
-            state["files"][r["session"]] = {"offset": 0, "rebuilt": True}
+            key = r["session"] + "/" + r["sub"] if isinstance(r.get("sub"), str) else r["session"]
+            state["files"][key] = {"offset": 0, "rebuilt": True}
     note = ("state.json was {} at {}: rebuilt from turns.jsonl (sessions with rows are voided and read again; rows of "
             "sessions whose files are gone are kept)").format(why, iso(now))
     state["notes"] = [note]
@@ -762,6 +822,47 @@ def _collect(directory, folder, now, quiet, resummarize):
         else:
             done.pop("until", None)
             rows.append(done)
+    def read_one(sess, sid, sub, f, path, rebuilt, others):
+        """Read one file of a session (its transcript, or one of its subagent files) and settle what is due."""
+        nonlocal rows
+        settled = []
+        try:
+            st = os.stat(path)
+        except OSError:  # a subagent file seen before and now deleted: what was read stays
+            Reader(sess, f, settled).settle()
+            f["done"] = True
+            settle_rows(sess, settled)
+            return
+        if rebuilt or (f.get("ino") is not None and (st.st_ino != f["ino"] or st.st_dev != f["dev"])) or st.st_size < f.get("offset", 0):
+            # Its earlier rows are dropped by the void and read again. Rows of it not written yet (held Project Agent
+            # turns, released in this run or still held) come back from the re-read too, so they are dropped here.
+            def same(r):
+                return r.get("session") == sid and r.get("sub") == sub
+            out.extend(r for r in rows if not same(r))
+            rows = []
+            out[:] = [r for r in out if not ("seq" in r and same(r))]
+            state["held"] = [r for r in state["held"] if not same(r)]
+            void = {"v": 1, "ev": "void", "session": sid, "upTo": state.get("lastSeq", 0)}
+            if sub:
+                void["sub"] = sub
+            out.append(void)
+            for k in ("offset", "tail", "open", "turn", "cum", "lastCall", "seen", "model", "late", "bad"):
+                f.pop(k, None)
+            f["offset"] = 0
+            f["tail"] = []
+            if not rebuilt:
+                f["voided"] = f.get("voided", 0) + 1
+        f.update(path=path, dev=st.st_dev, ino=st.st_ino)
+        if st.st_size > f.get("offset", 0):
+            reader = read_new(sess, f, path, st.st_size, settled, others)
+        else:
+            reader = Reader(sess, f, settled, others)
+        if f.get("open"):
+            seen = parse_ts(f.get("seen") or f["open"]["to"]) or now
+            if now - seen >= IDLE or iso(now)[:10] > f["open"]["day"]:
+                reader.settle()
+        settle_rows(sess, settled)
+
     for sid in sorted(sessions):
         sess = sessions[sid]
         f = files.setdefault(sid, {"offset": 0})
@@ -775,11 +876,14 @@ def _collect(directory, folder, now, quiet, resummarize):
         settled = []
         path = find_file(sess, f.get("path"))
         rebuilt = f.pop("rebuilt", False)
+        subs = {k: v for k, v in files.items() if k.startswith(sid + "/")}
         if not path:
             started = parse_ts(latest) or now
             if f.get("path") or rebuilt or sess.get("gone") or now - started >= GONE_UNSEEN:
-                reader = Reader(sess, f, settled)
-                reader.settle()
+                Reader(sess, f, settled).settle()
+                for key, sf in sorted(subs.items()):
+                    Reader(dict(sess, sub=key.split("/", 1)[1]), sf, settled).settle()
+                    sf["done"] = True
                 if not sess.get("gone"):
                     ctx["events"].append({"v": 1, "ev": "gone", "at": iso(now), "session": sid, "readTo": f.get("lastCall")})
                 if not f.get("offset") and not rebuilt:
@@ -787,29 +891,19 @@ def _collect(directory, folder, now, quiet, resummarize):
                 f["done"], f["doneAt"] = True, iso(now)
             settle_rows(sess, settled)
             continue
-        st = os.stat(path)
-        if rebuilt or (f.get("ino") is not None and (st.st_ino != f["ino"] or st.st_dev != f["dev"])) or st.st_size < f.get("offset", 0):
-            # Its earlier rows are dropped by the void and read again. Rows of it not written yet (held Project Agent
-            # turns, released in this run or still held) come back from the re-read too, so they are dropped here.
-            out.extend(r for r in rows if r["session"] != sid)
-            rows = []
-            out[:] = [r for r in out if not ("seq" in r and r["session"] == sid)]
-            state["held"] = [r for r in state["held"] if r["session"] != sid]
-            out.append({"v": 1, "ev": "void", "session": sid, "upTo": state.get("lastSeq", 0)})
-            for k in ("offset", "tail", "open", "turn", "cum", "lastCall", "seen", "model", "late", "bad"):
-                f.pop(k, None)
-            f["offset"] = 0
-            if not rebuilt:
-                f["voided"] = f.get("voided", 0) + 1
-        f.update(path=path, dev=st.st_dev, ino=st.st_ino)
-        reader = read_new(sess, f, path, st.st_size, settled) if st.st_size > f.get("offset", 0) else Reader(sess, f, settled)
-        if f.get("open"):
-            seen = parse_ts(f.get("seen") or f["open"]["to"]) or now
-            if now - seen >= IDLE or iso(now)[:10] > f["open"]["day"]:
-                reader.settle()
-        settle_rows(sess, settled)
+        read_one(sess, sid, None, f, path, rebuilt, [sf.setdefault("tail", []) for sf in subs.values()])
+        if sess.get("program") != "codex":  # subagent transcripts in their own files count for this session (P-c)
+            for sub, sub_path in subagent_files(path, sid, state.setdefault("owners", {}), ctx.setdefault("listing", {})):
+                key = sid + "/" + sub
+                sf = subs.get(key) or files.setdefault(key, {"offset": 0})
+                subs[key] = sf
+                if sf.get("done"):
+                    continue
+                others = [f.setdefault("tail", [])] + [o.setdefault("tail", []) for k, o in subs.items() if k != key]
+                read_one(dict(sess, sub=sub), sid, sub, sf, sub_path, sf.pop("rebuilt", False), others)
         seen = parse_ts(f.get("seen") or "") or 0
-        if (sess.get("closed") or sess.get("gone")) and not f.get("open") and now - seen >= DONE_AFTER:
+        if ((sess.get("closed") or sess.get("gone")) and not f.get("open") and not any(sf.get("open") for sf in subs.values())
+                and now - seen >= DONE_AFTER):
             f["done"], f["doneAt"] = True, iso(now)
     out.extend(rows)
     for row in out:
@@ -1153,13 +1247,13 @@ def ledger_rows(directory):
     rows, _bad = read_lines(os.path.join(costs_dir(directory), "turns.jsonl"))
     voids = {}
     for r in rows:
-        if r.get("ev") == "void":
-            voids.setdefault(r.get("session"), []).append(r.get("upTo") or 0)
+        if r.get("ev") == "void":  # a subagent file's void ("sub") drops the rows of that file only
+            voids.setdefault((r.get("session"), r.get("sub")), []).append(r.get("upTo") or 0)
     out = []
     for r in rows:
         if "seq" not in r or not isinstance(r.get("tokens"), dict):
             continue
-        if any(r["seq"] <= up for up in voids.get(r.get("session"), [])):
+        if any(r["seq"] <= up for up in voids.get((r.get("session"), r.get("sub")), [])):
             continue
         out.append(r)
     return out
