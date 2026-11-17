@@ -95,8 +95,11 @@ class Orchestrator(unittest.TestCase):
 
     # t-017 J1 (R1, R5, R8): finding labels, must-fix bar, stop rule, scope, gate before the check
     def test_t017_r1_stop_rule(self):  # AC1.3, AC1.5
-        self.assertIn("- Rounds: a round is one build or fix worker and the check that follows it. A fix round "
-                      "fixes only Must fix findings; Recorded limits and Nits go on the merge card. Stop rule: "
+        self.assertIn("- Rounds: a round is one build or fix worker and the check that follows it. The must-fix "
+                      "bar: a finding that breaks a requirement, the plan, a verification point, safety or "
+                      "security is Must fix; a handoff may not narrow it. A fix round fixes only Must fix "
+                      "findings; Recorded limits and Nits go on the card that asks to publish or merge, each "
+                      "Recorded limit with its follow-up task, or for the person to accept. Stop rule: "
                       "when a task reaches its round cap (low 2, normal 3, high 4) or two rechecks in a row "
                       "find Must fix in the same area, start no further round: open a decision card (cut that "
                       "area into a new task, record it as a limit, or one more round).", self.text)
@@ -104,10 +107,13 @@ class Orchestrator(unittest.TestCase):
     def test_t017_r1_handoff_states_bar(self):  # AC1.4
         self.assertIn("the phase and its artifact (see `sdlc.md`), the verification points, the must-fix bar "
                       "and the stop rule (see Rounds), the evidence folder", self.text)
+        self.assertIn("The must-fix bar: a finding that breaks a requirement", flat(self.raw[self.raw.index("- Rounds:"):self.raw.index("- One git worktree")]))  # J1 fix M1: the bar is in Rounds
 
     def test_t017_r1_merge_card_limits(self):  # AC1.3, G6
         cards = flat(self.raw[self.raw.index("## Decision cards"):self.raw.index("## Workers")])
-        self.assertIn('A merge card lists every Recorded limit, each with its follow-up task or "accepted".', cards)
+        self.assertIn("The card that asks to publish or merge lists every Recorded limit, each with its follow-up "
+                      "task, or for the person to accept.", cards)
+        self.assertNotIn("merge card", self.text)  # J1 fix M2
 
     def test_t017_r5_scope(self):  # AC5.1-5.3
         self.assertIn("- Scope: the handoff lists the requirements the job builds. A requirement that appears "
@@ -140,7 +146,7 @@ class Worker(unittest.TestCase):
     def test_t017_r1_finding_labels(self):  # AC1.1, AC1.2
         self.assertIn("- Verifiers, reviewers and check workers label every finding **Must fix** (it breaks a "
                       "requirement, the plan, a verification point, safety or security; say why it blocks the "
-                      "merge), **Recorded limit** (real, but outside the handoff's must-fix bar; name a "
+                      "merge), **Recorded limit** (real, but not Must fix; name a "
                       "follow-up) or **Nit**, and end the file with `Verdict: pass` or `Verdict: must fix (<n>)`.",
                       self.text)
         self.assertIn("write `VERIFY.md`, and report. Never fix anything. On a recheck the handoff names a base "
@@ -148,6 +154,7 @@ class Worker(unittest.TestCase):
         self.assertIn("compliance with `spec.md` and `plan.md`, and write `REVIEW.md`. On a diff recheck, review "
                       "the diff from the base commit the handoff names.", self.text)
         self.assertNotIn("Important or Nit", self.text)
+        self.assertNotIn("outside the handoff's must-fix bar", self.text)  # J1 fix M1
 
     def test_t017_r9_no_background_shell(self):  # AC9.1, G1: in Rules of the job, not Safety
         rules = flat(self.raw[self.raw.index("## Rules of the job"):self.raw.index("## Roles")])
@@ -161,8 +168,10 @@ class Worker(unittest.TestCase):
 class Sdlc(unittest.TestCase):  # t-017 J1 (R1)
     def test_t017_r1_gate_cell(self):
         text = flat(read("runtime", "core", "sdlc.md"))
-        self.assertIn("| Must fix findings fixed, recorded limits listed on the merge card, checks green, then the "
-                      "person approves publishing (decision card) |", text)
+        self.assertIn("| Must fix findings fixed, checks green, then the person approves publishing (decision "
+                      "card: it lists every Recorded limit, each with its follow-up task, or for the person to "
+                      "accept) |", text)
+        self.assertNotIn("merge card", text)  # J1 fix M2
         self.assertNotIn("Important findings", text)
 
 
