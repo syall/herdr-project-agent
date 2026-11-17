@@ -5,6 +5,8 @@
 // launcher that starts a Project Agent. Push cards (push.js, t-007b): a shown copy runs the
 // read-only `pa-push-main check` when one first appears and on a click, and the Rules view the
 // read-only `pa-push-allow show`; `pa-push-main run` runs only from a push card's Submit.
+// The Costs view (costs.js, t-009) reads costs/summary.json only while it is shown, and runs the
+// read-only `pa-costs billed compare`; its Refresh, Reconstruct and Turn off run `pa-costs` on a click.
 
 import { View, div } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, ScrollHandle } from "gpui-base";
@@ -15,6 +17,7 @@ import { SetupPane } from "./setup.js";
 import { Keeper, idleShell } from "./keeper.js";
 import { WorkerPane } from "./worker.js";
 import { PushCards, isPush, PUSH, PUSH_OPTIONS } from "./push.js";
+import { CostsPane } from "./costs.js";
 import { tick, cadence, holdReason, setSchedule, requestPass, PRESETS, MIN_MINUTES } from "./timer.js";
 
 const ACTIVE = ["needs-decision", "review", "in-progress", "investigating", "queued"];
@@ -25,6 +28,7 @@ const paRecords = (spaceId) => Object.values(shared("project-agent.tabs") ?? {})
 const LOAD_LIMIT = READ_LIMIT + 1000; // a load with no read settled or timed out for this long is given up: a new one may start
 const CACHE_MAX = 8; // spaces whose last load is kept (in memory), the least recently shown dropped first
 const CACHE_OLD = 60000; // a kept load older than this says "updating…" while its refresh runs
+const COSTS_MARK = 20000; // while Costs is shown: shared "project-agent.costsShown" is stamped at most this often (the timer collects faster then)
 const COUNT_EVERY = 10000; // while hidden: at most one card read and one ledger read per space this often
 const PROFILE_RETRY = 60000; // while hidden: a profile read that failed is tried again no sooner than this
 // A part of loadSpace's result that did not answer (its `unknown`), and the fields it fills.
@@ -83,10 +87,12 @@ export default class ProjectAgent extends View {
     this.again = {}; // space id -> a reload came while its load was in flight: one more when it ends (if the space is still shown)
     this.profiles = {}; // space id -> { at, busy, done, profile }: its profile, read once per session (a full load's counts)
     this.asleep = false; // not on screen: only the open-card count is read
-    this.view = null; // "decisions" | "tasks" | "rules"; null: decisions when any is open
+    this.view = null; // "decisions" | "tasks" | "rules" | "costs"; null: decisions when any is open
     this.viewShown = null; // the view the last render drew (this.view, or the one picked for null)
     this.rules = new RulesPane();
     this.push = new PushCards(); // push cards: the last pa-push-main check and run of each (push.js)
+    this.costs = new CostsPane(); // the Costs view: each space's last summary and billed comparison (costs.js)
+    this.costsMarked = {}; // space id -> when this copy last stamped "project-agent.costsShown"
     this.open = new Set(); // expanded task ids
     this.folded = new Set(["done", "parked"]); // task sections folded away (finished work starts folded)
     this.older = false; // answered cards shown
@@ -234,6 +240,7 @@ export default class ProjectAgent extends View {
     if (space.id !== this.space) { this.disarm(); this.adopt(space, cx); }
     if (!onScreen()) { this.asleep = true; this.hiddenRead(cx, space); return; }
     this.asleep = false;
+    if (this.view === "costs") this.costsShown(space, cx); // its own read, outside the load (costs.js); never while hidden
     if (this.inFlight(space.id)) { this.again[space.id] = true; return; }
     const token = ++this.seq, load = { token, at: Date.now() };
     this.loads[space.id] = load;
@@ -281,6 +288,16 @@ export default class ProjectAgent extends View {
       if (!((cards === null && !wasCurrent) || token < (this.committed[space.id] ?? 0))) this.commit(space, token, data, cards, rules, cx, missed);
       if (wasCurrent && this.again[space.id]) { delete this.again[space.id]; if (shown()) this.reload(cx); }
     });
+  }
+
+  // The Costs view is shown for `space` in this shown copy: its summary (at most every 10 s, costs.js), and the
+  // shared stamp the timer reads to collect every 120 s instead of every 30 min (in memory, not a file).
+  costsShown(space, cx, force = false) {
+    this.costs.want(space, cx, force);
+    const now = Date.now();
+    if (now - (this.costsMarked[space.id] ?? 0) < COSTS_MARK) return;
+    this.costsMarked[space.id] = now;
+    setShared("project-agent.costsShown", { ...(shared("project-agent.costsShown") ?? {}), [space.id]: now });
   }
 
   // A finished load of `space` (newest so far). Branches:
@@ -843,7 +860,7 @@ export default class ProjectAgent extends View {
     this.viewShown = view;
     const tab = (id, label) => div().id(`view-${id}`).px(9).h(24).flex().items_center().rounded(6).text_size(12).cursor_pointer()
       .bg(view === id ? t.selected : t.chrome).text_color(view === id ? t.foreground : t.muted).hover((s) => s.bg(t.hover))
-      .on_click((_e, cx) => { this.view = id; this.disarm(); if (id !== "decisions") this.push.leave(space.id); if (id === "rules") this.rules.wantAllow(space, cx); cx.notify(); }).child(label);
+      .on_click((_e, cx) => { this.view = id; this.disarm(); if (id !== "decisions") this.push.leave(space.id); if (id === "rules") this.rules.wantAllow(space, cx); if (id === "costs") this.costsShown(space, cx, true); cx.notify(); }).child(label);
     const unsent = this.unsent.filter((u) => u.spaceId === space.id);
     return root
       .child(head(`PA: ${a.name ?? space.name}`, h_flex().flex_none().gap(6).items_center()
@@ -868,7 +885,8 @@ export default class ProjectAgent extends View {
       .child(h_flex().px(8).py(6).gap(4).flex_none().border_b(1).border_color(t.border)
         .child(tab("decisions", openCards.length ? `Decisions · ${openCards.length}` : "Decisions"))
         .child(tab("tasks", `Tasks · ${tasks.length}`))
-        .child(tab("rules", this.rules.data?.error ? "Rules · !" : `Rules · ${(this.rules.data?.rules ?? []).filter((r) => r.status === "active").length}`)))
+        .child(tab("rules", this.rules.data?.error ? "Rules · !" : `Rules · ${(this.rules.data?.rules ?? []).filter((r) => r.status === "active").length}`))
+        .child(tab("costs", this.costs.tabLabel(space.id))))
       .children((data.errors ?? []).map((e) => div().px(12).py(6).text_size(11.5).text_color(t.blocked).child(e)))
       .when(unsent.length > 0 && !live, (el) => el.child(h_flex().px(12).py(6).gap(8).items_center().text_size(11.5).text_color(t.foreground)
         .child(div().flex_1().min_w(0).child(known === "down" ? "Answer saved. The Project Agent is not running."
@@ -889,6 +907,7 @@ export default class ProjectAgent extends View {
             ...(folded ? [] : s.tasks.map((task) => this.task(t, task, space))),
           ];
         }))))
+      .when(view === "costs", (el) => el.child(this.costs.render(t, space, (shared("project-agent.costs") ?? {})[space.id] ?? null)))
       .when(view === "rules", (el) => el.child(this.rules.render(t, space, (id, what) => new Promise((done) => cx.spawn(async (cx) => { try { await this.ruleDecided(space, id, what, cx); } finally { done(); } })))))
       .when(view === "decisions", (el) => el.child(v_flex().id("pa-decisions").flex_1().min_h(0).p(8).gap(8).overflow_y_scrollbar().track_scroll(this.cardScroll)
         .when(!listed.length && this.cardsFor !== space.id, (e) => e.child(note("Loading decisions…")))
