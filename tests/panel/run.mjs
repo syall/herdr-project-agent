@@ -16,7 +16,7 @@ for (const f of fs.readdirSync(src).filter((n) => n.endsWith(".js"))) {
 const stubs = await import(path.join(dst, "stubs.mjs"));
 const { default: ProjectAgent } = await import(path.join(dst, "main.js"));
 const { cx: baseCx, flush, inspect } = stubs;
-const cx = { ...baseCx, stop_propagation() {} };
+let cx = { ...baseCx, stop_propagation() {} }; // a new one per world (world())
 const g = globalThis;
 
 const T0 = 1_800_000_000_000; // ms
@@ -32,6 +32,7 @@ const check = (ok, what) => { if (!ok) throw new Failed(what); };
 // field names `agentTerminal`); records: project-agent.tabs; extra: more panes/terminals.
 function world({ agent = true, agentTerminal = "t30", records = {}, extraPanes = [], extraTerms = [], extraTabs = [], agents = [], machine = null } = {}) {
   g.__now = T0; g.__gen = (g.__gen ?? 0) + 1; g.__delay = {};
+  cx = stubs.makeCx({ stop_propagation() {} });
   g.__runs = []; g.__notes = []; g.__reads = []; g.__writes = []; g.__overlays = []; g.__offline = []; g.__hcs = []; g.__hcFail = []; g.__ls = {};
   g.__machines = [{ name: null, layout: "ready" }, ...(machine ? [{ name: machine, layout: "ready" }] : [])];
   g.__spaces = [{ id: machine ? `${machine}/${S}` : S, name: "proj", machine, folder: "/proj", active: true, tabs: [{ id: "tb9", index: 1, name: "2", named: false }, ...extraTabs] }];
@@ -42,6 +43,7 @@ function world({ agent = true, agentTerminal = "t30", records = {}, extraPanes =
   // A keeper ("K", in another copy) holds the lease and has judged the records.
   g.__shared = { "project-agent.tabs": records, "project-agent.timer": { id: "K", at: T0 }, "project-agent.keeper": { id: "K", at: T0 } };
   g.__files = {}; g.__fail = []; g.__hang = [];
+  g.__remoteDelay = 0; g.__execHang = []; g.__batchFail = {}; g.__issued = []; g.__timers = []; g.__layout = {}; g.__execs = [];
   if (agent) {
     const dir = machine ? `${machine}:.config/herdr-pa/spaces/${S}` : `:${DIR}`, home = machine ? `${machine}:.config/herdr-pa` : ":/home/u/.config/herdr-pa";
     g.__files[`${dir}/agent.json`] = JSON.stringify({ space: S, project: "/proj", profile: "test", name: "proj", terminal: agentTerminal });
@@ -487,12 +489,317 @@ cases["P2-worker-chips"] = async () => { // a closed worker reads (closed), a ke
   check(/build t34 \(ended\)/.test(text), "a gone worker that was not closed still reads (ended)");
 };
 
+// ---- t-012 Part P: a slow remote, a cache per space, timeouts, and the panel while hidden ----
+const M = "m1", RS = `${M}/${S}`, RDIR = `.config/herdr-pa/spaces/${S}`;
+const D = 50; // ms per remote call
+async function settle() { for (let i = 0; i < 25; i++) await new Promise((r) => setTimeout(r, 2)); await flush(); }
+async function step(ms) { advance(ms); await settle(); }
+const remoteCalls = (kind) => g.__issued.filter((x) => x.on === M && (!kind || x.kind === kind));
+const reads = (name) => g.__issued.filter((x) => x.on === M && x.kind === "read" && x.path.endsWith(`/${name}`));
+const ledgerOf = (n, prefix = "t") => JSON.stringify({ tasks: Array.from({ length: n }, (_, i) => ({ id: `${prefix}-${i + 1}`, title: `${prefix} task ${i + 1}`, state: "in-progress", updated: `2026-11-16T10:0${i}:00Z` })) });
+const openCard = (id, extra = {}) => JSON.stringify({ id, status: "open", question: `Question ${id}?`, options: [{ label: "Yes" }, { label: "No" }], created: "2026-11-16T10:00:00Z", ...extra });
+// A remote space (m1/sp1) with tasks and n open cards; `id` and `dir` name another space on m1.
+function remoteCards(n, { id = S, prefix = "d" } = {}) {
+  const dir = `.config/herdr-pa/spaces/${id}/decisions`, names = [];
+  for (let i = 1; i <= n; i++) { const c = `${prefix}-${String(i).padStart(2, "0")}`; names.push(`${c}.json`); g.__files[`${M}:${dir}/${c}.json`] = openCard(c); }
+  g.__ls[`${M}:${dir}`] = names;
+}
+function addRemoteSpace(id, name, tasks) {
+  g.__spaces.push({ id: `${M}/${id}`, name, machine: M, folder: `/${name}`, active: false, tabs: [{ id: `tb-${id}`, index: 1, name: "1", named: false }] });
+  g.__files[`${M}:.config/herdr-pa/spaces/${id}/agent.json`] = JSON.stringify({ space: id, project: `/${name}`, profile: "test", name });
+  g.__files[`${M}:.config/herdr-pa/spaces/${id}/ledger.json`] = tasks;
+}
+const show = (id) => { for (const sp of g.__spaces) sp.active = sp.id === id; };
+const panelLayout = (shownChild, { hidden = false, timerCopy = false } = {}) => ({ type: "row", id: "root", children: [
+  { type: "block", id: "main", content: { tab: "active" } },
+  { type: "column", id: "panel", hidden, children: [{ type: "stack", id: "panel-body", active: shownChild, children: [
+    { type: "block", id: "changes", content: { mod: "my-changes" } },
+    { type: "block", id: "project-agent", content: { mod: "project-agent" } }] }] },
+  ...(timerCopy ? [{ type: "block", id: "pa-timer", content: { mod: "project-agent", props: { timer: true } } }] : []),
+] });
+const fire = async (ms) => { for (const t of g.__timers.filter((x) => x.ms === ms)) t.fn(cx); await settle(); };
+
+cases["P-first-paint"] = async () => { // AC1.1, AC1.2: header and tasks after 2 round trips, cards after; never "No open decisions" while loading
+  world({ machine: M });
+  g.__files[`${M}:${RDIR}/ledger.json`] = ledgerOf(2);
+  remoteCards(27);
+  g.__remoteDelay = D;
+  const v = await mount();
+  check(/Loading…/.test(look(v).text), "Loading… before any read returns");
+  await step(D); await step(D);
+  let { text } = look(v);
+  check(/PA: proj/.test(text) && /Tasks · 2/.test(text) && !/(^| )Loading…/.test(text), `header and tasks by 2·d (got ${text.slice(0, 300)})`);
+  await click(v, "view-decisions");
+  ({ text } = look(v));
+  check(/Loading decisions…/.test(text) && !/No open decisions/.test(text), `"Loading decisions…", not "No open decisions" (got ${text.slice(0, 400)})`);
+  await step(D);
+  ({ text } = look(v));
+  check(/Decisions · 27/.test(text) && !/Loading decisions…/.test(text), `cards by 3·d (got ${text.slice(0, 300)})`);
+};
+
+cases["P-no-agent-remote"] = async () => { // AC1.3: no agent.json: today's view after one read
+  world({ machine: M, agent: false });
+  g.__remoteDelay = D;
+  const v = await mount();
+  await step(D);
+  check(/has no Project Agent yet/.test(look(v).text), `no-agent view after 1 read (got ${look(v).text.slice(0, 200)})`);
+  check(remoteCalls().length === 1, `one remote call (got ${remoteCalls().length})`);
+};
+
+cases["P-total-time"] = async () => { // AC3.1, AC2.1: the whole load settles by 3·d; the cards are one remote call
+  world({ machine: M });
+  g.__files[`${M}:${RDIR}/ledger.json`] = ledgerOf(2);
+  remoteCards(27);
+  g.__remoteDelay = D;
+  const v = await mount();
+  await step(D); await step(D); await step(D);
+  check(/Decisions · 27/.test(look(v).text), `settled by 3·d (got ${look(v).text.slice(0, 200)})`);
+  check(!v.loads?.[RS], "no load in flight after 3·d");
+  check(remoteCalls("batch").length === 1 && remoteCalls("ls").length === 0 && g.__issued.filter((x) => x.on === M && x.kind === "read" && x.path.includes("/decisions/")).length === 0, `cards from 1 batch (got ${JSON.stringify(remoteCalls().map((x) => x.kind))})`);
+};
+
+// A then B then A: both on m1; A has 2 tasks and 2 cards, B 3 tasks and 1 card.
+async function twoSpaces() {
+  world({ machine: M });
+  g.__files[`${M}:${RDIR}/ledger.json`] = ledgerOf(2, "a");
+  remoteCards(2, { prefix: "da" });
+  addRemoteSpace("sp2", "other", ledgerOf(3, "b"));
+  remoteCards(1, { id: "sp2", prefix: "db" });
+  g.__files[`${M}:.config/herdr-pa/spaces/sp2/ledger.json`] = JSON.stringify({ tasks: [{ id: "b-1", title: "b", state: "in-progress", worktree: "/wt/b" }, { id: "b-2", state: "queued" }, { id: "b-3", state: "queued" }] });
+  const v = await mount(); await settle();
+  check(/Tasks · 2/.test(look(v).text) && /Decisions · 2/.test(look(v).text), `A loaded (got ${look(v).text.slice(0, 200)})`);
+  return v;
+}
+
+cases["P-cache-switch-back"] = async () => { // AC4.1: back to A with every read hung: A's tasks and cards at once
+  const v = await twoSpaces();
+  show(`${M}/sp2`); look(v); await settle();
+  check(/Tasks · 3/.test(look(v).text), `B loaded (got ${look(v).text.slice(0, 200)})`);
+  g.__remoteDelay = 1e12; // nothing returns any more
+  show(RS);
+  const { text } = look(v);
+  check(/PA: proj/.test(text) && /Tasks · 2/.test(text) && /Decisions · 2/.test(text) && !/(^| )Loading…/.test(text), `A from the cache at once (got ${text.slice(0, 300)})`);
+};
+
+cases["P-no-cross-space"] = async () => { // AC4.2: B's late load draws nothing and writes none of B's shared keys while A is shown
+  const v = await twoSpaces();
+  g.__remoteDelay = D;
+  show(`${M}/sp2`); look(v); await settle();
+  check(/(^| )Loading…/.test(look(v).text), "B loading");
+  show(RS); look(v); await settle(); // back to A before B's first read returns
+  await step(D); await step(D); await step(D); await step(D);
+  const { text } = look(v);
+  check(/PA: proj/.test(text) && /Tasks · 2/.test(text) && !/PA: other|Tasks · 3/.test(text), `only A's data (got ${text.slice(0, 300)})`);
+  for (const k of ["project-agent.worktrees", "my-files.places", "project-agent.workers", "project-agent.open", "project-agent.mainBranches"]) check(!(g.__shared[k] ?? {})[`${M}/sp2`], `${k} has nothing for B (got ${JSON.stringify(g.__shared[k])})`);
+  check((g.__shared["project-agent.open"] ?? {})[RS] === 2, `A's open count kept (got ${JSON.stringify(g.__shared["project-agent.open"])})`);
+};
+
+cases["P-updating-note"] = async () => { // AC4.3: a cached result over 60 s old says "updating…" while its refresh runs; a fresh one does not
+  const v = await twoSpaces();
+  show(`${M}/sp2`); look(v); await settle();
+  g.__remoteDelay = D;
+  show(RS);
+  check(!/updating…/.test(look(v).text), `fresh cache: no note (got ${look(v).text.slice(0, 300)})`);
+  await step(D); await step(D); await step(D); await step(D);
+  show(`${M}/sp2`); look(v); await step(D); await step(D); await step(D); await step(D);
+  advance(61000);
+  show(RS);
+  check(/updating…/.test(look(v).text) && /Tasks · 2/.test(look(v).text), `61 s old: "updating…" (got ${look(v).text.slice(0, 300)})`);
+  await step(D); await step(D); await step(D); await step(D);
+  check(!/updating…/.test(look(v).text), "the note goes when the refresh commits");
+};
+
+cases["P-answer-from-cache"] = async () => { // AC4.4: answering a cached card reads the file now; a card answered meanwhile is refused
+  const v = await twoSpaces();
+  show(`${M}/sp2`); look(v); await settle();
+  g.__files[`${M}:${RDIR}/decisions/da-01.json`] = openCard("da-01", { status: "answered", answer: "No" });
+  g.__remoteDelay = 1e12;
+  show(RS); look(v); await settle(); // A's refresh is out, and hangs
+  g.__remoteDelay = 0; // the answer's own read returns
+  await click(v, "view-decisions");
+  await click(v, "opt-da-01-0");
+  await click(v, "submit-da-01");
+  await settle();
+  check(/This card was already answered\./.test(look(v).text), `refused with today's message (got ${look(v).text.slice(0, 500)})`);
+  check(JSON.parse(g.__files[`${M}:${RDIR}/decisions/da-01.json`]).answer === "No", "the file was not overwritten");
+};
+
+cases["P-hung-agent-json"] = async () => { // AC5.1: a hung agent.json leaves "Loading…" within 10 s, with "agent.json: timed out"
+  world({ machine: M });
+  g.__hang = [`${M}:${RDIR}/agent.json`];
+  const places = [{ label: "All evidence", path: "/x", group: "Project Agent" }];
+  g.__shared["project-agent.open"] = { [RS]: 3 }; g.__shared["my-files.places"] = { [RS]: places };
+  const v = await mount();
+  await step(9000);
+  check(/(^| )Loading…/.test(look(v).text), "still loading at 9 s");
+  await step(1000);
+  const { text } = look(v);
+  check(!/(^| )Loading…/.test(text) && /agent\.json: timed out/.test(text), `timed out at 10 s (got ${text.slice(0, 300)})`);
+  check(!/has no Project Agent yet/.test(text) && !look(v).clicks["pa-start"], `a timeout is not "no Project Agent" (got ${text.slice(0, 300)})`);
+  check(g.__shared["project-agent.open"][RS] === 3 && JSON.stringify(g.__shared["my-files.places"][RS]) === JSON.stringify(places), `a timeout clears no shared entry (got ${JSON.stringify(g.__shared["project-agent.open"])})`);
+};
+
+cases["P-cache-cap"] = async () => { // limits: at most 8 spaces kept, the least recently shown dropped
+  world({ machine: M });
+  for (let i = 2; i <= 9; i++) addRemoteSpace(`sp${i}`, `p${i}`, ledgerOf(i, `p${i}`));
+  const v = await mount(); await settle();
+  for (let i = 2; i <= 9; i++) { show(`${M}/sp${i}`); look(v); await settle(); check(new RegExp(`Tasks · ${i}`).test(look(v).text), `sp${i} loaded`); }
+  check(v.cache.size === 8 && !v.cache.has(RS), `8 kept, the first dropped (got ${[...v.cache.keys()]})`);
+  g.__remoteDelay = 1e12;
+  show(`${M}/sp2`); check(/Tasks · 2/.test(look(v).text), "sp2 still kept");
+  show(RS); check(/(^| )Loading…/.test(look(v).text), "sp1 was dropped: Loading…");
+};
+
+cases["P-hung-card-fallback"] = async () => { // AC5.2: batch fails, one card read hangs: tasks and the other cards show
+  world({ machine: M });
+  g.__files[`${M}:${RDIR}/ledger.json`] = ledgerOf(2);
+  remoteCards(3);
+  g.__batchFail = { [M]: { code: 1, stdout: "" } };
+  g.__hang = [`${M}:${RDIR}/decisions/d-02.json`];
+  const v = await mount();
+  await step(10000); await settle();
+  const { text } = look(v);
+  check(/Tasks · 2/.test(text) && /Decisions · 2/.test(text) && /d-01/.test(text) && /d-03/.test(text) && !/d-02/.test(text), `2 cards and the tasks (got ${text.slice(0, 400)})`);
+};
+
+cases["P-stuck-load-recovers"] = async () => { // AC5.3: a pending load blocks later reloads for at most 10 s + ε
+  world({ machine: M });
+  g.__hang = [`${M}:${RDIR}/agent.json`];
+  const v = await mount();
+  await step(2000); v.reload(cx); await settle();
+  check(reads("agent.json").length === 1, `no second load while the first is young (got ${reads("agent.json").length})`);
+  g.__hang = [];
+  await step(9500); await settle();
+  check(reads("agent.json").length === 2, `the queued reload ran after the stuck one ended (got ${reads("agent.json").length})`);
+  check(/PA: proj/.test(look(v).text), `loaded (got ${look(v).text.slice(0, 200)})`);
+};
+
+cases["P-one-in-flight"] = async () => { // AC5.4, AC5.3: one load per space in flight; another space's load does not restart it
+  const v = await twoSpaces();
+  g.__remoteDelay = 3000;
+  g.__issued = [];
+  show(`${M}/sp2`); look(v); await settle();
+  for (let t = 0; t < 6; t++) { v.reload(cx); look(v); await step(1500); }
+  const bReads = g.__issued.filter((x) => x.kind === "read" && x.path.endsWith("spaces/sp2/agent.json"));
+  check(bReads.length <= 1 || bReads[1].at - bReads[0].at >= 9000, `B's loads do not overlap (agent.json read at ${bReads.map((x) => x.at - T0)})`);
+  // A load of A that ends after the switch to B must not clear B's in-flight state (B's load is the longer one).
+  world({ machine: M });
+  remoteCards(2, { prefix: "da" });
+  addRemoteSpace("sp2", "other", ledgerOf(3, "b"));
+  remoteCards(5, { id: "sp2", prefix: "db" });
+  g.__remoteDelay = 3000;
+  const w = await mount(); look(w); await step(1000);
+  show(`${M}/sp2`); look(w); await step(1000);
+  for (let t = 0; t < 40; t++) { look(w); await step(1000); } // A's abandoned load ends meanwhile (today: about 30 s)
+  const b2 = g.__issued.filter((x) => x.kind === "read" && x.path.endsWith("spaces/sp2/agent.json")).map((x) => x.at - T0);
+  check(b2.length === 1, `one B load (agent.json read at ${b2})`);
+};
+
+// ---- R8: while hidden, only the open-card count ----
+cases["P-onscreen"] = async () => { // how "shown" is judged: stack child, hidden node, the timer copy, not in the layout
+  const runs = [["stack shows changes", panelLayout("changes"), false], ["stack shows project-agent", panelLayout("project-agent"), true],
+    ["panel hidden", panelLayout("project-agent", { hidden: true }), false], ["timer copy shown, panel hidden", panelLayout("changes", { timerCopy: true }), false],
+    ["not in the layout", {}, true], ["stack with no active: first child", { type: "stack", id: "s", children: [{ type: "block", id: "pa", content: { mod: "project-agent" } }, { type: "block", id: "c", content: { mod: "my-changes" } }] }, true]];
+  for (const [what, layout, shown] of runs) {
+    world({ machine: M }); remoteCards(1); g.__layout = layout;
+    const v = await mount(); await settle();
+    const full = reads("agent.json").length > 0;
+    check(full === shown, `${what}: ${shown ? "full load" : "count only"} (agent.json reads ${reads("agent.json").length}, calls ${JSON.stringify(remoteCalls().map((x) => x.kind))})`);
+    void v;
+  }
+};
+
+cases["P-hidden-one-call"] = async () => { // AC8.1: hidden: exactly 1 remote call per 10 s interval, the batched card read
+  world({ machine: M });
+  remoteCards(4);
+  g.__layout = panelLayout("changes");
+  const v = await mount();
+  for (let t = 1; t <= 60; t++) { // 60 s: every timer the panel set, and folder-watch reloads every 3 s
+    advance(1000);
+    for (const tm of g.__timers) if (t * 1000 % tm.ms === 0) tm.fn(cx);
+    if (t % 3 === 0) v.reload(cx);
+    look(v);
+    await settle();
+  }
+  const kinds = [...new Set(remoteCalls().map((x) => x.kind))];
+  check(JSON.stringify(kinds) === '["batch"]', `only the batched card read (got ${JSON.stringify(remoteCalls().map((x) => `${x.kind}${x.path ? ` ${x.path}` : ""}`).slice(0, 12))})`);
+  const per = []; for (let w = 0; w < 6; w++) per.push(remoteCalls().filter((x) => x.at > T0 + w * 10000 && x.at <= T0 + (w + 1) * 10000).length);
+  check(per.every((n) => n === 1), `1 call in each 10 s interval (got ${per})`);
+};
+
+cases["P-hidden-count"] = async () => { // AC8.2: the button's count follows the cards on disk while hidden
+  world({ machine: M });
+  remoteCards(2);
+  g.__layout = panelLayout("changes");
+  const v = await mount(); await settle();
+  check((g.__shared["project-agent.open"] ?? {})[RS] === 2, `2 open (got ${JSON.stringify(g.__shared["project-agent.open"])})`);
+  g.__files[`${M}:${RDIR}/decisions/d-03.json`] = openCard("d-03"); g.__ls[`${M}:${RDIR}/decisions`].push("d-03.json");
+  await step(5000); await fire(10000);
+  check((g.__shared["project-agent.open"] ?? {})[RS] === 2, "not before the interval");
+  await step(5000); await fire(10000);
+  check((g.__shared["project-agent.open"] ?? {})[RS] === 3, `3 after the interval (got ${JSON.stringify(g.__shared["project-agent.open"])})`);
+  for (const c of ["d-01", "d-02", "d-03"]) g.__files[`${M}:${RDIR}/decisions/${c}.json`] = openCard(c, { status: "answered", answer: "Yes" });
+  await step(10000); await fire(10000);
+  check(!(RS in (g.__shared["project-agent.open"] ?? {})), `none open: the key is gone (got ${JSON.stringify(g.__shared["project-agent.open"])})`);
+  g.__batchFail = { [M]: { code: 1, stdout: "" } };
+  g.__files[`${M}:${RDIR}/decisions/d-01.json`] = openCard("d-01");
+  await step(10000); await fire(10000);
+  check(!(RS in (g.__shared["project-agent.open"] ?? {})), "a failed read leaves the count as it was");
+  check(reads("agent.json").length === 0 && remoteCalls("ls").length === 0, `nothing but the batch (got ${JSON.stringify(remoteCalls().map((x) => x.kind))})`);
+};
+
+cases["P-hidden-notice"] = async () => { // AC8.3: a new card's notice still comes while the panel is hidden
+  world({ machine: M, records: { tb1: { space: RS, project: "/proj", profile: "test", name: "proj", terminal: "t4w", alive: true } } });
+  g.__spaces[0].tabs.push({ id: "tb1", index: 2, name: "PA: proj", named: true });
+  remoteCards(1);
+  g.__layout = panelLayout("changes");
+  delete g.__shared["project-agent.timer"]; delete g.__shared["project-agent.keeper"]; // this copy holds the lease
+  const v = await mount(); await settle();
+  await fire(15000); // the first look records what is there
+  g.__files[`${M}:${RDIR}/decisions/d-new.json`] = openCard("d-new", { task: "t-1" }); g.__ls[`${M}:${RDIR}/decisions`].push("d-new.json");
+  g.__now += 15000; await fire(15000);
+  check(g.__notes.some((n) => /^Decision needed \(t-1\): d-new$/.test(n.title)), `notice fired while hidden (got ${JSON.stringify(g.__notes.map((n) => n.title))})`);
+  // (agent.json and the ledger are also read by this copy's keeper and timer, which hold the lease here.)
+  check(reads("rules.json").length === 0 && remoteCalls("evidence").length === 0 && remoteCalls("stale").length === 0, `and the panel did no full load (got ${JSON.stringify(remoteCalls().map((x) => x.kind))})`);
+  void v;
+};
+
+cases["P-shown-again"] = async () => { // AC8.4: shown again: the kept data at once, one full reload started at once
+  world({ machine: M });
+  g.__files[`${M}:${RDIR}/ledger.json`] = ledgerOf(2);
+  remoteCards(2);
+  g.__layout = panelLayout("project-agent");
+  const v = await mount(); await settle();
+  check(/Tasks · 2/.test(look(v).text), "loaded while shown");
+  g.__layout = panelLayout("changes");
+  for (let t = 0; t < 30; t++) { await step(10000); await fire(10000); await fire(15000); }
+  check(reads("agent.json").length === 1, `no full load in 5 minutes hidden (agent.json reads ${reads("agent.json").length})`);
+  g.__files[`${M}:${RDIR}/ledger.json`] = ledgerOf(3);
+  g.__remoteDelay = D;
+  g.__layout = panelLayout("project-agent");
+  const { text } = look(v); // render runs as it is shown
+  check(/Tasks · 2/.test(text) && !/(^| )Loading…/.test(text), `kept data at once (got ${text.slice(0, 200)})`);
+  await settle(); // the clock stands still: nothing settles
+  check(reads("agent.json").length === 2, `one full reload started before any read settled (agent.json reads ${reads("agent.json").length})`);
+  look(v); await fire(1000);
+  check(reads("agent.json").length === 2, "not a second one");
+  await step(D); await step(D); await step(D);
+  check(/Tasks · 3/.test(look(v).text), `then refreshed (got ${look(v).text.slice(0, 200)})`);
+  // Shown again with no render: the 1 s timer starts the reload.
+  g.__layout = panelLayout("changes"); await step(10000); await fire(10000);
+  const before = reads("agent.json").length;
+  g.__layout = panelLayout("project-agent");
+  await fire(1000);
+  check(reads("agent.json").length === before + 1, `the 1 s timer wakes it (agent.json reads ${before} -> ${reads("agent.json").length})`);
+};
+
 const pick = process.argv.slice(2);
 let failed = 0;
 for (const [name, fn] of Object.entries(cases)) {
   if (pick.length && !pick.includes(name)) continue;
   try { await fn(); console.log(`PASS ${name}`); }
   catch (e) { failed++; console.log(`FAIL ${name}: ${e instanceof Failed ? e.message : e.stack}`); }
+  g.__gen = (g.__gen ?? 0) + 1; await settle(); // this case's views stop: their delayed reads end and they start nothing new
 }
 fs.rmSync(dst, { recursive: true, force: true });
 console.log(failed ? `${failed} case(s) failed` : "all panel cases passed");

@@ -4,14 +4,75 @@
 //   __agents   agents()          __props   props()
 // Elements are plain objects; render() returns a tree that run.mjs walks for its text and for
 // the click handlers of elements with an id.
+//   __layout      layout()            (default {}: the panel is not in it, so it counts as shown)
+// A slow remote (t-012), on the same __now clock as __delay:
+//   __remoteDelay  ms                every readTextFile and exec on another machine settles once __now has moved on by ms
+//   __execHang     ["<machine>:<kind>"]  exec of that kind never settles (kind: batch, evidence, stale, ls, or the command)
+//   __batchFail    { "<machine>": { code, stdout } }  what the batched card read returns instead
+//   __issued       [{ at, on, kind, path? }]  every readTextFile and exec, when it was called
+// The batched card read (`sh -c <script with "for f in *.json"> sh <dir>`) answers from __ls and __files:
+// each listed name the card-name filter takes that has a file, in byte order, as "name\0text\0". No __ls entry: exit 3 (no folder).
+// cx / makeCx(): the keeper stubs' spawn (flush() awaits it) plus sleep(ms) on the __now clock and a timer that
+// records every(ms, fn) in __timers ([{ ms, fn }]) so a case can fire them.
 export * from "./keeper-stubs.mjs";
+import { readTextFile as baseRead, exec as baseExec, cx as baseCx } from "./keeper-stubs.mjs";
 const g = globalThis;
+
+const waitFor = async (ms) => {
+  const until = g.__now + ms, gen = g.__gen;
+  while (g.__now < until) { if (g.__gen !== gen) throw new Error("an old world"); await new Promise((r) => setTimeout(r, 1)); }
+};
+export const execKind = (command, args = []) => {
+  if (command !== "sh") return command === "ls" ? "ls" : command;
+  const script = String(args[1] ?? "");
+  return /for f in \*\.json/.test(script) ? "batch" : /session\.log/.test(script) ? "stale" : /ls -t/.test(script) ? "evidence" : "sh";
+};
+export const readTextFile = async (path, options = {}) => {
+  const on = options?.on ?? null;
+  (g.__issued ??= []).push({ at: g.__now, on, kind: "read", path });
+  if (on && g.__remoteDelay && !(g.__offline ?? []).includes(on)) await waitFor(g.__remoteDelay);
+  return baseRead(path, options);
+};
+export const exec = async (command, args = [], options = {}) => {
+  const on = options?.on ?? null, kind = execKind(command, args);
+  if (!(command === "python3" && args[0] === "-c")) (g.__issued ??= []).push({ at: g.__now, on, kind });
+  if ((g.__execHang ?? []).includes(`${on ?? ""}:${kind}`)) { (g.__execs ??= []).push([command, args, on]); return new Promise(() => {}); }
+  if (on && g.__remoteDelay && !(g.__offline ?? []).includes(on)) await waitFor(g.__remoteDelay);
+  if (kind !== "batch") return baseExec(command, args, options);
+  if ((g.__offline ?? []).includes(on)) throw new Error(`machine ${on} is unreachable`);
+  (g.__execs ??= []).push([command, args, on]);
+  const forced = (g.__batchFail ?? {})[on ?? ""];
+  if (forced) return { code: forced.code ?? 1, stdout: forced.stdout ?? "", stderr: forced.stderr ?? "" };
+  const dir = args[3], names = (g.__ls ?? {})[`${on ?? ""}:${dir}`];
+  if (!names) return { code: 3, stdout: "", stderr: "" };
+  let out = "";
+  for (const n of [...names].filter((n) => /^[A-Za-z0-9_.-]+\.json$/.test(n) && !n.startsWith(".")).sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)))) {
+    const text = (g.__files ?? {})[`${on ?? ""}:${dir}/${n}`];
+    if (text === undefined || text === null) continue; // gone between the glob and the read
+    out += `${n}\0${text}\0`;
+  }
+  return { code: 0, stdout: out, stderr: "" };
+};
+// makeCx(): a cx for one world. Its spawns run only while that world lasts (__gen unchanged), so a
+// view mounted by an earlier case cannot start work in a later one.
+export function makeCx(extra = {}) {
+  const gen = g.__gen;
+  const c = {
+    spawn(f) { if (gen !== undefined && g.__gen !== gen) return Promise.resolve(); return baseCx.spawn(() => f(c)); },
+    sleep: (ms) => waitFor(ms ?? 0),
+    timer: { every(ms, fn) { if (gen === undefined || g.__gen === gen) (g.__timers ??= []).push({ ms, fn }); }, after() {} },
+    notify() {},
+    ...extra,
+  };
+  return c;
+}
+export const cx = makeCx();
 
 export const agents = () => g.__agents ?? [];
 export const props = () => g.__props ?? {};
 export const theme = () => new Proxy({}, { get: () => "#808080" });
 export const window = () => ({ platform: "macos" });
-export const layout = () => ({});
+export const layout = () => g.__layout ?? {};
 export const watchFolder = () => new Promise(() => {}); // never changes
 export const closeOverlay = (o) => { (g.__closed ??= []).push(o); return null; };
 export const pickFolder = async () => null;

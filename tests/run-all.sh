@@ -1,7 +1,7 @@
 #!/bin/sh
 # All of this repo's tests. Exits non-zero if any part fails.
 #   tests/run-all.sh             full suite: Python 3.7 parse check, unit tests (tests/test_*.py),
-#                                keeper harness, panel harness, and the pa-session integration check
+#                                keeper harness, panel harness, store harness, and the pa-session integration check
 #                                against a private hc core
 #   tests/run-all.sh --affected  the fast set only (no integration check). With PA_CHANGED_FILES
 #                                (paths separated by spaces or newlines), parts whose files did not
@@ -22,9 +22,9 @@ failed=0
 part() { name=$1; shift; echo "=== $name"; if "$@"; then echo "--- $name: ok"; else echo "--- $name: FAILED"; failed=$((failed + 1)); fi; }
 
 # Which parts the changed files touch (only with --affected and PA_CHANGED_FILES).
-want_py=1 want_keeper=1 want_panel=1
+want_py=1 want_keeper=1 want_panel=1 want_store=1
 if [ "$affected" = 1 ] && [ -n "${PA_CHANGED_FILES:-}" ]; then
-  want_py=0 want_keeper=0 want_panel=0
+  want_py=0 want_keeper=0 want_panel=0 want_store=0
   for f in $PA_CHANGED_FILES; do
     case "$f" in
       *runtime/tools/*|*tests/test_*.py|*tests/run-all.sh) want_py=1 ;;
@@ -35,8 +35,11 @@ if [ "$affected" = 1 ] && [ -n "${PA_CHANGED_FILES:-}" ]; then
     case "$f" in
       *mods/project-agent/*|*tests/panel/*|*tests/keeper/stubs.mjs|*tests/run-all.sh) want_panel=1 ;;
     esac
+    case "$f" in
+      *mods/project-agent/*|*tests/store/*|*tests/panel/stubs.mjs|*tests/keeper/stubs.mjs|*tests/run-all.sh) want_store=1 ;;
+    esac
   done
-  [ "$want_py" = 0 ] && [ "$want_keeper" = 0 ] && [ "$want_panel" = 0 ] && { echo "no tested files changed: nothing to run"; exit 0; }
+  [ "$want_py" = 0 ] && [ "$want_keeper" = 0 ] && [ "$want_panel" = 0 ] && [ "$want_store" = 0 ] && { echo "no tested files changed: nothing to run"; exit 0; }
 fi
 
 parse37() { "$PY" -c "import ast,sys
@@ -44,6 +47,7 @@ for f in sys.argv[1:]: ast.parse(open(f).read(), feature_version=(3,7)); print(f
 units() { "$PY" -m unittest discover -s tests -p 'test_*.py' -v; }
 keeper() { [ -n "$NODE" ] || { echo "no node found (set NODE)"; return 1; }; "$NODE" tests/keeper/run.mjs; }
 panel() { [ -n "$NODE" ] || { echo "no node found (set NODE)"; return 1; }; "$NODE" tests/panel/run.mjs; }
+store() { [ -n "$NODE" ] || { echo "no node found (set NODE)"; return 1; }; "$NODE" tests/store/run.mjs; }
 integration() {
   S=$(mktemp -d /tmp/t001.XXXXXX) || return 1
   sh tests/setup-scratch.sh "$S" && sh tests/pa_session_check.sh "$S"
@@ -55,6 +59,7 @@ integration() {
 if [ "$want_py" = 1 ]; then part "python 3.7 parse" parse37; part "unit tests" units; fi
 [ "$want_keeper" = 1 ] && part "keeper harness" keeper
 [ "$want_panel" = 1 ] && part "panel harness" panel
+[ "$want_store" = 1 ] && part "store harness" store
 [ "$affected" = 0 ] && part "pa-session integration (private hc core)" integration
 
 [ "$failed" = 0 ] && echo "=== all passed" || echo "=== $failed part(s) failed"
