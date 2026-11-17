@@ -3041,6 +3041,82 @@ class CC_Script(CCBase):
         self.assertLessEqual(best, 0.15)
 
 
+HANG_SCRIPT = "#!/bin/sh\ncat > /dev/null\nsleep 30 &\necho $$ $! > \"$1.part\"\nmv \"$1.part\" \"$1\"\nwait\n"
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+class CC_Cancel(CCBase):
+    """REVIEW M1: Claude Code cancels a run still in flight; the inner command and its children go with it."""
+
+    def cancel(self, sig):
+        stub = os.path.join(CC_STUBS, "hang")
+        if not os.path.exists(stub):
+            write(stub, HANG_SCRIPT)
+            os.chmod(stub, 0o755)
+        pids_file = os.path.join(TMP, "hang-pids-{}".format(int(sig)))
+        if os.path.exists(pids_file):
+            os.unlink(pids_file)
+        env = dict(os.environ)
+        env.update(_HOMES)
+        env["HC_TERMINAL_ID"] = "t5"
+        p = subprocess.Popen([sys.executable, os.path.join(TOOLS, "pa_costs.py"), "statusline", "--space", "sp1", "--then",
+                              stub, pids_file], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+        self.addCleanup(lambda: p.poll() is None and p.kill())
+        p.stdin.write(cc_bytes())
+        p.stdin.close()
+        deadline = time.monotonic() + 1.8  # well inside the 2 s self-timeout, so only the signal can stop it
+        pids = []
+        while time.monotonic() < deadline:
+            if os.path.exists(pids_file):
+                pids = [int(x) for x in open(pids_file).read().split()]
+                break
+            time.sleep(0.01)
+        self.assertEqual(len(pids), 2, "the stub started its child")
+        for pid in pids:
+            self.addCleanup(lambda pid=pid: alive(pid) and os.kill(pid, 9))
+        p.send_signal(sig)
+        try:
+            code = p.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            code = None
+        out, err = p.stdout.read(), p.stderr.read()
+        p.stdout.close()
+        p.stderr.close()
+        OUTPUT_SEEN.append(out.decode(errors="replace") + err.decode(errors="replace"))
+        gone_by = time.monotonic() + 1.0
+        while time.monotonic() < gone_by and any(alive(pid) for pid in pids):
+            time.sleep(0.02)
+        left = [pid for pid in pids if alive(pid)]
+        self.assertEqual((code, err, out), (0, b"", b""), sig)
+        self.assertEqual(left, [], "stub and its child are gone within a second")
+        folder = os.path.join(self.dir, "costs", "cc")
+        names = sorted(os.listdir(folder)) if os.path.isdir(folder) else []
+        self.assertEqual([n for n in names if n not in (".lock", CC_SID + ".json")], [], names)
+        if CC_SID + ".json" in names:
+            self.assertEqual(self.cc_record()["cost"], 1.25)  # whole, never partial
+
+    def test_cx1_sigterm(self):
+        import signal
+        self.cancel(signal.SIGTERM)
+
+    def test_cx2_sighup(self):
+        import signal
+        self.cancel(signal.SIGHUP)
+
+    def test_cx3_sigint(self):
+        import signal
+        self.cancel(signal.SIGINT)
+
+
 class CC_Launch(Base):
     """R3, R4: pa-claude and pa-session add one --settings with the recording status line, last, or nothing."""
 
