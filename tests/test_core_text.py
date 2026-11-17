@@ -303,6 +303,19 @@ class Worker(unittest.TestCase):
         self.assertEqual(section(self.raw, "## Safety"), WORKER_SAFETY)
 
 
+class T016J2WorkerSentence(unittest.TestCase):  # t-016 job 2, spec-2 R5 and section 6
+    def test_git_bullet_sentence(self):
+        raw = read("runtime", "core", "worker.md")
+        rules = flat(raw[raw.index("## Rules of the job"):raw.index("## Roles")])
+        self.assertIn(
+            "anything else is refused: report it to the Project Agent. The read-only `git status`, `git log`, "
+            "`git diff`, `git show` and `git rev-parse` may send their output to a file (`git diff > /tmp/x.diff`) and "
+            "may take one `-C <folder>` before the subcommand; write every other git, gh or hc command plainly, without "
+            "a redirect or `-C`. A Bash command that plainly writes into `.git`, the git and gh settings or the Project "
+            "Agent's state (a redirect, `cp`, `mv`, `rm`, `tee`, `sed -i`) is refused: write reports, logs and notes in "
+            "your evidence folder, and if such a write is needed, stop and report it. A bare `git` word counts", rules)
+
+
 class Sdlc(unittest.TestCase):  # t-017 J1 (R1)
     def test_t017_r1_gate_cell(self):
         text = flat(read("runtime", "core", "sdlc.md"))

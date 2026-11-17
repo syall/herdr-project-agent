@@ -147,7 +147,7 @@ SHAPE_REFUSALS = [
     "git diff-tree --output=x HEAD", "git log --o=x",
     "git reflog expire --all", "git reflog delete HEAD@{1}", "git reflog list extra",
     "git tag v1", "git tag -d v1", "git tag -a v1 -m x", "git tag -f v1", "git tag v1 HEAD",
-    "git -C /tmp/x status", "git -c core.pager=cat log", "git --git-dir=/x status", "git --no-pager",
+    "git -C /tmp/x commit -m x", "git -c core.pager=cat log", "git --git-dir=/x status", "git --no-pager",
     "FOO=1 git status", "/usr/bin/git status", "env git status", "sudo git status", "xargs git add", "! git status",
     "grep git notes.md",
 ]
@@ -232,7 +232,7 @@ class AC2OffTable(GuardTest):
 
 class AC3NotPlainWithGit(GuardTest):
     def test_not_plain_lines_that_involve_git_gh_or_hc(self):
-        for line in ["git diff > out.patch", "git log 2>&1", "git status &", "echo $(git rev-parse HEAD)",
+        for line in ["git commit -m x > out.patch", "git branch 2>&1", "git status &", "echo $(git rev-parse HEAD)",
                      "echo `git rev-parse HEAD`", "git commit -F - <<EOF\nmsg\nEOF", "(git status)", "{ git status; }",
                      "git status\ngit push", "git status |& cat", "g=gi''t; $g push", "cat <(gh pr view)",
                      "hc send pa1 \"$(cat report.md)\"", "git add *.py", "git status \\\n --short", "=git push",
@@ -327,7 +327,7 @@ class AC7Messages(GuardTest):
                                os.path.join(TMP, "r", ".git", "config"))]:
             for words in [item, "report", "Project Agent", "There is no override"]:
                 self.assertIn(words, message)
-        message = self.check("git diff > x")
+        message = self.check("git commit -m x > x")
         for words in ["report", "Project Agent", "There is no override", "plainly"]:
             self.assertIn(words, message)
 
@@ -428,7 +428,7 @@ class HookGuard(unittest.TestCase):
         code, err = self.bash("git push origin t-x")
         self.assertEqual(code, 2)
         self.assertIn(OFF_TABLE.format("git push origin t-x"), err)
-        code, err = self.bash("git diff > x.patch")
+        code, err = self.bash("git commit -m x > x.patch")
         self.assertEqual((code, err.strip()), (2, NOT_PLAIN))
 
     def test_hc_send_goes_to_the_project_agent_from_agent_json(self):
@@ -1399,7 +1399,7 @@ class PersonOnly(GuardTest):
 
     def test_git_lines_keep_their_messages(self):  # nothing else in the guard changes
         self.assertEqual(self.check("git push origin t-x"), OFF_TABLE.format("git push origin t-x"))
-        self.assertEqual(self.check("git diff > x"), NOT_PLAIN)
+        self.assertEqual(self.check("git commit -m x > x"), NOT_PLAIN)
         self.assertIsNone(self.check("git status && make"))
 
     def test_edit_push_allow_refused(self):  # already true (home rule): pinned
@@ -1849,6 +1849,199 @@ class T016_Fix2_PersonOnlyPiped(PersonOnly):
                      "git show HEAD:other.py | python3 -", "git diff pa_push.py && git add pa_push.py"]:
             with self.subTest(line=line):
                 self.assertIsNone(self.check(line))
+
+
+# ---- t-016 job 2: read-only git with redirects and -C ---------------------------------------------------------------
+# spec-2.md (evidence/t-016) R1-R5 and section 5. The lines are data for split_plain_ops, check_command, check_writes and
+# the in-process hook copy only; none is run. <wt> the test's worktree, <ev> a space's evidence folder (~ form), <sp> a
+# space folder. Table A rows 1, 20 and 35 of spec-2 cover the five commands whose old verdicts AC3, AC7, HookGuard,
+# PersonOnly and SHAPE_REFUSALS pinned before this job (those now pin a row outside the five).
+T016J2_A = [
+    "git diff > /tmp/x.diff", "git log --oneline > notes.txt", "git show HEAD:f > f.old",                         # 1-3
+    "git status > <ev>/status.txt", "git status --porcelain >> <ev>/status.txt", "git rev-parse HEAD > /tmp/head",  # 4-6
+    "git diff main...HEAD > <ev>/d.patch 2>&1", "git log -5 2>/dev/null", "git rev-parse --show-toplevel 2>/dev/null",
+    "git diff &> /tmp/d.txt", "git diff &>> /tmp/d.txt", "git log 2> err.txt > out.txt", "git show --stat HEAD >&2",
+    "git --no-pager log > /tmp/l", "git diff > /tmp/x && head /tmp/x", "cd <wt> && git diff > build/diff.txt",  # 14-16
+    "git log --oneline > notes.txt; git status", 'git diff > "/tmp/my diff.txt"', "git log > ~/scratch/log.txt",  # 17-19
+    "git -C <wt> status", "git -C ../other log --oneline -5", "git -C /tmp/repo diff HEAD~1",                     # 20-22
+    'git -C "dir with space" show HEAD', "git -C ~/work/wt rev-parse HEAD", "git -C sub status --short",          # 23-25
+    "git -C <wt> --no-pager log -3", "git -C <wt> diff > /tmp/x.diff", "git -C <wt> log --oneline > <ev>/log.txt 2>&1",
+    "git -C <wt> status && git -C <wt> diff --stat | head", "git > /tmp/s status", "> /tmp/s git status",          # 29-31
+    "git diff HEAD~1 -- runtime > /tmp/r.diff", "git show HEAD:runtime/core/worker.md > /tmp/w.md",                 # 32-33
+    "git log > logs/.gitkeep", "git status 2>&1 | head -5",                                                       # 34-35
+]
+T016J2_REGRESSION = ["git status", "git diff HEAD~1", "git log --oneline -5 | head",
+                     # the five replaced pins' original commands (orchestrator-approved amendment of R4)
+                     "git diff > out.patch", "git log 2>&1", "git diff > x", "git diff > x.patch", "git -C /tmp/x status"]
+# Table B: (row, line, kind, detail). NP, OT, P, V: check_command's message; W, FU: check_command None, check_writes refuses.
+T016J2_B = [
+    (1, "git commit -m x > /tmp/c.log", "NP", None), (2, "git add -A > /tmp/a", "NP", None),
+    (3, "git branch > /tmp/b", "NP", None), (4, "git rebase main > /tmp/r", "NP", None),
+    (5, "git rebase --onto main a b", "OT", None), (6, "git blame f > /tmp/b", "NP", None),
+    (7, "git ls-files > /tmp/f", "NP", None), (8, "gh pr view 1 > /tmp/p", "NP", None),
+    (9, 'hc send t2r "x" > /tmp/o', "NP", None), (10, "git -C <wt> commit -m x", "OT", None),
+    (11, "git -C <wt> add -A", "OT", None), (12, "git -C <wt> push origin t-x", "OT", None),
+    (13, "git -C <wt> blame f", "OT", None), (14, "git -C <wt> branch", "OT", None),
+    (15, "git -C <wt> rebase --onto main a", "OT", None), (16, "git diff > $(echo /tmp/x)", "NP", None),
+    (17, 'git log > "$HOME/x.txt"', "NP", None), (18, "git -C $HOME/wt status", "NP", None),
+    (19, 'git -C "$WT" status', "NP", None), (20, "git -C $(pwd) status", "NP", None),
+    (21, "echo $(git status) > /tmp/s", "NP", None), (22, "git diff < .git/HEAD", "NP", None),
+    (23, "git log > .git/x", "W", ".git/x"), (24, "git diff > .git/hooks/pre-commit", "W", ".git/hooks/pre-commit"),
+    (25, "git show HEAD:a >> ~/.gitconfig", "W", "~/.gitconfig"), (26, "git status > <sp>/ledger.json", "W", "<sp>/ledger.json"),
+    (27, "git log > ~/.config/herdr-pa/core/worker.md", "W", "~/.config/herdr-pa/core/worker.md"),
+    (28, "git diff > .claude/settings.local.json", "W", ".claude/settings.local.json"),
+    (29, "cd .git && git log > config", "W", "config"), (30, "cd - && git log > notes.txt", "FU", ("cd -", "notes.txt")),
+    (31, "git -C a -C b status", "OT", None), (32, "git -C status", "OT", None), (33, 'git -C "" status', "OT", None),
+    (34, "git -Cdir status", "OT", None), (35, "git -C -p status", "OT", None), (36, "git -c core.pager=x log", "OT", None),
+    (37, "git --git-dir=.git log", "OT", None), (38, "git --work-tree=. status", "OT", None),
+    (39, "git --exec-path=/tmp log", "OT", None), (40, "git -C d -c core.pager=x log", "OT", None),
+    (41, "git -C d --git-dir=x status", "OT", None), (42, "git --no-pager -C d log", "OT", None),
+    (43, "git diff --output=/tmp/x > /tmp/y", "NP", None), (44, "git -C d diff --output=/tmp/x", "OT", None),
+    (45, "make > b.log 2>&1 && git status", "NP", None), (46, "git status > /tmp/s | sh", "NP", None),
+    (47, "git show HEAD:pa_push.py > /tmp/p.py", "P", None), (48, "git log >| /tmp/x", "NP", None),
+    (48, "git log > /tmp/x &", "NP", None), (49, "git status > /tmp/s && git push origin t-x", "NP", None),
+    (50, "GIT_PAGER=cat git log > /tmp/x", "V", "GIT_PAGER=cat"), (51, "git log <<< x", "NP", None),
+    (51, "git log >", "NP", None), (52, "/usr/bin/git log > /tmp/x", "NP", None), (52, "env git log > /tmp/x", "NP", None),
+    (53, "git log > /tmp/x | tee .git/y", "W", ".git/y"),
+    (54, "git -C <wt> show HEAD:runtime/tools/pa_push.py | python3", "P", "git -C <wt> show HEAD:runtime/tools/pa_push.py"),
+]
+
+
+class T016J2(T016):
+    def both(self, line):
+        return self.check(self.fill(line), cwd=self.wt), self.w(line)
+
+    def quoted(self, line):
+        return " ".join(shlex.quote(w) for w in shlex.split(self.fill(line)))
+
+
+class T016J2_Scanner(T016J2):
+    def git(self, line):
+        return guard.split_plain_ops(line, writes="git")
+
+    def test_ac1_1_other_modes_unchanged(self):  # passes before the job; V2 is the full differential
+        self.assertIsNone(guard.split_plain_ops("git diff > /tmp/x"))
+        self.assertEqual(guard.split_plain_ops("git diff > /tmp/x 2>&1", writes=True), ([["git", "diff"]], [None], [["/tmp/x"]]))
+        self.assertEqual(guard.split_plain_ops("cat $HOME/x", writes=True)[0], [["cat", os.path.join(self.user, "x")]])
+        self.assertEqual(guard.split_plain_ops("wc -l < a", writes=True), ([["wc", "-l"]], [None], [[]]))
+        self.assertIsNone(guard.split_plain_ops("2>&1 && git status", writes=True))
+
+    def test_ac1_1_git_mode_within_write_mode(self):  # a line plain in git mode is plain in write mode, same targets
+        lines = [self.fill(l) for l in T016_ALLOWED + [l for l, _ in T016_REFUSED] + T016J2_A] + [
+            self.fill(l) for _, l, _, _ in T016J2_B]
+        for line in lines:
+            got = self.git(line)
+            if got is not None:
+                with self.subTest(line=line):
+                    want = guard.split_plain_ops(line, writes=True, bare=True)
+                    self.assertEqual((got[0], got[1], [[t for t in ts if not t.startswith(">&")] for ts in got[2]]), want)
+
+    def test_ac1_2_targets(self):
+        self.assertEqual(self.git("git diff > /tmp/x 2>&1"), ([["git", "diff"]], [None], [["/tmp/x", ">&1"]]))
+        self.assertEqual(self.git("git log 2>/dev/null"), ([["git", "log"]], [None], [["/dev/null"]]))
+        self.assertEqual(self.git("git status 2>&1 | head -5"), ([["git", "status"], ["head", "-5"]], ["|", None], [[">&1"], []]))
+        self.assertEqual(self.git("git show HEAD >&-")[2], [[">&-"]])
+
+    def test_ac1_3_not_plain(self):
+        for line in ["git diff < a", "git log <&0", 'git log > "$HOME/x"', "git log > $HOME/x", "git log > $X", "git log >",
+                     "2>&1 && git status", "git log <<< x", "git log <> x", "git log >| x", "git log > x &", "> x"]:
+            with self.subTest(line=line):
+                self.assertIsNone(self.git(line))
+
+
+class T016J2_Allowed(T016J2):
+    def test_ac2_1_table_a(self):
+        self.assertEqual(len(T016J2_A), 35)
+        for row, line in enumerate(T016J2_A + T016J2_REGRESSION, 1):
+            with self.subTest(row=row, line=line):
+                self.assertEqual(self.both(line), (None, None))
+
+    def test_ac3_1_profile_row_equal_to_a_read_row(self):
+        rows = [(("git", "status"), guard.any_args), (("git", "lfs", "pull"), guard.any_args)]
+        self.assertIsNone(self.check("git -C d status", extra_rows=rows))
+        self.assertEqual(self.check("git -C d lfs pull", extra_rows=rows), OFF_TABLE.format("git -C d lfs pull"))
+        self.assertIsNone(self.check("git lfs pull", extra_rows=rows))
+
+
+class T016J2_Refused(T016J2):
+    def test_ac2_2_table_b(self):
+        for row, line, kind, detail in T016J2_B:
+            with self.subTest(row=row, line=line):
+                command, writes = self.both(line)
+                if kind in ("W", "FU"):
+                    self.assertIsNone(command)
+                    want = WRITE.format(target=self.fill(detail)) if kind == "W" else FOLDER_UNKNOWN.format(
+                        word=detail[0], target=detail[1])
+                    self.assertEqual(writes, want)
+                    continue
+                want = {"NP": NOT_PLAIN, "OT": OFF_TABLE.format(self.quoted(line) if kind == "OT" else ""),
+                        "P": PERSON_MSG.format(self.quoted(detail) if detail else self.fill(line)),
+                        "V": VARIABLE.format(detail)}[kind]
+                self.assertEqual(command, want)
+
+    def test_ac3_2_pipe_rule_with_c(self):
+        message = self.check(self.fill("git -C <wt> show HEAD:runtime/tools/pa_push.py | python3"), cwd=self.wt)
+        self.assertTrue(message.startswith(PERSON_MSG.split("{}")[0]), message)
+        self.assertEqual(self.check("git -C d show HEAD:x.sh | bash"), OFF_TABLE.format("bash"))
+
+
+class T016J2_Limits(T016J2):
+    def test_ac5_1_sed_in_a_cluster(self):
+        self.refused("sed -Ei 's/a/b/' .git/config", ".git/config")
+        self.refused("sed -ni 's/a/b/' .git/config", ".git/config")
+        self.assertIsNone(self.w("sed -Ei 's/a/b/' notes.md"))
+        self.assertIsNone(self.w("sed -E 's/a/b/' .git/config"))
+
+    def test_ac5_2_cdpath_on_the_line(self):
+        self.assertEqual(self.w("export CDPATH=/tmp; cd build && echo x > notes.txt"),
+                         FOLDER_UNKNOWN.format(word="cd build", target="notes.txt"))
+        self.assertIsNone(self.w("cd build && echo x > notes.txt"))
+
+    def test_ac5_3_touch_truncate_reference(self):
+        self.assertIsNone(self.w("touch -r .git/HEAD build/stamp"))
+        self.assertIsNone(self.w("truncate -r .git/index build/x"))
+        self.assertIsNone(self.w("touch --reference .git/HEAD build/stamp"))
+        self.refused("touch -r build/a .git/x", ".git/x")
+
+    def test_ac5_4_command_options(self):
+        self.assertEqual(self.w("command -p cd .git && echo x > config"),
+                         FOLDER_UNKNOWN.format(word="command -p cd .git", target="config"))
+        self.assertIsNone(self.w("command -v ls && echo x > notes.txt"))
+
+    def test_ac5_5_pushd_plus(self):
+        self.assertEqual(self.w("pushd +1 && echo x > notes.txt"), FOLDER_UNKNOWN.format(word="pushd +1", target="notes.txt"))
+        self.assertIsNone(self.w("pushd build && echo x > notes.txt"))
+
+
+class T016J2_Docs(T016J2):
+    def test_r5_docstring(self):
+        doc = guard.__doc__
+        self.assertIn("output redirects", doc)
+        self.assertIn("one leading -C <dir>", doc)
+
+
+class T016J2_Hook(unittest.TestCase):
+    """Through an in-process copy of pa-hook guard: check_command then check_writes."""
+
+    @classmethod
+    def setUpClass(cls):
+        HookGuard.setUpClass.__func__(cls)
+        os.makedirs(os.path.join(cls.wt, ".git"), exist_ok=True)
+
+    def test_hook(self):
+        folder = tempfile.mkdtemp(dir=TMP)
+        shutil.copy(os.path.join(TOOLS, "pa_guard.py"), os.path.join(folder, "pa_guard.py"))
+        hooks = load_hooks_copy(folder)
+
+        def bash(line):
+            return call_hook(hooks, hooks.hook_guard, "Bash", {"command": line}, self.wt)
+        self.assertEqual(bash("git diff > " + os.path.join(folder, "x.diff"))[0], 0)
+        self.assertEqual(bash("git -C " + self.wt + " status")[0], 0)
+        code, err = bash("git log > .git/x")
+        self.assertEqual((code, err.strip()), (2, WRITE.format(target=".git/x")))
+        code, err = bash("git -C " + self.wt + " commit -m x")
+        self.assertEqual(code, 2)
+        self.assertIn(OFF_TABLE.format("git -C " + self.wt + " commit -m x"), err)
 
 
 def tearDownModule():
