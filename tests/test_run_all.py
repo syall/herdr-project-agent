@@ -14,6 +14,7 @@ NAMES = ["python 3.7 parse", "unit tests", "keeper harness", "panel harness", "s
 STUB = r'''k=$1
 eval "m=\${STUB_$k:-pass}"
 echo "start $k" >> "$STUB_DIR/events"
+echo "$k ${TMPDIR:-unset}" >> "$STUB_DIR/tmpdirs"
 echo "$k says hello"
 case "$m" in
   pass) ;;
@@ -30,10 +31,12 @@ echo "$k done"
 echo "end $k" >> "$STUB_DIR/events"
 '''
 
-UNITS = '''import os, unittest
+UNITS = '''import os, tempfile, unittest
 M = os.environ.get("STUB_units", "pass")
 class T(unittest.TestCase):
     def test_one(self):
+        with open(os.path.join(os.environ["STUB_DIR"], "tmpdirs"), "a") as f:
+            f.write("units %s\\n" % tempfile.gettempdir())
         if M == "loud":
             print("\\n".join("noise %d" % i for i in range(2000)))
         if M == "fail":
@@ -185,6 +188,22 @@ class RunAll(unittest.TestCase):
         for name in NAMES[:5]:
             self.assertIn("{}: ok".format(name), self.summary(out))
         self.assertNotIn("integration", out)
+
+    def test_r6c_each_part_has_its_own_temp_folder(self):
+        # A test that looks for its own leftovers in the temp folder (test_pa_push c13) must not see another
+        # part's, or another suite's running beside it: each part gets TMPDIR in the run folder.
+        for serial in ("", "1"):
+            write(os.path.join(self.tmp, "tmpdirs"), "")
+            code, out = self.run_all(PA_SERIAL=serial)
+            self.assertEqual(code, 0, out)
+            folder = self.outputs(out)
+            with open(os.path.join(self.tmp, "tmpdirs")) as f:
+                seen = dict(line.split(" ", 1) for line in f.read().splitlines())
+            self.assertEqual(sorted(seen), sorted(["units", "keeper", "panel", "store", "integration"]), seen)
+            dirs = [os.path.realpath(d) for d in seen.values()]
+            self.assertEqual(len(set(dirs)), 5, seen)
+            for d in dirs:
+                self.assertTrue(d.startswith(os.path.realpath(folder) + os.sep) and os.path.isdir(d), (d, folder))
 
     def test_r7_usage(self):
         code, out = self.run_all("--nope")
