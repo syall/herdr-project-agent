@@ -27,6 +27,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 
 sys.dont_write_bytecode = True  # keep tools/ free of caches
@@ -2925,6 +2926,38 @@ def cc_figure(rec):
     return rec["base"] + rec["cost"]
 
 
+# The statusline process's cancel state (REVIEW M1): the inner command, whether Popen is still starting it, whether
+# a cancel came, and the lock record_cc holds while it writes. Only statusline_main installs the signal handler.
+CC_STOP = {"proc": None, "starting": False, "stopping": False, "write": threading.Lock()}
+
+
+def statusline_kill(proc):
+    """Kill the inner command's whole process group (it runs in its own session), or the process alone."""
+    try:
+        os.killpg(proc.pid, 9)  # its whole group: a shell's children hold its stdout open
+    except OSError:
+        try:
+            proc.kill()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def statusline_stop(signum=None, frame=None):
+    """Claude Code cancelled this run (SIGTERM, SIGHUP, SIGINT): kill the inner group, let a record being written
+    finish (at most 1 s), print nothing and exit 0. A signal while Popen is starting the inner command is held until
+    Popen returns (statusline acts on it then)."""
+    try:
+        CC_STOP["stopping"] = True
+        if CC_STOP["proc"] is None and CC_STOP["starting"]:
+            return
+        if CC_STOP["proc"] is not None:
+            statusline_kill(CC_STOP["proc"])
+        CC_STOP["write"].acquire(timeout=1.0)  # kept until exit: no record write starts now
+    except BaseException:  # noqa: BLE001 - a status line never fails
+        pass
+    os._exit(0)
+
+
 def record_cc(directory, fields, now):
     """Merge one status line reading into costs/cc/<session>.json (AC1.2-AC1.5). True when written. Only for an
     existing space folder; a busy lock records nothing this run."""
@@ -2961,13 +2994,16 @@ def record_cc(directory, fields, now):
                 return False
         text = json.dumps({k: rec[k] for k in CC_KEYS}, separators=(",", ":")) + "\n"
         tmp = os.path.join(folder, ".{}.{}.tmp".format(fields["session"], os.getpid()))
-        try:
-            with open(tmp, "w") as f:
-                f.write(text)
-            os.replace(tmp, path)  # atomic: a cancelled run leaves the old file whole
-        finally:
-            if os.path.exists(tmp):
-                os.unlink(tmp)
+        with CC_STOP["write"]:  # a cancel waits for a write in progress (statusline_stop), and none starts after it
+            if CC_STOP["stopping"]:
+                return False
+            try:
+                with open(tmp, "w") as f:
+                    f.write(text)
+                os.replace(tmp, path)  # atomic: a cancelled run leaves the old file whole
+            finally:
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
         return True
     finally:
         os.close(fd)
@@ -2993,17 +3029,21 @@ def statusline(argv, data, now=None):
     """One status line update: start the inner command on `data`, record while it runs, return its stdout bytes
     unchanged (b"" when there is none, it failed to start, or it ran past INNER_TIMEOUT). Never raises."""
     import subprocess as sp
-    import threading
     out, proc = b"", None
     try:
         space, then = statusline_args(argv)
         record = len(data) <= STDIN_MAX
         data = data[:STDIN_MAX]
         if then:
+            CC_STOP["starting"] = True
             try:
                 proc = sp.Popen(then, stdin=sp.PIPE, stdout=sp.PIPE, stderr=sp.DEVNULL, close_fds=True, start_new_session=True)
             except Exception:  # noqa: BLE001 - missing or not executable: an empty line
                 proc = None
+            CC_STOP["proc"] = proc
+            CC_STOP["starting"] = False
+            if CC_STOP["stopping"]:
+                statusline_stop()  # cancelled while Popen was starting it (only the handler sets stopping)
         started = time.monotonic()
 
         def work():
@@ -3023,10 +3063,7 @@ def statusline(argv, data, now=None):
                 out = proc.communicate(data, timeout=max(0.0, INNER_TIMEOUT - (time.monotonic() - started)))[0] or b""
             except sp.TimeoutExpired:
                 out = b""
-                try:
-                    os.killpg(proc.pid, 9)  # its whole group: a shell's children hold its stdout open
-                except OSError:
-                    proc.kill()
+                statusline_kill(proc)
                 for pipe in (proc.stdin, proc.stdout):
                     try:
                         pipe.close()
@@ -3065,6 +3102,9 @@ def statusline_main(argv):
     """`pa-costs statusline ...` as a process: nothing on stderr, the inner bytes on stdout, exit 0."""
     try:
         sys.stderr = open(os.devnull, "w")
+        import signal
+        for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):  # Claude Code cancels a run still in flight (M1)
+            signal.signal(sig, statusline_stop)
         out = statusline(argv, read_stdin())
         view = memoryview(out)
         while view:
