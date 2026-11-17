@@ -172,6 +172,7 @@ IDLE = 600  # a segment settles after this many seconds without a new line, and 
 LONG = 200000  # a call whose prompt (in + cache write + cache read) is above this many tokens is long context
 REBUILD_MIN = 20000  # a cache write after idle counts as a rebuild from this many tokens
 TAIL = 256  # message ids remembered per session for the dedupe
+PA_TURNS = 64  # turn starts remembered per Project Agent session, for its subagents' rows (REVIEW-4 RL4-1)
 FORK_SLACK = 5  # seconds: a resumed or forked session skips calls older than its start record minus this
 GONE_UNSEEN = 7 * 86400  # a recorded session whose file was never found is gone after this many seconds (a transcript
 # is written at the first message, which can come hours after the start)
@@ -460,6 +461,10 @@ class Reader:
             if e["start"]:
                 self.settle(e["ts"])
                 f["turn"] = e["ts"]
+                if self.sess.get("kind") == "pa" and not self.sess.get("sub"):  # its subagents' rows take these turns
+                    turns = f.setdefault("turns", [])
+                    turns.append(e["ts"])
+                    del turns[:-PA_TURNS]
         elif e["type"] == "call":
             self.add_call(e["ts"], e["id"], e["model"], e["tokens"])
         elif e["type"] == "turn":
@@ -628,10 +633,32 @@ def attribute(row, sess, ctx):
     return row
 
 
+def parent_turn(row, ctx):
+    """A Project Agent subagent row's window from the parent turn open at its first call: (turn, start, end); "hold"
+    while that turn is the parent's latest and still open; None when the parent's turns do not cover it."""
+    pf = (ctx.get("files") or {}).get(row["session"]) or {}
+    first = parse_ts(row.get("from") or "")
+    turns = sorted((t, x) for t, x in ((parse_ts(x), x) for x in pf.get("turns") or []) if t is not None)
+    if first is None or not turns or turns[0][0] > first:
+        return None
+    i = max(n for n, (t, _x) in enumerate(turns) if t <= first)
+    if i + 1 < len(turns):
+        return turns[i][1], turns[i][0], turns[i + 1][0]
+    if pf.get("open"):
+        return "hold"
+    return turns[i][1], turns[i][0], max(parse_ts(row["to"]) or first, parse_ts(pf.get("lastCall") or "") or 0) + IDLE
+
+
 def attribute_pa(row, ctx):
     _ledger, journal = space_facts(ctx)
     start = parse_ts(row.get("turn") or row["from"]) or 0
     end = parse_ts(row.get("until") or "") or ((parse_ts(row["to"]) or start) + IDLE)
+    if row.get("sub"):
+        window = parent_turn(row, ctx)
+        if window == "hold":
+            return None
+        if window:
+            row["turn"], start, end = window
     entries = [e for e in journal if e["at"] + 0.999 >= start and e["at"] < end]
     row["task"], row["role"] = None, None
     if not entries:
@@ -842,7 +869,7 @@ def _collect(directory, folder, now, quiet, resummarize):
     ctx = {"directory": directory, "records": records, "sessions": sessions, "now": now, "events": []}
     bind_pending(ctx)
     sessions = ctx["sessions"]
-    files = state.setdefault("files", {})
+    files = ctx["files"] = state.setdefault("files", {})
     out, rows = [], []
     held, state["held"] = state.get("held") or [], []
 
@@ -887,7 +914,7 @@ def _collect(directory, folder, now, quiet, resummarize):
             if sub:
                 void["sub"] = sub
             out.append(void)
-            for k in ("offset", "tail", "open", "turn", "cum", "lastCall", "seen", "model", "late", "bad"):
+            for k in ("offset", "tail", "open", "turn", "turns", "cum", "lastCall", "seen", "model", "late", "bad"):
                 f.pop(k, None)
             f["offset"] = 0
             f["tail"] = []
