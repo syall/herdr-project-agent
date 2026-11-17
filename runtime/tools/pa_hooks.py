@@ -390,9 +390,11 @@ def applies(rule, task, phase):
     return target in ("all", phase, str(task.get("type", "")).lower(), str(task.get("tier", "")).lower() + " tier")
 
 
-def gate_commits(worktree):
+def gate_commits(worktree, runner=None):
     """The pin: the commit(s) a gate run saw in a task's worktree. One entry when the folder is a git top level,
-    one for each src/<name> child that is (a folder of packages), else []. Never raises; records, never fails."""
+    one for each src/<name> child that is (a folder of packages), else []. Never raises; records, never fails.
+    runner: how to run git, with git()'s signature and result (default: git(), the module's own)."""
+    git = globals()["git"] if runner is None else runner
     if not worktree or not os.path.isdir(worktree):
         return []
     root = os.path.realpath(worktree)
@@ -429,9 +431,10 @@ def gate_commits(worktree):
     return found
 
 
-def evaluate_gate(directory, task, phase, rules=None):
+def evaluate_gate(directory, task, phase, rules=None, runner=None):
     """The gate's verdict for one ledger task, as GATE.json holds it. Reads only: writes and prints nothing.
-    rules: the space's rules list (default: read from rules.json in directory)."""
+    rules: the space's rules list (default: read from rules.json in directory). runner: how gate_commits runs
+    git (default: git())."""
     tier = str(task.get("tier") or "normal").lower()
     code = bool(task.get("worktree")) or str(task.get("type", "")).lower() in ("feature", "bug", "chore", "code")
     # Leaving `review` (the default) needs every earlier phase's artifact too.
@@ -469,7 +472,7 @@ def evaluate_gate(directory, task, phase, rules=None):
                        **({} if separate else {"why": "the ledger lists no reviewer worker separate from the build workers"})})
     ok = all(c["ok"] for c in checks)
     return {"task": task.get("id"), "phase": phase, "tier": tier, "passed": ok, "at": pa.now(), "checks": checks,
-            "commits": gate_commits(task.get("worktree"))}
+            "commits": gate_commits(task.get("worktree"), runner)}
 
 
 def cmd_gate(args):

@@ -290,6 +290,8 @@ def caller_refusal(env, ancs, strict=True):
             return "{} is set: an agent's shell".format(k)
     if ancs is None:
         return "the process tree could not be read (ps failed), so the caller is unknown"
+    if all(a.get("pid") == 1 for a in ancs):
+        return "the caller is unknown (an orphaned process): its only ancestor is the system's first process"
     for a in ancs:
         name = os.path.basename(str(a.get("comm") or "")).lower()
         words = str(a.get("args") or "").lower()
@@ -456,6 +458,12 @@ class Session:
             return 124, "", "ran out of time"
         return git_call(base(path, self.hooks) + list(args), min(timeout, left))
 
+    def gate_git(self, path, *args, timeout=None):
+        """pa_hooks.git()'s signature and stripped result, run as self.git runs (hooks and fsmonitor off, no
+        GIT_*): the runner the gate evaluation is given, so it runs nothing the task worktree names."""
+        code, out, err = self.git(path, args, timeout or pa_hooks.GIT_TIMEOUT)
+        return code, out.strip(), err.strip()
+
     def sha(self, path, ref):
         code, out, _err = self.git(path, ["rev-parse", "--verify", "-q", ref + "^{commit}"])
         out = out.strip()
@@ -474,6 +482,41 @@ def tracked_changes(s, path):
     if code:
         return None
     return [l for l in out.splitlines() if l.strip() and not l[3:].strip('"').startswith(".claude/")]
+
+
+def task_places(worktree):
+    """The folders of the task's worktree that the gate and live_pin look in: the worktree, and its src/<name>
+    children (a folder of packages). [] when there is no worktree."""
+    if not worktree or not os.path.isdir(worktree):
+        return []
+    root = os.path.realpath(worktree)
+    places = [root]
+    src = os.path.join(root, "src")
+    if os.path.isdir(src):
+        places += [os.path.join(src, n) for n in sorted(os.listdir(src)) if os.path.isdir(os.path.join(src, n))]
+    return places
+
+
+def task_settings_refusal(s, worktree):
+    """C8a, before the gate is evaluated: the git settings of every repository in the task's worktree that the gate
+    or live_pin runs git status in, read as C7b reads the main checkout's (the local scope, and the worktree scope
+    when extensions.worktreeConfig is on). The worktree is the agent's, so a key that can run a program refuses.
+    The refusal message, or None."""
+    for place in task_places(worktree):
+        code, top, _ = s.git(place, ["rev-parse", "--show-toplevel"])
+        if code or os.path.realpath(top.strip()) != place:
+            continue
+        code, wt_config, _ = s.git(place, ["config", "--local", "--bool", "--get", "extensions.worktreeConfig"])
+        for scope in ("local", "worktree") if wt_config.strip() == "true" else ("local",):
+            code, out, err = s.git(place, ["config", "--" + scope, "--list", "--name-only"])
+            if code:
+                return "could not read the {} git settings of the task's worktree {} ({}); nothing was pushed".format(
+                    scope, place, err.strip()[-200:])
+            for key in out.split():
+                if RISKY.match(key):
+                    return ("the task's worktree {} has git setting {} ({}), which can run a program or redirect git; "
+                            "remove it, run pa-gate again and ask for a new card").format(place, key, scope)
+    return None
 
 
 def live_pin(s, worktree, common):
@@ -571,7 +614,10 @@ def gather(s, directory, space, push, facts, plan=False):
     task = next((t for t in ledger.get("tasks", []) if isinstance(t, dict) and t.get("id") == task_id), None)
     if not task:
         raise Refused("C8a", "no task {} in this space's ledger".format(task_id))
-    now_gate = pa_hooks.evaluate_gate(directory, task, "review")
+    why = task_settings_refusal(s, task.get("worktree"))
+    if why:
+        raise Refused("C8a", why)
+    now_gate = pa_hooks.evaluate_gate(directory, task, "review", runner=s.gate_git)
     if not now_gate["passed"]:
         failed = ["{} ({})".format(c["check"], c.get("why")) for c in now_gate["checks"] if not c["ok"]]
         raise Refused("C8a", "the full gate for {} does not pass now: {}".format(task_id, "; ".join(failed)))
@@ -669,24 +715,46 @@ def gather(s, directory, space, push, facts, plan=False):
     if not s.is_ancestor(real, remote, commit):
         raise Refused("C11c", "remote {} ({}) is not an ancestor of {}; only a fast-forward is allowed, never a force push".format(
             branch, short(remote), short(commit)))
-    facts["commits"], facts["count"] = commit_list(s, real, remote, commit, push.get("localBefore"))
+    facts["commits"], facts["count"] = commit_list(s, real, remote, commit, task_branch)
     if plan:
         push["commits"] = facts["commits"]
     return None
 
 
-def commit_list(s, path, remote, commit, local_before):
+REBASED = re.compile(r"^rebase\b.*\(finish\): refs/heads/(\S+) onto ([0-9a-f]{40}|[0-9a-f]{64})$")
+
+
+def task_base(s, path, task_branch):
+    """Where the task branch started, from its reflog in path: the newest `rebase (finish): refs/heads/<b> onto
+    <sha>`, else the oldest entry when it is `branch: Created from ...`. None when the reflog does not say."""
+    if branch_problem(task_branch):
+        return None
+    code, out, _ = s.git(path, ["reflog", "show", "--format=%H%x1f%gs", "refs/heads/" + task_branch, "--"])
+    entries = [l.split("\x1f", 1) for l in out.splitlines() if "\x1f" in l] if not code else []
+    for _sha, subject in entries:
+        m = REBASED.match(subject)
+        if m and m.group(1) == task_branch:
+            return m.group(2)
+    if entries and entries[-1][1].startswith("branch: Created from ") and HEX.match(entries[-1][0]):
+        return entries[-1][0]
+    return None
+
+
+def commit_list(s, path, remote, commit, task_branch):
     """([{sha, subject, author, fromTask}] of remote..commit, newest first, at most COMMITS_MAX; the full count).
-    fromTask is false for a commit that was on local main already when the card was made."""
+    fromTask (spec 6.1) is true for a commit on the task branch's own first-parent line since the branch started
+    (task_base), false for any other (on local main before this task, or merged in); null for every commit when
+    where the branch started cannot be read."""
     code, out, _ = s.git(path, ["log", "-n", str(COMMITS_MAX), "--format=%H%x1f%s%x1f%an <%ae>", remote + ".." + commit])
     rows = [l.split("\x1f") for l in out.splitlines() if l.count("\x1f") == 2] if not code else []
-    earlier = set()
-    if local_before and HEX.match(local_before) and local_before != remote:
-        code, mine, _ = s.git(path, ["log", "--format=%H", remote + ".." + local_before])
-        earlier = set(mine.split()) if not code else set()
+    own = None
+    base = task_base(s, path, task_branch)
+    if base and s.is_ancestor(path, base, commit):
+        code, mine, _ = s.git(path, ["rev-list", "--first-parent", base + ".." + commit])
+        own = set(mine.split()) if not code else None
     code, count, _ = s.git(path, ["rev-list", "--count", remote + ".." + commit])
     commits = [{"sha": r[0], "subject": pa_hooks.cut(pa_hooks.clean(r[1]), 200), "author": pa_hooks.cut(pa_hooks.clean(r[2]), 120),
-                "fromTask": r[0] not in earlier} for r in rows]
+                "fromTask": None if own is None else r[0] in own} for r in rows]
     return commits, int(count.strip()) if not code and count.strip().isdigit() else len(commits)
 
 
@@ -804,9 +872,12 @@ def card_context(push, facts, entry):
              "Gated commit: {} on {} (pa-gate review passed at {}).".format(c7, push["taskBranch"], push["gateAt"]),
              "Commits to push ({}):".format(facts["count"])]
     for c in push["commits"][:CONTEXT_COMMITS]:
-        lines.append("- {} {} ({}){}".format(short(c["sha"]), c["subject"], c["author"], "" if c["fromTask"] else " (not from this task)"))
+        lines.append("- {} {} ({}){}".format(short(c["sha"]), c["subject"], c["author"], " (not from this task)" if c["fromTask"] is False else ""))
     if facts["count"] > CONTEXT_COMMITS:
         lines.append("- and {} more".format(facts["count"] - CONTEXT_COMMITS))
+    if any(c["fromTask"] is None for c in push["commits"]):
+        lines.append("Note: which of these commits are this task's cannot be told: the record of where {} started "
+                     "(its reflog) is missing; read the list yourself.".format(push["taskBranch"]))
     if facts.get("originUrl") != push["url"]:
         lines.append("Note: origin of {} is {}, not the allowlist URL; the push goes to the allowlist URL.".format(
             push["path"], pa_hooks.clean(facts.get("originUrl") or "not set")))
