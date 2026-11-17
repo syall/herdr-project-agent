@@ -1568,6 +1568,72 @@ cases["W2-all-closed-no-row"] = async () => { // V3.2, V3.3: every worker closed
   check(g.__files[`:${DIR}/ledger.json`] === ledger && !(g.__writes ?? []).some((k) => k.endsWith("/ledger.json")), "ledger.json unchanged, never written");
 };
 
+// ---- t-011: the Rules view's Delete can be backed out of (as the task Delete) ----
+const RULES = `:${DIR}/rules.json`;
+const rule = (id, title) => ({ id, title, text: `${title} text`, status: "active", order: 10, source: "person" });
+async function ruleWorld() {
+  world();
+  g.__files[RULES] = JSON.stringify({ rules: [rule("r-one", "One"), rule("r-two", "Two")] });
+  g.__files[`:${DIR}/schedule.json`] = JSON.stringify({ everyMinutes: 15 });
+  const v = await mount(); await settle();
+  await press(v, "view-rules");
+  await press(v, "rule-head-r-one");
+  return v;
+}
+const ruleArmed = (v) => look(v).text.includes("Delete for good?");
+const ruleIds = () => JSON.parse(g.__files[RULES]).rules.map((r) => r.id).join(",");
+
+cases["R1-two-clicks-delete"] = async () => { // one click arms, with a Cancel beside it; the second deletes the rule
+  const v = await ruleWorld();
+  check(!ruleArmed(v) && !look(v).clicks["rule-delete-cancel-r-one"], "unarmed, no Cancel");
+  await press(v, "rule-delete-r-one");
+  check(ruleArmed(v) && Boolean(look(v).clicks["rule-delete-cancel-r-one"]), `armed with a Cancel (have ${Object.keys(look(v).clicks)})`);
+  check(ruleIds() === "r-one,r-two", "one click deletes nothing");
+  await press(v, "rule-delete-r-one"); await settle();
+  check(ruleIds() === "r-two", `the second click deletes r-one (got ${ruleIds()})`);
+};
+cases["R2-cancel"] = async () => {
+  const v = await ruleWorld();
+  await press(v, "rule-delete-r-one");
+  await press(v, "rule-delete-cancel-r-one");
+  check(!ruleArmed(v) && !look(v).clicks["rule-delete-cancel-r-one"], "Cancel disarms");
+  await press(v, "rule-delete-r-one");
+  check(ruleArmed(v) && ruleIds() === "r-one,r-two", "after Cancel one click only arms");
+};
+cases["R3-press-elsewhere"] = async () => { // empty space, another Rules control (they stop the press), the schedule line
+  const v = await ruleWorld();
+  for (const where of [null, "pa-rules", "rule-export", "rule-edit-r-one", "rule-toggle-r-two", "sched-summary"]) {
+    await press(v, "rule-delete-r-one");
+    check(ruleArmed(v), `armed before ${where}`);
+    await press(v, where);
+    if (v.rules.form) { v.rules.closeForm(); }
+    check(!ruleArmed(v), `a press on ${where ?? "the panel"} disarms`);
+  }
+  await settle();
+  check(ruleIds() === "r-one,r-two", `nothing deleted (got ${ruleIds()})`);
+};
+cases["R4-view-space-time"] = async () => { // a view switch, a space switch, 10 s
+  const v = await ruleWorld();
+  await click(v, "rule-delete-r-one");
+  await click(v, "view-tasks"); await click(v, "view-rules");
+  check(!ruleArmed(v), "view switched and back: not armed");
+  await click(v, "rule-delete-r-one");
+  const S2 = "sp2", D2 = "/home/u/.config/herdr-pa/spaces/sp2";
+  g.__spaces.push({ id: S2, name: "other", machine: null, folder: "/other", active: false, tabs: [{ id: "tb2", index: 1, name: "1", named: false }] });
+  g.__files[`:${D2}/agent.json`] = JSON.stringify({ space: S2, project: "/other", profile: "test", name: "other" });
+  g.__files[`:${D2}/ledger.json`] = JSON.stringify({ tasks: [] });
+  g.__files[`:${D2}/rules.json`] = JSON.stringify({ rules: [rule("r-one", "Other one")] });
+  show(S2); v.reload(cx); await settle();
+  show(S); v.reload(cx); await settle();
+  check(/One text|One/.test(look(v).text) && !ruleArmed(v), "space switched and back: not armed");
+  await click(v, "rule-delete-r-one");
+  advance(9000); await fire(1000);
+  check(ruleArmed(v), "still armed at 9 s");
+  advance(1500); await fire(1000);
+  check(!ruleArmed(v), "disarmed after 10 s");
+  check(ruleIds() === "r-one,r-two", "nothing deleted");
+};
+
 const pick = process.argv.slice(2);
 let failed = 0;
 for (const [name, fn] of Object.entries(cases)) {
