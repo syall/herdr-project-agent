@@ -1739,6 +1739,57 @@ class T016_Hook(unittest.TestCase):
         self.assertNotIn("this command writes to", err)
 
 
+# ---- t-016, card d-067: the person-only names are refused as the program run, not as a git row's path operand -------
+class T016_PersonOnlyOperands(PersonOnly):
+    """Every PersonOnly test still passes (this class inherits them). The lines are data for check_command only."""
+
+    def test_git_rows_with_the_file_as_operand(self):
+        for line in ["git add runtime/tools/pa_push.py", "git add -- runtime/tools/pa_push.py", "git add a.py pa_push.py",
+                     "git diff runtime/tools/pa_push.py", "git diff HEAD~1 -- runtime/tools/pa_push.py",
+                     "git --no-pager diff --stat pa_push.py", "git log --oneline -- runtime/tools/pa_push.py",
+                     "git log -p runtime/tools/PA_PUSH.PY", "git show HEAD:runtime/tools/pa_push.py",
+                     "git status runtime/tools/pa_push.py", "git status --short pa_push.py",
+                     "git restore runtime/tools/pa_push.py", "git restore --staged -- runtime/tools/pa_push.py",
+                     "git blame runtime/tools/pa_push.py", "git blame -L 1,9 pa_push.py",
+                     "git ls-files runtime/tools/pa_push.py", "git grep -n push -- runtime/tools/pa_push.py",
+                     "git diff pa_push.py && git add pa_push.py && git commit -m 'pa_push.py: fix'"]:
+            with self.subTest(line=line):
+                self.assertIsNone(self.check(line))
+
+    def test_git_mv_and_rm_are_not_rows(self):  # refused as for any file, not as a person-only tool
+        for line in ["git mv runtime/tools/pa_push.py runtime/tools/pa_push2.py", "git rm runtime/tools/pa_push.py",
+                     "git rm --cached pa_push.py"]:
+            with self.subTest(line=line):
+                self.assertEqual(self.check(line), OFF_TABLE.format(line))
+                other = line.replace("pa_push.py", "other.py").replace("pa_push2.py", "other2.py")
+                self.assertEqual(self.check(other), OFF_TABLE.format(other))
+
+    def test_interpreters_running_the_file(self):
+        for line in ["python pa_push.py run x", "python3 runtime/tools/pa_push.py check x", "python3 -u ./PA_PUSH.PY run x",
+                     "sh pa_push.py", "bash runtime/tools/pa_push.py run x", "zsh ./pa_push.py", "sh -c 'python3 pa_push.py run x'",
+                     "git add pa_push.py && python3 pa_push.py run x", "git status; pa-push-main run x",
+                     "git diff pa_push.py | sh", "env git add pa_push.py", "eval git add pa_push.py", "GIT add pa_push.py",
+                     "git add pa-push-main && pa-push-main run x"]:
+            with self.subTest(line=line):
+                self.assertIsNotNone(self.check(line))
+        for line in ["python pa_push.py run x", "sh pa_push.py", "git add a.py && python3 pa_push.py run x"]:
+            with self.subTest(line=line):
+                self.assertTrue(self.check(line).startswith(PERSON_MSG.split("{}")[0]), line)
+                self.assertIn("pa-push-main and pa-push-allow are the person's commands", self.check(line))
+
+    def test_off_table_git_lines_keep_refusing(self):
+        for line in ["git push origin pa_push.py", "git -C /tmp add pa_push.py", "git checkout -- pa_push.py"]:
+            with self.subTest(line=line):
+                self.assertIsNotNone(self.check(line))
+
+    def test_profile_rows_keep_the_person_check(self):  # a row with any arguments may run a program it names
+        rows = [(("git", "mv"), guard.any_args), (("git", "bisect"), guard.any_args)]
+        self.assertIsNone(self.check("git mv a.py b.py", extra_rows=rows))
+        for line in ["git mv pa_push.py x.py", "git bisect run pa-push-main run x"]:
+            with self.subTest(line=line):
+                self.assertEqual(self.check(line, extra_rows=rows), PERSON_MSG.format(line))
+
+
 def tearDownModule():
     shutil.rmtree(TMP, ignore_errors=True)
 
