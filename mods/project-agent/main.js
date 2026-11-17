@@ -233,14 +233,14 @@ export default class ProjectAgent extends View {
     const shown = () => spaces().find((s) => s.active)?.id === space.id;
     cx.spawn(async (cx) => {
       const rcx = { sleep: (ms) => cx.sleep(ms), progress: () => { load.at = Date.now(); } }; // the store's reads move `at`
-      let data, cards = [], rules = null;
+      let data, cards = [], rules = null, missed = []; // missed: the parts that did not answer (shown from the last known value, written nowhere)
       const kept = this.cache.get(space.id);
       const shownNow = () => (this.space === space.id && this.data?.agent ? this.data : null); // what is shown for this space, if it is
       const lastKnown = (part) => [kept?.data, shownNow()].find((d) => d?.agent && !(d.unknown ?? []).includes(part)) ?? null;
       try {
         data = await loadSpace(space, props()?.profile, rcx);
         if (data.agent) { // a part that did not answer: its last known value, else it stays unknown (its error line stays)
-          const unknown = [];
+          const unknown = []; missed = [...(data.unknown ?? [])];
           for (const part of data.unknown ?? []) { const src = lastKnown(part); if (src) for (const f of PARTS[part]) data[f] = src[f]; else unknown.push(part); }
           data.unknown = unknown;
         }
@@ -270,7 +270,7 @@ export default class ProjectAgent extends View {
       const wasCurrent = current();
       if (wasCurrent) delete this.loads[space.id];
       // Given up with its card fallback skipped (no result), or a newer load of this space has committed.
-      if (!((cards === null && !wasCurrent) || token < (this.committed[space.id] ?? 0))) this.commit(space, token, data, cards, rules, cx);
+      if (!((cards === null && !wasCurrent) || token < (this.committed[space.id] ?? 0))) this.commit(space, token, data, cards, rules, cx, missed);
       if (wasCurrent && this.again[space.id]) { delete this.again[space.id]; if (shown()) this.reload(cx); }
     });
   }
@@ -281,9 +281,12 @@ export default class ProjectAgent extends View {
   //   committed or written;
   // - cards null (the listing never answered): the last known cards, else unknown (no count written,
   //   no note field dropped, "Loading decisions…");
+  // - a part in `missed` (its read did not answer; shown from the last known value) writes none of the
+  //   shared keys it feeds, and the kept entry keeps its own value for it (else it is unknown there);
+  //   cards that did not answer write no count and leave the kept cards as they were;
   // - not shown: only kept (for the way back); nothing drawn or written;
   // - shown: drawn, kept, and the shared keys written unless a newer read of the space wrote them.
-  commit(space, token, data, cards, rules, cx) {
+  commit(space, token, data, cards, rules, cx, missed = []) {
     const kept = this.cache.get(space.id), same = this.space === space.id;
     const shown = spaces().find((s) => s.active)?.id === space.id;
     if (data.timedOut || data.failed) {
@@ -299,20 +302,25 @@ export default class ProjectAgent extends View {
       return;
     }
     let cardsUnknown = false;
-    if (cards === null) {
+    const listed = cards !== null;
+    if (!listed) {
       const src = kept && !kept.cardsUnknown ? kept.cards : same && this.cardsFor === space.id ? this.cards : null;
       if (src) cards = src; else { cards = []; cardsUnknown = true; }
       data.errors = [...(data.errors ?? []), src ? "decision cards: did not answer; the last known are shown" : "decision cards: did not answer"];
     }
     this.committed[space.id] = token;
-    if (!shown) { this.keep(space.id, { data, cards, cardsUnknown, rules: rules ?? kept?.rules ?? null, at: Date.now() }); return; }
+    // The kept entry takes only what answered: a missed part keeps the kept entry's value, else is unknown there.
+    const keptKnows = (part) => Boolean(kept?.data?.agent && !(kept.data.unknown ?? []).includes(part));
+    const keptData = { ...data, unknown: [...(data.unknown ?? []), ...missed.filter((p) => !keptKnows(p) && !(data.unknown ?? []).includes(p))] };
+    const keptCards = listed ? { cards, cardsUnknown } : kept && !kept.cardsUnknown ? { cards: kept.cards, cardsUnknown: false } : { cards: [], cardsUnknown: true };
+    if (!shown) { this.keep(space.id, { data: keptData, ...keptCards, rules: rules ?? kept?.rules ?? null, at: Date.now() }); return; }
     this.data = data; this.cards = cards; this.space = space.id; this.cardsFor = cardsUnknown ? null : space.id; this.dataAt = Date.now();
     if (rules) this.rules.data = rules;
-    this.keep(space.id, { data, cards, cardsUnknown, rules: rules ?? this.rules.data, at: this.dataAt });
-    if (data.agent && !(data.unknown ?? []).includes("profile")) this.profiles[space.id] = { done: true, profile: data.profile ?? null }; // read once per session
-    const open = cardsUnknown ? null : this.syncNotes(space, cards, true);
-    if (cardsUnknown) this.syncNotes(space, cards, false);
-    if (token > (this.wrote[space.id] ?? 0)) { this.wrote[space.id] = token; this.share(space, data.agent ? data : { ...data, evidence: new Map() }, { open }); }
+    this.keep(space.id, { data: keptData, ...keptCards, rules: rules ?? this.rules.data, at: this.dataAt });
+    if (data.agent && !keptData.unknown.includes("profile")) this.profiles[space.id] = { done: true, profile: data.profile ?? null }; // read once per session
+    const open = listed ? this.syncNotes(space, cards, true) : null; // cards that did not answer write no count
+    if (!listed) this.syncNotes(space, cards, false);
+    if (token > (this.wrote[space.id] ?? 0)) { this.wrote[space.id] = token; this.share(space, data.agent ? { ...data, unknown: [...(data.unknown ?? []), ...missed] } : { ...data, evidence: new Map() }, { open }); }
     cx.notify();
   }
 
@@ -326,8 +334,8 @@ export default class ProjectAgent extends View {
     if (JSON.stringify(allMains[space.id] ?? []) !== JSON.stringify(mains)) { if (mains.length) allMains[space.id] = mains; else delete allMains[space.id]; setShared("project-agent.mainBranches", allMains); }
   }
 
-  // A part of `data` that is unknown (data.unknown: its read did not answer and nothing was known)
-  // writes none of the keys it feeds: the ledger feeds the worktrees, the Files shortcuts and the
+  // A part of `data` that is unknown (data.unknown: its read did not answer in this load, whether or
+  // not it is shown from the last known value) writes none of the keys it feeds: the ledger feeds the worktrees, the Files shortcuts and the
   // workers; the profile, the main branches.
   share(space, data, { open = null, mains: writeMains = true } = {}) {
     const unknown = data.unknown ?? [];
