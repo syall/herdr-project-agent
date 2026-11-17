@@ -16,6 +16,7 @@ import { div } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
 import { exec } from "herdr";
 import { loadCosts, localId, withTimeout, TIMED_OUT, READ_LIMIT } from "./store.js";
+import { Copier } from "./copy.js";
 
 export const COSTS_EVERY = 10000; // the summary of a shown space: at most one read this often
 export const BILLING_EVERY = 60000; // the billed comparison: at most one this often
@@ -85,6 +86,7 @@ function tabFigure(s) {
 
 export class CostsPane {
   constructor(shown = () => true) {
+    this.copier = new Copier(); // the Copy of the totals, each section and the billed table (copy.js, t-026)
     this.shown = shown; // (space id) -> this view is on screen for that space now (main.js)
     this.spaces = new Map(); // space id -> its state (most recently shown last; at most CACHE_MAX)
     this.seq = 0;
@@ -218,10 +220,13 @@ export class CostsPane {
     const tot = s.totals && typeof s.totals === "object" ? s.totals : null;
     const problems = Array.isArray(s.problems) ? s.problems.filter((p) => typeof p === "string") : [];
     const priced = Boolean(s.prices?.source || s.prices?.currency);
+    const said = `${priced ? `Estimated from ${str(s.prices?.source) || "the profile's"} prices as of ${str(s.prices?.asOf) || "?"} (${str(cur) || "?"})`
+      : `No price table in profile ${str(s.prices?.profile) || "?"}: tokens only.`} · updated ${ago(s.updated)}`;
+    const totals = [said]; // the header and the tiles (filled by tiles() below), for Copy
     const header = h_flex().gap(8).items_center()
-      .child(div().flex_1().min_w(0).text_size(11.5).text_color(t.muted).child(`${priced ? `Estimated from ${str(s.prices?.source) || "the profile's"} prices as of ${str(s.prices?.asOf) || "?"} (${str(cur) || "?"})`
-        : `No price table in profile ${str(s.prices?.profile) || "?"}: tokens only.`} · updated ${ago(s.updated)}`))
-      .child(refresh());
+      .child(div().flex_1().min_w(0).text_size(11.5).text_color(t.muted).child(said))
+      .child(refresh())
+      .when(Boolean(tot), (e) => e.child(this.copier.button(t, "costs-copy-totals", () => totals.join("\n"))));
     box.child(header);
     if (st.timedOut) box.child(line(`summary.json did not answer; showing the copy read at ${clock(new Date(st.readAt).toISOString())}.`, t.blocked));
     if (st.error) box.child(line(`costs/summary.json: ${st.error}; showing the copy read at ${clock(new Date(st.readAt).toISOString())}.`, t.blocked));
@@ -239,14 +244,14 @@ export class CostsPane {
     const missingModels = Array.isArray(s.prices?.missing) ? s.prices.missing.map(str) : [];
     if (tot.money === null && num(tot.tokens?.all) > 0 && priced) box.child(line(`No price for ${missingModels.join(", ") || "these models"}: shown as tokens only.`, t.blocked));
     else if (tot.money !== null && num(tot.unpricedTokens) > 0) box.child(line(`${tokens(tot.unpricedTokens)} tokens of ${missingModels.join(", ") || "some models"} have no price: shown as tokens only.`, t.blocked));
-    box.child(this.tiles(t, s, tot, cur, priced));
+    box.child(this.tiles(t, s, tot, cur, priced, totals));
     if (num(tot.reconstructedMoney) > 0) box.child(line(`◌ Includes ${money(tot.reconstructedMoney, cur)} est. reconstructed (best effort) from session files still on disk.`, t.dim));
     box.child(this.sections(t, space, st, s, cur));
     box.child(this.billed(t, space, st, s, cur));
     return box;
   }
 
-  tiles(t, s, tot, cur, priced) {
+  tiles(t, s, tot, cur, priced, lines = []) {
     const hours = Array.isArray(s.hours) ? s.hours.filter((h) => Array.isArray(h) && h[1] && typeof h[1] === "object") : [];
     const today = new Date(Date.now()), localDay = (d) => `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
     const mine = hours.filter(([k]) => { const d = new Date(`${k}:00:00Z`); return !Number.isNaN(d.getTime()) && localDay(d) === localDay(today); }).map(([, v]) => v);
@@ -257,10 +262,14 @@ export class CostsPane {
     };
     const day0 = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate() - 6)).toISOString().slice(0, 10);
     const week = sum(list(s.byDay).filter((d) => /^\d{4}-\d{2}-\d{2}$/.test(str(d.key)) && d.key >= day0));
-    const tile = (title, e, small) => v_flex().flex_1().min_w(0).p(8).gap(2).rounded(7).border(1).border_color(t.border).bg(t.surface)
-      .child(div().text_size(11).text_color(t.dim).child(title))
-      .child(div().text_size(15).font_semibold().text_color(t.foreground).child(priced ? est(e, cur) : `${tokens(e.tokens)} tokens`))
-      .child(div().text_size(10.5).text_color(t.dim).child(small));
+    const tile = (title, e, small) => {
+      const figure = priced ? est(e, cur) : `${tokens(e.tokens)} tokens`;
+      lines.push(`${title}: ${figure} · ${small}`);
+      return v_flex().flex_1().min_w(0).p(8).gap(2).rounded(7).border(1).border_color(t.border).bg(t.surface)
+        .child(div().text_size(11).text_color(t.dim).child(title))
+        .child(div().text_size(15).font_semibold().text_color(t.foreground).child(figure))
+        .child(div().text_size(10.5).text_color(t.dim).child(small));
+    };
     const all = num(tot.tokens?.all), cr = num(tot.tokens?.cr);
     return h_flex().gap(6)
       .child(tile("Total", { money: tot.money, unpricedTokens: tot.unpricedTokens, tokens: all }, `${tokens(all)} tokens${all ? ` · ${Math.round((cr / all) * 100)}% cache read` : ""}`))
@@ -271,12 +280,18 @@ export class CostsPane {
   sections(t, space, st, s, cur) {
     const out = v_flex().gap(6);
     const totalMoney = s.totals?.money;
+    // Each section's text as drawn, for its Copy: the head, its rows, and the open drill rows (indented).
+    const blocks = {}; let lines = [];
+    const begin = (key, text) => { lines = blocks[key] = [text]; };
+    const copy = (key) => this.copier.button(t, `costs-copy-${key}`, () => blocks[key].join("\n"));
     const head = (text) => div().pt(4).px(4).text_size(11.5).font_semibold().text_color(t.foreground).child(text);
-    const sub = (text, color) => div().pl(20).text_size(11).text_color(color ?? t.muted).child(text);
+    const titled = (key, text) => { begin(key, text); return h_flex().gap(6).items_center().child(head(text)).child(copy(key)); };
+    const sub = (text, color) => { lines.push(`  ${text}`); return div().pl(20).text_size(11).text_color(color ?? t.muted).child(text); };
     const row = (section, i, entry, label, extra, drill) => {
       const key = str(entry.key), open = st.open[section] === key;
       const share = totalMoney && entry.money !== null && entry.money !== undefined && !num(entry.unpricedTokens) ? ` · ${Math.round((num(entry.money) / totalMoney) * 100)}%` : "";
       const tag = priceTag(entry), mark = num(entry.reconstructed) > 0 ? " ◌" : "";
+      lines.push([`${label}${mark}`, extra, tag, `${tokens(entry.tokens)} tokens`, `${est(entry, cur)}${share}`].filter(Boolean).join(" · "));
       const el = v_flex().child(h_flex().id(`costs-${section}-${i}`).gap(8).px(4).items_center().cursor_pointer().hover((x) => x.bg(t.hover))
         .on_click((_e, cx) => { st.open[section] = open ? null : key; cx.notify(); })
         .child(div().flex_none().text_size(11).text_color(t.dim).child(drill ? (open ? "▾" : "▸") : " "))
@@ -291,14 +306,14 @@ export class CostsPane {
     const entries = (items) => items.map((e) => sub(`${str(e.key)} · ${tokens(e.tokens)} tokens · ${est(e, cur)}${priceTag(e) ? ` · ${priceTag(e)}` : ""}`));
     // By activity: tasks of an activity; unattributed: its reasons; cache rebuild: the passes with a rebuild and its tasks.
     const acts = list(s.byActivity);
-    out.child(head("By activity"));
+    out.child(titled("activity", "By activity"));
     acts.forEach((a, i) => out.child(row("activity", i, a, ACTIVITY[a.key] ?? str(a.key).replace(/^pass:/, "pass: "), null, () => [
       ...(a.key === "unattributed" ? [sub("Reasons:", t.dim), ...entries(list(a.reasons))] : []),
       ...(a.key === "cache-rebuild" ? [sub("Passes with a cache rebuild:", t.dim), ...list(s.passes).filter((p) => p.rebuild).map((p) => sub(`pass ${str(p.pass)} · ${str(p.trigger)} · ${clock(p.from)} · ${est(p, cur)} · cache rebuild`))] : []),
       sub("Tasks:", t.dim), ...entries(list(a.tasks)),
     ])));
     // By task: its phases and its sessions.
-    out.child(head("By task"));
+    out.child(titled("task", "By task"));
     list(s.byTask).forEach((x, i) => out.child(row("task", i, x, `${str(x.key)}${x.key === "(other tasks)" && x.tasks ? ` (${x.tasks} tasks)` : ""}${x.state === "deleted" ? " (deleted)" : ""}${x.title ? ` ${str(x.title)}` : ""}${x.split ? " ≈" : ""}`,
       x.state && x.state !== "deleted" ? str(x.state) : null, () => [
         ...(x.split ? [sub("≈ shared passes split by journal entries", t.dim)] : []),
@@ -306,13 +321,14 @@ export class CostsPane {
         sub("Sessions:", t.dim), ...sessionsOf((ss) => (Array.isArray(x.sessions) ? x.sessions : []).includes(ss.key)),
       ])));
     // By session type: a selector; the machine is shown as Herdr's machine name, never a host name.
-    out.child(h_flex().gap(4).items_center().child(head("By session type")).children(DIMS.map((d) => div().id(`costs-dim-${d}`).px(6).h(20).flex().items_center().rounded(5).text_size(11)
+    begin("kind", `By session type: ${st.dim}`);
+    out.child(h_flex().gap(4).items_center().child(head("By session type")).child(copy("kind")).children(DIMS.map((d) => div().id(`costs-dim-${d}`).px(6).h(20).flex().items_center().rounded(5).text_size(11)
       .bg(st.dim === d ? t.selected : t.chrome).text_color(st.dim === d ? t.foreground : t.muted).cursor_pointer().on_click((_e, cx) => { st.dim = d; st.open.kind = null; cx.notify(); }).child(d))));
     const dimRows = st.dim === "machine" ? [this.machineRow(s, space)] : list(s.byKind?.[st.dim]);
     dimRows.forEach((x, i) => out.child(row("kind", i, x, str(x.key), null, () => sessionsOf((ss) => st.dim === "machine" || str(ss[st.dim] ?? "(none)") === str(x.key)))));
     // By day: newest first; Show more reveals up to 92.
     const days = list(s.byDay);
-    out.child(head("By day (UTC)"));
+    out.child(titled("day", "By day (UTC)"));
     days.slice(0, st.moreDays ? DAYS_MORE : DAYS_SHOWN).forEach((d, i) => out.child(row("day", i, d, d.key === "older" ? `older (${num(d.days)} days)` : str(d.key), null,
       () => Object.entries(d.byActivity && typeof d.byActivity === "object" ? d.byActivity : {}).map(([k, v]) => sub(`${ACTIVITY[k] ?? k} · ${money(v, cur)} est.`)))));
     if (days.length > DAYS_SHOWN && !st.moreDays) out.child(div().id("costs-days-more").px(4).text_size(11.5).text_color(t.accent).cursor_pointer().on_click((_e, cx) => { st.moreDays = true; cx.notify(); }).child("Show more"));
@@ -331,7 +347,8 @@ export class CostsPane {
   // Billed amounts beside the estimates (R14). Every billed figure says account-wide; the query's status and Turn off.
   billed(t, space, st, s, cur) {
     const b = st.billing, d = b.data, box = v_flex().id("costs-billed").gap(3).pt(6);
-    const line = (text, color) => div().px(4).text_size(11.5).text_color(color ?? t.muted).child(text);
+    const lines = []; // what the block draws, for its Copy (beside the head; there is none without billed rows)
+    const line = (text, color) => { lines.push(String(text)); return div().px(4).text_size(11.5).text_color(color ?? t.muted).child(text); };
     const status = d?.status, conf = status?.config, on = Boolean(conf?.enabled), qs = status?.state && typeof status.state === "object" ? status.state : {};
     if (!d) return b.error ? box.child(line(`Billed amounts could not be read (${b.error})`, t.blocked)) : box.child(line(b.busy ? "Billed amounts: reading…" : "Billed amounts: not read yet.", t.dim));
     if (b.error) box.child(line(`Billed amounts could not be read (${b.error}); showing the copy read earlier.`, t.blocked));
@@ -339,8 +356,10 @@ export class CostsPane {
     const fee = typeof status?.feePerRequest === "number" ? `, stated fee ≈ ${status.feePerRequest} ${str(status.feeCurrency)} each` : "";
     const statusRow = () => {
       const last = qs.lastRun ? `last run ${clock(qs.lastRun)} (${str(qs.result)}, ${num(qs.requests)} requests)` : "not run yet";
+      const said = `Billing query: on · ${last} · next after ${clock(qs.nextAfter ?? new Date(Date.now()).toISOString())} · cap 1/day (≤ ${num(status?.maxPages) || 3} requests${fee})`;
+      lines.push(said);
       return h_flex().gap(8).items_center()
-        .child(div().flex_1().min_w(0).px(4).text_size(11).text_color(t.dim).child(`Billing query: on · ${last} · next after ${clock(qs.nextAfter ?? new Date(Date.now()).toISOString())} · cap 1/day (≤ ${num(status?.maxPages) || 3} requests${fee})`))
+        .child(div().flex_1().min_w(0).px(4).text_size(11).text_color(t.dim).child(said))
         .child(div().id("costs-billing-off").flex_none().px(8).h(22).flex().items_center().rounded(6).border(1).border_color(t.border).text_size(11).text_color(t.foreground)
           .cursor_pointer().hover((x) => x.bg(t.hover)).on_click((_e, cx) => { this.turnOff(space, cx); cx.notify(); }).child(b.off ? "Turning off…" : "Turn off"));
     };
@@ -353,21 +372,28 @@ export class CostsPane {
       if (!on) return box.child(line("Billed amounts: none. The billing query is off; the person turns it on in their own terminal (pa-costs billed enable, see README)."));
       return box.child(statusRow()).child(line(`No billed rows for account ${str(c?.account ?? s.account)} yet.`));
     }
-    box.child(div().px(4).text_size(11.5).font_semibold().text_color(t.foreground).child("Billed (account-wide: includes use outside this space and outside Herdr)"));
+    const billedHead = "Billed (account-wide: includes use outside this space and outside Herdr)";
+    lines.length = 0; lines.push(billedHead); // the Copy starts at the head (a refused or failed query's line above it is dropped)
+    box.child(h_flex().gap(6).items_center().child(div().flex_1().min_w(0).px(4).text_size(11.5).font_semibold().text_color(t.foreground).child(billedHead))
+      .child(this.copier.button(t, "costs-copy-billed", () => lines.join("\n"))));
     if (d.hereError) box.child(line(`All spaces on ${str(space.machine)} could not be read (${str(d.hereError)}); the comparison is not shown.`, t.blocked));
     if (c && c.covered) {
       const cov = c.covered, ccur = c.currency ?? cur;
       box.child(line(`Covered ${str(cov.from)} – ${str(cov.to)} (${num(cov.days)} of ${num(cov.of)} days${Array.isArray(cov.missing) && cov.missing.length ? `; not billed: ${cov.missing.map(str).join(", ")}` : ""}) · source ${(Array.isArray(c.sources) ? c.sources : []).map(str).join(", ")}, fetched ${clock(c.fetchedAt)}`, t.dim));
       const missing = Array.isArray(s.prices?.missing) ? s.prices.missing.map(str) : [];
       const cell = (v, partial) => (v === null || v === undefined ? "— est. (no price)" : `${money(v, ccur)} est.${partial ? " + unpriced" : ""}`);
-      const fig = (cols) => h_flex().gap(8).px(4).children(cols.map((x, i) => div().when(i === 0, (e) => e.flex_1().min_w(0).truncate()).when(i > 0, (e) => e.flex_none()).text_size(11.5).text_color(t.foreground).child(x)));
+      const fig = (cols) => { lines.push(cols.map(String).join(" | ").replace(/^ \| /, "")); return figRow(cols); };
+      const figRow = (cols) => h_flex().gap(8).px(4).children(cols.map((x, i) => div().when(i === 0, (e) => e.flex_1().min_w(0).truncate()).when(i > 0, (e) => e.flex_none()).text_size(11.5).text_color(t.foreground).child(x)));
       box.child(fig(["", "this space", "all spaces here", "billed"]));
       for (const m of list(c.models)) {
         const f = m.factor ?? {};
         const fac = f.kind === "price" ? `price factor ${f.value} (from quantities)` : f.kind === "scope" ? `scope ratio ${f.value} (not applied)${num(f.value) < 1 ? " below 1.0: the table over-prices" : ""}` : "";
         box.child(fig([str(m.model), cell(m.thisSpace, m.thisSpacePartial), cell(m.allSpaces, m.allSpacesPartial), `${money(m.billed, ccur)} billed · account-wide`]))
-          .when(Boolean(fac) || m.notFinal || missing.includes(str(m.model)), (e) => e.child(div().pl(20).text_size(10.5).text_color(f.few ? t.dim : t.muted)
-            .child([fac, f.partial ? "(from a partial estimate)" : "", f.few ? "(few days)" : "", m.notFinal ? "(not final)" : "", missing.includes(str(m.model)) ? "(no price for part of it)" : ""].filter(Boolean).join(" "))));
+          .when(Boolean(fac) || m.notFinal || missing.includes(str(m.model)), (e) => {
+            const note = [fac, f.partial ? "(from a partial estimate)" : "", f.few ? "(few days)" : "", m.notFinal ? "(not final)" : "", missing.includes(str(m.model)) ? "(no price for part of it)" : ""].filter(Boolean).join(" ");
+            lines.push(`  ${note}`);
+            return e.child(div().pl(20).text_size(10.5).text_color(f.few ? t.dim : t.muted).child(note));
+          });
       }
       if (num(c.other)) box.child(fig(["other / unmapped labels", "", "", `${money(c.other, ccur)} billed · account-wide`]));
       const tt = c.total ?? {};

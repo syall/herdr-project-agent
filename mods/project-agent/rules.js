@@ -10,6 +10,7 @@ import { v_flex, h_flex, InputState, Input } from "gpui-base";
 import { home } from "herdr";
 import { loadRules, changeRules, touched, reorder, newRuleId, exportRules, importRules } from "./store.js";
 import { readAllow } from "./push.js";
+import { Copier } from "./copy.js";
 
 export const ALLOW_EVERY = 30000; // the push allowlist is read at most this often, but for Refresh
 
@@ -30,6 +31,7 @@ export class RulesPane {
     this.armed = null; // arm(): the rule whose Delete was clicked once (a second click deletes); see armedRule()
     this.pressed = null; // rule id being dragged
     this.declined = false; // declined rules shown
+    this.copier = new Copier(); // each open rule's Copy (copy.js, t-026)
     this.message = null; this.error = null;
     this.importPath = null; // InputState, made on first use (never in render)
     this.allow = {}; // space id -> { data, asked, busy }: the last pa-push-allow show --json (data: its report, or { error })
@@ -150,6 +152,17 @@ export class RulesPane {
         .child(this.button(t, "rule-cancel", "Cancel", (_e, cx) => { this.closeForm(); cx.notify(); }, t.muted)));
   }
 
+  // A rule as plain text lines (its Copy, t-026): what its open row shows.
+  ruleText(rule) {
+    return [
+      `${rule.title ?? rule.id} · ${rule.status} · ${rule.appliesTo ?? "all"}`,
+      String(rule.text ?? ""),
+      ...(rule.why ? [`Why: ${rule.why}`] : []),
+      ...(rule.needsAttention ? [`The Project Agent can't follow this: ${rule.needsAttention}`] : []),
+      `${rule.id} · from ${rule.source ?? "?"} · order ${rule.order ?? 0} · ${(rule.history ?? []).length} changes`,
+    ].join("\n");
+  }
+
   row(t, space, rule, onDecided, movable) {
     const armed = this.armedRule(space.id) === rule.id;
     const open = this.open.has(rule.id), proposed = rule.status === "proposed", on = rule.status === "active";
@@ -178,6 +191,7 @@ export class RulesPane {
         .when(Boolean(rule.needsAttention), (e) => e.child(div().text_color(t.blocked).child(`The Project Agent can't follow this: ${rule.needsAttention}`)))
         .child(div().text_size(11).text_color(t.dim).child(`${rule.id} · from ${rule.source ?? "?"} · order ${rule.order ?? 0} · ${(rule.history ?? []).length} changes`))
         .child(h_flex().gap(6).flex_wrap()
+          .child(this.copier.button(t, `rule-copy-${rule.id}`, () => this.ruleText(rule)))
           .when(proposed, (e) => e
             .child(this.button(t, `rule-approve-${rule.id}`, "Approve", (_e, cx) => this.setStatus(space, cx, rule.id, "active", "approved", onDecided)))
             .child(this.button(t, `rule-editapprove-${rule.id}`, "Edit, then approve", (_e, cx) => { this.edit(rule, true); cx.notify(); }))

@@ -147,14 +147,17 @@ export class PushCards {
 
   // The block drawn inside an open push card, above its options (spec §8.1, §8.2); for an answered one,
   // what this copy saw or what the card records.
-  block(t, space, entry, onCheck, onDone) {
+  // Every text row it draws is also pushed to `lines` (the card's Copy, t-026; an indented row with two spaces);
+  // the Check again and Done links are not.
+  block(t, space, entry, onCheck, onDone, lines = []) {
     const c = entry.card, open = c.status === "open", st = this.cards[`${space.id}\0${entry.id}`];
-    const line = (s, color) => div().text_size(12).text_color(color ?? t.muted).child(s);
-    const small = (s, color) => div().text_size(11).text_color(color ?? t.dim).child(s);
+    const line = (s, color) => { lines.push(String(s)); return div().text_size(12).text_color(color ?? t.muted).child(s); };
+    const small = (s, color) => { if (s) lines.push(String(s)); return div().text_size(11).text_color(color ?? t.dim).child(s); };
+    const sub = (s, color, size = 11.5) => { lines.push(`  ${s}`); return div().pl(12).text_size(size).text_color(color).child(s); };
     const box = v_flex().id(`push-${entry.id}`).gap(3).p(8).rounded(6).border(1).border_color(t.border).bg(t.background);
     if (!open) {
       const r = c.push?.result;
-      if (st?.result) this.shown(t, box, st, {});
+      if (st?.result) this.shown(t, box, st, {}, lines);
       if (st?.unknown) {
         // A run whose result is unknown, after which the card was read answered: the one check's verdict.
         box.child(line(`The result is unknown (${st.unknown}); checking the card again.`, t.blocked));
@@ -177,19 +180,19 @@ export class PushCards {
     if (Array.isArray(f.commits)) {
       const count = Number.isFinite(f.count) ? f.count : f.commits.length;
       box.child(line(`Commits (${count}):`));
-      for (const x of f.commits.slice(0, COMMITS_SHOWN)) box.child(div().pl(12).text_size(11.5).text_color(x?.fromTask === false ? t.working : t.muted)
-        .child(`${short(x?.sha)} ${text(x?.subject)} — ${text(x?.author)}${x?.fromTask === false ? " · already on local main, not from this task" : ""}`));
-      if (count > COMMITS_SHOWN) box.child(div().pl(12).text_size(11.5).text_color(t.dim).child(`… and ${count - COMMITS_SHOWN} more`));
+      for (const x of f.commits.slice(0, COMMITS_SHOWN)) box.child(sub(`${short(x?.sha)} ${text(x?.subject)} — ${text(x?.author)}${x?.fromTask === false ? " · already on local main, not from this task" : ""}`,
+        x?.fromTask === false ? t.working : t.muted));
+      if (count > COMMITS_SHOWN) box.child(sub(`… and ${count - COMMITS_SHOWN} more`, t.dim));
     }
     if (f.commit) box.child(line(`Gated commit: ${short(f.commit)}, full gate passed at ${stamp(f.gate?.at)}, task ${text(c.push?.task ?? c.task)}, branch ${text(f.taskBranch)}`));
     if (Array.isArray(f.commands) && f.commands.length) {
       box.child(line("What will run:"));
-      for (const argv of f.commands) box.child(div().pl(12).text_size(11).text_color(t.muted).child(Array.isArray(argv) ? argv.map(text).join(" ") : text(argv)));
+      for (const argv of f.commands) box.child(sub(Array.isArray(argv) ? argv.map(text).join(" ") : text(argv), t.muted, 11));
       box.child(small("No force, no tags, no other branches."));
     }
     if (chk?.caller) box.child(line(chk.caller.ok ? "This panel may push: yes" : `This panel may push: no (${text(chk.caller.why)})`, chk.caller.ok ? t.muted : t.blocked));
     // State: what this copy did last, then the check's verdict.
-    if (st?.result) this.shown(t, box, st, f);
+    if (st?.result) this.shown(t, box, st, f, lines);
     if (st?.error) box.child(line(`${st.errorFor === NOT_NOW ? "Not saved" : "Not pushed"}: ${st.error}`, t.blocked));
     if (st?.unknown) box.child(line(`The result is unknown (${st.unknown}); checking the card again.`, t.blocked));
     if (busy) box.child(line("Checking…", t.dim));
@@ -204,14 +207,16 @@ export class PushCards {
   }
 
   // What this copy's run printed: the result line and the tail of git's output.
-  shown(t, box, st, f) {
+  shown(t, box, st, f, lines = []) {
     const r = st.result.result;
     const where = `${text(r?.url ?? f.url)} ${text(r?.branch ?? f.branch)}`;
-    box.child(div().text_size(12).text_color(t.done).child(st.result.label !== PUSH ? "Answered Not now: nothing was pushed."
+    const said = st.result.label !== PUSH ? "Answered Not now: nothing was pushed."
       : r?.how && r.how !== "pushed" ? `Already on the remote: ${where} is at ${short(r?.to)} (recorded at ${clock(r?.at, false)})`
-      : `Pushed ${where} ${short(r?.from)}..${short(r?.to)} at ${clock(r?.at, false)}`));
+      : `Pushed ${where} ${short(r?.from)}..${short(r?.to)} at ${clock(r?.at, false)}`;
+    lines.push(said);
+    box.child(div().text_size(12).text_color(t.done).child(said));
     const out = Array.isArray(r?.output) ? r.output : text(r?.output).split("\n").filter(Boolean);
-    for (const o of out.slice(-15)) box.child(div().pl(12).text_size(11).text_color(t.dim).child(text(o)));
+    for (const o of out.slice(-15)) { lines.push(`  ${text(o)}`); box.child(div().pl(12).text_size(11).text_color(t.dim).child(text(o))); }
   }
 }
 

@@ -3104,7 +3104,7 @@ cases["T26-copy-push-card"] = async () => { // the push card's facts as drawn; C
   const text = lastClip(), lines = text.split("\n");
   check(lines[0].startsWith(`${PID} · t-1 · open · `) && lines[1] === "Push repo main (2 commits)?", `id line and question (got ${JSON.stringify(lines.slice(0, 2))})`);
   for (const want of ["Repository: /repo", "Commits (2):", "  cc11000 the task's change — A <a@x>", "What will run:", "No force, no tags, no other branches.",
-    "This panel may push: yes", "Options:", "  Push: Push exactly what is listed above, as a fast-forward. No force.", "  Not now: Nothing is pushed. The card closes."])
+    "This panel may push: yes", "Options:", "  Push: Push exactly what is listed above, as a fast-forward. No force. (recommended)", "  Not now: Nothing is pushed. The card closes."])
     check(lines.includes(want), `has "${want}" (got ${JSON.stringify(lines)})`);
   check(!text.includes("CONTEXT FROM THE CARD FILE") && !text.includes("DETAIL FROM THE CARD FILE") && !text.includes("Check again"), `not the card file's own text, nor the links (got ${text})`);
   check(pushExecs("check").length === checks && pushExecs("run").length === 0 && sideEffects() === before, "no check, no run, nothing written");
@@ -3190,7 +3190,7 @@ cases["T26-copy-costs"] = async () => { // the totals, a section (with its open 
   await press(v, "costs-copy-totals");
   let lines = lastClip().split("\n");
   check(/^Estimated from test table prices as of 2027-01-01 \(XTS\) · updated /.test(lines[0]), `the header (got ${lines[0]})`);
-  check(lines.length === 4 && /^Total: .*est\..* · 1,?000 tokens · 94% cache read$/.test(lines[1]) && lines[2].startsWith("Today: ") && lines[3].startsWith("Last 7 days (UTC): "), `the tiles (got ${JSON.stringify(lines)})`);
+  check(lines.length === 4 && /^Total: .*est\..* · 1k tokens · 94% cache read$/.test(lines[1]) && lines[2].startsWith("Today: ") && lines[3].startsWith("Last 7 days (UTC): "), `the tiles (got ${JSON.stringify(lines)})`);
   const shown = costsView(v).text;
   for (const l of lines.slice(1)) for (const part of l.replace(/^[^:]+: /, "").split(" · ")) check(shown.includes(part.split(" · ")[0]), `"${part}" is shown`);
   await press(v, "costs-copy-activity");

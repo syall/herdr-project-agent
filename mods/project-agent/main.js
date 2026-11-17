@@ -18,6 +18,7 @@ import { Keeper, idleShell } from "./keeper.js";
 import { WorkerPane } from "./worker.js";
 import { PushCards, isPush, PUSH, PUSH_OPTIONS } from "./push.js";
 import { CostsPane } from "./costs.js";
+import { Copier } from "./copy.js";
 import { tick, cadence, holdReason, setSchedule, requestPass, PRESETS, MIN_MINUTES } from "./timer.js";
 
 const ACTIVE = ["needs-decision", "review", "in-progress", "investigating", "queued"];
@@ -90,6 +91,7 @@ export default class ProjectAgent extends View {
     this.view = null; // "decisions" | "tasks" | "rules" | "costs"; null: decisions when any is open
     this.viewShown = null; // the view the last render drew (this.view, or the one picked for null)
     this.rules = new RulesPane();
+    this.copier = new Copier(); // the Copy controls of cards and tasks (copy.js, t-026)
     this.push = new PushCards(); // push cards: the last pa-push-main check and run of each (push.js)
     // The Costs view: each space's last summary and billed comparison (costs.js); it reads and runs only while
     // this check holds (asked live: `asleep` is updated only by the next reload).
@@ -713,8 +715,9 @@ export default class ProjectAgent extends View {
           this.button(t, `link-${task.id}-${i}`, `${l.label} ↗`, (_e, cx) => this.openLink(l.url, cx))))))
         .when(Boolean(this.data.evidence?.has(task.id)), (e) => e.child(h_flex().gap(6).child(this.button(t, `ev-${task.id}`, "Evidence", () => this.showEvidence(space, task.id)))))
         .children(this.actions(t, task, space))
-        // The person's own controls for the task.
+        // The person's own controls for the task. Copy (t-026) puts the task's text on the clipboard and does nothing else.
         .child(h_flex().gap(6).flex_wrap().pt(2)
+          .child(this.copier.button(t, `copy-task-${task.id}`, () => this.taskText(task, space, crew)))
           .when(task.state === "done" || task.state === "parked", (e) => e.child(this.button(t, `reopen-${task.id}`, "Reopen", (_e, cx) => this.changeTask(space, task, "reopen", cx))))
           .when(task.state !== "done", (e) => e.child(this.button(t, `done-${task.id}`, "Mark done", (_e, cx) => this.changeTask(space, task, "done", cx))))
           .when(task.state !== "done" && task.state !== "parked", (e) => e.child(this.button(t, `park-${task.id}`, "Park", (_e, cx) => this.changeTask(space, task, "park", cx))))
@@ -725,6 +728,41 @@ export default class ProjectAgent extends View {
             .child(armed ? "Delete the task, its evidence and its cards?" : "Delete…"))
           .when(armed, (e) => e.child(keep(this.button(t, `delete-cancel-${task.id}`, "Cancel", (_e, cx) => { cx.stop_propagation(); this.disarm(); cx.notify(); })))))
         .when(Boolean(this.taskError[task.id]), (e) => e.child(div().text_size(11.5).text_color(t.blocked).child(this.taskError[task.id])))));
+  }
+
+  // A task as plain text lines (its Copy, t-026): what its open card shows, the workers by their full address.
+  taskText(task, space, crew) {
+    const kind = [task.type, task.tier && `${task.tier} tier`].filter(Boolean).join(" · ");
+    const links = taskLinks(this.data.profile, task);
+    const workers = crew.map((w) => {
+      const address = space.machine ? `${space.machine}/${w.address}` : w.address;
+      const live = terminals().some((x) => x.address === address && x.state === "live");
+      return `  ${`${w.role ?? "worker"} ${address ?? ""}`.trim()}${w.keep ? " · kept" : ""}${live ? "" : w.finished ? " (closed)" : " (ended)"}`;
+    });
+    return [
+      `${task.id ?? "?"} ${task.title ?? "(untitled)"}`,
+      `State: ${task.state ?? "?"}${task.phase ? ` · ${task.phase}` : ""}`,
+      ...(task.goal ? [String(task.goal)] : []),
+      ...(kind ? [kind] : []),
+      ...(workers.length ? ["Workers:", ...workers] : []),
+      ...(links.length ? ["Links:", ...links.map((l) => `  ${l.label}: ${l.url}`)] : []),
+      ...this.cards.filter((c) => c.card?.status === "open" && c.card.task === task.id).map((c) => `Needs your decision: ${c.id}`),
+    ].join("\n");
+  }
+
+  // A decision card as plain text lines (its Copy, t-026). A push card's facts are the lines its block drew.
+  cardText(c, entry, evidence, pushLines) {
+    const open = c.status === "open", options = isPush(c) ? PUSH_OPTIONS : c.options ?? [];
+    return [
+      [entry.id, c.task, open ? "open" : c.status === "withdrawn" ? "withdrawn" : `answered: ${c.answer}`, when(open ? c.created : c.answered)].filter(Boolean).join(" · "),
+      String(c.question),
+      ...(isPush(c) ? pushLines : c.context ? String(c.context).split("\n") : []),
+      ...(options.length ? ["Options:", ...options.map((o) => `  ${o.label}${o.detail ? `: ${o.detail}` : ""}${c.recommendation === o.label ? " (recommended)" : ""}`)] : []),
+      ...(evidence ? [`Evidence: ${evidence}`] : []),
+      ...(!open && c.status !== "withdrawn" && c.answer ? [`Answer: ${c.answer}`] : []),
+      ...(!open && c.answeredBy ? [c.status === "withdrawn" ? "Closed by the Project Agent as no longer needed" : `Answered by the ${c.answeredBy}`] : []),
+      ...(!open && c.note ? [c.status === "withdrawn" ? `Why: ${c.note}` : c.answeredBy ? `You said: “${c.note}”` : `Note: ${c.note}`] : []),
+    ].join("\n");
   }
 
   card(t, entry, space) {
@@ -740,6 +778,8 @@ export default class ProjectAgent extends View {
     const task = c.task && (this.data?.ledger?.tasks ?? []).find((x) => x.id === c.task);
     const picked = open ? this.choice[entry.id] ?? null : null;
     const ready = Boolean(picked) && !busy && (!push || picked !== PUSH || this.push.canSubmit(space.id, entry.id)); // Push: a fresh check that passed
+    const evidence = Boolean(c.task) && Boolean(this.data?.evidence?.has(c.task)) ? cardEvidence(c, this.data?.evidence?.get(c.task)) ?? `${c.task} evidence` : null;
+    const pushLines = []; // filled by the push block below, in this render; read by Copy at its click
     return v_flex().id(`card-${entry.id}`).flex_none().p(10).gap(7).rounded(7).border(1).border_color(this.spotlight === entry.id ? t.accent : open ? t.input : t.border).bg(t.surface)
       .child(h_flex().gap(7).items_center()
         .child(div().flex_none().text_size(11.5).text_color(t.dim).child(entry.id))
@@ -748,10 +788,11 @@ export default class ProjectAgent extends View {
         .when(Boolean(c.task) && !this.data?.evidence?.has(c.task), (el) => el.child(div().flex_none().text_size(11.5).text_color(t.dim).child(c.task)))
         .child(div().flex_1())
         .child(div().flex_none().text_size(10.5).text_color(t.dim).child(when(open ? c.created : c.answered)))
-        .child(this.chip(t, open ? "open" : c.status === "withdrawn" ? "withdrawn" : `answered: ${c.answer}`, open ? t.blocked : t.dim)))
+        .child(this.chip(t, open ? "open" : c.status === "withdrawn" ? "withdrawn" : `answered: ${c.answer}`, open ? t.blocked : t.dim))
+        .child(this.copier.button(t, `copy-${entry.id}`, () => this.cardText(c, entry, evidence, pushLines))))
       .child(div().text_size(13).font_semibold().text_color(t.foreground).child(String(c.question)))
       // A push card: the facts pa-push-main check read now, never the card file's context (push.js).
-      .when(push, (el) => el.child(this.push.block(t, space, entry, (_e, cx) => { this.push.check(space, entry, cx); cx.notify(); }, (_e, cx) => { this.push.leave(space.id); this.view = "decisions"; cx.notify(); })))
+      .when(push, (el) => el.child(this.push.block(t, space, entry, (_e, cx) => { this.push.check(space, entry, cx); cx.notify(); }, (_e, cx) => { this.push.leave(space.id); this.view = "decisions"; cx.notify(); }, pushLines)))
       // The context, one row per line; a line that starts with two spaces is indented (a worktree card's details).
       .when(!push && Boolean(c.context) && !String(c.context).includes("\n"), (el) => el.child(div().text_size(12).text_color(t.muted).child(String(c.context))))
       .when(!push && String(c.context ?? "").includes("\n"), (el) => el.child(v_flex().gap(2).children(String(c.context).split("\n").map((line) =>
