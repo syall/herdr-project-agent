@@ -165,10 +165,30 @@ SPLIT_STRING = re.compile(r"^(-[A-Za-z]*S|--sp)")
 ASSIGN = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)(\[[^\]]*\])?\+?=")
 
 
+ANSI_ESCAPE = re.compile(r"\\(x[0-9A-Fa-f]{1,2}|u[0-9A-Fa-f]{1,4}|U[0-9A-Fa-f]{1,8}|[0-7]{1,3}|.)", re.DOTALL)
+# An expansion that may be empty: ${...}, $NAME, $1, $@, an empty $( ) or ` `.
+MAY_BE_EMPTY = re.compile(r"\$\{[^{}]*\}|\$\(\s*\)|`\s*`|\$[A-Za-z_][A-Za-z0-9_]*|\$[0-9@*#?$!-]")
+
+
+def ansi_c(m):
+    """The text of one $'...' quote, its escapes decoded (\\x67, \\147 and \\u0067 are g)."""
+    def one(e):
+        code = e.group(1)
+        if code[0] in "xuU" and len(code) > 1:
+            return chr(int(code[1:], 16) % 0x110000)
+        if code[0] in "01234567":
+            return chr(int(code, 8))
+        return code
+    return ANSI_ESCAPE.sub(one, m.group(1))
+
+
 def involves_text(line):
-    """git, gh or hc appears as a whole word, in any case, once quotes and backslashes are taken out.
+    """git, gh or hc appears as a whole word, in any case, once quotes and backslashes are taken out: as written, and
+    with $'...' decoded and each expansion that may be empty taken out (gi$''t, $'\\x67it', gi${X}t are git).
     Used for a line that is not plain, and for each word of a plain line that starts a shell or eval."""
-    return bool(WHOLE_WORD.search(re.sub(r"[\"'\\]", "", line)))
+    decoded = re.sub(r"\$'((?:[^'\\]|\\.)*)'", ansi_c, line, flags=re.DOTALL).replace('$"', '"')
+    texts = (line, decoded, MAY_BE_EMPTY.sub("", decoded))
+    return any(WHOLE_WORD.search(re.sub(r"[\"'\\]", "", t)) for t in texts)
 
 
 def wraps(commands):
@@ -394,12 +414,17 @@ def config_args(args, ctx):
             or (len(args) == 1 and bool(CONFIG_KEY.match(args[0]))))
 
 
+REFLOG_CHANGES = ("expire", "delete", "drop", "exists")
+
+
 def reflog_args(args, ctx):
     """Show and list only: `git reflog`, `git reflog show ...`, `git reflog -n 5 ...`, `git reflog list`."""
     if not args:
         return True
     if args[0] == "list":
         return len(args) == 1
+    if args[0].startswith("-") and any(a in REFLOG_CHANGES for a in args):
+        return False  # git reflog -n 5 expire ...: a subcommand after the options
     return (args[0] == "show" or args[0].startswith("-")) and no_output(args)
 
 
@@ -589,16 +614,20 @@ def changes_folder(words):
     return any(program(w) in CHANGERS for w in words) or words[0] in CHANGER_FIRST
 
 
-def cd_target(words, heres):
-    """Where `cd` goes, as a tuple (one folder per starting folder); None: not known."""
+def cd_target(words, heres, cdpath=False):
+    """Where `cd` goes, as a tuple (one folder per starting folder); None: not known. Not known either: a ~ form that
+    is not a home folder (~-, ~+, ~nobody: the shell reads them otherwise), and, when CDPATH may be set, a relative
+    target not starting with . (cd looks along CDPATH first)."""
     if len(words) == 1:
         return (os.path.expanduser("~"),)
     if len(words) != 2 or words[1] == "-":
         return None
     target = os.path.expanduser(words[1])
+    if target.startswith("~"):
+        return None
     if os.path.isabs(target):
         return (os.path.normpath(target),)
-    if heres is None:
+    if heres is None or (cdpath and not target.startswith(".")):
         return None
     return tuple(dict.fromkeys(os.path.normpath(os.path.join(h, target)) for h in heres))
 
@@ -611,11 +640,12 @@ def folders(commands, ops, start):
     operator a failed cd could have left the shell where it was. Any other word that may change folder (pushd, popd,
     cd -, builtin cd, eval, source, ...) makes the folder unknown from there on."""
     here = starts_of(start)
+    cdpath = bool(os.environ.get("CDPATH")) or any("cdpath" in w.lower() for words in commands for w in words)
     moved, prev, result = False, None, []
     for words, op in zip(commands, ops):
         result.append(here)
         if words[0] == "cd" and prev in (None, ";", "&&") and op == "&&":
-            here, moved = cd_target(words, here), True
+            here, moved = cd_target(words, here, cdpath), True
         elif changes_folder(words):
             here = None
         elif moved and op not in ("&&", None):
@@ -701,6 +731,11 @@ def check_command(line, pa_address=None, own_address=None, extra_rows=(), cwd=No
                     extra = list((extra_rows() if callable(extra_rows) else extra_rows) or [])
                 if not allowed(words, extra, ctx):
                     return OFF_TABLE.format(shown(" ".join(shlex.quote(w) for w in words)))
+    if any(involves(words) for words in commands):
+        # What git, gh or hc printed is not run by a shell reading the pipe (git show HEAD:x.sh | bash).
+        for k in range(1, len(commands)):
+            if ops[k - 1] == "|" and wraps([commands[k]]):
+                return OFF_TABLE.format(shown(" ".join(shlex.quote(w) for w in commands[k])))
     return None
 
 
@@ -721,13 +756,16 @@ def forms(folder):
 def protected(full, tops):
     """An absolute path is inside a .git folder (or is a worktree's .git file), is a task record or hook settings file
     (GUARDED), or is inside the spaces folder other than <space>/evidence/..., or anywhere else under the home.
-    tops: (forms(spaces_dir), forms(home)). Checked as written and after resolving links."""
-    spaces, homes = tops
+    Also the person's own git and gh settings (personal). tops: (forms(spaces_dir), forms(home), personal settings).
+    Checked as written and after resolving links."""
+    spaces, homes, personal = tops
     for low in {full.lower(), os.path.realpath(full).lower()}:
         parts = low.split(os.sep)
         if ".git" in parts:
             return True
         if tuple(parts[-2:]) in GUARDED:
+            return True
+        if any(low == top or low.startswith(top + os.sep) for top in personal):
             return True
         for top in spaces:
             if low == top or low.startswith(top + os.sep):
@@ -741,6 +779,17 @@ def protected(full, tops):
     return False
 
 
+def personal_settings():
+    """The person's own git and gh settings, as folders/files (forms): ~/.gitconfig, ~/.config/git, ~/.config/gh, and
+    the same under $XDG_CONFIG_HOME when it is set. Read at each check, so a test's HOME applies."""
+    user = os.path.expanduser("~")
+    configs = [os.path.join(user, ".config")] + [c for c in [os.environ.get("XDG_CONFIG_HOME")] if c]
+    found = set(forms(os.path.join(user, ".gitconfig")))
+    for config in configs:
+        found |= forms(os.path.join(config, "git")) | forms(os.path.join(config, "gh"))
+    return found
+
+
 def check_edit(path, spaces_dir, cwd=None, home=None):
     """None when Edit/Write/MultiEdit/NotebookEdit may write path; else the refusal message.
 
@@ -748,12 +797,13 @@ def check_edit(path, spaces_dir, cwd=None, home=None):
     .git file; a task record or hook settings file (.claude/pa-task.json, .claude/settings.local.json); anything in
     <spaces_dir> except a space's evidence folder (<spaces_dir>/<space>/evidence/...), so decisions/, ledger.json,
     journal.jsonl, rules.json, agent.json (STATE_FILES) and the rest of the state; and, when home (the Project Agent's
-    home) is given, anything else under it (profiles, core texts, tools). Names are compared without case (the Mac's
+    home) is given, anything else under it (profiles, core texts, tools); and the person's own git and gh settings
+    (~/.gitconfig, ~/.config/git/, ~/.config/gh/, card d-048). Names are compared without case (the Mac's
     file system ignores it). cwd may be several folders; a relative path is refused when it is protected from any.
     """
     if not path:
         return None
-    tops = (forms(spaces_dir), forms(home))
+    tops = (forms(spaces_dir), forms(home), personal_settings())
     for start in starts_of(cwd):
         given = os.path.normpath(os.path.join(start, os.path.expanduser(path)))
         if protected(given, tops):
