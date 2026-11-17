@@ -93,6 +93,35 @@ class Orchestrator(unittest.TestCase):
         self.assertIn("record the worker in the ledger with its `started` time", self.text)
         self.assertIn("a file that worker wrote after it started", self.text)
 
+    # t-017 J1 (R1, R5, R8): finding labels, must-fix bar, stop rule, scope, gate before the check
+    def test_t017_r1_stop_rule(self):  # AC1.3, AC1.5
+        self.assertIn("- Rounds: a round is one build or fix worker and the check that follows it. A fix round "
+                      "fixes only Must fix findings; Recorded limits and Nits go on the merge card. Stop rule: "
+                      "when a task reaches its round cap (low 2, normal 3, high 4) or two rechecks in a row "
+                      "find Must fix in the same area, start no further round: open a decision card (cut that "
+                      "area into a new task, record it as a limit, or one more round).", self.text)
+
+    def test_t017_r1_handoff_states_bar(self):  # AC1.4
+        self.assertIn("the phase and its artifact (see `sdlc.md`), the verification points, the must-fix bar "
+                      "and the stop rule (see Rounds), the evidence folder", self.text)
+
+    def test_t017_r1_merge_card_limits(self):  # AC1.3, G6
+        cards = flat(self.raw[self.raw.index("## Decision cards"):self.raw.index("## Workers")])
+        self.assertIn('A merge card lists every Recorded limit, each with its follow-up task or "accepted".', cards)
+
+    def test_t017_r5_scope(self):  # AC5.1-5.3
+        self.assertIn("- Scope: the handoff lists the requirements the job builds. A requirement that appears "
+                      "after the build starts, from the person, from a finding outside the must-fix bar, or "
+                      "from you, becomes a new task. When the person asks for one mid-task, open a card with "
+                      '"New task" recommended and "Add to this task" as the other option.', self.text)
+
+    def test_t017_r8_gate_before_check(self):  # AC8.1
+        gates = flat(section(self.raw, "## Phases and gates"))
+        self.assertIn("Before a task leaves a phase, run `pa-gate <task-id> --phase <phase>`. When a build or "
+                      "fix worker reports, run `pa-gate <task-id> --phase plan` and `--phase build` before "
+                      "starting its check; a missing artifact goes back to that worker as a follow-up for its "
+                      "own job.", gates)
+
     def test_safety_unchanged(self):
         self.assertEqual(section(self.raw, "## Safety"), ORCHESTRATOR_SAFETY)
 
@@ -107,8 +136,34 @@ class Worker(unittest.TestCase):
         self.assertIn("A new job for another task or another role is not yours: reply that it needs a fresh worker, and do nothing else.", self.text)
         self.assertIn("the orchestrator cannot close a worker that leaves them; it decides what to do with them", self.text)
 
+    # t-017 J1 (R1, R9)
+    def test_t017_r1_finding_labels(self):  # AC1.1, AC1.2
+        self.assertIn("- Verifiers, reviewers and check workers label every finding **Must fix** (it breaks a "
+                      "requirement, the plan, a verification point, safety or security; say why it blocks the "
+                      "merge), **Recorded limit** (real, but outside the handoff's must-fix bar; name a "
+                      "follow-up) or **Nit**, and end the file with `Verdict: pass` or `Verdict: must fix (<n>)`.",
+                      self.text)
+        self.assertIn("write `VERIFY.md`, and report. Never fix anything. On a recheck the handoff names a base "
+                      "commit: check the diff from it to HEAD.", self.text)
+        self.assertIn("compliance with `spec.md` and `plan.md`, and write `REVIEW.md`. On a diff recheck, review "
+                      "the diff from the base commit the handoff names.", self.text)
+        self.assertNotIn("Important or Nit", self.text)
+
+    def test_t017_r9_no_background_shell(self):  # AC9.1, G1: in Rules of the job, not Safety
+        rules = flat(self.raw[self.raw.index("## Rules of the job"):self.raw.index("## Roles")])
+        self.assertIn("- Before you report, stop every background command you started (a watcher, a server, a "
+                      "background shell): your session must go idle, or it cannot be closed.", rules)
+
     def test_safety_unchanged(self):
         self.assertEqual(section(self.raw, "## Safety"), WORKER_SAFETY)
+
+
+class Sdlc(unittest.TestCase):  # t-017 J1 (R1)
+    def test_t017_r1_gate_cell(self):
+        text = flat(read("runtime", "core", "sdlc.md"))
+        self.assertIn("| Must fix findings fixed, recorded limits listed on the merge card, checks green, then the "
+                      "person approves publishing (decision card) |", text)
+        self.assertNotIn("Important findings", text)
 
 
 class Docs(unittest.TestCase):  # AC6.1
