@@ -16,7 +16,7 @@ import { div } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
 import { exec } from "herdr";
 import { loadCosts, localId, withTimeout, TIMED_OUT, READ_LIMIT } from "./store.js";
-import { Copier } from "./copy.js";
+import { Copier, sel } from "./copy.js";
 
 export const COSTS_EVERY = 10000; // the summary of a shown space: at most one read this often
 export const BILLING_EVERY = 60000; // the billed comparison: at most one this often
@@ -199,7 +199,9 @@ export class CostsPane {
 
   render(t, space, collector) {
     const st = this.of(space.id), s = st.summary, cur = s?.prices?.currency ?? null;
-    const line = (text, color, id) => { const el = div().px(4).text_size(11.5).text_color(color ?? t.muted); return (id ? el.id(id) : el).child(text); };
+    // Selectable (t-026): every text row with no click handler, by a per-render counter (the same while the rows are).
+    let n = 0;
+    const line = (text, color, id) => { const el = div().px(4).text_size(11.5).text_color(color ?? t.muted); return id ? el.id(id).child(text) : el.child(sel(`costs-sel-${n++}`, text)); };
     const button = (id, label, click) => div().id(id).flex_none().px(8).h(24).flex().items_center().rounded(6).border(1).border_color(t.border).text_size(11.5)
       .text_color(t.foreground).cursor_pointer().hover((x) => x.bg(t.hover)).on_click(click).child(label);
     const refresh = () => button("costs-refresh", st.run?.busy && st.run.what === "collect" ? "Refreshing…" : "Refresh", (_e, cx) => { this.refresh(space, cx); cx.notify(); });
@@ -224,7 +226,7 @@ export class CostsPane {
       : `No price table in profile ${str(s.prices?.profile) || "?"}: tokens only.`} · updated ${ago(s.updated)}`;
     const totals = [said]; // the header and the tiles (filled by tiles() below), for Copy
     const header = h_flex().gap(8).items_center()
-      .child(div().flex_1().min_w(0).text_size(11.5).text_color(t.muted).child(said))
+      .child(div().flex_1().min_w(0).text_size(11.5).text_color(t.muted).child(sel("costs-sel-head", said)))
       .child(refresh())
       .when(Boolean(tot), (e) => e.child(this.copier.button(t, "costs-copy-totals", () => totals.join("\n"))));
     box.child(header);
@@ -265,10 +267,11 @@ export class CostsPane {
     const tile = (title, e, small) => {
       const figure = priced ? est(e, cur) : `${tokens(e.tokens)} tokens`;
       lines.push(`${title}: ${figure} · ${small}`);
+      const i = lines.length; // its row in the copy text: a stable id
       return v_flex().flex_1().min_w(0).p(8).gap(2).rounded(7).border(1).border_color(t.border).bg(t.surface)
-        .child(div().text_size(11).text_color(t.dim).child(title))
-        .child(div().text_size(15).font_semibold().text_color(t.foreground).child(figure))
-        .child(div().text_size(10.5).text_color(t.dim).child(small));
+        .child(div().text_size(11).text_color(t.dim).child(sel(`costs-sel-tile-${i}-title`, title)))
+        .child(div().text_size(15).font_semibold().text_color(t.foreground).child(sel(`costs-sel-tile-${i}-figure`, figure)))
+        .child(div().text_size(10.5).text_color(t.dim).child(sel(`costs-sel-tile-${i}-small`, small)));
     };
     const all = num(tot.tokens?.all), cr = num(tot.tokens?.cr);
     return h_flex().gap(6)
@@ -286,7 +289,8 @@ export class CostsPane {
     const copy = (key) => this.copier.button(t, `costs-copy-${key}`, () => blocks[key].join("\n"));
     const head = (text) => div().pt(4).px(4).text_size(11.5).font_semibold().text_color(t.foreground).child(text);
     const titled = (key, text) => { begin(key, text); return h_flex().gap(6).items_center().child(head(text)).child(copy(key)); };
-    const sub = (text, color) => { lines.push(`  ${text}`); return div().pl(20).text_size(11).text_color(color ?? t.muted).child(text); };
+    let n = 0; // the drill rows (children of a row's v_flex, not of its clickable h_flex) are selectable
+    const sub = (text, color) => { lines.push(`  ${text}`); return div().pl(20).text_size(11).text_color(color ?? t.muted).child(sel(`costs-sel-sub-${n++}`, text)); };
     const row = (section, i, entry, label, extra, drill) => {
       const key = str(entry.key), open = st.open[section] === key;
       const share = totalMoney && entry.money !== null && entry.money !== undefined && !num(entry.unpricedTokens) ? ` · ${Math.round((num(entry.money) / totalMoney) * 100)}%` : "";
@@ -348,7 +352,8 @@ export class CostsPane {
   billed(t, space, st, s, cur) {
     const b = st.billing, d = b.data, box = v_flex().id("costs-billed").gap(3).pt(6);
     const lines = []; // what the block draws, for its Copy (beside the head; there is none without billed rows)
-    const line = (text, color) => { lines.push(String(text)); return div().px(4).text_size(11.5).text_color(color ?? t.muted).child(text); };
+    let n = 0; // selectable rows (t-026), by a per-render counter
+    const line = (text, color) => { lines.push(String(text)); return div().px(4).text_size(11.5).text_color(color ?? t.muted).child(sel(`costs-sel-billed-${n++}`, text)); };
     const status = d?.status, conf = status?.config, on = Boolean(conf?.enabled), qs = status?.state && typeof status.state === "object" ? status.state : {};
     if (!d) return b.error ? box.child(line(`Billed amounts could not be read (${b.error})`, t.blocked)) : box.child(line(b.busy ? "Billed amounts: reading…" : "Billed amounts: not read yet.", t.dim));
     if (b.error) box.child(line(`Billed amounts could not be read (${b.error}); showing the copy read earlier.`, t.blocked));
@@ -359,7 +364,7 @@ export class CostsPane {
       const said = `Billing query: on · ${last} · next after ${clock(qs.nextAfter ?? new Date(Date.now()).toISOString())} · cap 1/day (≤ ${num(status?.maxPages) || 3} requests${fee})`;
       lines.push(said);
       return h_flex().gap(8).items_center()
-        .child(div().flex_1().min_w(0).px(4).text_size(11).text_color(t.dim).child(said))
+        .child(div().flex_1().min_w(0).px(4).text_size(11).text_color(t.dim).child(sel("costs-sel-billing-status", said)))
         .child(div().id("costs-billing-off").flex_none().px(8).h(22).flex().items_center().rounded(6).border(1).border_color(t.border).text_size(11).text_color(t.foreground)
           .cursor_pointer().hover((x) => x.bg(t.hover)).on_click((_e, cx) => { this.turnOff(space, cx); cx.notify(); }).child(b.off ? "Turning off…" : "Turn off"));
     };
@@ -374,7 +379,7 @@ export class CostsPane {
     }
     const billedHead = "Billed (account-wide: includes use outside this space and outside Herdr)";
     lines.length = 0; lines.push(billedHead); // the Copy starts at the head (a refused or failed query's line above it is dropped)
-    box.child(h_flex().gap(6).items_center().child(div().flex_1().min_w(0).px(4).text_size(11.5).font_semibold().text_color(t.foreground).child(billedHead))
+    box.child(h_flex().gap(6).items_center().child(div().flex_1().min_w(0).px(4).text_size(11.5).font_semibold().text_color(t.foreground).child(sel("costs-sel-billed-head", billedHead)))
       .child(this.copier.button(t, "costs-copy-billed", () => lines.join("\n"))));
     if (d.hereError) box.child(line(`All spaces on ${str(space.machine)} could not be read (${str(d.hereError)}); the comparison is not shown.`, t.blocked));
     if (c && c.covered) {
@@ -383,7 +388,7 @@ export class CostsPane {
       const missing = Array.isArray(s.prices?.missing) ? s.prices.missing.map(str) : [];
       const cell = (v, partial) => (v === null || v === undefined ? "— est. (no price)" : `${money(v, ccur)} est.${partial ? " + unpriced" : ""}`);
       const fig = (cols) => { lines.push(cols.map(String).join(" | ").replace(/^ \| /, "")); return figRow(cols); };
-      const figRow = (cols) => h_flex().gap(8).px(4).children(cols.map((x, i) => div().when(i === 0, (e) => e.flex_1().min_w(0).truncate()).when(i > 0, (e) => e.flex_none()).text_size(11.5).text_color(t.foreground).child(x)));
+      const figRow = (cols) => { const r = n++; return h_flex().gap(8).px(4).children(cols.map((x, i) => div().when(i === 0, (e) => e.flex_1().min_w(0).truncate()).when(i > 0, (e) => e.flex_none()).text_size(11.5).text_color(t.foreground).child(sel(`costs-sel-fig-${r}-${i}`, x)))); };
       box.child(fig(["", "this space", "all spaces here", "billed"]));
       for (const m of list(c.models)) {
         const f = m.factor ?? {};
@@ -392,7 +397,7 @@ export class CostsPane {
           .when(Boolean(fac) || m.notFinal || missing.includes(str(m.model)), (e) => {
             const note = [fac, f.partial ? "(from a partial estimate)" : "", f.few ? "(few days)" : "", m.notFinal ? "(not final)" : "", missing.includes(str(m.model)) ? "(no price for part of it)" : ""].filter(Boolean).join(" ");
             lines.push(`  ${note}`);
-            return e.child(div().pl(20).text_size(10.5).text_color(f.few ? t.dim : t.muted).child(note));
+            return e.child(div().pl(20).text_size(10.5).text_color(f.few ? t.dim : t.muted).child(sel(`costs-sel-billed-${n++}`, note)));
           });
       }
       if (num(c.other)) box.child(fig(["other / unmapped labels", "", "", `${money(c.other, ccur)} billed · account-wide`]));

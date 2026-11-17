@@ -14,6 +14,7 @@ import { div } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
 import { exec } from "herdr";
 import { isPush, localId, withTimeout, TIMED_OUT } from "./store.js";
+import { sel } from "./copy.js";
 
 export { isPush };
 export const PUSH = "Push", NOT_NOW = "Not now";
@@ -150,14 +151,16 @@ export class PushCards {
   // Every text row it draws is also pushed to `lines` (the card's Copy, t-026; an indented row with two spaces);
   // the Check again and Done links are not.
   block(t, space, entry, onCheck, onDone, lines = []) {
+    // Each row's text is selectable (t-026): ids by row order, the same while the rows are.
     const c = entry.card, open = c.status === "open", st = this.cards[`${space.id}\0${entry.id}`];
-    const line = (s, color) => { lines.push(String(s)); return div().text_size(12).text_color(color ?? t.muted).child(s); };
-    const small = (s, color) => { if (s) lines.push(String(s)); return div().text_size(11).text_color(color ?? t.dim).child(s); };
-    const sub = (s, color, size = 11.5) => { lines.push(`  ${s}`); return div().pl(12).text_size(size).text_color(color).child(s); };
+    const id = (n) => `sel-push-${entry.id}-${n}`;
+    const line = (s, color) => { lines.push(String(s)); return div().text_size(12).text_color(color ?? t.muted).child(sel(id(lines.length), s)); };
+    const small = (s, color) => { if (s) lines.push(String(s)); return div().text_size(11).text_color(color ?? t.dim).child(sel(id(lines.length), s)); };
+    const sub = (s, color, size = 11.5) => { lines.push(`  ${s}`); return div().pl(12).text_size(size).text_color(color).child(sel(id(lines.length), s)); };
     const box = v_flex().id(`push-${entry.id}`).gap(3).p(8).rounded(6).border(1).border_color(t.border).bg(t.background);
     if (!open) {
       const r = c.push?.result;
-      if (st?.result) this.shown(t, box, st, {}, lines);
+      if (st?.result) this.shown(t, box, st, {}, lines, entry.id);
       if (st?.unknown) {
         // A run whose result is unknown, after which the card was read answered: the one check's verdict.
         box.child(line(`The result is unknown (${st.unknown}); checking the card again.`, t.blocked));
@@ -192,7 +195,7 @@ export class PushCards {
     }
     if (chk?.caller) box.child(line(chk.caller.ok ? "This panel may push: yes" : `This panel may push: no (${text(chk.caller.why)})`, chk.caller.ok ? t.muted : t.blocked));
     // State: what this copy did last, then the check's verdict.
-    if (st?.result) this.shown(t, box, st, f, lines);
+    if (st?.result) this.shown(t, box, st, f, lines, entry.id);
     if (st?.error) box.child(line(`${st.errorFor === NOT_NOW ? "Not saved" : "Not pushed"}: ${st.error}`, t.blocked));
     if (st?.unknown) box.child(line(`The result is unknown (${st.unknown}); checking the card again.`, t.blocked));
     if (busy) box.child(line("Checking…", t.dim));
@@ -207,16 +210,17 @@ export class PushCards {
   }
 
   // What this copy's run printed: the result line and the tail of git's output.
-  shown(t, box, st, f, lines = []) {
+  shown(t, box, st, f, lines = [], cardId = "") {
     const r = st.result.result;
     const where = `${text(r?.url ?? f.url)} ${text(r?.branch ?? f.branch)}`;
     const said = st.result.label !== PUSH ? "Answered Not now: nothing was pushed."
       : r?.how && r.how !== "pushed" ? `Already on the remote: ${where} is at ${short(r?.to)} (recorded at ${clock(r?.at, false)})`
       : `Pushed ${where} ${short(r?.from)}..${short(r?.to)} at ${clock(r?.at, false)}`;
+    const id = () => `sel-push-${cardId}-${lines.length}`; // the block's scheme: one id per row
     lines.push(said);
-    box.child(div().text_size(12).text_color(t.done).child(said));
+    box.child(div().text_size(12).text_color(t.done).child(sel(id(), said)));
     const out = Array.isArray(r?.output) ? r.output : text(r?.output).split("\n").filter(Boolean);
-    for (const o of out.slice(-15)) { lines.push(`  ${text(o)}`); box.child(div().pl(12).text_size(11).text_color(t.dim).child(text(o))); }
+    for (const o of out.slice(-15)) { lines.push(`  ${text(o)}`); box.child(div().pl(12).text_size(11).text_color(t.dim).child(sel(id(), text(o)))); }
   }
 }
 

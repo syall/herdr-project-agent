@@ -18,7 +18,7 @@ import { Keeper, idleShell } from "./keeper.js";
 import { WorkerPane } from "./worker.js";
 import { PushCards, isPush, PUSH, PUSH_OPTIONS } from "./push.js";
 import { CostsPane } from "./costs.js";
-import { Copier } from "./copy.js";
+import { Copier, sel } from "./copy.js";
 import { tick, cadence, holdReason, setSchedule, requestPass, PRESETS, MIN_MINUTES } from "./timer.js";
 
 const ACTIVE = ["needs-decision", "review", "in-progress", "investigating", "queued"];
@@ -684,8 +684,8 @@ export default class ProjectAgent extends View {
         .when(Boolean(task.phase), (el) => el.child(div().flex_none().text_size(10.5).text_color(t.dim).child(String(task.phase))))
         .child(this.chip(t, String(task.state ?? "?"), tone)))
       .when(open, (el) => el.child(v_flex().px(10).pb(9).gap(6).text_size(12).text_color(t.muted)
-        .when(Boolean(task.goal), (e) => e.child(div().child(String(task.goal))))
-        .child(div().text_size(11).text_color(t.dim).child([task.type, task.tier && `${task.tier} tier`].filter(Boolean).join(" · ")))
+        .when(Boolean(task.goal), (e) => e.child(div().child(sel(`sel-goal-${task.id}`, String(task.goal)))))
+        .child(div().text_size(11).text_color(t.dim).child(sel(`sel-kind-${task.id}`, [task.type, task.tier && `${task.tier} tier`].filter(Boolean).join(" · "))))
         // Its workers: a live one opens in the Agents view. One closed with pa-worker close (finished,
         // closed set) is not drawn; its ledger entry stays (only the panel leaves it out). None left: no row.
         .when(crew.length > 0, (e) => e.child(h_flex().gap(6).flex_wrap().children(crew.map((w, i) => {
@@ -790,13 +790,14 @@ export default class ProjectAgent extends View {
         .child(div().flex_none().text_size(10.5).text_color(t.dim).child(when(open ? c.created : c.answered)))
         .child(this.chip(t, open ? "open" : c.status === "withdrawn" ? "withdrawn" : `answered: ${c.answer}`, open ? t.blocked : t.dim))
         .child(this.copier.button(t, `copy-${entry.id}`, () => this.cardText(c, entry, evidence, pushLines))))
-      .child(div().text_size(13).font_semibold().text_color(t.foreground).child(String(c.question)))
+      .child(div().text_size(13).font_semibold().text_color(t.foreground).child(sel(`sel-q-${entry.id}`, String(c.question))))
       // A push card: the facts pa-push-main check read now, never the card file's context (push.js).
       .when(push, (el) => el.child(this.push.block(t, space, entry, (_e, cx) => { this.push.check(space, entry, cx); cx.notify(); }, (_e, cx) => { this.push.leave(space.id); this.view = "decisions"; cx.notify(); }, pushLines)))
       // The context, one row per line; a line that starts with two spaces is indented (a worktree card's details).
-      .when(!push && Boolean(c.context) && !String(c.context).includes("\n"), (el) => el.child(div().text_size(12).text_color(t.muted).child(String(c.context))))
-      .when(!push && String(c.context ?? "").includes("\n"), (el) => el.child(v_flex().gap(2).children(String(c.context).split("\n").map((line) =>
-        div().text_size(12).text_color(t.muted).when(line.startsWith("  "), (d) => d.pl(12)).child(line.startsWith("  ") ? line.trimStart() : line)))))
+      // Selectable (t-026): the question, the context rows and the closing lines below; never the option rows.
+      .when(!push && Boolean(c.context) && !String(c.context).includes("\n"), (el) => el.child(div().text_size(12).text_color(t.muted).child(sel(`sel-ctx-${entry.id}`, String(c.context)))))
+      .when(!push && String(c.context ?? "").includes("\n"), (el) => el.child(v_flex().gap(2).children(String(c.context).split("\n").map((line, i) =>
+        div().text_size(12).text_color(t.muted).when(line.startsWith("  "), (d) => d.pl(12)).child(sel(`sel-ctx-${entry.id}-${i}`, line.startsWith("  ") ? line.trimStart() : line))))))
       .when(Boolean(task), (el) => el.children(this.actions(t, task, space)))
       .children((push ? PUSH_OPTIONS : c.options ?? []).map((o, i) => {
         const recommended = c.recommendation === o.label, chosen = open ? picked === o.label : c.answer === o.label;
@@ -823,8 +824,8 @@ export default class ProjectAgent extends View {
           .child(div().flex_1().min_w(0).text_size(10.5).text_color(t.dim).child(push && picked === PUSH && !ready && !busy ? "Push needs a check that passed, under 2 minutes old, that says this panel may push."
             : picked ? "Add a note above if you want; it is sent with the answer." : "Pick an option, add a note if you want, then submit."))))
       // Closed from the conversation: say so, with the words that decided it (or why it was withdrawn).
-      .when(!open && Boolean(c.answeredBy), (el) => el.child(div().text_size(11).text_color(t.dim).child(c.status === "withdrawn" ? "Closed by the Project Agent as no longer needed" : `Answered by the ${c.answeredBy}`)))
-      .when(!open && Boolean(c.note), (el) => el.child(div().text_size(12).text_color(t.muted).child(c.status === "withdrawn" ? `Why: ${c.note}` : c.answeredBy ? `You said: “${c.note}”` : `Note: ${c.note}`)))
+      .when(!open && Boolean(c.answeredBy), (el) => el.child(div().text_size(11).text_color(t.dim).child(sel(`sel-by-${entry.id}`, c.status === "withdrawn" ? "Closed by the Project Agent as no longer needed" : `Answered by the ${c.answeredBy}`))))
+      .when(!open && Boolean(c.note), (el) => el.child(div().text_size(12).text_color(t.muted).child(sel(`sel-note-${entry.id}`, c.status === "withdrawn" ? `Why: ${c.note}` : c.answeredBy ? `You said: “${c.note}”` : `Note: ${c.note}`))))
       .when(Boolean(this.failed[entry.id]), (el) => el.child(div().text_size(11.5).text_color(t.blocked).child(this.failed[entry.id])));
   }
 

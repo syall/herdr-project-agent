@@ -10,7 +10,7 @@ import { v_flex, h_flex, InputState, Input } from "gpui-base";
 import { home } from "herdr";
 import { loadRules, changeRules, touched, reorder, newRuleId, exportRules, importRules } from "./store.js";
 import { readAllow } from "./push.js";
-import { Copier } from "./copy.js";
+import { Copier, sel } from "./copy.js";
 
 export const ALLOW_EVERY = 30000; // the push allowlist is read at most this often, but for Refresh
 
@@ -186,10 +186,11 @@ export class RulesPane {
           .on_click((_e, cx) => { cx.stop_propagation(); this.armed = null; this.setStatus(space, cx, rule.id, on ? "off" : "active", on ? "turned off" : "turned on"); }).child(on ? "On" : "Off")))
         .when(!on && rule.status !== "off", (el) => el.child(this.chip(t, rule.status, tone))))
       .when(open, (el) => el.child(v_flex().px(10).pb(9).gap(6).text_size(12).text_color(t.muted)
-        .child(div().text_color(t.foreground).child(String(rule.text ?? "")))
-        .when(Boolean(rule.why), (e) => e.child(div().child(`Why: ${rule.why}`)))
-        .when(Boolean(rule.needsAttention), (e) => e.child(div().text_color(t.blocked).child(`The Project Agent can't follow this: ${rule.needsAttention}`)))
-        .child(div().text_size(11).text_color(t.dim).child(`${rule.id} · from ${rule.source ?? "?"} · order ${rule.order ?? 0} · ${(rule.history ?? []).length} changes`))
+        // Selectable (t-026): the open rule's text rows; never its head (it folds the rule).
+        .child(div().text_color(t.foreground).child(sel(`sel-rule-${rule.id}`, String(rule.text ?? ""))))
+        .when(Boolean(rule.why), (e) => e.child(div().child(sel(`sel-rule-why-${rule.id}`, `Why: ${rule.why}`))))
+        .when(Boolean(rule.needsAttention), (e) => e.child(div().text_color(t.blocked).child(sel(`sel-rule-att-${rule.id}`, `The Project Agent can't follow this: ${rule.needsAttention}`))))
+        .child(div().text_size(11).text_color(t.dim).child(sel(`sel-rule-meta-${rule.id}`, `${rule.id} · from ${rule.source ?? "?"} · order ${rule.order ?? 0} · ${(rule.history ?? []).length} changes`)))
         .child(h_flex().gap(6).flex_wrap()
           .child(this.copier.button(t, `rule-copy-${rule.id}`, () => this.ruleText(rule)))
           .when(proposed, (e) => e

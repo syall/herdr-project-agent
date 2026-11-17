@@ -3302,7 +3302,7 @@ cases["T26-sel-costs"] = async () => { // the Costs figures are selectable; the 
   const all = safeViews(tree, "costs");
   const texts = all.map((x) => x.text);
   for (const want of ["Total", "Today", "Billed (account-wide: includes use outside this space and outside Herdr)", "Tasks:", "model-a"]) check(texts.includes(want), `"${want}" is selectable (have ${JSON.stringify(texts)})`);
-  check(texts.some((x) => /^Estimated from test table prices/.test(x)) && texts.some((x) => /^XTS 12\.50 est\.$/.test(x)) && texts.some((x) => /^Billing query: on · /.test(x)), `the header, a figure and the status (have ${JSON.stringify(texts)})`);
+  check(texts.some((x) => /^Estimated from test table prices/.test(x)) && texts.some((x) => /^XTS\s12\.50 est\.$/.test(x)) && texts.some((x) => /^Billing query: on · /.test(x)), `the header, a figure and the status (have ${JSON.stringify(texts)})`);
   check(!texts.includes("By activity") || all.find((x) => x.text === "By activity"), "heads may be selectable");
   check(new Set(all.map((x) => x.id)).size === all.length, `ids unique (got ${JSON.stringify(all.map((x) => x.id))})`);
 };
