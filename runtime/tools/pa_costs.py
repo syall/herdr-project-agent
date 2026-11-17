@@ -21,7 +21,6 @@ import hashlib
 import json
 import os
 import re
-import socket
 import subprocess
 import sys
 import time
@@ -768,9 +767,7 @@ def _collect(directory, folder, now, quiet, resummarize):
         pa.write_text(state_path, text)
     written = [r for r in out if "seq" in r]
     if written or resummarize or not os.path.exists(os.path.join(folder, "summary.json")):
-        summarize = globals().get("write_summary")
-        if summarize:
-            summarize(directory, state)
+        write_summary(directory, state, now, ctx["records"] + ctx["events"])
     if not quiet:
         print("collected {} new segment(s) from {} session(s)".format(len(written), len(sessions)))
     return {"rows": len(written), "sessions": len(sessions)}
@@ -1060,6 +1057,405 @@ def reconstruct(directory, dry_run=False, now=None, quiet=False):
     return {"matches": matches, "unmatched": um}
 
 
+# ---- summary.json and the report ------------------------------------------------------------------
+
+SUMMARY_MAX = 65536
+DAYS, SESSIONS, PASSES, HOURS = 92, 200, 20, 48
+
+
+def ledger_rows(directory):
+    """The ledger rows that count: a void line drops the earlier rows of its session."""
+    rows, _bad = read_lines(os.path.join(costs_dir(directory), "turns.jsonl"))
+    voids = {}
+    for r in rows:
+        if r.get("ev") == "void":
+            voids.setdefault(r.get("session"), []).append(r.get("upTo") or 0)
+    out = []
+    for r in rows:
+        if "seq" not in r or not isinstance(r.get("tokens"), dict):
+            continue
+        if any(r["seq"] <= up for up in voids.get(r.get("session"), [])):
+            continue
+        out.append(r)
+    return out
+
+
+def space_prices(directory):
+    """(table, problem, profile name) for the space's profile."""
+    agent = pa.read_json(os.path.join(directory, "agent.json"), {}) or {}
+    try:
+        profile = pa.load_profile(agent.get("profile"))
+    except pa.Problem as e:
+        return None, str(e), agent.get("profile")
+    table, problem = load_prices(profile)
+    return table, problem, profile.get("name")
+
+
+def costs_account():
+    return ((pa.config().get("costs") or {}).get("account")) or "default"
+
+
+class Bucket:
+    __slots__ = ("tokens", "money", "priced", "calls", "recon", "kinds")
+
+    def __init__(self):
+        self.tokens, self.money, self.priced, self.calls, self.recon, self.kinds = 0, 0.0, False, 0, 0.0, None
+
+    def add(self, tokens, money, calls, recon, kinds=None):
+        self.tokens += tokens
+        self.calls += calls
+        if money is not None:
+            self.money += money
+            self.priced = True
+            if recon:
+                self.recon += money
+        if kinds is not None:
+            self.kinds = self.kinds or zero()
+            for k in KINDS:
+                self.kinds[k] += kinds.get(k, 0)
+
+    def out(self, key, **extra):
+        d = {"key": key, "tokens": int(round(self.tokens)), "money": round(self.money, 6) if self.priced else None,
+             "calls": int(round(self.calls))}
+        if self.recon:
+            d["reconstructed"] = round(self.recon, 6)
+        d.update(extra)
+        return d
+
+
+def group(buckets, key):
+    b = buckets.get(key)
+    if b is None:
+        b = buckets[key] = Bucket()
+    return b
+
+
+def by_money(buckets, **extra_for):
+    items = [b.out(k, **(extra_for.get(k) or {})) for k, b in buckets.items()]
+    items.sort(key=lambda e: (-(e["money"] or 0), -e["tokens"], str(e["key"])))
+    return items
+
+
+def summarize(directory, rows, records, table, price_problem, profile_name, now, problems=()):
+    """The summary.json object (spec 2.3) for the given ledger rows."""
+    sessions = sessions_of(records)
+    try:
+        ledger = pa.read_json(os.path.join(directory, "ledger.json"), {}) or {}
+    except (OSError, ValueError):
+        ledger = {}
+    tasks = {t.get("id"): t for t in ledger.get("tasks", []) or [] if isinstance(t, dict) and t.get("id")}
+    total, recon_money, unpriced, missing = Bucket(), 0.0, 0, set()
+    kinds_total = zero()
+    acts, task_b, phases, task_phase, task_sessions, task_split = {}, {}, {}, {}, {}, set()
+    dims = {d: {} for d in ("kind", "role", "program", "model", "machine")}
+    days, day_acts, day_model, hours, passes, sess_b, sess_info = {}, {}, {}, {}, {}, {}, {}
+    hour_floor = iso(now - HOURS * 3600)[:13]
+    for r in rows:
+        tokens = {k: num(r["tokens"].get(k)) for k in KINDS}
+        t = total_tokens(tokens)
+        m = row_money(r, table)
+        rec = r.get("source") == "reconstructed"
+        calls = num(r.get("calls"))
+        if m is None and t:
+            unpriced += t
+            missing.add(r.get("model") or "(unknown model)")
+        if m is not None and rec:
+            recon_money += m
+        total.add(t, m, calls, rec)
+        for k in KINDS:
+            kinds_total[k] += tokens[k]
+        # by activity: a rebuild's cache write moves to cache-rebuild
+        rb = r.get("rebuild") or {}
+        rb_tokens = {"in": 0, "out": 0, "cw5m": num(rb.get("cw5m")), "cw1h": num(rb.get("cw1h")), "cr": 0}
+        rb_t = rb_tokens["cw5m"] + rb_tokens["cw1h"]
+        rb_m = None
+        if rb_t:
+            price = price_for(table, r.get("model"), r.get("from"))
+            rb_m = money(rb_tokens, zero(), price) if m is not None else None
+            group(acts, "cache-rebuild").add(rb_t, rb_m, 0, rec)
+        group(acts, r.get("activity") or "unattributed").add(t - rb_t, None if m is None else m - (rb_m or 0), calls, rec)
+        # by task (split rows by their weights), phase, sessions per task
+        split = r.get("split") if isinstance(r.get("split"), list) and r.get("split") else [{"task": r.get("task"), "w": 1.0}]
+        wsum = sum(float(s.get("w") or 0) for s in split) or 1.0
+        for s in split:
+            w = float(s.get("w") or 0) / wsum
+            key = s.get("task") or "(no task)"
+            group(task_b, key).add(t * w, None if m is None else m * w, calls * w, rec)
+            if len(split) > 1:
+                task_split.add(key)
+            group(task_phase.setdefault(key, {}), r.get("phase") or "(none)").add(t * w, None if m is None else m * w, calls * w, rec)
+            task_sessions.setdefault(key, [])
+            if short(r["session"]) not in task_sessions[key]:
+                task_sessions[key].append(short(r["session"]))
+        group(phases, r.get("phase") or "(none)").add(t, m, calls, rec)
+        sess = sessions.get(r["session"]) or {}
+        for dim, value in (("kind", r.get("kind")), ("role", r.get("role")), ("program", r.get("program")),
+                           ("model", r.get("model")), ("machine", sess.get("host"))):
+            group(dims[dim], value or ("unknown" if dim == "machine" else "(none)")).add(t, m, calls, rec)
+        day = r.get("day") or (r.get("from") or "")[:10]
+        group(days, day).add(t, m, calls, rec)
+        da = day_acts.setdefault(day, {})
+        act = r.get("activity") or "unattributed"
+        if m is not None:
+            da[act] = da.get(act, 0.0) + m - (rb_m or 0)
+            if rb_m:
+                da["cache-rebuild"] = da.get("cache-rebuild", 0.0) + rb_m
+        group(day_model, (day, r.get("model") or "(unknown model)")).add(t, m, calls, rec, tokens)
+        hour = (r.get("from") or "")[:13]
+        if hour >= hour_floor:
+            group(hours, hour).add(t, m, calls, rec)
+        if r.get("kind") == "pa" and r.get("pass") is not None:
+            p = passes.setdefault(r["pass"], {"pass": r["pass"], "trigger": r.get("trigger"), "from": r.get("from"), "money": 0.0,
+                                               "tokens": 0, "rebuild": False})
+            p["money"] += m or 0
+            p["tokens"] += t
+            p["rebuild"] = p["rebuild"] or bool(rb_t)
+            p["from"] = min(p["from"] or r.get("from"), r.get("from"))
+        group(sess_b, r["session"]).add(t, m, calls, rec)
+        info = sess_info.setdefault(r["session"], {"from": r.get("from"), "to": r.get("to"), "models": {}, "tasks": {}, "role": None})
+        info["from"] = min(info["from"], r.get("from"))
+        info["to"] = max(info["to"], r.get("to"))
+        info["models"][r.get("model")] = info["models"].get(r.get("model"), 0) + t
+        info["tasks"][r.get("task")] = info["tasks"].get(r.get("task"), 0) + t
+        info["role"] = r.get("role") or info["role"]
+        info["row"] = r
+    task_extra = {}
+    for key in task_b:
+        t = tasks.get(key) or {}
+        extra = {"state": t.get("state") if key in tasks else ("deleted" if key != "(no task)" else None),
+                 "phases": [{k: v for k, v in ph.items() if k != "calls"} for ph in by_money(task_phase.get(key, {}))],
+                 "sessions": task_sessions.get(key, [])[:20]}
+        if isinstance(t.get("title"), str):
+            extra["title"] = t["title"][:80]
+        if key in task_split:
+            extra["split"] = True
+        task_extra[key] = extra
+    day_list = sorted(days, reverse=True)
+    older = Bucket()
+    for d in day_list[DAYS:]:
+        b = days[d]
+        older.tokens += b.tokens
+        older.calls += b.calls
+        if b.priced:
+            older.money += b.money
+            older.priced = True
+            older.recon += b.recon
+    by_day = [days[d].out(d, byActivity={k: round(v, 6) for k, v in sorted(day_acts.get(d, {}).items())}) for d in day_list[:DAYS]]
+    if day_list[DAYS:]:
+        by_day.append(older.out("older", days=len(day_list) - DAYS))
+    kept_days = set(day_list[:DAYS])
+    by_day_model = [dict(day=d, model=mod, tokens=b.kinds or zero(), money=round(b.money, 6) if b.priced else None)
+                    for (d, mod), b in sorted(day_model.items(), reverse=True) if d in kept_days]
+    sess_list = []
+    for sid, b in sess_b.items():
+        info, sess = sess_info[sid], sessions.get(sid) or {}
+        r = info["row"]
+        state = "gone" if sess.get("gone") else ("closed" if sess.get("closed") else "open")
+        sess_list.append(b.out(short(sid), kind=r.get("kind"), role=info["role"], program=r.get("program"),
+                               task=max(info["tasks"], key=lambda k: info["tasks"][k]),
+                               model=max(info["models"], key=lambda k: info["models"][k]), **{"from": info["from"]},
+                               to=info["to"], state=state, source=r.get("source"), match=r.get("match")))
+    sess_list.sort(key=lambda e: e["to"] or "", reverse=True)
+    um = [x for x in records if x.get("ev") == "unmatched"]
+    problems = list(problems)
+    if price_problem:
+        problems.append(price_problem)
+    return {
+        "v": 1, "space": os.path.basename(directory), "updated": iso(now), "account": costs_account(),
+        "prices": {"profile": profile_name, "source": (table or {}).get("source"), "asOf": (table or {}).get("asOf"),
+                   "currency": (table or {}).get("currency"), "missing": sorted(missing)},
+        "totals": {"tokens": {"in": kinds_total["in"], "out": kinds_total["out"], "cw": kinds_total["cw5m"] + kinds_total["cw1h"],
+                              "cr": kinds_total["cr"], "all": total_tokens(kinds_total)},
+                   "money": round(total.money, 6) if total.priced else None, "unpricedTokens": unpriced,
+                   "reconstructedMoney": round(recon_money, 6), "calls": total.calls},
+        "hours": [[h, {"tokens": int(b.tokens), "money": round(b.money, 6) if b.priced else None}] for h, b in sorted(hours.items())],
+        "byActivity": by_money(acts),
+        "byTask": by_money(task_b, **task_extra),
+        "byPhase": by_money(phases),
+        "byKind": {d: by_money(v) for d, v in dims.items()},
+        "byDay": by_day,
+        "byDayModel": by_day_model,
+        "passes": sorted(({**p, "money": round(p["money"], 6)} for p in passes.values()), key=lambda p: -p["money"])[:PASSES],
+        "sessions": sess_list[:SESSIONS],
+        "unmatched": {"sessions": um[-1].get("sessions", 0), "tokens": um[-1].get("tokens", 0)} if um else {"sessions": 0, "tokens": 0},
+        "problems": problems[:20],
+    }
+
+
+def compact(value):
+    return json.dumps(value, separators=(",", ":")) + "\n"
+
+
+def fold_tasks(entries, keep):
+    """The costliest `keep` tasks, and the rest folded into one "(other tasks)" entry (totals unchanged)."""
+    if len(entries) <= keep:
+        return entries
+    rest = entries[keep:]
+    priced = [e["money"] for e in rest if e["money"] is not None]
+    other = {"key": "(other tasks)", "tokens": sum(e["tokens"] for e in rest), "money": round(sum(priced), 6) if priced else None,
+             "calls": sum(e["calls"] for e in rest), "tasks": len(rest) + sum(e.get("tasks", 0) for e in rest if e["key"] == "(other tasks)"),
+             "phases": [], "sessions": []}
+    recon = sum(e.get("reconstructed", 0) for e in rest)
+    if recon:
+        other["reconstructed"] = round(recon, 6)
+    return entries[:keep] + [other]
+
+
+def shrink(s):
+    """One step towards SUMMARY_MAX: fewer sessions, then shorter session lists per task, then fewer tasks."""
+    if s["sessions"]:
+        s["sessions"] = s["sessions"][:len(s["sessions"]) * 3 // 4]
+    elif any(t["sessions"] for t in s["byTask"]):
+        for t in s["byTask"]:
+            t["sessions"] = t["sessions"][:len(t["sessions"]) // 2]
+    elif s["passes"]:
+        s["passes"] = s["passes"][:len(s["passes"]) // 2]
+    elif len(s["byTask"]) > 10:
+        s["byTask"] = fold_tasks(s["byTask"], len(s["byTask"]) * 3 // 4)
+    elif s["byDayModel"]:
+        s["byDayModel"] = s["byDayModel"][:len(s["byDayModel"]) * 3 // 4]
+    else:
+        return False
+    s["truncated"] = True
+    return True
+
+
+def write_summary(directory, state=None, now=None, records=None):
+    """Rewrites costs/summary.json (≤ 64 KB: lists are shortened, never the totals, until it fits)."""
+    now = time.time() if now is None else now
+    folder = costs_dir(directory)
+    if state is None:
+        state = pa.read_json(os.path.join(folder, "state.json"), {}) or {}
+    bad = 0
+    if records is None:
+        records, bad = read_lines(os.path.join(folder, "sessions.jsonl"))
+    table, problem, name = space_prices(directory)
+    problems = list(state.get("problems") or [])
+    if bad:
+        problems.append("{} lines of sessions.jsonl are not JSON".format(bad))
+    s = summarize(directory, ledger_rows(directory), records, table, problem, name, now, problems)
+    text = compact(s)
+    while len(text.encode()) > SUMMARY_MAX and shrink(s):
+        text = compact(s)
+    pa.write_text(os.path.join(folder, "summary.json"), text)
+    return s
+
+
+def fmt_money(value, currency=None):
+    if value is None:
+        return "—"
+    return "<0.01" if 0 < value < 0.005 else "{:.2f}".format(value)
+
+
+def fmt_tokens(n):
+    for unit, size in (("B", 1e9), ("M", 1e6), ("k", 1e3)):
+        if n >= size:
+            return "{:.1f}{}".format(n / size, unit)
+    return str(int(n))
+
+
+REPORT_BY = ("activity", "task", "phase", "kind", "role", "program", "model", "machine", "day", "pass", "session")
+
+
+def report_lines(s, by=None):
+    out = []
+    p, tot = s["prices"], s["totals"]
+    if p.get("source") or p.get("currency"):
+        head = "estimated from {} prices as of {} ({})".format(p.get("source") or "?", p.get("asOf") or "?", p.get("currency") or "?")
+    else:
+        head = "No price table in profile {}: tokens only".format(p.get("profile") or "?")
+    out.append("Space {} · {} · updated {}".format(s["space"], head, s["updated"]))
+    share = (100.0 * tot["tokens"]["cr"] / tot["tokens"]["all"]) if tot["tokens"]["all"] else 0
+    line = "Total     {} est.   {} tokens (cache read {:.0f}%)".format(fmt_money(tot["money"]), fmt_tokens(tot["tokens"]["all"]), share)
+    if tot.get("reconstructedMoney"):
+        line += "   includes {} est. reconstructed (best effort)".format(fmt_money(tot["reconstructedMoney"]))
+    if tot.get("unpricedTokens"):
+        line += "   + {} unpriced tokens".format(fmt_tokens(tot["unpricedTokens"]))
+    if by is None:
+        out.append(line)
+        today = sum(e["money"] or 0 for e in s["byDay"] if e["key"] == s["updated"][:10])
+        out.append("Today     {} est. (UTC day)".format(fmt_money(today)))
+
+    def table(title, entries, label=lambda e: str(e["key"])):
+        total = sum(e["money"] or 0 for e in entries) or 0
+        out.append("{:<28} {:>10} {:>6} {:>10}".format(title, "est.", "share", "tokens"))
+        for e in entries:
+            pct = "{:.0f}%".format(100.0 * (e["money"] or 0) / total) if total and e["money"] is not None else ""
+            mark = " ◌" if e.get("reconstructed") else ""
+            out.append("  {:<26} {:>10} {:>6} {:>10}{}".format(label(e)[:26], fmt_money(e["money"]), pct, fmt_tokens(e["tokens"]), mark))
+    sections = [("activity", "By activity", s["byActivity"], None), ("task", "By task", s["byTask"], None),
+                ("phase", "By phase", s["byPhase"], None)]
+    sections += [(d, "By " + d, s["byKind"].get(d, []), None) for d in ("kind", "role", "program", "model", "machine")]
+    sections += [("day", "By day", s["byDay"], None),
+                 ("pass", "Costliest passes", [dict(p, key="pass {} ({})".format(p["pass"], p.get("trigger") or "?") + (" rebuild" if p.get("rebuild") else ""))
+                                               for p in s["passes"]], None),
+                 ("session", "Sessions", s["sessions"], lambda e: "{} {} {}".format(e["key"], e.get("role") or e.get("kind"), e.get("task") or ""))]
+    for key, title, entries, label in sections:
+        if by is None and key in ("phase", "session", "pass", "program", "machine"):
+            continue
+        if by is not None and key != by:
+            continue
+        table(title, entries, label or (lambda e: str(e["key"])))
+    if by is None:
+        out.append("No price: {}".format(", ".join(p.get("missing") or []) or "(none)"))
+        if s.get("unmatched", {}).get("sessions"):
+            out.append("Unmatched sessions (not in the totals): {}, {} tokens".format(s["unmatched"]["sessions"], fmt_tokens(s["unmatched"]["tokens"])))
+        for prob in s.get("problems") or []:
+            out.append("Problem: " + prob)
+    return out
+
+
+def account_wide_summary(account, now):
+    """byDayModel summed over every space on this machine with the same account label (read-only)."""
+    root = os.path.join(pa.ROOT, "spaces")
+    spaces, merged = [], {}
+    for name in sorted(os.listdir(root)) if os.path.isdir(root) else []:
+        s = pa.read_json(os.path.join(root, name, "costs", "summary.json"), None) if pa.ID.match(name) else None
+        try:
+            if not isinstance(s, dict) or (s.get("account") or "default") != account:
+                continue
+        except ValueError:
+            continue
+        spaces.append(name)
+        for e in s.get("byDayModel") or []:
+            m = merged.setdefault((e.get("day"), e.get("model")), {"day": e.get("day"), "model": e.get("model"), "tokens": zero(), "money": None})
+            for k in KINDS:
+                m["tokens"][k] += num((e.get("tokens") or {}).get(k))
+            if e.get("money") is not None:
+                m["money"] = (m["money"] or 0) + e["money"]
+    return {"v": 1, "account": account, "spaces": spaces, "updated": iso(now),
+            "byDayModel": [merged[k] for k in sorted(merged, key=lambda k: (k[0] or "", k[1] or ""), reverse=True)]}
+
+
+def report(directory, by=None, since=None, until=None, as_json=False, account_wide=False, billed=False, now=None):
+    now = time.time() if now is None else now
+    if account_wide:
+        print(json.dumps(account_wide_summary(costs_account(), now), indent=2))
+        return 0
+    for d in (since, until):
+        if d is not None and not DATE.match(d):
+            raise pa.Problem("dates are YYYY-MM-DD (UTC)")
+    if by is not None and by not in REPORT_BY:
+        raise pa.Problem("--by is one of " + ", ".join(REPORT_BY))
+    folder = costs_dir(directory)
+    rows = [r for r in ledger_rows(directory) if (not since or r.get("day", "") >= since) and (not until or r.get("day", "") <= until)]
+    records, _bad = read_lines(os.path.join(folder, "sessions.jsonl"))
+    table, problem, name = space_prices(directory)
+    state = pa.read_json(os.path.join(folder, "state.json"), {}) or {}
+    s = summarize(directory, rows, records, table, problem, name, now, state.get("problems") or [])
+    if as_json:
+        print(json.dumps(s, indent=2))
+        return 0
+    print("\n".join(report_lines(s, by)))
+    if billed:
+        print("\n".join(billed_lines(s, now)))
+    return 0
+
+
+def billed_lines(s, now):
+    return ["Billed: (no billed rows)"]
+
+
 # ---- launch records (called by pa.py: pa-claude, pa-codex, pa-session) ---------------------------
 
 APPEND_WAIT = 1.0  # seconds a launcher waits for the append lock before it gives up (the launch goes on)
@@ -1136,8 +1532,8 @@ def launch_plan(kind, argv):
 
 def host():
     try:
-        return socket.gethostname().split(".")[0][:64]
-    except OSError:
+        return os.uname()[1].split(".")[0][:64]
+    except (OSError, AttributeError):
         return None
 
 
@@ -1172,10 +1568,76 @@ def record_agent_start(directory, agent, address, project, model, resume):
 
 # ---- command line ------------------------------------------------------------------------------
 
+def space_directory(explicit):
+    directory, _agent = pa.space_for_command(explicit)
+    return directory
+
+
+def cmd_prices(directory):
+    table, problem, name = space_prices(directory)
+    if problem:
+        print(problem)
+    if not table:
+        print("No price table in profile {}: tokens only.".format(name))
+    else:
+        print("Profile {}: {} per 1M tokens, source {}, as of {}".format(name, table["currency"], table.get("source"), table.get("asOf")))
+        for model, entries in sorted(table["models"].items()):
+            for e in entries:
+                print("  {:<24} from {}  ".format(model, e["validFrom"]) + "  ".join(
+                    "{} {}".format(k, "—" if e.get(k) is None else e.get(k, 0)) for k in KINDS) + ("  (long above {})".format(
+                        e["long"].get("above")) if e.get("long") else ""))
+    seen = sorted({r.get("model") for r in ledger_rows(directory) if r.get("model")})
+    unpriced = [m for m in seen if model_key(table, m) is None]
+    print("Models seen without a price: {}".format(", ".join(unpriced) or "(none)"))
+    return 0
+
+
 def main(argv=None):
-    parser = argparse.ArgumentParser(prog="pa-costs")
-    parser.parse_args(argv)
-    raise pa.Problem("give a subcommand: collect, report, reconstruct, prices or billed")
+    parser = argparse.ArgumentParser(prog="pa-costs", description="Cost tracking per space (tokens; money is an estimate).")
+    sub = parser.add_subparsers(dest="cmd")
+    c = sub.add_parser("collect", help="read new session bytes into the space's cost ledger")
+    c.add_argument("--space")
+    c.add_argument("--quiet", action="store_true")
+    c.add_argument("--resummarize", action="store_true", help="only rewrite summary.json (after a price table change)")
+    r = sub.add_parser("report", help="the space's costs as text, or --json")
+    r.add_argument("--space")
+    r.add_argument("--by", choices=REPORT_BY)
+    r.add_argument("--since")
+    r.add_argument("--until")
+    r.add_argument("--json", action="store_true")
+    r.add_argument("--billed", action="store_true", help="add the comparison with billed amounts")
+    r.add_argument("--account-wide", action="store_true", help="byDayModel of every space here with the same account")
+    x = sub.add_parser("reconstruct", help="find and bind the space's sessions from before launch records")
+    x.add_argument("--space")
+    x.add_argument("--dry-run", action="store_true")
+    p = sub.add_parser("prices", help="the price table in use, and models seen without a price")
+    p.add_argument("--space")
+    add_billed_parser(sub)
+    args = parser.parse_args(argv)
+    if args.cmd == "collect":
+        result = collect(space_directory(args.space), quiet=args.quiet, resummarize=args.resummarize)
+        return 0 if result is not None else 0
+    if args.cmd == "report":
+        if args.account_wide:
+            return report(None, account_wide=True)
+        return report(space_directory(args.space), by=args.by, since=args.since, until=args.until, as_json=args.json, billed=args.billed)
+    if args.cmd == "reconstruct":
+        reconstruct(space_directory(args.space), dry_run=args.dry_run)
+        return 0
+    if args.cmd == "prices":
+        return cmd_prices(space_directory(args.space))
+    if args.cmd == "billed":
+        return cmd_billed(args)
+    parser.print_help()
+    return 2
+
+
+def add_billed_parser(sub):
+    return None
+
+
+def cmd_billed(args):
+    raise pa.Problem("billed: not available")
 
 
 if __name__ == "__main__":
