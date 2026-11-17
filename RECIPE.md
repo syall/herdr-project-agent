@@ -127,7 +127,14 @@ A new space opens with a 600 x 440 dialog: a Project Agent card (`Set up for <fo
   and only a load with no read answering or timing out for 11 s is given up. A load that ends is
   used unless a newer load of its space has already been. The last load of each space (8 at most, in
   memory, also one that ends after a switch away) shows at once when the space is shown again, and
-  refreshes. A read that times out keeps the last value known for the space.
+  refreshes. A read that times out, fails or is not valid JSON (the ledger, the profile, the
+  schedule, the pass request, the card listing, one card, rules, evidence) never counts as "none":
+  the panel keeps the last value known for the space and shows the error, and the shared keys that
+  value feeds (worktrees, workers, Files shortcuts, main branches, the open-card count) and any note
+  typed on a card stay as they were. Only a read that answered (a missing file or an empty
+  decisions folder included) replaces them. When agent.json does not answer, what is shown stays,
+  with the error. Of a full load and a hidden refresh of a space, the one started later writes the
+  shared keys; an older one ending later writes none. A typed note belongs to its space's card.
 - While the panel is not the side panel's shown view (the `layout()` test the tabs mod uses, over
   the blocks with this copy's props), it reads, per space every 10 s and together, the cards (for
   the open-card count) and the ledger. From the ledger it refreshes the shared worktrees, workers
