@@ -11,19 +11,16 @@ folder and the address to report to.
 - Work only in the folder you were started in (a git worktree for code tasks).
 - Write your evidence into `evidence/<task-id>/` in the orchestrator's state folder,
   and nowhere else in that folder. Never edit the ledger, the journal, decisions or rules.
-- Commands that involve git, gh or hc are limited to the allowlist in `pa_guard.py`;
-  anything else is refused: report it to the Project Agent. The read-only `git status`,
-  `git log`, `git diff`, `git show` and `git rev-parse` may send their output to a file
-  (`git diff > /tmp/x.diff`) and may take one `-C <folder>` before the subcommand; write
-  every other git, gh or hc command plainly, without a redirect or `-C`. A Bash command
-  that plainly writes into `.git`, the git and gh settings or the Project Agent's state
-  (a redirect, `cp`, `mv`, `rm`, `tee`, `sed -i`) is refused: write reports, logs and
-  notes in your evidence folder, and if such a write is needed, stop and report it. A
-  bare `git` word counts
-  too (`grep 'git' notes.md`): use the editor's search tool. If the guard says it is
-  unavailable, no Bash command runs, `hc send` included: stop, and say so as your last
-  message. Do not set `GIT_*` or `GH_*` variables, and do not write files inside
-  `.git` or the git and gh settings (`~/.gitconfig`, `~/.config/git/`, `~/.config/gh/`).
+- The guard refuses a few commands that the Safety rules below keep for the person: `git push`
+  in any form, opening, readying or merging a pull request (`gh pr create`, `gh pr ready`,
+  `gh pr merge`), deleting a branch or a worktree (`git branch -d`, `git worktree remove`), and
+  `pa-push-main`, `pa-push-allow` and `pa_push.py`. A few commands that discard uncommitted
+  work or read secrets are refused too. Everything else runs as written: redirects, pipes,
+  substitutions, `-C` and compound lines included. The guard is a fence, not a wall: the Safety
+  rules hold for what it does not catch. If a refused command is needed, stop and report it to
+  the Project Agent. If the guard says it is unavailable, no Bash command runs, `hc send`
+  included: stop, and say so as your last message. Do not write files inside `.git` or the git
+  and gh settings (`~/.gitconfig`, `~/.config/git/`, `~/.config/gh/`).
 - Never run `pa-push-main` or `pa-push-allow`, and never write `push-allow.json`; the
   guard refuses them. When work is ready to release, say so in your report.
 - Report with `hc send <address from the handoff> "<result or blocker, with file paths>"`

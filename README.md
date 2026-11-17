@@ -137,6 +137,17 @@ A remote launcher must write the heartbeat
 (run `pa-sync --on <machine>`): one from before the heartbeat existed is never `alive`, so it gets
 no passes and no answer notices.
 
+## The worker guard
+
+Each worker's `pa-hook guard` refuses a short list of commands that the core Safety rules keep for you:
+`git push` in any form, opening, readying or merging a pull request, deleting a branch or a worktree, and
+`pa-push-main`, `pa-push-allow` and `pa_push.py`. It keeps the older refusals (force pushes, pushes to a main
+branch, discarding uncommitted work, reading secrets, a profile's `releaseTools`) and refuses editor writes
+into `.git` and the Project Agent's state. It is a fence for workers that follow their rules, not a sandbox: a
+script a worker writes can still do what your user can. When it cannot load, it refuses everything. The rules
+it had before (an allowlist, plain lines, a Bash write rule) are described in `docs/worker-guard-history.md`,
+with the commits that hold them.
+
 ## Pushing main from the panel
 
 Off by default. No agent pushes a main branch: not the Project Agent, not a worker. For the
