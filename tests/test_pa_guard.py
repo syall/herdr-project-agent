@@ -1790,6 +1790,67 @@ class T016_PersonOnlyOperands(PersonOnly):
                 self.assertEqual(self.check(line, extra_rows=rows), PERSON_MSG.format(line))
 
 
+class T016_Fix2_RedirectsOnly(T016):
+    """REVIEW-2 M1: a command made only of redirects is judged like any other; its redirect targets are write targets."""
+
+    def test_redirects_only_refused(self):
+        for line, target in [("> <sp>/ledger.json", "<sp>/ledger.json"), ("> .git/index", ".git/index"),
+                             (">> ~/.gitconfig", "~/.gitconfig"), ("ls && > .git/index", ".git/index"),
+                             ("2> .git/HEAD", ".git/HEAD"), ("ls; >> <wt>/.git/config", "<wt>/.git/config"),
+                             ("&> .git/x", ".git/x"), ("< a.txt > .git/x", ".git/x"), ("X=1 > .git/x", ".git/x")]:
+            with self.subTest(line=line):
+                self.refused(line, target)
+
+    def test_redirects_only_allowed(self):
+        for line in ["> build/x.log", "> <ev>/x.txt", ">> /tmp/t016.txt", "ls && > build/y", "< a.txt", "2>&1 > /dev/null"]:
+            with self.subTest(line=line):
+                self.assertIsNone(self.w(line))
+
+    def test_folder_after_cd_applies(self):
+        self.refused("cd .git && > config", "config")
+        self.assertIsNone(self.w("cd build && > x.log"))
+
+
+class T016_Fix2_ManyRedirects(T016):
+    """REVIEW-1 F2: redirect targets are collected in one pass, so very many redirects are not quadratic."""
+
+    def test_twenty_thousand_redirects(self):
+        line = "ls" + " > build/x.log" * 20000
+        started = time.monotonic()
+        self.assertIsNone(self.w(line))
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.refused(line + " > .git/x", ".git/x")
+
+
+class T016_Fix2_PersonOnlyPiped(PersonOnly):
+    """REVIEW-2 L1, VERIFY F2: a git command naming pa_push.py as a path may be piped only into a known text filter
+    (FILTERS, tee with no file); into any other program it is refused with the person-only message. Data for
+    check_command only; none of these lines is run."""
+
+    def test_piped_into_a_program_refused(self):
+        for line in ["git show HEAD:runtime/tools/pa_push.py | python3 - push main",
+                     "git cat-file -p HEAD:runtime/tools/pa_push.py | python3 -", "git show HEAD:pa_push.py | python3",
+                     "git cat-file -p HEAD:pa_push.py | python3", "git show HEAD:runtime/tools/PA_PUSH.PY | perl",
+                     "git show HEAD:runtime/tools/pa_push.py | tee /tmp/p.py", "git show HEAD:pa_push.py | tee -a /tmp/p.py",
+                     "git show HEAD:pa_push.py | sh", "git show HEAD:pa_push.py | bash -s", "git diff pa_push.py | node",
+                     "git show HEAD:pa_push.py | grep . | python3 -", "git show HEAD:pa_push.py | X=1 python3",
+                     "git log -p runtime/tools/pa_push.py | xargs echo", "git status && git show HEAD:pa_push.py | ruby",
+                     "git show HEAD:runtime/tools/pa_push.py | env python3", "git show HEAD:bin/pa-push-main | sh"]:
+            with self.subTest(line=line):
+                message = self.check(line)
+                self.assertIsNotNone(message, line)
+                self.assertTrue(message.startswith(PERSON_MSG.split("{}")[0]), message)
+
+    def test_no_pipe_or_a_text_filter_allowed(self):
+        for line in ["git show HEAD:runtime/tools/pa_push.py", "git show HEAD:pa_push.py",
+                     "git show HEAD:runtime/tools/pa_push.py | head -50", "git show HEAD:pa_push.py | grep -n push | wc -l",
+                     "git diff pa_push.py | cat", "git log -p pa_push.py | tail -n 5", "git show HEAD:pa_push.py | tee",
+                     "git show HEAD:pa_push.py | LC_ALL=C sort", "git diff pa_push.py; python3 -m pytest",
+                     "git show HEAD:other.py | python3 -", "git diff pa_push.py && git add pa_push.py"]:
+            with self.subTest(line=line):
+                self.assertIsNone(self.check(line))
+
+
 def tearDownModule():
     shutil.rmtree(TMP, ignore_errors=True)
 
