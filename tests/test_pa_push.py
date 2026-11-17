@@ -668,5 +668,326 @@ class Check(Planned):
         self.assertNotEqual(self.origin_head(), self.task_commit)
 
 
+# ---- A3: run's checks, one test per refusal -----------------------------------------------------------
+
+FRESH = object()  # take the seen token from a check made just now
+
+
+class Runs(Planned):
+    """A push card made by plan, and the seen token of a check made right after it (what the person saw)."""
+
+    def setUp(self):
+        Planned.setUp(self)
+        self.assertEqual(self.plan()[0], 0)
+        self.seen = self.check()["seen"]
+        self.assertTrue(self.seen)
+        self.origin_before = self.origin_head()
+        self.main_before = self.head(self.main)
+        self.calls[:] = []
+
+    def replan(self, **entry_changes):
+        """The allowlist entry changed by the person, and a new card made with it."""
+        self.set_allow(**entry_changes)
+        os.remove(self.card_path())
+        code, _o, err = self.plan()
+        self.assertEqual(code, 0, err)
+        self.seen = self.check()["seen"]
+
+    def run_push(self, answer="Push", seen=None, env=None, tree=None, space=SPACE, card=CARD, note=None, deadline=None):
+        if seen is FRESH:
+            seen = self.check(card)["seen"]
+        elif seen is None:
+            seen = self.seen
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            return pa_push.run_push(space, card, answer, note, seen, PERSON_ENV if env is None else env,
+                                    PERSON_TREE if tree is None else tree, deadline)
+
+    def card_edit(self, **push_changes):
+        c = self.card()
+        c["push"].update(push_changes)
+        dump(c, self.card_path())
+
+    def gate_edit(self, **pin_changes):
+        path = os.path.join(self.dir, "evidence", TASK, "GATE.json")
+        g = load(path)
+        if pin_changes.pop("no_pin", False):
+            g["commits"] = []
+        g["commits"] and g["commits"][0].update(pin_changes)
+        dump(g, path)
+
+    def assertRefused(self, result, check, text, attempts=1, origin=True):
+        code, r = result
+        self.assertEqual(code, 1, r)
+        self.assertFalse(r["ok"])
+        self.assertFalse(r["done"])
+        self.assertEqual(r["refusal"]["check"], check, r["refusal"])
+        self.assertIn(text, r["refusal"]["message"])
+        if origin:
+            self.assertEqual(self.origin_head(), self.origin_before)
+        self.assertEqual(self.head(self.main, "refs/heads/main"), self.main_before)
+        if os.path.exists(self.card_path()):
+            c = self.card()
+            if c.get("push", {}).get("space") == SPACE and c["status"] in ("open",):
+                self.assertEqual(len(c["push"]["attempts"]), attempts, c["push"]["attempts"])
+                if attempts:
+                    self.assertEqual(c["push"]["attempts"][-1]["check"], check)
+                    self.assertIn("push refused: ", self.journal()[-1]["why"])
+        self.assertFalse(any(a[:1] == ["git"] and "push" in a for a in self.calls), self.calls)
+        return r
+
+
+class RunChecks(Runs):
+    def test_r_c0_env_markers(self):
+        for k in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CODEX_SANDBOX", "CODEX_HOME_SESSION", "CODEX_ANYTHING", "CLAUDE_CODE_SSE_PORT"):
+            r = self.assertRefused(self.run_push(env=dict(PERSON_ENV, **{k: "1"})), "C0", k, attempts=0)
+            self.assertIn("the person's command", r["refusal"]["message"])
+        self.assertEqual(self.calls, [])  # nothing was read
+
+    def test_r_c0_ancestor_claude(self):
+        for tree in ([{"pid": 7, "comm": "/opt/bin/claude", "args": "claude --resume"}] + PERSON_TREE,
+                     PERSON_TREE[:1] + [{"pid": 8, "comm": "node", "args": "node /usr/lib/node_modules/@anthropic-ai/claude-code/cli.js"}]):
+            self.assertRefused(self.run_push(tree=tree), "C0", "ancestor", attempts=0)
+        self.assertEqual(self.calls, [])
+
+    def test_r_c0_ancestor_codex(self):
+        for tree in ([{"pid": 7, "comm": "codex", "args": "codex"}] + PERSON_TREE,
+                     [{"pid": 8, "comm": "/usr/bin/node", "args": "node /x/@openai/codex/bin/codex.js"}]):
+            self.assertRefused(self.run_push(tree=tree), "C0", "codex", attempts=0)
+
+    def test_r_c0_ps_fails_closed(self):
+        code, r = pa_push.run_push(SPACE, CARD, "Push", None, self.seen, PERSON_ENV, None, None)
+        self.assertEqual((code, r["refusal"]["check"]), (1, "C0"))
+        self.assertIn("ps failed", r["refusal"]["message"])
+        self.assertIsNone(pa_push.ancestors(table={}))
+        self.assertIsNone(pa_push.ancestors(pid=5, table={9: (1, "x", "x")}))
+        tree = pa_push.ancestors(pid=5, table={5: (4, "python3", "python3 pa_push.py"), 4: (3, "/bin/zsh", "-zsh"), 3: (0, "launchd", "launchd")})
+        self.assertEqual([a["comm"] for a in tree], ["/bin/zsh", "launchd"])
+
+    def test_r_c0_hc_terminal(self):
+        self.assertRefused(self.run_push(env=dict(PERSON_ENV, HC_TERMINAL_ID="t7")), "C0", "Herdr terminal", attempts=0)
+
+    def test_r_c0_cli_refuses_in_this_session(self):
+        """The real command line, started from this agent session: refused by C0, with the JSON contract."""
+        code, out, err = self.cli("pa-push-main", "run", CARD, "--answer", "Push", "--space", SPACE, "--seen", self.seen, "--json",
+                                  env=dict(os.environ, CLAUDECODE="1"))
+        self.assertEqual(code, 1, err)
+        r = json.loads(out)
+        self.assertEqual(set(r), {"ok", "done", "answer", "refusal", "result", "message"})
+        self.assertEqual(r["refusal"]["check"], "C0")
+        self.assertEqual(self.origin_head(), self.origin_before)
+        self.assertEqual(self.card()["push"]["attempts"], [])
+        code, _o, _e = self.cli("pa-push-main", "run", CARD, "--space", SPACE)
+        self.assertEqual(code, 2)  # --answer is required: a usage error
+
+    def test_r_c1_no_space_state(self):
+        self.assertRefused(self.run_push(space="sp9"), "C1", "no Project Agent state for space sp9", attempts=0)
+        self.assertRefused(self.run_push(space=None), "C1", "--space", attempts=0)
+
+    def test_r_c2_lock_held(self):
+        with pa_push.push_lock(self.dir):
+            t = time.monotonic()
+            self.assertRefused(self.run_push(), "C2", "another push for this space is running", attempts=0)
+            self.assertGreaterEqual(time.monotonic() - t, 4)
+
+    def test_r_c3_not_push_card(self):
+        dump({"id": "d-1", "question": "Q", "options": [{"label": "Push"}], "status": "open"}, os.path.join(self.dir, "decisions", "d-1.json"))
+        self.assertRefused(self.run_push(card="d-1"), "C3", "d-1 is not a push card", attempts=0)
+        self.assertRefused(self.run_push(card="d-none"), "C3", "no decision card d-none", attempts=0)
+        self.assertRefused(self.run_push(card="../x"), "C3", "no decision card", attempts=0)
+        self.card_edit(version=2)
+        self.assertRefused(self.run_push(), "C3", "push version 2", attempts=0)
+
+    def test_r_c3_other_space(self):
+        self.card_edit(space="sp2")
+        self.assertRefused(self.run_push(), "C3", "belongs to space sp2, not sp1", attempts=0)
+
+    def test_r_c4_answered_or_withdrawn(self):
+        for status in ("withdrawn", "answered"):
+            c = self.card()
+            c["status"] = status
+            dump(c, self.card_path())
+            self.assertRefused(self.run_push(), "C4", "{} is {}; nothing was pushed".format(CARD, status), attempts=0)
+
+    def test_r_c5_bad_answer(self):
+        self.assertRefused(self.run_push(answer="Yes"), "C5", "--answer must be one of: Push, Not now", attempts=0)
+
+    def test_r_c6a(self):
+        os.remove(self.allow)
+        self.assertRefused(self.run_push(), "C6a", "no push allowlist")
+
+    def test_r_c6b(self):
+        write(self.allow, '{"version": 1, "enabled": true, "repos": [], "x": 1}')
+        self.assertRefused(self.run_push(), "C6b", "the push allowlist is not valid: unknown key x")
+
+    def test_r_c6c(self):
+        dump(dict(load(self.allow), enabled=False), self.allow)
+        self.assertRefused(self.run_push(), "C6c", "turned off (enabled: false)")
+
+    def test_r_c6d(self):
+        self.set_allow(path=os.path.join(self.tmp, "elsewhere"))
+        self.assertRefused(self.run_push(), "C6d", "no allowlist entry for " + self.main)
+
+    def test_r_c6e(self):
+        self.card_edit(url="file://" + os.path.join(self.tmp, "other.git"))
+        self.assertRefused(self.run_push(), "C6e", "has URL " + self.url)
+
+    def test_r_c6f(self):
+        self.card_edit(branch="dev")
+        self.assertRefused(self.run_push(), "C6f", "has branch main, the card says dev")
+
+    def test_r_c6g(self):
+        self.set_allow(space="sp2")
+        self.assertRefused(self.run_push(), "C6g", "names space sp2, not this space sp1")
+
+    def test_r_c6h(self):
+        self.set_allow(enabled=False)
+        self.assertRefused(self.run_push(), "C6h", "is turned off")
+
+    def test_r_c6i(self):
+        self.set_allow(note="changed after the card")
+        self.assertRefused(self.run_push(), "C6i", "changed since this card was made")
+
+    def test_r_order_earlier_check_wins(self):
+        self.set_allow(enabled=False)  # C6h, and the file's SHA changes too (C6i)
+        self.assertRefused(self.run_push(), "C6h", "turned off")
+        self.set_allow(enabled=True, note="x")  # C6i
+        self.commit_on(self.wt, "late.txt", "late")  # C8f too
+        self.assertRefused(self.run_push(), "C6i", "changed", attempts=2)
+
+    def test_r_c7b_hookspath(self):
+        sh(self.main, "git", "config", "core.hooksPath", os.path.join(self.tmp, "planted"))
+        self.assertRefused(self.run_push(), "C7b", "has git setting core.hookspath (local)")
+
+    def test_r_c7b_sshcommand(self):
+        sh(self.main, "git", "config", "core.sshCommand", "/tmp/planted")
+        self.assertRefused(self.run_push(), "C7b", "core.sshcommand")
+        sh(self.main, "git", "config", "--unset", "core.sshCommand")
+        sh(self.main, "git", "config", "remote.origin.pushurl", "file:///elsewhere")
+        self.assertRefused(self.run_push(), "C7b", "remote.origin.pushurl", attempts=2)
+
+    def test_r_c7c_pushinsteadof(self):
+        gitconfig = os.path.join(os.environ["HOME"], ".gitconfig")
+        self.addCleanup(lambda: os.path.exists(gitconfig) and os.remove(gitconfig))
+        write(gitconfig, '[url "file:///nowhere/"]\n\tpushInsteadOf = file://{}\n'.format(TMP))
+        self.assertRefused(self.run_push(), "C7c", "a URL rewrite")
+
+    def test_r_c8a_evidence_removed(self):
+        os.remove(os.path.join(self.dir, "evidence", TASK, "REVIEW.md"))
+        self.assertRefused(self.run_push(), "C8a", "does not pass now: REVIEW.md (missing)")
+        self.ledger_task(workers=[{"address": "t31", "role": "build"}])
+        write(os.path.join(self.dir, "evidence", TASK, "REVIEW.md"), "x\n")
+        self.assertRefused(self.run_push(), "C8a", "reviewer is not the author", attempts=2)
+
+    def test_r_c8b_phase(self):
+        self.gate(phase="build")
+        self.assertRefused(self.run_push(), "C8b", "is from phase build")
+
+    def test_r_c8c_no_pin(self):
+        self.gate_edit(no_pin=True)
+        self.assertRefused(self.run_push(), "C8c", "pins no commit for this repository")
+
+    def test_r_c8d_uncommitted(self):
+        self.gate_edit(uncommitted=2)
+        self.assertRefused(self.run_push(), "C8d", "2 uncommitted file(s)")
+
+    def test_r_c8e_pin_differs(self):
+        self.gate_edit(commit=self.main_before)
+        self.assertRefused(self.run_push(), "C8e", "the gate passed {}, the card says {}".format(self.main_before[:7], self.task_commit[:7]))
+
+    def test_r_c8f_commit_after_gate(self):
+        late = self.commit_on(self.wt, "late.txt", "after the gate")
+        self.assertRefused(self.run_push(), "C8f", "commits were added to t-1-x after the gate (gate {}, branch now {})".format(
+            self.task_commit[:7], late[:7]))
+
+    def test_r_c8g_live_worktree_moved(self):
+        sh(self.wt, "git", "checkout", "-q", "--detach", "HEAD~1")
+        self.assertRefused(self.run_push(), "C8g", "not at the gated commit now")
+        sh(self.wt, "git", "checkout", "-q", "t-1-x")
+        write(os.path.join(self.wt, "b.txt"), "changed, not committed\n")
+        self.assertRefused(self.run_push(), "C8g", "1 uncommitted change(s)", attempts=2)
+
+    def test_r_c9_short_sha(self):
+        """A short id never reaches git: with the gate pin and the card both short, the branch tip (always a full
+        id) differs, so C8f refuses before C9 (C9 is the backstop)."""
+        self.gate_edit(commit=self.task_commit[:7])
+        self.card_edit(commit=self.task_commit[:7])
+        self.assertRefused(self.run_push(), "C8f", "commits were added")
+        self.assertFalse(any(self.task_commit[:7] in a for a in self.calls), self.calls)
+
+    def test_r_c10a_local_moved(self):
+        self.commit_on(self.main, "m.txt", "on main after the card")
+        self.main_before = self.head(self.main)
+        self.assertRefused(self.run_push(), "C10a", "local main moved since the card")
+
+    def test_r_c10a_not_ancestor(self):
+        x = self.commit_on(self.main, "m.txt", "diverged")
+        self.main_before = x
+        self.card_edit(localBefore=x)
+        self.assertRefused(self.run_push(), "C10a", "local main ({}) is not an ancestor of {}".format(x[:7], self.task_commit[:7]))
+
+    def test_r_c10b_not_on_branch(self):
+        sh(self.main, "git", "checkout", "-q", "-b", "other")
+        self.assertRefused(self.run_push(), "C10b", "is on other, not main")
+
+    def test_r_c10b_dirty(self):
+        write(os.path.join(self.main, "a.txt"), "dirty\n")
+        self.assertRefused(self.run_push(), "C10b", "1 uncommitted change(s) to tracked files")
+
+    def test_r_c11a_unreadable_url(self):
+        moved = self.origin + ".away"
+        os.rename(self.origin, moved)
+        try:
+            self.assertRefused(self.run_push(), "C11a", "could not read " + self.url, origin=False)
+        finally:
+            os.rename(moved, self.origin)
+        self.assertEqual(self.origin_head(), self.origin_before)
+
+    def test_r_c11a_no_branch(self):
+        sh(self.origin, "git", "update-ref", "-d", "refs/heads/main")
+        self.assertRefused(self.run_push(), "C11a", "has no branch main", origin=False)
+        self.assertEqual(sh(self.origin, "git", "for-each-ref"), "")
+
+    def test_r_c11b_remote_moved(self):
+        other = os.path.join(self.tmp, "other")
+        sh(self.tmp, "git", "clone", "-q", self.url, other)
+        self.commit_on(other, "o.txt", "someone else")
+        sh(other, "git", "push", "-q", "origin", "main")
+        self.origin_before = self.origin_head()
+        self.assertRefused(self.run_push(), "C11b", "remote main moved since the card")
+
+    def test_r_c11c_rewritten(self):
+        sh(self.main, "git", "checkout", "-q", "-b", "side", self.origin_before)
+        x = self.commit_on(self.main, "s.txt", "rewritten history")
+        sh(self.main, "git", "push", "-q", "origin", "side")
+        sh(self.main, "git", "checkout", "-q", "main")
+        sh(self.origin, "git", "update-ref", "refs/heads/main", x)
+        self.origin_before = x
+        self.card_edit(remoteBefore=x)
+        self.assertRefused(self.run_push(), "C11c", "remote main ({}) is not an ancestor of {}; only a fast-forward".format(x[:7], self.task_commit[:7]))
+
+    def test_r_c12_seen_missing(self):
+        self.assertRefused(self.run_push(seen=""), "C12", "--seen is required")
+
+    def test_r_c12_seen_differs(self):
+        self.assertRefused(self.run_push(seen="0" * 64), "C12", "the facts changed since you looked")
+        # a re-run of the gate after the person looked changes the token too
+        time.sleep(1.1)
+        self.gate()
+        self.assertRefused(self.run_push(), "C12", "the facts changed since you looked", attempts=2)
+
+    def test_r_c13_prepush_fails(self):
+        self.replan(prePush=["/bin/sh", "-c", "echo checking; echo bad thing >&2; exit 3"])
+        before = {n for n in os.listdir(tempfile.gettempdir()) if n.startswith("pa-push-")}
+        r = self.assertRefused(self.run_push(), "C13", "the allowlist's prePush check failed (exit 3)")
+        self.assertIn("bad thing", r["refusal"]["message"])
+        leftovers = {n for n in os.listdir(tempfile.gettempdir()) if n.startswith("pa-push-")} - before
+        self.assertEqual(leftovers, set(), "the temporary clone and hooks folder are removed")
+
+    def test_r_deadline(self):
+        r = self.assertRefused(self.run_push(deadline=time.monotonic() + 100), "deadline", "ran out of time before pushing; nothing was pushed")
+        self.assertIn("nothing was pushed", r["message"])
+
+
 if __name__ == "__main__":
     unittest.main()
