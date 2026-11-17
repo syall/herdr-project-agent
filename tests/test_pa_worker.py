@@ -1669,5 +1669,84 @@ class Describe(Base):
         self.assertEqual([(c["sha"], c["merged"]) for c in repo["commits"]], [(c1, True)])
 
 
+def hc_status(state, msg=None):
+    """A status as `hc get --json` gives it on this machine (t-014): an object, not a word."""
+    return dict({"app": "claude-code", "state": state}, **({"msg": msg} if msg else {}))
+
+
+class StatusShapes(Base):
+    """t-014: hc get gives a worker's status as an object {app, state, msg}; hc ls gives a word. Every
+    reader of the status takes both: done and idle close, working and blocked refuse, the rest refuse."""
+
+    def test_s1_the_refusal_reads_both_shapes(self):
+        entry = {"name": "t-003-tests"}
+        for status in ("done", "idle", hc_status("done"), hc_status("idle", "Finished")):
+            self.assertIsNone(pa_hooks.status_refusal("t31", entry, {"name": "t-003-tests", "status": status}), status)
+        for status, kind in (("working", "working"), (hc_status("working", "Running tests"), "working"),
+                             ("blocked", "blocked"), (hc_status("blocked"), "blocked"),
+                             ("thinking", "status"), (hc_status("thinking"), "status"), ({"app": "claude-code"}, "status"),
+                             ({"state": ["done"]}, "status"), (["done"], "status"), (7, "status")):
+            refusal = pa_hooks.status_refusal("t31", entry, {"name": "t-003-tests", "status": status})
+            self.assertIsNotNone(refusal, status)
+            self.assertEqual(refusal[0], kind, status)
+        refusal = pa_hooks.status_refusal("t31", entry, {"name": "t-003-tests", "status": hc_status("thinking", "hm")})
+        self.assertEqual(refusal[1], "t31 has status thinking; nothing was closed")
+        refusal = pa_hooks.status_refusal("t31", entry, {"name": "t-003-tests", "status": {"app": "claude-code"}})
+        self.assertEqual(refusal[1], "t31 has status none; nothing was closed")
+        # an ended terminal with no status is still closable, an empty object too
+        self.assertIsNone(pa_hooks.status_refusal("t31", entry, {"state": "finished", "status": None}))
+        self.assertIsNone(pa_hooks.status_refusal("t31", entry, {"state": "finished", "status": {}}))
+
+    def test_s2_close_a_done_worker_whose_status_is_an_object(self):
+        proj = self.repo()
+        wt = self.worktree(proj, "t-003-x")
+        self.add_task("t-003", "in-progress", wt, [{"address": "t31", "role": "build", "name": "t-003-tests"}])
+        self.term("t31", "t-003-tests", status=hc_status("done"))
+        self.evidence("t-003")
+        pa_hooks.by_an_agent = lambda: True
+        code, out, err = self.worker("close", "t31", "--evidence", "FINDINGS.md")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.ended(), [["hc", "kill", "t31"], ["hc", "rm", "t31"]])
+        self.assertTrue(self.entry("t-003", "t31")["finished"])
+
+    def test_s3_working_and_blocked_objects_are_refused(self):
+        self.add_task("t-003", "in-progress", None, [{"address": "t31", "role": "build", "name": "t-003-tests"}])
+        self.evidence("t-003")
+        pa_hooks.by_an_agent = lambda: True
+        for status, why in ((hc_status("working", "Running"), "t31 (t-003-tests) is working; close it after its report"),
+                            (hc_status("blocked"), "t31 (t-003-tests) is blocked on a question or a permission"),
+                            (hc_status("thinking"), "t31 has status thinking; nothing was closed")):
+            self.term("t31", "t-003-tests", status=status)
+            before = self.snapshot()
+            self.assertRefused(self.worker("close", "t31", "--evidence", "FINDINGS.md"), why)
+            self.assertEqual(self.snapshot(), before)
+
+    def test_s4_leftovers_and_card_read_object_statuses(self):
+        pa_hooks.by_an_agent = lambda: True
+        now = time.time()
+        for tid, address, status in (("t-001", "t31", hc_status("done")), ("t-002", "t32", hc_status("idle")),
+                                     ("t-003", "t33", hc_status("working", "Running")), ("t-004", "t34", hc_status("blocked")),
+                                     ("t-005", "t35", hc_status("thinking"))):
+            self.add_task(tid, "in-progress", None, [{"address": address, "role": "build", "name": tid + "-build"}])
+            self.term(address, tid + "-build", status=status, status_ms=int((now - 3600) * 1000))
+        code, out, err = self.worker("close", "--leftovers")
+        self.assertEqual(code, 0, err)
+        card = pa.read_json(os.path.join(self.dir, "decisions", "d-leftovers.json"))
+        self.assertIsNotNone(card, "the sweep lists the done and idle workers on a card: " + out)
+        listed = {w["address"]: w["state"] for w in card["workers"]}
+        self.assertEqual(listed, {"t31": "done", "t32": "idle"})
+        held = {n["address"]: n["why"] for n in card["notListed"]}
+        self.assertEqual(held, {"t33": "working", "t34": "blocked", "t35": "status thinking"})
+        self.assertNotIn("'app'", card["context"])
+        path = os.path.join(self.dir, "decisions", "d-leftovers.json")
+        card.update(status="answered", answer="Close all listed", note=None, answered=pa.now())
+        dump(card, path)
+        code, out, err = self.worker("close", "--card", "d-leftovers")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.ended(), [["hc", "kill", "t31"], ["hc", "rm", "t31"], ["hc", "kill", "t32"], ["hc", "rm", "t32"]])
+        self.assertTrue(self.entry("t-001", "t31")["finished"])
+        self.assertTrue(self.entry("t-002", "t32")["finished"])
+
+
 if __name__ == "__main__":
     unittest.main()
