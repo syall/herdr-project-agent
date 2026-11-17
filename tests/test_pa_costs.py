@@ -2717,6 +2717,48 @@ class T9_SummaryDrill(Collecting):
         S_Summary.test_s1_every_breakdown_sums_to_the_totals(self)
 
 
+# ---- t-009 part A, second half, step 11: the doctor line and the docs ----
+
+class T9_DoctorAndDocs(Base):
+    def doctor(self):
+        import argparse
+        result, out, err = self.run_cmd(pa.cmd_doctor, argparse.Namespace(space="sp1"))
+        return result, out
+
+    def test_dr1_doctor_notes_the_costs_folder(self):
+        code0, out = self.doctor()
+        self.assertIn("  costs/: none yet", out)
+        os.makedirs(os.path.join(self.dir, "costs"), exist_ok=True)
+        write(os.path.join(self.dir, "costs", "turns.jsonl"), "x" * 3000)
+        dump({"v": 1, "updated": "2026-11-17T09:00:00Z"}, os.path.join(self.dir, "costs", "summary.json"))
+        code1, out = self.doctor()
+        self.assertRegex(out, r"  costs/: \d+(\.\d)? KB \(summary updated 2026-11-17T09:00:00Z\)")
+        self.assertEqual(code0, code1)
+        os.unlink(os.path.join(self.dir, "costs", "summary.json"))
+        _c, out = self.doctor()
+        self.assertRegex(out, r"  costs/: \d+(\.\d)? KB \(no summary yet\)")
+        self.assertIn("pa-costs", pa.__doc__)
+
+    def test_doc1_readme_and_recipe(self):
+        def read(name):
+            with open(os.path.join(HERE, "..", name)) as f:
+                return f.read()
+        readme = read("README.md")
+        tool = "pa-" + "costs"
+        for want in (tool + " collect", tool + " report", tool + " reconstruct", tool + " billed compare", tool + " billed enable",
+                     tool + " billed disable", "est.", "account-wide", "once a day", "Turn off", "Costs view"):
+            self.assertIn(want, readme)
+        recipe = read("RECIPE.md")
+        for head in ("## What you see", "## How it behaves", "## Watch out"):
+            start = recipe.index(head)
+            nxt = recipe.find("\n## ", start + 1)
+            body = recipe[start:nxt if nxt > 0 else None]
+            self.assertIn("Costs", body, head)
+        self.assertIn("120 s", recipe)
+        self.assertIn("30 min", recipe)
+        self.assertIn("estimate", recipe)
+
+
 class I1_Install(unittest.TestCase):
     def test_i1_install_links_pa_costs(self):
         with open(os.path.join(HERE, "..", "install.sh")) as f:
