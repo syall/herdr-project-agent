@@ -10,6 +10,8 @@
 # one after another, each streamed as it runs. Each part's whole output is kept in its own file in one temp
 # folder and printed in the order above, then a summary: every part with ok or FAILED, for a failed part its
 # failing tests (lines starting FAIL or ERROR), else its last 40 lines. The last line names the folder.
+# Each part's TMPDIR is its own folder in there (<n>.tmp), so no part sees another's temp files, nor another
+# suite's running beside it.
 # Exit: 0 all passed, 1 a part failed, 2 a usage error or no temp folder, 130/143 interrupted.
 # Node: $NODE, else `node` on PATH, else the newest mise install.
 set -u
@@ -73,6 +75,9 @@ out=$(mktemp -d "${tmp%/}/run-all.XXXXXX") || { echo "run-all.sh: cannot make a 
 log() { eval "echo \"\$out/\$1-\$part_$1.log\""; }
 # Print a file whole, ending in a newline.
 show() { cat "$1"; [ -s "$1" ] && [ -n "$(tail -c 1 "$1")" ] && echo; return 0; }
+# Run part $1 (function $2) with its own TMPDIR in the run folder: a test that looks for its own leftovers in
+# the temp folder then sees no other part's, nor those of another suite running beside this one.
+inpart() { TMPDIR="$out/$1.tmp"; export TMPDIR; mkdir "$TMPDIR" || return 1; "$2"; }
 
 # Ctrl-C or TERM: stop every part still running (each is its own process group), then exit.
 pids=
@@ -89,7 +94,7 @@ if [ "${PA_SERIAL:-}" = 1 ]; then
   while [ "$i" -le "$count" ]; do
     eval "p=\$part_$i; name=\$name_$i"
     echo "=== $name"
-    { "$p" 2>&1; echo $? > "$out/$i.code"; } </dev/null | tee "$(log "$i")"
+    { (inpart "$i" "$p") 2>&1; echo $? > "$out/$i.code"; } </dev/null | tee "$(log "$i")"
     code=$(cat "$out/$i.code" 2>/dev/null) || code=1
     eval "code_$i=\${code:-1}"
     [ "$code" = 0 ] && echo "--- $name: ok" || echo "--- $name: FAILED"
@@ -99,7 +104,7 @@ else
   set -m 2>/dev/null  # each part in its own process group, so stop() can end all of it
   while [ "$i" -le "$count" ]; do
     eval "p=\$part_$i"
-    "$p" </dev/null >"$(log "$i")" 2>&1 &
+    inpart "$i" "$p" </dev/null >"$(log "$i")" 2>&1 &
     eval "pid_$i=\$!"
     pids="$pids $!"
     i=$((i + 1))
