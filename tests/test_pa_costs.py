@@ -2114,6 +2114,120 @@ class FR4_BillingRound4(BillingBase):
         self.assertEqual(len(self.billed()), len(rows))
 
 
+class FR5_BillingRound5(BillingBase):
+    """Fix round 5: VERIFY-4 F4-1 / REVIEW-4 MF4-1, the billed comparison never shows "no price" as 0.00 (AC4.4, R14)."""
+
+    def summary(self, rows):
+        s = BC_Comparison.summary(self, rows)
+        s["prices"]["profile"] = "test"
+        return s
+
+    def compare(self, billed, space_rows, all_rows=None):
+        return BC_Comparison.compare(self, billed, space_rows, all_rows)
+
+    def text(self, billed, space_rows, all_rows=None):
+        rows = [pa_costs.validate_row(dict(r), "query:q1", "acct1", T0) for r in billed]
+        here = self.summary(all_rows or space_rows)
+        saved = (pa_costs.effective_billed, pa_costs.account_wide_summary)
+        pa_costs.effective_billed, pa_costs.account_wide_summary = (lambda: rows), (lambda _a, _n: here)
+        try:
+            return pa_costs.billed_lines(self.summary(space_rows), T0)
+        finally:
+            pa_costs.effective_billed, pa_costs.account_wide_summary = saved
+
+    def line(self, out, start):
+        return [x for x in out if x.strip().startswith(start)][0]
+
+    def empty_table(self):
+        t = json.loads(json.dumps(PRICES))
+        t["models"]["model-a"][0].update({k: None for k in ("in", "out", "cw5m", "cw1h", "cr")})
+        self.prices(t)
+
+    def test_fr5_no_price_table_no_estimate_reads_zero(self):
+        os.unlink(os.path.join(self.profile_dir, "prices.json"))
+        billed = [brow(amount=1.5), brow(amount=1.5, model=None, label="other-label")]
+        c = pa_costs.billing_comparison([pa_costs.validate_row(dict(r), "query:q1", "acct1", T0) for r in billed],
+                                        self.summary([("2026-11-16", "model-a", None)]), self.summary([("2026-11-16", "model-a", None)]), None)
+        self.assertIsNone(c["total"]["thisSpace"])
+        self.assertIsNone(c["total"]["allSpaces"])
+        self.assertIsNone(c["calibrated"])
+        self.assertEqual(c["noPrice"], ["model-a"])
+        for m in c["models"]:
+            self.assertIsNone(m["thisSpace"])
+            self.assertIsNone(m["allSpaces"])
+        out = self.text(billed, [("2026-11-16", "model-a", None)])
+        self.assertNotIn("0.00", "\n".join(out))
+        self.assertIn("—", self.line(out, "total"))
+        self.assertIn("—", self.line(out, "calibrated"))
+        self.assertIn("no price for model-a", "\n".join(out))
+
+    def test_fr5_every_price_empty_no_estimate_reads_zero(self):
+        self.empty_table()
+        billed = [brow(amount=1.5), brow(amount=1.5, model=None, label="other-label")]
+        use = [("2026-11-16", "model-a", None)]
+        c = self.compare(billed, use)
+        m = c["models"][0]
+        self.assertEqual(m["model"], "model-a")
+        self.assertIsNone(m["thisSpace"])
+        self.assertIsNone(m["allSpaces"])
+        self.assertIsNone(c["total"]["thisSpace"])
+        self.assertIsNone(c["total"]["allSpaces"])
+        self.assertIsNone(c["calibrated"])
+        self.assertEqual(c["noPrice"], ["model-a"])
+        out = self.text(billed, use)
+        self.assertNotIn("0.00", "\n".join(out))
+        self.assertIn("—", self.line(out, "model-a"))
+        self.assertIn("—", self.line(out, "total"))
+        self.assertIn("—", self.line(out, "calibrated"))
+        self.assertIn("no price for model-a", "\n".join(out))
+
+    def test_fr5_some_models_priced_the_estimate_says_partial(self):
+        billed = [brow(amount=1.5), brow(amount=1.5, model="model-b", label="usage-b-out"),
+                  brow(day="2026-11-17", amount=1.5, model="model-b", label="usage-b-out"), brow(amount=1.5, model=None, label="other-label")]
+        use = [("2026-11-16", "model-a", 2.0), ("2026-11-16", "model-b", 1.0), ("2026-11-17", "model-b", None), ("2026-11-16", "model-z", None)]
+        c = self.compare(billed, use)
+        ms = {m["model"]: m for m in c["models"]}
+        self.assertAlmostEqual(ms["model-a"]["thisSpace"], 2.0)
+        self.assertFalse(ms["model-a"]["thisSpacePartial"])
+        self.assertAlmostEqual(ms["model-b"]["thisSpace"], 1.0)
+        self.assertTrue(ms["model-b"]["thisSpacePartial"])
+        self.assertTrue(ms["model-b"]["allSpacesPartial"])
+        self.assertAlmostEqual(c["total"]["thisSpace"], 3.0)
+        self.assertTrue(c["total"]["thisSpacePartial"])
+        self.assertTrue(c["total"]["allSpacesPartial"])
+        self.assertAlmostEqual(c["calibrated"], 3.0)
+        self.assertTrue(c["calibratedPartial"])
+        self.assertEqual(c["noPrice"], ["model-b", "model-z"])
+        out = self.text(billed, use)
+        self.assertIn("+", self.line(out, "model-b"))
+        self.assertNotIn("+", self.line(out, "model-a"))
+        self.assertIn("3.00+", self.line(out, "total"))
+        self.assertIn("3.00 + unpriced", self.line(out, "calibrated"))
+        self.assertIn("no price for model-b, model-z", "\n".join(out))
+
+    def test_fr5_fully_priced_real_zero_still_reads_zero(self):
+        t = json.loads(json.dumps(PRICES))
+        t["models"]["model-a"][0].update({k: 0.0 for k in ("in", "out", "cw5m", "cw1h", "cr")})
+        self.prices(t)
+        billed = [brow(amount=1.5), brow(amount=1.5, model="model-b", label="usage-b-out")]  # model-b: no use in this space
+        use = [("2026-11-16", "model-a", 0.0)]
+        c = self.compare(billed, use)
+        ms = {m["model"]: m for m in c["models"]}
+        for key in ("model-a", "model-b"):
+            self.assertEqual((ms[key]["thisSpace"], ms[key]["allSpaces"]), (0.0, 0.0))
+            self.assertFalse(ms[key]["thisSpacePartial"])
+        self.assertEqual((c["total"]["thisSpace"], c["total"]["allSpaces"]), (0.0, 0.0))
+        self.assertFalse(c["total"]["thisSpacePartial"])
+        self.assertEqual(c["calibrated"], 0.0)
+        self.assertFalse(c["calibratedPartial"])
+        self.assertEqual(c["noPrice"], [])
+        out = self.text(billed, use)
+        self.assertIn("0.00", self.line(out, "model-a"))
+        self.assertIn("0.00", self.line(out, "total"))
+        self.assertTrue(self.line(out, "calibrated").endswith("this space 0.00"))
+        self.assertNotIn("no price", "\n".join(out))
+
+
 ABSENT = object()
 
 
