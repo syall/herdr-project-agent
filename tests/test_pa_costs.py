@@ -2891,15 +2891,11 @@ class CC_StatusLine(CCBase):
             self.assertNotIn(fx.CANARY.encode(), raw(os.path.join(pa.ROOT, n)) or b"", n)
 
     def test_cc3_each_field_is_validated(self):
-        cases = [("cost", {"cost": {"total_cost_usd": -1}}), ("cost", {"cost": {"total_cost_usd": "1.0"}}),
-                 ("cost", {"cost": {"total_cost_usd": True}}), ("cost", {"cost": {"total_cost_usd": 1e6}}),
-                 ("cost", {"cost": {"total_cost_usd": float("nan")}}), ("cost", {"cost": {"total_cost_usd": float("inf")}})]
-        for i, (field, over) in enumerate(cases):
+        for i, bad in enumerate((-1, "1.0", True, 1e6, float("nan"), float("inf"), None, [1])):
             sid = "dddd000{}-0000-4000-8000-abcdef000000".format(i)
-            self.run_sl(cc_bytes(sid=sid, **over))
-            self.assertIsNone(self.cc_record(sid)[field], over)
-        self.run_sl(cc_bytes(sid="eeee0000-0000-4000-8000-abcd00000001", cost={"total_cost_usd": 2.5, "total_duration_ms": -5,
-                                                                              "total_api_duration_ms": "x"}))
+            self.run_sl(cc_bytes(sid=sid, cost=bad))
+            self.assertIsNone(self.cc_record(sid)["cost"], bad)
+        self.run_sl(cc_bytes(sid="eeee0000-0000-4000-8000-abcd00000001", cost=2.5, dur=-5, api="x"))
         rec = self.cc_record("eeee0000-0000-4000-8000-abcd00000001")
         self.assertEqual((rec["cost"], rec["durationMs"], rec["apiDurationMs"]), (2.5, None, None))
         os.environ["HC_TERMINAL_ID"] = "t5; rm -rf /"
@@ -2908,7 +2904,9 @@ class CC_StatusLine(CCBase):
         self.assertEqual((rec["terminal"], rec["model"]), (None, None))
         for sid in ("short", "x" * 65, "a/b-0000-0000", "abc_def_ghi"):
             self.run_sl(cc_bytes(sid=sid))
-        self.assertEqual(len([n for n in os.listdir(os.path.join(self.dir, "costs", "cc")) if n.endswith(".json")]), 8)
+        self.assertEqual(len([n for n in os.listdir(os.path.join(self.dir, "costs", "cc")) if n.endswith(".json")]), 10)
+        self.run_sl(cc_bytes(sid="eeee0000-0000-4000-8000-abcd00000001", cost="bad", dur=10, api=10), now=T0 + 400)
+        self.assertEqual(self.cc_record("eeee0000-0000-4000-8000-abcd00000001")["cost"], 2.5)  # a figure never disappears
 
     def test_cc4_writes_only_on_change_or_every_300_s(self):
         self.run_sl(cc_bytes(), now=T0)
