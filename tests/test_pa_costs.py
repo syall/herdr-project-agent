@@ -480,8 +480,10 @@ class D_Dedupe(Collecting):
         self.assertEqual({r["program"] for r in rows}, {"codex"})
         self.assertEqual(sum(r["calls"] for r in rows), 2)
 
-    def test_d5_forked_or_resumed_record_skips_copied_older_calls(self):
-        self.record(session=SID, resumed=True, at=iso(T0 + 100), task="t-001")
+    def test_d5_forked_record_skips_copied_older_calls(self):
+        # A fork writes a new file that may hold copies of the old session's calls. A resume with the same id writes
+        # into that session's own file, so its older calls are its own past: fix round 2, FR-M2.
+        self.record(session=SID, fork=True, at=iso(T0 + 100), task="t-001")
         self.add(self.prompt(T0 + 1), self.call(T0 + 10, "old", lines=1, out=1000),
                  self.prompt(T0 + 150), self.call(T0 + 200, "new", lines=1, out=7))
         self.collect(T0 + 3000)
@@ -600,6 +602,12 @@ class G_Gone(Collecting):
         os.unlink(self.transcript())
         self.collect(T0 + 2100)
         self.collect(T0 + 2200)
+        gone = [r for r in lines(self.costs("sessions.jsonl")) if r.get("ev") == "gone"]
+        self.assertEqual([g["session"] for g in gone], [SID])  # a file that was seen and is deleted: gone at once, once
+        self.assertEqual(self.rows(), rows)
+        # SID2's file never appeared: it waits (fix round 2, FR-M1), and is gone only after GONE_UNSEEN.
+        self.collect(T0 + pa_costs.GONE_UNSEEN + 1)
+        self.collect(T0 + pa_costs.GONE_UNSEEN + 100)
         gone = [r for r in lines(self.costs("sessions.jsonl")) if r.get("ev") == "gone"]
         self.assertEqual(sorted(g["session"] for g in gone), sorted([SID, SID2]))  # one gone event each, not repeated
         self.assertEqual(self.rows(), rows)
@@ -1639,6 +1647,141 @@ class W_CloseAndGuard(CostsBase):
         for command in (tool + " report", tool + " report --billed", tool + " billed status", tool + " billed list",
                         tool + " billed disable", tool + " collect --space sp1 --quiet"):
             self.assertEqual(self.guard(command)[0], 0, command)
+
+
+# ---- fix round 2: review M1-M3, verify M1-M2 ---------------------------------------------------------------
+
+class FR_FixRound2(Collecting):
+    def pa_turn(self, t, mid, sid=SID, inp=2, out=10):
+        self.add(self.prompt(t, sid=sid), self.call(t + 2, mid, lines=1, out=out, inp=inp, sid=sid), sid=sid)
+
+    def test_fr_m1_transcript_written_late_is_still_counted(self):
+        # Review M1: the program writes its transcript at the first message, which can come hours after the start.
+        self.record(session=SID, kind="pa", terminal="t0", parent=None, at=iso(T0))
+        self.collect(T0 + 700)
+        self.collect(T0 + 3 * 3600)
+        self.assertFalse([r for r in lines(self.costs("sessions.jsonl")) if r.get("ev") == "gone"])
+        self.pa_turn(T0 + 4 * 3600, "m1", out=650)
+        self.collect(T0 + 5 * 3600)
+        self.assertEqual(self.totals()["out"], 650)
+        self.assertFalse(any("gone before" in p for p in load(self.costs("state.json")).get("problems", [])))
+
+    def test_fr_m1_a_later_start_record_brings_a_gone_session_back(self):
+        self.record(session=SID, kind="pa", terminal="t0", parent=None, at=iso(T0))
+        later = T0 + pa_costs.GONE_UNSEEN + 10
+        self.collect(later)
+        self.assertEqual([r["session"] for r in lines(self.costs("sessions.jsonl")) if r.get("ev") == "gone"], [SID])
+        self.record(session=SID, kind="pa", terminal="t0", parent=None, at=iso(later + 100), resumed=True)
+        self.pa_turn(later + 200, "m1", out=40)
+        self.collect(later + 3000)
+        self.assertEqual(self.totals()["out"], 40)
+        s = load(self.costs("summary.json"))
+        self.assertEqual([x["state"] for x in s["sessions"]], ["open"])
+
+    def test_fr_m2_resumed_after_install_keeps_its_earlier_spend(self):
+        # Review M2: the Project Agent was running before install; its next start is a --resume of the same id.
+        for i in range(4):
+            self.pa_turn(T0 - 3000 + i * 100, "old{}".format(i), inp=100, out=95)
+        self.record(session=SID, kind="pa", terminal="t0", parent=None, at=iso(T0), resumed=True)
+        for i in range(2):
+            self.pa_turn(T0 + 100 + i * 100, "new{}".format(i), inp=100, out=95)
+        self.collect(T0 + 2000)
+        self.run_cmd(pa_costs.reconstruct, self.dir, now=T0 + 2100)
+        self.collect(T0 + 4000)
+        self.assertEqual(self.totals()["in"], 600)
+        self.assertEqual(sum(r["calls"] for r in self.rows()), 6)
+        early = [r for r in self.rows() if r["from"] < iso(T0)]
+        self.assertEqual(sum(r["calls"] for r in early), 4)
+        self.assertEqual({r["source"] for r in early}, {"reconstructed"})  # shown as best effort, R7
+        self.assertEqual({r["source"] for r in self.rows() if r["from"] >= iso(T0)}, {"recorded"})
+        self.assertFalse([r for r in lines(self.costs("sessions.jsonl")) if r.get("ev") == "bind"])
+
+    def m3_space(self):
+        self.record(session=SID, task="t-001")
+        self.record(session=SID2, task="t-002")
+        self.add(self.prompt(T0 + 1), self.call(T0 + 2, "m1", out=30, inp=500))
+        self.add(self.prompt(T0 + 1, sid=SID2), self.call(T0 + 2, "m2", out=7, inp=5, sid=SID2), sid=SID2)
+        self.collect(T0 + 2000)
+        before = self.totals()
+        os.unlink(self.transcript(SID2))  # swept: its rows are the only record left
+        self.collect(T0 + 2100)
+        self.assertEqual(self.totals(), before)
+        return before
+
+    def test_fr_m3_missing_state_json_rebuilds_and_keeps_every_row(self):
+        before = self.m3_space()
+        os.unlink(self.costs("state.json"))
+        self.collect(T0 + 2200)
+        self.assertEqual(self.totals(), before)
+        state = load(self.costs("state.json"))
+        self.assertTrue(any("rebuilt from turns.jsonl" in p for p in state["problems"]), state["problems"])
+        self.collect(T0 + 2300)
+        self.assertEqual(self.totals(), before)
+        seqs = [r["seq"] for r in lines(self.costs("turns.jsonl")) if "seq" in r]
+        self.assertEqual(len(seqs), len(set(seqs)))
+
+    def test_fr_m3_unreadable_state_json_rebuilds_and_keeps_the_bad_copy(self):
+        before = self.m3_space()
+        write(self.costs("state.json"), "{not json")
+        self.collect(T0 + 2200)
+        self.assertEqual(self.totals(), before)
+        kept = [n for n in os.listdir(os.path.join(self.dir, "costs")) if n.startswith("state.json.bad-")]
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(raw(os.path.join(self.dir, "costs", kept[0])), b"{not json")
+
+    def test_fr_m3_unknown_state_version_is_refused_and_nothing_changes(self):
+        self.m3_space()
+        state = load(self.costs("state.json"))
+        state["v"] = 2
+        dump(state, self.costs("state.json"))
+        before = self.costs_bytes()
+        with self.assertRaises(pa.Problem) as e:
+            pa_costs.collect(self.dir, now=T0 + 2200)
+        self.assertIn("state.json", str(e.exception))
+        self.assertEqual(self.costs_bytes(), before)
+
+    def test_fr_vm1_reconstruct_does_not_bind_to_a_recorded_worker(self):
+        # Verify M1: the journal's start entry of t5 belongs to t5's own recorded session.
+        self.record(session=SID2, task="t-001", terminal="t5", name="t-001-build", at=iso(T0 + 99))
+        self.add(self.prompt(T0 + 100, sid=SID2), self.call(T0 + 101, "w1", out=20, sid=SID2), sid=SID2)
+        self.journal({"at": iso(T0 + 100), "trigger": "report", "task": "t-001", "why": "Started build worker t5 (t-001-build)"})
+        self.add(self.prompt(T0 + 130, sid=SID3), self.call(T0 + 131, "h1", out=10000, sid=SID3), sid=SID3)  # run by hand
+        self.run_cmd(pa_costs.reconstruct, self.dir, now=T0 + 5000)
+        self.assertFalse([r for r in lines(self.costs("sessions.jsonl")) if r.get("ev") == "bind"])
+        um = [r for r in lines(self.costs("sessions.jsonl")) if r.get("ev") == "unmatched"]
+        self.assertEqual(um[-1]["sessions"], 1)
+        self.assertEqual(self.totals()["out"], 20)
+
+    def test_fr_vm1_codex_rollout_is_left_to_its_launch_record(self):
+        self.record(program="codex", bind="launch-window", at=iso(T0 + 100), terminal="t6", task="t-003", name="t-003-build")
+        self.journal({"at": iso(T0 + 101), "trigger": "report", "task": "t-003", "why": "Started t6 (t-003-build)"})
+        path = fx.codex_path(_HOMES["CODEX_HOME"], iso(T0)[:10], SID4)
+        fx.append(path, [fx.codex_meta(isoms(T0 + 102), SID4, self.project), fx.codex_turn(isoms(T0 + 103)),
+                         fx.codex_tokens(isoms(T0 + 104), inp=100, out=10)])
+        self.run_cmd(pa_costs.reconstruct, self.dir, now=T0 + 5000)
+        binds = [r for r in lines(self.costs("sessions.jsonl")) if r.get("ev") == "bind"]
+        self.assertEqual([(b["session"], b["match"]) for b in binds], [(SID4, "launch-window")])
+        um = [r for r in lines(self.costs("sessions.jsonl")) if r.get("ev") == "unmatched"]
+        self.assertFalse(um and um[-1]["sessions"])
+        self.assertEqual(self.totals()["out"], 10)
+
+    def test_fr_vm2_held_project_agent_turn_is_not_counted_twice_on_a_void(self):
+        # Verify M2: the first turn is held for its journal entries when the file is replaced.
+        self.record(session=SID, kind="pa", terminal="t0", parent=None, at=iso(T0))
+        self.pa_turn(T0 + 10, "m1", inp=100, out=1)
+        self.pa_turn(T0 + 100, "m2", inp=100, out=1)
+        self.collect(T0 + 150)
+        self.assertEqual(len(load(self.costs("state.json"))["held"]), 1)
+        path = self.transcript()
+        data = raw(path)
+        with open(path + ".new", "wb") as f:
+            f.write(data)
+        os.replace(path + ".new", path)  # same bytes, new inode
+        self.collect(T0 + 2000)
+        self.assertEqual(self.totals()["in"], 200)
+        self.collect(T0 + 4000)
+        self.assertEqual(self.totals()["in"], 200)
+        self.assertEqual(load(self.costs("state.json"))["held"], [])
 
 
 class I1_Install(unittest.TestCase):
