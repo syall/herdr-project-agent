@@ -101,6 +101,7 @@ merging, deleting, touching production. Write `decisions/<id>.json`:
 ```
 `evidence` names the files in the task's evidence folder the decision is about, the one to
 read first at the front; the card's link opens that file.
+A merge card lists every Recorded limit, each with its follow-up task or "accepted".
 Set the task to `needs-decision` and carry on with other work. Never decide a card
 yourself, and never act on a guess about the answer. An answer covers exactly the
 question asked, once.
@@ -154,10 +155,15 @@ Run `hc --skill` once to learn `hc`. Start workers with the profile's commands (
   starts your next pass; the scheduled pass catches a worker that went quiet.
 
 - The handoff states the task id and goal, the scope (what it may and may not touch),
-  the phase and its artifact (see `sdlc.md`), the verification points, the evidence
-  folder, and ends: "Report with `hc send <your address>` when done or stuck." Use
-  your real address; a worker's `$HC_TERMINAL_ID` is its own. Codex workers get no
-  standing instructions, so their handoff starts: "Read <core folder>/worker.md first."
+  the phase and its artifact (see `sdlc.md`), the verification points, the must-fix
+  bar and the stop rule (see Rounds), the evidence folder, and ends: "Report with
+  `hc send <your address>` when done or stuck." Use your real address; a worker's
+  `$HC_TERMINAL_ID` is its own. Codex workers get no standing instructions, so their
+  handoff starts: "Read <core folder>/worker.md first."
+- Scope: the handoff lists the requirements the job builds. A requirement that appears
+  after the build starts, from the person, from a finding outside the must-fix bar, or
+  from you, becomes a new task. When the person asks for one mid-task, open a card with
+  "New task" recommended and "Add to this task" as the other option.
 - Roles: `design`, `build`, `verifier` (reports, never fixes) and `reviewer` (fresh
   context, never the author of what it reviews).
 - One fresh worker per job. Name it for the job, not the role: `t-010-design`,
@@ -166,6 +172,11 @@ Run `hc --skill` once to learn `hc`. Start workers with the profile's commands (
   fix round after a review or a verification is a new worker, so reviewers and
   verifiers stay fresh. The only follow-ups a worker gets are for its own job (a
   correction, an answered question, a fix round you already asked it for).
+- Rounds: a round is one build or fix worker and the check that follows it. A fix round
+  fixes only Must fix findings; Recorded limits and Nits go on the merge card. Stop rule:
+  when a task reaches its round cap (low 2, normal 3, high 4) or two rechecks in a row
+  find Must fix in the same area, start no further round: open a decision card (cut that
+  area into a new task, record it as a limit, or one more round).
 - One git worktree per code task. Parallel workers only when they touch different files.
 - Before starting the first worker in a worktree, install the verification hooks there:
   `pa-hooks install <worktree> --task <task-id>` (add `--fix` for a bug fix: it locks test
@@ -244,10 +255,13 @@ Run `hc --skill` once to learn `hc`. Start workers with the profile's commands (
 `sdlc.md` in the core folder defines the phases, the artifact each one leaves in the
 evidence folder, the risk tiers and who approves what. Read it before your first task
 and when unsure. Give every task a tier at intake. Before a task leaves a phase, run
-`pa-gate <task-id> --phase <phase>`. Before moving a task to `review`, run
-`pa-gate <task-id>` (it checks every artifact so far, and that the reviewer is not the
-author). If the gate fails or is missing, the task does not move; record the failure in
-the journal and get the missing evidence produced. The gate is a script: do not argue with it.
+`pa-gate <task-id> --phase <phase>`. When a build or fix worker reports, run
+`pa-gate <task-id> --phase plan` and `--phase build` before starting its check; a
+missing artifact goes back to that worker as a follow-up for its own job. Before
+moving a task to `review`, run `pa-gate <task-id>` (it checks every artifact so far,
+and that the reviewer is not the author). If the gate fails or is missing, the task does
+not move; record the failure in the journal and get the missing evidence produced. The
+gate is a script: do not argue with it.
 
 ## Other Project Agents
 

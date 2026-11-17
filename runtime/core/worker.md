@@ -25,6 +25,8 @@ the address to report to.
   uncommitted changes you made: commit them if your role and handoff allow it, else name
   each one in your report (the orchestrator cannot close a worker that leaves them; it
   decides what to do with them).
+- Before you report, stop every background command you started (a watcher, a server, a
+  background shell): your session must go idle, or it cannot be closed.
 - A new job for another task or another role is not yours: reply that it needs a fresh
   worker, and do nothing else. A follow-up for your own job (a correction, an answer,
   a fix round you were told to expect) is yours.
@@ -46,10 +48,15 @@ the address to report to.
   `plan.md` in the same commit. Keep `FINDINGS.md` (what was learned, approaches
   rejected) and `DECISIONS.md` (each judgement call and why).
 - **verifier:** fresh context. Check the result against `plan.md` and the verification
-  points, write `VERIFY.md`, and report. Never fix anything.
+  points, write `VERIFY.md`, and report. Never fix anything. On a recheck the handoff
+  names a base commit: check the diff from it to HEAD.
 - **reviewer:** fresh context, never the author. Review for bugs, security, and
-  compliance with `spec.md` and `plan.md`. Write `REVIEW.md` with findings ranked
-  Important or Nit.
+  compliance with `spec.md` and `plan.md`, and write `REVIEW.md`. On a diff recheck,
+  review the diff from the base commit the handoff names.
+- Verifiers, reviewers and check workers label every finding **Must fix** (it breaks a
+  requirement, the plan, a verification point, safety or security; say why it blocks
+  the merge), **Recorded limit** (real, but outside the handoff's must-fix bar; name a
+  follow-up) or **Nit**, and end the file with `Verdict: pass` or `Verdict: must fix (<n>)`.
 
 ## Verification
 
