@@ -560,6 +560,44 @@ class Plan(Planned):
         self.assertEqual([(x["subject"], x["fromTask"]) for x in c["push"]["commits"]], [("task work", None)])
         self.assertIn("which of these commits are this task's cannot be told", c["context"])
 
+    def test_p14_fromtask_branch_fast_forwarded_onto_newer_main(self):
+        """The task branch caught up with a newer local main by a fast-forward before its own first commit: the
+        earlier task's commit it picked up is not this task's."""
+        sh(self.wt, "git", "reset", "-q", "--hard", "HEAD~1")
+        earlier = self.commit_on(self.main, "e.txt", "earlier task")
+        sh(self.wt, "git", "merge", "-q", "--ff-only", "main")
+        self.commit_on(self.wt, "f.txt", "own work")
+        self.assertEqual(self.gate(), 0)
+        code, out, err = self.plan()
+        self.assertEqual(code, 0, err)
+        c = self.card()
+        self.assertEqual({x["subject"]: x["fromTask"] for x in c["push"]["commits"]}, {"own work": True, "earlier task": False})
+        lines = c["context"].splitlines()
+        self.assertTrue(any(l.startswith("- " + earlier[:7]) and l.endswith("(not from this task)") for l in lines), lines)
+
+    def test_p15_fromtask_branch_reset_onto_newer_main(self):
+        """The task branch was reset --hard onto a newer local main, then committed."""
+        self.commit_on(self.main, "e.txt", "earlier task")
+        sh(self.wt, "git", "reset", "-q", "--hard", "main")
+        self.commit_on(self.wt, "f.txt", "own work")
+        self.assertEqual(self.gate(), 0)
+        code, out, err = self.plan()
+        self.assertEqual(code, 0, err)
+        self.assertEqual({x["subject"]: x["fromTask"] for x in self.card()["push"]["commits"]}, {"own work": True, "earlier task": False})
+
+    def test_p16_fromtask_unknown_after_a_move_the_tool_cannot_read(self):
+        """A reflog entry that is neither the branch's own commit nor a known move onto main: unknown, never true."""
+        earlier = self.commit_on(self.main, "e.txt", "earlier task")
+        sh(self.wt, "git", "update-ref", "-m", "something else", "refs/heads/t-1-x", earlier)
+        sh(self.wt, "git", "read-tree", "--reset", "-u", "HEAD")  # the files follow; no reflog entry of its own
+        self.commit_on(self.wt, "f.txt", "own work")
+        self.assertEqual(self.gate(), 0)
+        code, out, err = self.plan()
+        self.assertEqual(code, 0, err)
+        c = self.card()
+        self.assertEqual({x["subject"]: x["fromTask"] for x in c["push"]["commits"]}, {"own work": None, "earlier task": None})
+        self.assertIn("which of these commits are this task's cannot be told", c["context"])
+
     def test_p02_plan_refuses_without_allowlist(self):
         os.remove(self.allow)
         code, out, err = self.plan()
@@ -834,13 +872,48 @@ class RunChecks(Runs):
         """A process whose parent chain holds nothing but the system's first process: the caller is unknown."""
         for tree in ([{"pid": 1, "comm": "/sbin/launchd", "args": "/sbin/launchd"}], [{"pid": 1, "comm": "launchd", "args": "launchd"}],
                      [{"pid": 1, "comm": "/sbin/init", "args": "/sbin/init splash"}], [{"pid": 1, "comm": "systemd", "args": "/sbin/init"}]):
-            self.assertRefused(self.run_push(tree=tree), "C0", "the caller is unknown (an orphaned process)", attempts=0)
+            self.assertRefused(self.run_push(tree=tree), "C0", "the caller is not the panel", attempts=0)
         self.assertEqual(self.calls, [])
         tree = pa_push.ancestors(pid=5, table={5: (1, "python3", "python3 pa_push.py"), 1: (0, "/sbin/launchd", "/sbin/launchd")})
         self.assertEqual([a["pid"] for a in tree], [1])
-        self.assertIn("orphaned", pa_push.caller_refusal(PERSON_ENV, tree) or "")
+        self.assertIn("the caller is not the panel", pa_push.caller_refusal(PERSON_ENV, tree) or "")
         self.assertIn("orphaned", pa_push.caller_refusal(PERSON_ENV, tree, strict=False) or "")
-        self.assertIsNone(pa_push.caller_refusal(PERSON_ENV, PERSON_TREE))
+        self.assertIsNone(pa_push.caller_refusal(PERSON_ENV, PANEL_TREE))
+        self.assertIsNone(pa_push.caller_refusal(PERSON_ENV, PERSON_TREE, strict=False))
+
+    def test_r_c0_not_the_panel(self):
+        """d-069: check and run pass only with the Herdr app or Herdr core among the ancestors (and no agent)."""
+        launchd = {"pid": 1, "comm": "/sbin/launchd", "args": "/sbin/launchd"}
+        user_systemd = {"pid": 41, "comm": "systemd", "args": "/usr/lib/systemd/systemd --user"}
+        init = {"pid": 1, "comm": "systemd", "args": "/sbin/init splash"}
+        detached = ([{"pid": 40, "comm": "/bin/sh", "args": "/bin/sh -c x; true"}, launchd],
+                    [launchd],
+                    [user_systemd, init],
+                    [{"pid": 42, "comm": "sh", "args": "sh"}, user_systemd, init],
+                    PERSON_TREE,
+                    [{"pid": 43, "comm": "/bin/zsh", "args": "-zsh"}, {"pid": 44, "comm": "login", "args": "login -fp p"},
+                     {"pid": 45, "comm": "/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal", "args": "Terminal"}, launchd],
+                    [{"pid": 46, "comm": "/tmp/herdrx", "args": "herdrx"}, launchd])
+        for tree in detached:
+            self.assertRefused(self.run_push(tree=tree), "C0", "the caller is not the panel", attempts=0)
+            r = self.check(tree=tree)
+            self.assertFalse(r["caller"]["ok"])
+            self.assertIn("the caller is not the panel", r["caller"]["why"])
+        for tree in (PANEL_TREE, PANEL_TREE[1:], [PANEL_TREE[0], launchd],
+                     [{"pid": 47, "comm": "/bin/sh", "args": "sh -c pa-push-main"}] + PANEL_TREE,
+                     [{"pid": 48, "comm": "herdr-core", "args": "herdr-core"}, user_systemd, init]):
+            self.assertIsNone(pa_push.caller_refusal(PERSON_ENV, tree), tree)
+        # the existing refusals still come first, with their own messages
+        self.assertIn("CLAUDECODE", pa_push.caller_refusal(dict(PERSON_ENV, CLAUDECODE="1"), PANEL_TREE))
+        self.assertIn("ancestor process is claude",
+                      pa_push.caller_refusal(PERSON_ENV, [{"pid": 7, "comm": "claude", "args": "claude"}] + PANEL_TREE))
+        self.assertIn("Herdr terminal", pa_push.caller_refusal(dict(PERSON_ENV, HC_TERMINAL_ID="t1"), PANEL_TREE))
+        self.assertIn("ps failed", pa_push.caller_refusal(PERSON_ENV, None))
+        # pa-push-allow (typed by the person in a plain terminal) keeps today's rule
+        self.assertIsNone(pa_push.caller_refusal(PERSON_ENV, PERSON_TREE, strict=False))
+        self.assertIsNone(pa_push.caller_refusal(PERSON_ENV, detached[0], strict=False))
+        self.assertIn("orphaned", pa_push.caller_refusal(PERSON_ENV, [launchd], strict=False))
+        self.assertEqual(set(pa_push.PANEL_NAMES), {"herdr", "herdr-core"})
 
     def test_r_c0_cli_refuses_in_this_session(self):
         """The real command line, started from this agent session: refused by C0, with the JSON contract."""
@@ -1328,7 +1401,76 @@ class GateGit(Runs):
         status = [a for a in self.calls if a[:3] == ["git", "-C", wt] and "status" in a]
         self.assertGreaterEqual(len(status), 2, self.calls)  # the gate's and the live pin's, in check and run
         self.assertTrue(all("core.fsmonitor=false" in a and any(x.startswith("core.hooksPath=") for x in a) for a in status), status)
+        self.assertTrue(all("--ignore-submodules=all" in a for a in status), status)
 
+    def nested_repo(self, commit=True):
+        """A nested repository wt/sub (a submodule entry), committed or only staged in the task worktree."""
+        sub = os.path.join(self.wt, "sub")
+        os.makedirs(sub)
+        sh(sub, "git", "init", "-q")
+        write(os.path.join(sub, "s.txt"), "s\n")
+        sh(sub, "git", "add", "s.txt")
+        sh(sub, "git", "commit", "-q", "-m", "s")
+        write(os.path.join(self.wt, ".gitmodules"), '[submodule "sub"]\n\tpath = sub\n\turl = ./sub\n')
+        sh(self.wt, "git", "add", ".gitmodules", "sub")
+        if commit:
+            sh(self.wt, "git", "commit", "-q", "-m", "add sub")
+        return sub
+
+    def plant_in_nested(self, sub):
+        """The agent names a program in the nested repository's own settings (no place C8a's settings read covers)."""
+        prog = self.program("nested")
+        sh(sub, "git", "config", "filter.planted.clean", prog)
+        write(os.path.join(sub, ".git", "info", "attributes"), "* filter=planted\n")
+        later = time.time() + 5
+        os.utime(os.path.join(sub, "s.txt"), (later, later))
+
+    def test_g05_nested_repository_committed(self):
+        sub = self.nested_repo(commit=True)
+        self.assertEqual(self.gate(), 0)
+        self.plant_in_nested(sub)
+        r = self.check()
+        self.assertNeverRan()
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["refusal"]["check"], "C8a", r["refusal"])
+        self.assertIn("nested repository", r["refusal"]["message"])
+        self.assertIn("sub", r["refusal"]["message"])
+        self.assertIn("committed", r["refusal"]["message"])
+        self.assertRefused(self.run_push(), "C8a", "nested repository")
+        self.assertNeverRan()
+        os.remove(self.card_path())
+        code, _o, err = self.plan()
+        self.assertEqual(code, 1)
+        self.assertIn("nested repository", err)
+        self.assertNeverRan()
+
+    def test_g06_nested_repository_staged_only(self):
+        sub = self.nested_repo(commit=False)
+        self.plant_in_nested(sub)
+        r = self.check()
+        self.assertNeverRan()
+        self.assertEqual(r["refusal"]["check"], "C8a", r["refusal"])
+        self.assertIn("nested repository", r["refusal"]["message"])
+        self.assertIn("staged", r["refusal"]["message"])
+        self.assertRefused(self.run_push(), "C8a", "sub")
+        self.assertNeverRan()
+
+    def test_g07_status_calls_do_not_look_inside_nested_repositories(self):
+        """Behind C8a: the gate's status (through the runner) and the live pin's status never enter a nested repository."""
+        sub = self.nested_repo(commit=True)
+        self.plant_in_nested(sub)
+        s = pa_push.Session()
+        try:
+            wt = os.path.realpath(self.wt)
+            pins = pa_hooks.gate_commits(wt, runner=s.gate_git)
+            self.assertEqual(len(pins), 1)
+            self.assertNeverRan()
+            self.assertEqual(pa_push.tracked_changes(s, wt), [])
+            self.assertNeverRan()
+        finally:
+            s.close()
+        status = [a for a in self.calls if "status" in a]
+        self.assertTrue(status and all("--ignore-submodules=all" in a for a in status), status)
 
 # ---- A5: links --------------------------------------------------------------------------------
 
