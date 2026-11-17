@@ -18,6 +18,8 @@ const { default: ProjectAgent } = await import(path.join(dst, "main.js"));
 const { cx: baseCx, flush, inspect } = stubs;
 let cx = { ...baseCx, stop_propagation() {} }; // a new one per world (world())
 const g = globalThis;
+g.__rejected = []; // what tasks threw and nobody caught (the runner fails the case)
+process.on("unhandledRejection", (e) => { g.__rejected.push(String(e?.message ?? e)); });
 
 const T0 = 1_800_000_000_000; // ms
 const S = "sp1";
@@ -2891,14 +2893,137 @@ cases["K-billing-tick"] = async () => { // R15: the lease holder only, here, bil
   check(costsExecs("billed fetch").length === 2, `a takeover inside the hour runs none (got ${costsExecs("billed fetch").length})`);
 };
 
+// ---- t-022: a cx is valid only for the call that gave it (gpui-kit.d.ts Context: "a cx kept across [an
+// await] reports a stale-context error"). callCx() models Herdr's: a cx for one call whose spawn, notify and
+// timers throw "stale context" once end() is called. staleClick() renders with one (ended when render
+// returns, so a callback render built closes over a dead cx) and calls the handler with another, ended
+// when the handler returns. Work the handler spawns gets the world's task cx, live as Herdr's AsyncContext. ----
+function callCx() {
+  let live = true;
+  const base = cx;
+  const dead = (what) => { throw new Error(`stale context: ${what} on a cx kept past its call`); };
+  const c = { ...base, spawn(f) { if (!live) dead("spawn"); return base.spawn(f); }, notify() { if (!live) dead("notify"); return base.notify(); },
+    timer: { every(...a) { if (!live) dead("timer.every"); return base.timer.every(...a); }, after(...a) { if (!live) dead("timer.after"); return base.timer.after(...a); } } };
+  return { cx: c, end() { live = false; } };
+}
+const staleLook = (v) => { const r = callCx(); try { return inspect(v.render(r.cx)); } finally { r.end(); } };
+async function staleClick(v, id) {
+  const { clicks } = staleLook(v);
+  check(Boolean(clicks[id]), `a click target ${id} (have ${Object.keys(clicks).join(", ")})`);
+  const c = callCx(); try { clicks[id]({}, c.cx); } finally { c.end(); }
+  await settle();
+}
+const untold = (v) => /hasn't been told yet/.test(look(v).text);
+const stuck = (v) => `sending ${v.sending}, unsent ${JSON.stringify(v.unsent)}, rejected ${JSON.stringify(g.__rejected)}`;
+const pushWant = `decision ${PID} answered Push; result: pushed ${PURL} main aa22000..cc11000 (2 commits)`;
+const live4w = () => ({ records: alive(), extraTabs: [paTab], extraPanes: [paPane()], extraTerms: [paTerm()], agents: [{ address: "t4w", status: "idle" }] });
+
+cases["C22-push-push"] = async () => { // a push card answered Push: its notice reaches the Project Agent; the line clears
+  const { v } = await pushWorld({ opts: live4w() });
+  await staleClick(v, `opt-${PID}-0`);
+  await staleClick(v, `submit-${PID}`);
+  check(JSON.stringify(sends()) === JSON.stringify([["send", "t4w", pushWant]]), `the notice is sent once (got ${JSON.stringify(sends())}; ${stuck(v)})`);
+  check(v.sending === false && v.unsent.length === 0, `nothing left sending or queued (${stuck(v)})`);
+  check(!untold(v), `no "hasn't been told yet" line (got ${look(v).text.slice(0, 600)})`);
+};
+
+cases["C22-push-notnow"] = async () => { // a push card answered Not now, with a note: its notice reaches the Project Agent
+  const { v } = await pushWorld({ opts: live4w(), tool: { run: () => json(0, { ok: true, done: false, answer: "Not now", refusal: null, result: null, message: "answered Not now" }) } });
+  v.notes[PKEY].set("after the release");
+  await staleClick(v, `opt-${PID}-1`);
+  await staleClick(v, `submit-${PID}`);
+  const ran = pushExecs("run")[0]?.[1] ?? [];
+  check(ran.includes("Not now") && ran.includes("after the release"), `ran Not now with the note (got ${JSON.stringify(ran)})`);
+  check(JSON.stringify(sends()) === JSON.stringify([["send", "t4w", `decision ${PID} answered Not now`]]), `the notice is sent once (got ${JSON.stringify(sends())}; ${stuck(v)})`);
+  check(v.sending === false && !untold(v), `the line clears (${stuck(v)})`);
+};
+
+cases["C22-after-push"] = async () => { // after a push card, an ordinary card's and a worktree card's answers are still sent
+  world(live4w());
+  pushFiles();
+  card("d-x");
+  g.__files[`:${DIR}/decisions/d-wt-t-1.json`] = JSON.stringify({ id: "d-wt-t-1", task: "t-1", status: "open", question: "Delete the worktree?",
+    options: [{ label: "Delete" }, { label: "Keep" }], created: "2026-11-16T10:00:00Z" });
+  g.__ls[`:${DIR}/decisions`] = [`${PID}.json`, "d-x.json", "d-wt-t-1.json"];
+  pushTool();
+  const v = await mount(); await settle();
+  await staleClick(v, `opt-${PID}-0`); await staleClick(v, `submit-${PID}`);
+  await staleClick(v, "opt-d-x-0"); await staleClick(v, "submit-d-x");
+  await staleClick(v, "opt-d-wt-t-1-0"); await staleClick(v, "submit-d-wt-t-1");
+  await fire(10000);
+  check(JSON.parse(g.__files[`:${DIR}/decisions/d-wt-t-1.json`]).status === "answered", "the worktree card is answered");
+  const want = [pushWant, "decision d-x answered", "decision d-wt-t-1 answered"];
+  check(JSON.stringify(sends().map((x) => x[2])) === JSON.stringify(want), `all three sent once, in order, within one 10 s tick (got ${JSON.stringify(sends())}; ${stuck(v)})`);
+  check(v.sending === false && !untold(v), `the line clears (${stuck(v)})`);
+};
+
+cases["C22-resend-throws"] = async () => { // a send that throws once is retried, and the sending mark is not left set
+  const v = await cardsWorld(live4w(), []);
+  v.unsent = [{ spaceId: S, message: "m1" }];
+  const bad = { ...cx, spawn() { throw new Error("stale context"); } };
+  try { v.resend(bad); } catch {}
+  check(v.sending !== true, `a spawn that throws leaves sending clear (${stuck(v)})`);
+  check(JSON.stringify(v.unsent.map((x) => x.message)) === JSON.stringify(["m1"]), `the notice is kept (${stuck(v)})`);
+  await fire(10000);
+  check(JSON.stringify(sends().map((x) => x[2])) === JSON.stringify(["m1"]), `sent at the next 10 s tick (got ${JSON.stringify(sends())}; ${stuck(v)})`);
+  check(!untold(v), "the line clears");
+  // A throw inside the send task (here the target lookup, once): the mark is cleared and the notice kept.
+  g.__hcs = [];
+  v.unsent = [{ spaceId: S, message: "m2" }];
+  const tabs = g.__shared["project-agent.tabs"];
+  Object.defineProperty(g.__shared, "project-agent.tabs", { configurable: true, enumerable: true, get() {
+    Object.defineProperty(g.__shared, "project-agent.tabs", { configurable: true, enumerable: true, writable: true, value: tabs });
+    throw new Error("lookup failed once");
+  } });
+  v.resend(cx); await settle();
+  g.__rejected = g.__rejected.filter((m) => !/lookup failed once/.test(m)); // this case's own throw, not a stale cx
+  check(v.sending === false, `a throw in the task leaves sending clear (${stuck(v)})`);
+  check(JSON.stringify(v.unsent.map((x) => x.message)) === JSON.stringify(["m2"]), `the notice is kept (${stuck(v)})`);
+  await fire(10000);
+  check(JSON.stringify(sends().map((x) => x[2])) === JSON.stringify(["m2"]), `sent at the next 10 s tick (got ${JSON.stringify(sends())}; ${stuck(v)})`);
+};
+
+cases["C22-line-clears"] = async () => { // a push notice whose send fails: the line says why; delivered next tick, it clears
+  const { v } = await pushWorld({ opts: live4w() });
+  g.__hcFail = ["t4w"];
+  await staleClick(v, `opt-${PID}-0`);
+  await staleClick(v, `submit-${PID}`);
+  check(/hasn't been told yet \(refused\)\. Trying again every 10 s\./.test(look(v).text), `the line names the failure (got ${look(v).text.slice(0, 600)}; ${stuck(v)})`);
+  g.__hcFail = []; g.__hcs = [];
+  await fire(10000);
+  check(JSON.stringify(sends()) === JSON.stringify([["send", "t4w", pushWant]]), `delivered at the next tick (got ${JSON.stringify(sends())}; ${stuck(v)})`);
+  check(!untold(v) && v.sending === false, `the line is gone (${stuck(v)})`);
+};
+
+cases["C22-rules-view"] = async () => { // Approve in the Rules view (render's cx long gone): its card is answered and the Project Agent told
+  world(live4w());
+  g.__files[RULES] = JSON.stringify({ rules: [{ ...rule("r-p", "Proposed"), status: "proposed", source: "agent" }] });
+  g.__files[`:${DIR}/schedule.json`] = JSON.stringify({ everyMinutes: 15 });
+  g.__files[`:${DIR}/decisions/d-r.json`] = JSON.stringify({ id: "d-r", status: "open", rule: "r-p", question: "Adopt rule r-p?",
+    options: [{ label: "Approve" }, { label: "Decline" }], created: "2026-11-16T10:00:00Z" });
+  g.__ls[`:${DIR}/decisions`] = ["d-r.json"];
+  const v = await mount(); await settle();
+  await staleClick(v, "view-rules");
+  await staleClick(v, "rule-head-r-p");
+  await staleClick(v, "rule-approve-r-p");
+  check(JSON.parse(g.__files[RULES]).rules[0].status === "active", "the rule is approved");
+  check(!v.rules.error, `no Rules view error (got ${v.rules.error})`);
+  check(JSON.parse(g.__files[`:${DIR}/decisions/d-r.json`]).status === "answered", "its card is answered");
+  check(JSON.stringify(sends()) === JSON.stringify([["send", "t4w", "decision d-r answered"]]), `the Project Agent is told once (got ${JSON.stringify(sends())}; ${stuck(v)})`);
+};
+
 const pick = process.argv.slice(2);
 let failed = 0;
 for (const [name, fn] of Object.entries(cases)) {
   if (pick.length && !pick.includes(name)) continue;
-  try { await fn(); console.log(`PASS ${name}`); }
-  catch (e) { failed++; console.log(`FAIL ${name}: ${e instanceof Failed ? e.message : e.stack}`); }
+  g.__rejected = [];
+  let why = null;
+  try { await fn(); } catch (e) { why = e instanceof Failed ? e.message : e.stack; }
   // This case's views stop: their delayed reads end, every call they still make fails, and they start nothing new.
   g.__gen = (g.__gen ?? 0) + 1; g.__draining = true; await settle(); await settle();
+  // A task of this case that threw (a stale cx, say) fails it; without this it would end the whole run.
+  if (!why && g.__rejected.length) why = `a task threw: ${g.__rejected.join("; ")}`;
+  if (why) { failed++; console.log(`FAIL ${name}: ${why}`); } else console.log(`PASS ${name}`);
 }
 fs.rmSync(dst, { recursive: true, force: true });
 console.log(failed ? `${failed} case(s) failed` : "all panel cases passed");
