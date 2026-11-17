@@ -1634,6 +1634,75 @@ cases["R4-view-space-time"] = async () => { // a view switch, a space switch, 10
   check(ruleIds() === "r-one,r-two", "nothing deleted");
 };
 
+// ---- t-011 fix round 2: every control that stops the mouse-down disarms an armed Delete ----
+// down(): the mouse-down only (bubbling until stopped), no click: a press that is not released on the control.
+async function down(v, id) {
+  const route = pathTo(v.render(cx), id);
+  check(Boolean(route), `an element ${id} to press`);
+  let stopped = false;
+  const ecx = { ...cx, stop_propagation() { stopped = true; } };
+  for (const el of [...route].reverse()) {
+    const h = el.style?.on_mouse_down;
+    if (h && h[0] === "left") h[1]({}, ecx);
+    if (stopped) break;
+  }
+  await flush();
+}
+async function crewWorld() {
+  world();
+  g.__files[`:${DIR}/ledger.json`] = JSON.stringify({ tasks: [
+    { id: "t-1", title: "One", state: "in-progress", updated: "2026-11-16T10:02:00Z", workers: [{ address: "w1", role: "build", name: "a" }] },
+    { id: "t-2", title: "Two", state: "in-progress", updated: "2026-11-16T10:01:00Z", workers: [{ address: "w2", role: "build", name: "b" }] }] });
+  g.__files[`:${DIR}/schedule.json`] = JSON.stringify({ everyMinutes: 15 });
+  const v = await mount();
+  await press(v, "view-tasks");
+  await press(v, "task-head-t-1"); await press(v, "task-head-t-2");
+  return v;
+}
+cases["X1-worker-x-while-armed"] = async () => { // REVIEW M1: a press on a worker × (same card) disarms; the dialog still opens
+  const v = await crewWorld();
+  await press(v, "delete-t-1");
+  check(armedText(v), "armed");
+  const before = (g.__overlays ?? []).length;
+  await press(v, "worker-x-t-1-0");
+  check(!armedText(v), "press on worker x disarms");
+  check((g.__overlays ?? []).length === before + 1, "the delete-worker dialog still opens");
+  await press(v, "delete-t-1");
+  check(armedText(v) && deletes().length === 0, "after it, one click only arms again");
+};
+cases["X2-worker-x-down-only"] = async () => { // the mouse-down alone on a ×, this card's or another card's, disarms
+  const v = await crewWorld();
+  for (const where of ["worker-x-t-1-0", "worker-x-t-2-0"]) {
+    await press(v, "delete-t-1");
+    check(armedText(v), `armed before ${where}`);
+    await down(v, where);
+    check(!armedText(v), `a mouse-down on ${where} disarms`);
+  }
+  check(deletes().length === 0, "nothing deleted");
+};
+cases["X3-rules-controls-down-only"] = async () => { // the Rules view's stopping controls: a button, the On/Off toggle, the drag grip
+  const v = await ruleWorld();
+  for (const where of ["rule-export", "rule-edit-r-one", "rule-toggle-r-two", "rule-grip-r-two"]) {
+    await press(v, "rule-delete-r-one");
+    check(ruleArmed(v), `armed before ${where}`);
+    await down(v, where);
+    v.rules.pressed = null;
+    check(!ruleArmed(v), `a mouse-down on ${where} disarms`);
+  }
+  await settle();
+  check(ruleIds() === "r-one,r-two", `nothing deleted (got ${ruleIds()})`);
+};
+cases["X4-own-buttons-keep"] = async () => { // the armed Delete and its Cancel: a mouse-down on them does not disarm
+  const v = await crewWorld();
+  await press(v, "delete-t-1");
+  await down(v, "delete-t-1"); await down(v, "delete-cancel-t-1");
+  check(armedText(v) && deletes().length === 0, "task Delete: still armed, nothing deleted");
+  const r = await ruleWorld();
+  await press(r, "rule-delete-r-one");
+  await down(r, "rule-delete-r-one"); await down(r, "rule-delete-cancel-r-one");
+  check(ruleArmed(r), "rule Delete: still armed");
+};
+
 const pick = process.argv.slice(2);
 let failed = 0;
 for (const [name, fn] of Object.entries(cases)) {
