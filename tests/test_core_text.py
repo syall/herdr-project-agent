@@ -103,7 +103,7 @@ class Orchestrator(unittest.TestCase):
                       "Recorded limit with its follow-up task, or for the person to accept. Stop rule: "
                       "when a task reaches its round cap (low 2, normal 3, high 4) with Must fix still open, or two "
                       "rechecks in a row find Must fix in what you judge the same area, start no further round: open a decision card (cut that "
-                      "area into a new task, record it as a limit, or one more round). Normal and high tier: if every full review so far found Must fix", self.text)
+                      "area into a new task, record it as a limit, or one more round). Normal and high tier: the card that asks to publish or merge needs a full review", self.text)
 
     def test_t017_r1_handoff_states_bar(self):  # AC1.4
         self.assertIn("the phase and its artifact (see `sdlc.md`), the verification points, the must-fix bar "
@@ -134,7 +134,7 @@ class Orchestrator(unittest.TestCase):
         return flat(self.raw[self.raw.index("- Rounds:"):self.raw.index("- One git worktree")])
 
     def test_t017_r2_rechecks(self):  # AC2.1-2.5, G4, spec amendments B1, B2
-        self.assertIn("without any full review that found no Must fix. The first check of a task is full: the whole change. A recheck after a "
+        self.assertIn("asking to publish or merge without one. The first check of a task is full: the whole change. A recheck after a "
                       "fix gets the commit the previous check saw as its base: a fresh verifier (for low tier a `check` worker) on the diff from it "
                       "to HEAD with one full suite run, and, for normal and high tier, a fresh reviewer on that diff "
                       "when the fix changed anything but tests or docs. Normal and high tier: the review stays full "
@@ -203,9 +203,12 @@ class Orchestrator(unittest.TestCase):
                       "that card, in the same round.", self.rounds())
 
     def test_t017_j8_stop_card_no_clean_review(self):  # RL-D
-        self.assertIn("or one more round). Normal and high tier: if every full review so far found Must fix, the "
-                      "stop card says so plainly; recording it as a limit then means asking to publish or merge "
-                      "without any full review that found no Must fix. The first check", self.rounds())
+        self.assertIn("or one more round). Normal and high tier: the card that asks to publish or merge needs a full "
+                      "review that found no Must fix, so a fix that changed only tests or docs still gets a full "
+                      "review while none has. If the round cap comes first, the stop card opens even with no Must fix "
+                      "open, says no review has come back clean, and that recording it as a limit means asking to "
+                      "publish or merge without one. The first check", self.rounds())  # RL-D, J8-2
+        self.assertNotIn("if every full review so far found Must fix", self.rounds())
 
     def test_t017_j8_round_cap_reads_per_job(self):  # RL-F: the stop rule's cap is the job's
         self.assertIn("each job counts its rounds from 1 and has its own tier and round cap", self.rounds())
