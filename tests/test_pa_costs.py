@@ -735,3 +735,170 @@ class L_LaunchRecords(Base):
 
 def pa_costs_time(text):
     return int(time.mktime(time.strptime(text, "%Y-%m-%dT%H:%M:%SZ")) - time.timezone)
+
+
+# ---- step 4: attribution (R3) ---------------------------------------------------------------------
+
+class A_Attribution(Collecting):
+    def pa_session(self):
+        self.record(session=SID, kind="pa", terminal="t0", parent=None)
+
+    def turn(self, t, mid, out=10, sid=SID, **kw):
+        self.add(self.prompt(t, sid=sid), self.call(t + 2, mid, lines=1, out=out, sid=sid, **kw))
+
+    def j(self, t, trigger="report", task=None, pass_=1, **kw):
+        e = {"at": iso(t), "by": "agent", "trigger": trigger, "task": task, "pass": pass_}
+        e.update(kw)
+        self.journal(e)
+
+    def by_turn(self):
+        return {r["turn"]: r for r in self.rows()}
+
+    def test_a1_pa_turn_by_majority_trigger_and_largest_pass(self):
+        self.pa_session()
+        self.turn(T0 + 10, "m1")
+        self.j(T0 + 12, "report", "t-001", 4)
+        self.j(T0 + 13, "report", "t-001", 5)
+        self.j(T0 + 14, "message", "t-001", 5)
+        self.collect(T0 + 2000)
+        r = self.rows()[0]
+        self.assertEqual((r["activity"], r["pass"], r["trigger"], r["task"], r["split"]), ("pass:report", 5, "report", "t-001", None))
+
+    def test_a2_two_tasks_give_split_weights(self):
+        self.pa_session()
+        self.turn(T0 + 10, "m1")
+        self.j(T0 + 12, "decision", "t-001")
+        self.j(T0 + 13, "decision", "t-001")
+        self.j(T0 + 14, "decision", "t-002")
+        self.collect(T0 + 2000)
+        r = self.rows()[0]
+        self.assertIsNone(r["task"])
+        self.assertEqual([s["task"] for s in r["split"]], ["t-001", "t-002"])
+        self.assertAlmostEqual(sum(s["w"] for s in r["split"]), 1.0)
+        self.assertAlmostEqual(r["split"][0]["w"], 2 / 3, places=3)
+
+    def test_a3_no_journal_entry_is_unattributed_after_the_hold(self):
+        self.pa_session()
+        self.turn(T0 + 10, "m1")
+        self.turn(T0 + 100, "m2")
+        self.collect(T0 + 150)
+        self.assertEqual(self.rows(), [])  # held: the agent journals at the end of a pass
+        self.collect(T0 + 2000)
+        r = self.by_turn()[isoms(T0 + 10)]
+        self.assertEqual((r["activity"], r["reason"], r["task"]), ("unattributed", "pa-no-journal", None))
+
+    def test_a4_late_journal_entry_within_the_hold_is_attributed(self):
+        self.pa_session()
+        self.turn(T0 + 10, "m1")
+        self.turn(T0 + 100, "m2")
+        self.collect(T0 + 105)
+        self.j(T0 + 50, "message", "t-003", 7)  # written late, but during the first turn
+        self.collect(T0 + 2000)
+        r = self.by_turn()[isoms(T0 + 10)]
+        self.assertEqual((r["activity"], r["task"], r["pass"]), ("pass:message", "t-003", 7))
+        self.assertEqual(self.by_turn()[isoms(T0 + 100)]["reason"], "pa-no-journal")
+
+    def test_a9_unknown_trigger_is_pass_other(self):
+        self.pa_session()
+        self.turn(T0 + 10, "m1")
+        self.j(T0 + 12, "close", "t-001")
+        self.collect(T0 + 2000)
+        self.assertEqual(self.rows()[0]["activity"], "pass:other")
+
+    def worker(self, name="t-001-build", role="build", task="t-001", terminal="t5"):
+        self.record(session=SID, kind="worker", terminal=terminal, name=name, task=task)
+        if role:
+            self.ledger({"version": 1, "tasks": [{"id": task or "t-001", "state": "in-progress",
+                                                  "workers": [{"address": terminal, "role": role, "name": name}]}]})
+
+    def test_a5_a10_worker_role_from_the_ledger_is_pinned(self):
+        self.worker()
+        self.turn(T0 + 10, "m1")
+        self.collect(T0 + 2000)
+        self.assertEqual((self.rows()[0]["role"], self.rows()[0]["activity"]), ("build", "build"))
+        pins = [r for r in lines(self.costs("sessions.jsonl")) if r.get("ev") == "role"]
+        self.assertEqual([(p["session"], p["role"], p["from"]) for p in pins], [(SID, "build", "ledger")])
+        self.ledger({"version": 1, "tasks": [{"id": "t-001", "state": "in-progress", "workers": []}]})  # pa-worker delete
+        self.turn(T0 + 3000, "m2")
+        self.collect(T0 + 6000)
+        self.assertEqual([r["role"] for r in self.rows()], ["build", "build"])
+        self.assertEqual(len([r for r in lines(self.costs("sessions.jsonl")) if r.get("ev") == "role"]), 1)
+
+    def test_a6_reused_worker_split_by_journal_address_token(self):
+        self.record(session=SID, kind="worker", terminal="t5", name="t-001-design", task="t-001")
+        self.ledger({"version": 1, "tasks": [{"id": "t-001", "state": "done", "workers": [{"address": "t5", "role": "design", "name": "t-001-design"}]},
+                                             {"id": "t-002", "state": "in-progress", "workers": [{"address": "t5", "role": "design", "name": "t-001-design"}]}]})
+        self.j(T0 + 5, "report", "t-001", why="Started worker t5 (t-001-design)")
+        self.turn(T0 + 10, "m1")
+        self.j(T0 + 500, "report", "t-002", why="Sent t5 the design of t-002; not t55 or xt5")
+        self.j(T0 + 600, "report", "t-003", why="Started t55 for t-003")
+        self.turn(T0 + 503, "m2")
+        self.turn(T0 + 700, "m3")
+        self.collect(T0 + 4000)
+        rows = self.by_turn()
+        self.assertEqual(rows[isoms(T0 + 10)]["task"], "t-001")
+        self.assertEqual((rows[isoms(T0 + 503)]["task"], rows[isoms(T0 + 503)]["match"], rows[isoms(T0 + 503)]["confidence"]),
+                         ("t-002", "journal-handoff", "medium"))
+        self.assertEqual(rows[isoms(T0 + 700)]["task"], "t-002")
+
+    def test_a7_phase_from_the_journal(self):
+        self.worker()
+        self.j(T0 + 1, "report", "t-001", to="build/in-progress")
+        self.j(T0 + 2, "report", "t-002", to="review/review")
+        self.turn(T0 + 10, "m1")
+        self.j(T0 + 20, "report", "t-001", to="test/review")
+        self.turn(T0 + 30, "m2")
+        self.collect(T0 + 2000)
+        self.assertEqual([r["phase"] for r in self.rows()], ["build", "test"])
+
+    def test_a8_activity_map(self):
+        cases = [("design", "t-001-design", "intent/investigating", "investigate"), ("design", "t-001-design", "plan/in-progress", "plan"),
+                 ("design", "t-001-design", "design/in-progress", "design"), ("verifier", "t-001-verify", "test/review", "verify"),
+                 ("reviewer", "t-001-review", "review/review", "review"), (None, "t-001-investigate", None, "investigate"),
+                 (None, "t-001-tests", None, "other")]
+        for role, name, to, activity in cases:
+            self.setUp()
+            self.worker(name=name, role=role)
+            if to:
+                self.j(T0 + 1, "report", "t-001", to=to)
+            self.turn(T0 + 10, "m1")
+            self.collect(T0 + 2000)
+            self.assertEqual(self.rows()[0]["activity"], activity, (role, name, to))
+        self.setUp()
+        self.record(session=SID, kind="worker", terminal="t5", name="scratch", task=None)
+        self.turn(T0 + 10, "m1")
+        self.collect(T0 + 2000)
+        self.assertEqual((self.rows()[0]["activity"], self.rows()[0]["reason"]), ("unattributed", "worker-no-task"))
+
+    def test_a11_unknown_kind_is_unattributed(self):
+        self.record(session=SID, kind="mystery")
+        self.turn(T0 + 10, "m1")
+        self.collect(T0 + 2000)
+        self.assertEqual((self.rows()[0]["activity"], self.rows()[0]["reason"]), ("unattributed", "unknown-session-kind"))
+
+
+class C_CacheRebuild(Collecting):
+    def rebuilds(self, gap, cw=30000, key="cw5m"):
+        self.setUp()
+        self.record(session=SID, task="t-001")
+        self.add(self.prompt(T0 + 1), self.call(T0 + 2, "m1", lines=1, out=5, **{key: cw}),
+                 self.call(T0 + 2 + gap, "m2", lines=1, out=5, **{key: cw}))
+        self.collect(T0 + 10000)
+        return [r["rebuild"] for r in self.rows()]
+
+    def test_c1_idle_gap_over_the_cache_lifetime_is_a_rebuild(self):
+        self.assertEqual(sum(r["calls"] for r in self.rebuilds(301)), 1)
+        self.assertEqual(sum(r["cw5m"] for r in self.rebuilds(301)), 30000)
+        self.assertEqual(sum(r["calls"] for r in self.rebuilds(3601, key="cw1h")), 1)
+
+    def test_c2_shorter_gap_or_small_write_is_not(self):
+        self.assertEqual(sum(r["calls"] for r in self.rebuilds(299)), 0)
+        self.assertEqual(sum(r["calls"] for r in self.rebuilds(301, cw=19999)), 0)
+        self.assertEqual(sum(r["calls"] for r in self.rebuilds(3599, key="cw1h")), 0)
+
+    def test_c3_first_call_is_a_cold_start(self):
+        self.setUp()
+        self.record(session=SID, task="t-001")
+        self.add(self.prompt(T0 + 1), self.call(T0 + 5000, "m1", lines=1, cw5m=90000))
+        self.collect(T0 + 10000)
+        self.assertEqual(self.rows()[0]["rebuild"]["calls"], 0)
