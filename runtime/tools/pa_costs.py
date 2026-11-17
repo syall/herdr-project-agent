@@ -1417,15 +1417,22 @@ def costs_account():
 
 
 class Bucket:
-    __slots__ = ("tokens", "money", "priced", "calls", "recon", "kinds")
+    __slots__ = ("tokens", "money", "priced", "calls", "recon", "kinds", "unpriced")
 
     def __init__(self):
         self.tokens, self.money, self.priced, self.calls, self.recon, self.kinds = 0, 0.0, False, 0, 0.0, None
+        self.unpriced = 0
+
+    def partial(self):
+        """The unpriced tokens of an entry that also has a priced part (its money is the priced part only), else 0."""
+        return int(round(self.unpriced)) if self.priced else 0
 
     def add(self, tokens, money, calls, recon, kinds=None):
         self.tokens += tokens
         self.calls += calls
-        if money is not None:
+        if money is None:
+            self.unpriced += tokens
+        else:
             self.money += money
             self.priced = True
             if recon:
@@ -1438,6 +1445,8 @@ class Bucket:
     def out(self, key, **extra):
         d = {"key": key, "tokens": int(round(self.tokens)), "money": round(self.money, 6) if self.priced else None,
              "calls": int(round(self.calls))}
+        if self.partial():
+            d["unpricedTokens"] = self.partial()
         if self.recon:
             d["reconstructed"] = round(self.recon, 6)
         d.update(extra)
@@ -1527,9 +1536,11 @@ def summarize(directory, rows, records, table, price_problem, profile_name, now,
             group(hours, hour).add(t, m, calls, rec)
         if r.get("kind") == "pa" and r.get("pass") is not None:
             p = passes.setdefault(r["pass"], {"pass": r["pass"], "trigger": r.get("trigger"), "from": r.get("from"), "money": None,
-                                               "tokens": 0, "rebuild": False})
+                                               "tokens": 0, "rebuild": False, "unpricedTokens": 0})
             if m is not None:
                 p["money"] = (p["money"] or 0.0) + m
+            else:
+                p["unpricedTokens"] += t
             p["tokens"] += t
             p["rebuild"] = p["rebuild"] or bool(rb_t)
             p["from"] = min(p["from"] or r.get("from"), r.get("from"))
@@ -1558,6 +1569,7 @@ def summarize(directory, rows, records, table, price_problem, profile_name, now,
         b = days[d]
         older.tokens += b.tokens
         older.calls += b.calls
+        older.unpriced += b.unpriced
         if b.priced:
             older.money += b.money
             older.priced = True
@@ -1566,7 +1578,8 @@ def summarize(directory, rows, records, table, price_problem, profile_name, now,
     if day_list[DAYS:]:
         by_day.append(older.out("older", days=len(day_list) - DAYS))
     kept_days = set(day_list[:DAYS])
-    by_day_model = [dict(day=d, model=mod, tokens=b.kinds or zero(), money=round(b.money, 6) if b.priced else None)
+    by_day_model = [dict(day=d, model=mod, tokens=b.kinds or zero(), money=round(b.money, 6) if b.priced else None,
+                         **({"unpricedTokens": b.partial()} if b.partial() else {}))
                     for (d, mod), b in sorted(day_model.items(), reverse=True) if d in kept_days]
     sess_list = []
     for sid, b in sess_b.items():
@@ -1591,15 +1604,18 @@ def summarize(directory, rows, records, table, price_problem, profile_name, now,
                               "cr": kinds_total["cr"], "all": total_tokens(kinds_total)},
                    "money": round(total.money, 6) if total.priced else None, "unpricedTokens": unpriced,
                    "reconstructedMoney": round(recon_money, 6) if total.priced else None, "calls": total.calls},
-        "hours": [[h, {"tokens": int(b.tokens), "money": round(b.money, 6) if b.priced else None}] for h, b in sorted(hours.items())],
+        "hours": [[h, dict({"tokens": int(b.tokens), "money": round(b.money, 6) if b.priced else None},
+                           **({"unpricedTokens": b.partial()} if b.partial() else {}))] for h, b in sorted(hours.items())],
         "byActivity": by_money(acts),
         "byTask": by_money(task_b, **task_extra),
         "byPhase": by_money(phases),
         "byKind": {d: by_money(v) for d, v in dims.items()},
         "byDay": by_day,
         "byDayModel": by_day_model,
-        "passes": sorted(({**p, "money": None if p["money"] is None else round(p["money"], 6)} for p in passes.values()),
-                         key=lambda p: -(p["money"] or 0))[:PASSES],
+        "passes": sorted(({**{k: v for k, v in p.items() if k != "unpricedTokens"},
+                           "money": None if p["money"] is None else round(p["money"], 6),
+                           **({"unpricedTokens": p["unpricedTokens"]} if p["money"] is not None and p["unpricedTokens"] else {})}
+                          for p in passes.values()), key=lambda p: -(p["money"] or 0))[:PASSES],
         "sessions": sess_list[:SESSIONS],
         "unmatched": {"sessions": um[-1].get("sessions", 0), "tokens": um[-1].get("tokens", 0)} if um else {"sessions": 0, "tokens": 0},
         "problems": problems[:20],
@@ -1619,6 +1635,9 @@ def fold_tasks(entries, keep):
     other = {"key": "(other tasks)", "tokens": sum(e["tokens"] for e in rest), "money": round(sum(priced), 6) if priced else None,
              "calls": sum(e["calls"] for e in rest), "tasks": len(rest) + sum(e.get("tasks", 0) for e in rest if e["key"] == "(other tasks)"),
              "phases": [], "sessions": []}
+    unpriced = sum(e.get("unpricedTokens", 0) if e["money"] is not None else e["tokens"] for e in rest)
+    if priced and unpriced:
+        other["unpricedTokens"] = unpriced
     recon = sum(e.get("reconstructed", 0) for e in rest)
     if recon:
         other["reconstructed"] = round(recon, 6)
@@ -1699,7 +1718,7 @@ def report_lines(s, by=None):
         out.append(line)
         days = [e for e in s["byDay"] if e["key"] == s["updated"][:10]]
         today = days[0]["money"] if days else (0.0 if p.get("source") or p.get("currency") else None)
-        out.append("Today     {} est. (UTC day)".format(fmt_money(today)))
+        out.append("Today     {}{} est. (UTC day)".format(fmt_money(today), "+" if days and days[0].get("unpricedTokens") else ""))
 
     def table(title, entries, label=lambda e: str(e["key"])):
         total = sum(e["money"] or 0 for e in entries) or 0
@@ -1707,7 +1726,10 @@ def report_lines(s, by=None):
         for e in entries:
             pct = "{:.0f}%".format(100.0 * (e["money"] or 0) / total) if total and e["money"] is not None else ""
             mark = " ◌" if e.get("reconstructed") else ""
-            out.append("  {:<26} {:>10} {:>6} {:>10}{}".format(label(e)[:26], fmt_money(e["money"]), pct, fmt_tokens(e["tokens"]), mark))
+            plus = "+" if e["money"] is not None and e.get("unpricedTokens") else ""
+            out.append("  {:<26} {:>10} {:>6} {:>10}{}".format(label(e)[:26], fmt_money(e["money"]) + plus, pct, fmt_tokens(e["tokens"]), mark))
+        if any(e["money"] is not None and e.get("unpricedTokens") for e in entries):
+            out.append("  + marks an estimate of the priced part only (some of its use has no price)")
     sections = [("activity", "By activity", s["byActivity"], None), ("task", "By task", s["byTask"], None),
                 ("phase", "By phase", s["byPhase"], None)]
     sections += [(d, "By " + d, s["byKind"].get(d, []), None) for d in ("kind", "role", "program", "model", "machine")]
@@ -1733,7 +1755,7 @@ def report_lines(s, by=None):
 def account_wide_summary(account, now):
     """byDayModel summed over every space on this machine with the same account label (read-only)."""
     root = os.path.join(pa.ROOT, "spaces")
-    spaces, merged = [], {}
+    spaces, merged, unpriced = [], {}, {}
     for name in sorted(os.listdir(root)) if os.path.isdir(root) else []:
         s = pa.read_json(os.path.join(root, name, "costs", "summary.json"), None) if pa.ID.match(name) else None
         try:
@@ -1748,6 +1770,13 @@ def account_wide_summary(account, now):
                 m["tokens"][k] += num((e.get("tokens") or {}).get(k))
             if e.get("money") is not None:
                 m["money"] = (m["money"] or 0) + e["money"]
+                u = num(e.get("unpricedTokens"))
+            else:
+                u = total_tokens({k: num((e.get("tokens") or {}).get(k)) for k in KINDS})
+            unpriced[(e.get("day"), e.get("model"))] = unpriced.get((e.get("day"), e.get("model")), 0) + u
+    for k, m in merged.items():  # a merged entry with a priced part and unpriced use is partial (VERIFY-5 RL5-2)
+        if m["money"] is not None and unpriced.get(k):
+            m["unpricedTokens"] = unpriced[k]
     return {"v": 1, "account": account, "spaces": spaces, "updated": iso(now),
             "byDayModel": [merged[k] for k in sorted(merged, key=lambda k: (k[0] or "", k[1] or ""), reverse=True)]}
 
@@ -2282,6 +2311,8 @@ def billing_comparison(billed, space, here, table):
             key = model_key(table, e.get("model")) or e.get("model")
             if e.get("money") is not None:
                 out[key] = out.get(key, 0.0) + e["money"]
+                if e.get("unpricedTokens"):  # a mixed entry: priced part only
+                    unpriced.add(key)
             elif total_tokens(e.get("tokens")):
                 unpriced.add(key)
         return out, unpriced
