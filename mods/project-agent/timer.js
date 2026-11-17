@@ -5,6 +5,12 @@
 //
 // schedule.json ownership: the person (this panel) and the orchestrator write the settings;
 // only this timer writes lastPass and nextPass. pass-request.json is the on-demand queue.
+//
+// Costs (t-009): the lease holder also runs `pa-costs collect --space <id> --quiet` for each space,
+// on its machine, every 120 s while some copy shows that space's Costs view (shared
+// "project-agent.costsShown"), else every 30 min; and `pa-costs billed fetch --scheduled --quiet`
+// here at most once an hour (the tool itself queries at most once a day, and only once the person
+// turned it on). Neither is awaited: a slow or hung machine never delays a pass.
 
 import { terminals, hc, readTextFile, exec, shared, setShared, notify, spaces } from "herdr";
 import { paHome, replaceFile, localId, keeperJudging } from "./store.js";
@@ -34,7 +40,7 @@ export function holdReason(schedule, ledger) {
 }
 
 // Every Project Agent the keeper records in this window (shared "project-agent.tabs"), one per
-// space: { address, machine, status, tab, dir, name, alive }. alive: the record says its launcher
+// space: { address, machine, space, status, tab, dir, name, alive } (space: the panel's space id). alive: the record says its launcher
 // runs in that terminal, and the terminal is live. Passes go only to an alive one; a labelled
 // terminal without that (a kept shell, the old terminal during a restore) gets nothing, and so
 // does every record while the marks are not the current keeper's (after a reload or takeover).
@@ -48,7 +54,7 @@ export function projectAgents() {
     const alive = judged && r.alive === true && Boolean(term);
     const prev = byDir.get(dir);
     if (prev && (prev.alive || !alive)) continue;
-    byDir.set(dir, { address: r.terminal, machine, status: term?.status ?? null, tab, dir, name: r.name ?? "", alive });
+    byDir.set(dir, { address: r.terminal, machine, space: String(r.space), status: term?.status ?? null, tab, dir, name: r.name ?? "", alive });
   }
   return [...byDir.values()];
 }
@@ -122,13 +128,62 @@ async function tickOne(agent, now) {
   await patchJson(`${agent.dir}/schedule.json`, agent.machine, stamp, null);
 }
 
+// ---- costs (t-009) ----
+export const COLLECT_FAST = 120000; // a space whose Costs view is shown somewhere
+export const COLLECT_SLOW = 1800000; // every other space
+export const SHOWN_FRESH = 30000; // a costsShown stamp younger than this counts (the panel writes it every 20 s while shown)
+export const COLLECT_STALE = 90000; // a collect still running after this counts as gone (the tool's lock refuses a second run anyway)
+export const BILLING_EVERY = 3600000; // the scheduled billing query is asked at most this often (shared stamp)
+const COLLECT_TIMEOUT = 30000, FETCH_TIMEOUT = 180000, LOG_EVERY = 3600000;
+const NOT_FOUND = /not found|no such file|ENOENT|cannot (start|find)/i;
+const logged = {}; // what -> when a failure was last written to the console
+const logOnce = (what, text, now) => { if (now - (logged[what] ?? 0) < LOG_EVERY) return; logged[what] = now; console.log(`project-agent timer: ${text}`); };
+const outcome = (r) => (r.code === 0 ? { ok: true } : r.code === 127 ? { ok: false, code: 127, missing: true }
+  : { ok: false, code: r.code, error: String(r.stderr || r.stdout || "").trim().split("\n")[0].slice(0, 200) });
+const failure = (e) => { const why = String(e?.message ?? e).slice(0, 200); return NOT_FOUND.test(why) ? { ok: false, missing: true, error: why } : { ok: false, error: why }; };
+
+// The space's collect, when due (shared "project-agent.costsRun": { [space]: { at, busy } }, kept across a takeover).
+// The result goes to shared "project-agent.costs" ({ [space]: { at, ok, code?, error?, missing? } }), written on change only.
+export function collectCosts(agent, now) {
+  const id = agent.space;
+  if (!id) return;
+  const runs = shared("project-agent.costsRun") ?? {}, run = runs[id];
+  if (run?.busy && now - run.at < COLLECT_STALE) return;
+  const shownAt = Number((shared("project-agent.costsShown") ?? {})[id]) || 0;
+  const every = now - shownAt < SHOWN_FRESH ? COLLECT_FAST : COLLECT_SLOW;
+  if (run && now - run.at < every) return;
+  setShared("project-agent.costsRun", { ...runs, [id]: { at: now, busy: true } });
+  let p;
+  try { p = exec("pa-costs", ["collect", "--space", localId(id), "--quiet"], { on: agent.machine, timeout: COLLECT_TIMEOUT }); } catch (e) { p = Promise.reject(e); }
+  Promise.resolve(p).then(outcome, failure).then((res) => {
+    const all = { ...(shared("project-agent.costsRun") ?? {}) };
+    if (all[id]?.at === now) { all[id] = { at: now, busy: false }; setShared("project-agent.costsRun", all); }
+    const kept = { ...(shared("project-agent.costs") ?? {}) }, was = kept[id];
+    const same = was && was.ok === res.ok && was.code === res.code && was.error === res.error && was.missing === res.missing;
+    if (!same) { kept[id] = { at: iso(now), ...res }; setShared("project-agent.costs", kept); }
+    if (!res.ok) logOnce(`collect ${id}`, `pa-costs collect for ${id}: ${res.missing ? "pa-costs is not installed there" : res.error || `exit ${res.code}`}`, now);
+  }, () => {});
+}
+
+// The scheduled billing query, here only: at most once per BILLING_EVERY (a shared stamp, so a takeover inside the hour runs none).
+export function billingTick(now) {
+  const last = Number(shared("project-agent.billingTick")?.at) || 0;
+  if (now - last < BILLING_EVERY) return;
+  setShared("project-agent.billingTick", { at: now });
+  let p;
+  try { p = exec("pa-costs", ["billed", "fetch", "--scheduled", "--quiet"], { timeout: FETCH_TIMEOUT }); } catch (e) { p = Promise.reject(e); }
+  Promise.resolve(p).then(outcome, failure).then((res) => { if (!res.ok) logOnce("billing", `pa-costs billed fetch: ${res.missing ? "pa-costs is not installed here" : res.error || `exit ${res.code}`}`, now); }, () => {});
+}
+
 // One copy of the mod holds the lease and does the sending, so a pass is never sent twice.
 export async function tick(me) {
   const now = Date.now(), lease = shared("project-agent.timer");
   // Renewed about every 30 s; taken over after 50 s of silence (the holder's copy was reloaded or closed).
   if (lease && lease.id !== me && now - lease.at < 50000) return;
   if (!lease || lease.id !== me || now - lease.at > 20000) setShared("project-agent.timer", { id: me, at: now });
+  billingTick(now);
   for (const agent of projectAgents()) {
+    collectCosts(agent, now); // not awaited: it runs beside the pass, also for an agent that is not alive
     try { await tickOne(agent, now); } catch (e) { console.log(`project-agent timer: ${agent.name}: ${e.message ?? e}`); }
   }
 }
