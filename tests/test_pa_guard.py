@@ -1214,6 +1214,179 @@ class R2_Hook(unittest.TestCase):
         self.assertEqual(self.call("Read", {"file_path": record}, self.wt)[0], 0)
 
 
+# ---- Split (card d-048): the Bash path rule goes to a later task; what stays is tightened -----------------
+# Finding ids: VERIFY-3 Fn, REVIEW-5 In/Mn/Nn, REVIEW-6 In/Mn/Nn.
+
+VARIABLE = ("Refused by the Project Agent's allowlist: {} sets a git or gh variable (GIT_*, GH_*), which changes what the "
+            "allowed git and gh commands do. Run the command without it. If it is needed, stop and report this to the "
+            "Project Agent with hc send. There is no override.")
+
+
+class Split(GuardTest):
+    """A user home (HOME patched) with a worktree in it."""
+
+    def setUp(self):
+        super().setUp()
+        self.user = tempfile.mkdtemp(dir=TMP)
+        self.wt = os.path.join(self.user, "work", "wt")
+        os.makedirs(os.path.join(self.wt, "sub"))
+        for f in [os.path.join(self.wt, "a.py"), os.path.join(self.user, "a.py"), os.path.join(self.user, "sub-a.py")]:
+            open(f, "a").close()
+        patcher = mock.patch.dict(os.environ, {"HOME": self.user})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for name in ("CDPATH", "XDG_CONFIG_HOME"):  # put back by the patcher
+            os.environ.pop(name, None)
+
+    def at(self, line, cwd=None):
+        return self.check(line, cwd=cwd or self.wt)
+
+
+class Split_PersonalSettings(Split):
+    """(2) decided with d-048: the editor rule protects the person's own git and gh settings."""
+
+    def setUp(self):
+        super().setUp()
+        self.spaces = os.path.join(TMP, "split-spaces")
+        for d in [os.path.join(self.user, ".config", "git"), os.path.join(self.user, ".config", "gh"),
+                  os.path.join(self.user, "real-gh")]:
+            os.makedirs(d, exist_ok=True)
+        link = os.path.join(self.wt, "settings-link")
+        if not os.path.lexists(link):
+            os.symlink(os.path.join(self.user, ".gitconfig"), link)
+
+    def edit(self, path, cwd=None):
+        return guard.check_edit(path, self.spaces, cwd=cwd or self.wt, home=os.path.join(self.user, "pa"))
+
+    def test_refused(self):
+        u = self.user
+        for path, cwd in [(os.path.join(u, ".gitconfig"), None), ("~/.gitconfig", None), (".gitconfig", u),
+                          ("../../.gitconfig", None), (os.path.join(u, ".GITCONFIG"), None),
+                          (os.path.join(u, ".config", "git", "config"), None), (os.path.join(u, ".config", "git", "ignore"), None),
+                          (os.path.join(u, ".config", "git"), None), ("~/.config/gh/config.yml", None),
+                          (os.path.join(u, ".config", "gh", "hosts.yml"), None), (os.path.join(u, ".config", "GH", "config.yml"), None),
+                          (os.path.join(self.wt, "settings-link"), None)]:
+            with self.subTest(path=path):
+                self.assertEqual(self.edit(path, cwd), OFF_TABLE.format(path))
+
+    def test_through_a_linked_folder(self):
+        link = os.path.join(self.wt, "ghlink")
+        if not os.path.lexists(link):
+            os.symlink(os.path.join(self.user, ".config", "gh"), link)
+        self.assertIsNotNone(self.edit(os.path.join(link, "config.yml")))
+
+    def test_xdg_config_home(self):
+        xdg = os.path.join(self.user, "xdg")
+        with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": xdg}):
+            self.assertIsNotNone(self.edit(os.path.join(xdg, "git", "config")))
+            self.assertIsNotNone(self.edit(os.path.join(xdg, "gh", "config.yml")))
+            self.assertIsNotNone(self.edit(os.path.join(self.user, ".config", "git", "config")))
+
+    def test_allowed(self):
+        u = self.user
+        for path in [os.path.join(u, ".gitconfig.bak"), os.path.join(u, ".gitconfig-notes.md"),
+                     os.path.join(u, ".config", "github-notes.md"), os.path.join(u, ".config", "ghx", "a"),
+                     os.path.join(u, ".config", "other", "git", "config"), os.path.join(self.wt, ".gitconfig"),
+                     os.path.join(self.wt, "a.py"), os.path.join(self.wt, ".github", "workflows", "ci.yml")]:
+            with self.subTest(path=path):
+                self.assertIsNone(self.edit(path))
+
+    def test_through_the_hook(self):
+        HookGuard.setUpClass.__func__(self)
+        for tool, key in [("Edit", "file_path"), ("Write", "file_path"), ("MultiEdit", "file_path"), ("NotebookEdit", "notebook_path")]:
+            with self.subTest(tool=tool):
+                self.assertEqual(HookGuard.run_hook(self, tool, {key: os.path.join(self.user, ".gitconfig")})[0], 2)
+                self.assertEqual(HookGuard.run_hook(self, tool, {key: os.path.join(self.user, ".config", "gh", "config.yml")})[0], 2)
+        self.assertEqual(HookGuard.run_hook(self, "Read", {"file_path": os.path.join(self.user, ".gitconfig")})[0], 0)
+
+
+class Split_HiddenNames(Split):
+    """VERIFY-3 F3, REVIEW-5 M2: a not-plain line that spells git, gh or hc through $'...', $'' or an expansion that may be
+    empty involves them."""
+
+    def test_refused_not_plain(self):
+        for line in ["gi$''t push origin HEAD > /dev/null", "$'\\x67it' push origin HEAD > /dev/null", "gi$'t' push origin HEAD",
+                     "$'\\147it' push > /dev/null", "$'\\u0067it' push > /dev/null", "g$()it push origin HEAD", "gi${NOPE}t push",
+                     "h$'c' send x y > /dev/null", "g$\"\"h pr create > /dev/null", "gi$NOPE''t push > /dev/null"]:
+            with self.subTest(line=line):
+                self.assertEqual(self.at(line), NOT_PLAIN)
+
+    def test_ordinary_not_plain_lines_stay_allowed(self):
+        for line in ["make test > build.log 2>&1", "echo $HOME > /tmp/x", "for f in *.py; do echo $f; done",
+                     "python3 -c 'print(1)' | tee out.txt", "echo ${PATH} > /tmp/p", "printf $'a\\tb\\n' > /tmp/t"]:
+            with self.subTest(line=line):
+                self.assertIsNone(self.at(line))
+
+
+class Split_PipeIntoShell(Split):
+    """REVIEW-5 M1: what an allowed row prints is not run by a shell in the same line."""
+
+    def test_refused(self):
+        for line, shown_part in [("git log -1 --format=%s | bash", "bash"), ("git show HEAD:x.sh | bash", "bash"),
+                                 ("git show HEAD:x.sh | sh -s", "sh -s"), ("git diff | grep x | zsh", "zsh"),
+                                 ("git log --format=%s | xargs sh -c", "xargs sh -c"), ("gh pr view 1 | bash", "bash"),
+                                 ("hc read w1 | sh", "sh"), ("git status && echo x | sh", "sh")]:
+            with self.subTest(line=line):
+                self.assertEqual(self.at(line), OFF_TABLE.format(shown_part))
+
+    def test_allowed(self):
+        for line in ["git log | head", "git diff | grep x | wc -l", "echo hi | bash", "cat x.sh | sh", "git status && bash tests/run-all.sh",
+                     "git log --oneline | tee log.txt"]:
+            with self.subTest(line=line):
+                self.assertIsNone(self.at(line))
+
+
+class Split_Reflog(Split):
+    """REVIEW-5 N1: git reflog with options first does not take a subcommand word after them."""
+
+    def test_refused(self):
+        for line in ["git reflog -n 5 expire --all", "git reflog -n 5 delete HEAD", "git reflog --all drop",
+                     "git reflog -n 1 exists HEAD"]:
+            with self.subTest(line=line):
+                self.assertEqual(self.at(line), OFF_TABLE.format(line))
+
+    def test_allowed(self):
+        for line in ["git reflog -n 5", "git reflog --date=iso", "git reflog show HEAD", "git reflog -n 5 HEAD"]:
+            with self.subTest(line=line):
+                self.assertIsNone(self.at(line))
+
+
+class Split_CdTracking(Split):
+    """VERIFY-3 F5 and F4 (CDPATH), for the folder git checkout and git restore are checked in: a cd whose target the
+    guard cannot work out leaves the folder unknown."""
+
+    def test_tilde_forms_the_shell_expands_differently(self):
+        for line in ["cd ~- && git checkout a.py", "cd ~+ && git checkout a.py", "cd ~-/sub && git checkout a.py",
+                     "cd ~+ && git restore a.py", "cd ~nosuchuser-x && git checkout x"]:
+            with self.subTest(line=line):
+                self.assertIsNotNone(self.at(line, cwd=os.path.join(self.wt, "sub")))
+
+    def test_cdpath(self):
+        for line in ["export CDPATH=" + self.user + " && cd work && git checkout feature",
+                     "export CDPATH=" + self.user + " && cd sub && git restore a.py"]:
+            with self.subTest(line=line):
+                self.assertIsNotNone(self.at(line, cwd=self.user))
+        with mock.patch.dict(os.environ, {"CDPATH": self.user}):
+            self.assertIsNotNone(self.at("cd sub && git checkout a.py"))
+            self.assertIsNone(self.at("cd ./sub && git checkout feature"))
+            self.assertIsNone(self.at("cd " + os.path.join(self.wt, "sub") + " && git checkout feature"))
+
+    def test_still_known(self):
+        for line in ["cd ~ && git checkout feature", "cd sub && git checkout feature", "cd ./sub && git restore b.py",
+                     "cd ~/work/wt && git restore a.py"]:
+            with self.subTest(line=line):
+                self.assertIsNone(self.at(line))
+        self.assertIsNotNone(self.at("cd ~ && git checkout a.py"))  # a.py exists in ~: a file restore
+
+
+class Split_Texts(GuardTest):
+    """VERIFY-3 N1: the R12 text is pinned."""
+
+    def test_variable_text(self):
+        self.assertEqual(guard.VARIABLE, VARIABLE)
+        self.assertEqual(self.check("export GIT_DIR=x"), VARIABLE.format("GIT_DIR=x"))
+
+
 def tearDownModule():
     shutil.rmtree(TMP, ignore_errors=True)
 
