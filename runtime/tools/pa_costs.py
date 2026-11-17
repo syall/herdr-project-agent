@@ -7,6 +7,7 @@ Python standard library only (3.7+). Linked as pa-costs.
   pa-costs reconstruct [--space ID] [--dry-run]              find the space's sessions from before launch records
   pa-costs prices [--space ID]                               the price table in use, and models seen without a price
   pa-costs billed status|list|remove|disable|enable|fetch|import ...   billed amounts (the person's commands)
+  pa-costs billed compare --json [--space ID] [--summary-json J] [--here-json J]   the Costs view's billed comparison
 
 Files, in the space's state folder (costs/): sessions.jsonl (launch and other session records, append-only),
 turns.jsonl (the cost ledger: tokens per settled segment, append-only), state.json (read offsets), summary.json
@@ -1469,6 +1470,11 @@ def by_money(buckets, **extra_for):
     return items
 
 
+def drill(buckets, keep=8):
+    """The costliest `keep` entries of a breakdown, as {key, tokens, money} (and unpricedTokens when partial)."""
+    return [{k: v for k, v in e.items() if k in ("key", "tokens", "money", "unpricedTokens")} for e in by_money(buckets)[:keep]]
+
+
 def summarize(directory, rows, records, table, price_problem, profile_name, now, problems=()):
     """The summary.json object (spec 2.3) for the given ledger rows."""
     sessions = sessions_of(records)
@@ -1480,6 +1486,7 @@ def summarize(directory, rows, records, table, price_problem, profile_name, now,
     total, recon_money, unpriced, missing = Bucket(), 0.0, 0, set()
     kinds_total = zero()
     acts, task_b, phases, task_phase, task_sessions, task_split = {}, {}, {}, {}, {}, set()
+    act_tasks, reasons = {}, {}  # activity -> task -> Bucket (the Costs view's drill); unattributed's reasons
     dims = {d: {} for d in ("kind", "role", "program", "model", "machine")}
     days, day_acts, day_model, hours, passes, sess_b, sess_info = {}, {}, {}, {}, {}, {}, {}
     hour_floor = iso(now - HOURS * 3600)[:13]
@@ -1506,10 +1513,18 @@ def summarize(directory, rows, records, table, price_problem, profile_name, now,
             price = price_for(table, r.get("model"), r.get("from"))
             rb_m = money(rb_tokens, zero(), price) if m is not None else None
             group(acts, "cache-rebuild").add(rb_t, rb_m, 0, rec)
-        group(acts, r.get("activity") or "unattributed").add(t - rb_t, None if m is None else m - (rb_m or 0), calls, rec)
+        act = r.get("activity") or "unattributed"
+        group(acts, act).add(t - rb_t, None if m is None else m - (rb_m or 0), calls, rec)
+        if act == "unattributed":
+            group(reasons, r.get("reason") or "(no reason)").add(t - rb_t, None if m is None else m - (rb_m or 0), calls, rec)
         # by task (split rows by their weights), phase, sessions per task
         split = r.get("split") if isinstance(r.get("split"), list) and r.get("split") else [{"task": r.get("task"), "w": 1.0}]
         wsum = sum(float(s.get("w") or 0) for s in split) or 1.0
+        for s in split:
+            w, key = float(s.get("w") or 0) / wsum, s.get("task") or "(no task)"
+            group(act_tasks.setdefault(act, {}), key).add((t - rb_t) * w, None if m is None else (m - (rb_m or 0)) * w, calls * w, rec)
+            if rb_t:
+                group(act_tasks.setdefault("cache-rebuild", {}), key).add(rb_t * w, None if rb_m is None else rb_m * w, 0, rec)
         for s in split:
             w = float(s.get("w") or 0) / wsum
             key = s.get("task") or "(no task)"
@@ -1528,7 +1543,6 @@ def summarize(directory, rows, records, table, price_problem, profile_name, now,
         day = r.get("day") or (r.get("from") or "")[:10]
         group(days, day).add(t, m, calls, rec)
         da = day_acts.setdefault(day, {})
-        act = r.get("activity") or "unattributed"
         if m is not None:
             da[act] = da.get(act, 0.0) + m - (rb_m or 0)
             if rb_m:
@@ -1609,7 +1623,8 @@ def summarize(directory, rows, records, table, price_problem, profile_name, now,
                    "reconstructedMoney": round(recon_money, 6) if total.priced else None, "calls": total.calls},
         "hours": [[h, dict({"tokens": int(b.tokens), "money": round(b.money, 6) if b.priced else None},
                            **({"unpricedTokens": b.partial()} if b.partial() else {}))] for h, b in sorted(hours.items())],
-        "byActivity": by_money(acts),
+        "byActivity": by_money(acts, **{k: dict({"tasks": drill(act_tasks.get(k, {}))}, **({"reasons": drill(reasons)} if k == "unattributed" else {}))
+                                         for k in acts}),
         "byTask": by_money(task_b, **task_extra),
         "byPhase": by_money(phases),
         "byKind": {d: by_money(v) for d, v in dims.items()},
@@ -2460,8 +2475,65 @@ def billed_lines(s, now):
     return out
 
 
+COMPARE_ARG_MAX = 100 * 1024  # a summary passed as an argument (the panel, for a remote space): Linux caps one at 128 KB
+
+
+def json_arg(text, what):
+    if len(text.encode()) > COMPARE_ARG_MAX:
+        raise pa.Problem("{} is over 100 KB; pass a trimmed summary".format(what))
+    try:
+        value = json.loads(text)
+    except ValueError:
+        raise pa.Problem("{} is not JSON".format(what))
+    if not isinstance(value, dict):
+        raise pa.Problem("{} is not a JSON object".format(what))
+    return value
+
+
+def billing_status(now=None):
+    """The query's status for the Costs view: config, state, the status line, and the stated fee and caps."""
+    conf = billing_config()
+    fee = cur = None
+    try:
+        _p, block = billing_profile()
+        queries = block.get("queries") if isinstance(block.get("queries"), dict) else {}
+        name = (conf or {}).get("query") or (next(iter(queries)) if len(queries) == 1 else None)
+        entry = queries.get(name) if isinstance(queries.get(name), dict) else {}
+        fee = entry.get("feePerRequest") if isinstance(entry.get("feePerRequest"), (int, float)) else None
+        cur = entry.get("currency") if isinstance(entry.get("currency"), str) else None
+    except pa.Problem:
+        pass
+    return {"config": conf, "state": query_state(), "line": status_line(now), "feePerRequest": fee, "feeCurrency": cur,
+            "maxPages": MAX_PAGES, "runsPerDay": RUNS_PER_DAY}
+
+
+def billed_compare(space=None, summary_json=None, here_json=None, now=None):
+    """`pa-costs billed compare --json` (read-only, allowed anywhere): the billed comparison of the Costs view, as JSON.
+    The space's summary from its folder (--space), or passed as an argument (a remote space's, trimmed); the all
+    spaces here figure computed on this machine, or passed (a remote's `report --account-wide`). Billed rows are this
+    machine's."""
+    now = time.time() if now is None else now
+    if summary_json is not None:
+        s = json_arg(summary_json, "--summary-json")
+    else:
+        s = pa.read_json(os.path.join(costs_dir(space_directory(space)), "summary.json"), None)
+        s = s if isinstance(s, dict) else {}
+    account = s.get("account") or "default"
+    here = json_arg(here_json, "--here-json") if here_json is not None else account_wide_summary(account, now)
+    table = None
+    try:
+        table, _problem = load_prices(pa.load_profile((s.get("prices") or {}).get("profile")))
+    except pa.Problem:
+        pass
+    billed = effective_billed()
+    out = {"comparison": billing_comparison(billed, s, here, table), "status": billing_status(now),
+           "rows": sum(1 for r in billed if r.get("account") == account)}
+    print(json.dumps(out, indent=2))
+    return 0
+
+
 def add_billed_parser(sub):
-    b = sub.add_parser("billed", help="billed amounts: the person's commands (status, list, remove, disable, enable, fetch, import)")
+    b = sub.add_parser("billed", help="billed amounts: status, list, remove, compare, disable; the person's enable, fetch, import")
     bs = b.add_subparsers(dest="action")
     s = bs.add_parser("status")
     s.add_argument("--json", action="store_true")
@@ -2469,6 +2541,11 @@ def add_billed_parser(sub):
     s.add_argument("--json", action="store_true")
     s = bs.add_parser("remove")
     s.add_argument("row_id")
+    s = bs.add_parser("compare", help="the comparison with estimates, as JSON (read-only; the Costs view)")
+    s.add_argument("--json", action="store_true", required=True)
+    s.add_argument("--space")
+    s.add_argument("--summary-json", help="a space's summary.json text (a remote space's); else --space's own")
+    s.add_argument("--here-json", help="`pa-costs report --account-wide` output (a remote's); else computed here")
     bs.add_parser("disable")
     s = bs.add_parser("enable")
     s.add_argument("--query", required=True)
@@ -2496,6 +2573,8 @@ def cmd_billed(args):
         return billed_list(as_json=args.json)
     if a == "remove":
         return billed_remove(args.row_id)
+    if a == "compare":
+        return billed_compare(args.space, args.summary_json, args.here_json)
     if a == "disable":
         return billed_disable()
     if a == "enable":
@@ -2510,7 +2589,7 @@ def cmd_billed(args):
     if a == "import":
         billed_import(args.file, args.via, dry_run=args.dry_run)
         return 0
-    raise pa.Problem("billed: give status, list, remove, disable, enable, fetch or import")
+    raise pa.Problem("billed: give status, list, remove, compare, disable, enable, fetch or import")
 
 
 # ---- launch records (called by pa.py: pa-claude, pa-codex, pa-session) ---------------------------
