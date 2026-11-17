@@ -60,28 +60,41 @@ export function lookAlike(space, agent) {
 export const paHome = (machine) => (machine ? ".config/herdr-pa" : `${home()}/.config/herdr-pa`);
 export const stateDir = (space) => `${paHome(space.machine)}/spaces/${localId(space.id)}`;
 
-async function readJson(path, on) {
-  const text = await readTextFile(path, { on: on ?? null });
+// A remote read that has not answered by then is given up (a load must not stay stuck).
+export const READ_LIMIT = 10000;
+export const TIMED_OUT = Object.freeze({ timedOut: true });
+// `p`, or TIMED_OUT after `ms` on the cx of the task that waits (cx.sleep: mods have no setTimeout).
+// Without a cx it is just `p`.
+export function withTimeout(cx, p, ms = READ_LIMIT) {
+  if (!cx?.sleep) return p;
+  return Promise.race([p, cx.sleep(ms).then(() => TIMED_OUT, () => TIMED_OUT)]);
+}
+
+async function readJson(path, on, cx) {
+  const text = await withTimeout(cx, readTextFile(path, { on: on ?? null }));
+  if (text === TIMED_OUT) return { value: null, text: null, error: "timed out", timedOut: true };
   if (text === null) return { value: null, text: null, error: null };
   try { return { value: JSON.parse(text), text, error: null }; }
   catch (e) { return { value: null, text, error: String(e.message ?? e) }; }
 }
 
-// { agent, ledger, profile, errors } for a space; agent is null when it has no Project Agent.
-export async function loadSpace(space, profileProp) {
+// { agent, ledger, profile, errors } for a space; agent is null when it has no Project Agent
+// (timedOut: agent.json did not answer). With `cx`, each read gives up after READ_LIMIT. After
+// agent.json, the other reads run at the same time; the error lines keep their order.
+export async function loadSpace(space, profileProp, cx) {
   const on = space.machine, dir = stateDir(space), root = paHome(on);
   const errors = [];
-  const agent = await readJson(`${dir}/agent.json`, on);
+  const agent = await readJson(`${dir}/agent.json`, on, cx);
   if (agent.error) errors.push(`agent.json: ${agent.error}`);
-  if (!agent.value) return { agent: null, ledger: null, profile: null, errors, dir };
-  const ledger = await readJson(`${dir}/ledger.json`, on);
-  if (ledger.error) errors.push(`ledger.json: ${ledger.error}`);
+  if (!agent.value) return { agent: null, ledger: null, profile: null, errors, dir, ...(agent.timedOut ? { timedOut: true } : {}) };
   let name = agent.value.profile || profileProp;
-  if (!name) name = (await readJson(`${root}/config.json`, on)).value?.defaultProfile;
-  const profile = name ? await readJson(`${root}/profiles/${name}/profile.json`, on) : { value: null };
-  const schedule = await readJson(`${dir}/schedule.json`, on);
+  const profileRead = async () => {
+    if (!name) name = (await readJson(`${root}/config.json`, on, cx)).value?.defaultProfile;
+    return name ? readJson(`${root}/profiles/${name}/profile.json`, on, cx) : { value: null };
+  };
+  const [ledger, profile, schedule, request] = await Promise.all([readJson(`${dir}/ledger.json`, on, cx), profileRead(), readJson(`${dir}/schedule.json`, on, cx), readJson(`${dir}/pass-request.json`, on, cx)]);
+  if (ledger.error) errors.push(`ledger.json: ${ledger.error}`);
   if (schedule.error) errors.push(`schedule.json: ${schedule.error}`);
-  const request = await readJson(`${dir}/pass-request.json`, on);
   if (profile.error) errors.push(`profile ${name}: ${profile.error}`);
   return { agent: agent.value, ledger: ledger.value, profile: profile.value, schedule: schedule.value, request: request.value, profileDir: `${root}/profiles/${name}`, errors, dir };
 }
@@ -184,24 +197,65 @@ export function cardEvidence(card, files) {
 
 // ---- decision cards (milestone 2) ----------------------------------------------------------------
 
-// Every card in decisions/: [{ id, path, text, card | null, error | null }], open first, newest first.
-export async function loadDecisions(space) {
-  const on = space.machine ?? null, dir = `${stateDir(space)}/decisions`;
-  let names = [];
-  try {
-    const r = await exec("ls", ["-1", dir], { on, timeout: 10000 });
-    if (r.code === 0) names = r.stdout.split("\n").filter((n) => /^[A-Za-z0-9_.-]+\.json$/.test(n));
-  } catch { return []; }
+const CARD_NAME = /^[A-Za-z0-9_.-]+\.json$/;
+export const MAX_CARDS = 200;
+
+// Cards from [{ name, path, text }] (text null: the file is gone, skipped):
+// [{ id, path, text, card | null, error | null }], open first, newest first.
+export function parseCards(files) {
   const cards = [];
-  for (const name of names.slice(0, 200)) {
-    const path = `${dir}/${name}`;
-    const { value, text, error } = await readJson(path, on);
-    if (text === null) continue;
+  for (const { name, path, text } of files) {
+    if (text === null || text === undefined) continue;
+    let value = null, error = null;
+    try { value = JSON.parse(text); } catch (e) { error = String(e.message ?? e); }
     const valid = value && typeof value === "object" && typeof value.question === "string" && Array.isArray(value.options);
     cards.push({ id: value?.id ?? name.replace(/\.json$/, ""), path, text, card: valid ? value : null, error: error ?? (valid ? null : "not a decision card (needs question and options)") });
   }
   const when = (c) => String(c.card?.created ?? "");
   return cards.sort((a, b) => Number(b.card?.status === "open") - Number(a.card?.status === "open") || when(b).localeCompare(when(a)) || b.id.localeCompare(a.id));
+}
+
+// Every card in one call on the space's machine: for each *.json the name filter takes, in byte
+// order, "name\0text\0". The folder goes in as $1, never into the script. Exit 3: no folder.
+const CARDS_SCRIPT = 'export LC_ALL=C; cd "$1" 2>/dev/null || exit 3; for f in *.json; do case "$f" in *[!A-Za-z0-9_.-]*) continue ;; esac; [ -f "$f" ] || continue; printf "%s\\0" "$f"; cat -- "$f" 2>/dev/null; printf "\\0"; done';
+
+// [{ name, text }] from the script's output, or null when it cannot be read as such.
+function splitBatch(stdout) {
+  const parts = String(stdout).split("\0");
+  if (parts.length % 2 !== 1 || parts[parts.length - 1] !== "") return null;
+  const out = [];
+  for (let i = 0; i + 1 < parts.length; i += 2) { if (!CARD_NAME.test(parts[i])) return null; out.push({ name: parts[i], text: parts[i + 1] }); }
+  return out;
+}
+const byteOrder = (a, b) => (a < b ? -1 : a > b ? 1 : 0); // names are ASCII: code units are bytes
+
+// Every card in decisions/ (the first 200 names): see parseCards. On another machine one call reads
+// them all; if that call fails, times out or prints something unreadable, they are read one by one,
+// in parallel (as before, but not in sequence). On this computer the files are read directly.
+// Options: cx (each call gives up after READ_LIMIT), batchOnly (no fallback: null when the call
+// fails), live() (false: the caller no longer wants the result; the fallback is skipped).
+export async function loadDecisions(space, { cx, batchOnly = false, live } = {}) {
+  const on = space.machine ?? null, dir = `${stateDir(space)}/decisions`;
+  if (on) {
+    let r = null;
+    try { r = await withTimeout(cx, exec("sh", ["-c", CARDS_SCRIPT, "sh", dir], { on, timeout: READ_LIMIT })); } catch { r = null; }
+    if (r && r !== TIMED_OUT && r.code === 3 && !r.stdout) return []; // no decisions folder: no cards (as a failing ls)
+    const files = r && r !== TIMED_OUT && (r.code === 0 || r.stdout) ? splitBatch(r.stdout) : null;
+    if (files) return parseCards(files.sort((a, b) => byteOrder(a.name, b.name)).slice(0, MAX_CARDS).map((f) => ({ ...f, path: `${dir}/${f.name}` })));
+    if (batchOnly || (live && !live())) return batchOnly ? null : [];
+  }
+  let names = [];
+  try {
+    const r = await withTimeout(cx, exec("ls", ["-1", dir], { on, timeout: READ_LIMIT }));
+    if (r === TIMED_OUT) return batchOnly ? null : [];
+    if (r.code === 0) names = r.stdout.split("\n").filter((n) => CARD_NAME.test(n));
+  } catch { return batchOnly ? null : []; }
+  const picked = names.slice(0, MAX_CARDS);
+  const texts = await Promise.all(picked.map(async (name) => {
+    const text = await withTimeout(cx, readTextFile(`${dir}/${name}`, { on }));
+    return text === TIMED_OUT ? null : text; // a read that hangs is left out
+  }));
+  return parseCards(picked.map((name, i) => ({ name, path: `${dir}/${name}`, text: texts[i] })));
 }
 
 // Compare-and-write on the space's machine: the file must be unchanged since it was read.
