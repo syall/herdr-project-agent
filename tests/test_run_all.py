@@ -1,10 +1,12 @@
 """tests/run-all.sh itself (t-017 J6, R7): parts in parallel, output in a fixed order, a summary that names
-every part and every failure, PA_SERIAL=1, --affected. The real script runs in a temp copy of the repo whose
+every part and every failure, PA_SERIAL=1, --affected; J9: TERM, INT and HUP stop every part and its children. The real script runs in a temp copy of the repo whose
 parts are stubs (stub.sh, chosen per part by STUB_<part>), so no real suite runs here."""
 import os
 import shutil
+import signal
 import subprocess
 import tempfile
+import time
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -22,6 +24,8 @@ case "$m" in
   crash) i=1; while [ $i -le 50 ]; do echo "$k line $i"; i=$((i + 1)); done; exit 3 ;;
   quiet) exit 1 ;;
   sleep:*) sleep "${m#sleep:}" ;;
+  child) sleep 300 & c=$!
+    echo "$$ $c" > "$STUB_DIR/$k.pids.new"; mv "$STUB_DIR/$k.pids.new" "$STUB_DIR/$k.pids"; wait ;;
   wait:*) other=${m#wait:}; n=0
     until grep -q "start $other" "$STUB_DIR/events"; do
       n=$((n + 1)); [ $n -gt 200 ] && { echo "FAIL barrier: $other never started"; exit 1; }; sleep 0.1
@@ -52,6 +56,16 @@ def write(path, text, mode=0o644):
     with open(path, "w") as f:
         f.write(text)
     os.chmod(path, mode)
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 class RunAll(unittest.TestCase):
@@ -204,6 +218,63 @@ class RunAll(unittest.TestCase):
             self.assertEqual(len(set(dirs)), 5, seen)
             for d in dirs:
                 self.assertTrue(d.startswith(os.path.realpath(folder) + os.sep) and os.path.isdir(d), (d, folder))
+
+    def test_r8_stop(self):
+        # TERM, INT or HUP sent to the script alone (a closed pane, a kill, a Ctrl-C) stops every running part
+        # and the children it started, in parallel and in PA_SERIAL=1 mode, and exits 128 + the signal.
+        cases = [("", ("keeper", "panel")), ("1", ("keeper",))]
+        for serial, hung in cases:
+            for sig, want in ((signal.SIGTERM, 143), (signal.SIGINT, 130), (signal.SIGHUP, 129)):
+                with self.subTest(serial=serial, sig=sig.name):
+                    self.stop_case(serial, hung, sig, want)
+
+    def stop_case(self, serial, hung, sig, want):
+        for k in hung:
+            if os.path.exists(os.path.join(self.tmp, k + ".pids")):
+                os.remove(os.path.join(self.tmp, k + ".pids"))
+        env = {k: v for k, v in os.environ.items() if not k.startswith(("STUB_", "PA_SERIAL", "PA_CHANGED"))}
+        env.update({"NODE": self.node, "STUB_DIR": self.tmp, "TMPDIR": self.tmp, "PA_SERIAL": serial})
+        env.update({"STUB_" + k: "child" for k in hung})
+        log = os.path.join(self.tmp, "stop.out")
+        with open(log, "w") as out:
+            proc = subprocess.Popen(["sh", os.path.join(self.repo, "tests", "run-all.sh")], cwd=self.tmp, env=env,
+                                    stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
+                                    start_new_session=True)
+        pids = []
+        try:
+            for k in hung:
+                path = os.path.join(self.tmp, k + ".pids")
+                end = time.time() + 30
+                while not os.path.exists(path) and time.time() < end:
+                    time.sleep(0.05)
+                with open(path) as f:
+                    pids += [int(p) for p in f.read().split()]  # the part's shell and the child it started
+            os.kill(proc.pid, sig)
+            try:
+                code = proc.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                code = None
+            end = time.time() + 5
+            while time.time() < end and any(alive(p) for p in pids):
+                time.sleep(0.05)
+            left = [p for p in pids if alive(p)]
+            with open(log) as f:
+                text = f.read()
+            self.assertEqual(code, want, text)
+            self.assertIn("=== interrupted (outputs so far: ", text)
+            self.assertEqual(left, [], "part processes still running after the script ended: " + text)
+        finally:
+            for p in pids + [proc.pid]:
+                try:
+                    g = os.getpgid(p)
+                    if g != os.getpgrp():
+                        os.killpg(g, signal.SIGKILL)
+                    os.kill(p, signal.SIGKILL)
+                except OSError:
+                    pass
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
 
     def test_r7_usage(self):
         code, out = self.run_all("--nope")
