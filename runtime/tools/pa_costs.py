@@ -2169,7 +2169,7 @@ def billing_comparison(billed, space, here, table):
             s["rows"] += 1
     if not rows:
         return {"account": account, "currency": currency, "accountWide": True, "models": [], "covered": None, "other": 0.0,
-                "total": {"thisSpace": 0.0, "allSpaces": 0.0, "billed": 0.0}, "calibrated": None,
+                "total": {"thisSpace": None, "allSpaces": None, "billed": 0.0}, "calibrated": None, "noPrice": [],
                 "separate": sorted(separate.values(), key=lambda s: s["currency"] or ""), "sources": []}
     covered = set()
     for r in rows:
@@ -2179,13 +2179,25 @@ def billing_comparison(billed, space, here, table):
     missing = [d for d in day_range(first, end) if d not in covered]
 
     def est(summary):
-        out = {}
+        """({key: money of the priced entries}, {keys with tokens and no price}) over the covered days."""
+        out, unpriced = {}, set()
         for e in summary.get("byDayModel") or []:
-            if e.get("day") in covered and e.get("money") is not None:
-                key = model_key(table, e.get("model")) or e.get("model")
+            if e.get("day") not in covered:
+                continue
+            key = model_key(table, e.get("model")) or e.get("model")
+            if e.get("money") is not None:
                 out[key] = out.get(key, 0.0) + e["money"]
-        return out
-    this, alls = est(space), est(here)
+            elif total_tokens(e.get("tokens")):
+                unpriced.add(key)
+        return out, unpriced
+
+    def est_of(priced, unpriced, key):
+        # No use: a real 0.0. Use and no price: None ("no price"), never 0.
+        return priced[key] if key in priced else (None if key in unpriced else 0.0)
+
+    def est_total(priced, unpriced):
+        return round(sum(priced.values()), 6) if priced else (None if unpriced else 0.0)
+    (this, this_np), (alls, alls_np) = est(space), est(here)
     models, other = {}, 0.0
     for r in rows:
         key = model_key(table, r.get("model")) if r.get("model") else None
@@ -2202,31 +2214,39 @@ def billing_comparison(billed, space, here, table):
             if p:
                 m["num"] += r.get("amount") or 0
                 m["den"] += r["quantity"] * p / 1e6
-    out_models, calibrated = [], 0.0
+    out_models, calibrated, cal_priced, cal_partial = [], 0.0, False, False
     for key in sorted(models):
         m = models[key]
         few = len(m["days"]) < 3 or m["notFinal"]
-        t, a = this.get(key, 0.0), alls.get(key, 0.0)
+        t, a = est_of(this, this_np, key), est_of(alls, alls_np, key)
+        if t is None or key in this_np:
+            cal_partial = True
+        if t is not None:
+            cal_priced = True
         if m["den"] > 0:
             factor = {"kind": "price", "value": round(m["num"] / m["den"], 4), "applied": True, "few": few, "note": "from quantities"}
-            calibrated += t * factor["value"]
-        elif a > 0:
+            calibrated += (t or 0.0) * factor["value"]
+        elif a is not None and a > 0:
             value = round(m["billed"] / a, 4)
             factor = {"kind": "scope", "value": value, "applied": False, "few": few,
                       "note": "not applied" + ("; below 1.0: the table over-prices" if value < 1.0 else "")}
-            calibrated += t
+            calibrated += t or 0.0
         else:
             factor = {"kind": None, "value": None, "applied": False, "few": few, "note": "no estimate to compare"}
-            calibrated += t
-        out_models.append({"model": key, "thisSpace": round(t, 6), "allSpaces": round(a, 6), "billed": round(m["billed"], 6),
-                           "factor": factor, "notFinal": m["notFinal"], "days": len(m["days"])})
+            calibrated += t or 0.0
+        out_models.append({"model": key, "thisSpace": None if t is None else round(t, 6), "allSpaces": None if a is None else round(a, 6),
+                           "thisSpacePartial": key in this and key in this_np, "allSpacesPartial": key in alls and key in alls_np,
+                           "billed": round(m["billed"], 6), "factor": factor, "notFinal": m["notFinal"], "days": len(m["days"])})
     return {"account": account, "currency": currency, "accountWide": True,
             "covered": {"from": first, "to": max(covered), "days": len(covered), "of": len(day_range(first, end)), "missing": missing},
             "sources": sorted({r.get("source") for r in rows}), "fetchedAt": max(r.get("fetchedAt") or "" for r in rows),
             "models": out_models, "other": round(other, 6),
-            "total": {"thisSpace": round(sum(this.values()), 6), "allSpaces": round(sum(alls.values()), 6),
+            "total": {"thisSpace": est_total(this, this_np), "allSpaces": est_total(alls, alls_np),
+                      "thisSpacePartial": bool(this and this_np), "allSpacesPartial": bool(alls and alls_np),
                       "billed": round(sum(r.get("amount") or 0 for r in rows), 6)},
-            "calibrated": round(calibrated, 6), "separate": sorted(separate.values(), key=lambda s: s["currency"] or "")}
+            # Calibrated only where there is a priced estimate to calibrate; partial when a billed model has unpriced use.
+            "calibrated": round(calibrated, 6) if cal_priced else None, "calibratedPartial": cal_priced and cal_partial,
+            "noPrice": sorted(this_np | alls_np), "separate": sorted(separate.values(), key=lambda s: s["currency"] or "")}
 
 
 def billed_lines(s, now):
@@ -2248,18 +2268,27 @@ def billed_lines(s, now):
             ", ".join(c["sources"]), c["fetchedAt"]))
         out.append("  {:<22} {:>12} {:>16} {:>14}".format("", "this space", "all spaces here", "billed"))
         out.append("  {:<22} {:>12} {:>16} {:>14}".format("", "est.", "est.", "account-wide"))
+        def est(v, partial):
+            return fmt_money(v) + ("+" if partial else "")
         for m in c["models"]:
             f = m["factor"]
             fac = "" if f["kind"] is None else "{} factor {}{}".format("price" if f["kind"] == "price" else "scope ratio", f["value"],
                                                                       " (not applied)" if not f["applied"] else "")
-            out.append("  {:<22} {:>12} {:>16} {:>14}  {}{}{}".format(m["model"][:22], fmt_money(m["thisSpace"]), fmt_money(m["allSpaces"]),
+            out.append("  {:<22} {:>12} {:>16} {:>14}  {}{}{}".format(m["model"][:22], est(m["thisSpace"], m["thisSpacePartial"]), est(m["allSpaces"], m["allSpacesPartial"]),
                                                                     fmt_money(m["billed"]), fac, " (few days)" if f["few"] else "",
                                                                     " (not final)" if m["notFinal"] else ""))
         if c["other"]:
             out.append("  {:<22} {:>12} {:>16} {:>14}".format("other / unmapped labels", "", "", fmt_money(c["other"])))
         t = c["total"]
-        out.append("  {:<22} {:>12} {:>16} {:>14}".format("total", fmt_money(t["thisSpace"]), fmt_money(t["allSpaces"]), fmt_money(t["billed"])))
-        out.append("  calibrated (price factor applied where available): this space {}".format(fmt_money(c["calibrated"])))
+        out.append("  {:<22} {:>12} {:>16} {:>14}".format("total", est(t["thisSpace"], t["thisSpacePartial"]),
+                                                           est(t["allSpaces"], t["allSpacesPartial"]), fmt_money(t["billed"])))
+        if c["noPrice"]:
+            out.append("  no price for {}{}".format(", ".join(c["noPrice"]), "; + marks an estimate of the priced part only"
+                                                    if any(m["thisSpacePartial"] or m["allSpacesPartial"] for m in c["models"])
+                                                    or t["thisSpacePartial"] or t["allSpacesPartial"] else ""))
+        cal = c["calibrated"]
+        out.append("  calibrated (price factor applied where available): this space {}".format(
+            "— (no priced estimate)" if cal is None else fmt_money(cal) + (" + unpriced" if c["calibratedPartial"] else "")))
     for sep in c["separate"]:
         out.append("  in {} (not compared): {} billed, account-wide, {} row(s)".format(sep["currency"], fmt_money(sep["amount"]), sep["rows"]))
     out.append(status_line(now))
