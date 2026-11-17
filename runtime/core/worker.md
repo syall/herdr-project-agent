@@ -48,22 +48,29 @@ the address to report to.
   `plan.md` in the same commit. Keep `FINDINGS.md` (what was learned, approaches
   rejected) and `DECISIONS.md` (each judgement call and why).
 - **verifier:** fresh context. Check the result against `plan.md` and the verification
-  points, write `VERIFY.md`, and report. Never fix anything. On a recheck the handoff
-  names a base commit: check the diff from it to HEAD.
+  points, write `VERIFY.md`, and report. Never fix anything. On a diff recheck the
+  handoff names a base commit: check the diff from it to HEAD.
 - **reviewer:** fresh context, never the author. Review for bugs, security, and
   compliance with `spec.md` and `plan.md`, and write `REVIEW.md`. On a diff recheck,
   review the diff from the base commit the handoff names.
+- **check** (low tier only): fresh context, never the author. One worker does the
+  verifier's and the reviewer's job and writes both `VERIFY.md` and `REVIEW.md`.
 - Verifiers, reviewers and check workers label every finding **Must fix** (it breaks a
   requirement, the plan, a verification point, safety or security; say why it blocks
-  the merge), **Recorded limit** (real, but not Must fix; name a follow-up) or **Nit**, and end the file with `Verdict: pass` or `Verdict: must fix (<n>)`.
+  the merge), **Recorded limit** (real, but not Must fix; name a follow-up) or **Nit**,
+  and end the file with `Verdict: pass` or `Verdict: must fix (<n>)`.
 
 ## Verification
 
 - While working, run only the tests affected by your change: the tests for the files
   you changed and the packages that depend on them. If you cannot work that out, run
   the changed package's tests and say so in `VERIFY.md`.
-- Run the full test suite once, at the end of the Test phase, before the commit:
-  `pa-full-suite` runs it and appends the output to your task's `build.log`.
+- Run the full test suite once per round with `pa-full-suite`; it appends the output to
+  your task's `build.log`. A verifier or check worker runs it at HEAD and no other
+  suite-wide run at that commit (not `--affected`, not the suite's own script); re-run
+  single tests only (a failing-first check, a mutation). Builders: high tier, run it at
+  the end of the Test phase, before the commit; low and normal tier, the affected tests
+  are enough, the verifier's run is the round's.
 - For a bug fix, commit a failing test first. Do not edit test files while fixing.
 - Paste real tool output into `build.log`; never summarize a build you did not run.
 - A hook that exits with code 2 means fix it and try again. Do not work around a hook.
