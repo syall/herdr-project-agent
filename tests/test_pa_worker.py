@@ -736,22 +736,24 @@ class Close(Base):
 
     def test_w14_waits_for_the_ledger_lock(self):
         import fcntl
-        held = threading.Event()
+        held, released = threading.Event(), []
 
         def hold():
             with open(os.path.join(self.dir, ".ledger.lock"), "a") as lock:
                 fcntl.flock(lock, fcntl.LOCK_EX)
                 held.set()
-                time.sleep(0.5)
+                time.sleep(1.0)
+                released.append(time.monotonic())  # the lock goes when the file closes, just after this
         t = threading.Thread(target=hold)
         t.start()
-        held.wait(5)
-        began = time.time()
+        self.assertTrue(held.wait(5))
         code, _, err = self.close("t31", "--evidence", "FINDINGS.md")
-        waited = time.time() - began
+        ended = time.monotonic()
         t.join()
         self.assertEqual(code, 0, err)
-        self.assertGreaterEqual(waited, 0.3)
+        # Order of events, not a time window: a close that waits for the lock can only end after it was
+        # released, however slow the machine is.
+        self.assertTrue(released and ended >= released[0], (released, ended))
         self.assertTrue(self.entry("t-003", "t31")["finished"])
 
     def test_w15_other_machines(self):
@@ -1564,7 +1566,7 @@ class Describe(Base):
         # the short cap; the quick calls keep the real GIT_TIMEOUT, so machine load cannot time them out.
         real = shutil.which("git")
         bin_dir = os.path.join(self.tmp, "bin")
-        write(os.path.join(bin_dir, "git"), '#!/bin/sh\nfor a in "$@"; do [ "$a" = log ] && exec sleep 600; done\nexec "{}" "$@"\n'.format(real))
+        write(os.path.join(bin_dir, "git"), '#!/bin/sh\nfor a in "$@"; do [ "$a" = log ] && exec sleep 30; done\nexec "{}" "$@"\n'.format(real))
         os.chmod(os.path.join(bin_dir, "git"), 0o755)
         self.commit(self.wt, "a.txt", "a\n", "slow")
         real_git, slow = pa_hooks.git, []
@@ -1580,7 +1582,7 @@ class Describe(Base):
         try:
             began = time.time()
             card = self.open_card()
-            self.assertLess(time.time() - began, 60)  # the stand-in alone would take 600 s
+            self.assertLess(time.time() - began, 25)  # the stand-in alone would take 30 s
         finally:
             os.environ["PATH"], pa_hooks.git = saved_path, real_git
         self.assertEqual(len(slow), 1, slow)
@@ -1657,7 +1659,7 @@ class Describe(Base):
         bin_dir = os.path.join(self.tmp, "bin")
         # As in d11: the slow stand-in waits until it is killed, and only the slow call gets the short cap
         # (here the one describe_repo gives it from the 1.5 s deadline); the quick calls keep GIT_TIMEOUT.
-        write(os.path.join(bin_dir, "git"), '#!/bin/sh\nfor a in "$@"; do [ "$a" = log ] && exec sleep 600; done\nexec "{}" "$@"\n'.format(real))
+        write(os.path.join(bin_dir, "git"), '#!/bin/sh\nfor a in "$@"; do [ "$a" = log ] && exec sleep 30; done\nexec "{}" "$@"\n'.format(real))
         os.chmod(os.path.join(bin_dir, "git"), 0o755)
         real_git, slow = pa_hooks.git, []
 
@@ -1675,7 +1677,7 @@ class Describe(Base):
             took = time.time() - began
         finally:
             (os.environ["PATH"], pa_hooks.DESCRIBE_DEADLINE), pa_hooks.git = saved, real_git
-        self.assertLess(took, 60)  # the stand-in alone would take 600 s
+        self.assertLess(took, 25)  # the stand-in alone would take 30 s
         # r0's log call runs until the deadline has passed (its cap is what is left of 1.5 s, at least 0.2 s), so r1, r2 wait
         self.assertEqual(len(slow), 1, slow)
         self.assertTrue(slow[0] and 0 < slow[0] <= 1.5 < pa_hooks.GIT_TIMEOUT, slow)
