@@ -1091,11 +1091,20 @@ def identity_refusal(address, task, entry, info):
     return None
 
 
+def status_word(info):
+    """hc's status of a terminal as a word. `hc ls` gives a word; `hc get` gives an object
+    {app, state, msg}. '' when there is none, or it is in neither shape."""
+    status = (info or {}).get("status")
+    if isinstance(status, dict):
+        status = status.get("state")
+    return status if isinstance(status, str) else ""
+
+
 def status_refusal(address, entry, info):
     """Only an idle, done, exited or gone worker is closed."""
     if not info:
         return None
-    status = info.get("status") or ""
+    status = status_word(info)
     if status == "working":
         return "working", "{} is working; close it after its report".format(worker_label(address, entry, info))
     if status == "blocked":
@@ -1430,7 +1439,7 @@ def leftover_list(directory, agent, profile, ledger):
             refusal = identity_refusal(address, task, entry, info) or status_refusal(address, entry, info)
             if refusal:
                 why = {"name": "the address now names another terminal ({})".format(clean(info.get("name") or "unnamed")),
-                       "working": "working", "blocked": "blocked"}.get(refusal[0], "status {}".format(clean(info.get("status") or "none")))
+                       "working": "working", "blocked": "blocked"}.get(refusal[0], "status {}".format(clean(status_word(info) or "none")))
                 held.append(dict(base, why=why))
                 continue
             path, count, files = uncommitted_in(task, profile)
@@ -1439,7 +1448,7 @@ def leftover_list(directory, agent, profile, ledger):
                 if any(re.search(w, line_text(line)) for w in worker_words(address, entry.get("name"))):
                     last = line
             listed.append(dict(base, name=clean(entry.get("name")), title=clean(task.get("title")), taskState=clean(task.get("state")),
-                               role=clean(entry.get("role") or "worker"), state="gone" if not info else clean(info.get("status") or info.get("state")),
+                               role=clean(entry.get("role") or "worker"), state="gone" if not info else clean(status_word(info) or info.get("state")),
                                idle="gone" if not info else idle_for(info), worktree=path, uncommitted=count, uncommittedFiles=files[:50],
                                lastLine={k: cut(clean(last.get(k)), 300) for k in ("at", "trigger", "why") if last.get(k) is not None} if last else None))
     return listed, held
