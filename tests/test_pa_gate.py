@@ -363,5 +363,69 @@ class G6NoOptionalLocks(Base):
             self.assertEqual(args[0], "--no-optional-locks", args)
 
 
+class J5CheckRole(Base):  # t-017 J5: R4 AC4.3, G3. The gate's tier is the task's ledger tier.
+    BUILD = {"address": "t31", "role": "build"}
+    REVIEWER = {"address": "t32", "role": "reviewer"}
+    CHECK = {"address": "t33", "role": "check"}
+
+    def review_check(self, tier, workers):
+        dump({"version": 1, "tasks": []}, os.path.join(self.dir, "ledger.json"))
+        task = self.add_task("t-1", type="docs", tier=tier, workers=workers)
+        self.evidence("t-1")
+        result = pa_hooks.evaluate_gate(self.dir, task, "review")
+        found = [c for c in result["checks"] if c["check"] == "reviewer is not the author"]
+        self.assertEqual(len(found), 1, result["checks"])
+        return result, found[0]
+
+    def test_j5_low_tier_check_worker_passes(self):
+        result, check = self.review_check("low", [self.BUILD, self.CHECK])
+        self.assertTrue(check["ok"], check)
+        self.assertTrue(result["passed"], result["checks"])
+
+    def test_j5_low_tier_check_worker_passes_through_the_command(self):
+        self.add_task("t-1", type="docs", tier="low", workers=[self.BUILD, self.CHECK])
+        self.evidence("t-1")
+        code, out, err = self.run_gate("t-1")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("ok    reviewer is not the author", out)
+
+    def test_j5_normal_and_high_tier_check_worker_alone_fails(self):
+        for tier in ("normal", "high"):
+            with self.subTest(tier=tier):
+                result, check = self.review_check(tier, [self.BUILD, self.CHECK])
+                self.assertFalse(check["ok"])
+                self.assertFalse(result["passed"])
+                self.assertEqual(check["why"], "the ledger lists no reviewer worker separate from the build "
+                                               "workers (a check worker counts for low tier only)")
+
+    def test_j5_check_worker_who_is_an_author_fails_at_every_tier(self):
+        for tier, role in (("low", "build"), ("low", "design"), ("normal", "build"), ("high", "design")):
+            for extra in ([], [self.REVIEWER]):
+                with self.subTest(tier=tier, role=role, reviewer=bool(extra)):
+                    workers = [{"address": "t31", "role": role}, {"address": "t31", "role": "check"}] + extra
+                    result, check = self.review_check(tier, workers)
+                    self.assertFalse(check["ok"], check)
+                    self.assertFalse(result["passed"])
+                    self.assertEqual(check["why"], "t31 is recorded as check and as a build or design worker")
+
+    def test_j5_reviewer_who_is_an_author_names_the_role(self):
+        workers = [self.BUILD, {"address": "t31", "role": "reviewer"}]
+        _result, check = self.review_check("normal", workers)
+        self.assertFalse(check["ok"])
+        self.assertEqual(check["why"], "t31 is recorded as reviewer and as a build or design worker")
+
+    def test_j5_interim_record_as_reviewer_still_passes(self):
+        for tier in ("low", "normal", "high"):
+            with self.subTest(tier=tier):
+                result, check = self.review_check(tier, [self.BUILD, self.REVIEWER])
+                self.assertTrue(check["ok"], check)
+                self.assertTrue(result["passed"], result["checks"])
+
+    def test_j5_low_tier_with_neither_names_both_roles(self):
+        _result, check = self.review_check("low", [self.BUILD])
+        self.assertFalse(check["ok"])
+        self.assertEqual(check["why"], "the ledger lists no reviewer or check worker separate from the build workers")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -166,7 +166,7 @@ class Orchestrator(unittest.TestCase):
         self.assertIn("- The handoff states the task id, goal and tier, the scope (what it may and may not touch),",
                       self.text)
 
-    def test_t017_r4_roles_and_tiers(self):  # AC4.1, AC4.2, AC4.4 (R10), L4, amendment B4
+    def test_t017_r4_roles_and_tiers(self):  # AC4.1, AC4.2, AC4.4 (R10), L4, J5 (replaces amendment B4)
         self.assertIn("- Roles: `design`, `build`, `verifier` (reports, never fixes), `reviewer` (fresh context, "
                       "never the author of what it reviews) and `check` (low tier only: the verifier's and the "
                       "reviewer's job in one fresh worker, never the author).", self.text)
@@ -175,8 +175,14 @@ class Orchestrator(unittest.TestCase):
                       "reviewer; high a verifier and two reviewers when its review is full, one on a diff review. Size the verifier's brief by "
                       "tier: low, the full suite once, the diff, at most 5 mutations on changed logic; normal, add a "
                       "failing-first run for each fix commit, at most 15 mutations; high, what the plan's "
-                      "verification points ask. Until the gate accepts the `check` role, record a `check` worker in "
-                      "the ledger with role `reviewer`. - One git worktree", workers)
+                      "verification points ask. Record a `check` worker in the ledger with role `check`; the gate "
+                      "counts it as the reviewer for low tier only. - One git worktree", workers)
+
+    def test_t017_j5_interim_sentence_gone(self):  # J5 removes the amendment B4 interim
+        for name in ("orchestrator.md", "worker.md", "sdlc.md"):
+            text = flat(read("runtime", "core", name))
+            self.assertNotIn("Until the gate accepts the `check` role", text, name)
+            self.assertNotIn("with role `reviewer`", text, name)
 
     def test_t017_r11_round_fields(self):  # AC11.1, AC11.2
         self.assertIn('"name": "t-003-tests", "round": 1, "started": "<UTC time>" }', self.text)
