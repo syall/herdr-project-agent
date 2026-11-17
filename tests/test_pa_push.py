@@ -150,7 +150,7 @@ class Repo(unittest.TestCase):
         self.url = "file://" + self.origin
         self.assertTrue(self.url.startswith("file://" + TMP))
         sh(self.tmp, "git", "-c", "init.defaultBranch=main", "init", "-q", "--bare", self.origin)
-        sh(self.tmp, "git", "clone", "-q", self.origin, self.main)
+        sh(self.tmp, "git", "clone", "-q", self.url, self.main)
         sh(self.main, "git", "checkout", "-q", "-b", "main")
         write(os.path.join(self.main, "a.txt"), "one\n")
         sh(self.main, "git", "add", "a.txt")
@@ -403,7 +403,7 @@ class Allowlist(Repo):
         self.assertGreaterEqual(len(backups), 4)
         # a change that would make the file invalid is refused, and the file is untouched
         before = snapshot(pa.ROOT)
-        code, _o, err = self.quiet(pa_push.allow_change, parse(["add", "--path", self.main, "--space", "sp3", "--url", "-x", "--branch", "main"]),
+        code, _o, err = self.quiet(pa_push.allow_change, parse(["add", "--path", self.main, "--space", "sp3", "--url=-x", "--branch", "main"]),
                                    env=PERSON_ENV, ancestors=PERSON_TREE)
         self.assertEqual(code, 1)
         self.assertIn("url", err)
