@@ -422,5 +422,250 @@ class Allowlist(Repo):
         self.assertNotIn("push-allow.json", text)
 
 
+# ---- A2: plan and check; pa-decide ---------------------------------------------------------------
+
+CARD = "d-push-t-1-1"
+FACT_KEYS = {"path", "url", "branch", "originUrl", "remoteNow", "localNow", "commit", "taskBranch", "branchTip", "merge",
+             "gate", "commits", "count", "allow", "commands", "checkedAt"}
+
+
+class Planned(Repo):
+    """The fixture with a passed review gate."""
+
+    def setUp(self):
+        Repo.setUp(self)
+        self.assertEqual(self.gate(), 0)
+        self.task_commit = self.head(self.wt)
+        self.main_before = self.head(self.main)
+
+    def plan(self, *extra, repo=None):
+        args = pa_push.main_parser().parse_args(["plan", TASK, "--repo", repo or self.main, "--space", SPACE] + list(extra))
+        return self.quiet(pa_push.cmd_plan, args)
+
+    def card_path(self, card=CARD):
+        return os.path.join(self.dir, "decisions", card + ".json")
+
+    def card(self, card=CARD):
+        return load(self.card_path(card))
+
+    def check(self, card=CARD, env=None, tree=None):
+        return pa_push.check_card(self.dir, SPACE, card, env if env is not None else PERSON_ENV, PERSON_TREE if tree is None else tree)
+
+    def journal(self):
+        path = os.path.join(self.dir, "journal.jsonl")
+        if not os.path.exists(path):
+            return []
+        with open(path) as f:
+            return [json.loads(l) for l in f if l.strip()]
+
+
+class Plan(Planned):
+    def test_p01_plan_writes_card_shape(self):
+        # an earlier task's commit, merged locally and not pushed yet: it rides along, marked not from this task
+        earlier = self.commit_on(self.main, "e.txt", "earlier task")
+        sh(self.wt, "git", "rebase", "-q", "main")
+        self.assertEqual(self.gate(), 0)
+        commit = self.head(self.wt)
+        code, out, err = self.plan()
+        self.assertEqual(code, 0, err)
+        self.assertIn(CARD, out)
+        c = self.card()
+        for key in ("id", "task", "kind", "question", "context", "options", "evidence", "recommendation", "status", "answer",
+                    "note", "created", "answered", "push"):
+            self.assertIn(key, c)
+        self.assertEqual((c["id"], c["task"], c["kind"], c["status"], c["answer"], c["recommendation"]), (CARD, TASK, "push", "open", None, "Push"))
+        self.assertEqual([o["label"] for o in c["options"]], ["Push", "Not now"])
+        self.assertIn("No force", c["options"][0]["detail"])
+        p = c["push"]
+        with open(self.allow, "rb") as f:
+            sha = hashlib.sha256(f.read()).hexdigest()
+        gate_at = load(os.path.join(self.dir, "evidence", TASK, "GATE.json"))["at"]
+        self.assertEqual(p["version"], 1)
+        self.assertEqual((p["space"], p["task"], p["path"], p["url"], p["branch"]), (SPACE, TASK, self.main, self.url, "main"))
+        self.assertEqual((p["taskBranch"], p["commit"], p["localBefore"], p["remoteBefore"]), ("t-1-x", commit, earlier, self.origin_head()))
+        self.assertEqual((p["merge"], p["allowSha"], p["gateAt"], p["done"], p["result"], p["attempts"]), (True, sha, gate_at, False, None, []))
+        self.assertTrue(p["allowMtime"].endswith("Z"))
+        self.assertEqual([(x["subject"], x["fromTask"]) for x in p["commits"]], [("task work", True), ("earlier task", False)])
+        self.assertTrue(all(len(x["sha"]) == 40 and "<" in x["author"] for x in p["commits"]))
+        self.assertIn(self.url, c["question"])
+        self.assertIn("2 commits", c["question"])
+        self.assertIn("not from this task", c["context"])
+        line = self.journal()[-1]
+        self.assertEqual((line["trigger"], line["task"], line["decision"]), ("push-plan", TASK, CARD))
+        self.assertIn(line["by"], ("agent", "person"))
+        # plan pushed and merged nothing
+        self.assertEqual(self.head(self.main), earlier)
+        self.assertNotEqual(self.origin_head(), commit)
+
+    def test_p02_plan_refuses_without_allowlist(self):
+        os.remove(self.allow)
+        code, out, err = self.plan()
+        self.assertEqual(code, 1)
+        self.assertIn("no push allowlist", err)
+        self.assertIn("main-branch pushes are off", err)
+        self.assertFalse(os.listdir(os.path.join(self.dir, "decisions")))
+        dump({"version": 1, "enabled": False, "repos": [self.entry]}, self.allow)
+        code, _o, err = self.plan()
+        self.assertEqual(code, 1)
+        self.assertIn("turned off", err)
+
+    def test_p03_plan_refuses_other_space_or_url(self):
+        self.set_allow(space="sp2")
+        code, _o, err = self.plan()
+        self.assertEqual(code, 1)
+        self.assertIn("names space sp2, not this space sp1", err)
+        self.set_allow(space=SPACE, path=os.path.join(self.tmp, "elsewhere"))
+        code, _o, err = self.plan()
+        self.assertEqual(code, 1)
+        self.assertIn("no allowlist entry for", err)
+        self.assertFalse(os.listdir(os.path.join(self.dir, "decisions")))
+        # origin pointing elsewhere is a warning on the card, not a refusal (the URL comes from the allowlist)
+        self.set_allow(path=self.main)
+        sh(self.main, "git", "remote", "set-url", "origin", "file://" + os.path.join(self.tmp, "other.git"))
+        code, _o, err = self.plan()
+        self.assertEqual(code, 0, err)
+        self.assertIn("origin", self.card()["context"])
+        self.assertIn("other.git", self.card()["context"])
+        self.assertEqual(self.card()["push"]["url"], self.url)
+
+    def test_p04_plan_refuses_from_a_worker_worktree(self):
+        dump({"task": TASK, "space": SPACE, "fix": False}, os.path.join(self.wt, ".claude", "pa-task.json"))
+        os.chdir(self.wt)
+        code, _o, err = self.plan()
+        self.assertEqual(code, 1)
+        self.assertIn("workers do not open push cards", err)
+        self.assertFalse(os.listdir(os.path.join(self.dir, "decisions")))
+
+    def test_p05_second_plan_with_open_card_refused(self):
+        self.assertEqual(self.plan()[0], 0)
+        code, _o, err = self.plan()
+        self.assertEqual(code, 1)
+        self.assertIn(CARD, err)
+        self.assertIn("withdraw", err)
+        c = self.card()
+        c["status"] = "withdrawn"
+        dump(c, self.card_path())
+        code, out, err = self.plan()
+        self.assertEqual(code, 0, err)
+        self.assertIn("d-push-t-1-2", out)
+
+    def test_p06_plan_refuses_gate_not_review_or_failed(self):
+        gate_file = os.path.join(self.dir, "evidence", TASK, "GATE.json")
+        os.remove(gate_file)
+        code, _o, err = self.plan()
+        self.assertEqual(code, 1)
+        self.assertIn("GATE.json", err)
+        self.gate(phase="build")
+        code, _o, err = self.plan()
+        self.assertEqual(code, 1)
+        self.assertIn("is from phase build", err)
+        self.gate()
+        g = load(gate_file)
+        g["passed"] = False
+        dump(g, gate_file)
+        code, _o, err = self.plan()
+        self.assertEqual(code, 1)
+        self.assertIn("did not pass", err)
+        os.remove(os.path.join(self.dir, "evidence", TASK, "REVIEW.md"))
+        code, _o, err = self.plan()
+        self.assertEqual(code, 1)
+        self.assertIn("does not pass now", err)
+        self.assertIn("REVIEW.md", err)
+        self.assertFalse(os.listdir(os.path.join(self.dir, "decisions")))
+
+    def test_p06b_plan_refuses_nothing_to_push(self):
+        sh(self.main, "git", "merge", "-q", "--ff-only", "t-1-x")
+        sh(self.main, "git", "push", "-q", "origin", "main")
+        code, _o, err = self.plan()
+        self.assertEqual(code, 1)
+        self.assertIn("already", err)
+
+
+class Check(Planned):
+    def setUp(self):
+        Planned.setUp(self)
+        self.assertEqual(self.plan()[0], 0)
+
+    def test_p07_check_writes_nothing(self):
+        before = snapshot(pa.ROOT)
+        refs = (self.head(self.main), self.origin_head(), self.head(self.main, "refs/heads/t-1-x"))
+        report = self.check()
+        self.assertTrue(report["ok"], report["refusal"])
+        code, out, err = self.cli("pa-push-main", "check", CARD, "--space", SPACE, "--json")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(snapshot(pa.ROOT), before)
+        self.assertEqual((self.head(self.main), self.origin_head(), self.head(self.main, "refs/heads/t-1-x")), refs)
+        self.assertFalse(os.path.exists(os.path.join(self.dir, ".push.lock")))
+
+    def test_p08_check_json_contract(self):
+        code, out, err = self.cli("pa-push-main", "check", CARD, "--space", SPACE, "--json")
+        self.assertEqual(code, 0, err)
+        r = json.loads(out)
+        self.assertEqual(set(r), {"card", "ok", "refusal", "caller", "status", "done", "result", "facts", "seen"})
+        self.assertEqual((r["card"], r["ok"], r["refusal"], r["status"], r["done"]), (CARD, True, None, "open", False))
+        self.assertEqual(set(r["facts"]), FACT_KEYS)
+        f = r["facts"]
+        self.assertEqual((f["path"], f["url"], f["branch"], f["originUrl"], f["commit"], f["taskBranch"], f["branchTip"], f["merge"], f["count"]),
+                         (self.main, self.url, "main", self.url, self.task_commit, "t-1-x", self.task_commit, True, 1))
+        self.assertEqual((f["remoteNow"], f["localNow"]), (self.origin_head(), self.main_before))
+        self.assertEqual(set(f["gate"]), {"at", "phase", "passed", "commit", "uncommitted"})
+        self.assertEqual(set(f["allow"]), {"file", "sha", "mtime", "changedSinceCard", "entry"})
+        self.assertFalse(f["allow"]["changedSinceCard"])
+        self.assertEqual(set(f["commits"][0]), {"sha", "subject", "author", "fromTask"})
+        flat = [" ".join(c) for c in f["commands"]]
+        self.assertTrue(any(" merge --ff-only " in c for c in flat), flat)
+        self.assertTrue(any(" push " in c and c.endswith(self.url + " " + self.task_commit + ":refs/heads/main") for c in flat), flat)
+        self.assertEqual(len(r["seen"]), 64)
+        self.assertEqual(set(r["caller"]), {"ok", "why", "ancestors"})
+        # refused: exit 1, the first failing check named
+        self.set_allow(enabled=False)
+        code, out, _e = self.cli("pa-push-main", "check", CARD, "--space", SPACE, "--json")
+        self.assertEqual(code, 1)
+        r = json.loads(out)
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["refusal"]["check"], "C6h")
+        self.assertIsNone(r["seen"])
+        code, _o, _e = self.cli("pa-push-main", "check", "d-nope", "--space", SPACE, "--json")
+        self.assertEqual(code, 1)
+        code, _o, _e = self.cli("pa-push-main", "check")
+        self.assertEqual(code, 2)
+
+    def test_p09_check_reports_caller(self):
+        r = self.check()
+        self.assertEqual(r["caller"], {"ok": True, "why": None, "ancestors": ["zsh", "launchd"]})
+        r = self.check(env=dict(PERSON_ENV, CLAUDECODE="1"))
+        self.assertFalse(r["caller"]["ok"])
+        self.assertIn("CLAUDECODE", r["caller"]["why"])
+        self.assertTrue(r["ok"])  # the caller line is shown; the facts are still checked
+        r = self.check(env=dict(PERSON_ENV, HC_TERMINAL_ID="t9"))
+        self.assertIn("Herdr terminal", r["caller"]["why"])
+        r = pa_push.check_card(self.dir, SPACE, CARD, PERSON_ENV, None)
+        self.assertIn("ps failed", r["caller"]["why"])
+
+    def test_d01_decide_refuses_push_card(self):
+        before = snapshot(self.dir)
+        args = argparse.Namespace(space=SPACE, card=CARD, withdraw=False, answer="Push", quote="yes, push it", why=None)
+        with self.assertRaises(pa.Problem) as e:
+            pa.cmd_decide(args)
+        self.assertIn("a push card is answered in the panel, not in conversation (its answer runs the push)", str(e.exception))
+        c = self.card()
+        del c["push"]  # recognised by kind alone too
+        dump(c, self.card_path())
+        with self.assertRaises(pa.Problem):
+            pa.cmd_decide(args)
+        c["push"], c["kind"] = {"version": 1}, "other"  # and by the push object alone
+        dump(c, self.card_path())
+        with self.assertRaises(pa.Problem):
+            pa.cmd_decide(args)
+        self.assertEqual(set(snapshot(self.dir)), set(before))
+
+    def test_d02_decide_withdraw_works(self):
+        args = argparse.Namespace(space=SPACE, card=CARD, withdraw=True, answer=None, quote=None, why="superseded by a new card")
+        self.quiet(pa.cmd_decide, args)
+        c = self.card()
+        self.assertEqual((c["status"], c["push"]["done"]), ("withdrawn", False))
+        self.assertNotEqual(self.origin_head(), self.task_commit)
+
+
 if __name__ == "__main__":
     unittest.main()
