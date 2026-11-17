@@ -1311,6 +1311,58 @@ cases["P-unknown-profile-hidden"] = async () => { // I1 with AC8.5: a full load 
   check(JSON.stringify(g.__shared["project-agent.mainBranches"]?.[RS]) === '["trunk"]', `hidden: the profile is read and written (got ${JSON.stringify(g.__shared["project-agent.mainBranches"])})`);
 };
 
+// Fix round 3 (REVIEW-3 I1): a part that did not answer and is shown from its last known value writes
+// none of its shared keys, the open count or the kept entry, so a newer hidden refresh is not rolled back.
+cases["P3-hidden-then-unknown-ledger"] = async () => {
+  const keys = () => JSON.stringify(["project-agent.worktrees", "project-agent.workers", "my-files.places"].map((k) => (g.__shared[k] ?? {})[RS] ?? null));
+  world({ machine: M }); remoteCards(1);
+  g.__files[LEDGER] = tasksWith([t1]);
+  g.__layout = panelLayout("project-agent");
+  const v = await mount(); await settle();
+  const old = keys();
+  g.__files[LEDGER] = tasksWith([hiddenTask]);
+  g.__layout = panelLayout("changes"); advance(12000); v.reload(cx); await settle();
+  const hid = keys();
+  check(hid !== old && /w9/.test(hid), `hidden wrote the newer ledger (${old} -> ${hid})`);
+  g.__hang = [LEDGER];
+  g.__layout = panelLayout("project-agent"); advance(12000); v.reload(cx); await settle();
+  for (let t = 0; t < 12; t++) await step(1000);
+  check(!v.loads[RS], "ended");
+  check(v.data?.ledger?.tasks?.[0]?.id === "t-1" && /ledger\.json: timed out/.test(look(v).text), "the last known tasks are shown, with the error");
+  check(keys() === hid, `the keys keep the hidden refresh's ledger (hidden ${hid}, now ${keys()})`);
+};
+cases["P3-hidden-then-unknown-cards"] = async () => {
+  const open = () => g.__shared["project-agent.open"]?.[RS];
+  world({ machine: M }); remoteCards(1);
+  g.__layout = panelLayout("project-agent");
+  const v = await mount(); await settle();
+  check(open() === 1, `first load: 1 (got ${open()})`);
+  remoteCards(3);
+  g.__layout = panelLayout("changes"); advance(12000); v.reload(cx); await settle();
+  check(open() === 3, `hidden: 3 (got ${open()})`);
+  g.__execHang = [`${M}:batch`, `${M}:ls`];
+  g.__layout = panelLayout("project-agent"); advance(12000); v.reload(cx); await settle();
+  for (let t = 0; t < 25; t++) await step(1000);
+  check(!v.loads[RS], "ended");
+  check(/the last known are shown/.test(look(v).text), "the last known cards are shown");
+  check(open() === 3, `the count keeps the hidden refresh's 3 (got ${open()})`);
+};
+cases["P3-filled-not-kept"] = async () => { // filled from what is shown (no kept entry): the kept entry takes none of it
+  world({ machine: M }); remoteCards(1);
+  g.__files[LEDGER] = tasksWith([t1]);
+  g.__layout = panelLayout("project-agent");
+  const v = await mount(); await settle();
+  v.cache.clear();
+  g.__hang = [LEDGER]; g.__execHang = [`${M}:batch`, `${M}:ls`];
+  advance(12000); v.reload(cx); await settle();
+  for (let t = 0; t < 40; t++) await step(1000);
+  check(!v.loads[RS], "ended");
+  check(v.data?.ledger?.tasks?.[0]?.id === "t-1" && v.cards.length === 1, `shown: the last known tasks and cards (${JSON.stringify(v.data?.ledger)}, ${v.cards.length})`);
+  const k = v.cache.get(RS);
+  check(k && (k.data.unknown ?? []).includes("ledger"), `kept: the ledger unknown (got ${JSON.stringify(k?.data?.unknown)})`);
+  check(k && k.cardsUnknown === true, `kept: the cards unknown (got ${k?.cardsUnknown})`);
+};
+
 const pick = process.argv.slice(2);
 let failed = 0;
 for (const [name, fn] of Object.entries(cases)) {
