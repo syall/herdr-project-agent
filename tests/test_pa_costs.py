@@ -2337,6 +2337,48 @@ class F2_SharedFolder(Collecting):
         self.assertIn("claude session for t6 not found", load(self.costs("state.json"))["problems"])
 
 
+class F3_SubagentTurn(Collecting):
+    """Item 3 (REVIEW-4 RL4-1): a Project Agent's subagent rows are attributed by the parent turn open at their first call."""
+    sub_lines, nested = PC_Subagents.sub_lines, PC_Subagents.nested
+
+    def j(self, t, trigger, task, pass_):
+        self.journal({"at": iso(t), "by": "agent", "trigger": trigger, "task": task, "pass": pass_})
+
+    def sub_rows(self):
+        return [r for r in self.rows() if r.get("sub")]
+
+    def test_f3_pass_journaled_long_after_the_subagent_ended(self):
+        self.record(session=SID, kind="pa", terminal="t0", parent=None)
+        self.add(self.prompt(T0 + 1), self.call(T0 + 2, "p1", lines=1, out=10), self.call(T0 + 500, "p2", lines=1, out=10))
+        fx.append(self.nested("agent-a1"), self.sub_lines(T0 + 10, "s1", 100))
+        self.collect(T0 + 700)  # the subagent has been idle 10 min; the parent's turn goes on
+        self.assertEqual(self.sub_rows(), [])
+        self.add(self.call(T0 + 1000, "p3", lines=1, out=10))
+        self.j(T0 + 1800, "report", "t-001", 3)  # the pass journals 30 min after the subagent ended
+        self.add(self.prompt(T0 + 2400), self.call(T0 + 2402, "p4", lines=1, out=10))
+        self.j(T0 + 2410, "message", "t-002", 4)
+        self.collect(T0 + 2500)
+        self.collect(T0 + 2700)
+        self.collect(T0 + 4000)
+        subs = self.sub_rows()
+        self.assertEqual([(r["activity"], r["task"], r["pass"], r["turn"]) for r in subs], [("pass:report", "t-001", 3, isoms(T0 + 1))])
+        self.assertEqual(self.totals()["out"], 140)
+        parent = {r["turn"]: r for r in self.rows() if not r.get("sub")}
+        self.assertEqual((parent[isoms(T0 + 1)]["activity"], parent[isoms(T0 + 2400)]["activity"]), ("pass:report", "pass:message"))
+
+    def test_f3_a_subagent_in_the_second_turn_takes_that_turn(self):
+        self.record(session=SID, kind="pa", terminal="t0", parent=None)
+        self.add(self.prompt(T0 + 1), self.call(T0 + 2, "p1", lines=1, out=10))
+        self.j(T0 + 5, "report", "t-001", 3)
+        self.add(self.prompt(T0 + 100), self.call(T0 + 102, "p2", lines=1, out=10))
+        fx.append(self.nested("agent-a1"), self.sub_lines(T0 + 110, "s1", 100))
+        self.j(T0 + 1500, "decision", "t-002", 4)
+        self.add(self.prompt(T0 + 1600), self.call(T0 + 1602, "p3", lines=1, out=10))
+        self.collect(T0 + 5000)
+        self.collect(T0 + 5200)
+        self.assertEqual([(r["activity"], r["task"], r["pass"]) for r in self.sub_rows()], [("pass:decision", "t-002", 4)])
+
+
 ABSENT = object()
 
 
