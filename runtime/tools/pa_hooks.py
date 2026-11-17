@@ -292,6 +292,9 @@ def _hook_guard(data, _args):
                                          extra_rows=lambda: pa_guard.profile_rows(profile), cwd=starts)
         if refusal:
             block(refusal)
+        refusal = pa_guard.check_writes(command, os.path.join(pa.ROOT, "spaces"), cwd=starts, home=pa.ROOT)  # t-016
+        if refusal:
+            block(refusal)
     else:
         path = tool_input.get("file_path") or tool_input.get("path") or tool_input.get("notebook_path") or ""
         for pattern, what in DENY_PATHS + extra_paths:

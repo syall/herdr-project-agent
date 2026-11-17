@@ -11,12 +11,13 @@ in-process: no subprocess, no files read except to resolve links and to see whet
 
   check_command(line, pa_address, own_address, extra_rows, cwd) -> None (allowed) or the refusal
   check_edit(path, spaces_dir, cwd, home)                       -> None (allowed) or the refusal
+  check_writes(line, spaces_dir, cwd, home)                     -> None (allowed) or the refusal
   profile_rows(profile)                                         -> the profile's "guardAllow" rows, checked
 
 This is a fence for agents that follow their rules, not a sandbox: a program the worker writes itself can
-still start git, and a Bash command that names a file (inside .git, the Project Agent's state, the git
-settings) is not checked for it; only the editor tools are (card d-048: a Bash path rule is a later task).
-The rules it backs are in worker.md.
+still start git. A Bash command that plainly writes (a redirect, or a file command of file_targets' table)
+into the paths check_edit protects is refused, evidence folder excepted (t-016); reads, lines that are not
+plain, and programs that write files themselves are not judged. The rules it backs are in worker.md.
 """
 import os
 import re
@@ -40,6 +41,15 @@ PERSON_MSG = ("Refused by the Project Agent's allowlist: {}. pa-push-main and pa
               "main branch is pushed only when the person answers a push card in the panel. Say in your report that the "
               "work is ready to release. There is no override.")
 SHOWN = 300  # longest command or path quoted back in a message
+WRITE = ("Refused by the Project Agent's guard: this command writes to {target}, which is inside a .git folder or the Project "
+         "Agent's files. Change git state with the allowed git commands only; write reports, logs and notes in your task's "
+         "evidence folder (evidence/<task-id>/ in the Project Agent's state folder). If the write is needed, stop and report "
+         "to the Project Agent with hc send. There is no override.")  # t-016, check_writes
+FOLDER_UNKNOWN = ("Refused by the Project Agent's guard: after {word} the folder is not known, so the write to {target} cannot "
+                  "be checked. Write the target as a full path, or run the cd as a command of its own first. There is no "
+                  "override.")
+HOME_VAR = re.compile(r"\$(?:HOME(?![A-Za-z0-9_])|\{HOME\})")
+REDIRECT = re.compile(r"(?:>&(?:\d+|-)|<&\d+)(?=[ \t;&|]|$)|&>>|&>|>>|>|<")  # a duplication first: it has no target
 
 
 # ---- R1: the plain form --------------------------------------------------------------------------
@@ -50,7 +60,7 @@ def split_plain(line):
     return None if scanned is None else scanned[0]
 
 
-def split_plain_ops(line):
+def split_plain_ops(line, writes=False):
     """(commands, operators) of a plain line: operators[i] is the ; && || | after commands[i] (None after the last).
     None when the line is not plain.
 
@@ -58,6 +68,9 @@ def split_plain_ops(line):
     Not plain: $ and backticks (outside single quotes), < >, a lone &, |&, ( ) { } (except the @{...} of
     stash@{0} and HEAD@{1}), unquoted glob characters * ? [, a # or = starting a word, an unquoted line
     break or line continuation, an unterminated quote, an empty command between operators.
+    writes=True (t-016): also plain are > >> < &> &>> (an fd's digits before them dropped), each followed by a word, and
+    >&N N>&M >&- <&N; $HOME or ${HOME} starting a word (bare or in double quotes) is the home. Returns (commands,
+    operators, targets): targets[i] the words after commands[i]'s output redirects (an input's word is a read).
     """
     s = line.strip()
     commands, ops, words, word = [], [], [], []
@@ -80,6 +93,10 @@ def split_plain_ops(line):
                 if c == '"':
                     i += 1
                     break
+                if writes and c == "$" and not word and HOME_VAR.match(s, i):
+                    word.append(os.path.expanduser("~"))
+                    i = HOME_VAR.match(s, i).end()
+                    continue
                 if c in "$`":
                     return None
                 if c == "\\" and i + 1 < n and s[i + 1] in '$`"\\\n':
@@ -100,6 +117,19 @@ def split_plain_ops(line):
                 words.append("".join(word))
             word, has_word = [], False
             i += 1
+        elif writes and (c in "<>" or s.startswith("&>", i)):
+            if has_word and not (c != "&" and "".join(word).isdigit() and s[i - 1].isdigit()):
+                words.append("".join(word))  # else the word is the fd: dropped
+            word, has_word = [], False
+            m = REDIRECT.match(s, i)
+            i = m.end()
+            if m.group(0)[-1] not in "-0123456789":  # a duplication has no word
+                if i < n and s[i] in "<>|&":
+                    return None  # << <<< <> >| >&word
+                words.append(("<",) if m.group(0) == "<" else (">",))  # a mark: the next word is its target
+        elif writes and c == "$" and not word and HOME_VAR.match(s, i):
+            word.append(os.path.expanduser("~"))
+            has_word, i = True, HOME_VAR.match(s, i).end()
         elif c in ";&|":
             if has_word:
                 words.append("".join(word))
@@ -141,7 +171,16 @@ def split_plain_ops(line):
         ops.append(None)
     elif pending_op not in (None, ";"):
         return None
-    return commands, ops
+    if not writes:
+        return commands, ops
+    targets = []
+    for k, words in enumerate(commands):  # each mark takes the word after it out of the command's words
+        marks = [j for j, w in enumerate(words) if isinstance(w, tuple)]
+        if any(j + 1 == len(words) or j + 1 in marks for j in marks) or len(words) == 2 * len(marks):
+            return None  # a redirect without its word, or a command of redirects only
+        targets.append([words[j + 1] for j in marks if words[j] == (">",)])
+        commands[k] = [w for j, w in enumerate(words) if j not in marks and j - 1 not in marks]
+    return commands, ops, targets
 
 
 # ---- R2: involves git, gh or hc ------------------------------------------------------------------
@@ -876,4 +915,59 @@ def check_edit(path, spaces_dir, cwd=None, home=None):
         given = os.path.normpath(os.path.join(start, os.path.expanduser(path)))
         if protected(given, tops):
             return OFF_TABLE.format(shown(path))
+    return None
+
+
+def operands(args):  # t-016, the Bash write rule: words not starting with -, every word after --; empty words skipped
+    return [a for j, a in enumerate(args) if a and (not a.startswith("-") or "--" in args[:j])]
+
+
+def file_targets(words):
+    """The words a listed file command writes (spec section 3); [] for any other program, a launcher included."""
+    p, args = program(words[0]), words[1:]
+    if p in ("cp", "ln", "install", "rsync", "mv"):  # rsync: -t is --times, so its last operand only
+        named = [a.split("=", 1)[1] for a in args if a.startswith("--target-directory=")]
+        if p not in ("rsync", "mv"):
+            named += [a[2:] for a in args if a.startswith("-t") and a != "-t"] + [b for a, b in zip(args, args[1:]) if a == "-t"]
+        return named + operands(args) if p == "mv" or p == "install" and "-d" in args else named or operands(args)[-1:]
+    if p in ("rm", "rmdir", "unlink", "touch", "mkdir", "tee", "truncate", "chmod", "chown", "chgrp"):
+        return operands(args)
+    if p == "dd":
+        return [a[3:] for a in args if a.startswith("of=")]
+    sed, script = p == "sed" and any(a.startswith(("-i", "--in-place")) for a in args), ("-e", "-f", "--expression", "--file")
+    if not sed and not (p == "perl" and any(short_cluster(a, "i") for a in args)):
+        return []  # sed or perl without in-place: reads
+    values = [j + 1 for j, a in enumerate(args) if (a in script if sed else a[-1:] in ("e", "E") and short_cluster(a, a[-1]))]
+    rest = operands([a for j, a in enumerate(args) if j not in values])
+    return rest if values or sed and any(a.startswith(script) for a in args) else rest[1:]  # else the first is the script
+
+
+def folder_change(words, here, cdpath):
+    """A cd or pushd adds its folder to here (it only grows); returns the words that make the folder unknown (R4), or None."""
+    p, args, found = program(words[0]), words[1:], operands(words[1:])
+    t = found[0] if found else "~"
+    if (p == "popd" or p in ("builtin", "command") and args and program(args[0]) in ("cd", "pushd", "popd")
+            or p in ("cd", "pushd") and ("-" in args or len(found) > 1 or p == "pushd" and not found
+                                         or t.startswith("~") and t != "~" and not t.startswith("~/")
+                                         or cdpath and not t.startswith((".", "/", "~")))):
+        return " ".join(words)
+    if p in ("cd", "pushd"):  # joined to each folder; an absolute one stays as it is
+        here[:] = list(dict.fromkeys(here + [os.path.normpath(os.path.join(h, os.path.expanduser(t))) for h in here]))
+    return None
+
+
+def check_writes(line, spaces_dir, cwd=None, home=None):
+    """None when a plain Bash line writes nothing check_edit protects; else WRITE or FOLDER_UNKNOWN (spec t-016)."""
+    scanned = split_plain_ops(line or "", writes=True) or ([], None, [])  # a line that is not plain is not judged
+    tops = (forms(spaces_dir), forms(home), personal_settings())
+    here, cdpath, unknown = list(starts_of(cwd)), bool(os.environ.get("CDPATH")), None
+    for words, outs in zip(scanned[0], scanned[2]):
+        words = words[next(k for k, w in enumerate(words) if k == len(words) - 1 or not ASSIGN.match(w)):]
+        for t in [t for t in outs + file_targets(words) if t and (t[:1] != "~" or t == "~" or t.startswith("~/"))]:
+            full = os.path.expanduser(t)  # ~x forms other than ~ and ~/ are skipped
+            if not os.path.isabs(full) and unknown:
+                return FOLDER_UNKNOWN.format(word=shown(unknown), target=shown(t))
+            if any(protected(os.path.normpath(os.path.join(h, full)), tops) for h in here):  # absolute: full itself
+                return WRITE.format(target=shown(t))
+        unknown = unknown or folder_change(words, here, cdpath)
     return None
