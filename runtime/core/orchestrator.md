@@ -158,7 +158,7 @@ Run `hc --skill` once to learn `hc`. Start workers with the profile's commands (
   must be able to keep talking to you. A worker's report arrives later as a message and
   starts your next pass; the scheduled pass catches a worker that went quiet.
 
-- The handoff states the task id and goal, the scope (what it may and may not touch),
+- The handoff states the task id, goal and tier, the scope (what it may and may not touch),
   the phase and its artifact (see `sdlc.md`), the verification points, the must-fix
   bar and the stop rule (see Rounds), the evidence folder, and ends: "Report with
   `hc send <your address>` when done or stuck." Use your real address; a worker's
@@ -195,6 +195,8 @@ Run `hc --skill` once to learn `hc`. Start workers with the profile's commands (
   full. Any tier: a recheck is full when the fix touches files outside the previous fix's
   diff and outside the task's plan, rewrites more than half of a file the task changed,
   or follows a rebase with conflicts. The handoff names the base and says full or diff.
+  Decide the full cases from the build or fix worker's report (`worker.md`, build role);
+  in round 2 the previous fix's diff is the diff of round 1's build.
 - Checks by tier (`sdlc.md`): low tier gets one `check` worker; normal a verifier and a
   reviewer; high a verifier and two reviewers on its full checks. Size the verifier's
   brief by tier: low, the full suite once, the diff, at most 5 mutations on changed
