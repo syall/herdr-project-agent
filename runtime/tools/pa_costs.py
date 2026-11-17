@@ -2189,6 +2189,11 @@ def record_launch(directory, space, kind, argv, command, walked):
     return command
 
 
+def record_closed(directory, terminal, by):
+    """pa-worker close: the worker in `terminal` ended (the collector then stops looking at its file once read)."""
+    return append_session(directory, {"v": 1, "ev": "closed", "at": pa.now(), "terminal": terminal, "by": by})
+
+
 def record_agent_start(directory, agent, address, project, model, resume):
     """pa-session: one start record per start and resume of the Project Agent's own session."""
     return append_session(directory, {

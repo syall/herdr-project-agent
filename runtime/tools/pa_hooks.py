@@ -87,6 +87,8 @@ DENY_COMMANDS = [
     (r"\b(npm|pnpm|yarn)\s+publish\b|\bcargo\s+publish\b|\btwine\s+upload\b", "publishing a package"),
     (r"\bterraform\s+(apply|destroy)\b|\bkubectl\s+(apply|delete|rollout)\b|\bcdk\s+(deploy|destroy)\b|\bhelm\s+(install|upgrade|uninstall)\b", "a deploy or infrastructure change"),
     (r"(^|[\s'\"=/])\.env(\.[\w.-]+)?(\s|$|['\"])|~/\.ssh\b|/\.ssh/|\bid_(rsa|ed25519|ecdsa)\b", "reading secrets"),
+    # t-009 R15: billed amounts come only from the person (quotes and backslashes between the words do not hide it)
+    (r"\bpa-costs['\"\s\\]+billed['\"\s\\]+(fetch|enable|import)\b", "the person's billing command (pa-costs billed fetch, enable or import)"),
 ]
 DENY_PATHS = [(r"(^|/)\.env(\.[^/]*)?$", "an environment file with secrets"), (r"(^|/)\.ssh(/|$)", "SSH keys"),
               (r"(^|/)(credentials|\.netrc|\.npmrc|\.pypirc)$", "a credentials file")]
@@ -1362,6 +1364,12 @@ def end_worker(directory, ledger, task, entry, address, info, report, by, trigge
     name = entry.get("name") or "unnamed"
     append_journal(directory, {"by": actor or by, "trigger": trigger, "task": task.get("id"),
                                "why": why or "closed worker {} ({}) after reading its report {}".format(address, name, report)})
+    costs = pa.costs_module()  # t-009: one closed event for the space's costs; never changes what close does
+    if costs:
+        try:
+            costs.record_closed(directory, address, "pa-worker close" + (" --card" if trigger == "leftovers" else ""))
+        except Exception:  # noqa: BLE001
+            pass
     return "Closed worker {} ({}, task {}); its worktree and branch are untouched.{}".format(address, name, task.get("id"), note)
 
 
