@@ -1478,6 +1478,18 @@ cases["A6-times-out"] = async () => { // V1.6: by itself after 10 s; still armed
   check(armedText(v) && deletes().length === 0, "one click after the time-out arms again and deletes nothing");
 };
 
+cases["A7-default-tasks-view"] = async () => { // V1.1: the Tasks view shown by default (no open cards, no tab clicked) arms and deletes as well
+  world();
+  g.__files[`:${DIR}/ledger.json`] = JSON.stringify({ tasks: [{ id: "t-1", title: "One", state: "in-progress" }] });
+  const v = await mount();
+  check(v.view === null, "no view picked");
+  await press(v, "task-head-t-1");
+  await press(v, "delete-t-1");
+  check(armedText(v), "one click arms");
+  await press(v, "delete-t-1");
+  check(deletes().length === 1, `the second click deletes (got ${JSON.stringify(deletes())})`);
+};
+
 const pick = process.argv.slice(2);
 let failed = 0;
 for (const [name, fn] of Object.entries(cases)) {
