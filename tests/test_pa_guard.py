@@ -1231,6 +1231,58 @@ class SplitFix_PipeIntoShell(Split):
                 self.assertEqual(self.at(line), OFF_TABLE.format(shown_part))
 
 
+class PipeFix_PipeIntoShell(Split):
+    """VERIFY-5 V5-1, REVIEW-8 I-1, I-2, M2: after a |, a known text filter is allowed whatever its arguments say; a
+    launcher is judged by the program it starts; for any other program a later word naming a shell refuses the line,
+    as at b43e3e5. source and . count only as the program word or the launched program word."""
+
+    def test_shell_after_a_program_the_guard_does_not_know(self):
+        for part in ["caffeinate sh", "caffeinate -i bash", "FOO=1 caffeinate sh", "setsid bash",
+                     "arch -arm64 bash", "ionice -c3 sh", "doas sh", "script -q /dev/null sh", "busybox sh",
+                     "chrt -b 0 zsh", "unbuffer -p bash"]:
+            with self.subTest(part=part):
+                self.assertEqual(self.at("git show HEAD:x.sh | " + part), OFF_TABLE.format(part))
+
+    def test_launchers_judge_the_program_they_start(self):
+        for part in ["nohup bash", "time bash", "timeout 5 bash", "nice -n 10 sh", "env -i PATH=/bin bash",
+                     "xargs -I% sh -c x", "nohup caffeinate sh", "command . /dev/stdin", "builtin source /dev/stdin",
+                     "time source /dev/stdin"]:
+            with self.subTest(part=part):
+                self.assertEqual(self.at("git show HEAD:x.sh | " + part), OFF_TABLE.format(part))
+
+    def test_filters_whatever_their_arguments(self):
+        for line in ["git log | grep bash", "git ls-files | xargs ls -d .", "git ls-files | xargs grep -l source",
+                     "git ls-files | xargs -0 grep -l bash", "git log | rg -w sh", "git log | head -n 3 sh",
+                     "git log | tail -n 2 bash", "git ls-files | wc -l bash", "git log | sort -k 2 zsh",
+                     "git log | uniq -c sh", "git log | cut -d ' ' -f 1 bash", "git log | tr a-z A-Z",
+                     "git log | tee bash.log sh", "git show HEAD:x.sh | cat - bash", "git log | less bash",
+                     "git log --format=%s | jq -R .", "git log | column -t sh", "git ls-files | grep -l source",
+                     "git log | nohup grep sh", "git log | timeout 5 grep bash",
+                     "git log | timeout -k 5 10s grep bash", "git log | nice -n 10 grep sh", "git log | xargs -n 1 grep sh", "git ls-files | env LC_ALL=C sort .",
+                     "git log | time wc -l", "git ls-files | caffeinate ls -d ."]:
+            with self.subTest(line=line):
+                self.assertIsNone(self.at(line))
+
+    def test_reserved_word_before_a_shell(self):
+        self.assertEqual(self.at("git show HEAD:x.sh | ! bash"), OFF_TABLE.format("'!' bash"))
+
+    def test_option_value_named_like_a_filter(self):
+        self.assertEqual(self.at("git show HEAD:x.sh | xargs -I grep bash -c x"), OFF_TABLE.format("xargs -I grep bash -c x"))
+
+    def test_assignment_before_a_shell(self):
+        self.assertEqual(self.at("git show HEAD:x.sh | FOO=1 bash"), OFF_TABLE.format("FOO=1 bash"))
+
+
+class PipeFix_WrapperTexts(Split):
+    """VERIFY-5 V5-6 (a), (b): the env -S prefix in a wrapped word, and message texts in a wrapped line."""
+
+    def test_env_split_prefix_joined(self):
+        self.assertEqual(self.at("env -SGIT_DIR=x make"), VARIABLE.format("GIT_DIR=x"))
+
+    def test_message_in_a_wrapped_line(self):
+        self.assertIsNone(self.at("bash -c 'make' && git commit -m 'set GIT_DIR=x later; ok'"))
+
+
 class Split_Texts(GuardTest):
     """VERIFY-3 N1: the R12 text is pinned."""
 
