@@ -1284,6 +1284,30 @@ cases["P-notes-per-space"] = async () => { // REVIEW-2 N3: a note typed on one s
   check(a.includes("for A"), `A's note is still there (got ${JSON.stringify(a)})`);
 };
 
+cases["P-hung-agent-json-keeps-keys"] = async () => { // I1 / round-1 verifier N5: a timed-out agent.json writes no shared key, not even from the kept data
+  goodRemote();
+  const v = await mount(); await settle();
+  g.__shared["project-agent.worktrees"] = { [RS]: [{ task: "t-7", path: "/wt/7", title: "newer" }] }; g.__shared["project-agent.open"] = { [RS]: 4 }; // written since (a hidden refresh)
+  const before = snap();
+  g.__hang = [`${M}:${RDIR}/agent.json`];
+  advance(12000); v.reload(cx); await settle(); await step(10000); await settle();
+  check(!v.loads[RS] && /agent\.json: timed out/.test(look(v).text), "timed out");
+  check(snap() === before, `the keys as they were (before ${before}, after ${snap()})`);
+};
+
+cases["P-unknown-profile-hidden"] = async () => { // I1 with AC8.5: a full load whose profile never answered leaves the main branches; while hidden they are not cleared from it, and the profile is read
+  goodRemote();
+  g.__shared["project-agent.mainBranches"] = { [RS]: ["kept"] }; // written by another copy
+  g.__hang = [PROFILE];
+  g.__layout = panelLayout("project-agent");
+  const v = await mount(); await settle();
+  for (let t = 0; t < 12; t++) await step(1000);
+  check(!v.loads[RS] && JSON.stringify(g.__shared["project-agent.mainBranches"]?.[RS]) === '["kept"]', `full load: left (got ${JSON.stringify(g.__shared["project-agent.mainBranches"])})`);
+  g.__hang = []; g.__layout = panelLayout("changes");
+  advance(12000); v.reload(cx); await settle(); await step(1000);
+  check(JSON.stringify(g.__shared["project-agent.mainBranches"]?.[RS]) === '["trunk"]', `hidden: the profile is read and written, never cleared (got ${JSON.stringify(g.__shared["project-agent.mainBranches"])})`);
+};
+
 const pick = process.argv.slice(2);
 let failed = 0;
 for (const [name, fn] of Object.entries(cases)) {
