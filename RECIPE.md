@@ -120,6 +120,14 @@ A new space opens with a 600 x 440 dialog: a Project Agent card (`Set up for <fo
   fill is not drawn.
 - One copy of the mod does the sending and the tab keeping (a lease in `project-agent.timer`,
   taken over after 50 s of silence); after a reload the tab is unguarded for up to that long.
+- Loading a space: agent.json, then the ledger, profile, schedule and pass request together (the
+  header and tasks show), then the cards, rules, evidence and stale instructions together. On another
+  machine all cards come from one `sh` call; if it fails, they are read one by one in parallel. Each
+  remote read gives up after 10 s, and a load still pending after 11 s is given up. The last load of
+  each space (8 at most, in memory) shows at once when the space is shown again, and refreshes.
+- While the panel is not the side panel's shown view (the `layout()` test the tabs mod uses), it
+  reads only the open-card count (one card read per space per 10 s). New-card notices come from the
+  timer copy and do not depend on it. The other shared keys are refreshed only while it is shown.
 - Scheduled passes need Herdr's window open. The minimum cadence is 5 minutes. Rule fields are
   single-line inputs.
 - Without the runtime in `~/.config/herdr-pa` every space shows "no Project Agent".

@@ -148,7 +148,8 @@ A profile is a folder in `~/.config/herdr-pa/profiles/<name>/` (`profile.json`, 
 profile lists its own terms in `profile.json` (`"coreCheck": ["..."]`), so this repo holds no such list.
 `herdr-app check mods/project-agent` loads the mod once.
 `tests/run-all.sh` runs this repo's tests (a Python 3.7 parse check, the unit tests in
-`tests/test_*.py`, a keeper harness and a panel render harness under Node, and a `pa-session` check
+`tests/test_*.py`, a keeper harness, a panel render harness and a store harness under Node (the last two
+simulate a slow or hung remote machine), and a `pa-session` check
 against a private hc core); `--affected` runs only the
 fast set. After updating, run `pa-sync --on <machine>` before installing the mod, so remote launchers
 get the new `pa-session` (see the install order above).
