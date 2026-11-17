@@ -1028,3 +1028,172 @@ class R_Reconstruct(Collecting):
         self.session(SID2, T0 + 130, cwd=self.wt)
         self.reconstruct()
         self.assertEqual(self.binds(), {})
+
+
+# ---- step 6: summary and report (R9 data, R10, R11) ------------------------------------------------------
+
+def money_of(entries):
+    return round(sum(e["money"] or 0 for e in entries), 6)
+
+
+def tokens_of(entries):
+    return sum(e["tokens"] for e in entries)
+
+
+class S_Summary(Collecting):
+    def mixed(self):
+        """A Project Agent with a split pass, a worker with a rebuild, a reconstructed session, an unpriced model."""
+        self.prices()
+        self.ledger({"version": 1, "tasks": [{"id": "t-001", "title": "One", "state": "in-progress", "workers": [{"address": "t5", "role": "build", "name": "t-001-build"}]},
+                                             {"id": "t-002", "title": "Two", "state": "done", "workers": []}]})
+        self.record(session=SID, kind="pa", terminal="t0", parent=None)
+        self.add(self.prompt(T0 + 10), self.call(T0 + 12, "p1", lines=2, out=1000, cr=50000), self.prompt(T0 + 100),
+                 self.call(T0 + 102, "p2", lines=1, out=500, cw5m=1000))
+        self.journal({"at": iso(T0 + 20), "trigger": "report", "task": "t-001", "pass": 1},
+                     {"at": iso(T0 + 21), "trigger": "report", "task": "t-002", "pass": 1})
+        self.record(session=SID2, kind="worker", terminal="t5", name="t-001-build", task="t-001", host="h2")
+        self.add(self.prompt(T0 + 30, sid=SID2), self.call(T0 + 31, "w1", sid=SID2, lines=3, out=3000, cr=100000, cw5m=40000),
+                 self.call(T0 + 700, "w2", sid=SID2, lines=1, out=200, cw5m=60000),  # a rebuild after 669 s idle
+                 fx.claude_assistant(isoms(T0 + 701), SID2, self.project, "w3", model="model-z", out=77), sid=SID2)
+        with open(self.costs("sessions.jsonl"), "a") as f:
+            f.write(json.dumps({"v": 1, "ev": "bind", "at": iso(T0), "session": SID3, "program": "claude", "kind": "worker",
+                                "task": "t-002", "name": "t-002-build", "terminal": "t4", "cwd": self.project,
+                                "source": "reconstructed", "match": "cwd+start", "confidence": "medium"}) + "\n")
+        self.add(fx.claude_user(isoms(T0 - 3600), SID3, self.project), self.call(T0 - 3590, "r1", sid=SID3, lines=1, out=4000, model="model-b"), sid=SID3)
+        self.collect(T0 + 5000)
+        return load(self.costs("summary.json"))
+
+    def test_s1_every_breakdown_sums_to_the_totals(self):
+        s = self.mixed()
+        total_tokens = sum(r["tokens"][k] for r in self.rows() for k in r["tokens"])
+        self.assertEqual(s["totals"]["tokens"]["all"], total_tokens)
+        money = s["totals"]["money"]
+        self.assertGreater(money, 0)
+        self.assertGreater(s["totals"]["unpricedTokens"], 0)
+        self.assertEqual(s["prices"]["missing"], ["model-z"])
+        groups = [s["byActivity"], s["byTask"], s["byPhase"], s["byDay"], s["sessions"]] + list(s["byKind"].values())
+        for g in groups:
+            self.assertAlmostEqual(money_of(g), money, places=4)
+            self.assertEqual(tokens_of(g), total_tokens)
+        self.assertAlmostEqual(round(sum(e["money"] or 0 for e in s["byDayModel"]), 6), money, places=4)
+        acts = {e["key"]: e for e in s["byActivity"]}
+        self.assertIn("cache-rebuild", acts)
+        self.assertEqual(acts["cache-rebuild"]["tokens"], 60000)
+        tasks = {e["key"]: e for e in s["byTask"]}
+        self.assertEqual((tasks["t-001"]["title"], tasks["t-001"]["state"]), ("One", "in-progress"))
+        self.assertTrue(tasks["t-001"]["split"])
+        self.assertGreater(s["totals"]["reconstructedMoney"], 0)
+        self.assertEqual({e["key"] for e in s["byKind"]["machine"]}, {"h1", "h2", "unknown"})
+        self.assertEqual(s["passes"][0]["pass"], 1)
+        self.assertEqual({x["state"] for x in s["sessions"]}, {"open"})
+        self.assertEqual(s["account"], "default")
+        self.assertEqual((s["prices"]["source"], s["prices"]["asOf"], s["prices"]["currency"]), ("test table", "2026-11-01", "USD"))
+        self.assertLessEqual(len(raw(self.costs("summary.json"))), 65536)
+
+    def test_s2_summary_stays_under_64_kb(self):
+        rows, recs = [], []
+        for i in range(1000):
+            sid = "{:08x}-0000-4000-8000-{:012x}".format(i, i)
+            day = T0 - (i % 120) * 86400
+            recs.append({"v": 1, "ev": "start", "at": iso(day), "session": sid, "program": "claude", "kind": "worker",
+                         "task": "t-{:03d}".format(i % 300), "name": "t-{:03d}-build".format(i % 300), "terminal": "t{}".format(i), "host": "h1"})
+            rows.append({"v": 1, "seq": i + 1, "session": sid, "program": "claude", "kind": "worker", "model": "model-a",
+                         "from": iso(day), "to": iso(day + 60), "day": iso(day)[:10], "calls": 3, "tokens": toks(out=1000 + i, cr=50000),
+                         "long": dict(ZERO), "rebuild": {"calls": 0, "cw5m": 0, "cw1h": 0, "gapS": 0}, "turn": iso(day),
+                         "task": "t-{:03d}".format(i % 300), "phase": "build", "activity": "build", "role": "build", "pass": None,
+                         "trigger": None, "split": None, "reason": None, "source": "recorded", "match": "launch-record", "confidence": "high"})
+        os.makedirs(os.path.join(self.dir, "costs"), exist_ok=True)
+        write(self.costs("sessions.jsonl"), "".join(json.dumps(r) + "\n" for r in recs))
+        write(self.costs("turns.jsonl"), "".join(json.dumps(r) + "\n" for r in rows))
+        self.prices()
+        pa_costs.write_summary(self.dir, now=T0)
+        s = load(self.costs("summary.json"))
+        self.assertLessEqual(len(raw(self.costs("summary.json"))), 65536)
+        self.assertLessEqual(len(s["byDay"]), 93)
+        self.assertLessEqual(len(s["sessions"]), 200)
+        self.assertAlmostEqual(money_of(s["byDay"]), s["totals"]["money"], places=3)
+
+    def test_rp1_report_text(self):
+        self.mixed()
+        _r, out, _e = self.run_cmd(pa_costs.report, self.dir, now=T0 + 5000)
+        for want in ("est.", "test table", "2026-11-01", "USD", "By activity", "cache-rebuild", "By task", "t-001", "includes", "reconstructed",
+                     "No price: model-z"):
+            self.assertIn(want, out)
+        _r, only, _e = self.run_cmd(pa_costs.report, self.dir, by="task", now=T0 + 5000)
+        self.assertIn("t-002", only)
+        self.assertNotIn("By activity", only)
+        _r, later, _e = self.run_cmd(pa_costs.report, self.dir, by="day", since="2026-11-17", now=T0 + 5000)
+        self.assertIn("2026-11-17", later)
+        self.assertNotIn("2026-11-16", later)
+        _r, earlier, _e = self.run_cmd(pa_costs.report, self.dir, by="day", until="2026-11-16", now=T0 + 5000)
+        self.assertIn("2026-11-16", earlier)
+        self.assertNotIn("2026-11-17", earlier)
+
+    def test_rp2_report_json_is_the_summary_shape(self):
+        s = self.mixed()
+        _r, out, _e = self.run_cmd(pa_costs.report, self.dir, as_json=True, now=T0 + 5000)
+        j = json.loads(out)
+        self.assertEqual(sorted(j), sorted(s))
+        self.assertAlmostEqual(j["totals"]["money"], s["totals"]["money"], places=4)
+
+    def test_rp3_no_price_table_is_tokens_only(self):
+        self.record(session=SID, task="t-001")
+        self.add(self.prompt(T0 + 1), self.call(T0 + 2, "m1", out=30))
+        self.collect(T0 + 2000)
+        s = load(self.costs("summary.json"))
+        self.assertIsNone(s["totals"]["money"])
+        self.assertIsNone(s["prices"]["source"])
+        _r, out, _e = self.run_cmd(pa_costs.report, self.dir, now=T0 + 2000)
+        self.assertIn("No price table in profile test: tokens only", out)
+
+    def test_aw1_account_wide_sums_spaces_with_the_same_account(self):
+        self.mixed()
+        other = os.path.join(pa.ROOT, "spaces", "sp2", "costs")
+        mine = load(self.costs("summary.json"))
+        dump(dict(mine, space="sp2"), os.path.join(other, "summary.json"))
+        dump(dict(mine, space="sp3", account="elsewhere"), os.path.join(pa.ROOT, "spaces", "sp3", "costs", "summary.json"))
+        _r, out, _e = self.run_cmd(pa_costs.report, self.dir, account_wide=True, now=T0 + 5000)
+        j = json.loads(out)
+        self.assertEqual((j["account"], sorted(j["spaces"])), ("default", ["sp1", "sp2"]))
+        self.assertAlmostEqual(sum(e["money"] or 0 for e in j["byDayModel"]), 2 * money_of(mine["byDayModel"]), places=3)
+
+    def test_t1_collect_with_nothing_new_is_cheap(self):
+        for i in range(50):
+            sid = "{:08x}-1111-4111-8111-1111abcd{:04x}".format(i, i)
+            self.record(session=sid, task="t-001", terminal="t{}".format(i))
+            self.add(self.prompt(T0 + 1, sid=sid), self.call(T0 + 2, "m{}".format(i), sid=sid, lines=2, out=5), sid=sid)
+        self.collect(T0 + 2000)
+        self.opened[:] = []
+        best = None
+        for _ in range(3):
+            began = time.time()
+            self.collect(T0 + 2010)
+            took = time.time() - began
+            best = took if best is None else min(best, took)
+        self.assertLess(best, 0.2 * 5)
+        self.assertEqual({os.path.basename(p) for p in self.opened}, {"state.json", "sessions.jsonl"})
+
+    def test_rs1_resummarize_reprices_without_reading_session_files(self):
+        self.mixed()
+        before = load(self.costs("summary.json"))["totals"]["money"]
+        t = json.loads(json.dumps(PRICES))
+        for e in t["models"].values():
+            for k in ("in", "out", "cw5m", "cw1h", "cr"):
+                e[0][k] *= 2
+        self.prices(t)
+        self.opened[:] = []
+        self.collect(T0 + 5001, resummarize=True)
+        self.assertAlmostEqual(load(self.costs("summary.json"))["totals"]["money"], 2 * before, places=4)
+        self.assertFalse([p for p in self.opened if p.startswith(pa.CLAUDE_HOME) or p.startswith(_HOMES["CODEX_HOME"])])
+
+    def test_n1_no_network_module(self):
+        import ast
+        with open(os.path.join(TOOLS, "pa_costs.py")) as f:
+            tree = ast.parse(f.read())
+        names = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                names.update(a.name.split(".")[0] for a in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                names.add((node.module or "").split(".")[0])
+        self.assertFalse(names & {"socket", "urllib", "http", "ssl", "ftplib", "smtplib", "requests"}, names)
