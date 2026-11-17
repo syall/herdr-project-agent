@@ -410,7 +410,9 @@ def git(path, *args, timeout=None):
 
 def worktree_facts(path, profile=None):
     """What deleting this folder would cost. None if it is not a worktree we know how to remove:
-    a linked git worktree, or the profile's own kind (a marker file plus status and remove scripts)."""
+    a linked git worktree, or the profile's own kind (a marker file plus status and remove scripts).
+    {"unreadable": <why>} when it is one but its state cannot be read (git status or the profile's
+    status script failed): never to be taken for gone or clean."""
     if not os.path.isdir(path):
         return None
     custom = (profile or {}).get("worktree") or {}
@@ -422,7 +424,7 @@ def worktree_facts(path, profile=None):
         except ValueError:
             facts = None
         if not facts:
-            return None
+            return {"unreadable": "the profile's worktree status script failed"}
         # "repos" (optional): the git repositories inside it, so its card can describe each one.
         repos = [os.path.realpath(r) for r in facts.get("repos") or [] if isinstance(r, str) and os.path.isabs(r)
                  and os.path.isdir(r) and inside(r, path)]
@@ -439,7 +441,7 @@ def worktree_facts(path, profile=None):
     _c, branch, _ = git(path, "rev-parse", "--abbrev-ref", "HEAD")
     _c, ahead, _ = git(path, "rev-list", "--count", "HEAD", "--not", "--remotes")
     if files is None:
-        return None
+        return {"unreadable": "git status failed"}
     return {"main": False, "repo": os.path.dirname(os.path.realpath(common)), "branch": branch,
             "uncommitted": len(files), "unpushed": int(ahead) if ahead.isdigit() else 0}
 
@@ -802,6 +804,8 @@ def cmd_worktree(args):
             still = tasks_still(row)
             if not facts:
                 print("{}: gone or not a git worktree ({})".format(task, row["path"]))
+            elif facts.get("unreadable"):
+                print("{}: could not read {} ({}); asked once it can be read".format(task, row["path"], facts["unreadable"]))
             elif facts.get("main"):
                 print("{}: {} is the project's main checkout; never removed".format(task, row["path"]))
             elif row["keep"]:
@@ -889,6 +893,8 @@ def cmd_worktree(args):
     if not facts:
         print("Already gone: " + row["path"])
         return
+    if facts.get("unreadable"):
+        raise pa.Problem("could not read {} ({}); nothing was removed".format(row["path"], facts["unreadable"]))
     if facts.get("main"):
         raise pa.Problem("{} is the project's main checkout; it is never removed".format(row["path"]))
     if row["keep"]:
@@ -899,16 +905,25 @@ def cmd_worktree(args):
     busy = [w["address"] for w in row["workers"] if w["fate"] == "live"] + row["others"]
     if busy:
         raise pa.Problem("still in use by {}; nothing was removed".format(", ".join(busy)))
-    if facts["uncommitted"] > (card.get("snapshot") or {}).get("uncommitted", 0):
-        raise pa.Problem("there are more uncommitted files now ({}) than when the person answered ({}); ask again".format(
-            facts["uncommitted"], (card.get("snapshot") or {}).get("uncommitted", 0)))
     snapshot = card.get("snapshot") or {}
-    if facts.get("removesBranches") and facts["unpushed"] > snapshot.get("unpushed", 0):
-        raise pa.Problem("there are more unpushed commits now ({}) than when the person answered ({}); ask again".format(
-            facts["unpushed"], snapshot.get("unpushed", 0)))
-    changed = changed_since_card(snapshot)
+    changed = None
+    if facts["uncommitted"] > snapshot.get("uncommitted", 0):
+        changed = "there are more uncommitted files now ({}) than when the person answered ({})".format(
+            facts["uncommitted"], snapshot.get("uncommitted", 0))
+    elif facts.get("removesBranches") and facts["unpushed"] > snapshot.get("unpushed", 0):
+        changed = "there are more unpushed commits now ({}) than when the person answered ({})".format(
+            facts["unpushed"], snapshot.get("unpushed", 0))
+    else:
+        changed = changed_since_card(snapshot)
     if changed:
-        raise pa.Problem(changed + "; ask again. Nothing was removed")
+        # The person answered about a worktree that is no longer the same: ask again with a fresh card.
+        why = "the worktree changed since the person answered {!r}: {}".format(card.get("answer"), changed)
+        card.update(status="withdrawn", previousAnswer=card.get("answer"), answer=None, answered=pa.now(),
+                    answeredBy="pa-worktree remove: withdrawn", note="Withdrawn by pa-worktree remove: " + why)
+        pa.write_json(card_path(directory, row["tasks"][0]), card)
+        append_journal(directory, {"by": "agent" if by_an_agent() else "person", "trigger": "worktree", "task": row["tasks"][0],
+                                   "why": "withdrew card {}: {}".format(card["id"], why)})
+        raise pa.Problem(changed + "; the card is withdrawn and the next `pa-worktree check --open-cards` asks again. Nothing was removed")
     print(remove_worktree(row["path"], facts) + " (card {})".format(card["id"]))
 
 
@@ -980,7 +995,7 @@ def worker_facts(directory, agent, profile, address):
     out.update(task=task.get("id"), title=task.get("title"), taskState=task.get("state"), role=entry.get("role"),
                onlyWorker=len(crew) == 1, keep=bool(entry.get("keep")), finished=bool(entry.get("finished")), closed=entry.get("closed"))
     row = next((r for r in worktree_state(directory, agent, profile).values() if task.get("id") in r["tasks"]), None)
-    if row and row["facts"] and not row["facts"].get("main"):
+    if row and row["facts"] and not row["facts"].get("main") and not row["facts"].get("unreadable"):
         others = [w["address"] for w in row["workers"] if w["fate"] == "live" and w["address"] != address] + row["others"]
         out["worktree"] = {"path": row["path"], "kind": row["facts"].get("kind", "worktree"), "uncommitted": row["facts"]["uncommitted"],
                            "unpushed": row["facts"]["unpushed"], "removesBranches": bool(row["facts"].get("removesBranches")),
@@ -1045,13 +1060,17 @@ def worker_label(address, entry, info):
 
 
 def worker_start(entry, info):
-    """When the worker started (epoch seconds): the ledger's `started`, else hc's created_ms; None if unknown."""
+    """When the worker started (epoch seconds): the later of the ledger's `started` (the agent writes it) and
+    hc's created_ms (hc records it), so a wrong early `started` cannot make an older file count; None if neither."""
+    known = []
     if entry.get("started"):
         stamp = pa.parse_time(str(entry["started"]))
         if stamp:
-            return stamp
+            known.append(stamp)
     created = (info or {}).get("created_ms")
-    return created / 1000.0 if isinstance(created, (int, float)) and created > 0 else None
+    if isinstance(created, (int, float)) and created > 0:
+        known.append(created / 1000.0)
+    return max(known) if known else None
 
 
 def iso(epoch):
@@ -1137,6 +1156,9 @@ def worktree_refusal(task, profile, info=None):
             why = ("the profile's worktree status script failed" if custom.get("marker") and os.path.exists(os.path.join(path, custom["marker"]))
                    else "not a git worktree")
             return ("unreadable", "cannot tell whether {} holds uncommitted work ({}); nothing was closed".format(path, why)), checked, unseen
+        if facts.get("unreadable"):
+            return ("unreadable", "cannot tell whether {} holds uncommitted work ({}); nothing was closed".format(
+                path, facts["unreadable"])), checked, unseen
         if facts.get("remove"):  # the profile's own kind: its script's count, and each repository it lists
             for repo in facts.get("repos") or []:
                 refusal = uncommitted_refusal(repo)
