@@ -82,7 +82,13 @@ export class RulesPane {
   button(t, id, label, onClick, tone, keepArm) {
     return div().id(id).flex_none().px(8).h(24).flex().items_center().rounded(6).border(1).border_color(t.border).text_size(11.5)
       .text_color(tone ?? t.foreground).cursor_pointer().hover((s) => s.bg(t.hover))
-      .on_mouse_down("left", (_e, cx) => cx.stop_propagation()).on_click((e, cx) => { if (!keepArm && this.armed) { this.armed = null; cx.notify(); } onClick(e, cx); }).child(label);
+      .on_mouse_down("left", (_e, cx) => { cx.stop_propagation(); if (!keepArm) this.drop(cx); })
+      .on_click((e, cx) => { if (!keepArm) this.drop(cx); onClick(e, cx); }).child(label);
+  }
+
+  // Drops an armed Delete: on the press of a control that stops it (and on its click, for a click alone).
+  drop(cx) {
+    if (this.armed) { this.armed = null; cx.notify(); }
   }
 
   chip(t, text, color) {
@@ -118,7 +124,7 @@ export class RulesPane {
         .when(Boolean(rule.needsAttention), (el) => el.child(this.chip(t, "needs attention", t.blocked)))
         .child(div().flex_none().text_size(10.5).text_color(t.dim).child(String(rule.appliesTo ?? "all")))
         .when(on || rule.status === "off", (el) => el.child(div().id(`rule-toggle-${rule.id}`).flex_none().px(7).h(20).flex().items_center().rounded(10).text_size(10.5).font_semibold().cursor_pointer()
-          .bg(on ? t.done + "33" : t.raised).text_color(on ? t.done : t.dim).on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+          .bg(on ? t.done + "33" : t.raised).text_color(on ? t.done : t.dim).on_mouse_down("left", (_e, cx) => { cx.stop_propagation(); this.drop(cx); })
           .on_click((_e, cx) => { cx.stop_propagation(); this.armed = null; this.setStatus(space, cx, rule.id, on ? "off" : "active", on ? "turned off" : "turned on"); }).child(on ? "On" : "Off")))
         .when(!on && rule.status !== "off", (el) => el.child(this.chip(t, rule.status, tone))))
       .when(open, (el) => el.child(v_flex().px(10).pb(9).gap(6).text_size(12).text_color(t.muted)

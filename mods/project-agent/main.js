@@ -647,8 +647,9 @@ export default class ProjectAgent extends View {
             .child(div().size(6).rounded(3).bg(term ? t[term.status] ?? t.idle : t.dim))
             .child(term ? `${label} ↗` : w.finished ? `${label} (closed)` : `${label} (ended)`)
             // The × opens the delete dialog: the person's way to close any worker (the agent closes finished ones itself).
+            // It stops the press, so it drops an armed Delete itself (the root never sees this press).
             .child(div().id(`worker-x-${task.id}-${i}`).flex_none().px(3).text_color(t.dim).cursor_pointer().hover((s) => s.text_color(t.blocked))
-              .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+              .on_mouse_down("left", (_e, cx) => { cx.stop_propagation(); if (this.armed || this.rules.armed) { this.disarm(); cx.notify(); } })
               .on_click((_e, cx) => { cx.stop_propagation(); openOverlay({ mod: "project-agent", kind: "dialog", width: 540, height: 400, props: { deleteWorker: { space: space.id, machine: space.machine ?? null, address, name: w.name ?? label } } }); })
               .child("×"));
         }))))
