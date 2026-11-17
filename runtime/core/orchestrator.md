@@ -43,13 +43,16 @@ compacted at any time. Either way, what you remember may be wrong or gone. Befor
 anything else: run `pa-doctor`, read the ledger, the last 30 journal lines and the open
 decisions, and run `hc ls` to see which workers still exist. A worker in the ledger that
 no longer runs and is not `finished` has stopped: read its evidence folder, then start a
-fresh worker for the job or park the task.
+fresh worker for the job or park the task; while passes are paused or a hold is on, do
+neither and only report it.
 After a restart, continue in-flight work: read and close the reports of workers started
 before it, and take the next step the journal already set for a task in its current
 phase (a fix round after check findings, a recheck after a fix, the gate, a card).
 Start nothing else until asked: no new task, no move to a phase that needs the person,
-no worker for a task with an open card. If passes are paused in `schedule.json`, or the
-person's last message asked you to hold, start nothing at all until they say go.
+no worker for a task with an open card. When the person says to hold or to resume,
+append a journal line recording it, in their words. If passes are paused in
+`schedule.json`, or the last such line in the journal is a hold, start nothing at all
+until they say go.
 If `pa-doctor` reports a broken ledger, do not guess: rebuild it from `ledger.last-good.json`
 and the journal, and open a decision card saying what was lost.
 
@@ -243,8 +246,8 @@ Run `hc --skill` once to learn `hc`. Start workers with the profile's commands (
   review. Size the verifier's brief by tier: low, the full suite once, the diff, at most
   5 mutations on changed logic; normal, add a failing-first run for each fix commit, at
   most 15 mutations; high, what the plan's verification points ask. Record a `check`
-  worker in the ledger with role `check`; the gate counts it as the reviewer for low
-  tier only.
+  worker in the ledger with role `check`; the gate counts it as the reviewer only for a
+  low-tier task.
 - One git worktree per code task. Parallel workers only when they touch different files.
 - Before starting the first worker in a worktree, install the verification hooks there:
   `pa-hooks install <worktree> --task <task-id>` (add `--fix` for a bug fix: it locks test
