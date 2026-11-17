@@ -161,7 +161,7 @@ export default class ProjectAgent extends View {
   // profile; with none kept, the profile is read once per session (readProfile). A failed read
   // changes nothing; one that ends after a newer one wrote, nothing.
   hiddenRead(cx, space) {
-    if (!this.cache.get(space.id)?.data?.agent) this.readProfile(cx, space);
+    if (!this.knownProfile(space.id)) this.readProfile(cx, space);
     const h = this.hidden[space.id], now = Date.now();
     if (h && (now - h.at < COUNT_EVERY || (h.busy && now - h.at < LOAD_LIMIT))) return;
     const mine = { at: now, busy: true, seq: ++this.seq };
@@ -182,12 +182,12 @@ export default class ProjectAgent extends View {
       }
       if (ledger && !ledger.timedOut && !ledger.error && ledger.value && typeof ledger.value === "object") {
         const known = this.cache.get(space.id)?.data ?? (this.space === space.id ? this.data : null);
-        this.share(space, { ledger: ledger.value, evidence: known?.evidence, profile: known?.profile }, { mains: Boolean(known?.agent) });
+        this.share(space, { ledger: ledger.value, evidence: known?.evidence, profile: known?.profile }, { mains: Boolean(known?.agent && !(known.unknown ?? []).includes("profile")) });
       }
     });
   }
 
-  // While hidden with no kept load: the space's profile, for "project-agent.mainBranches". Read once
+  // While hidden with no kept load whose profile answered: the space's profile, for "project-agent.mainBranches". Read once
   // per session once it has answered; a failed or timed-out read is tried again after PROFILE_RETRY.
   readProfile(cx, space) {
     const p = this.profiles[space.id] ??= {}, now = Date.now();
@@ -199,9 +199,12 @@ export default class ProjectAgent extends View {
       p.busy = false;
       if (!r.answered || p.done) return;
       p.done = true; p.profile = r.profile;
-      if (this.asleep && r.profile !== undefined && !this.cache.get(space.id)?.data?.agent) this.shareMains(space, r.profile);
+      if (this.asleep && r.profile !== undefined && !this.knownProfile(space.id)) this.shareMains(space, r.profile);
     });
   }
+
+  // Whether the space's kept load has a profile that answered (else the hidden panel reads it itself).
+  knownProfile(id) { const d = this.cache.get(id)?.data; return Boolean(d?.agent && !(d.unknown ?? []).includes("profile")); }
 
   // Keeps a finished load of a space (the most recently shown last; at most CACHE_MAX).
   keep(id, entry) {
