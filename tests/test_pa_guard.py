@@ -1,21 +1,23 @@
-"""Unit tests for the worker command allowlist (t-007 part 7a): runtime/tools/pa_guard.py and its call
-from `pa-hook guard`.
+"""Unit tests for the worker guard (t-025: a short denylist; before it t-007 part 7a and t-016):
+runtime/tools/pa_guard.py and its call from `pa-hook guard`.
 
 Run: python3 -m unittest -v tests/test_pa_guard.py
 The command lines below are data: they are only handed to the check functions, never run. No hc calls
 and no real homes: HERDR_PA_HOME, CLAUDE_CONFIG_DIR and HERDR_APP_HOME point at a temp folder while
 pa.py and pa_hooks.py are loaded, and every space, profile and repository is made under that folder.
+The rules removed by t-025 (the allowlist, plain lines, the Bash write rule) are described in
+docs/worker-guard-history.md; their tests are in this file as it was at af47aa1.
 """
+import ast
 import contextlib
 import importlib.util
+import inspect
 import io
 import json
 import os
 import re
 import shlex
 import shutil
-import statistics
-import subprocess
 import sys
 import tempfile
 import time
@@ -25,7 +27,7 @@ from unittest import mock
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.join(HERE, "..")
 TOOLS = os.path.join(REPO, "runtime", "tools")
-TMP = os.path.realpath(tempfile.mkdtemp(prefix="t007a-guard-"))
+TMP = os.path.realpath(tempfile.mkdtemp(prefix="t025-guard-"))
 
 # Load pa.py and pa_hooks.py with the temp homes, then give the environment back (as test_pa_worker.py does).
 _HOMES = {"HERDR_PA_HOME": os.path.join(TMP, "pa"), "CLAUDE_CONFIG_DIR": os.path.join(TMP, "claude"),
@@ -51,106 +53,132 @@ for _k, _v in _saved_env.items():
         os.environ[_k] = _v
 assert pa.ROOT.startswith(TMP), "pa.py must use the temp homes"
 
-# The module under test, loaded by path. Before it exists every test fails on its own (setUp), not as one import error.
+# The module under test, loaded by path. If it does not load, every test fails on its own (setUp), not as one import error.
 try:
     _spec = importlib.util.spec_from_file_location("pa_guard_under_test", os.path.join(TOOLS, "pa_guard.py"))
     guard = importlib.util.module_from_spec(_spec)
     _spec.loader.exec_module(guard)
-except (OSError, ImportError) as e:  # FileNotFoundError before the implementation
+except (OSError, ImportError) as e:
     guard, GUARD_ERROR = None, e
 
 PA = "pa1"       # the Project Agent's address (agent.json "terminal")
 OWN = "w1"       # this worker's own address (HC_TERMINAL_ID)
-OFF_TABLE = ("Refused by the Project Agent's allowlist: {}. Workers run only the git, gh and hc commands on the "
-             "allowlist. Stop and report this to the Project Agent with hc send; it handles publishing and "
-             "repository settings. There is no override.")
-NOT_PLAIN = ("Refused by the Project Agent's allowlist: this line uses git, gh or hc beyond plain commands joined by "
-             "; && || |. Write the command plainly and run it again. If it cannot be written plainly, stop and "
-             "report to the Project Agent with hc send. There is no override.")
 
-# AC1: at least one allowed line per row of the table (spec section 3, plus the read-only rows the person added).
-# Keyed by the row's command words; test_every_row_has_a_case pins that a new row needs a new case here.
-ROW_CASES = {
-    ("git", "status"): ["git status", "git status --short", "git --no-pager status"],
-    ("git", "diff"): ["git diff", "git diff --stat HEAD~1", "git diff --cached -- runtime/tools/pa.py", "git --no-pager diff e21fe98"],
-    ("git", "log"): ["git log --oneline -5", "git --no-pager log -p -1", "git log --oneline"],
-    ("git", "show"): ["git show HEAD", "git show --stat e21fe98"],
-    ("git", "blame"): ["git blame -L 1,10 runtime/tools/pa.py"],
-    ("git", "ls-files"): ["git ls-files -m", "git ls-files"],
-    ("git", "rev-parse"): ["git rev-parse --abbrev-ref HEAD", "git rev-parse --show-toplevel"],
-    ("git", "branch"): ["git branch", "git branch --show-current", "git branch -a", "git branch -r", "git branch -vv",
-                        "git branch --list 't-*'", "git branch --contains HEAD", "git branch --merged main",
-                        "git branch --no-merged", "git branch new-x", "git branch new-x main"],
-    ("git", "switch"): ["git switch main", "git switch -c new-x", "git switch -c new-x main"],
-    ("git", "checkout"): ["git checkout some-branch", "git checkout -b new-x", "git checkout -b new-x main"],
-    ("git", "add"): ["git add a.py b.py", "git add -A", "git add -u", "git add -- a.py", "git add -A a.py", "git add ."],
-    ("git", "restore"): ["git restore a.py", "git restore --staged a.py", "git restore --staged -- a.py b.py", "git restore -- src/a.py"],
-    ("git", "commit"): ["git commit -m 'Fix: one; two | three && four'", "git commit -F msg.txt", "git commit -a -m x",
-                        "git commit --amend --no-edit", "git commit --allow-empty -s -m x", "git commit -am x",
-                        'git commit -m "first line\n\nbody line"'],
-    ("git", "stash"): ["git stash", "git stash push -m wip -- a.py", "git stash push", "git stash list", "git stash show",
-                       "git stash show stash@{1}", "git stash apply", "git stash pop stash@{0}"],
-    ("git", "fetch"): ["git fetch", "git fetch --prune", "git fetch origin", "git fetch origin main"],
-    ("git", "pull"): ["git pull", "git pull --rebase", "git pull --ff-only origin main"],
-    ("git", "merge"): ["git merge main", "git merge --no-ff -m 'Merge x' feature", "git merge --ff-only main",
-                       "git merge --abort", "git merge --continue"],
-    ("git", "rebase"): ["git rebase main", "git rebase --continue", "git rebase --abort", "git rebase --skip"],
-    ("git", "worktree", "list"): ["git worktree list", "git worktree list --porcelain"],
-    ("git", "config"): ["git config --get user.name", "git config --get-all remote.origin.fetch", "git config --list",
-                        "git config -l", "git config user.email"],
-    ("gh", "pr"): ["gh pr view 12", "gh pr list --state open", "gh pr diff 12", "gh pr checks 12", "gh pr status"],
-    ("gh", "issue"): ["gh issue view 3 --comments", "gh issue list", "gh issue status"],
-    ("gh", "run"): ["gh run view 1 --log", "gh run list --limit 5"],
-    ("gh", "release"): ["gh release view v1.0", "gh release list"],
-    ("gh", "repo", "view"): ["gh repo view", "gh repo view --json name"],
-    ("hc", "send"): ["hc send pa1 'done: evidence/t-x/VERIFY.md'"],
-    ("hc", "read"): ["hc read w1", "hc read w1 --lines 50"],
-    ("hc", "get"): ["hc get w1"],
-    # the read-only rows the person added
-    ("git", "archive"): ["git archive --format=tar HEAD", "git archive HEAD runtime"],
-    ("git", "merge-base"): ["git merge-base HEAD main", "git merge-base --is-ancestor e21fe98 HEAD"],
-    ("git", "grep"): ["git grep -n foo", "git grep -e pattern -- '*.py'", "git grep --or -e a -e b"],
-    ("git", "cat-file"): ["git cat-file -p HEAD", "git cat-file -t e21fe98"],
-    ("git", "ls-tree"): ["git ls-tree -r HEAD", "git ls-tree --name-only HEAD runtime"],
-    ("git", "for-each-ref"): ["git for-each-ref refs/heads", "git for-each-ref --format='%(refname)' refs/tags"],
-    ("git", "describe"): ["git describe --tags", "git describe --always HEAD"],
-    ("git", "reflog"): ["git reflog", "git reflog show HEAD", "git reflog -n 5", "git reflog list"],
-    ("git", "diff-tree"): ["git diff-tree --no-commit-id --name-only -r HEAD"],
-    ("git", "cherry"): ["git cherry -v main", "git cherry"],
-    ("git", "tag"): ["git tag", "git tag -l 'v*'", "git tag --list", "git tag --list 'v1.*' 'v2.*'",
-                     "git tag --contains HEAD", "git tag --merged main"],
-}
-# The last three rows of the table and the ordinary tools: allowed whenever no git, gh or hc is involved.
-FREE_CASES = ["tests/run-all.sh", "tests/run-all.sh --affected", "pa-gate t-x --phase build", "pa-full-suite",
-              "python3 -m unittest -v tests/test_pa_guard.py", "ls -la", "cat README.md", "make", "node tests/keeper/run.mjs",
-              "grep -rn foo runtime", "sed -n 1,5p README.md", "find . -name '*.py'", "mkdir -p out", "echo 'use git push here'"]
-# Lines that reach a row but not its argument shape: refused with the off-table text.
-SHAPE_REFUSALS = [
-    "git diff --output=x.patch", "git diff --output x.patch", "git log --outp=x", "git show --output=x HEAD",
-    "git branch -d x", "git branch -m a b", "git branch --set-upstream-to origin/x", "git branch a b c",
-    "git switch --detach HEAD", "git switch -", "git checkout -b",
-    "git add -f ignored.txt", "git add -p", "git add",
-    "git restore", "git restore '*.py'", "git restore ./", "git restore --source HEAD a.py", "git restore :/a.py",
-    "git commit --no-verify -m x", "git commit -m", "git commit a.py -m x", "git commit --fixup HEAD",
-    "git stash show -p extra", "git stash push --keep-index", "git stash list --all", "git stash branch x",
-    "git fetch origin +main:main", "git fetch origin main:main", "git fetch --all", "git fetch a b c",
-    "git pull origin", "git pull --rebase --ff-only", "git pull --force",
-    "git merge", "git merge a b", "git merge -s ours main", "git merge --no-ff --ff-only main",
-    "git rebase -i main", "git rebase main topic", "git rebase --onto x y",
-    "git worktree list --verbose", "git worktree add ../x", "git worktree prune",
-    "git config user.name Someone", "git config --unset user.name", "git config --global --get user.name", "git config",
-    "gh pr create --fill", "gh pr edit 3", "gh pr", "gh issue create", "gh run rerun 1", "gh release upload v1 a.zip",
-    "gh repo edit", "gh repo create x",
-    "hc send other 'text'", "hc send pa1", "hc send pa1 a b", "hc read other", "hc read w1 --lines x", "hc get other", "hc get",
-    "git archive -o x.tar HEAD", "git archive --output=x.tar HEAD", "git archive -vo x.tar HEAD",
-    "git grep -O vim foo", "git grep -Ovim foo", "git grep -nO foo", "git grep --open-files-in-pager foo",
-    "git diff-tree --output=x HEAD", "git log --o=x",
-    "git reflog expire --all", "git reflog delete HEAD@{1}", "git reflog list extra",
-    "git tag v1", "git tag -d v1", "git tag -a v1 -m x", "git tag -f v1", "git tag v1 HEAD",
-    "git -C /tmp/x commit -m x", "git -c core.pager=cat log", "git --git-dir=/x status", "git --no-pager",
-    "FOO=1 git status", "/usr/bin/git status", "env git status", "sudo git status", "xargs git add", "! git status",
-    "grep git notes.md",
+# ---- The messages (spec section 3 and 3.5) ----------------------------------------------------------------------
+TEXT_HINT = ("If this is text, not a command (a heredoc line or an unquoted argument), quote it or write it with the "
+             "editor tool.")
+D1 = ("Refused by the Project Agent's guard: {} pushes to a remote. Agents never push (worker.md, Safety): commit your "
+      "work and say in your report that it is ready; the person pushes. " + TEXT_HINT + " There is no override.")
+D2 = ("Refused by the Project Agent's guard: {} publishes or merges a change request. That is the person's decision "
+      "(worker.md, Safety): say in your report that the work is ready, and the Project Agent asks them on a decision "
+      "card. " + TEXT_HINT + " There is no override.")
+D3 = ("Refused by the Project Agent's guard: {} deletes a branch or a worktree. Deleting is the person's decision "
+      "(worker.md, Safety): leave it, and name it in your report if it should go. " + TEXT_HINT + " There is no override.")
+D4 = ("Refused by the Project Agent's guard: {}. pa-push-main and pa-push-allow are the person's commands: a main branch "
+      "is pushed only when the person answers a push card in the panel. Say in your report that the work is ready to "
+      "release. There is no override.")
+EDIT = ("Refused by the Project Agent's guard: {} is inside a .git folder, the Project Agent's files or the person's git "
+        "and gh settings, which workers do not edit. Write reports, logs and notes in your task's evidence folder "
+        "(evidence/<task-id>/ in the Project Agent's state folder). If the edit is needed, stop and report it to the "
+        "Project Agent with hc send. There is no override.")
+
+
+def shown(inner):
+    """{command}: the matching simple command's words, shlex-quoted and joined by blanks, cut to 300 characters."""
+    text = " ".join(shlex.quote(w) for w in inner.split(" "))
+    return text if len(text) <= 300 else text[:297] + "..."
+
+
+def msg(row, inner):
+    return row.format(shown(inner))
+
+
+# ---- Table 3: the forms each row must catch. (line, the inner simple command, as words joined by blanks) ----------
+# The inner command is the line itself unless given.
+D1_FORMS = [
+    ("git push",), ("git push origin t-1",), ("git push -f",), ("git push --force",), ("git push --force-with-lease",),
+    ("git push origin +t-1",), ("git push --mirror",), ("git push --all",), ("git push --tags",),
+    ("git push --delete x",), ("git push origin :x",), ("git push -o ci.skip",), ("git -C ../wt push",),
+    ("git -c push.default=current push",), ("git --no-pager push",), ("git --git-dir=x push",), ("/usr/bin/git push",),
+    ("GIT push",), ('"git" push', "git push"), ("g'i't push", "git push"), ("\\git push", "git push"),
+    ("GIT_SSH_COMMAND=ssh git push",), ("env X=1 git push",), ("sudo -u me git push",), ("timeout 60 git push",),
+    ("echo x | xargs git push", "xargs git push"), ("cd wt && git push", "git push"), ("(cd wt; git push)", "git push"),
+    ("{ git push; } | tee log", "{ git push"), ("for b in a c; do git push origin $b; done", "do git push origin $b"),
+    ("git push > log 2>&1", "git push"), ("echo $(git push 2>&1)", "git push"), ("echo `git push`", "git push"),
+    ('x="$(git push)"', "git push"), ("sh -c 'git push'", "git push"), ('bash -lc "cd wt && git push"', "git push"),
+    ('eval "git push"', "git push"), ("bash <<EOF\ngit push\nEOF", "git push"), ("git subtree push --prefix d o b",),
+    ("git lfs push origin b",), ("git-push origin b",), ("/usr/libexec/git-core/git-send-pack x",),
 ]
+D2_FORMS = [
+    ("gh pr create --fill",), ("gh pr new",), ("gh pr ready 12",), ("gh pr ready 12 --undo",),
+    ("gh pr merge 12 --squash --delete-branch",), ("gh pr --repo o/r merge 5",), ("gh pr -R o/r create",),
+    ("/opt/homebrew/bin/gh pr create",), ("GH_TOKEN=x gh pr create",), ("cd wt && gh pr create", "gh pr create"),
+    ("sh -c 'gh pr merge 3'", "gh pr merge 3"), ("$(gh pr create --fill)", "gh pr create --fill"),
+]
+D3_FORMS = [
+    ("git branch -d t-1",), ("git branch -D t-1",), ("git branch --delete t-1",), ("git branch -dr origin/t-1",),
+    ("git branch -Df t-1",), ("git -C wt branch -D t-1",), ("cd wt && git branch -d x", "git branch -d x"),
+    ("git worktree remove ../wt",), ("git worktree remove --force ../wt",), ("git -C main worktree remove wt",),
+    ("git update-ref -d refs/heads/t-1",), ("sh -c 'git branch -D x'", "git branch -D x"),
+]
+D4_FORMS = [
+    ("pa-push-main run d-1 --answer Push --space s",), ("pa-push-main check d-1",), ("pa-push-main plan t-1 --repo r",),
+    ("pa-push-allow add --path p --space s",), ("pa-push-allow show",), ("~/.local/bin/pa-push-main run x",),
+    ("PA-PUSH-MAIN run",), ("./runtime/tools/pa_push.py run",), ("python3 runtime/tools/pa_push.py run",),
+    ("python3 -I runtime/tools/pa_push.py show",), ("cd wt && pa-push-main run x", "pa-push-main run x"),
+    ("env X=1 pa-push-allow on",), ("sudo pa-push-main",), ("nohup pa-push-main run x",),
+    ("sh -c 'pa-push-main run x'", "pa-push-main run x"), ("y=$(pa-push-allow show)", "pa-push-allow show"),
+    ("if pa-push-main check x; then :; fi", "if pa-push-main check x"),
+]
+ROWS = [("D1", D1, D1_FORMS), ("D2", D2, D2_FORMS), ("D3", D3, D3_FORMS), ("D4", D4, D4_FORMS)]
+
+# ---- Table 4.1: must be allowed ----------------------------------------------------------------------------------
+ALLOWED = {
+    "reset": ["git reset HEAD~1", "git reset --soft HEAD~3", "git reset --mixed main", "git reset --keep HEAD~1",
+              "git reset --merge", "git reset -- a.py", "git reset -q HEAD a.py", "git -C wt reset --soft main"],
+    "squash": ["git merge --squash t-1", 'git merge --squash t-1 && git commit -m "squash t-1"',
+               "git reset --soft main && git commit -m one", "git commit --fixup HEAD~1",
+               "GIT_SEQUENCE_EDITOR=: git rebase -i --autosquash main"],
+    "rebase": ["git rebase main", "git rebase --onto main a b", "git rebase -i main", "git rebase --autosquash -i main",
+               'git rebase -x "make test" main', "git rebase --continue", "GIT_EDITOR=true git rebase --continue",
+               "git rebase --abort", "git -C wt rebase main"],
+    "stash": ["git stash", "git stash push -m wip -- a.py", "git stash -u", "git stash pop", "git stash apply stash@{1}",
+              "git stash list", "git stash show -p", "git stash branch t-2"],
+    "redirects": ["git diff main > /tmp/x.diff", "git log --oneline > notes.txt 2>&1", "git diff >> d.txt",
+                  "git show HEAD:f > f.old", "git status 2>/dev/null", "hooks/tests.sh affected > build.log 2>&1",
+                  "echo x > .git/info/exclude"],
+    "substitutions": ['git commit -m "$(cat msg.txt)"', "echo $(git rev-parse HEAD)", "B=`git branch --show-current`",
+                      'test -n "$(git status --porcelain)"', 'for f in $(git diff --name-only); do wc -l "$f"; done'],
+    "pipes": ["git log -5 | head", "git diff | tee d.txt", "git ls-files | xargs wc -l", "git status --porcelain | grep -c ."],
+    "heredocs": ["cat > notes.md <<'EOF'\nthe guard refuses pa-push-main\nEOF", "git commit -F - <<EOF\nmsg\nEOF",
+                 "python3 - <<EOF\nprint(1)\nEOF"],
+    "-C": ["git -C ../wt commit -am x", "git -C wt log -1", "git -C wt add -A"],
+    "-q": ['git commit -qm "x; y"', "git fetch -q origin", "git checkout -q main", "git pull -q --rebase origin main"],
+    "compound": ["git add -A && git commit -m x && git log -1", "cd wt && git status; git diff | tee d.txt",
+                 'for f in a b; do git add "$f"; done', "{ git status; git diff; } > s.txt", "(cd wt && git log -1)",
+                 "git fetch && git rebase origin/main || git rebase --abort", "if git diff --quiet; then echo clean; fi"],
+    "other git": ["git checkout -- a.py", "git restore src/", "git cherry-pick abc", "git revert abc", "git mv a b",
+                  "git rm a", "git tag v1", "git config user.name x", "git remote -v", "git worktree add ../wt b",
+                  "git worktree list", "git worktree prune", "git branch -m a b", "git branch -f x y",
+                  "git commit --amend --no-edit", "git archive HEAD | tar t", "git hash-object a.py",
+                  "git fetch origin main:main", "git merge main"],
+    "text that names a row": ['grep -rn "git push" .', 'git commit -m "the guard refuses git push"',
+                              "git log --grep push", "git help push", "man git-push", "grep -n pa-push-main README.md",
+                              "git add runtime/tools/pa_push.py", "git show HEAD:runtime/tools/pa_push.py > /tmp/p.py",
+                              "python3 -m unittest tests/test_pa_push.py", "echo \"gh pr merge is the person's\""],
+    "gh, hc": ["gh pr view 5", "gh pr list", "gh pr checks", "gh pr diff 5", "gh issue list", "gh api repos/o/r/pulls",
+               'hc send pa1 "done"', 'hc send anyone "x"', "hc read w1"],
+}
+# Table 4.2: allowed by the denylist, refused by the older safety hook (unchanged).
+OLDER_ONLY = ["git reset --hard", "git reset --hard HEAD~1", "git clean -f", "git clean -fdx", "git checkout .",
+              "git restore .", "git stash drop", "git stash clear", "gh release create v1", "npm publish",
+              "terraform apply", "cat .env", "pa-costs billed fetch --now"]
+# Spec section 3, "overlap": both refuse; through the hook the older message wins.
+OVERLAP = [("git push --force origin t-x", D1, "a force push"),
+           ("git push origin main", D1, "a push to the main branch"),
+           ("git branch -D x", D3, "force-deleting a branch"),
+           ("git worktree remove --force x", D3, "force-removing a worktree"),
+           ("gh pr merge 1", D2, "merging a change request")]
 
 
 def write_json(path, value):
@@ -165,232 +193,164 @@ class GuardTest(unittest.TestCase):
             self.fail("runtime/tools/pa_guard.py does not load: {!r}".format(GUARD_ERROR))
         self.cwd = tempfile.mkdtemp(dir=TMP)
 
-    def check(self, line, **kw):
-        kw.setdefault("pa_address", PA)
-        kw.setdefault("own_address", OWN)
-        kw.setdefault("cwd", self.cwd)
-        return guard.check_command(line, **kw)
+    def check(self, line):
+        return guard.check_command(line)
 
 
-class AC1EveryRowAllowed(GuardTest):
-    def test_every_row_has_a_case(self):
-        rows = {tuple(row[0]) for row in guard.ALLOWLIST}
-        self.assertEqual(sorted(rows - set(ROW_CASES)), [], "rows without a positive test")
-        self.assertEqual(sorted(set(ROW_CASES) - rows), [], "cases for rows that are not in ALLOWLIST")
+class T025Deny(GuardTest):  # AC4.1: every form of table 3 gives exactly its row's message
+    def assert_row(self, row, forms):
+        for form in forms:
+            line, inner = form[0], form[-1]
+            with self.subTest(line=line):
+                self.assertEqual(self.check(line), msg(row, inner))
 
-    def test_each_row_allows_its_shapes(self):
-        for command, lines in sorted(ROW_CASES.items()):
+    def test_d1_push(self):
+        self.assert_row(D1, D1_FORMS)
+
+    def test_d2_change_request(self):
+        self.assert_row(D2, D2_FORMS)
+
+    def test_d3_delete_branch_or_worktree(self):
+        self.assert_row(D3, D3_FORMS)
+
+    def test_d4_push_tools(self):
+        self.assert_row(D4, D4_FORMS)
+
+    def test_message_shape(self):
+        for _name, row, forms in ROWS:
+            with self.subTest(row=_name):
+                text = msg(row, forms[0][-1])
+                self.assertTrue(text.startswith("Refused by the Project Agent's guard: "))
+                self.assertTrue(text.endswith("There is no override."))
+                self.assertNotIn("allowlist", text)
+                self.assertEqual(TEXT_HINT in text, row is not D4)
+
+    def test_first_match_in_line_order(self):
+        self.assertEqual(self.check("gh pr create && git push"), msg(D2, "gh pr create"))
+        self.assertEqual(self.check("git status; git branch -d x; git push"), msg(D3, "git branch -d x"))
+
+    def test_long_command_is_cut(self):
+        line = "git push origin " + "b" * 400
+        self.assertEqual(self.check(line), msg(D1, line))
+        self.assertTrue(msg(D1, line).count("...") >= 1)
+
+
+class T025Allowed(GuardTest):  # AC1.2, AC2.2, AC3.1, AC4.2
+    def test_table_4_1(self):
+        for group, lines in ALLOWED.items():
             for line in lines:
-                with self.subTest(row=" ".join(command), line=line):
+                with self.subTest(group=group, line=line):
                     self.assertIsNone(self.check(line))
 
-    def test_free_tools_and_last_three_rows(self):
-        for line in FREE_CASES:
+    def test_table_4_2_is_left_to_the_older_hook(self):
+        for line in OLDER_ONLY:
             with self.subTest(line=line):
                 self.assertIsNone(self.check(line))
 
-    def test_shapes_outside_a_row_are_refused(self):
-        for line in SHAPE_REFUSALS:
+    def test_overlap_gives_the_row_alone(self):
+        for line, row, _older in OVERLAP:
             with self.subTest(line=line):
-                message = self.check(line)
-                self.assertIsNotNone(message, line)
-                self.assertTrue(message.startswith("Refused by the Project Agent's allowlist: "), message)
-                self.assertNotEqual(message, NOT_PLAIN)
+                self.assertEqual(self.check(line), msg(row, line))
 
-    def test_checkout_of_an_existing_path_is_refused(self):
-        os.makedirs(os.path.join(self.cwd, "sub"))
-        open(os.path.join(self.cwd, "a.py"), "w").close()
-        open(os.path.join(self.cwd, "sub", "b.py"), "w").close()
-        self.assertIsNotNone(self.check("git checkout a.py"))
-        self.assertIsNotNone(self.check("git checkout sub"))
-        self.assertIsNotNone(self.check("cd sub && git checkout b.py"))
-        self.assertIsNone(self.check("git checkout b.py"))  # no such path here: a branch name
-        self.assertIsNotNone(self.check("cd - && git checkout x"))  # folder unknown: refused
-
-    def test_hc_send_without_a_known_project_agent_allows_one_address(self):  # open question Q2, accepted
-        self.assertIsNone(self.check("hc send anyone 'report'", pa_address=None))
-        self.assertIsNotNone(self.check("hc send anyone two 'report'", pa_address=None))
-        self.assertIsNotNone(self.check("hc send --all 'report'", pa_address=None))
-
-    def test_hc_read_without_own_address_is_refused(self):
-        self.assertIsNotNone(self.check("hc read w1", own_address=None))
-        self.assertIsNotNone(self.check("hc get w1", own_address=None))
-
-
-class AC2OffTable(GuardTest):
-    def test_one_off_table_subcommand_each(self):
-        for line in ["git push origin t-x", "gh api repos/x/y", "hc kill w2"]:
-            with self.subTest(line=line):
-                self.assertEqual(self.check(line), OFF_TABLE.format(line))
-
-    def test_more_off_table(self):
-        for line in ["git remote add origin x", "git remote -v", "git gc", "git submodule update", "gh auth status",
-                     "gh secret list", "hc run sh", "hc exec ls", "git", "gh", "hc"]:
-            with self.subTest(line=line):
-                self.assertEqual(self.check(line), OFF_TABLE.format(line))
-
-
-class AC3NotPlainWithGit(GuardTest):
-    def test_not_plain_lines_that_involve_git_gh_or_hc(self):
-        for line in ["git commit -m x > out.patch", "git branch 2>&1", "git status &", "echo $(git rev-parse HEAD)",
-                     "echo `git rev-parse HEAD`", "git commit -F - <<EOF\nmsg\nEOF", "(git status)", "{ git status; }",
-                     "git status\ngit push", "git status |& cat", "g=gi''t; $g push", "cat <(gh pr view)",
-                     "hc send pa1 \"$(cat report.md)\"", "git add *.py", "git status \\\n --short", "=git push",
-                     "git log -1 # comment", "git add {a,b}.py", "git status;; ls", "git status && ", "| git status",
-                     "git commit -m 'unterminated", "/usr/bin/git push > /dev/null"]:
-            with self.subTest(line=line):
-                self.assertEqual(self.check(line), NOT_PLAIN)
-
-
-class AC4NotPlainWithoutGit(GuardTest):
-    def test_not_plain_lines_without_git_gh_or_hc(self):
-        for line in ["make test > build.log 2>&1", "for f in *.py; do echo $f; done", "echo $HOME",
-                     "python3 -c 'print(1)' | tee out.txt", "cat <<EOF > notes.txt\nplain notes\nEOF",
-                     "(cd sub && make)", "ls *.py", "echo github.com/x/y > url.txt", "cat .git/HEAD > /tmp/head"]:
+    def test_bash_writes_are_not_judged(self):  # AC3.1, limit L10 (accepted, Q3)
+        for line in ["echo x > .git/HEAD", "cd - && echo x > notes.txt", "cp a ~/.config/herdr-pa/push-allow.json",
+                     "tee .claude/settings.local.json < x"]:
             with self.subTest(line=line):
                 self.assertIsNone(self.check(line))
 
 
-class AC5JoinedLines(GuardTest):
-    def test_joined_allowed_commands(self):
-        for line in ["cd x && git status && git diff | head", "git add a.py && git commit -m 'x; y' && git log -1",
-                     "git status; git log --oneline -3 || true", "git status;", "ls && pa-full-suite"]:
-            with self.subTest(line=line):
+class T025Limits(GuardTest):
+    """Section 4.3: pinned with today's verdict, so that a change is deliberate."""
+
+    def test_not_caught(self):
+        for line, limit in [("git config alias.p push; git p", "L2"), ("git -c alias.x=push x", "L2"),
+                            ("G=git; $G push", "L3"), ("${X:-git} push", "L3"), ("printf 'git push' | sh", "L5"),
+                            ("ssh host 'git push'", "L5"), ("gh api -X PUT repos/o/r/pulls/1/merge", "L6"),
+                            ("rm -rf ../wt", "L7"), ("git show HEAD:runtime/tools/pa_push.py | python3", "L8"),
+                            ("sudo -u bob pa-push-main run x", "L4")]:
+            with self.subTest(line=line, limit=limit):
                 self.assertIsNone(self.check(line))
 
-    def test_one_off_table_part_refuses_the_line(self):
-        self.assertEqual(self.check("git status && git push origin t-x"), OFF_TABLE.format("git push origin t-x"))
-        self.assertEqual(self.check("ls; git remote -v"), OFF_TABLE.format("git remote -v"))
-        self.assertEqual(self.check("git log | grep git"), OFF_TABLE.format("grep git"))
-
-    def test_split_plain_keeps_quoted_operators_in_one_word(self):
-        self.assertEqual(guard.split_plain("git commit -m 'a; b | c && d' && git log"),
-                         [["git", "commit", "-m", "a; b | c && d"], ["git", "log"]])
-        self.assertEqual(guard.split_plain('echo "x \\"y\\" z" | cat'), [["echo", 'x "y" z'], ["cat"]])
-        self.assertEqual(guard.split_plain("git show stash@{0}"), [["git", "show", "stash@{0}"]])
-        self.assertEqual(guard.split_plain(""), [])
-        self.assertIsNone(guard.split_plain("a > b"))
-
-    def test_involves(self):
-        self.assertTrue(guard.involves(["/usr/bin/git", "status"]))
-        self.assertTrue(guard.involves(["xargs", "gh"]))
-        self.assertFalse(guard.involves(["cat", ".git/HEAD"]))
-        self.assertTrue(guard.involves(["git-lfs", "ls-files"]))  # fix round 2: a dashed git program is git
-        self.assertFalse(guard.involves(["cat", "docs/git-guide.md"]))
-        self.assertFalse(guard.involves(["echo", "see github.com"]))
+    def test_over_refusals(self):
+        for line, inner in [("echo git push", "echo git push"), ("grep -rn git push .", "grep -rn git push ."),
+                            ("cat > f <<EOF\nrun git push later\nEOF", "run git push later"),
+                            ("echo '$(git push)'", "git push")]:
+            with self.subTest(line=line):
+                self.assertEqual(self.check(line), msg(D1, inner))
 
 
-class AC6EditorRule(GuardTest):
-    def setUp(self):
-        super().setUp()
-        self.spaces = os.path.join(TMP, "spaces-ac6")
-        self.state = os.path.join(self.spaces, "sp1")
-        self.repo = os.path.join(TMP, "repo-ac6")
-        for d in [os.path.join(self.state, "decisions"), os.path.join(self.state, "evidence", "t-x"),
-                  os.path.join(self.repo, ".git", "hooks"), os.path.join(self.repo, "src")]:
-            os.makedirs(d, exist_ok=True)
+class T025Robust(GuardTest):  # AC4.3
+    ODD = ["", " ", "\t\n", "'", '"', "$(", "`", "(", ")", "$(git push", "git push '", 'git "push', "\\", "a\\\nb",
+           "x" * 10000, "git push\x00", "\x00", "gît push", "git push ünïcode", "日本 git status", "$'", "$'git push",
+           "<<", ">", "&&", ";;", "|", "<(", "eval", "sh -c", "git", "gh pr", "git -C", "git branch", "$((1+2))"]
 
-    def edit(self, path):
-        return guard.check_edit(path, self.spaces, cwd=self.repo)
+    def test_no_exception(self):
+        for line in self.ODD:
+            with self.subTest(line=line[:40]):
+                result = self.check(line)
+                self.assertTrue(result is None or isinstance(result, str), result)
 
-    def test_refused(self):
-        for path in [os.path.join(self.repo, ".git", "config"), os.path.join(self.repo, ".git", "hooks", "pre-commit"),
-                     os.path.join(self.repo, ".GIT", "config"), os.path.join(self.repo, "sub", ".git"),
-                     ".git/info/exclude", os.path.join(self.state, "ledger.json"),
-                     os.path.join(self.state, "decisions", "d-001.json"), os.path.join(self.state, "journal.jsonl"),
-                     os.path.join(self.state, "rules.json"), os.path.join(self.state, "agent.json")]:
-            with self.subTest(path=path):
-                self.assertEqual(self.edit(path), OFF_TABLE.format(path))
-
-    def test_links_are_resolved(self):
-        link = os.path.join(self.repo, "src", "innocent.txt")
-        if not os.path.lexists(link):
-            os.symlink(os.path.join(self.repo, ".git", "config"), link)
-        self.assertIsNotNone(self.edit(link))
-        state_link = os.path.join(self.repo, "state")
-        if not os.path.lexists(state_link):
-            os.symlink(self.state, state_link)
-        self.assertIsNotNone(self.edit(os.path.join(state_link, "ledger.json")))
-
-    def test_allowed(self):
-        for path in [os.path.join(self.state, "evidence", "t-x", "x.md"), os.path.join(self.repo, "src", "a.py"),
-                     os.path.join(self.repo, ".github", "workflows", "ci.yml"), "src/b.py", "",
-                     os.path.join(self.state, "evidence", "t-x", "ledger.json")]:
-            with self.subTest(path=path):
-                self.assertIsNone(self.edit(path))
+    def test_time_bound(self):
+        base = [f[0] for _n, _r, forms in ROWS for f in forms] + [l for ls in ALLOWED.values() for l in ls] + self.ODD
+        padded = ["git status && " * 700, "echo " + "a " * 5000, "$(" * 3000 + "git push", "eval " * 2000 + "git push",
+                  "sh -c " * 1500 + "'git push'", "'" * 10000, "`" * 10000, "a;" * 5000, "x=$(y) " * 1400,
+                  "git -C " * 1400 + "push", "git branch " * 900 + "-d", "gh pr " * 1600 + "merge", "sh " * 3000 + "-c x",
+                  "python3 " * 1200 + "pa_push.py", "$(echo " * 1400 + "git push" + ")" * 1400]
+        lines = (base * 2)[:170] + padded * 2  # 200 lines, 30 of them about 10 kB
+        self.assertEqual(len(lines), 200)
+        for line in lines:
+            start = time.perf_counter()
+            self.check(line)
+            spent = time.perf_counter() - start
+            self.assertLess(spent, 0.05, line[:60])
 
 
-class AC7Messages(GuardTest):
-    def test_message_contents(self):
-        for message, item in [(self.check("git push origin t-x"), "git push origin t-x"),
-                              (guard.check_edit(os.path.join(TMP, "r", ".git", "config"), os.path.join(TMP, "none")),
-                               os.path.join(TMP, "r", ".git", "config"))]:
-            for words in [item, "report", "Project Agent", "There is no override"]:
-                self.assertIn(words, message)
-        message = self.check("git commit -m x > x")
-        for words in ["report", "Project Agent", "There is no override", "plainly"]:
-            self.assertIn(words, message)
-
-    def test_exact_texts(self):
-        self.assertEqual(guard.OFF_TABLE, OFF_TABLE)
-        self.assertEqual(guard.NOT_PLAIN, NOT_PLAIN)
-
-    def test_quoted_words_are_shown_quoted(self):
-        self.assertEqual(self.check("git push origin 'a b'"), OFF_TABLE.format("git push origin 'a b'"))
+REMOVED_BOTH = ["ALLOWLIST", "READS", "NEVER_ADD", "profile_rows", "guardAllow", "OFF_TABLE", "NOT_PLAIN", "VARIABLE",
+                "git_variable", "judge_plain", "read_redirects", "check_writes", "file_targets", "folder_change", "operands",
+                "WRITE", "FOLDER_UNKNOWN", "HOME_VAR", "REDIRECT"]  # AC1.1, AC3.1
+REMOVED_GUARD = ["split_plain", "split_plain_ops", "involves", "involves_text", "person_text", "names_in_text", "wraps",
+                 "runs_input", "filters_only", "WRAPPERS", "FILTERS", "PIPE_READERS", "MAY_BE_EMPTY", "DEFAULT_VALUE",
+                 "ansi_c", "ANSI_ESCAPE", "ADDED_SHAPES", "cd_target", "changes_folder"]  # AC2.1, R1
+EDITOR_RULE = {"forms", "protected", "personal_settings", "check_edit", "starts_of"}
+FILE_CALLS = {"open", "stat", "lstat", "exists", "lexists", "isfile", "isdir", "islink", "listdir", "scandir", "walk",
+              "realpath", "readlink"}
 
 
-class AC8ProfileRows(GuardTest):
-    def rows(self, allow):
-        err = io.StringIO()
-        rows = guard.profile_rows({"name": "p", "guardAllow": allow}, err=err)
-        return rows, err.getvalue()
-
-    def test_added_rows_widen(self):
-        rows, note = self.rows([{"command": ["git", "lfs", "pull"], "args": "any"}, {"command": ["git", "gc"], "args": "none"}])
-        self.assertEqual(note, "")
-        self.assertIsNotNone(self.check("git lfs pull"))
-        self.assertIsNone(self.check("git lfs pull --include x", extra_rows=rows))
-        self.assertIsNone(self.check("git gc", extra_rows=rows))
-        self.assertIsNotNone(self.check("git gc --aggressive", extra_rows=rows))
-
-    def test_never_add_rows_are_ignored_with_a_note(self):
-        for command, line in [(["git", "push"], "git push origin x"), (["git"], "git push origin x"),
-                              (["gh", "pr"], "gh pr create"), (["gh", "pr", "merge"], "gh pr merge 1"),
-                              (["git", "remote", "add"], "git remote add x y"), (["git", "config"], "git config a b"),
-                              (["gh", "api"], "gh api x"), (["hc", "send"], "hc send other x")]:
-            with self.subTest(command=command):
-                rows, note = self.rows([{"command": command, "args": "any"}])
-                self.assertEqual(rows, [])
-                self.assertIn(" ".join(command), note)
-                self.assertIsNotNone(self.check(line, extra_rows=rows))
-
-    def test_malformed_rows_are_ignored(self):
-        rows, note = self.rows([{"command": "git gc", "args": "any"}, {"command": ["git", "gc"], "args": "some"},
-                                {"command": ["make"], "args": "any"}, "x"])
-        self.assertEqual(rows, [])
-        self.assertTrue(note)
-        self.assertEqual(self.rows(None)[0], [])
-        self.assertEqual(guard.profile_rows(None), [])
+def source(name):
+    with open(os.path.join(TOOLS, name), encoding="utf-8") as f:
+        return f.read()
 
 
-class AC9Fast(GuardTest):
-    def test_no_subprocess_and_fast(self):
-        line = ""
-        while len(line) < 2000:
-            line += "git status && git diff --stat HEAD~1 | head -n 20; git commit -m 'one; two | three' && "
-        line = line + "git log --oneline -5"
-        self.assertGreaterEqual(len(line), 2000)
-        forbidden = mock.Mock(side_effect=AssertionError("a subprocess was started"))
-        with mock.patch.object(subprocess, "run", forbidden), mock.patch.object(subprocess, "Popen", forbidden), \
-                mock.patch.object(os, "system", forbidden):
-            self.assertIsNone(self.check(line))
-            guard.check_edit(os.path.join(TMP, "x", ".git", "config"), TMP)
-            times = []
-            for _ in range(100):
-                start = time.perf_counter()
-                self.check(line)
-                times.append(time.perf_counter() - start)
-        self.assertLess(statistics.median(times), 0.010)
+class T025Removed(unittest.TestCase):  # AC1.1, AC2.1, AC3.1, AC4.4, R10
+    def test_names_absent(self):
+        for name in ("pa_guard.py", "pa_hooks.py"):
+            text = source(name)
+            for word in REMOVED_BOTH + (REMOVED_GUARD if name == "pa_guard.py" else []):
+                with self.subTest(file=name, word=word):
+                    self.assertIsNone(re.search(r"(?<![\w])" + re.escape(word) + r"(?![\w])", text))
+            self.assertNotIn("allowed(", text)
+
+    def test_no_folder_tracking(self):
+        defined = {n.name for n in ast.walk(ast.parse(source("pa_guard.py"))) if isinstance(n, ast.FunctionDef)}
+        self.assertFalse(defined & {"folders", "cd_target", "changes_folder", "allowed", "shown_plain"}, defined)
+
+    def test_stdlib_no_subprocess_no_file_access_in_the_denylist(self):
+        tree = ast.parse(source("pa_guard.py"))
+        imported = {a.name.split(".")[0] for n in ast.walk(tree) if isinstance(n, (ast.Import, ast.ImportFrom))
+                    for a in (n.names if isinstance(n, ast.Import) else [ast.alias(name=n.module or "", asname=None)])}
+        self.assertNotIn("subprocess", imported)
+        self.assertLessEqual(imported, {"os", "re", "shlex", "sys"})
+        for fn in [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name not in EDITOR_RULE]:
+            for call in [c for c in ast.walk(fn) if isinstance(c, ast.Call)]:
+                name = call.func.attr if isinstance(call.func, ast.Attribute) else getattr(call.func, "id", "")
+                with self.subTest(function=fn.name, call=name):
+                    self.assertNotIn(name, FILE_CALLS)
+
+    def test_one_argument(self):
+        self.assertEqual(list(inspect.signature(guard.check_command).parameters), ["line"])
+
+    def test_size(self):  # R10: about 230 lines
+        self.assertLessEqual(len(source("pa_guard.py").splitlines()), 240)
 
 
 class HookGuard(unittest.TestCase):
@@ -424,28 +384,49 @@ class HookGuard(unittest.TestCase):
         return self.run_hook("Bash", {"command": command}, cwd)
 
     def test_allowed_and_refused(self):
-        self.assertEqual(self.bash("git status && git diff | head")[0], 0)
-        code, err = self.bash("git push origin t-x")
-        self.assertEqual(code, 2)
-        self.assertIn(OFF_TABLE.format("git push origin t-x"), err)
-        code, err = self.bash("git commit -m x > x.patch")
-        self.assertEqual((code, err.strip()), (2, NOT_PLAIN))
+        for group in ("reset", "squash", "redirects", "substitutions", "heredocs", "-C", "-q", "compound", "gh, hc"):
+            for line in ALLOWED[group]:
+                with self.subTest(line=line):
+                    self.assertEqual(self.bash(line), (0, ""))
+        for _name, row, forms in ROWS:
+            line, inner = forms[0][0], forms[0][-1]
+            with self.subTest(line=line):
+                code, err = self.bash(line)
+                self.assertEqual((code, err.strip()), (2, msg(row, inner)))
 
-    def test_hc_send_goes_to_the_project_agent_from_agent_json(self):
+    def test_bash_writes_run(self):  # R3: the hook calls no write check (L10, accepted, Q3)
+        for line in ["echo x > .git/HEAD", "cd - && echo x > notes.txt", "echo x > .claude/settings.local.json",
+                     "cp a {}".format(os.path.join(self.state, "ledger.json"))]:
+            with self.subTest(line=line):
+                self.assertEqual(self.bash(line), (0, ""))
+
+    def test_hc_send_to_any_address(self):
         self.assertEqual(self.bash("hc send pa1 'done'")[0], 0)
-        self.assertEqual(self.bash("hc send w9 'done'")[0], 2)
+        self.assertEqual(self.bash("hc send w9 'done'")[0], 0)
         self.assertEqual(self.bash("hc read w1 --lines 20")[0], 0)
 
-    def test_no_task_record_still_applies_the_allowlist(self):  # Q2, accepted
+    def test_no_task_record_still_applies_the_denylist(self):
         self.assertEqual(self.bash("hc send anyone 'done'", cwd=self.bare)[0], 0)
-        self.assertEqual(self.bash("git push origin t-x", cwd=self.bare)[0], 2)
+        code, err = self.bash("git push origin t-x", cwd=self.bare)
+        self.assertEqual((code, err.strip()), (2, msg(D1, "git push origin t-x")))
         self.assertEqual(self.bash("git status", cwd=self.bare)[0], 0)
 
-    def test_profile_rows_through_the_hook(self):  # AC8 through the hook
+    def test_a_profiles_guard_allow_is_ignored(self):  # the key is no longer read
         self.assertEqual(self.bash("git lfs pull")[0], 0)
         code, err = self.bash("git push origin t-x")
-        self.assertEqual(code, 2)
-        self.assertIn("git push", err)
+        self.assertEqual((code, err.strip()), (2, msg(D1, "git push origin t-x")))
+
+    def test_older_refusals_first_and_overlap(self):
+        for line in OLDER_ONLY:
+            with self.subTest(line=line):
+                code, err = self.bash(line)
+                self.assertEqual(code, 2)
+                self.assertTrue(err.startswith("Blocked by the Project Agent safety hook: "), err)
+        for line, _row, older in OVERLAP:
+            with self.subTest(line=line):
+                code, err = self.bash(line)
+                self.assertEqual(code, 2)
+                self.assertTrue(err.startswith("Blocked by the Project Agent safety hook: " + older), err)
 
     def test_editor_tools(self):  # AC6 through the hook
         for tool, key in [("Edit", "file_path"), ("Write", "file_path"), ("MultiEdit", "file_path"), ("NotebookEdit", "notebook_path")]:
@@ -493,7 +474,6 @@ class AC10Unchanged(unittest.TestCase):
         with open(os.path.join(REPO, "tests", "run-all.sh")) as f:
             self.assertIn("runtime/tools/pa_guard.py", f.read())
         with open(os.path.join(TOOLS, "pa_guard.py")) as f:
-            import ast
             ast.parse(f.read(), feature_version=(3, 7))
 
     def test_worker_rule_line(self):
@@ -501,15 +481,12 @@ class AC10Unchanged(unittest.TestCase):
             text = f.read()
         rules = text.split("## Rules of the job", 1)[1].split("\n## ", 1)[0]
         flat = re.sub(r"\s+", " ", rules)
-        self.assertIn("Commands that involve git, gh or hc are limited to the allowlist in `pa_guard.py`; anything "
-                      "else is refused: report it to the Project Agent.", flat)
+        self.assertIn("- The guard refuses a few commands that the Safety rules below keep for the person: `git push` "
+                      "in any form,", flat)
 
-
-# ---- Allowlist guard fix round: each case makes the guard stricter -------------------------------------
-# Finding ids: reviewer 1 #n (REVIEW.md), reviewer 2 In/Mn (REVIEW-2.md), verifier Fn (VERIFY.md).
 
 GUARD_UNAVAILABLE_WORDS = ["guard unavailable", "report", "Project Agent", "There is no override",
-                           "hc send is refused too", "last message"]  # fix round 2: REVIEW-4 M1
+                           "hc send is refused too", "last message"]  # t-007 fix round 2: REVIEW-4 M1
 
 
 def load_hooks_copy(folder):
@@ -541,7 +518,7 @@ def call_hook(hooks, function, tool, tool_input, cwd):
 
 
 class FixA_FailClosed(unittest.TestCase):
-    """(a) card d-038 'Block'; reviewer 1 #1, reviewer 2 I2: a guard that cannot load or that raises refuses the call."""
+    """Card d-038 'Block': a guard that cannot load or that raises refuses the call (R6)."""
 
     @classmethod
     def setUpClass(cls):
@@ -554,7 +531,7 @@ class FixA_FailClosed(unittest.TestCase):
                 f.write(guard_text)
         try:
             return load_hooks_copy(folder)
-        except Exception as e:  # noqa: BLE001 - before the fix the import itself dies
+        except Exception as e:  # noqa: BLE001
             self.fail("pa_hooks.py must load without a working pa_guard.py (the other hooks keep working): {!r}".format(e))
 
     def assert_unavailable(self, code, err):
@@ -579,17 +556,21 @@ class FixA_FailClosed(unittest.TestCase):
         self.assert_unavailable(*call_hook(hooks, hooks.hook_guard, "Bash", {"command": "git status"}, self.wt))
         self.assertEqual(call_hook(hooks, hooks.hook_test_lock, "Edit", {"file_path": os.path.join(self.wt, "a.py")}, self.wt)[0], 0)
 
+    def test_an_old_guard_api_blocks(self):  # install skew (spec section 6): a guard without the one-argument check
+        hooks = self.copy("def check_command(line, pa_address, own_address, extra_rows, cwd):\n    return None\n")
+        self.assert_unavailable(*call_hook(hooks, hooks.hook_guard, "Bash", {"command": "git status"}, self.wt))
+
     def test_a_check_that_raises_blocks(self):
         def boom(*_a, **_k):
             raise RuntimeError("boom")
-        broken = mock.Mock(check_command=boom, check_edit=boom, profile_rows=boom)
+        broken = mock.Mock(check_command=boom, check_edit=boom)
         with mock.patch.object(pa_hooks, "_load_guard", return_value=broken):
             self.assert_unavailable(*call_hook(pa_hooks, pa_hooks.hook_guard, "Bash", {"command": "git status"}, self.wt))
             self.assert_unavailable(*call_hook(pa_hooks, pa_hooks.hook_guard, "Write", {"file_path": os.path.join(self.wt, "a.py")}, self.wt))
         with mock.patch.object(pa_hooks, "hook_context", side_effect=OSError("gone")):
             self.assert_unavailable(*call_hook(pa_hooks, pa_hooks.hook_guard, "Bash", {"command": "git status"}, self.wt))
 
-    def test_a_malformed_profile_does_not_open_the_table(self):  # reviewer 2 I2
+    def test_a_malformed_guard_allow_changes_no_verdict(self):
         for n, allow in enumerate([5, [{"command": ["git", "lfs"], "args": ["any"]}], "rows", [{"command": ["git", "push"], "args": {}}]]):
             with self.subTest(allow=allow):
                 space = "spbad{}".format(n)
@@ -600,182 +581,103 @@ class FixA_FailClosed(unittest.TestCase):
                 wt = os.path.join(TMP, "wt-bad{}".format(n))
                 write_json(os.path.join(wt, ".claude", "pa-task.json"), {"task": "t-x", "space": space, "fix": False})
                 code, err = call_hook(pa_hooks, pa_hooks.hook_guard, "Bash", {"command": "git push origin t-x"}, wt)
-                self.assertEqual(code, 2)
-                self.assertIn(OFF_TABLE.format("git push origin t-x"), err)
-                self.assertEqual(call_hook(pa_hooks, pa_hooks.hook_guard, "Bash", {"command": "git status"}, wt)[0], 0)
+                self.assertEqual((code, err.strip()), (2, msg(D1, "git push origin t-x")))
+                self.assertEqual(call_hook(pa_hooks, pa_hooks.hook_guard, "Bash", {"command": "git status"}, wt), (0, ""))
 
 
-class FixB_CheckoutBranchOnly(GuardTest):
-    """(b) reviewer 1 #2, reviewer 2 I1, verifier F1: git checkout takes a branch name only."""
+class R2_Hook(unittest.TestCase):
+    """t-007 fix round 2 (REVIEW-4 M1, REVIEW-3 M5): through pa_hooks.hook_guard."""
 
-    def test_pathspec_words_are_refused(self):
-        for line in ["git checkout '*.py'", "git checkout ':/'", "git checkout ':(glob)**'", "git checkout 'a?b'",
-                     "git checkout '[ab]c'", "git checkout ':!x'", "git checkout -b x '*.py'", "git checkout -b ':x'",
-                     "git checkout -b x ':/'", "git checkout -b 'n*'", "git --no-pager checkout '*.md'"]:
-            with self.subTest(line=line):
-                self.assertTrue((self.check(line) or "").startswith("Refused by the Project Agent's allowlist: git"), line)
+    @classmethod
+    def setUpClass(cls):
+        HookGuard.setUpClass.__func__(cls)
+        cls.elsewhere = os.path.join(TMP, "r2-elsewhere")
+        os.makedirs(cls.elsewhere, exist_ok=True)
+        open(os.path.join(cls.wt, "only-in-root.py"), "a").close()
 
-    def test_branch_words_still_allowed(self):
-        for line in ["git checkout some-branch", "git checkout HEAD~1", "git checkout -b new-x", "git checkout -b new-x main",
-                     "git checkout feature/x"]:
-            with self.subTest(line=line):
-                self.assertIsNone(self.check(line))
+    def call(self, tool, tool_input, cwd, env=None):
+        err = io.StringIO()
+        data = {"tool_name": tool, "tool_input": tool_input, "cwd": cwd}
+        with mock.patch.dict(os.environ, dict({"HC_TERMINAL_ID": OWN}, **(env or {}))), contextlib.redirect_stderr(err):
+            try:
+                code = pa_hooks.hook_guard(data, [])
+            except SystemExit as e:
+                code = e.code
+        return code, err.getvalue()
 
-    def test_a_cd_that_may_not_run_leaves_the_folder_unknown(self):  # reviewer 2 I1, the cd blind spot
-        os.makedirs(os.path.join(self.cwd, "sub"))
-        open(os.path.join(self.cwd, "a.py"), "w").close()
-        open(os.path.join(self.cwd, "sub", "b.py"), "w").close()
-        for line in ["cd /nonexistent || true; git checkout a.py", "cd sub; git checkout a.py", "true || cd sub && git checkout a.py",
-                     "ls | cd sub && git checkout a.py", "pushd sub && git checkout a.py", "popd && git checkout x",
-                     "cd sub || true && git checkout a.py"]:
-            with self.subTest(line=line):
-                self.assertIsNotNone(self.check(line))
-        for line in ["cd sub && git checkout a.py", "git status; cd sub && git checkout x", "cd sub && cd .. && git checkout x"]:
-            with self.subTest(line=line):
-                self.assertIsNone(self.check(line))
+    def test_unavailable_message(self):
+        for words in GUARD_UNAVAILABLE_WORDS:
+            self.assertIn(words, pa_hooks.GUARD_UNAVAILABLE)
+
+    def test_malformed_input_is_refused(self):
+        for data in [{}, {"tool_input": {"command": "git push"}}]:
+            with self.subTest(data=data), contextlib.redirect_stderr(io.StringIO()) as err:
+                with self.assertRaises(SystemExit) as caught:
+                    pa_hooks.hook_guard(data, [])
+                self.assertEqual(caught.exception.code, 2)
+                self.assertIn("guard unavailable", err.getvalue())
+
+    def test_bash_from_another_folder(self):  # REVIEW-3 M5: the hook does not assume its folder
+        env = {"CLAUDE_PROJECT_DIR": self.wt}
+        self.assertEqual(self.call("Bash", {"command": "hc send w9 'done'"}, self.elsewhere, env)[0], 0)
+        self.assertEqual(self.call("Bash", {"command": "git checkout only-in-root.py"}, self.elsewhere, env)[0], 0)
+        self.assertEqual(self.call("Bash", {"command": "git push origin t-x"}, self.elsewhere, env)[0], 2)
+        self.assertEqual(self.call("Write", {"file_path": ".claude/pa-task.json"}, self.elsewhere, env)[0], 2)
+
+    def test_task_record_through_the_hook(self):
+        record = os.path.join(self.wt, ".claude", "pa-task.json")
+        self.assertEqual(self.call("Write", {"file_path": record}, self.wt)[0], 2)
+        self.assertEqual(self.call("Read", {"file_path": record}, self.wt)[0], 0)
 
 
-class FixC_ConfigReadOnly(GuardTest):
-    """(c) reviewer 1 #3, reviewer 2 I4: git config reads only (a key containing a dot, list, get <key>)."""
+# ---- The editor rule (t-007 R8; kept, Q1): verdicts unchanged, the message is EDIT ---------------------------------
+
+class AC6EditorRule(GuardTest):
+    def setUp(self):
+        super().setUp()
+        self.spaces = os.path.join(TMP, "spaces-ac6")
+        self.state = os.path.join(self.spaces, "sp1")
+        self.repo = os.path.join(TMP, "repo-ac6")
+        for d in [os.path.join(self.state, "decisions"), os.path.join(self.state, "evidence", "t-x"),
+                  os.path.join(self.repo, ".git", "hooks"), os.path.join(self.repo, "src")]:
+            os.makedirs(d, exist_ok=True)
+
+    def edit(self, path):
+        return guard.check_edit(path, self.spaces, cwd=self.repo)
 
     def test_refused(self):
-        for line in ["git config edit", "git config set", "git config unset", "git config rename-section",
-                     "git config remove-section", "git config foo", "git config get", "git config get a.b c",
-                     "git config get edit", "git config --get edit", "git config --get-all x", "git config list x",
-                     "git config set user.name x", "git config get --all a.b", "git config .", "git config -e"]:
-            with self.subTest(line=line):
-                self.assertIsNotNone(self.check(line))
+        for path in [os.path.join(self.repo, ".git", "config"), os.path.join(self.repo, ".git", "hooks", "pre-commit"),
+                     os.path.join(self.repo, ".GIT", "config"), os.path.join(self.repo, "sub", ".git"),
+                     ".git/info/exclude", os.path.join(self.state, "ledger.json"),
+                     os.path.join(self.state, "decisions", "d-001.json"), os.path.join(self.state, "journal.jsonl"),
+                     os.path.join(self.state, "rules.json"), os.path.join(self.state, "agent.json")]:
+            with self.subTest(path=path):
+                self.assertEqual(self.edit(path), EDIT.format(path))
+
+    def test_links_are_resolved(self):
+        link = os.path.join(self.repo, "src", "innocent.txt")
+        if not os.path.lexists(link):
+            os.symlink(os.path.join(self.repo, ".git", "config"), link)
+        self.assertIsNotNone(self.edit(link))
+        state_link = os.path.join(self.repo, "state")
+        if not os.path.lexists(state_link):
+            os.symlink(self.state, state_link)
+        self.assertIsNotNone(self.edit(os.path.join(state_link, "ledger.json")))
 
     def test_allowed(self):
-        for line in ["git config user.email", "git config list", "git config get user.name", "git config --get user.name",
-                     "git config --get-all remote.origin.fetch", "git config --list", "git config -l", "git config branch.x.remote"]:
-            with self.subTest(line=line):
-                self.assertIsNone(self.check(line))
+        for path in [os.path.join(self.state, "evidence", "t-x", "x.md"), os.path.join(self.repo, "src", "a.py"),
+                     os.path.join(self.repo, ".github", "workflows", "ci.yml"), "src/b.py", "",
+                     os.path.join(self.state, "evidence", "t-x", "ledger.json")]:
+            with self.subTest(path=path):
+                self.assertIsNone(self.edit(path))
 
-
-class FixD_ProfileOptionRows(AC8ProfileRows):
-    """(d) reviewer 1 #4, verifier F4: guardAllow rows whose words after the program start with - are ignored, with a note."""
-
-    def test_option_rows_are_ignored(self):
-        for command, line in [(["git", "-c"], "git -c a=b push origin x"), (["git", "-C"], "git -C . push origin x"),
-                              (["git", "--no-pager"], "git --no-pager --no-pager push origin x"),
-                              (["gh", "--repo"], "gh --repo x pr create"), (["git", "-c", "a=b", "push"], "git -c a=b push origin x"),
-                              (["git", "lfs", "--x"], "git lfs --x"), (["hc", "-v"], "hc -v kill w2")]:
-            with self.subTest(command=command):
-                rows, note = self.rows([{"command": command, "args": "any"}])
-                self.assertEqual(rows, [])
-                self.assertIn(" ".join(command), note)
-                self.assertIsNotNone(self.check(line, extra_rows=rows))
-
-    def test_profile_rows_are_total(self):  # reviewer 2 I2
-        for allow in [5, "rows", {"command": ["git", "gc"]}, [{"command": ["git", "gc"], "args": ["any"]}],
-                      [{"command": ["git", "gc"], "args": {"x": 1}}], [{"command": ["git", 5], "args": "any"}], [None]]:
-            with self.subTest(allow=allow):
-                rows, note = self.rows(allow)
-                self.assertEqual(rows, [])
-                self.assertTrue(note)
-        for profile in ["x", 5, ["guardAllow"]]:
-            with self.subTest(profile=profile):
-                self.assertEqual(guard.profile_rows(profile, err=io.StringIO()), [])
-
-
-class FixE_ShellWrappers(GuardTest):
-    """(e) reviewer 2 I3: a shell -c wrapper or eval whose text names git, gh or hc as a whole word involves them."""
-
-    def test_refused(self):
-        for line in ['sh -c "git push origin x"', 'bash -c "gh pr create"', 'zsh -c "hc send x y"', "dash -c 'git push'",
-                     "ksh -c 'git push'", "eval 'git push'", 'eval "gh api x"', "bash -lc 'git push'", "/bin/sh -c 'git push'",
-                     "env bash -c 'git push'", "echo 'git push' | sh", "sh -c 'GIT push'", "bash -c 'git status'",
-                     "xargs sh -c 'git push' _", "sh -c 'cd x; git push'", "BASH -c 'git push'", "sh -c 'x=1 /usr/bin/git push'"]:
-            with self.subTest(line=line):
-                message = self.check(line)
-                self.assertIsNotNone(message, line)
-                self.assertTrue(message.startswith("Refused by the Project Agent's allowlist: "), message)
-
-    def test_ordinary_uses_stay_allowed(self):
-        for line in ["sh -c 'make test'", "bash tests/run-all.sh", "sh -c 'echo github.com'", "grep 'git push' notes.md",
-                     "echo 'use git push here'", "echo 'git'' notes'", "eval 'make'", "bash -c 'ls .git'", "sh -c 'cat x.git'"]:
-            with self.subTest(line=line):
-                self.assertIsNone(self.check(line))
-
-
-class FixF_ProgramCase(GuardTest):
-    """(f) verifier F2: git, gh and hc are recognised without regard to case; only the exact lowercase word matches a row."""
-
-    def test_case_variants_are_refused(self):
-        for line in ["GIT push origin x", "Gh pr create", "HC send x y", "GIT status", "Git log", "/usr/bin/GIT push",
-                     "xargs GIT push", "gIt diff", "HC read w1"]:
-            with self.subTest(line=line):
-                self.assertEqual(self.check(line), OFF_TABLE.format(line))
-        for line in ["GIT diff > x", "echo $(Git rev-parse HEAD)"]:
-            with self.subTest(line=line):
-                self.assertEqual(self.check(line), NOT_PLAIN)
-
-    def test_other_words_stay_allowed(self):
-        for line in ["echo GITHUB", "ls Git.log", "cat .GIT/HEAD", "make > GIT.log", "grep -rn gitignore ."]:
-            with self.subTest(line=line):
-                self.assertIsNone(self.check(line))
-
-
-class FixG_ArchiveRemote(GuardTest):
-    """(g) reviewer 1 #6, reviewer 2 M5, verifier F3: git archive refuses --remote and --exec and their abbreviations."""
-
-    def test_refused(self):
-        for line in ["git archive --remote=. HEAD", "git archive --remote . HEAD", "git archive --exec=x --remote=. HEAD",
-                     "git archive --rem=. HEAD", "git archive --r=. HEAD", "git archive --e=x HEAD", "git archive --ex x HEAD",
-                     "git archive --format=tar --exec=./x --remote=. HEAD", "git archive HEAD --remote=."]:
-            with self.subTest(line=line):
-                self.assertIsNotNone(self.check(line))
-
-    def test_allowed(self):
-        for line in ["git archive --format=tar HEAD", "git archive HEAD runtime", "git archive --prefix=x/ HEAD"]:
-            with self.subTest(line=line):
-                self.assertIsNone(self.check(line))
-
-
-class FixH_NeverAdd(AC8ProfileRows):
-    """(h) reviewer 1 #5, reviewer 2 M1: NEVER_ADD covers git lfs push and the missing gh groups."""
-
-    def test_more_rows_are_ignored(self):
-        for command in [["git", "lfs"], ["git", "lfs", "push"], ["git", "svn"], ["git", "p4"], ["git", "daemon"],
-                        ["git", "instaweb"], ["git", "imap-send"], ["git", "http-push"], ["git", "send-pack"],
-                        ["gh", "run"], ["gh", "run", "rerun"], ["gh", "run", "cancel"], ["gh", "run", "delete"],
-                        ["gh", "issue", "delete"], ["gh", "issue", "transfer"], ["gh", "issue", "reopen"],
-                        ["gh", "issue", "develop"], ["gh", "issue", "lock"], ["gh", "issue", "pin"],
-                        ["gh", "pr", "update-branch"], ["gh", "pr", "revert"], ["gh", "pr", "lock"], ["gh", "label"],
-                        ["gh", "cache"], ["gh", "project"], ["gh", "ssh-key"], ["gh", "gpg-key"], ["gh", "codespace"],
-                        ["gh", "org"]]:
-            with self.subTest(command=command):
-                rows, note = self.rows([{"command": command, "args": "any"}])
-                self.assertEqual(rows, [])
-                self.assertIn(" ".join(command), note)
-
-    def test_lfs_pull_still_added(self):
-        rows, note = self.rows([{"command": ["git", "lfs", "pull"], "args": "any"}])
-        self.assertEqual((len(rows), note), (1, ""))
-
-
-class FixH_Restore(GuardTest):
-    """(h) reviewer 1 #9, reviewer 2 M4: git restore names files, not folders."""
-
-    def test_folders_are_refused(self):
-        os.makedirs(os.path.join(self.cwd, "sub", "deeper"))
-        for line in ["git restore ../..", "git restore ..//..", "git restore sub", "git restore sub/", "git restore sub/deeper/..",
-                     "git restore " + self.cwd, "git restore /", "git restore --staged sub", "git restore -- sub",
-                     "cd - && git restore a.py", "cd /nonexistent; git restore a.py", "git restore '~'"]:
-            with self.subTest(line=line):
-                self.assertIsNotNone(self.check(line))
-
-    def test_files_still_allowed(self):
-        os.makedirs(os.path.join(self.cwd, "sub"))
-        for line in ["git restore a.py", "git restore --staged sub/a.py", "git restore ../a.py", "cd sub && git restore a.py",
-                     "git restore " + os.path.join(self.cwd, "a.py")]:
-            with self.subTest(line=line):
-                self.assertIsNone(self.check(line))
+    def test_long_path_is_cut(self):
+        path = os.path.join(self.repo, ".git", "x" * 400)
+        self.assertEqual(self.edit(path), EDIT.format(path[:297] + "..."))
 
 
 class FixH_EditorRule(GuardTest):
-    """(h) reviewer 1 #7, verifier F4 (profiles folder), reviewer 2 M2 (.git reached through a link)."""
+    """t-007 (h) reviewer 1 #7, verifier F4 (profiles folder), reviewer 2 M2 (.git reached through a link)."""
 
     run_hook = HookGuard.run_hook
 
@@ -808,7 +710,7 @@ class FixH_EditorRule(GuardTest):
                      os.path.join(self.home, "core", "worker.md"), os.path.join(self.home, "config.json"),
                      os.path.join(self.repo, "sub", ".git", "config"), "sub/.git/hooks/pre-commit"]:
             with self.subTest(path=path):
-                self.assertEqual(self.edit(path), OFF_TABLE.format(path))
+                self.assertEqual(self.edit(path), EDIT.format(path))
 
     def test_allowed(self):
         for path in [os.path.join(self.state, "evidence", "t-x", "x.md"), os.path.join(self.state, "evidence", "t-y", "build.log"),
@@ -819,215 +721,47 @@ class FixH_EditorRule(GuardTest):
     def test_through_the_hook(self):
         profile = os.path.join(pa.ROOT, "profiles", "guardp", "profile.json")
         code, err = self.run_hook("Edit", {"file_path": profile})
-        self.assertEqual(code, 2)
-        self.assertIn(profile, err)
+        self.assertEqual((code, err.strip()), (2, EDIT.format(profile)))
         self.assertEqual(self.run_hook("Write", {"file_path": os.path.join(pa.space_dir("spguard"), "schedule.json")})[0], 2)
         self.assertEqual(self.run_hook("Write", {"file_path": os.path.join(pa.space_dir("spguard"), "evidence", "t-x", "a.md")})[0], 0)
 
 
-class FixH_HcSendText(GuardTest):
-    """(h) reviewer 2 nit: the hc send text is a word, not an option."""
+class R2b_TaskRecord(GuardTest):
+    """t-007 (e) REVIEW-3 M3: the editor rule protects the task record and the hook settings."""
 
-    def test_refused(self):
-        for line in ["hc send pa1 --force", "hc send pa1 -", "hc send pa1 -x", "hc send --force pa1"]:
-            with self.subTest(line=line):
-                self.assertIsNotNone(self.check(line))
-        self.assertIsNone(self.check("hc send pa1 'done - see evidence'"))
-
-
-# ---- Fix round 2 -----------------------------------------------------------------------------------
-# A user home (HOME is patched to it) holding the Project Agent's home at ~/.config/herdr-pa, and a worktree beside it.
-
-class Round2(GuardTest):
     def setUp(self):
         super().setUp()
-        self.user = os.path.join(TMP, "r2user")
-        self.home = os.path.join(self.user, ".config", "herdr-pa")
+        user = os.path.join(TMP, "r2user")
+        self.home = os.path.join(user, ".config", "herdr-pa")
         self.spaces = os.path.join(self.home, "spaces")
-        self.space = os.path.join(self.spaces, "sp1")
-        self.evidence = os.path.join(self.space, "evidence")
-        self.wt = os.path.join(self.user, "work", "wt")
-        for d in [os.path.join(self.evidence, "t-x"), os.path.join(self.wt, ".git"), os.path.join(self.wt, "src"),
+        self.wt = os.path.join(user, "work", "wt")
+        for d in [os.path.join(self.spaces, "sp1", "evidence", "t-x"), os.path.join(self.wt, "src"),
                   os.path.join(self.wt, ".claude")]:
             os.makedirs(d, exist_ok=True)
-        for f in [os.path.join(self.wt, "src", "a.py"), os.path.join(self.wt, "b.py"), os.path.join(self.space, "ledger.json"),
-                  os.path.join(self.home, "config.json"), os.path.join(self.wt, ".claude", "pa-task.json")]:
-            open(f, "a").close()
-        patcher = mock.patch.dict(os.environ, {"HOME": self.user, "HERDR_PA_HOME": self.home})
+        patcher = mock.patch.dict(os.environ, {"HOME": user, "HERDR_PA_HOME": self.home})
         patcher.start()
         self.addCleanup(patcher.stop)
-
-    def r2(self, line, cwd=None):
-        return self.check(line, cwd=cwd or self.wt)
-
-    def fill(self, line):
-        # {name} placeholders only; other braces are shell text
-        for name in ("user", "home", "spaces", "space", "evidence", "wt"):
-            line = line.replace("{" + name + "}", getattr(self, name))
-        return line
-
-    def assert_allowed(self, lines):
-        for line in lines:
-            line = self.fill(line)
-            with self.subTest(line=line):
-                self.assertIsNone(self.r2(line), line)
-
-
-class R2b_TaskRecord(Round2):
-    """(e) REVIEW-3 M3: the editor rule protects the task record and the hook settings."""
 
     def test_editor(self):
         for path in [os.path.join(self.wt, ".claude", "pa-task.json"), os.path.join(self.wt, ".claude", "settings.local.json"),
                      os.path.join(self.wt, ".claude", "PA-TASK.json")]:
             with self.subTest(path=path):
-                self.assertIsNotNone(guard.check_edit(path, self.spaces, cwd=self.wt, home=self.home))
+                self.assertEqual(guard.check_edit(path, self.spaces, cwd=self.wt, home=self.home), EDIT.format(path))
         self.assertIsNone(guard.check_edit(os.path.join(self.wt, "src", "a.py"), self.spaces, cwd=self.wt, home=self.home))
 
 
-VARIABLE_WORDS = ["sets a git or gh variable", "report", "Project Agent", "There is no override"]
-
-
-class R2c_GitVariables(Round2):
-    """(c) REVIEW-3 I2, REVIEW-4 M3: a command that sets GIT_* or GH_* is refused."""
-
-    def test_refused(self):
-        for line in ["export GIT_CONFIG_COUNT=1 && export GIT_CONFIG_KEY_0=core.fsmonitor && export GIT_CONFIG_VALUE_0=x && git status",
-                     "export GIT_DIR=/tmp/x && git status", "GIT_SSH_COMMAND=x make", "env GIT_DIR=x make",
-                     "GH_REPO=a/b gh pr view 1", "export gh_token=x", "declare -x GIT_WORK_TREE=/tmp", "typeset GIT_PAGER=cat",
-                     "local GIT_X=1", "readonly GH_HOST=x", "set GIT_X=1", "export GIT_DIR", "export -n Git_Dir",
-                     "if true; then GIT_DIR=x git status; fi", "GIT_DIR=x; git status", "GIT_X+=y make",
-                     "export GIT_PAGER='git push origin HEAD'; git log", "export GIT_DIR=$(mktemp -d) && git status",
-                     "GIT_EDITOR=vi make > out", "builtin export GIT_DIR=x"]:
-            with self.subTest(line=line):
-                message = self.r2(line)
-                self.assertIsNotNone(message, line)
-                for words in VARIABLE_WORDS:
-                    self.assertIn(words, message)
-
-    def test_values_naming_git_involve_git(self):
-        for line in ["export PAGER='git push origin HEAD'", "EDITOR='gh pr create' make", "export LESSOPEN='|hc run x'"]:
-            with self.subTest(line=line):
-                self.assertIsNotNone(self.r2(line), line)
-
-    def test_allowed(self):
-        self.assert_allowed(["export FOO=1 && make", "env FOO=bar make", "export GITHUB_WORKSPACE_X=1", "make CC=gcc",
-                             "git commit -m 'GIT_DIR=x is bad'", "echo GIT_DIR > /tmp/x", "python3 x.py --tool=git"])
-
-
-class R2e_DashedAndWrappers(Round2):
-    """(e) REVIEW-3 M4, VERIFY-2 F2: git-<cmd> programs, csh, tcsh, fish, watch and env -S."""
-
-    def test_refused(self):
-        for line in ["git-push origin x", "/Library/Developer/CommandLineTools/usr/libexec/git-core/git-push origin HEAD",
-                     "git-lfs push origin x", "xargs git-push", "GIT-PUSH origin x", "csh -c 'git push'", "tcsh -c 'git push'",
-                     "/bin/tcsh -c 'git push'", "echo 'git push' | csh", "env -S 'git push origin x'", "env -S'git push'",
-                     "env --split-string='git push'", "fish -c 'git push'", "watch 'git push'", "git-push origin x > /tmp/o"]:
-            with self.subTest(line=line):
-                self.assertIsNotNone(self.r2(line), line)
-
-    def test_allowed(self):
-        self.assert_allowed(["cat docs/git-guide.md", "env | sort", "ls -la"])
-
-
-class R2e_NeverAdd(AC8ProfileRows):
-    """(e) REVIEW-3 M1: more rows can never be added."""
-
-    def test_more_rows_are_ignored(self):
-        for command in [["git", "subtree"], ["git", "subtree", "push"], ["git", "credential-osxkeychain"],
-                        ["git", "credential-store"], ["git", "credential-cache"], ["git", "Credential-Store"],
-                        ["git", "maintenance"], ["git", "lfs", "install"], ["git", "lfs", "uninstall"], ["git", "lfs", "lock"],
-                        ["git", "lfs", "unlock"], ["git", "receive-pack"], ["git", "upload-pack"], ["git", "shell"],
-                        ["git", "cvsserver"], ["hc", "run"], ["hc", "kill"], ["hc", "rm"], ["hc", "interrupt"]]:
-            with self.subTest(command=command):
-                rows, note = self.rows([{"command": command, "args": "any"}])
-                self.assertEqual(rows, [])
-                self.assertIn(" ".join(command), note)
-
-    def test_lfs_pull_still_added(self):
-        rows, note = self.rows([{"command": ["git", "lfs", "pull"], "args": "any"}])
-        self.assertEqual((len(rows), note), (1, ""))
-
-
-class R2_Hook(unittest.TestCase):
-    """(d) REVIEW-4 M1, (e) REVIEW-3 M5, REVIEW-3 N3 / REVIEW-4 N4: through pa_hooks.hook_guard."""
-
-    @classmethod
-    def setUpClass(cls):
-        HookGuard.setUpClass.__func__(cls)
-        cls.elsewhere = os.path.join(TMP, "r2-elsewhere")
-        os.makedirs(cls.elsewhere, exist_ok=True)
-        open(os.path.join(cls.wt, "only-in-root.py"), "a").close()
-
-    def call(self, tool, tool_input, cwd, env=None):
-        err = io.StringIO()
-        data = {"tool_name": tool, "tool_input": tool_input, "cwd": cwd}
-        with mock.patch.dict(os.environ, dict({"HC_TERMINAL_ID": OWN}, **(env or {}))), contextlib.redirect_stderr(err):
-            try:
-                code = pa_hooks.hook_guard(data, [])
-            except SystemExit as e:
-                code = e.code
-        return code, err.getvalue()
-
-    def test_unavailable_message(self):
-        for words in GUARD_UNAVAILABLE_WORDS:
-            self.assertIn(words, pa_hooks.GUARD_UNAVAILABLE)
-
-    def test_malformed_input_is_refused(self):
-        for data in [{}, {"tool_input": {"command": "git push"}}]:
-            with self.subTest(data=data), contextlib.redirect_stderr(io.StringIO()) as err:
-                with self.assertRaises(SystemExit) as caught:
-                    pa_hooks.hook_guard(data, [])
-                self.assertEqual(caught.exception.code, 2)
-                self.assertIn("guard unavailable", err.getvalue())
-
-    def test_the_hook_does_not_assume_its_folder(self):  # REVIEW-3 M5
-        env = {"CLAUDE_PROJECT_DIR": self.wt}
-        # the reported folder has no task record, but the project folder has: the Project Agent's address still applies
-        self.assertEqual(self.call("Bash", {"command": "hc send w9 'done'"}, self.elsewhere, env)[0], 2)
-        self.assertEqual(self.call("Bash", {"command": "hc send pa1 'done'"}, self.elsewhere, env)[0], 0)
-        # a file in the project folder is not checked out over, whichever folder the hook was given
-        self.assertEqual(self.call("Bash", {"command": "git checkout only-in-root.py"}, self.elsewhere, env)[0], 2)
-        self.assertEqual(self.call("Bash", {"command": "git checkout feature"}, self.elsewhere, env)[0], 0)
-
-    def test_task_record_through_the_hook(self):
-        record = os.path.join(self.wt, ".claude", "pa-task.json")
-        self.assertEqual(self.call("Write", {"file_path": record}, self.wt)[0], 2)
-        self.assertEqual(self.call("Read", {"file_path": record}, self.wt)[0], 0)
-
-
-# ---- Split (card d-048): the Bash path rule goes to a later task; what stays is tightened -----------------
-# Finding ids: VERIFY-3 Fn, REVIEW-5 In/Mn/Nn, REVIEW-6 In/Mn/Nn.
-
-VARIABLE = ("Refused by the Project Agent's allowlist: {} sets a git or gh variable (GIT_*, GH_*), which changes what the "
-            "allowed git and gh commands do. Run the command without it. If it is needed, stop and report this to the "
-            "Project Agent with hc send. There is no override.")
-
-
-class Split(GuardTest):
-    """A user home (HOME patched) with a worktree in it."""
+class Split_PersonalSettings(GuardTest):
+    """Decided with d-048: the editor rule protects the person's own git and gh settings."""
 
     def setUp(self):
         super().setUp()
         self.user = tempfile.mkdtemp(dir=TMP)
         self.wt = os.path.join(self.user, "work", "wt")
         os.makedirs(os.path.join(self.wt, "sub"))
-        for f in [os.path.join(self.wt, "a.py"), os.path.join(self.user, "a.py"), os.path.join(self.user, "sub-a.py")]:
-            open(f, "a").close()
         patcher = mock.patch.dict(os.environ, {"HOME": self.user})
         patcher.start()
         self.addCleanup(patcher.stop)
-        for name in ("CDPATH", "XDG_CONFIG_HOME"):  # put back by the patcher
-            os.environ.pop(name, None)
-
-    def at(self, line, cwd=None):
-        return self.check(line, cwd=cwd or self.wt)
-
-
-class Split_PersonalSettings(Split):
-    """(2) decided with d-048: the editor rule protects the person's own git and gh settings."""
-
-    def setUp(self):
-        super().setUp()
+        os.environ.pop("XDG_CONFIG_HOME", None)  # put back by the patcher
         self.spaces = os.path.join(TMP, "split-spaces")
         for d in [os.path.join(self.user, ".config", "git"), os.path.join(self.user, ".config", "gh"),
                   os.path.join(self.user, "real-gh")]:
@@ -1048,7 +782,7 @@ class Split_PersonalSettings(Split):
                           (os.path.join(u, ".config", "gh", "hosts.yml"), None), (os.path.join(u, ".config", "GH", "config.yml"), None),
                           (os.path.join(self.wt, "settings-link"), None)]:
             with self.subTest(path=path):
-                self.assertEqual(self.edit(path, cwd), OFF_TABLE.format(path))
+                self.assertEqual(self.edit(path, cwd), EDIT.format(path))
 
     def test_through_a_linked_folder(self):
         link = os.path.join(self.wt, "ghlink")
@@ -1079,1027 +813,6 @@ class Split_PersonalSettings(Split):
                 self.assertEqual(HookGuard.run_hook(self, tool, {key: os.path.join(self.user, ".gitconfig")})[0], 2)
                 self.assertEqual(HookGuard.run_hook(self, tool, {key: os.path.join(self.user, ".config", "gh", "config.yml")})[0], 2)
         self.assertEqual(HookGuard.run_hook(self, "Read", {"file_path": os.path.join(self.user, ".gitconfig")})[0], 0)
-
-
-class Split_HiddenNames(Split):
-    """VERIFY-3 F3, REVIEW-5 M2: a not-plain line that spells git, gh or hc through $'...', $'' or an expansion that may be
-    empty involves them."""
-
-    def test_refused_not_plain(self):
-        for line in ["gi$''t push origin HEAD > /dev/null", "$'\\x67it' push origin HEAD > /dev/null", "gi$'t' push origin HEAD",
-                     "$'\\147it' push > /dev/null", "$'\\u0067it' push > /dev/null", "g$()it push origin HEAD", "gi${NOPE}t push",
-                     "h$'c' send x y > /dev/null", "g$\"\"h pr create > /dev/null", "gi$NOPE''t push > /dev/null"]:
-            with self.subTest(line=line):
-                self.assertEqual(self.at(line), NOT_PLAIN)
-
-    def test_ordinary_not_plain_lines_stay_allowed(self):
-        for line in ["make test > build.log 2>&1", "echo $HOME > /tmp/x", "for f in *.py; do echo $f; done",
-                     "python3 -c 'print(1)' | tee out.txt", "echo ${PATH} > /tmp/p", "printf $'a\\tb\\n' > /tmp/t"]:
-            with self.subTest(line=line):
-                self.assertIsNone(self.at(line))
-
-
-class Split_PipeIntoShell(Split):
-    """REVIEW-5 M1: what an allowed row prints is not run by a shell in the same line."""
-
-    def test_refused(self):
-        for line, shown_part in [("git log -1 --format=%s | bash", "bash"), ("git show HEAD:x.sh | bash", "bash"),
-                                 ("git show HEAD:x.sh | sh -s", "sh -s"), ("git diff | grep x | zsh", "zsh"),
-                                 ("git log --format=%s | xargs sh -c", "xargs sh -c"), ("gh pr view 1 | bash", "bash"),
-                                 ("hc read w1 | sh", "sh"), ("git status && echo x | sh", "sh")]:
-            with self.subTest(line=line):
-                self.assertEqual(self.at(line), OFF_TABLE.format(shown_part))
-
-    def test_allowed(self):
-        for line in ["git log | head", "git diff | grep x | wc -l", "echo hi | bash", "cat x.sh | sh", "git status && bash tests/run-all.sh",
-                     "git log --oneline | tee log.txt"]:
-            with self.subTest(line=line):
-                self.assertIsNone(self.at(line))
-
-
-class Split_Reflog(Split):
-    """REVIEW-5 N1: git reflog with options first does not take a subcommand word after them."""
-
-    def test_refused(self):
-        for line in ["git reflog -n 5 expire --all", "git reflog -n 5 delete HEAD", "git reflog --all drop",
-                     "git reflog -n 1 exists HEAD"]:
-            with self.subTest(line=line):
-                self.assertEqual(self.at(line), OFF_TABLE.format(line))
-
-    def test_allowed(self):
-        for line in ["git reflog -n 5", "git reflog --date=iso", "git reflog show HEAD", "git reflog -n 5 HEAD"]:
-            with self.subTest(line=line):
-                self.assertIsNone(self.at(line))
-
-
-class Split_CdTracking(Split):
-    """VERIFY-3 F5 and F4 (CDPATH), for the folder git checkout and git restore are checked in: a cd whose target the
-    guard cannot work out leaves the folder unknown."""
-
-    def test_tilde_forms_the_shell_expands_differently(self):
-        for line in ["cd ~- && git checkout a.py", "cd ~+ && git checkout a.py", "cd ~-/sub && git checkout a.py",
-                     "cd ~+ && git restore a.py", "cd ~nosuchuser-x && git checkout x"]:
-            with self.subTest(line=line):
-                self.assertIsNotNone(self.at(line, cwd=os.path.join(self.wt, "sub")))
-
-    def test_cdpath(self):
-        for line in ["export CDPATH=" + self.user + " && cd work && git checkout feature",
-                     "export CDPATH=" + self.user + " && cd sub && git restore a.py"]:
-            with self.subTest(line=line):
-                self.assertIsNotNone(self.at(line, cwd=self.user))
-        with mock.patch.dict(os.environ, {"CDPATH": self.user}):
-            self.assertIsNotNone(self.at("cd sub && git checkout a.py"))
-            self.assertIsNone(self.at("cd ./sub && git checkout feature"))
-            self.assertIsNone(self.at("cd " + os.path.join(self.wt, "sub") + " && git checkout feature"))
-
-    def test_still_known(self):
-        for line in ["cd ~ && git checkout feature", "cd sub && git checkout feature", "cd ./sub && git restore b.py",
-                     "cd ~/work/wt && git restore a.py"]:
-            with self.subTest(line=line):
-                self.assertIsNone(self.at(line))
-        self.assertIsNotNone(self.at("cd ~ && git checkout a.py"))  # a.py exists in ~: a file restore
-
-
-class R2b_UnknownFolderAndQuotes(Round2):
-    """Put back (VERIFY-4 V4-1, REVIEW-7 M2): the cd tracking for git checkout, which the split keeps."""
-
-    def test_known_cd_then_or_makes_the_folder_unknown(self):  # VERIFY-2 F3 (mutation M31)
-        self.assertIsNotNone(self.r2("cd src && git status || git checkout feature"))
-        self.assertIsNotNone(self.r2("cd src && git status ; git checkout feature"))
-        self.assertIsNone(self.r2("cd src && git status && git checkout feature"))
-
-
-class SplitFix_WrapperVariables(Split):
-    """REVIEW-7 I1: R12 applies inside an eval or shell -c text too, as it did at ca7adf8."""
-
-    def test_refused(self):
-        for line, word in [("eval 'export GIT_DIR=/tmp/x' && git status", "GIT_DIR=/tmp/x"),
-                           ("eval 'export GIT_CONFIG_GLOBAL=/tmp/x'; git status", "GIT_CONFIG_GLOBAL=/tmp/x"),
-                           ("eval 'export GIT_SSH_COMMAND=x' && git fetch origin", "GIT_SSH_COMMAND=x"),
-                           ("eval 'export GIT_WORK_TREE=/tmp/o GIT_DIR=/tmp/o/.git'", "GIT_WORK_TREE=/tmp/o"),
-                           ("eval 'export GIT_DIR' && git status", "GIT_DIR"),
-                           ("bash -c 'export GH_TOKEN=x; make'", "GH_TOKEN=x"),
-                           ("env -S 'FOO=1 GIT_DIR=x make'", "GIT_DIR=x")]:
-            with self.subTest(line=line):
-                self.assertEqual(self.at(line), VARIABLE.format(word))
-
-    def test_allowed(self):
-        for line in ["eval 'make'", "sh -c 'make test'", "bash -c 'export FOO=1; make'", "eval 'echo hi' && git status"]:
-            with self.subTest(line=line):
-                self.assertIsNone(self.at(line))
-
-
-class SplitFix_HiddenNames(Split):
-    """REVIEW-7 I2: a program word built from an expansion or substitution whose text spells git, gh or hc."""
-
-    def test_refused_not_plain(self):
-        for line in ["${X:-git} push origin HEAD > /dev/null", "${X-git} push > /dev/null", "gi`:`t push > /dev/null",
-                     "gi$(:)t push > /dev/null", "gi$(true)t push > /dev/null", "${X:+gh} pr create > /dev/null",
-                     "${X:=hc} send a b > /dev/null", "${X=git} push > /dev/null", "${X:-gi}t push > /dev/null",
-                     "gi$(echo $(true))t push > /dev/null"]:
-            with self.subTest(line=line):
-                self.assertEqual(self.at(line), NOT_PLAIN)
-
-    def test_inside_a_wrapper_text(self):
-        for line in ["sh -c 'gi$(:)t push'", "eval '${X:-git} push'"]:
-            with self.subTest(line=line):
-                self.assertIsNotNone(self.at(line))
-
-    def test_ordinary_not_plain_lines_stay_allowed(self):
-        for line in ["echo ${X:-default} > /tmp/x", "echo $(date) > /tmp/d", "echo `date` > /tmp/d", "make -j$(nproc) > log",
-                     "echo ${HOME:-/tmp}/x > /tmp/y", "sh -c 'make test'"]:
-            with self.subTest(line=line):
-                self.assertIsNone(self.at(line))
-
-
-class SplitFix_PipeIntoShell(Split):
-    """REVIEW-7 Minor (M1): only the program word after the pipe counts; source and . read the pipe too."""
-
-    def test_allowed(self):
-        for line in ["git log | grep bash", "git ls-files | grep -c watch", "git log | grep -w sh", "git diff | grep eval",
-                     "git log --oneline | grep -e source"]:
-            with self.subTest(line=line):
-                self.assertIsNone(self.at(line))
-
-    def test_refused(self):
-        for line, shown_part in [("git show HEAD:x.sh | source /dev/stdin", "source /dev/stdin"),
-                                 ("git show HEAD:x.sh | . /dev/stdin", ". /dev/stdin"),
-                                 ("git show HEAD:x.sh | env bash", "env bash"),
-                                 ("git show HEAD:x.sh | exec sh", "exec sh"),
-                                 ("git show HEAD:x.sh | xargs -0 bash -c", "xargs -0 bash -c"),
-                                 ("git show HEAD:x.sh | /bin/bash", "/bin/bash")]:
-            with self.subTest(line=line):
-                self.assertEqual(self.at(line), OFF_TABLE.format(shown_part))
-
-
-class PipeFix_PipeIntoShell(Split):
-    """VERIFY-5 V5-1, REVIEW-8 I-1, I-2, M2: after a |, a known text filter is allowed whatever its arguments say; for
-    any other program, launchers included, a later word naming a shell refuses the line, as at b43e3e5. source and .
-    count only as the program word or the first later word that does not start with -."""
-
-    def test_shell_after_a_program_the_guard_does_not_know(self):
-        for part in ["caffeinate sh", "caffeinate -i bash", "FOO=1 caffeinate sh", "setsid bash",
-                     "arch -arm64 bash", "ionice -c3 sh", "doas sh", "script -q /dev/null sh", "busybox sh",
-                     "chrt -b 0 zsh", "unbuffer -p bash"]:
-            with self.subTest(part=part):
-                self.assertEqual(self.at("git show HEAD:x.sh | " + part), OFF_TABLE.format(part))
-
-    def test_launchers_judge_the_program_they_start(self):
-        for part in ["nohup bash", "time bash", "timeout 5 bash", "nice -n 10 sh", "env -i PATH=/bin bash",
-                     "xargs -I% sh -c x", "nohup caffeinate sh", "command . /dev/stdin", "builtin source /dev/stdin",
-                     "time source /dev/stdin"]:
-            with self.subTest(part=part):
-                self.assertEqual(self.at("git show HEAD:x.sh | " + part), OFF_TABLE.format(part))
-
-    def test_filters_whatever_their_arguments(self):
-        for line in ["git log | grep bash", "git ls-files | xargs ls -d .", "git ls-files | xargs grep -l source",
-                     "git log | rg -w sh", "git log | head -n 3 sh",
-                     "git log | tail -n 2 bash", "git ls-files | wc -l bash", "git log | sort -k 2 zsh",
-                     "git log | uniq -c sh", "git log | cut -d ' ' -f 1 bash", "git log | tr a-z A-Z",
-                     "git log | tee bash.log sh", "git show HEAD:x.sh | cat - bash", "git log | less bash",
-                     "git log --format=%s | jq -R .", "git log | column -t sh", "git ls-files | grep -l source",
-                     "git ls-files | env LC_ALL=C sort .", "git log | time wc -l", "git ls-files | caffeinate ls -d ."]:
-            with self.subTest(line=line):
-                self.assertIsNone(self.at(line))
-
-    def test_reserved_word_before_a_shell(self):
-        self.assertEqual(self.at("git show HEAD:x.sh | ! bash"), OFF_TABLE.format("'!' bash"))
-
-    def test_option_value_named_like_a_filter(self):
-        self.assertEqual(self.at("git show HEAD:x.sh | xargs -I grep bash -c x"), OFF_TABLE.format("xargs -I grep bash -c x"))
-
-    def test_assignment_before_a_shell(self):
-        self.assertEqual(self.at("git show HEAD:x.sh | FOO=1 bash"), OFF_TABLE.format("FOO=1 bash"))
-
-
-class PipeFix2_PipeIntoShell(Split):
-    """VERIFY-6 V6-1: launcher options are not parsed. After a |, a program other than a known filter is refused when
-    any later word names a shell or is eval, or when its first later word not starting with - is source or . ; a
-    launcher followed by a filter whose argument names a shell is refused too (the accepted cost: use git grep)."""
-
-    def test_refused(self):
-        for part in ["env -iu grep bash", "xargs -0I grep sh -c grep", "sudo -Eu grep bash", "env --unset grep bash",
-                     "time --output grep bash", "caffeinate sh", "! bash", "setsid bash", "busybox sh",
-                     "env -S 'bash -c x'", "xargs grep bash", "xargs -0 grep -l bash", "nohup grep sh",
-                     "timeout 5 grep bash", "timeout -k 5 10s grep bash", "nice -n 10 grep sh", "xargs -n 1 grep sh",
-                     "xargs -n1 . /dev/stdin", "env eval x"]:
-            with self.subTest(part=part):
-                self.assertEqual(self.at("git show HEAD:x.sh | " + part), OFF_TABLE.format(shlex.join(shlex.split(part))))
-
-    def test_allowed(self):
-        for part in ["grep bash", "xargs ls -d .", "xargs grep -l source", "xargs -0 wc -l", "env LC_ALL=C sort",
-                     "nohup cat", "time wc -l", "timeout 5 head"]:
-            with self.subTest(part=part):
-                self.assertIsNone(self.at("git ls-files | " + part))
-
-
-class PipeFix_WrapperTexts(Split):
-    """VERIFY-5 V5-6 (a), (b): the env -S prefix in a wrapped word, and message texts in a wrapped line."""
-
-    def test_env_split_prefix_joined(self):
-        self.assertEqual(self.at("env -SGIT_DIR=x make"), VARIABLE.format("GIT_DIR=x"))
-
-    def test_message_in_a_wrapped_line(self):
-        self.assertIsNone(self.at("bash -c 'make' && git commit -m 'set GIT_DIR=x later; ok'"))
-
-
-class Split_Texts(GuardTest):
-    """VERIFY-3 N1: the R12 text is pinned."""
-
-    def test_variable_text(self):
-        self.assertEqual(guard.VARIABLE, VARIABLE)
-        self.assertEqual(self.check("export GIT_DIR=x"), VARIABLE.format("GIT_DIR=x"))
-
-
-# ---- t-007 part 7b, Job B: the person-only tools ----------------------------------------------------------------------
-PERSON_MSG = ("Refused by the Project Agent's allowlist: {}. pa-push-main and pa-push-allow are the person's commands: a "
-              "main branch is pushed only when the person answers a push card in the panel. Say in your report that the "
-              "work is ready to release. There is no override.")
-
-
-class PersonOnly(GuardTest):
-    """pa-push-main, pa-push-allow and pa_push.py are refused for a worker in every form the guard recognises for git
-    (plan-7b section 2, Job B). The lines are data handed to check_command only; none of them is run."""
-
-    def person(self, line, shown_part=None):
-        message = self.check(line)
-        if shown_part is not None:
-            self.assertEqual(message, PERSON_MSG.format(shown_part), line)
-        else:
-            self.assertIsNotNone(message, line)
-            self.assertTrue(message.startswith("Refused by the Project Agent's allowlist: "), message)
-            self.assertIn("pa-push-main and pa-push-allow are the person's commands", message)
-        return message
-
-    def test_plain(self):
-        line = "pa-push-main run d-push-t-1-1 --answer Push --space S"
-        self.person(line, line)
-        self.person("pa-push-main check d-push-t-1-1 --json", "pa-push-main check d-push-t-1-1 --json")
-        self.person("pa-push-main plan t-1 --repo /tmp/x", "pa-push-main plan t-1 --repo /tmp/x")
-        self.person("make && pa-push-main run x", "pa-push-main run x")
-
-    def test_path_forms(self):
-        for line in ["~/.local/bin/pa-push-main run x", "./pa_push.py run x", "PA-PUSH-MAIN run x", "Pa_Push.PY run x",
-                     "/usr/local/bin/pa-push-allow show", "~/.config/herdr-pa/tools/pa_push.py check x",
-                     "pa-push-allow add --path /tmp/r --space S", "PA-Push-Allow on"]:
-            with self.subTest(line=line):
-                self.person(line, shlex.join(shlex.split(line)))
-
-    def test_launchers(self):
-        for line in ["env pa-push-main run x", "env -i PATH=/bin pa-push-main run x", "nohup pa-push-main run x",
-                     "xargs pa-push-main", "command pa-push-main run x", "exec pa-push-allow off", "time pa-push-main run x",
-                     "sudo pa-push-main run x", "FOO=1 pa-push-main run x", "PAGER=pa-push-main make",
-                     "echo x | xargs pa-push-main run"]:
-            with self.subTest(line=line):
-                self.person(line)
-
-    def test_wrappers(self):
-        for line in ["sh -c 'pa-push-main run x'", "bash -lc 'pa-push-allow on'", "eval 'pa-push-main run x'",
-                     "zsh -c \"pa_push.py run x\"", "env -S 'pa-push-main run x'", "echo 'pa-push-main run x' | sh",
-                     "make && sh -c 'PA-PUSH-MAIN run x'"]:
-            with self.subTest(line=line):
-                self.person(line)
-
-    def test_non_plain(self):
-        for line in ["pa-push-main run $X > /dev/null", "pa-push-${A}main run x", "pa-push-$'main' run x",
-                     "$(pa-push-main run x)", "pa-push-allow on &", "pa_pu${X}sh.py run x", "pa-push-m`:`ain run x",
-                     "pa-push-main run x 2>&1 | tee out.txt"]:
-            with self.subTest(line=line):
-                self.assertEqual(self.check(line), PERSON_MSG.format(line))
-
-    def test_python_runs_tool(self):
-        for line in ["python3 ~/.config/herdr-pa/tools/pa_push.py run x", "python3 runtime/tools/pa_push.py check x",
-                     "/usr/bin/env python3 pa_push.py run x", "python3 -c 'import runpy' pa_push.py"]:
-            with self.subTest(line=line):
-                self.person(line)
-
-    def test_allow_cmd(self):  # AC3.4: a worker cannot change the allowlist through its tool
-        for sub in ["add --path /tmp/r --space S --url file:///tmp/o.git --branch main", "remove --path /tmp/r --space S",
-                    "on", "off", "show", "show --json"]:
-            line = "pa-push-allow " + sub
-            with self.subTest(line=line):
-                self.person(line, line)
-
-    def test_message_text(self):
-        self.assertEqual(guard.PERSON_MSG, PERSON_MSG)
-        self.assertEqual(guard.PERSON_ONLY, ("pa-push-main", "pa-push-allow", "pa_push.py"))
-        message = self.check("pa-push-main run 'a b'")
-        self.assertEqual(message, PERSON_MSG.format("pa-push-main run 'a b'"))
-        for words in ["push card in the panel", "ready to release", "There is no override"]:
-            self.assertIn(words, message)
-
-    def test_unrelated_words_allowed(self):
-        for line in ["python3 -m unittest tests/test_pa_push.py", "python3 -m unittest -v tests/test_pa_push.py > out.txt",
-                     'hc send {} "ready for pa-push-main plan"'.format(PA), "git commit -m 'pa-push-main docs'",
-                     "git commit -m pa-push-main", "hc send {} pa-push-main".format(PA), "ls runtime/tools",
-                     "cat my-pa-push-main.txt", "cat pa-push-main-notes.md", "cat pa_push.pyc", "python3 test_pa_push.py",
-                     "make pa-push", "grep -n push_allow notes.md"]:
-            with self.subTest(line=line):
-                self.assertIsNone(self.check(line))
-
-    def test_git_lines_keep_their_messages(self):  # nothing else in the guard changes
-        self.assertEqual(self.check("git push origin t-x"), OFF_TABLE.format("git push origin t-x"))
-        self.assertEqual(self.check("git commit -m x > x"), NOT_PLAIN)
-        self.assertIsNone(self.check("git status && make"))
-
-    def test_edit_push_allow_refused(self):  # already true (home rule): pinned
-        spaces = os.path.join(pa.ROOT, "spaces")
-        for path in [os.path.join(pa.ROOT, "push-allow.json"), os.path.join(pa.ROOT, "push-allow.json.bak-pa-push-allow")]:
-            with self.subTest(path=path):
-                self.assertEqual(guard.check_edit(path, spaces, cwd=self.cwd, home=pa.ROOT), OFF_TABLE.format(path))
-
-
-# ---- t-016: the Bash write rule ----------------------------------------------------------------------------------------
-# spec.md (evidence/t-016) R1-R8. The lines are data handed to check_writes, split_plain_ops, check_command and the hook
-# function in-process only; none is run. <wt> is the test's worktree, <ev> the literal ~ form of a space's evidence
-# folder, <sp> a space folder. Rows 2 and 46 name the build tool `pkg-build` (the public-repo check refuses internal
-# names); their shape is the spec's.
-WRITE = ("Refused by the Project Agent's guard: this command writes to {target}, which is inside a .git folder or the "
-         "Project Agent's files. Change git state with the allowed git commands only; write reports, logs and notes in "
-         "your task's evidence folder (evidence/<task-id>/ in the Project Agent's state folder). If the write is needed, "
-         "stop and report to the Project Agent with hc send. There is no override.")
-FOLDER_UNKNOWN = ("Refused by the Project Agent's guard: after {word} the folder is not known, so the write to {target} "
-                  "cannot be checked. Write the target as a full path, or run the cd as a command of its own first. "
-                  "There is no override.")
-T016_EV = "~/.config/herdr-pa/spaces/sp1/evidence/t-016"
-# spec section 4: every row must stay allowed (a refusal of any is Must fix).
-T016_ALLOWED = [
-    "cd <wt> && hooks/tests.sh affected > build.log 2>&1",                                   # 1
-    "cd <wt>/src/Pkg && pkg-build release > /tmp/b.log 2>&1 && tail -n 20 /tmp/b.log",      # 2
-    "python3 -m pytest tests/test_pa_guard.py > <ev>/test.log 2>&1",                         # 3
-    "pa-full-suite",                                                                         # 4
-    "cat <ev>/spec.md",                                                                      # 5
-    "cat a.log >> <ev>/build.log",                                                           # 6
-    "make 2>&1 | tee <ev>/build.log",                                                        # 7
-    "tee -a <ev>/notes.md < draft.md",                                                       # 8
-    "echo done > <ev>/status.txt",                                                           # 9
-    "cat > <ev>/REVIEW.md <<'EOF'\nThe fix names .git/config in prose.\nEOF",                # 10
-    "cat <<'EOF' > notes.md\nprose about .git/config\nEOF",                                  # 11
-    "git status",                                                                            # 12
-    "git diff HEAD~1",                                                                       # 13
-    'git add -A && git commit -m "fix .git/config handling"',                                # 14
-    "git log --oneline -5 | head",                                                           # 15
-    "git grep -n protected -- runtime",                                                      # 16
-    "grep -rn --exclude-dir=.git TODO .",                                                    # 17
-    "rg TODO --glob '!.git'",                                                                # 18
-    "find . -path ./.git -prune -o -name '*.py' -print",                                     # 19
-    "cat .git/HEAD",                                                                         # 20
-    "ls -la .git/hooks",                                                                     # 21
-    "cp .git/config /tmp/config.bak",                                                        # 22
-    "diff .git/info/exclude .gitignore",                                                     # 23
-    "wc -l < .git/HEAD",                                                                     # 24
-    "echo 'build/' >> .gitignore",                                                           # 25
-    "mkdir -p .github/workflows && cp ci.yml .github/workflows/ci.yml",                      # 26
-    "touch logs/.gitkeep",                                                                   # 27
-    "echo x > .git-blame-ignore-revs",                                                       # 28
-    "sed -i '' 's/foo/bar/' .gitignore",                                                     # 29
-    "sed -i '' 's#/.git/#/git dir/#' docs/notes.md",                                         # 30
-    "perl -pi -e 's/.git\\//x/' notes.md",                                                   # 31
-    "chmod +x scripts/run.sh",                                                               # 32
-    "chmod 755 build/tool",                                                                  # 33
-    "truncate -s 0 build/out.log",                                                           # 34
-    "mkdir -p build/tmp && cp -r src/fixtures build/tmp/",                                   # 35
-    "mv build/out.txt build/out.old",                                                        # 36
-    "rm -rf build/tmp",                                                                      # 37
-    "ln -s ../shared/config.json config.json",                                               # 38
-    "rsync -a src/ /tmp/backup/",                                                            # 39
-    "dd if=/dev/zero of=build/blank.img bs=1k count=1",                                      # 40
-    "install -m 644 a.conf build/etc/a.conf",                                                # 41
-    "mkdir -p <ev>",                                                                         # 42
-    "cp <wt>/plan.md <ev>/plan.md",                                                          # 43
-    'hc send t2r "done: see <ev>/spec.md"',                                                  # 44
-    "npm test 2>/dev/null",                                                                  # 45
-    "pkg-build release > build.log 2>&1; echo $?",                                           # 46
-    'echo "a > b" > notes.md',                                                               # 47
-    'cp a.py "$HOME/tmp/a.py"',                                                              # 48
-    "source .venv/bin/activate && pytest > t.log",                                           # 49
-]
-# spec section 5: (command, the target the message names); each ;-separated example its own entry.
-T016_REFUSED = [
-    ("echo x > .git/config", ".git/config"), ("cat hook.sh >> .git/hooks/pre-commit", ".git/hooks/pre-commit"),
-    ("make 2> .git/x", ".git/x"), ("ls &> .git/x", ".git/x"), ("cd .git && echo x > config", "config"),
-    ("cd <wt> || exit 1; echo x > .git/HEAD", ".git/HEAD"),
-    ("cp hook.sh .git/hooks/pre-commit", ".git/hooks/pre-commit"), ("cp -t .git/hooks hook.sh", ".git/hooks"),
-    ("mv .git/index /tmp/index", ".git/index"), ("tee .git/info/exclude", ".git/info/exclude"),
-    ("touch .git/index.lock", ".git/index.lock"), ("rm -rf .git", ".git"), ("/bin/rm -rf .git", ".git"),
-    ("ln -sf /tmp/x .git/hooks/post-commit", ".git/hooks/post-commit"), ("mkdir .git/hooks/x", ".git/hooks/x"),
-    ("rmdir .git/refs/x", ".git/refs/x"), ("chmod +x .git/hooks/pre-push", ".git/hooks/pre-push"),
-    ("truncate -s 0 .git/index", ".git/index"), ("sed -i '' 's/a/b/' .git/config", ".git/config"),
-    ("LC_ALL=C sed -i '' s/a/b/ .git/config", ".git/config"), ("perl -pi -e 's/a/b/' .git/config", ".git/config"),
-    ("dd if=x of=.git/HEAD", ".git/HEAD"), ("rsync -a x .git/", ".git/"), ("install x .git/hooks/y", ".git/hooks/y"),
-    ("echo x > .GIT/config", ".GIT/config"), ("echo x > lnk/config", "lnk/config"),
-    ("echo x > <sp>/ledger.json", "<sp>/ledger.json"), ("cp d.json <sp>/decisions/d-9.json", "<sp>/decisions/d-9.json"),
-    ("echo x >> ~/.config/herdr-pa/spaces/sp1/journal.jsonl", "~/.config/herdr-pa/spaces/sp1/journal.jsonl"),
-    ('tee "$HOME/.config/herdr-pa/core/worker.md"', "<user>/.config/herdr-pa/core/worker.md"),
-    ("echo '[alias]' >> ~/.gitconfig", "~/.gitconfig"), ("echo '{}' > .claude/pa-task.json", ".claude/pa-task.json"),
-]
-
-
-class T016(Split):
-    """A Project Agent home with spaces in the patched user home, and a worktree with a .git folder and a link to it."""
-
-    def setUp(self):
-        super().setUp()
-        self.home = os.path.join(self.user, ".config", "herdr-pa")
-        self.spaces = os.path.join(self.home, "spaces")
-        self.sp = os.path.join(self.spaces, "sp1")
-        for d in [os.path.join(self.sp, "evidence", "t-016"), os.path.join(self.sp, "decisions"),
-                  os.path.join(self.spaces, "sp2", "evidence", "t-x")] + [os.path.join(self.wt, ".git", d) for d in ("hooks", "info", "refs")]:
-            os.makedirs(d, exist_ok=True)
-        for f in ("ledger.json", "journal.jsonl"):
-            open(os.path.join(self.sp, f), "a").close()
-        os.symlink(os.path.join(self.wt, ".git"), os.path.join(self.wt, "lnk"))
-
-    def fill(self, line):
-        return line.replace("<wt>", self.wt).replace("<ev>", T016_EV).replace("<sp>", self.sp).replace("<user>", self.user)
-
-    def w(self, line, cwd=None):
-        return guard.check_writes(self.fill(line), self.spaces, cwd=cwd or self.wt, home=self.home)
-
-    def refused(self, line, target=None):
-        message = self.w(line)
-        self.assertIsNotNone(message, line)
-        if target is not None:
-            self.assertEqual(message, WRITE.format(target=self.fill(target)), line)
-        return message
-
-
-class T016_Scanner(T016):
-    def scan(self, line):
-        return guard.split_plain_ops(self.fill(line), writes=True)
-
-    def test_ac1_1_writes_false_is_todays_scanner(self):  # passes today
-        for line in ["make > a", "cat $HOME/x", "ls &> a", "wc -l < a", "echo x 2>&1"]:
-            with self.subTest(line=line):
-                self.assertIsNone(guard.split_plain_ops(line))
-        self.assertEqual(guard.split_plain_ops("git status && make"), ([["git", "status"], ["make"]], ["&&", None]))
-
-    def test_ac1_2_redirect_targets(self):
-        self.assertEqual(self.scan("make test > build.log 2>&1"), ([["make", "test"]], [None], [["build.log"]]))
-
-    def test_ac1_3_forms(self):
-        self.assertEqual(self.scan("echo hi>.git/x"), ([["echo", "hi"]], [None], [[".git/x"]]))
-        self.assertEqual(self.scan("ls 2>>e.log"), ([["ls"]], [None], [["e.log"]]))
-        self.assertEqual(self.scan("ls &> a.log"), ([["ls"]], [None], [["a.log"]]))
-        self.assertEqual(self.scan("ls &>> a.log; echo x >&2"), ([["ls"], ["echo", "x"]], [";", None], [["a.log"], []]))
-
-    def test_ac1_4_not_plain(self):
-        for line in ["echo x >", ">|x", "echo >|x", "cat <<EOF", "cat <<< x", "ls >&file", "echo $X > a", "> x",
-                     "ls; > x", "cat <> a", "echo x > ; ls", "echo x > > y"]:
-            with self.subTest(line=line):
-                self.assertIsNone(self.scan(line))
-        self.assertEqual(self.scan("wc -l < .git/HEAD"), ([["wc", "-l"]], [None], [[]]))
-
-    def test_ac1_5_quoted_redirect_is_a_word(self):
-        self.assertEqual(self.scan("echo \"a > b\" '>' c"), ([["echo", "a > b", ">", "c"]], [None], [[]]))
-
-    def test_ac1_6_home(self):
-        self.assertEqual(self.scan('echo x > "$HOME/x"')[2], [[os.path.join(self.user, "x")]])
-        self.assertEqual(self.scan("cat $HOME/x")[0], [["cat", os.path.join(self.user, "x")]])
-        self.assertEqual(self.scan("cat ${HOME}/x")[0], [["cat", os.path.join(self.user, "x")]])
-        self.assertEqual(self.scan("cat '$HOME/x'")[0], [["cat", "$HOME/x"]])
-        self.assertIsNone(self.scan("cat $HOMEX/x"))
-
-
-class T016_Targets(T016):
-    def test_ac2_1_each_row(self):
-        pairs = [("cp hook.sh .git/hooks/pre-commit", "cp hook.sh build/pre-commit"),
-                 ("cp -t .git/hooks hook.sh", "cp -t build hook.sh"), ("cp -t.git/hooks a", "cp -tbuild .git/config"),
-                 ("cp --target-directory=.git/hooks a", "cp --target-directory=build .git/config"),
-                 ("ln -sf /tmp/x .git/hooks/post-commit", "ln -sf .git/config build/post-commit"),
-                 ("install x .git/hooks/y", "install .git/config build/y"), ("install -d build/x .git/x", "install -d build/x build/y"),
-                 ("install -t .git/hooks x", "install -t build .git/config"),
-                 ("rsync -a x .git/", "rsync -a .git/ /tmp/backup/"),
-                 ("rsync -t x .git/", "rsync -t .git/config /tmp/y"),  # rsync: -t is --times; the last operand only
-                 ("mv .git/index /tmp/index", "mv build/a /tmp/a"), ("mv --target-directory=.git a", "mv -t build a"),
-                 ("rm -rf .git", "rm -rf build"), ("rmdir .git/refs/x", "rmdir build/x"), ("unlink .git/HEAD", "unlink build/x"),
-                 ("touch .git/index.lock", "touch build/x"), ("mkdir .git/hooks/x", "mkdir build/x"),
-                 ("tee .git/info/exclude", "tee build/x"), ("truncate -s 0 .git/index", "truncate -s 0 build/x"),
-                 ("chmod +x .git/hooks/pre-push", "chmod +x build/x"), ("chown me:staff .git/HEAD", "chown me:staff build/x"),
-                 ("chgrp staff .git/HEAD", "chgrp staff build/x"),
-                 ("sed -i '' 's/a/b/' .git/config", "sed -i '' 's/a/b/' build/x"), ("sed -i.bak -e s/a/b/ .git/config", "sed -i.bak -e s/a/b/ build/x"),
-                 ("sed --in-place=.bak s/a/b/ .git/config", "sed --in-place s/.git/b/ build/x"),
-                 ("sed -i -f .git/script build/x .git/config", "sed -i -f .git/script build/x"),
-                 ("perl -pi -e 's/a/b/' .git/config", "perl -pi -e 's/a/b/' build/x"), ("perl -i.bak -pE s/a/b/ .git/config", "perl -i -pe s/a/b/ build/x"),
-                 ("perl -i script.pl .git/config", "perl -i .git/script.pl build/x"),
-                 ("dd if=x of=.git/HEAD", "dd if=.git/HEAD of=build/x")]
-        for bad, good in pairs:
-            with self.subTest(bad=bad):
-                self.refused(bad)
-            with self.subTest(good=good):
-                self.assertIsNone(self.w(good))
-
-    def test_ac2_2_non_path_words(self):
-        for line in ["chmod +x scripts/run.sh", "chmod 755 build/tool", "truncate -s 0 build/out.log", "chown me:staff a.py"]:
-            with self.subTest(line=line):
-                self.assertIsNone(self.w(line))
-
-    def test_ac2_3_assignments_and_paths(self):
-        self.refused("LC_ALL=C sed -i '' s/a/b/ .git/config", ".git/config")
-        self.refused("/bin/rm -rf .git", ".git")
-        self.refused("RM -rf .git", ".git")
-
-    def test_ac2_4_reads(self):
-        for line in ["sed s/a/b/ .git/config", "sed -n 1p .git/config", "perl -pe 's/a/b/' .git/config", "env rm -rf .git",
-                     "sudo rm -rf .git", "xargs rm -rf .git", "command rm .git/x", "find .git -delete"]:
-            with self.subTest(line=line):
-                self.assertIsNone(self.w(line))
-
-    def test_ac3_1_names_that_are_not_git(self):
-        for target in [".gitignore", ".github/x", ".gitkeep", ".git-blame-ignore-revs", "x.git.bak",
-                       os.path.join(self.spaces, "sp2", "evidence", "t-x", "a.md"), "~/.config/herdr-pa/spaces/sp2/evidence/t-x/b.md"]:
-            with self.subTest(target=target):
-                self.assertIsNone(self.w("echo x > " + target))
-
-    def test_ac3_2_case_links_and_the_folder(self):
-        self.refused("echo x > .GIT/config", ".GIT/config")
-        self.refused("echo x > lnk/config", "lnk/config")
-        self.refused("rm -rf .git", ".git")
-        self.refused("touch " + os.path.join(self.wt, ".git"), os.path.join(self.wt, ".git"))
-
-    def test_ac3_3_state(self):
-        self.assertIsNone(self.w("echo x > " + T016_EV + "/x.md"))
-        for target in ["~/.config/herdr-pa/spaces/sp1/ledger.json", "~/.config/herdr-pa/spaces/sp1/decisions/d-1.json",
-                       "~/.config/herdr-pa/spaces/sp1/evidence", "~/.config/herdr-pa/tools/pa_guard.py"]:
-            with self.subTest(target=target):
-                self.refused("echo x > " + target, target)
-
-
-class T016_Folders(T016):
-    def test_ac4_1_cd_then_write(self):
-        self.assertIsNone(self.w("cd <wt> && hooks/tests.sh affected > build.log 2>&1"))
-        self.refused("cd .git && echo x > config", "config")
-        self.refused("cd " + os.path.join(self.wt, ".git") + " && echo x > config", "config")
-
-    def test_ac4_2_the_set_only_grows(self):
-        self.refused("cd <wt> || exit 1; echo x > .git/HEAD", ".git/HEAD")
-        self.refused("cd /tmp; cd " + self.wt + " && echo x > .git/HEAD", ".git/HEAD")
-        self.refused("cd .git || true; echo x > config", "config")
-        self.refused("cd sub && cd ../.git && echo x > config", "config")
-
-    def test_ac4_3_folder_unknown(self):
-        self.assertEqual(self.w("cd - && echo x > notes.txt"), FOLDER_UNKNOWN.format(word="cd -", target="notes.txt"))
-        self.assertIsNone(self.w("cd - && echo x > /tmp/n"))
-        self.refused("cd - && echo x > " + os.path.join(self.wt, ".git", "x"))
-
-    def test_ac4_4_source_keeps_the_folder(self):
-        self.assertIsNone(self.w("source .venv/bin/activate && pytest > t.log"))
-        self.assertIsNone(self.w(". .venv/bin/activate && pytest > t.log"))
-
-    def test_r4_unknown(self):
-        for first in ["popd", "cd a b", "cd ~x", "builtin cd x", "command pushd x", "pushd", "cd -P -"]:
-            with self.subTest(first=first):
-                message = self.w(first + " && echo x > n.txt")
-                self.assertIsNotNone(message)
-                self.assertTrue(message.startswith("Refused by the Project Agent's guard: after "), message)
-                self.assertIn("the write to n.txt cannot be checked", message)
-                self.assertIsNone(self.w(first + " && echo x > /tmp/n"))
-        with mock.patch.dict(os.environ, {"CDPATH": "/somewhere"}):
-            self.assertEqual(self.w("cd sub && echo x > n.txt"), FOLDER_UNKNOWN.format(word="cd sub", target="n.txt"))
-            self.assertIsNone(self.w("cd ./sub && echo x > n.txt"))
-            self.assertIsNone(self.w("cd sub && echo x > /tmp/n"))
-        self.assertIsNone(self.w("cd sub && echo x > n.txt"))
-
-    def test_r4_cd_alone(self):
-        self.refused("cd && echo x > .gitconfig", ".gitconfig")
-        self.refused("cd ~ && echo x > .gitconfig", ".gitconfig")
-        self.refused("cd ~/.config/herdr-pa && echo x > core/worker.md", "core/worker.md")
-        self.refused("pushd .git && echo x > config", "config")
-
-
-class T016_Reads(T016):
-    def test_ac5_1(self):
-        for line in T016_ALLOWED[16:24]:  # rows 17-24
-            with self.subTest(line=line):
-                self.assertIsNone(self.w(line))
-
-
-class T016_Allowed(T016):
-    def test_section4(self):
-        self.assertEqual(len(T016_ALLOWED), 49)
-        for row, line in enumerate(T016_ALLOWED, 1):
-            with self.subTest(row=row, line=line):
-                self.assertIsNone(self.w(line))
-
-    def test_git_rows_check_command(self):  # AC7.2, passes today
-        for line in T016_ALLOWED[11:16]:  # rows 12-16
-            with self.subTest(line=line):
-                self.assertIsNone(self.at(line))
-
-
-class T016_Refused(T016):
-    def test_section5(self):
-        for line, target in T016_REFUSED:
-            with self.subTest(line=line):
-                self.refused(line, target)
-        self.assertEqual(self.w("cd - && echo x > notes.txt"), FOLDER_UNKNOWN.format(word="cd -", target="notes.txt"))
-
-
-class T016_Messages(T016):
-    def test_ac6_1(self):
-        self.assertEqual(guard.WRITE, WRITE)
-        message = self.w("echo x > .git/config")
-        self.assertEqual(message, WRITE.format(target=".git/config"))
-        for words in ["git commands", "evidence folder", "hc send", "no override"]:
-            self.assertIn(words, message)
-        long_target = ".git/" + "x" * 400
-        self.assertEqual(self.w("touch " + long_target), WRITE.format(target=guard.shown(long_target)))
-
-    def test_ac6_2(self):
-        self.assertEqual(guard.FOLDER_UNKNOWN, FOLDER_UNKNOWN)
-        message = self.w("cd - && echo x > notes.txt")
-        self.assertIn("cd -", message)
-        self.assertIn("notes.txt", message)
-
-    def test_r8_docs(self):
-        doc = guard.__doc__
-        self.assertIn("check_writes", doc)
-        self.assertNotIn("is not checked", doc)
-        self.assertIn("plainly writes", doc)
-
-
-class T016_Hook(unittest.TestCase):
-    """AC7.1: pa-hook guard calls check_writes for Bash, after check_command (in-process, a copy of the tools)."""
-
-    @classmethod
-    def setUpClass(cls):
-        HookGuard.setUpClass.__func__(cls)
-        os.makedirs(os.path.join(cls.wt, ".git"), exist_ok=True)
-
-    def test_ac7_1(self):
-        folder = tempfile.mkdtemp(dir=TMP)
-        shutil.copy(os.path.join(TOOLS, "pa_guard.py"), os.path.join(folder, "pa_guard.py"))
-        hooks = load_hooks_copy(folder)
-        code, err = call_hook(hooks, hooks.hook_guard, "Bash", {"command": "echo x > .git/config"}, self.wt)
-        self.assertEqual((code, err.strip()), (2, WRITE.format(target=".git/config")))
-        self.assertEqual(call_hook(hooks, hooks.hook_guard, "Bash", {"command": "echo x > a.txt"}, self.wt)[0], 0)
-        code, err = call_hook(hooks, hooks.hook_guard, "Bash", {"command": "git push origin t-x"}, self.wt)
-        self.assertEqual(code, 2)
-        self.assertIn(OFF_TABLE.format("git push origin t-x"), err)  # check_command first, its own message
-        self.assertNotIn("this command writes to", err)
-
-
-# ---- t-016, card d-067: the person-only names are refused as the program run, not as a git row's path operand -------
-class T016_PersonOnlyOperands(PersonOnly):
-    """Every PersonOnly test still passes (this class inherits them). The lines are data for check_command only."""
-
-    def test_git_rows_with_the_file_as_operand(self):
-        for line in ["git add runtime/tools/pa_push.py", "git add -- runtime/tools/pa_push.py", "git add a.py pa_push.py",
-                     "git diff runtime/tools/pa_push.py", "git diff HEAD~1 -- runtime/tools/pa_push.py",
-                     "git --no-pager diff --stat pa_push.py", "git log --oneline -- runtime/tools/pa_push.py",
-                     "git log -p runtime/tools/PA_PUSH.PY", "git show HEAD:runtime/tools/pa_push.py",
-                     "git status runtime/tools/pa_push.py", "git status --short pa_push.py",
-                     "git restore runtime/tools/pa_push.py", "git restore --staged -- runtime/tools/pa_push.py",
-                     "git blame runtime/tools/pa_push.py", "git blame -L 1,9 pa_push.py",
-                     "git ls-files runtime/tools/pa_push.py", "git grep -n push -- runtime/tools/pa_push.py",
-                     "git diff pa_push.py && git add pa_push.py && git commit -m 'pa_push.py: fix'"]:
-            with self.subTest(line=line):
-                self.assertIsNone(self.check(line))
-
-    def test_git_mv_and_rm_are_not_rows(self):  # refused as for any file, not as a person-only tool
-        for line in ["git mv runtime/tools/pa_push.py runtime/tools/pa_push2.py", "git rm runtime/tools/pa_push.py",
-                     "git rm --cached pa_push.py"]:
-            with self.subTest(line=line):
-                self.assertEqual(self.check(line), OFF_TABLE.format(line))
-                other = line.replace("pa_push.py", "other.py").replace("pa_push2.py", "other2.py")
-                self.assertEqual(self.check(other), OFF_TABLE.format(other))
-
-    def test_interpreters_running_the_file(self):
-        for line in ["python pa_push.py run x", "python3 runtime/tools/pa_push.py check x", "python3 -u ./PA_PUSH.PY run x",
-                     "sh pa_push.py", "bash runtime/tools/pa_push.py run x", "zsh ./pa_push.py", "sh -c 'python3 pa_push.py run x'",
-                     "git add pa_push.py && python3 pa_push.py run x", "git status; pa-push-main run x",
-                     "git diff pa_push.py | sh", "env git add pa_push.py", "eval git add pa_push.py", "GIT add pa_push.py",
-                     "git add pa-push-main && pa-push-main run x"]:
-            with self.subTest(line=line):
-                self.assertIsNotNone(self.check(line))
-        for line in ["python pa_push.py run x", "sh pa_push.py", "git add a.py && python3 pa_push.py run x"]:
-            with self.subTest(line=line):
-                self.assertTrue(self.check(line).startswith(PERSON_MSG.split("{}")[0]), line)
-                self.assertIn("pa-push-main and pa-push-allow are the person's commands", self.check(line))
-
-    def test_off_table_git_lines_keep_refusing(self):
-        for line in ["git push origin pa_push.py", "git -C /tmp add pa_push.py", "git checkout -- pa_push.py"]:
-            with self.subTest(line=line):
-                self.assertIsNotNone(self.check(line))
-
-    def test_profile_rows_keep_the_person_check(self):  # a row with any arguments may run a program it names
-        rows = [(("git", "mv"), guard.any_args), (("git", "bisect"), guard.any_args)]
-        self.assertIsNone(self.check("git mv a.py b.py", extra_rows=rows))
-        for line in ["git mv pa_push.py x.py", "git bisect run pa-push-main run x"]:
-            with self.subTest(line=line):
-                self.assertEqual(self.check(line, extra_rows=rows), PERSON_MSG.format(line))
-
-
-class T016_Fix2_RedirectsOnly(T016):
-    """REVIEW-2 M1: a command made only of redirects is judged like any other; its redirect targets are write targets."""
-
-    def test_redirects_only_refused(self):
-        for line, target in [("> <sp>/ledger.json", "<sp>/ledger.json"), ("> .git/index", ".git/index"),
-                             (">> ~/.gitconfig", "~/.gitconfig"), ("ls && > .git/index", ".git/index"),
-                             ("2> .git/HEAD", ".git/HEAD"), ("ls; >> <wt>/.git/config", "<wt>/.git/config"),
-                             ("&> .git/x", ".git/x"), ("< a.txt > .git/x", ".git/x"), ("X=1 > .git/x", ".git/x")]:
-            with self.subTest(line=line):
-                self.refused(line, target)
-
-    def test_redirects_only_allowed(self):
-        for line in ["> build/x.log", "> <ev>/x.txt", ">> /tmp/t016.txt", "ls && > build/y", "< a.txt", "2>&1 > /dev/null"]:
-            with self.subTest(line=line):
-                self.assertIsNone(self.w(line))
-
-    def test_folder_after_cd_applies(self):
-        self.refused("cd .git && > config", "config")
-        self.assertIsNone(self.w("cd build && > x.log"))
-
-
-class T016_Fix2_ManyRedirects(T016):
-    """REVIEW-1 F2: redirect targets are collected in one pass, so very many redirects are not quadratic."""
-
-    def test_twenty_thousand_redirects(self):
-        line = "ls" + " > build/x.log" * 20000
-        started = time.monotonic()
-        self.assertIsNone(self.w(line))
-        self.assertLess(time.monotonic() - started, 1.0)
-        self.refused(line + " > .git/x", ".git/x")
-
-
-class T016_Fix2_PersonOnlyPiped(PersonOnly):
-    """REVIEW-2 L1, VERIFY F2: a git command naming pa_push.py as a path may be piped only into a known text filter
-    (FILTERS, tee with no file); into any other program it is refused with the person-only message. Data for
-    check_command only; none of these lines is run."""
-
-    def test_piped_into_a_program_refused(self):
-        for line in ["git show HEAD:runtime/tools/pa_push.py | python3 - push main",
-                     "git cat-file -p HEAD:runtime/tools/pa_push.py | python3 -", "git show HEAD:pa_push.py | python3",
-                     "git cat-file -p HEAD:pa_push.py | python3", "git show HEAD:runtime/tools/PA_PUSH.PY | perl",
-                     "git show HEAD:runtime/tools/pa_push.py | tee /tmp/p.py", "git show HEAD:pa_push.py | tee -a /tmp/p.py",
-                     "git show HEAD:pa_push.py | sh", "git show HEAD:pa_push.py | bash -s", "git diff pa_push.py | node",
-                     "git show HEAD:pa_push.py | grep . | python3 -", "git show HEAD:pa_push.py | X=1 python3",
-                     "git log -p runtime/tools/pa_push.py | xargs echo", "git status && git show HEAD:pa_push.py | ruby",
-                     "git show HEAD:runtime/tools/pa_push.py | env python3", "git show HEAD:bin/pa-push-main | sh"]:
-            with self.subTest(line=line):
-                message = self.check(line)
-                self.assertIsNotNone(message, line)
-                self.assertTrue(message.startswith(PERSON_MSG.split("{}")[0]), message)
-
-    def test_no_pipe_or_a_text_filter_allowed(self):
-        for line in ["git show HEAD:runtime/tools/pa_push.py", "git show HEAD:pa_push.py",
-                     "git show HEAD:runtime/tools/pa_push.py | head -50", "git show HEAD:pa_push.py | grep -n push | wc -l",
-                     "git diff pa_push.py | cat", "git log -p pa_push.py | tail -n 5", "git show HEAD:pa_push.py | tee",
-                     "git show HEAD:pa_push.py | LC_ALL=C sort", "git diff pa_push.py; python3 -m pytest",
-                     "git show HEAD:other.py | python3 -", "git diff pa_push.py && git add pa_push.py"]:
-            with self.subTest(line=line):
-                self.assertIsNone(self.check(line))
-
-
-# ---- t-016 job 2: read-only git with redirects and -C ---------------------------------------------------------------
-# spec-2.md (evidence/t-016) R1-R5 and section 5. The lines are data for split_plain_ops, check_command, check_writes and
-# the in-process hook copy only; none is run. <wt> the test's worktree, <ev> a space's evidence folder (~ form), <sp> a
-# space folder. Table A rows 1, 20 and 35 of spec-2 cover the five commands whose old verdicts AC3, AC7, HookGuard,
-# PersonOnly and SHAPE_REFUSALS pinned before this job (those now pin a row outside the five).
-T016J2_A = [
-    "git diff > /tmp/x.diff", "git log --oneline > notes.txt", "git show HEAD:f > f.old",                         # 1-3
-    "git status > <ev>/status.txt", "git status --porcelain >> <ev>/status.txt", "git rev-parse HEAD > /tmp/head",  # 4-6
-    "git diff main...HEAD > <ev>/d.patch 2>&1", "git log -5 2>/dev/null", "git rev-parse --show-toplevel 2>/dev/null",
-    "git diff &> /tmp/d.txt", "git diff &>> /tmp/d.txt", "git log 2> err.txt > out.txt", "git show --stat HEAD >&2",
-    "git --no-pager log > /tmp/l", "git diff > /tmp/x && head /tmp/x", "cd <wt> && git diff > build/diff.txt",  # 14-16
-    "git log --oneline > notes.txt; git status", 'git diff > "/tmp/my diff.txt"', "git log > ~/scratch/log.txt",  # 17-19
-    "git -C <wt> status", "git -C ../other log --oneline -5", "git -C /tmp/repo diff HEAD~1",                     # 20-22
-    'git -C "dir with space" show HEAD', "git -C ~/work/wt rev-parse HEAD", "git -C sub status --short",          # 23-25
-    "git -C <wt> --no-pager log -3", "git -C <wt> diff > /tmp/x.diff", "git -C <wt> log --oneline > <ev>/log.txt 2>&1",
-    "git -C <wt> status && git -C <wt> diff --stat | head", "git > /tmp/s status", "> /tmp/s git status",          # 29-31
-    "git diff HEAD~1 -- runtime > /tmp/r.diff", "git show HEAD:runtime/core/worker.md > /tmp/w.md",                 # 32-33
-    "git log > logs/.gitkeep", "git status 2>&1 | head -5",                                                       # 34-35
-]
-T016J2_REGRESSION = ["git status", "git diff HEAD~1", "git log --oneline -5 | head",
-                     # the five replaced pins' original commands (orchestrator-approved amendment of R4)
-                     "git diff > out.patch", "git log 2>&1", "git diff > x", "git diff > x.patch", "git -C /tmp/x status"]
-# Table B: (row, line, kind, detail). NP, OT, P, V: check_command's message; W, FU: check_command None, check_writes refuses.
-T016J2_B = [
-    (1, "git commit -m x > /tmp/c.log", "NP", None), (2, "git add -A > /tmp/a", "NP", None),
-    (3, "git branch > /tmp/b", "NP", None), (4, "git rebase main > /tmp/r", "NP", None),
-    (5, "git rebase --onto main a b", "OT", None), (6, "git blame f > /tmp/b", "NP", None),
-    (7, "git ls-files > /tmp/f", "NP", None), (8, "gh pr view 1 > /tmp/p", "NP", None),
-    (9, 'hc send t2r "x" > /tmp/o', "NP", None), (10, "git -C <wt> commit -m x", "OT", None),
-    (11, "git -C <wt> add -A", "OT", None), (12, "git -C <wt> push origin t-x", "OT", None),
-    (13, "git -C <wt> blame f", "OT", None), (14, "git -C <wt> branch", "OT", None),
-    (15, "git -C <wt> rebase --onto main a", "OT", None), (16, "git diff > $(echo /tmp/x)", "NP", None),
-    (17, 'git log > "$HOME/x.txt"', "NP", None), (18, "git -C $HOME/wt status", "NP", None),
-    (19, 'git -C "$WT" status', "NP", None), (20, "git -C $(pwd) status", "NP", None),
-    (21, "echo $(git status) > /tmp/s", "NP", None), (22, "git diff < .git/HEAD", "NP", None),
-    (23, "git log > .git/x", "W", ".git/x"), (24, "git diff > .git/hooks/pre-commit", "W", ".git/hooks/pre-commit"),
-    (25, "git show HEAD:a >> ~/.gitconfig", "W", "~/.gitconfig"), (26, "git status > <sp>/ledger.json", "W", "<sp>/ledger.json"),
-    (27, "git log > ~/.config/herdr-pa/core/worker.md", "W", "~/.config/herdr-pa/core/worker.md"),
-    (28, "git diff > .claude/settings.local.json", "W", ".claude/settings.local.json"),
-    (29, "cd .git && git log > config", "W", "config"), (30, "cd - && git log > notes.txt", "FU", ("cd -", "notes.txt")),
-    (31, "git -C a -C b status", "OT", None), (32, "git -C status", "OT", None), (33, 'git -C "" status', "OT", None),
-    (34, "git -Cdir status", "OT", None), (35, "git -C -p status", "OT", None), (36, "git -c core.pager=x log", "OT", None),
-    (37, "git --git-dir=.git log", "OT", None), (38, "git --work-tree=. status", "OT", None),
-    (39, "git --exec-path=/tmp log", "OT", None), (40, "git -C d -c core.pager=x log", "OT", None),
-    (41, "git -C d --git-dir=x status", "OT", None), (42, "git --no-pager -C d log", "OT", None),
-    (43, "git diff --output=/tmp/x > /tmp/y", "NP", None), (44, "git -C d diff --output=/tmp/x", "OT", None),
-    (45, "make > b.log 2>&1 && git status", "NP", None), (46, "git status > /tmp/s | sh", "NP", None),
-    (47, "git show HEAD:pa_push.py > /tmp/p.py", "P", None), (48, "git log >| /tmp/x", "NP", None),
-    (48, "git log > /tmp/x &", "NP", None), (49, "git status > /tmp/s && git push origin t-x", "NP", None),
-    (50, "GIT_PAGER=cat git log > /tmp/x", "V", "GIT_PAGER=cat"), (51, "git log <<< x", "NP", None),
-    (51, "git log >", "NP", None), (52, "/usr/bin/git log > /tmp/x", "NP", None), (52, "env git log > /tmp/x", "NP", None),
-    (53, "git log > /tmp/x | tee .git/y", "W", ".git/y"),
-    (54, "git -C <wt> show HEAD:runtime/tools/pa_push.py | python3", "P", "git -C <wt> show HEAD:runtime/tools/pa_push.py"),
-]
-
-
-class T016J2(T016):
-    def both(self, line):
-        return self.check(self.fill(line), cwd=self.wt), self.w(line)
-
-    def quoted(self, line):
-        return " ".join(shlex.quote(w) for w in shlex.split(self.fill(line)))
-
-
-class T016J2_Scanner(T016J2):
-    def git(self, line):
-        return guard.split_plain_ops(line, writes="git")
-
-    def test_ac1_1_other_modes_unchanged(self):  # passes before the job; V2 is the full differential
-        self.assertIsNone(guard.split_plain_ops("git diff > /tmp/x"))
-        self.assertEqual(guard.split_plain_ops("git diff > /tmp/x 2>&1", writes=True), ([["git", "diff"]], [None], [["/tmp/x"]]))
-        self.assertEqual(guard.split_plain_ops("cat $HOME/x", writes=True)[0], [["cat", os.path.join(self.user, "x")]])
-        self.assertEqual(guard.split_plain_ops("wc -l < a", writes=True), ([["wc", "-l"]], [None], [[]]))
-        self.assertIsNone(guard.split_plain_ops("2>&1 && git status", writes=True))
-
-    def test_ac1_1_git_mode_within_write_mode(self):  # a line plain in git mode is plain in write mode, same targets
-        lines = [self.fill(l) for l in T016_ALLOWED + [l for l, _ in T016_REFUSED] + T016J2_A] + [
-            self.fill(l) for _, l, _, _ in T016J2_B]
-        for line in lines:
-            got = self.git(line)
-            if got is not None:
-                with self.subTest(line=line):
-                    want = guard.split_plain_ops(line, writes=True, bare=True)
-                    self.assertEqual((got[0], got[1], [[t for t in ts if not t.startswith(">&")] for ts in got[2]]), want)
-
-    def test_ac1_2_targets(self):
-        self.assertEqual(self.git("git diff > /tmp/x 2>&1"), ([["git", "diff"]], [None], [["/tmp/x", ">&1"]]))
-        self.assertEqual(self.git("git log 2>/dev/null"), ([["git", "log"]], [None], [["/dev/null"]]))
-        self.assertEqual(self.git("git status 2>&1 | head -5"), ([["git", "status"], ["head", "-5"]], ["|", None], [[">&1"], []]))
-        self.assertEqual(self.git("git show HEAD >&-")[2], [[">&-"]])
-
-    def test_ac1_3_not_plain(self):
-        for line in ["git diff < a", "git log <&0", 'git log > "$HOME/x"', "git log > $HOME/x", "git log > $X", "git log >",
-                     "2>&1 && git status", "git log <<< x", "git log <> x", "git log >| x", "git log > x &", "> x"]:
-            with self.subTest(line=line):
-                self.assertIsNone(self.git(line))
-
-
-class T016J2_Allowed(T016J2):
-    def test_ac2_1_table_a(self):
-        self.assertEqual(len(T016J2_A), 35)
-        for row, line in enumerate(T016J2_A + T016J2_REGRESSION, 1):
-            with self.subTest(row=row, line=line):
-                self.assertEqual(self.both(line), (None, None))
-
-    def test_ac3_1_profile_row_equal_to_a_read_row(self):
-        rows = [(("git", "status"), guard.any_args), (("git", "lfs", "pull"), guard.any_args)]
-        self.assertIsNone(self.check("git -C d status", extra_rows=rows))
-        self.assertEqual(self.check("git -C d lfs pull", extra_rows=rows), OFF_TABLE.format("git -C d lfs pull"))
-        self.assertIsNone(self.check("git lfs pull", extra_rows=rows))
-
-
-class T016J2_Refused(T016J2):
-    def test_ac2_2_table_b(self):
-        for row, line, kind, detail in T016J2_B:
-            with self.subTest(row=row, line=line):
-                command, writes = self.both(line)
-                if kind in ("W", "FU"):
-                    self.assertIsNone(command)
-                    want = WRITE.format(target=self.fill(detail)) if kind == "W" else FOLDER_UNKNOWN.format(
-                        word=detail[0], target=detail[1])
-                    self.assertEqual(writes, want)
-                    continue
-                want = {"NP": NOT_PLAIN, "OT": OFF_TABLE.format(self.quoted(line) if kind == "OT" else ""),
-                        "P": PERSON_MSG.format(self.quoted(detail) if detail else self.fill(line)),
-                        "V": VARIABLE.format(detail)}[kind]
-                self.assertEqual(command, want)
-
-    def test_ac3_2_pipe_rule_with_c(self):
-        message = self.check(self.fill("git -C <wt> show HEAD:runtime/tools/pa_push.py | python3"), cwd=self.wt)
-        self.assertTrue(message.startswith(PERSON_MSG.split("{}")[0]), message)
-        self.assertEqual(self.check("git -C d show HEAD:x.sh | bash"), OFF_TABLE.format("bash"))
-
-
-class T016J2_Limits(T016J2):
-    def test_ac5_1_sed_in_a_cluster(self):
-        self.refused("sed -Ei 's/a/b/' .git/config", ".git/config")
-        self.refused("sed -ni 's/a/b/' .git/config", ".git/config")
-        self.assertIsNone(self.w("sed -Ei 's/a/b/' notes.md"))
-        self.assertIsNone(self.w("sed -E 's/a/b/' .git/config"))
-
-    def test_ac5_2_cdpath_on_the_line(self):
-        self.assertEqual(self.w("export CDPATH=/tmp; cd build && echo x > notes.txt"),
-                         FOLDER_UNKNOWN.format(word="cd build", target="notes.txt"))
-        self.assertIsNone(self.w("cd build && echo x > notes.txt"))
-
-    # d-078: section 5 #7 (AC5.3) withdrawn; touch and truncate are back to a5edfb3, every file word a target.
-    def test_ac5_3_withdrawn_d078(self):
-        for line, target in [("touch -r .git/HEAD build/stamp", ".git/HEAD"), ("truncate -r .git/index build/x", ".git/index"),
-                             ("touch --reference .git/HEAD build/stamp", ".git/HEAD"), ("touch -r build/a .git/x", ".git/x"),
-                             ("touch -r .git/HEAD -r .git/index build/x", ".git/HEAD"),  # rounds 2 and 3: allowed
-                             ("touch -r .git/HEAD -- build/x", ".git/HEAD")]:  # round 2: allowed
-            with self.subTest(line=line):
-                self.refused(line, target)
-        for line in ["touch --reference=.git/HEAD build/stamp", "truncate --reference=.git/index build/x"]:
-            with self.subTest(line=line):  # one dash word, never a target (operands), as at a5edfb3
-                self.assertIsNone(self.w(line))
-
-    def test_ac5_3_finding_lines_refused(self):  # every line of REVIEW-J2-A/-R2/-R3 M1 and VERIFY-J2-R3 M1, M2
-        rows = [("touch -- -r .git/x", ".git/x"), ("touch -r -r .git/x", ".git/x"),  # REVIEW-J2-A M1
-                ("truncate -r -r .git/index", ".git/index"), ("truncate --reference -r .git/config", ".git/config"),
-                ("truncate -r --reference .git/config", ".git/config"),
-                ("truncate -s 0 build/a -r .git/index", ".git/index"), ("touch build/a -r .git/x", ".git/x"),  # -R2 M1
-                ("touch build/a --reference .git/config", ".git/config"),
-                ("touch - -r .git/x", ".git/x"), ("touch '' -r .git/x", ".git/x"),  # REVIEW-J2-R3 M1
-                ("truncate -s0 - -r .git/index", ".git/index"),
-                ("truncate -r build/a - --reference .git/index", ".git/index"),
-                ("truncate -s0 '' -r .git/index", ".git/index"),  # VERIFY-J2-R3 M1
-                ("truncate --size=0 - --reference .git/index", ".git/index"),
-                ("touch '' -r .git/x build/a", ".git/x"), ("touch - -r .git/x build/a", ".git/x"),
-                ("touch '' --reference .git/config", ".git/config"), ("touch - --reference .git/config", ".git/config"),
-                ("touch '' --reference .git/x", ".git/x"), ("touch - --reference .git/x", ".git/x"),
-                ("touch -cr -r .git/x", ".git/x"), ("touch -cr --reference .git/x", ".git/x"),  # VERIFY-J2-R3 M2
-                ("truncate -cr -r .git/x", ".git/x"), ("truncate -cr --reference .git/x", ".git/x"),
-                ("truncate -cr -r .git/index", ".git/index"), ("touch -mr -r .git/w", ".git/w"),
-                ("touch -ar -r .git/x", ".git/x"), ("touch -hr -r .git/x", ".git/x"), ("touch -fr -r .git/x", ".git/x"),
-                ("truncate -or -r .git/x", ".git/x"),
-                ("touch --ref -r .git/x", ".git/x"), ("touch --ref --reference .git/x", ".git/x"),  # class C
-                ("truncate --ref -r .git/index", ".git/index"), ("truncate --ref --reference .git/x", ".git/x"),
-                ("touch -d -r .git/x", ".git/x"), ("touch -d --reference .git/x", ".git/x"),  # class D (R2 L2)
-                ("touch -r x -- -r .git/y", ".git/y"), ("touch -r -- .git/x", ".git/x"),  # round 2 rows, still refused
-                ("truncate --reference=x -- -r .git/index", ".git/index"),
-                ("touch --reference=build/a .git/x", ".git/x"), ("touch -r --reference .git/x", ".git/x"),
-                ("rm -- -r .git/x", ".git/x"), ("rm -r .git/x", ".git/x"),  # pins of the other eight programs
-                ("rm -- a -/../.git/x", "-/../.git/x"), ("touch -- x -r .git/y", ".git/y")]
-        for line, target in rows:
-            with self.subTest(line=line):
-                self.refused(line, target)
-
-    def test_ac5_3_targets_are_operands(self):  # for all ten programs file_targets == operands(args), as at a5edfb3
-        spread = [[], ["-r"], ["--reference"], ["-r", "a"], ["a", "-r"], ["-r", "a", "b"], ["a", "-r", "b"],
-                  ["a", "b", "-r"], ["--reference", "a", "b"], ["a", "--reference", "b"], ["--reference=a", "b"],
-                  ["b", "--reference=a"], ["-r", "-r", "a"], ["-r", "--reference", "a"], ["--reference", "-r", "a"],
-                  ["-r", "--", "a"], ["--", "-r", "a"], ["a", "--", "-r", "b"], ["-r", "a", "--", "-r", "b"],
-                  ["-", "-r", "a"], ["", "-r", "a"], ["-r", "", "a"], ["-r", "-", "a"], ["-cr", "-r", "a"],
-                  ["-cr", "a", "b"], ["-mr", "--reference", "a"], ["-ar", "a"], ["-s", "0", "-r", "a", "b"],
-                  ["-s0", "-", "-r", "a"], ["--ref", "-r", "a"], ["-d", "-r", "a"], ["-c", "a", "-", "b"],
-                  ["--", "--", "a"], ["--", "", "-", "a"], ["-rfoo", "a"], ["a", "", "-x", "b"]]
-        for p in ("rm", "rmdir", "unlink", "touch", "mkdir", "tee", "truncate", "chmod", "chown", "chgrp"):
-            for args in spread:
-                with self.subTest(program=p, args=args):
-                    self.assertEqual(guard.file_targets([p] + args), guard.operands(args))
-        self.assertEqual(guard.file_targets(["touch", "-r", ".git/HEAD", "build/stamp"]), [".git/HEAD", "build/stamp"])
-        self.assertEqual(guard.file_targets(["truncate", "-r", "a", "--", "-r", "b"]), ["a", "-r", "b"])
-        self.assertEqual(guard.file_targets(["touch", "-", "", "--reference=a", "b"]), ["b"])
-
-    def test_ac5_4_command_options(self):
-        self.assertEqual(self.w("command -p cd .git && echo x > config"),
-                         FOLDER_UNKNOWN.format(word="command -p cd .git", target="config"))
-        self.assertIsNone(self.w("command -v ls && echo x > notes.txt"))
-
-    def test_ac5_5_pushd_plus(self):
-        self.assertEqual(self.w("pushd +1 && echo x > notes.txt"), FOLDER_UNKNOWN.format(word="pushd +1", target="notes.txt"))
-        self.assertIsNone(self.w("pushd build && echo x > notes.txt"))
-
-
-class T016J2_Docs(T016J2):
-    def test_r5_docstring(self):
-        doc = guard.__doc__
-        self.assertIn("output redirects", doc)
-        self.assertIn("one leading -C <dir>", doc)
-
-
-class T016J2_Hook(unittest.TestCase):
-    """Through an in-process copy of pa-hook guard: check_command then check_writes."""
-
-    @classmethod
-    def setUpClass(cls):
-        HookGuard.setUpClass.__func__(cls)
-        os.makedirs(os.path.join(cls.wt, ".git"), exist_ok=True)
-
-    def test_hook(self):
-        folder = tempfile.mkdtemp(dir=TMP)
-        shutil.copy(os.path.join(TOOLS, "pa_guard.py"), os.path.join(folder, "pa_guard.py"))
-        hooks = load_hooks_copy(folder)
-
-        def bash(line):
-            return call_hook(hooks, hooks.hook_guard, "Bash", {"command": line}, self.wt)
-        self.assertEqual(bash("git diff > " + os.path.join(folder, "x.diff"))[0], 0)
-        self.assertEqual(bash("git -C " + self.wt + " status")[0], 0)
-        code, err = bash("git log > .git/x")
-        self.assertEqual((code, err.strip()), (2, WRITE.format(target=".git/x")))
-        code, err = bash("git -C " + self.wt + " commit -m x")
-        self.assertEqual(code, 2)
-        self.assertIn(OFF_TABLE.format("git -C " + self.wt + " commit -m x"), err)
-
-
-def tearDownModule():
-    shutil.rmtree(TMP, ignore_errors=True)
 
 
 if __name__ == "__main__":

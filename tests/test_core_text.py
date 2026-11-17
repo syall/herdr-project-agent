@@ -320,17 +320,75 @@ class Worker(unittest.TestCase):
         self.assertEqual(section(self.raw, "## Safety"), WORKER_SAFETY)
 
 
-class T016J2WorkerSentence(unittest.TestCase):  # t-016 job 2, spec-2 R5 and section 6
-    def test_git_bullet_sentence(self):
+# t-025 (spec section 9, AC9.1): the guard bullet of worker.md, replacing t-016 job 2's T016J2WorkerSentence.
+WORKER_GUARD_BULLET = (
+    "- The guard refuses a few commands that the Safety rules below keep for the person: `git push` in any form, "
+    "opening, readying or merging a pull request (`gh pr create`, `gh pr ready`, `gh pr merge`), deleting a branch "
+    "or a worktree (`git branch -d`, `git worktree remove`), and `pa-push-main`, `pa-push-allow` and `pa_push.py`. "
+    "A few commands that discard uncommitted work or read secrets are refused too. Everything else runs as written: "
+    "redirects, pipes, substitutions, `-C` and compound lines included. The guard is a fence, not a wall: the Safety "
+    "rules hold for what it does not catch. If a refused command is needed, stop and report it to the Project Agent. "
+    "If the guard says it is unavailable, no Bash command runs, `hc send` included: stop, and say so as your last "
+    "message. Do not write files inside `.git` or the git and gh settings (`~/.gitconfig`, `~/.config/git/`, "
+    "`~/.config/gh/`).")
+
+
+class T025WorkerGuardBullet(unittest.TestCase):  # AC9.1
+    def test_guard_bullet(self):
         raw = read("runtime", "core", "worker.md")
         rules = flat(raw[raw.index("## Rules of the job"):raw.index("## Roles")])
-        self.assertIn(
-            "anything else is refused: report it to the Project Agent. The read-only `git status`, `git log`, "
-            "`git diff`, `git show` and `git rev-parse` may send their output to a file (`git diff > /tmp/x.diff`) and "
-            "may take one `-C <folder>` before the subcommand; write every other git, gh or hc command plainly, without "
-            "a redirect or `-C`. A Bash command that plainly writes into `.git`, the git and gh settings or the Project "
-            "Agent's state (a redirect, `cp`, `mv`, `rm`, `tee`, `sed -i`) is refused: write reports, logs and notes in "
-            "your evidence folder, and if such a write is needed, stop and report it. A bare `git` word counts", rules)
+        self.assertIn(WORKER_GUARD_BULLET + " - Never run `pa-push-main`", rules)
+        for gone in ("limited to the allowlist", "A bare `git` word counts", "Do not set `GIT_*` or `GH_*` variables",
+                     "may take one `-C <folder>`"):
+            self.assertNotIn(gone, rules)
+
+
+class T025NoOldGuardText(unittest.TestCase):  # AC9.2: no text still describes the removed rules
+    def test_no_allowlist_or_plain_lines_text(self):
+        core = os.path.join(REPO, "runtime", "core")
+        files = [("runtime", "core", name) for name in sorted(os.listdir(core)) if name.endswith(".md")]
+        for parts in files + [("README.md",), ("RECIPE.md",)]:
+            text = flat(read(*parts))
+            for phrase in ("allowlist in `pa_guard.py`", "plainly", "beyond plain commands"):
+                with self.subTest(file="/".join(parts), phrase=phrase):
+                    self.assertNotIn(phrase, text)
+
+    def test_readme_section(self):
+        text = read("README.md")
+        self.assertIn("## The worker guard\n", text)
+        self.assertLess(text.index("## The worker guard\n"), text.index("## Pushing main from the panel"))
+        self.assertIn("`docs/worker-guard-history.md`", text)
+
+
+HISTORY_PARTS = ["## 1. Summary", "## 2. The allowlist", "## 3. The plain-lines rule", "## 4. The Bash write rule",
+                 "## 5. What it cost in practice: the friction list", "## 6. Why it was removed",
+                 "## 7. What replaced it", "## 8. How to bring it back", "## 9. Records"]
+HISTORY_RULE_PARTS = ["**What it did.**", "**Why it was built.**", "**What it cost.**", "**Why it was removed.**",
+                      "**History.**"]
+
+
+class T025HistoryDoc(unittest.TestCase):  # AC8.1 (AC8.2, that each id resolves on main, is the verifier's)
+    def setUp(self):
+        self.text = read("docs", "worker-guard-history.md")
+
+    def test_parts_in_order(self):
+        at = [self.text.find(h + "\n") for h in HISTORY_PARTS]
+        self.assertNotIn(-1, at, HISTORY_PARTS)
+        self.assertEqual(at, sorted(at))
+
+    def test_each_removed_rule_has_five_parts(self):
+        for k in (1, 2, 3):
+            body = self.text[self.text.index(HISTORY_PARTS[k]):self.text.index(HISTORY_PARTS[k + 1])]
+            for part in HISTORY_RULE_PARTS:
+                with self.subTest(rule=HISTORY_PARTS[k], part=part):
+                    self.assertEqual(body.count(part), 1)
+
+    def test_commits_named(self):
+        for commit in ("a1c8873", "af47aa1", "926bb73"):
+            self.assertIn("`{}`".format(commit), self.text)
+
+    def test_nothing_personal(self):
+        self.assertIsNone(re.search(r"/Users/|/home/|\bsp[0-9a-f]{32}\b|~/\.config/herdr-pa/spaces", self.text))
 
 
 class Sdlc(unittest.TestCase):  # t-017 J1 (R1)
