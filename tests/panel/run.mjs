@@ -838,7 +838,7 @@ cases["P-slow-progress-commits"] = async () => { // AC5.3-AC5.5 (review P-I1): a
     let seen = null;
     for (let t = 0; t < 90; t++) { if (t % 2 === 0) v.reload(cx); look(v); await step(1000); if (seen === null && /Decisions · 4/.test(look(v).text)) seen = t + 1; }
     check(seen !== null && seen * 1000 <= 2 * L + 2000, `${label}: d-04 shown within two loads (${(2 * L) / 1000} s; first shown at ${seen} s)`);
-    const at = reads("agent.json").filter((x) => x.at >= start).map((x) => x.at - start);
+    const at = reads("agent.json").filter((x) => x.at > start).map((x) => x.at - start); // after the mount's own load
     const gaps = at.slice(1).map((x, i) => x - at[i]);
     check(at.length >= 2 && gaps.every((gp) => gp >= L - 1000), `${label}: one load at a time, each about ${L / 1000} s (agent.json read at ${at.map((x) => x / 1000)} s)`);
   }
