@@ -12,6 +12,7 @@ import io
 import json
 import os
 import re
+import shlex
 import shutil
 import statistics
 import subprocess
@@ -1232,9 +1233,9 @@ class SplitFix_PipeIntoShell(Split):
 
 
 class PipeFix_PipeIntoShell(Split):
-    """VERIFY-5 V5-1, REVIEW-8 I-1, I-2, M2: after a |, a known text filter is allowed whatever its arguments say; a
-    launcher is judged by the program it starts; for any other program a later word naming a shell refuses the line,
-    as at b43e3e5. source and . count only as the program word or the launched program word."""
+    """VERIFY-5 V5-1, REVIEW-8 I-1, I-2, M2: after a |, a known text filter is allowed whatever its arguments say; for
+    any other program, launchers included, a later word naming a shell refuses the line, as at b43e3e5. source and .
+    count only as the program word or the first later word that does not start with -."""
 
     def test_shell_after_a_program_the_guard_does_not_know(self):
         for part in ["caffeinate sh", "caffeinate -i bash", "FOO=1 caffeinate sh", "setsid bash",
@@ -1252,14 +1253,12 @@ class PipeFix_PipeIntoShell(Split):
 
     def test_filters_whatever_their_arguments(self):
         for line in ["git log | grep bash", "git ls-files | xargs ls -d .", "git ls-files | xargs grep -l source",
-                     "git ls-files | xargs -0 grep -l bash", "git log | rg -w sh", "git log | head -n 3 sh",
+                     "git log | rg -w sh", "git log | head -n 3 sh",
                      "git log | tail -n 2 bash", "git ls-files | wc -l bash", "git log | sort -k 2 zsh",
                      "git log | uniq -c sh", "git log | cut -d ' ' -f 1 bash", "git log | tr a-z A-Z",
                      "git log | tee bash.log sh", "git show HEAD:x.sh | cat - bash", "git log | less bash",
                      "git log --format=%s | jq -R .", "git log | column -t sh", "git ls-files | grep -l source",
-                     "git log | nohup grep sh", "git log | timeout 5 grep bash",
-                     "git log | timeout -k 5 10s grep bash", "git log | nice -n 10 grep sh", "git log | xargs -n 1 grep sh", "git ls-files | env LC_ALL=C sort .",
-                     "git log | time wc -l", "git ls-files | caffeinate ls -d ."]:
+                     "git ls-files | env LC_ALL=C sort .", "git log | time wc -l", "git ls-files | caffeinate ls -d ."]:
             with self.subTest(line=line):
                 self.assertIsNone(self.at(line))
 
@@ -1271,6 +1270,27 @@ class PipeFix_PipeIntoShell(Split):
 
     def test_assignment_before_a_shell(self):
         self.assertEqual(self.at("git show HEAD:x.sh | FOO=1 bash"), OFF_TABLE.format("FOO=1 bash"))
+
+
+class PipeFix2_PipeIntoShell(Split):
+    """VERIFY-6 V6-1: launcher options are not parsed. After a |, a program other than a known filter is refused when
+    any later word names a shell or is eval, or when its first later word not starting with - is source or . ; a
+    launcher followed by a filter whose argument names a shell is refused too (the accepted cost: use git grep)."""
+
+    def test_refused(self):
+        for part in ["env -iu grep bash", "xargs -0I grep sh -c grep", "sudo -Eu grep bash", "env --unset grep bash",
+                     "time --output grep bash", "caffeinate sh", "! bash", "setsid bash", "busybox sh",
+                     "env -S 'bash -c x'", "xargs grep bash", "xargs -0 grep -l bash", "nohup grep sh",
+                     "timeout 5 grep bash", "timeout -k 5 10s grep bash", "nice -n 10 grep sh", "xargs -n 1 grep sh",
+                     "xargs -n1 . /dev/stdin", "env eval x"]:
+            with self.subTest(part=part):
+                self.assertEqual(self.at("git show HEAD:x.sh | " + part), OFF_TABLE.format(shlex.join(shlex.split(part))))
+
+    def test_allowed(self):
+        for part in ["grep bash", "xargs ls -d .", "xargs grep -l source", "xargs -0 wc -l", "env LC_ALL=C sort",
+                     "nohup cat", "time wc -l", "timeout 5 head"]:
+            with self.subTest(part=part):
+                self.assertIsNone(self.at("git ls-files | " + part))
 
 
 class PipeFix_WrapperTexts(Split):
