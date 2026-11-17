@@ -134,6 +134,17 @@ PRICES = {"v": 1, "currency": "USD", "unit": "per-1M-tokens", "source": "test ta
                      "model-b": [{"validFrom": "2026-01-01", "in": 2.0, "out": 20.0, "cw5m": 4.0, "cw1h": 8.0, "cr": 1.0}]},
           "aliases": [{"match": "^model-a-.*", "model": "model-a"}]}
 OUTPUT_SEEN = []  # every stdout/stderr text a test captured, for V1
+CANARY_HITS = []  # files under costs/ or billing/ that held the canary after a test, for V1
+
+
+def scan_for_canary():
+    for folder, _dirs, names in os.walk(pa.ROOT):
+        if os.sep + "costs" not in folder + os.sep and not (folder + os.sep).startswith(os.path.join(pa.ROOT, "billing") + os.sep):
+            continue
+        for name in names:
+            path = os.path.join(folder, name)
+            if fx.CANARY.encode() in (raw(path) or b""):
+                CANARY_HITS.append(os.path.relpath(path, pa.ROOT))
 
 
 class HcStub:
@@ -181,6 +192,7 @@ class Base(unittest.TestCase):
     def tearDown(self):
         for k, v in self.saved.items():
             setattr(pa, k, v)
+        scan_for_canary()
 
     # ---- state helpers
     def ledger(self, value):
@@ -618,6 +630,7 @@ class L_LaunchRecords(Base):
 
     def launch(self, kind, *argv):
         result, out, err = self.run_cmd(pa.cmd_launch, kind, list(argv))
+        OUTPUT_SEEN.pop()  # PA_PRINT echoes the launcher's own argv by design; V1 is about what pa-costs keeps and prints
         self.assertEqual(err, "")
         return json.loads(out.strip().splitlines()[-1])
 
@@ -1558,3 +1571,80 @@ class BC_Comparison(BillingBase):
                           brow(day="2026-11-14", amount=1.0)], [("2026-11-14", "model-a", 1.0)])
         self.assertEqual([(x["currency"], x["amount"]) for x in c["separate"]], [("EUR", 9.0)])
         self.assertAlmostEqual(c["total"]["billed"], 1.0)
+
+
+# ---- step 8: the closed event and the guard (R5, R15) ------------------------------------------------------
+
+class W_CloseAndGuard(CostsBase):
+    def close_one(self):
+        ledger = {"version": 1, "tasks": [{"id": "t-001", "state": "in-progress",
+                                           "workers": [{"address": "t5", "role": "build", "name": "t-001-build"}]}]}
+        self.ledger(ledger)
+        task = ledger["tasks"][0]
+        return pa_hooks.end_worker(self.dir, ledger, task, task["workers"][0], "t5", {}, "evidence/t-001/REPORT.md", "agent", "close")
+
+    def test_w1_close_appends_one_closed_event(self):
+        line = self.close_one()
+        self.assertIn("Closed worker t5", line)
+        recs = lines(self.costs("sessions.jsonl"))
+        self.assertEqual([(r["ev"], r["terminal"], r["by"]) for r in recs], [("closed", "t5", "pa-worker close")])
+        self.assertRegex(recs[0]["at"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+
+    def test_w1b_a_failing_append_does_not_change_close(self):
+        write(os.path.join(self.dir, "costs"), "a file where the costs folder should be\n")
+        line = self.close_one()
+        self.assertIn("Closed worker t5", line)
+        self.assertTrue(load(os.path.join(self.dir, "ledger.json"))["tasks"][0]["workers"][0]["finished"])
+        saved = pa.COSTS_FILE
+        pa.COSTS_FILE = os.path.join(TMP, "no-such-costs.py")
+        pa._COSTS.clear()
+        try:
+            os.unlink(os.path.join(self.dir, "costs"))
+            self.assertIn("Closed worker t5", self.close_one())
+        finally:
+            pa.COSTS_FILE = saved
+            pa._COSTS.clear()
+        self.assertFalse(os.path.exists(self.costs("sessions.jsonl")))
+
+    def test_w1c_collector_marks_the_session_closed(self):
+        self.record(session=SID, task="t-001", terminal="t5", name="t-001-build", at=iso(T0))
+        fx.append(fx.claude_path(pa.CLAUDE_HOME, self.project, SID), [fx.claude_user(isoms(T0 + 1), SID, self.project)]
+                  + fx.claude_call(isoms(T0 + 2), SID, self.project, "m1", lines=1, out=5))
+        self.close_one()
+        pa_costs.collect(self.dir, now=T0 + 2000)
+        s = load(self.costs("summary.json"))
+        self.assertEqual([x["state"] for x in s["sessions"]], ["closed"])
+        pa_costs.collect(self.dir, now=T0 + 2000 + 86400 + 1)
+        self.assertTrue(load(self.costs("state.json"))["files"][SID]["done"])
+
+    def guard(self, command):
+        err = io.StringIO()
+        data = {"tool_name": "Bash", "tool_input": {"command": command}, "cwd": self.project}
+        with contextlib.redirect_stderr(err):
+            try:
+                code = pa_hooks.hook_guard(data, [])
+            except SystemExit as e:
+                code = e.code
+        return code, err.getvalue()
+
+    def test_w2_guard_blocks_the_persons_billing_commands(self):
+        tool = "pa-" + "costs"
+        for command in (tool + " billed fetch --now", tool + " billed fetch --scheduled --quiet",
+                        tool + " billed enable --query q1 --credential X --read-only-match X", tool + " billed import f --via f1",
+                        tool + " 'billed' fetch --now", tool + ' billed "enable"', "cd /tmp && " + tool + " billed\\ fetch --now",
+                        "~/.local/bin/" + tool + " billed fetch --now"):
+            code, err = self.guard(command)
+            self.assertEqual(code, 2, command)
+            self.assertIn("billing command", err, command)
+        for command in (tool + " report", tool + " report --billed", tool + " billed status", tool + " billed list",
+                        tool + " billed disable", tool + " collect --space sp1 --quiet"):
+            self.assertEqual(self.guard(command)[0], 0, command)
+
+
+class ZZ_V1_Privacy(unittest.TestCase):
+    """Run last: the canary of every fixture reached no file under costs/ or billing/ and no captured output."""
+
+    def test_v1_canary_nowhere(self):
+        self.assertTrue(OUTPUT_SEEN, "the tests captured some output")
+        self.assertEqual(CANARY_HITS, [])
+        self.assertFalse([o for o in OUTPUT_SEEN if fx.CANARY in o])
