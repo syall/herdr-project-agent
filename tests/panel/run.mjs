@@ -733,8 +733,8 @@ cases["P-onscreen"] = async () => { // how "shown" is judged: stack child, hidde
   for (const [what, layout, shown] of runs) {
     world({ machine: M }); remoteCards(1); g.__layout = layout;
     const v = await mount(); await settle();
-    const full = reads("agent.json").length > 0;
-    check(full === shown, `${what}: ${shown ? "full load" : "count only"} (agent.json reads ${reads("agent.json").length}, calls ${JSON.stringify(remoteCalls().map((x) => x.kind))})`);
+    const full = reads("rules.json").length > 0; // only a full load reads rules (the hidden panel reads agent.json once, for the profile)
+    check(full === shown, `${what}: ${shown ? "full load" : "count only"} (rules.json reads ${reads("rules.json").length}, calls ${JSON.stringify(remoteCalls().map((x) => x.kind))})`);
     void v;
   }
 };
@@ -751,7 +751,8 @@ cases["P-hidden-one-call"] = async () => { // AC8.1 (d-039): hidden: exactly 2 r
     look(v);
     await settle();
   }
-  const kinds = [...new Set(remoteCalls().map((x) => (x.kind === "read" ? `read ${x.path.split("/").pop()}` : x.kind)))].sort();
+  check(reads("agent.json").length === 1 && reads("profile.json").length === 1 && reads("agent.json")[0].at === T0, `the profile read once, at the start (agent.json at ${reads("agent.json").map((x) => x.at - T0)})`);
+  const kinds = [...new Set(remoteCalls().filter((x) => x.at > T0).map((x) => (x.kind === "read" ? `read ${x.path.split("/").pop()}` : x.kind)))].sort();
   check(JSON.stringify(kinds) === '["batch","read ledger.json"]', `only the batched card read and the ledger (got ${JSON.stringify(remoteCalls().map((x) => `${x.kind}${x.path ? ` ${x.path}` : ""}`).slice(0, 12))})`);
   const per = []; for (let w = 0; w < 6; w++) per.push(remoteCalls().filter((x) => x.at > T0 + w * 10000 && x.at <= T0 + (w + 1) * 10000));
   check(per.every((l) => l.length === 2 && l[0].at === l[1].at), `2 calls, issued together, in each 10 s interval (got ${per.map((l) => l.map((x) => x.at - T0))})`);
@@ -775,7 +776,7 @@ cases["P-hidden-count"] = async () => { // AC8.2: the button's count follows the
   g.__files[`${M}:${RDIR}/decisions/d-01.json`] = openCard("d-01");
   await step(10000); await fire(10000);
   check(!(RS in (g.__shared["project-agent.open"] ?? {})), "a failed read leaves the count as it was");
-  check(reads("agent.json").length === 0 && remoteCalls("ls").length === 0, `nothing but the batch (got ${JSON.stringify(remoteCalls().map((x) => x.kind))})`);
+  check(reads("rules.json").length === 0 && reads("agent.json").length === 1 && remoteCalls("ls").length === 0, `nothing but the batch, the ledger and the profile once (got ${JSON.stringify(remoteCalls().map((x) => x.kind))})`);
 };
 
 cases["P-hidden-notice"] = async () => { // AC8.3: a new card's notice still comes while the panel is hidden
@@ -980,10 +981,11 @@ cases["P-hidden-ledger"] = async () => { // AC8.5 (d-039): while hidden, the led
   g.__files[`${M}:${RDIR}/ledger.json`] = tasksWith([t1]);
   remoteCards(1);
   g.__shared["my-files.places"] = { [RS]: [evSpots[0], evSpots[1]] }; g.__shared["project-agent.mainBranches"] = { [RS]: ["kept"] };
+  g.__files[`${M}:.config/herdr-pa/profiles/test/profile.json`] = JSON.stringify({ name: "test", mainBranches: ["from-profile"] });
   g.__layout = panelLayout("changes");
   await mount(); await settle();
   check(JSON.stringify(g.__shared["my-files.places"]?.[RS]) === JSON.stringify([evSpots[0], evSpots[1], wtSpot(t1)]), `nothing kept: the evidence shortcuts stay (got ${JSON.stringify(g.__shared["my-files.places"]?.[RS])})`);
-  check(JSON.stringify(g.__shared["project-agent.mainBranches"]?.[RS]) === '["kept"]' && JSON.stringify(g.__shared["project-agent.worktrees"]?.[RS]) === JSON.stringify([{ task: "t-1", path: "/wt/1", title: "one" }]), "worktrees written, main branches left");
+  check(JSON.stringify(g.__shared["project-agent.mainBranches"]?.[RS]) === '["from-profile"]' && JSON.stringify(g.__shared["project-agent.worktrees"]?.[RS]) === JSON.stringify([{ task: "t-1", path: "/wt/1", title: "one" }]), `worktrees written, main branches from the profile read once (got ${JSON.stringify(g.__shared["project-agent.mainBranches"])})`);
 };
 
 cases["P-hidden-ledger-fails"] = async () => { // AC8.5: a ledger that fails, hangs, is missing or is not JSON leaves every key as it was
@@ -993,6 +995,7 @@ cases["P-hidden-ledger-fails"] = async () => { // AC8.5: a ledger that fails, ha
     remoteCards(1);
     const before = { "project-agent.worktrees": { [RS]: [{ task: "t-0", path: "/wt/0", title: "" }] }, "my-files.places": { [RS]: [evSpots[0]] }, "project-agent.workers": { [RS]: { "m1/w0": { task: "t-0" } } }, "project-agent.mainBranches": { [RS]: ["kept"] } };
     for (const k of keys) g.__shared[k] = before[k];
+    g.__files[`${M}:.config/herdr-pa/profiles/test/profile.json`] = JSON.stringify({ name: "test", mainBranches: ["kept"] }); // the profile read gives the same
     const L = `${M}:${RDIR}/ledger.json`;
     if (how === "invalid") g.__files[L] = "{bad";
     if (how === "hung") g.__hang = [L];
@@ -1031,9 +1034,53 @@ cases["P-onscreen-props"] = async () => { // R8 (review P-M4): only this copy's 
   for (const [what, props, layout, shown] of runs) {
     world({ machine: M }); remoteCards(1); g.__layout = layout; g.__props = props;
     await mount(); await settle();
-    const full = reads("agent.json").length > 0;
-    check(full === shown, `${what}: ${shown ? "full load" : "count only"} (agent.json reads ${reads("agent.json").length})`);
+    const full = reads("rules.json").length > 0;
+    check(full === shown, `${what}: ${shown ? "full load" : "count only"} (rules.json reads ${reads("rules.json").length})`);
   }
+};
+
+// ---- follow-up (t2r): the profile once per space while hidden ----
+const PROFILE = `${M}:.config/herdr-pa/profiles/test/profile.json`;
+cases["P-hidden-profile"] = async () => { // AC8.5: no kept load: the hidden panel reads the profile once per session for the main branches
+  world({ machine: M }); remoteCards(1);
+  g.__files[PROFILE] = JSON.stringify({ name: "test", mainBranches: ["trunk"] });
+  g.__layout = panelLayout("changes");
+  await mount(); await settle();
+  check(JSON.stringify(g.__shared["project-agent.mainBranches"]?.[RS]) === '["trunk"]', `main branches written (got ${JSON.stringify(g.__shared["project-agent.mainBranches"])})`);
+  for (let i = 0; i < 9; i++) { await step(10000); await fire(10000); }
+  check(reads("agent.json").length === 1 && reads("profile.json").length === 1, `read once in 90 s (agent.json ${reads("agent.json").length}, profile.json ${reads("profile.json").length})`);
+  check(reads("rules.json").length === 0, "no full load");
+  // agent.json names no profile: config.json, then its default profile.
+  world({ machine: M }); remoteCards(1);
+  g.__files[`${M}:${RDIR}/agent.json`] = JSON.stringify({ space: S, project: "/proj", name: "proj" });
+  g.__files[`${M}:.config/herdr-pa/config.json`] = JSON.stringify({ defaultProfile: "test" });
+  g.__files[PROFILE] = JSON.stringify({ name: "test", mainBranches: ["c"] });
+  g.__layout = panelLayout("changes");
+  await mount(); await settle();
+  check(JSON.stringify(g.__shared["project-agent.mainBranches"]?.[RS]) === '["c"]' && reads("config.json").length === 1, `through config.json (got ${JSON.stringify(g.__shared["project-agent.mainBranches"])})`);
+  // No agent.json: nothing written, not read again.
+  world({ machine: M, agent: false });
+  g.__shared["project-agent.mainBranches"] = { [RS]: ["kept"] };
+  g.__layout = panelLayout("changes");
+  await mount(); await settle();
+  for (let i = 0; i < 9; i++) { await step(10000); await fire(10000); }
+  check(JSON.stringify(g.__shared["project-agent.mainBranches"]?.[RS]) === '["kept"]' && reads("agent.json").length === 1, `no agent: left, read once (agent.json ${reads("agent.json").length})`);
+};
+
+cases["P-hidden-profile-retry"] = async () => { // AC8.5: a profile read that times out writes nothing and is tried again no sooner than 60 s after it started
+  world({ machine: M }); remoteCards(1);
+  g.__files[PROFILE] = JSON.stringify({ name: "test", mainBranches: ["trunk"] });
+  g.__hang = [`${M}:${RDIR}/agent.json`];
+  g.__layout = panelLayout("changes");
+  await mount(); await settle();
+  await step(10000); // 10 s: timed out
+  for (let i = 0; i < 4; i++) { await step(10000); await fire(10000); } // 20-50 s
+  check(!(RS in (g.__shared["project-agent.mainBranches"] ?? {})) && reads("agent.json").length === 1, `nothing written, no retry before 60 s (agent.json at ${reads("agent.json").map((x) => x.at - T0)})`);
+  g.__hang = [];
+  await step(10000); await fire(10000); // 60 s
+  check(reads("agent.json").length === 2 && JSON.stringify(g.__shared["project-agent.mainBranches"]?.[RS]) === '["trunk"]', `retried at 60 s and written (agent.json at ${reads("agent.json").map((x) => x.at - T0)}; ${JSON.stringify(g.__shared["project-agent.mainBranches"])})`);
+  for (let i = 0; i < 9; i++) { await step(10000); await fire(10000); }
+  check(reads("agent.json").length === 2, `never again once answered (agent.json reads ${reads("agent.json").length})`);
 };
 
 const pick = process.argv.slice(2);

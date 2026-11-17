@@ -260,6 +260,26 @@ cases["S-load-ledger"] = async () => { // AC8.5: the hidden refresh's ledger rea
   check(h.done && h.value.timedOut === true, `hung: timed out within 10 s (got ${JSON.stringify(h.value)})`);
 };
 
+cases["S-load-profile"] = async () => { // AC8.5: the hidden panel's profile read: answered or not, and the profile
+  world(); agentFiles(remote); g.__files[`${M}:.config/herdr-pa/profiles/test/profile.json`] = JSON.stringify({ name: "test", mainBranches: ["trunk"] });
+  let r = await store.loadProfile(remote, undefined, cx);
+  check(r.answered === true && JSON.stringify(r.profile?.mainBranches) === '["trunk"]' && remoteCalls().length === 2, `agent.json then the profile (got ${JSON.stringify(r)}, ${remoteCalls().length} calls)`);
+  world(); agentFiles(remote, { profile: "" });
+  r = await store.loadProfile(remote, undefined, cx);
+  check(r.answered && r.profile?.name === "test" && remoteCalls().length === 3, `through config.json (got ${JSON.stringify(r)})`);
+  world(); agentFiles(remote); delete g.__files[`${M}:.config/herdr-pa/profiles/test/profile.json`];
+  r = await store.loadProfile(remote, undefined, cx);
+  check(r.answered && r.profile === null, `a missing profile is an answer (got ${JSON.stringify(r)})`);
+  world();
+  r = await store.loadProfile(remote, undefined, cx);
+  check(r.answered && r.profile === undefined, `no agent.json: answered, nothing to write (got ${JSON.stringify(r)})`);
+  world(); agentFiles(remote); g.__hang = [keyOf(remote, "/agent.json")];
+  const h = await within(store.loadProfile(remote, undefined, cx), 10000);
+  check(h.done && h.value.answered === false, `hung agent.json: not answered within 10 s (got ${JSON.stringify(h.value)})`);
+  world(); agentFiles(remote); g.__files[`${M}:.config/herdr-pa/profiles/test/profile.json`] = "{bad";
+  check((await store.loadProfile(remote, undefined, cx)).answered === false, "an invalid profile is not an answer");
+};
+
 const pick = process.argv.slice(2);
 let failed = 0;
 for (const [name, fn] of Object.entries(cases)) {
