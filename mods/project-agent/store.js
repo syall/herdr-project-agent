@@ -85,8 +85,9 @@ async function readJson(path, on, cx) {
 // Only costs/summary.json is read (never a session file); when it is missing, one listing of costs/
 // tells "no records" from "records, first collect still running". Each call capped at READ_LIMIT.
 // { summary, error, timedOut, missing: "none" | "pending" | null }: a timed-out read is never "none".
+// `live()` (the view's shown check) is asked again before the listing: false -> { left: true }, no ls.
 export const costsDir = (space) => `${stateDir(space)}/costs`;
-export async function loadCosts(space, cx) {
+export async function loadCosts(space, cx, live = () => true) {
   const on = space.machine ?? null, r = await readJson(`${costsDir(space)}/summary.json`, on, cx);
   if (r.timedOut) return { summary: null, error: null, timedOut: true, missing: null };
   if (r.error) return { summary: null, error: r.error, timedOut: false, missing: null };
@@ -94,6 +95,7 @@ export async function loadCosts(space, cx) {
     const ok = r.value && typeof r.value === "object" && !Array.isArray(r.value);
     return ok ? { summary: r.value, error: null, timedOut: false, missing: null } : { summary: null, error: "not a summary (not a JSON object)", timedOut: false, missing: null };
   }
+  if (!live()) return { summary: null, error: null, timedOut: false, missing: null, left: true };
   const ls = await withTimeout(cx, exec("ls", ["-1", costsDir(space)], { on, timeout: READ_LIMIT }));
   if (ls === TIMED_OUT) return { summary: null, error: null, timedOut: true, missing: null };
   const names = ls.code === 0 ? String(ls.stdout ?? "").split("\n") : [];

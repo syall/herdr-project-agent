@@ -6,8 +6,9 @@
 //           only while this view is shown in a shown copy (main.js reload(), after its hidden return),
 //           at most once per COSTS_EVERY per space, one in flight per space. The billed comparison:
 //           the local `pa-costs billed compare --json`, at most once per BILLING_EVERY while shown.
-//           `shown(spaceId)` (main.js) is asked live before each read and compare: a run or read that ends
-//           after the view was left starts nothing; the space is marked stale and read at once when shown.
+//           `shown(spaceId)` (main.js) is asked live before each read and exec, also between the steps of one
+//           (before the ls, the remote report and the second compare): a run, read or compare that ends after
+//           the view was left starts nothing; the space is marked stale and read at once when shown.
 //   runs:   on a click only: Refresh (`pa-costs collect`), Reconstruct (`pa-costs reconstruct`) on the
 //           space's machine, Turn off (`pa-costs billed disable`, here). Nothing else writes (R12).
 
@@ -113,9 +114,10 @@ export class CostsPane {
     st.busy = true; st.at = now; st.seq = mine; st.stale = false;
     cx.spawn(async (cx) => {
       let r;
-      try { r = await loadCosts(space, sleeper(cx)); } catch (e) { r = { failed: String(e?.message ?? e) }; }
+      try { r = await loadCosts(space, sleeper(cx), () => this.shown(space.id)); } catch (e) { r = { failed: String(e?.message ?? e) }; }
       if (st.seq !== mine) return; // a newer read of this space started (this one was given up)
       st.busy = false;
+      if (r.left) { st.stale = true; cx.notify(); return; } // the view was left before the ls: the kept copy stays; read at once when shown
       if (r.timedOut || r.failed) { st.timedOut = true; st.readFailed = r.failed ?? null; } // the kept copy stays
       else if (r.error) { st.error = r.error; st.timedOut = false; st.readFailed = null; }
       else { st.summary = r.summary; st.missing = r.missing; st.error = null; st.timedOut = false; st.readFailed = null; st.readAt = Date.now(); }
@@ -144,11 +146,13 @@ export class CostsPane {
   // its summary trimmed to what the comparison reads; only when this machine has billed rows for its account, the
   // remote's `report --account-wide` and the compare again with it ("all spaces here" are that machine's spaces).
   wantBilling(space, cx, force = false) {
-    const b = this.of(space.id).billing, now = Date.now(), s = this.of(space.id).summary;
+    const st = this.of(space.id), b = st.billing, now = Date.now(), s = st.summary;
     if (!this.shown(space.id)) { if (force) b.at = 0; return; } // not shown: none; a forced one runs with the next shown read
     if (b.busy || (!force && b.at && now - b.at < BILLING_EVERY) || !s) return;
     b.busy = true; b.at = now;
     cx.spawn(async (cx) => {
+      // Asked before each step after the first: the view was left -> stop; the next shown read runs the whole chain.
+      const left = () => { if (this.shown(space.id)) return false; b.busy = false; b.at = 0; st.stale = true; cx.notify(); return true; };
       const compare = async (extra) => {
         const { r, error } = await call(cx, null, ["billed", "compare", "--json", ...extra], TOOL_TIMEOUT);
         if (error) return { error };
@@ -162,10 +166,11 @@ export class CostsPane {
         else {
           got = await compare(["--summary-json", trimmed]);
           if (!got.error && num(got.rows) > 0) {
+            if (left()) return;
             const { r, error } = await call(cx, space.machine, ["report", "--account-wide"], TOOL_TIMEOUT);
             const here = error ? null : r.code === 0 ? str(r.stdout).trim() : null;
             if (!here || here.length > ARG_MAX) got = { ...got, comparison: null, hereError: error ?? (here ? "over 100 KB" : said(r)) };
-            else got = await compare(["--summary-json", trimmed, "--here-json", here]);
+            else { if (left()) return; got = await compare(["--summary-json", trimmed, "--here-json", here]); }
           }
         }
       }
