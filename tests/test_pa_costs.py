@@ -1916,6 +1916,95 @@ class PD_LongAbove(Collecting):
         self.assertIn(table["warnings"][0], out)
 
 
+class FX_FixRound3(Collecting):
+    """Fix round 3: REVIEW-2 MF1-MF3 (MF3 is in FX_BillingRound3) and VERIFY-2 M-1."""
+
+    def turn(self, t, mid, out=10, sid=SID):
+        self.add(self.prompt(t, sid=sid), self.call(t + 2, mid, lines=1, out=out, sid=sid), sid=sid)
+
+    def reused_t5(self, new_in_ledger):
+        # t5 did t-001 (closed, journaled before); a new worker t-002-design starts on the same address at T0.
+        workers_t2 = [{"address": "t5", "role": "design", "name": "t-002-design"}] if new_in_ledger else []
+        self.ledger({"version": 1, "tasks": [
+            {"id": "t-001", "state": "done", "workers": [{"address": "t5", "role": "build", "name": "t-001-build"}]},
+            {"id": "t-002", "state": "in-progress", "workers": workers_t2}]})
+        self.journal({"at": iso(T0 - 600), "by": "agent", "trigger": "report", "task": "t-001", "pass": 3,
+                      "why": "closed worker t5 (t-001-build)"})
+        self.record(session=SID, kind="worker", terminal="t5", name="t-002-design", task="t-002", at=iso(T0))
+        self.turn(T0 + 2, "m1", out=1800)
+        self.journal({"at": iso(T0 + 30), "by": "agent", "trigger": "report", "task": "t-002", "pass": 4,
+                      "why": "Started t5 (t-002-design)"})
+
+    def test_fx_mf1_a_new_worker_on_a_reused_address_keeps_its_own_task(self):
+        self.reused_t5(new_in_ledger=True)
+        self.collect(T0 + 4000)
+        r = self.rows()[0]
+        self.assertEqual((r["task"], r["role"], r["activity"]), ("t-002", "design", "design"))
+        self.assertNotEqual(r.get("match"), "journal-handoff")
+
+    def test_fx_mf1_the_old_workers_role_is_not_pinned_before_the_ledger_lists_the_new_one(self):
+        self.reused_t5(new_in_ledger=False)
+        self.collect(T0 + 4000)
+        r = self.rows()[0]
+        self.assertEqual((r["task"], r["role"], r["activity"]), ("t-002", "design", "design"))
+        pins = [x for x in lines(self.costs("sessions.jsonl")) if x.get("ev") == "role"]
+        self.assertEqual(pins, [])
+
+    def test_fx_mf2_problems_from_state_reach_the_summary_without_a_new_row(self):
+        self.record(session=SID, kind="worker", terminal="t5", name="t-001-build", task="t-001", at=iso(T0))
+        self.turn(T0 + 2, "m1")
+        self.record(program="codex", bind="launch-window", at=iso(T0), terminal="t7", task="t-002")
+        self.record(session=SID2, kind="worker", terminal="t8", name="t-003-build", task="t-003", at=iso(T0))  # never written
+        self.collect(T0 + 2000)
+        self.assertEqual(load(self.costs("summary.json"))["problems"], [])
+        self.collect(T0 + 8000)
+        self.assertIn("codex session for t7 not found", load(self.costs("summary.json"))["problems"])
+        self.collect(T0 + 8 * 86400)
+        self.assertIn("1 sessions' files were gone before they were read", load(self.costs("summary.json"))["problems"])
+        before = self.costs_bytes()
+        self.collect(T0 + 8 * 86400 + 100)
+        self.assertEqual(self.costs_bytes(), before)  # a rerun with nothing new changes no byte
+
+    def test_fx_m1_an_unknown_subagent_layout_counts_nothing_and_says_so(self):
+        self.record(session=SID, kind="worker", terminal="t5", name="t-001-build", task="t-001")
+        self.turn(T0 + 1, "p1", out=10)
+        base = os.path.dirname(self.transcript())
+        sub = [fx.claude_assistant(isoms(T0 + 5), SID, self.project, "u1", out=600, sidechain=True)]
+        fx.append(os.path.join(base, SID, "subagents", "deeper", "agent-x.jsonl"), sub)
+        fx.append(os.path.join(base, SID, "agents", "agent-y.jsonl"), sub)
+        noid = json.loads(sub[0])
+        noid.pop("sessionId")
+        fx.append(os.path.join(base, "agent-noid.jsonl"), [json.dumps(noid) + "\n"])
+        fx.append(fx.claude_subagent_path(pa.CLAUDE_HOME, self.project, SID, "agent-ok"), sub)  # the known layout
+        self.collect(T0 + 2000)
+        self.assertEqual(self.totals()["out"], 610)  # the parent and the known file only
+        problems = load(self.costs("summary.json"))["problems"]
+        said = [p for p in problems if "unknown layout" in p]
+        self.assertEqual(len(said), 2, problems)
+        mine = [p for p in said if SID[:8] in p]
+        self.assertEqual(len(mine), 1, problems)
+        self.assertIn("agents/agent-y.jsonl", mine[0])
+        self.assertIn("subagents/deeper/agent-x.jsonl", mine[0])
+        self.assertNotIn("agent-ok", mine[0])
+        self.assertTrue(any("agent-noid.jsonl" in p for p in said), problems)
+        before = self.costs_bytes()
+        self.collect(T0 + 2100)
+        self.assertEqual(self.costs_bytes(), before)
+
+
+class FX_BillingRound3(BillingBase):
+    def test_fx_mf3_a_twelve_digit_number_in_a_dropped_field_rejects_the_batch(self):
+        self.enable()
+        for bad in (brow(accountId=TWELVE), brow(extra={"ids": [int(TWELVE)]})):
+            self.query_out([brow(day="2026-11-15"), bad])
+            result, _o, _e = self.fetch(mode="now", now=T0 + len(self.calls()))
+            self.assertEqual(result["result"], "failed")
+        self.assertEqual(self.billed(), [])
+        self.query_out([brow(amount=0.1234567890123)])  # a long fraction is not an id: the stored amount is rounded
+        result, _o, _e = self.fetch(mode="now", now=T0 + len(self.calls()))
+        self.assertNotEqual(result["result"], "failed")
+
+
 ABSENT = object()
 
 
