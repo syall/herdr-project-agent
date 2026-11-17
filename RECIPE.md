@@ -131,7 +131,8 @@ A new space opens with a 600 x 440 dialog: a Project Agent card (`Set up for <fo
 - While the panel is not the side panel's shown view (the `layout()` test the tabs mod uses, over
   the blocks with this copy's props), it reads, per space every 10 s and together, the cards (for
   the open-card count) and the ledger. From the ledger it refreshes the shared worktrees, workers
-  and Files shortcuts (evidence counts and main branches as of the last full load). New-card notices
+  and Files shortcuts (evidence counts as of the last full load); the main branches come from the last
+  full load's profile, or with none, from the profile read once per space per session. New-card notices
   come from the timer copy and do not depend on it.
 - Scheduled passes need Herdr's window open. The minimum cadence is 5 minutes. Rule fields are
   single-line inputs.
