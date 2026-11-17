@@ -34,7 +34,7 @@ function world() {
   g.__now = T0; g.__gen = (g.__gen ?? 0) + 1;
   g.__files = {}; g.__ls = {}; g.__fail = []; g.__hang = []; g.__delay = {}; g.__offline = [];
   g.__reads = []; g.__execs = []; g.__writes = []; g.__issued = [];
-  g.__remoteDelay = 0; g.__execHang = []; g.__batchFail = {}; g.__timers = []; g.__execOut = {}; g.__sleepHang = false; g.__execFail = [];
+  g.__remoteDelay = 0; g.__execHang = []; g.__batchFail = {}; g.__timers = []; g.__execOut = {}; g.__sleepHang = false; g.__execFail = []; g.__execFn = null;
   g.__shared = {};
 }
 // Cards for both a remote and a local copy of the same space: { name: text | null (listed, file gone) }.
@@ -330,6 +330,29 @@ cases["S-card-known"] = async () => { // M2: a fallback card read that hangs tak
   g.__fail = [keyOf(remote, "/decisions/d-2.json")];
   r = await within(store.loadDecisions(remote, { cx }), 10000);
   check(r.done && Array.isArray(r.value) && r.value.map((c) => c.id).join() === "d-1", `a thrown read is left out (got ${r.value instanceof Error ? r.value.message : JSON.stringify(r.value?.map?.((c) => c.id))})`);
+};
+
+cases["S-push-refuse"] = async () => { // AC5.3 (t-007b): answerDecision refuses a push card, judged on the copy read from disk; the file is unchanged
+  const push = { version: 1, space: S, task: "t-1", path: "/repo", url: "file:///tmp/o.git", branch: "main", commit: "c".repeat(40) };
+  const opts = { options: [{ label: "Push" }, { label: "Not now" }] };
+  const variants = { both: card("d-push-t-1-1", { kind: "push", push, ...opts }), object: card("d-push-t-1-2", { push, ...opts }), kind: card("d-push-t-1-3", { kind: "push", ...opts }) };
+  for (const space of [local, remote]) {
+    for (const [name, text] of Object.entries(variants)) {
+      world();
+      const id = JSON.parse(text).id, k = keyOf(space, `/decisions/${id}.json`);
+      g.__files[k] = text;
+      // The entry in memory looks like a plain card: the refusal comes from what is on disk.
+      const entry = { id, path: `${space.machine ? rdir : ldir}/decisions/${id}.json`, card: { ...JSON.parse(card(id)), options: opts.options } };
+      let err = null;
+      try { await store.answerDecision(space, entry, "Push", "a note"); } catch (e) { err = e; }
+      check(err && err.message === "A push card is answered with its own Submit; its answer runs pa-push-main.", `${space.machine ?? "local"} ${name}: refused (got ${err?.message ?? "no error"})`);
+      check(g.__files[k] === text && !(g.__writes ?? []).length && !g.__execs.some(([c, a]) => c === "python3" && a[0] === "-c"), `${space.machine ?? "local"} ${name}: the file is unchanged, nothing written`);
+    }
+  }
+  check(store.isPush({ push: {} }) && store.isPush({ kind: "push" }) && !store.isPush({ id: "d-1" }) && !store.isPush(null) && !store.isPush({ push: "x" }), "isPush by the push object or kind");
+  world(); g.__files[keyOf(local, "/decisions/d-1.json")] = card("d-1");
+  await store.answerDecision(local, { id: "d-1", path: `${ldir}/decisions/d-1.json` }, "A", "");
+  check(JSON.parse(g.__files[keyOf(local, "/decisions/d-1.json")]).status === "answered", "a plain card is still answered");
 };
 
 const pick = process.argv.slice(2);

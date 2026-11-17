@@ -13,6 +13,8 @@
 //   __execOut      { "<machine>:<kind>": { code?, stdout } }  what an exec of that kind (evidence, stale) prints
 //   __sleepHang    true: cx.sleep never settles (a read that ignores its 10 s limit)
 //   __execFail     ["<machine>:<kind>"]  exec of that kind throws (a failed call)
+//   __execFn       (command, args, on, options) => reply | undefined  a case's own answer for an exec (t-007b: the
+//                  pa-push-main and pa-push-allow stand-ins; a reply may be a promise); recorded in __execs with its options
 // The batched card read (`sh -c <script with "for f in *.json"> sh <dir>`) answers from __ls and __files:
 // each listed name the card-name filter takes that has a file, in byte order, as "name\0text\0". No __ls entry: exit 3 (no folder).
 // cx / makeCx(): the keeper stubs' spawn (flush() awaits it) plus sleep(ms) on the __now clock and a timer that
@@ -46,6 +48,8 @@ export const exec = async (command, args = [], options = {}) => {
   if ((g.__execFail ?? []).includes(`${on ?? ""}:${kind}`)) throw new Error("exec failed");
   if ((g.__execHang ?? []).includes(`${on ?? ""}:${kind}`)) { (g.__execs ??= []).push([command, args, on]); return new Promise(() => {}); }
   if (on && g.__remoteDelay && !(g.__offline ?? []).includes(on)) await waitFor(g.__remoteDelay);
+  const own = g.__execFn ? g.__execFn(command, args, on, options) : undefined;
+  if (own !== undefined) { (g.__execs ??= []).push([command, args, on, options]); return own; }
   const canned = (g.__execOut ?? {})[`${on ?? ""}:${kind}`];
   if (canned && kind !== "batch") { if ((g.__offline ?? []).includes(on)) throw new Error(`machine ${on} is unreachable`); return { code: 0, stderr: "", ...canned }; }
   if (kind !== "batch") return baseExec(command, args, options);

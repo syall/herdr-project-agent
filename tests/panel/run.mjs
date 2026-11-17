@@ -43,7 +43,7 @@ function world({ agent = true, agentTerminal = "t30", records = {}, extraPanes =
   // A keeper ("K", in another copy) holds the lease and has judged the records.
   g.__shared = { "project-agent.tabs": records, "project-agent.timer": { id: "K", at: T0 }, "project-agent.keeper": { id: "K", at: T0 } };
   g.__files = {}; g.__fail = []; g.__hang = [];
-  g.__remoteDelay = 0; g.__execHang = []; g.__batchFail = {}; g.__issued = []; g.__timers = []; g.__layout = {}; g.__execs = []; g.__execOut = {}; g.__sleepHang = false; g.__execFail = [];
+  g.__remoteDelay = 0; g.__execHang = []; g.__batchFail = {}; g.__issued = []; g.__timers = []; g.__layout = {}; g.__execs = []; g.__execOut = {}; g.__sleepHang = false; g.__execFail = []; g.__execFn = null;
   if (agent) {
     const dir = machine ? `${machine}:.config/herdr-pa/spaces/${S}` : `:${DIR}`, home = machine ? `${machine}:.config/herdr-pa` : ":/home/u/.config/herdr-pa";
     g.__files[`${dir}/agent.json`] = JSON.stringify({ space: S, project: "/proj", profile: "test", name: "proj", terminal: agentTerminal });
@@ -1701,6 +1701,303 @@ cases["X4-own-buttons-keep"] = async () => { // the armed Delete and its Cancel:
   await press(r, "rule-delete-r-one");
   await down(r, "rule-delete-r-one"); await down(r, "rule-delete-cancel-r-one");
   check(ruleArmed(r), "rule Delete: still armed");
+};
+
+// ---- t-007b Job C: the push card (spec §8, plan §4.3, §4.7). pa-push-main and pa-push-allow are
+// stand-ins (__execFn): the real tool never runs here. ----
+const PID = "d-push-t-1-1", PKEY = `${S}\0${PID}`;
+const PC = "cc11" + "0".repeat(36), PR = "aa22" + "0".repeat(36), PL = "bb33" + "0".repeat(36), PE = "ee44" + "0".repeat(36);
+const PURL = "file:///tmp/pa-scratch/origin.git";
+const pushCardText = (extra = {}) => JSON.stringify({ id: PID, task: "t-1", kind: "push", question: "Push repo main (2 commits)?",
+  context: "CONTEXT FROM THE CARD FILE", options: [{ label: "Push", detail: "DETAIL FROM THE CARD FILE" }, { label: "Not now", detail: "x" }],
+  recommendation: "Push", status: "open", answer: null, note: null, created: "2026-11-16T10:00:00Z", answered: null,
+  push: { version: 1, space: S, task: "t-1", path: "/repo", url: PURL, branch: "main", taskBranch: "t-1-x", commit: PC, localBefore: PL, remoteBefore: PR, merge: true,
+    commits: [], allowSha: "a".repeat(64), allowMtime: "2026-11-16T08:00:00Z", gateAt: "2026-11-16T09:00:00Z", done: false, result: null, attempts: [] }, ...extra });
+const PCMDS = [["git", "-C", "/repo", "-c", "core.hooksPath=<an empty folder>", "-c", "core.fsmonitor=false", "merge", "--ff-only", "--no-edit", PC],
+  ["git", "-C", "/repo", "-c", "core.hooksPath=<an empty folder>", "-c", "core.fsmonitor=false", "push", "--porcelain", "--no-follow-tags", "--recurse-submodules=no", PURL, `${PC}:refs/heads/main`]];
+const checkReply = (over = {}, facts = {}) => ({ card: PID, ok: true, refusal: null, caller: { ok: true, why: null, ancestors: ["herdr"] }, status: "open", done: false, result: null,
+  facts: { path: "/repo", url: PURL, branch: "main", originUrl: PURL, remoteNow: PR, localNow: PL, commit: PC, taskBranch: "t-1-x", branchTip: PC, merge: true,
+    gate: { at: "2026-11-16T09:00:00Z", phase: "review", passed: true, commit: PC, uncommitted: 0 },
+    commits: [{ sha: PC, subject: "the task's change", author: "A <a@x>", fromTask: true }, { sha: PE, subject: "an earlier local merge", author: "B <b@x>", fromTask: false }], count: 2,
+    allow: { file: "/home/u/.config/herdr-pa/push-allow.json", sha: "a".repeat(64), mtime: "2026-11-16T08:00:00Z", changedSinceCard: false, entry: { path: "/repo", url: PURL, branch: "main", space: S, enabled: true } },
+    commands: PCMDS, checkedAt: "2026-11-16T10:00:00Z", ...facts }, seen: "seen-token-1", ...over });
+const runPushed = { ok: true, done: true, answer: "Push", refusal: null, message: `pushed ${PURL} main aa22000..cc11000 (2 commits)`,
+  result: { at: "2026-11-16T10:01:00Z", from: PR, to: PC, url: PURL, branch: "main", merged: true, output: ["To file:///tmp/pa-scratch/origin.git", "Done"] } };
+const json = (code, value) => ({ code, stdout: JSON.stringify(value), stderr: "" });
+// The tool's stand-in: check, run and show answer from these (each may return a promise).
+function pushTool({ check: onCheck = () => json(0, checkReply()), run: onRun = () => json(0, runPushed), show = () => json(0, { exists: false, valid: true, problem: null, enabled: false, repos: [], file: "/home/u/.config/herdr-pa/push-allow.json", state: "off (the default): no push allowlist" }) } = {}) {
+  g.__execFn = (command, args) => {
+    if (command === "pa-push-main" && args[0] === "check") return onCheck(args);
+    if (command === "pa-push-main" && args[0] === "run") return onRun(args);
+    if (command === "pa-push-allow" && args[0] === "show") return show(args);
+    if (/^pa-push|pa_push/.test(command)) throw new Error(`unexpected ${command} ${args.join(" ")}`);
+    return undefined;
+  };
+}
+const pushExecs = (sub) => g.__execs.filter(([c, a]) => c === "pa-push-main" && (!sub || a[0] === sub));
+const allExecsOfTool = () => g.__execs.filter(([c]) => /pa-push|pa_push/.test(c));
+function pushFiles({ machine = null, card = pushCardText() } = {}) {
+  const dir = machine ? `${machine}:${RDIR}` : `:${DIR}`;
+  g.__files[`${dir}/decisions/${PID}.json`] = card; g.__ls[`${dir}/decisions`] = [`${PID}.json`];
+  g.__files[`${dir}/ledger.json`] = JSON.stringify({ tasks: [{ id: "t-1", title: "One", state: "review", updated: "2026-11-16T10:02:00Z" }] });
+  g.__files[`${dir}/schedule.json`] = JSON.stringify({ everyMinutes: 15 });
+  return `${dir}/decisions/${PID}.json`;
+}
+async function pushWorld({ machine = null, tool = {}, card, opts = {}, layout = null, props = null } = {}) {
+  world({ machine, ...opts });
+  const file = pushFiles({ machine, card });
+  pushTool(tool);
+  if (layout) g.__layout = layout;
+  if (props) g.__props = props;
+  const v = await mount(); await settle();
+  return { v, file };
+}
+const deferred = () => { let resolve; const promise = new Promise((r) => { resolve = r; }); return { promise, resolve }; };
+
+cases["P-push-facts"] = async () => { // §8.1: the block shows the facts of the last check, not the card file's own text
+  const { v } = await pushWorld();
+  const { text } = look(v);
+  for (const want of ["Read now by pa-push-main check (not from the card file)", "Repository: /repo", `Pushes to: ${PURL}, on your allowlist (entry on`,
+    "Remote main now: aa22000", "Local main: bb33000", "Commits (2):", "cc11000 the task's change — A <a@x>",
+    "ee44000 an earlier local merge — B <b@x> · already on local main, not from this task", "Gated commit: cc11000, full gate passed at", "task t-1, branch t-1-x",
+    "What will run:", `git -C /repo -c core.hooksPath=<an empty folder> -c core.fsmonitor=false push --porcelain --no-follow-tags --recurse-submodules=no ${PURL} ${PC}:refs/heads/main`,
+    "No force, no tags, no other branches.", "This panel may push: yes", "Check again"]) check(text.includes(want), `shows "${want}" (got ${text.slice(0, 1500)})`);
+  check(!text.includes("CONTEXT FROM THE CARD FILE") && !text.includes("DETAIL FROM THE CARD FILE"), "the card file's context and option details are not shown");
+  check(text.includes("Push") && text.includes("Not now"), "the two options");
+};
+
+cases["P-push-facts-warnings"] = async () => { // §8.1: red lines for a changed allowlist, another origin URL, more than 20 commits
+  const many = Array.from({ length: 23 }, (_, i) => ({ sha: `${String(i).padStart(4, "0")}${"0".repeat(36)}`, subject: `s${i}`, author: "A <a@x>", fromTask: true }));
+  const { v } = await pushWorld({ tool: { check: () => json(0, checkReply({}, { originUrl: "git@other:x.git", commits: many, count: 23,
+    allow: { ...checkReply().facts.allow, changedSinceCard: true } })) } });
+  const { text } = look(v);
+  check(/The allowlist changed at .*, after this card was made/.test(text), `allowlist changed line (got ${text.slice(0, 1200)})`);
+  check(text.includes("origin's URL is git@other:x.git, not the allowlist's URL"), "origin URL line");
+  check(text.includes("Commits (23):") && text.includes("… and 3 more") && !text.includes(" s20 "), "20 commits, then … and 3 more");
+};
+
+cases["P-push-check-on-first-show"] = async () => { // AC6.1: one check after the first load commits; none from render or later reloads
+  const { v } = await pushWorld();
+  let checks = pushExecs("check");
+  check(checks.length === 1, `one check (got ${JSON.stringify(checks.map((x) => x[1]))})`);
+  check(JSON.stringify(checks[0][1]) === JSON.stringify(["check", PID, "--space", S, "--json"]) && checks[0][2] === null && checks[0][3]?.timeout === 60000, `its argv, on and timeout (got ${JSON.stringify(checks[0])})`);
+  for (let i = 0; i < 5; i++) look(v);
+  await settle();
+  for (let i = 0; i < 6; i++) { advance(10000); await fire(10000); }
+  checks = pushExecs("check");
+  check(checks.length === 1, `still one check after renders and 6 reloads (got ${checks.length})`);
+  check(pushExecs("run").length === 0, "no run");
+};
+
+cases["P-push-pick-checks"] = async () => { // AC6.1: picking Push checks again; so does Check again; Not now does not
+  const { v } = await pushWorld();
+  await click(v, `opt-${PID}-0`); await settle();
+  check(pushExecs("check").length === 2, `picking Push checks (got ${pushExecs("check").length})`);
+  await click(v, `opt-${PID}-1`); await settle();
+  check(pushExecs("check").length === 2, "picking Not now does not");
+  await click(v, `push-check-${PID}`); await settle();
+  check(pushExecs("check").length === 3, "Check again does");
+  check(pushExecs("run").length === 0, "no run");
+};
+
+cases["P-push-run-once"] = async () => { // AC6.2, AC5.3: Submit Push runs pa-push-main run once per click; the card file is never written by the panel
+  const gate = deferred();
+  const { v, file } = await pushWorld({ tool: { run: () => gate.promise } });
+  const before = g.__files[file];
+  await click(v, `opt-${PID}-0`); await settle();
+  await click(v, `submit-${PID}`); await settle();
+  const { text, clicks } = look(v);
+  check(text.includes("Pushing…") && !clicks[`submit-${PID}`], `Pushing…, no second Submit while it runs (got ${Object.keys(clicks)})`);
+  const runs = pushExecs("run");
+  check(runs.length === 1, `one run (got ${runs.length})`);
+  check(JSON.stringify(runs[0][1]) === JSON.stringify(["run", PID, "--answer", "Push", "--space", S, "--seen", "seen-token-1", "--json"]), `its argv (got ${JSON.stringify(runs[0][1])})`);
+  check(runs[0][2] === null && runs[0][3]?.timeout === 600000, `on null, timeout 600 s (got ${JSON.stringify(runs[0][3])})`);
+  gate.resolve(json(0, runPushed)); await settle();
+  check(pushExecs("run").length === 1, "still one run");
+  check(g.__files[file] === before && !(g.__writes ?? []).some((k) => k.includes("/decisions/")), "the panel wrote no card file");
+  check(look(v).text.includes(`Pushed ${PURL} main aa22000..cc11000`) && look(v).text.includes("Done"), `the result and the output tail (got ${look(v).text.slice(0, 1500)})`);
+};
+
+cases["P-push-note-passed"] = async () => { // the note goes with --note
+  const { v } = await pushWorld();
+  v.notes[PKEY].set("  ship it  ");
+  await click(v, `opt-${PID}-0`); await settle();
+  await click(v, `submit-${PID}`); await settle();
+  const a = pushExecs("run")[0]?.[1] ?? [];
+  check(JSON.stringify(a.slice(-2)) === JSON.stringify(["--note", "ship it"]), `--note ship it (got ${JSON.stringify(a)})`);
+};
+
+cases["P-push-refused"] = async () => { // §8.2: a refusal is shown on the card, which stays open; a fresh check follows
+  const msg = "remote main moved since the card (was aa22000, now dd55000); ask for a new card";
+  const { v } = await pushWorld({ tool: { run: () => json(1, { ok: false, done: false, answer: "Push", refusal: { check: "C11b", message: msg }, result: null, message: msg }) } });
+  await click(v, `opt-${PID}-0`); await settle();
+  await click(v, `submit-${PID}`); await settle();
+  const { text } = look(v);
+  check(text.includes(`Not pushed: ${msg}`), `the refusal (got ${text.slice(0, 1500)})`);
+  check(text.includes("open") && !text.includes("answered: Push"), "the card stays open");
+  check(pushExecs("check").length === 3, `a fresh check after the refusal (got ${pushExecs("check").length})`);
+  // A tool that prints no JSON: its stderr is shown.
+  const { v: w } = await pushWorld({ tool: { run: () => ({ code: 1, stdout: "", stderr: "pa-push-main: refused: pa-push-main run is the person's command (HC_TERMINAL_ID is set)" }) } });
+  await click(w, `opt-${PID}-0`); await settle();
+  await click(w, `submit-${PID}`); await settle();
+  check(look(w).text.includes("Not pushed: pa-push-main: refused: pa-push-main run is the person's command (HC_TERMINAL_ID is set)"), `stderr shown (got ${look(w).text.slice(0, 1500)})`);
+};
+
+cases["P-push-notnow"] = async () => { // AC6.3: Not now runs run --answer "Not now" (no --seen), even when the check refused
+  const { v } = await pushWorld({ tool: { check: () => json(1, checkReply({ ok: false, seen: null, refusal: { check: "C6a", message: "no push allowlist (x); main-branch pushes are off" } })),
+    run: () => json(0, { ok: true, done: false, answer: "Not now", refusal: null, result: null, message: "answered Not now" }) } });
+  await click(v, `opt-${PID}-1`); await settle();
+  await click(v, `submit-${PID}`); await settle();
+  const runs = pushExecs("run");
+  check(runs.length === 1 && JSON.stringify(runs[0][1]) === JSON.stringify(["run", PID, "--answer", "Not now", "--space", S, "--json"]), `run --answer "Not now" (got ${JSON.stringify(runs.map((r) => r[1]))})`);
+};
+
+cases["P-push-disabled"] = async () => { // AC6.5: Push is disabled after a failed check, an old check, a refused caller, a done card, no seen token
+  const variants = {
+    refused: { check: () => json(1, checkReply({ ok: false, seen: null, refusal: { check: "C6a", message: "no push allowlist (x); main-branch pushes are off" } })), says: "Push is not possible now (C6a): no push allowlist (x); main-branch pushes are off" },
+    caller: { check: () => json(0, checkReply({ caller: { ok: false, why: "HC_TERMINAL_ID is set", ancestors: ["zsh"] } })), says: "This panel may push: no (HC_TERMINAL_ID is set)" },
+    done: { check: () => json(1, checkReply({ ok: false, done: true, refusal: { check: "C4", message: `${PID} was already pushed` } })), says: `${PID} was already pushed` },
+    noseen: { check: () => json(0, checkReply({ seen: null })), says: "Check again" },
+    bad: { check: () => ({ code: 0, stdout: "not json", stderr: "" }), says: "pa-push-main check printed no result" },
+  };
+  for (const [name, x] of Object.entries(variants)) {
+    const { v } = await pushWorld({ tool: { check: x.check } });
+    await click(v, `opt-${PID}-0`); await settle();
+    const { text, clicks } = look(v);
+    check(!clicks[`submit-${PID}`], `${name}: no Submit (have ${Object.keys(clicks)})`);
+    check(text.includes(x.says), `${name}: says "${x.says}" (got ${text.slice(0, 1500)})`);
+  }
+  const { v } = await pushWorld();
+  await click(v, `opt-${PID}-0`); await settle();
+  check(Boolean(look(v).clicks[`submit-${PID}`]), "fresh ok check: Submit");
+  advance(119000);
+  check(Boolean(look(v).clicks[`submit-${PID}`]), "at 119 s: Submit");
+  advance(2000);
+  const { text, clicks } = look(v);
+  check(!clicks[`submit-${PID}`] && text.includes("This check is over 2 minutes old: Check again before pushing."), `over 120 s: disabled (got ${text.slice(0, 1500)})`);
+  const slow = deferred();
+  const { v: w } = await pushWorld({ tool: { check: () => slow.promise } });
+  await click(w, `opt-${PID}-0`); await settle();
+  check(look(w).text.includes("Checking…") && !look(w).clicks[`submit-${PID}`], "Checking… while the check runs, no Submit");
+  slow.resolve(json(0, checkReply())); await settle();
+  check(Boolean(look(w).clicks[`submit-${PID}`]), "then Submit");
+};
+
+cases["P-push-timer-copy"] = async () => { // AC6.4: the timer copy (props.timer) never runs pa-push-main
+  const { v } = await pushWorld({ props: { timer: true } });
+  for (let i = 0; i < 10; i++) { advance(15000); for (const t of [...g.__timers]) t.fn(cx); await settle(); v.render(cx); }
+  check(allExecsOfTool().length === 0, `no pa-push-* exec (got ${JSON.stringify(allExecsOfTool().map((x) => x[1]))})`);
+};
+
+cases["P-push-hidden"] = async () => { // AC6.4: a hidden copy reloading 10 times runs no pa-push-main of any kind
+  const { v } = await pushWorld({ layout: panelLayout("changes") });
+  for (let i = 0; i < 10; i++) { advance(10000); await fire(10000); await fire(1000); v.resend(cx); await settle(); }
+  check(g.__issued.some((x) => x.kind === "batch" || x.kind === "ls"), "the hidden copy did read the cards");
+  check(allExecsOfTool().length === 0, `no pa-push-* exec (got ${JSON.stringify(allExecsOfTool().map((x) => x[1]))})`);
+};
+
+cases["P-push-reloads"] = async () => { // AC6.4: a shown copy with Push picked, 10 reloads and resends: no run
+  const { v } = await pushWorld({ opts: { records: alive() } });
+  await click(v, `opt-${PID}-0`); await settle();
+  for (let i = 0; i < 10; i++) { advance(10000); await fire(10000); await fire(15000); await fire(1000); v.resend(cx); await settle(); }
+  check(pushExecs("run").length === 0, `no run (got ${pushExecs("run").length})`);
+};
+
+cases["P-push-remote-on"] = async () => { // §7.6: on a remote space every exec runs on its machine, with the local space id
+  const { v } = await pushWorld({ machine: M });
+  await click(v, `opt-${PID}-0`); await settle();
+  await click(v, `submit-${PID}`); await settle();
+  await click(v, "view-rules"); await settle();
+  const mine = allExecsOfTool();
+  check(mine.length >= 4 && mine.every(([, a, on]) => on === M), `every exec on ${M} (got ${JSON.stringify(mine.map((x) => [x[1][0], x[2]]))})`);
+  check(mine.every(([, a]) => a[a.indexOf("--space") + 1] === S), "--space is the local id");
+};
+
+cases["P-push-exec-timeout"] = async () => { // D8: a run that never settles: "result unknown" after 600 s, then one check
+  const { v } = await pushWorld({ tool: { run: () => new Promise(() => {}) } });
+  await click(v, `opt-${PID}-0`); await settle();
+  await click(v, `submit-${PID}`); await settle();
+  const checks = pushExecs("check").length;
+  await step(590000);
+  check(look(v).text.includes("Pushing…"), "still running at 590 s");
+  await step(20000); await settle();
+  const { text } = look(v);
+  check(/The result is unknown \(.*\); checking the card again\./.test(text), `result unknown (got ${text.slice(0, 1500)})`);
+  check(pushExecs("check").length === checks + 1, `one check after it (got ${pushExecs("check").length - checks})`);
+  check(pushExecs("run").length === 1, "one run");
+};
+
+cases["P-push-lastknown"] = async () => { // D7: a card shown from its last known copy still checks and runs on a click; reloads run nothing
+  const { v } = await pushWorld();
+  g.__execFail = [":ls"]; // the card listing stops answering: the last known card stays shown
+  for (let i = 0; i < 3; i++) { advance(10000); await fire(10000); }
+  check(look(v).text.includes("the last known are shown"), `shown from the last known copy (got ${look(v).text.slice(0, 600)})`);
+  check(pushExecs("run").length === 0, "reloads ran no run");
+  await click(v, `push-check-${PID}`); await settle();
+  check(pushExecs("check").length === 2, "Check again checks");
+  await click(v, `opt-${PID}-0`); await settle();
+  await click(v, `submit-${PID}`); await settle();
+  check(pushExecs("run").length === 1, "Submit runs once");
+};
+
+cases["P-push-notice"] = async () => { // §8.2: the orchestrator is told the result through the notice queue
+  const msg = "the push allowlist changed since this card was made; ask for a new card";
+  const outcomes = [
+    [json(0, runPushed), `decision ${PID} answered Push; result: pushed ${PURL} main aa22000..cc11000 (2 commits)`, 0],
+    [json(1, { ok: false, done: false, answer: "Push", refusal: { check: "C6i", message: msg }, result: null, message: msg }), `decision ${PID} answered Push; refused: ${msg} (the card stays open)`, 0],
+    [json(0, { ok: true, done: false, answer: "Not now", refusal: null, result: null, message: "answered Not now" }), `decision ${PID} answered Not now`, 1],
+  ];
+  for (const [reply, want, opt] of outcomes) {
+    const { v } = await pushWorld({ opts: { records: alive() }, tool: { run: () => reply } });
+    await click(v, `opt-${PID}-${opt}`); await settle();
+    await click(v, `submit-${PID}`); await settle();
+    check(JSON.stringify(sends()) === JSON.stringify([["send", "t4w", want]]), `notice "${want}" (got ${JSON.stringify(sends())})`);
+  }
+};
+
+cases["P-push-answered"] = async () => { // an answered push card shows its answer; no check runs for it
+  const { v } = await pushWorld({ card: pushCardText({ status: "answered", answer: "Push", answered: "2026-11-16T10:01:00Z", answeredBy: "person, in the panel" }) });
+  await click(v, "view-decisions"); await click(v, "pa-older");
+  check(pushExecs().length === 0, `no pa-push-main for an answered card (got ${pushExecs().length})`);
+  check(look(v).text.includes("answered: Push"), "its answer");
+};
+
+const allowShow = (over = {}) => json(0, { file: "/home/u/.config/herdr-pa/push-allow.json", exists: true, valid: true, problem: null, sha: "a".repeat(64), mtime: "2026-11-16T08:00:00Z", enabled: true, space: S, state: "on",
+  repos: [{ path: "/repo", url: PURL, branch: "main", space: S, enabled: true, prePush: ["/bin/check", "{path}"], note: "scratch", thisSpace: true },
+    { path: "/other", url: "git@host:me/other.git", branch: "main", space: "sp9", enabled: false, thisSpace: false }], ...over });
+const shows = () => g.__execs.filter(([c, a]) => c === "pa-push-allow" && a[0] === "show");
+
+cases["P-push-rules-off"] = async () => { // AC3.5: no file: "off (the default)"; read with pa-push-allow show --json
+  const { v } = await pushWorld();
+  check(shows().length === 0, "not read before the Rules view opens");
+  await click(v, "view-rules"); await settle();
+  check(shows().length === 1 && JSON.stringify(shows()[0][1]) === JSON.stringify(["show", "--json", "--space", S]), `one show (got ${JSON.stringify(shows().map((x) => x[1]))})`);
+  check(look(v).text.includes("Push allowlist: off (the default): main-branch pushes are not possible."), `off (got ${look(v).text.slice(0, 1500)})`);
+};
+
+cases["P-push-rules-entries"] = async () => { // AC3.5 / D15: the entries, this space marked; reread on reloads at most every 30 s and on Refresh
+  const { v } = await pushWorld({ tool: { show: () => allowShow() } });
+  await click(v, "view-rules"); await settle();
+  const { text } = look(v);
+  for (const want of ["Push allowlist: on", "/home/u/.config/herdr-pa/push-allow.json", "/repo → file:///tmp/pa-scratch/origin.git main", "this space", "prePush: /bin/check {path}", "scratch",
+    "/other → git@host:me/other.git main", "space sp9", "off", "Read only: change it in your own terminal with pa-push-allow, or by hand."]) check(text.includes(want), `shows "${want}" (got ${text.slice(0, 2000)})`);
+  advance(10000); await fire(10000); advance(10000); await fire(10000);
+  check(shows().length === 1, `reloads within 30 s: no new read (got ${shows().length})`);
+  advance(11000); await fire(10000);
+  check(shows().length === 2, `a reload after 30 s reads again (got ${shows().length})`);
+  await click(v, "push-allow-refresh"); await settle();
+  check(shows().length === 3, "Refresh reads again");
+  await click(v, "view-tasks"); advance(40000); await fire(10000);
+  check(shows().length === 3, "not read while another view is shown");
+};
+
+cases["P-push-rules-invalid"] = async () => { // AC3.2: an invalid file says why
+  const { v } = await pushWorld({ tool: { show: () => allowShow({ valid: false, problem: "repos[0].url is not an allowed URL", enabled: false, repos: [], state: "not valid, so off: repos[0].url is not an allowed URL" }) } });
+  await click(v, "view-rules"); await settle();
+  check(look(v).text.includes("Push allowlist: not valid, so nothing is allowed: repos[0].url is not an allowed URL. Fix it by hand."), `the reason (got ${look(v).text.slice(0, 1500)})`);
+  const { v: w } = await pushWorld({ tool: { show: () => ({ code: 127, stdout: "", stderr: "pa-push-allow: command not found" }) } });
+  await click(w, "view-rules"); await settle();
+  check(look(w).text.includes("Push allowlist: could not read it (pa-push-allow: command not found)"), `a failed read says so (got ${look(w).text.slice(0, 1500)})`);
 };
 
 const pick = process.argv.slice(2);
