@@ -1409,6 +1409,336 @@ class PersonOnly(GuardTest):
                 self.assertEqual(guard.check_edit(path, spaces, cwd=self.cwd, home=pa.ROOT), OFF_TABLE.format(path))
 
 
+# ---- t-016: the Bash write rule ----------------------------------------------------------------------------------------
+# spec.md (evidence/t-016) R1-R8. The lines are data handed to check_writes, split_plain_ops, check_command and the hook
+# function in-process only; none is run. <wt> is the test's worktree, <ev> the literal ~ form of a space's evidence
+# folder, <sp> a space folder. Rows 2 and 46 name the build tool `pkg-build` (the public-repo check refuses internal
+# names); their shape is the spec's.
+WRITE = ("Refused by the Project Agent's guard: this command writes to {target}, which is inside a .git folder or the "
+         "Project Agent's files. Change git state with the allowed git commands only; write reports, logs and notes in "
+         "your task's evidence folder (evidence/<task-id>/ in the Project Agent's state folder). If the write is needed, "
+         "stop and report to the Project Agent with hc send. There is no override.")
+FOLDER_UNKNOWN = ("Refused by the Project Agent's guard: after {word} the folder is not known, so the write to {target} "
+                  "cannot be checked. Write the target as a full path, or run the cd as a command of its own first. "
+                  "There is no override.")
+T016_EV = "~/.config/herdr-pa/spaces/sp1/evidence/t-016"
+# spec section 4: every row must stay allowed (a refusal of any is Must fix).
+T016_ALLOWED = [
+    "cd <wt> && hooks/tests.sh affected > build.log 2>&1",                                   # 1
+    "cd <wt>/src/Pkg && pkg-build release > /tmp/b.log 2>&1 && tail -n 20 /tmp/b.log",      # 2
+    "python3 -m pytest tests/test_pa_guard.py > <ev>/test.log 2>&1",                         # 3
+    "pa-full-suite",                                                                         # 4
+    "cat <ev>/spec.md",                                                                      # 5
+    "cat a.log >> <ev>/build.log",                                                           # 6
+    "make 2>&1 | tee <ev>/build.log",                                                        # 7
+    "tee -a <ev>/notes.md < draft.md",                                                       # 8
+    "echo done > <ev>/status.txt",                                                           # 9
+    "cat > <ev>/REVIEW.md <<'EOF'\nThe fix names .git/config in prose.\nEOF",                # 10
+    "cat <<'EOF' > notes.md\nprose about .git/config\nEOF",                                  # 11
+    "git status",                                                                            # 12
+    "git diff HEAD~1",                                                                       # 13
+    'git add -A && git commit -m "fix .git/config handling"',                                # 14
+    "git log --oneline -5 | head",                                                           # 15
+    "git grep -n protected -- runtime",                                                      # 16
+    "grep -rn --exclude-dir=.git TODO .",                                                    # 17
+    "rg TODO --glob '!.git'",                                                                # 18
+    "find . -path ./.git -prune -o -name '*.py' -print",                                     # 19
+    "cat .git/HEAD",                                                                         # 20
+    "ls -la .git/hooks",                                                                     # 21
+    "cp .git/config /tmp/config.bak",                                                        # 22
+    "diff .git/info/exclude .gitignore",                                                     # 23
+    "wc -l < .git/HEAD",                                                                     # 24
+    "echo 'build/' >> .gitignore",                                                           # 25
+    "mkdir -p .github/workflows && cp ci.yml .github/workflows/ci.yml",                      # 26
+    "touch logs/.gitkeep",                                                                   # 27
+    "echo x > .git-blame-ignore-revs",                                                       # 28
+    "sed -i '' 's/foo/bar/' .gitignore",                                                     # 29
+    "sed -i '' 's#/.git/#/git dir/#' docs/notes.md",                                         # 30
+    "perl -pi -e 's/.git\\//x/' notes.md",                                                   # 31
+    "chmod +x scripts/run.sh",                                                               # 32
+    "chmod 755 build/tool",                                                                  # 33
+    "truncate -s 0 build/out.log",                                                           # 34
+    "mkdir -p build/tmp && cp -r src/fixtures build/tmp/",                                   # 35
+    "mv build/out.txt build/out.old",                                                        # 36
+    "rm -rf build/tmp",                                                                      # 37
+    "ln -s ../shared/config.json config.json",                                               # 38
+    "rsync -a src/ /tmp/backup/",                                                            # 39
+    "dd if=/dev/zero of=build/blank.img bs=1k count=1",                                      # 40
+    "install -m 644 a.conf build/etc/a.conf",                                                # 41
+    "mkdir -p <ev>",                                                                         # 42
+    "cp <wt>/plan.md <ev>/plan.md",                                                          # 43
+    'hc send t2r "done: see <ev>/spec.md"',                                                  # 44
+    "npm test 2>/dev/null",                                                                  # 45
+    "pkg-build release > build.log 2>&1; echo $?",                                           # 46
+    'echo "a > b" > notes.md',                                                               # 47
+    'cp a.py "$HOME/tmp/a.py"',                                                              # 48
+    "source .venv/bin/activate && pytest > t.log",                                           # 49
+]
+# spec section 5: (command, the target the message names); each ;-separated example its own entry.
+T016_REFUSED = [
+    ("echo x > .git/config", ".git/config"), ("cat hook.sh >> .git/hooks/pre-commit", ".git/hooks/pre-commit"),
+    ("make 2> .git/x", ".git/x"), ("ls &> .git/x", ".git/x"), ("cd .git && echo x > config", "config"),
+    ("cd <wt> || exit 1; echo x > .git/HEAD", ".git/HEAD"),
+    ("cp hook.sh .git/hooks/pre-commit", ".git/hooks/pre-commit"), ("cp -t .git/hooks hook.sh", ".git/hooks"),
+    ("mv .git/index /tmp/index", ".git/index"), ("tee .git/info/exclude", ".git/info/exclude"),
+    ("touch .git/index.lock", ".git/index.lock"), ("rm -rf .git", ".git"), ("/bin/rm -rf .git", ".git"),
+    ("ln -sf /tmp/x .git/hooks/post-commit", ".git/hooks/post-commit"), ("mkdir .git/hooks/x", ".git/hooks/x"),
+    ("rmdir .git/refs/x", ".git/refs/x"), ("chmod +x .git/hooks/pre-push", ".git/hooks/pre-push"),
+    ("truncate -s 0 .git/index", ".git/index"), ("sed -i '' 's/a/b/' .git/config", ".git/config"),
+    ("LC_ALL=C sed -i '' s/a/b/ .git/config", ".git/config"), ("perl -pi -e 's/a/b/' .git/config", ".git/config"),
+    ("dd if=x of=.git/HEAD", ".git/HEAD"), ("rsync -a x .git/", ".git/"), ("install x .git/hooks/y", ".git/hooks/y"),
+    ("echo x > .GIT/config", ".GIT/config"), ("echo x > lnk/config", "lnk/config"),
+    ("echo x > <sp>/ledger.json", "<sp>/ledger.json"), ("cp d.json <sp>/decisions/d-9.json", "<sp>/decisions/d-9.json"),
+    ("echo x >> ~/.config/herdr-pa/spaces/sp1/journal.jsonl", "~/.config/herdr-pa/spaces/sp1/journal.jsonl"),
+    ('tee "$HOME/.config/herdr-pa/core/worker.md"', "<user>/.config/herdr-pa/core/worker.md"),
+    ("echo '[alias]' >> ~/.gitconfig", "~/.gitconfig"), ("echo '{}' > .claude/pa-task.json", ".claude/pa-task.json"),
+]
+
+
+class T016(Split):
+    """A Project Agent home with spaces in the patched user home, and a worktree with a .git folder and a link to it."""
+
+    def setUp(self):
+        super().setUp()
+        self.home = os.path.join(self.user, ".config", "herdr-pa")
+        self.spaces = os.path.join(self.home, "spaces")
+        self.sp = os.path.join(self.spaces, "sp1")
+        for d in [os.path.join(self.sp, "evidence", "t-016"), os.path.join(self.sp, "decisions"),
+                  os.path.join(self.spaces, "sp2", "evidence", "t-x")] + [os.path.join(self.wt, ".git", d) for d in ("hooks", "info", "refs")]:
+            os.makedirs(d, exist_ok=True)
+        for f in ("ledger.json", "journal.jsonl"):
+            open(os.path.join(self.sp, f), "a").close()
+        os.symlink(os.path.join(self.wt, ".git"), os.path.join(self.wt, "lnk"))
+
+    def fill(self, line):
+        return line.replace("<wt>", self.wt).replace("<ev>", T016_EV).replace("<sp>", self.sp).replace("<user>", self.user)
+
+    def w(self, line, cwd=None):
+        return guard.check_writes(self.fill(line), self.spaces, cwd=cwd or self.wt, home=self.home)
+
+    def refused(self, line, target=None):
+        message = self.w(line)
+        self.assertIsNotNone(message, line)
+        if target is not None:
+            self.assertEqual(message, WRITE.format(target=self.fill(target)), line)
+        return message
+
+
+class T016_Scanner(T016):
+    def scan(self, line):
+        return guard.split_plain_ops(self.fill(line), writes=True)
+
+    def test_ac1_1_writes_false_is_todays_scanner(self):  # passes today
+        for line in ["make > a", "cat $HOME/x", "ls &> a", "wc -l < a", "echo x 2>&1"]:
+            with self.subTest(line=line):
+                self.assertIsNone(guard.split_plain_ops(line))
+        self.assertEqual(guard.split_plain_ops("git status && make"), ([["git", "status"], ["make"]], ["&&", None]))
+
+    def test_ac1_2_redirect_targets(self):
+        self.assertEqual(self.scan("make test > build.log 2>&1"), ([["make", "test"]], [None], [["build.log"]]))
+
+    def test_ac1_3_forms(self):
+        self.assertEqual(self.scan("echo hi>.git/x"), ([["echo", "hi"]], [None], [[".git/x"]]))
+        self.assertEqual(self.scan("ls 2>>e.log"), ([["ls"]], [None], [["e.log"]]))
+        self.assertEqual(self.scan("ls &> a.log"), ([["ls"]], [None], [["a.log"]]))
+        self.assertEqual(self.scan("ls &>> a.log; echo x >&2"), ([["ls"], ["echo", "x"]], [";", None], [["a.log"], []]))
+
+    def test_ac1_4_not_plain(self):
+        for line in ["echo x >", ">|x", "echo >|x", "cat <<EOF", "cat <<< x", "ls >&file", "echo $X > a", "> x",
+                     "ls; > x", "cat <> a", "echo x > ; ls", "echo x > > y"]:
+            with self.subTest(line=line):
+                self.assertIsNone(self.scan(line))
+        self.assertEqual(self.scan("wc -l < .git/HEAD"), ([["wc", "-l"]], [None], [[]]))
+
+    def test_ac1_5_quoted_redirect_is_a_word(self):
+        self.assertEqual(self.scan("echo \"a > b\" '>' c"), ([["echo", "a > b", ">", "c"]], [None], [[]]))
+
+    def test_ac1_6_home(self):
+        self.assertEqual(self.scan('echo x > "$HOME/x"')[2], [[os.path.join(self.user, "x")]])
+        self.assertEqual(self.scan("cat $HOME/x")[0], [["cat", os.path.join(self.user, "x")]])
+        self.assertEqual(self.scan("cat ${HOME}/x")[0], [["cat", os.path.join(self.user, "x")]])
+        self.assertEqual(self.scan("cat '$HOME/x'")[0], [["cat", "$HOME/x"]])
+        self.assertIsNone(self.scan("cat $HOMEX/x"))
+
+
+class T016_Targets(T016):
+    def test_ac2_1_each_row(self):
+        pairs = [("cp hook.sh .git/hooks/pre-commit", "cp hook.sh build/pre-commit"),
+                 ("cp -t .git/hooks hook.sh", "cp -t build hook.sh"), ("cp -t.git/hooks a", "cp -tbuild .git/config"),
+                 ("cp --target-directory=.git/hooks a", "cp --target-directory=build .git/config"),
+                 ("ln -sf /tmp/x .git/hooks/post-commit", "ln -sf .git/config build/post-commit"),
+                 ("install x .git/hooks/y", "install .git/config build/y"), ("install -d build/x .git/x", "install -d build/x build/y"),
+                 ("install -t .git/hooks x", "install -t build .git/config"),
+                 ("rsync -a x .git/", "rsync -a .git/ /tmp/backup/"),
+                 ("rsync -t x .git/", "rsync -t .git/config /tmp/y"),  # rsync: -t is --times; the last operand only
+                 ("mv .git/index /tmp/index", "mv build/a /tmp/a"), ("mv --target-directory=.git a", "mv -t build a"),
+                 ("rm -rf .git", "rm -rf build"), ("rmdir .git/refs/x", "rmdir build/x"), ("unlink .git/HEAD", "unlink build/x"),
+                 ("touch .git/index.lock", "touch build/x"), ("mkdir .git/hooks/x", "mkdir build/x"),
+                 ("tee .git/info/exclude", "tee build/x"), ("truncate -s 0 .git/index", "truncate -s 0 build/x"),
+                 ("chmod +x .git/hooks/pre-push", "chmod +x build/x"), ("chown me:staff .git/HEAD", "chown me:staff build/x"),
+                 ("chgrp staff .git/HEAD", "chgrp staff build/x"),
+                 ("sed -i '' 's/a/b/' .git/config", "sed -i '' 's/a/b/' build/x"), ("sed -i.bak -e s/a/b/ .git/config", "sed -i.bak -e s/a/b/ build/x"),
+                 ("sed --in-place=.bak s/a/b/ .git/config", "sed --in-place s/.git/b/ build/x"),
+                 ("sed -i -f .git/script build/x .git/config", "sed -i -f .git/script build/x"),
+                 ("perl -pi -e 's/a/b/' .git/config", "perl -pi -e 's/a/b/' build/x"), ("perl -i.bak -pE s/a/b/ .git/config", "perl -i -pe s/a/b/ build/x"),
+                 ("perl -i script.pl .git/config", "perl -i .git/script.pl build/x"),
+                 ("dd if=x of=.git/HEAD", "dd if=.git/HEAD of=build/x")]
+        for bad, good in pairs:
+            with self.subTest(bad=bad):
+                self.refused(bad)
+            with self.subTest(good=good):
+                self.assertIsNone(self.w(good))
+
+    def test_ac2_2_non_path_words(self):
+        for line in ["chmod +x scripts/run.sh", "chmod 755 build/tool", "truncate -s 0 build/out.log", "chown me:staff a.py"]:
+            with self.subTest(line=line):
+                self.assertIsNone(self.w(line))
+
+    def test_ac2_3_assignments_and_paths(self):
+        self.refused("LC_ALL=C sed -i '' s/a/b/ .git/config", ".git/config")
+        self.refused("/bin/rm -rf .git", ".git")
+        self.refused("RM -rf .git", ".git")
+
+    def test_ac2_4_reads(self):
+        for line in ["sed s/a/b/ .git/config", "sed -n 1p .git/config", "perl -pe 's/a/b/' .git/config", "env rm -rf .git",
+                     "sudo rm -rf .git", "xargs rm -rf .git", "command rm .git/x", "find .git -delete"]:
+            with self.subTest(line=line):
+                self.assertIsNone(self.w(line))
+
+    def test_ac3_1_names_that_are_not_git(self):
+        for target in [".gitignore", ".github/x", ".gitkeep", ".git-blame-ignore-revs", "x.git.bak",
+                       os.path.join(self.spaces, "sp2", "evidence", "t-x", "a.md"), "~/.config/herdr-pa/spaces/sp2/evidence/t-x/b.md"]:
+            with self.subTest(target=target):
+                self.assertIsNone(self.w("echo x > " + target))
+
+    def test_ac3_2_case_links_and_the_folder(self):
+        self.refused("echo x > .GIT/config", ".GIT/config")
+        self.refused("echo x > lnk/config", "lnk/config")
+        self.refused("rm -rf .git", ".git")
+        self.refused("touch " + os.path.join(self.wt, ".git"), os.path.join(self.wt, ".git"))
+
+    def test_ac3_3_state(self):
+        self.assertIsNone(self.w("echo x > " + T016_EV + "/x.md"))
+        for target in ["~/.config/herdr-pa/spaces/sp1/ledger.json", "~/.config/herdr-pa/spaces/sp1/decisions/d-1.json",
+                       "~/.config/herdr-pa/spaces/sp1/evidence", "~/.config/herdr-pa/tools/pa_guard.py"]:
+            with self.subTest(target=target):
+                self.refused("echo x > " + target, target)
+
+
+class T016_Folders(T016):
+    def test_ac4_1_cd_then_write(self):
+        self.assertIsNone(self.w("cd <wt> && hooks/tests.sh affected > build.log 2>&1"))
+        self.refused("cd .git && echo x > config", "config")
+        self.refused("cd " + os.path.join(self.wt, ".git") + " && echo x > config", "config")
+
+    def test_ac4_2_the_set_only_grows(self):
+        self.refused("cd <wt> || exit 1; echo x > .git/HEAD", ".git/HEAD")
+        self.refused("cd /tmp; cd " + self.wt + " && echo x > .git/HEAD", ".git/HEAD")
+        self.refused("cd .git || true; echo x > config", "config")
+        self.refused("cd sub && cd ../.git && echo x > config", "config")
+
+    def test_ac4_3_folder_unknown(self):
+        self.assertEqual(self.w("cd - && echo x > notes.txt"), FOLDER_UNKNOWN.format(word="cd -", target="notes.txt"))
+        self.assertIsNone(self.w("cd - && echo x > /tmp/n"))
+        self.refused("cd - && echo x > " + os.path.join(self.wt, ".git", "x"))
+
+    def test_ac4_4_source_keeps_the_folder(self):
+        self.assertIsNone(self.w("source .venv/bin/activate && pytest > t.log"))
+        self.assertIsNone(self.w(". .venv/bin/activate && pytest > t.log"))
+
+    def test_r4_unknown(self):
+        for first in ["popd", "cd a b", "cd ~x", "builtin cd x", "command pushd x", "pushd", "cd -P -"]:
+            with self.subTest(first=first):
+                message = self.w(first + " && echo x > n.txt")
+                self.assertIsNotNone(message)
+                self.assertTrue(message.startswith("Refused by the Project Agent's guard: after "), message)
+                self.assertIn("the write to n.txt cannot be checked", message)
+                self.assertIsNone(self.w(first + " && echo x > /tmp/n"))
+        with mock.patch.dict(os.environ, {"CDPATH": "/somewhere"}):
+            self.assertEqual(self.w("cd sub && echo x > n.txt"), FOLDER_UNKNOWN.format(word="cd sub", target="n.txt"))
+            self.assertIsNone(self.w("cd ./sub && echo x > n.txt"))
+            self.assertIsNone(self.w("cd sub && echo x > /tmp/n"))
+        self.assertIsNone(self.w("cd sub && echo x > n.txt"))
+
+    def test_r4_cd_alone(self):
+        self.refused("cd && echo x > .gitconfig", ".gitconfig")
+        self.refused("cd ~ && echo x > .gitconfig", ".gitconfig")
+        self.refused("cd ~/.config/herdr-pa && echo x > core/worker.md", "core/worker.md")
+        self.refused("pushd .git && echo x > config", "config")
+
+
+class T016_Reads(T016):
+    def test_ac5_1(self):
+        for line in T016_ALLOWED[16:24]:  # rows 17-24
+            with self.subTest(line=line):
+                self.assertIsNone(self.w(line))
+
+
+class T016_Allowed(T016):
+    def test_section4(self):
+        self.assertEqual(len(T016_ALLOWED), 49)
+        for row, line in enumerate(T016_ALLOWED, 1):
+            with self.subTest(row=row, line=line):
+                self.assertIsNone(self.w(line))
+
+    def test_git_rows_check_command(self):  # AC7.2, passes today
+        for line in T016_ALLOWED[11:16]:  # rows 12-16
+            with self.subTest(line=line):
+                self.assertIsNone(self.at(line))
+
+
+class T016_Refused(T016):
+    def test_section5(self):
+        for line, target in T016_REFUSED:
+            with self.subTest(line=line):
+                self.refused(line, target)
+        self.assertEqual(self.w("cd - && echo x > notes.txt"), FOLDER_UNKNOWN.format(word="cd -", target="notes.txt"))
+
+
+class T016_Messages(T016):
+    def test_ac6_1(self):
+        self.assertEqual(guard.WRITE, WRITE)
+        message = self.w("echo x > .git/config")
+        self.assertEqual(message, WRITE.format(target=".git/config"))
+        for words in ["git commands", "evidence folder", "hc send", "no override"]:
+            self.assertIn(words, message)
+        long_target = ".git/" + "x" * 400
+        self.assertEqual(self.w("touch " + long_target), WRITE.format(target=guard.shown(long_target)))
+
+    def test_ac6_2(self):
+        self.assertEqual(guard.FOLDER_UNKNOWN, FOLDER_UNKNOWN)
+        message = self.w("cd - && echo x > notes.txt")
+        self.assertIn("cd -", message)
+        self.assertIn("notes.txt", message)
+
+    def test_r8_docs(self):
+        doc = guard.__doc__
+        self.assertIn("check_writes", doc)
+        self.assertNotIn("is not checked", doc)
+        self.assertIn("plainly writes", doc)
+
+
+class T016_Hook(unittest.TestCase):
+    """AC7.1: pa-hook guard calls check_writes for Bash, after check_command (in-process, a copy of the tools)."""
+
+    @classmethod
+    def setUpClass(cls):
+        HookGuard.setUpClass.__func__(cls)
+        os.makedirs(os.path.join(cls.wt, ".git"), exist_ok=True)
+
+    def test_ac7_1(self):
+        folder = tempfile.mkdtemp(dir=TMP)
+        shutil.copy(os.path.join(TOOLS, "pa_guard.py"), os.path.join(folder, "pa_guard.py"))
+        hooks = load_hooks_copy(folder)
+        code, err = call_hook(hooks, hooks.hook_guard, "Bash", {"command": "echo x > .git/config"}, self.wt)
+        self.assertEqual((code, err.strip()), (2, WRITE.format(target=".git/config")))
+        self.assertEqual(call_hook(hooks, hooks.hook_guard, "Bash", {"command": "echo x > a.txt"}, self.wt)[0], 0)
+        code, err = call_hook(hooks, hooks.hook_guard, "Bash", {"command": "git push origin t-x"}, self.wt)
+        self.assertEqual(code, 2)
+        self.assertIn(OFF_TABLE.format("git push origin t-x"), err)  # check_command first, its own message
+        self.assertNotIn("this command writes to", err)
+
+
 def tearDownModule():
     shutil.rmtree(TMP, ignore_errors=True)
 
