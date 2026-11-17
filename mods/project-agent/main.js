@@ -27,6 +27,7 @@ const PROFILE_RETRY = 60000; // while hidden: a profile read that failed is trie
 // A part of loadSpace's result that did not answer (its `unknown`), and the fields it fills.
 const PARTS = { ledger: ["ledger"], profile: ["profile", "profileDir"], schedule: ["schedule"], request: ["request"] };
 const NOTE = "Note for the Project Agent (optional)";
+const ARM_WAIT = 10000; // an armed Delete (its first click) not clicked again within this is disarmed by itself
 const noteKey = (spaceId, cardId) => `${spaceId}\0${cardId}`; // note fields are per space: two spaces can have the same card id
 
 // Whether this panel is on screen: a block showing it in the shown layout with no hidden node above
@@ -78,12 +79,13 @@ export default class ProjectAgent extends View {
     this.profiles = {}; // space id -> { at, busy, done, profile }: its profile, read once per session (a full load's counts)
     this.asleep = false; // not on screen: only the open-card count is read
     this.view = null; // "decisions" | "tasks" | "rules"; null: decisions when any is open
+    this.viewShown = null; // the view the last render drew (this.view, or the one picked for null)
     this.rules = new RulesPane();
     this.open = new Set(); // expanded task ids
     this.folded = new Set(["done", "parked"]); // task sections folded away (finished work starts folded)
     this.older = false; // answered cards shown
     this.output = {}; // `${task}:${label}` -> { text, code, running }
-    this.armedTask = null; // task id armed for delete (second click deletes)
+    this.armed = null; // { task, space, at }: the task whose Delete was clicked once (a second click deletes); see armedTask()
     this.taskError = {}; // task id -> why the last change failed
     this.notes = {}; // noteKey(space id, card id) -> InputState (the optional note)
     this.choice = {}; // card id -> the option picked, not yet submitted
@@ -115,7 +117,7 @@ export default class ProjectAgent extends View {
     if (props()?.timer) return; // the always-on copy only keeps time; it shows nothing
     this.reload(cx);
     cx.timer.every(10000, (cx) => { this.reload(cx); this.resend(cx); });
-    cx.timer.every(1000, (cx) => this.wake(cx)); // shown again (render may not run for a hidden copy)
+    cx.timer.every(1000, (cx) => { this.wake(cx); if (this.armed && !this.armedTask(this.space)) cx.notify(); }); // shown again (render may not run for a hidden copy); an armed Delete timed out
     cx.spawn(async (cx) => {
       for (;;) {
         try { await watchFolder(`${paHome(null)}/spaces`); } catch { return; }
@@ -223,7 +225,7 @@ export default class ProjectAgent extends View {
   reload(cx) {
     const space = spaces().find((s) => s.active);
     if (!space) { this.data = null; this.space = null; cx.notify(); return; }
-    if (space.id !== this.space) this.adopt(space, cx);
+    if (space.id !== this.space) { this.disarm(); this.adopt(space, cx); }
     if (!onScreen()) { this.asleep = true; this.hiddenRead(cx, space); return; }
     this.asleep = false;
     if (this.inFlight(space.id)) { this.again[space.id] = true; return; }
@@ -399,7 +401,7 @@ export default class ProjectAgent extends View {
 
   // From a task to its open decision card.
   showCard(id, cx) {
-    this.view = "decisions"; this.spotlight = id;
+    this.view = "decisions"; this.spotlight = id; this.disarm();
     const at = this.cards.filter((c) => !c.card || c.card.status === "open").findIndex((c) => c.id === id);
     if (at >= 0) this.cardScroll.scroll_to_item(at);
     cx.notify();
@@ -519,7 +521,7 @@ export default class ProjectAgent extends View {
   // The person's own change to a task: done, park, reopen, delete (to the trash). Runs pa-task on
   // the space's machine; it edits the ledger under a lock and tells the Project Agent.
   changeTask(space, task, action, cx) {
-    delete this.taskError[task.id]; this.armedTask = null;
+    delete this.taskError[task.id]; this.disarm();
     cx.notify();
     cx.spawn(async (cx) => {
       try {
@@ -529,6 +531,18 @@ export default class ProjectAgent extends View {
       this.reload(cx); cx.notify();
     });
   }
+
+  // The task id whose Delete is armed, if the arm still holds: same space, Tasks view, the task
+  // expanded, under ARM_WAIT old (the view the last render drew: a new open card can switch it). One that no longer holds is dropped (it never comes back).
+  armedTask(spaceId) {
+    const a = this.armed;
+    if (!a) return null;
+    if (a.space === spaceId && this.viewShown === "tasks" && this.open.has(a.task) && Date.now() - a.at < ARM_WAIT) return a.task;
+    this.armed = null;
+    return null;
+  }
+
+  disarm() { this.armed = null; }
 
   // Opens a link on this computer (wherever the space lives).
   openLink(url, cx) {
@@ -597,11 +611,13 @@ export default class ProjectAgent extends View {
   }
 
   task(t, task, space) {
-    const open = this.open.has(task.id);
+    const open = this.open.has(task.id), armed = open && this.armedTask(space.id) === task.id;
+    // A press on the armed Delete or its Cancel stops here: a press anywhere else in the panel disarms (render's root).
+    const keep = (el) => el.on_mouse_down("left", (_e, cx) => cx.stop_propagation());
     const tone = { "needs-decision": t.blocked, review: t.done, "in-progress": t.working, investigating: t.working, queued: t.muted, parked: t.dim, done: t.dim }[task.state] ?? t.muted;
     return v_flex().id(`task-${task.id}`).flex_none().rounded(7).border(1).border_color(t.border).bg(t.surface)
       .child(h_flex().id(`task-head-${task.id}`).h(32).px(9).gap(7).items_center().cursor_pointer().hover((s) => s.bg(t.hover))
-        .on_click((_e, cx) => { open ? this.open.delete(task.id) : this.open.add(task.id); cx.notify(); })
+        .on_click((_e, cx) => { if (open) { this.open.delete(task.id); if (this.armed?.task === task.id) this.disarm(); } else this.open.add(task.id); cx.notify(); })
         .child(div().flex_none().text_size(11).text_color(t.dim).child(open ? "▾" : "▸"))
         .child(div().flex_none().text_size(11.5).text_color(t.dim).child(String(task.id ?? "?")))
         .child(div().flex_1().min_w(0).truncate().text_size(12.5).text_color(t.foreground).child(String(task.title ?? "(untitled)")))
@@ -642,10 +658,12 @@ export default class ProjectAgent extends View {
           .when(task.state === "done" || task.state === "parked", (e) => e.child(this.button(t, `reopen-${task.id}`, "Reopen", (_e, cx) => this.changeTask(space, task, "reopen", cx))))
           .when(task.state !== "done", (e) => e.child(this.button(t, `done-${task.id}`, "Mark done", (_e, cx) => this.changeTask(space, task, "done", cx))))
           .when(task.state !== "done" && task.state !== "parked", (e) => e.child(this.button(t, `park-${task.id}`, "Park", (_e, cx) => this.changeTask(space, task, "park", cx))))
-          .child(div().id(`delete-${task.id}`).flex_none().px(8).h(24).flex().items_center().rounded(6).border(1).border_color(this.armedTask === task.id ? t.blocked : t.border)
-            .text_size(11.5).text_color(this.armedTask === task.id ? t.blocked : t.muted).cursor_pointer().hover((s) => s.bg(t.hover))
-            .on_click((_e, cx) => { if (this.armedTask === task.id) this.changeTask(space, task, "delete", cx); else { this.armedTask = task.id; cx.notify(); } })
-            .child(this.armedTask === task.id ? "Delete the task, its evidence and its cards?" : "Delete…")))
+          // Two clicks on the same button: the first arms it (ARM_WAIT; Cancel, a press elsewhere, collapsing, another view or space disarm).
+          .child(keep(div().id(`delete-${task.id}`)).flex_none().px(8).h(24).flex().items_center().rounded(6).border(1).border_color(armed ? t.blocked : t.border)
+            .text_size(11.5).text_color(armed ? t.blocked : t.muted).cursor_pointer().hover((s) => s.bg(t.hover))
+            .on_click((_e, cx) => { cx.stop_propagation(); if (armed) this.changeTask(space, task, "delete", cx); else { this.armed = { task: task.id, space: space.id, at: Date.now() }; cx.notify(); } })
+            .child(armed ? "Delete the task, its evidence and its cards?" : "Delete…"))
+          .when(armed, (e) => e.child(keep(this.button(t, `delete-cancel-${task.id}`, "Cancel", (_e, cx) => { cx.stop_propagation(); this.disarm(); cx.notify(); })))))
         .when(Boolean(this.taskError[task.id]), (e) => e.child(div().text_size(11.5).text_color(t.blocked).child(this.taskError[task.id])))));
   }
 
@@ -707,7 +725,9 @@ export default class ProjectAgent extends View {
     const space = spaces().find((s) => s.active);
     this.wake(cx);
     if (space?.id !== this.space && space && !this.inFlight(space.id)) this.reload(cx);
-    const root = v_flex().id("project-agent").size_full().min_h(0).bg(t.chrome).text_color(t.foreground);
+    // A press anywhere in the panel but the armed Delete and its Cancel (they stop it) disarms the Delete.
+    const root = v_flex().id("project-agent").size_full().min_h(0).bg(t.chrome).text_color(t.foreground)
+      .on_mouse_down("left", (_e, cx) => { if (this.armed) { this.disarm(); cx.notify(); } });
     const head = (title, right) => h_flex().h(34).px(12).gap(8).flex_none().items_center().border_b(1).border_color(t.border)
       .child(div().flex_1().min_w(0).truncate().text_size(13).font_semibold().child(title)).when(Boolean(right), (el) => el.child(right));
     const note = (text) => div().p(12).text_size(12).text_color(t.dim).child(text);
@@ -772,14 +792,15 @@ export default class ProjectAgent extends View {
     // Another mod asked to show a task (shared "project-agent.show": { space, task, at }): once.
     const ask = shared("project-agent.show");
     if (ask && ask.space === space.id && ask.at !== this.shownAt) {
-      this.shownAt = ask.at; this.view = "tasks"; this.open.add(ask.task);
+      this.shownAt = ask.at; this.view = "tasks"; this.open.add(ask.task); this.disarm();
       const state = tasks.find((x) => x.id === ask.task)?.state;
       if (state) this.folded.delete(state);
     }
     const view = this.view ?? (openCards.length || !tasks.length ? "decisions" : "tasks");
+    this.viewShown = view;
     const tab = (id, label) => div().id(`view-${id}`).px(9).h(24).flex().items_center().rounded(6).text_size(12).cursor_pointer()
       .bg(view === id ? t.selected : t.chrome).text_color(view === id ? t.foreground : t.muted).hover((s) => s.bg(t.hover))
-      .on_click((_e, cx) => { this.view = id; cx.notify(); }).child(label);
+      .on_click((_e, cx) => { this.view = id; this.disarm(); cx.notify(); }).child(label);
     const unsent = this.unsent.filter((u) => u.spaceId === space.id);
     return root
       .child(head(`PA: ${a.name ?? space.name}`, h_flex().flex_none().gap(6).items_center()

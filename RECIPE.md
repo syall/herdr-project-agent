@@ -53,8 +53,11 @@ A new space opens with a 600 x 440 dialog: a Project Agent card (`Set up for <fo
 - **Tasks:** one section per state (finished ones start folded), newest first. An expanded task
   shows its goal, tier, a chip per worker (a live one opens in the Agents view), a button per
   open decision, a button per artifact link, Evidence (only when there is some), the profile's
-  declared actions, and your own controls: Reopen, Mark done, Park, Delete… (two clicks; the
-  task, its evidence and its cards go to a trash folder).
+  declared actions, and your own controls: Reopen, Mark done, Park, Delete… (two clicks on the
+  same button; the task, its evidence and its cards go to a trash folder). After the first click
+  it asks "Delete the task, its evidence and its cards?" with a Cancel beside it; Cancel, a click
+  anywhere else in the panel, collapsing the task, another view or space, or 10 s without a
+  second click put it back to Delete….
 - **Finished workers are closed by the agent.** The agent starts one fresh worker per job, named
   for the job (`t-010-tests`, `t-010-fix`), and closes it in the pass where it reads its report,
   with `pa-worker close`. That command refuses a worker that is working or blocked, has no
