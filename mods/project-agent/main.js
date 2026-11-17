@@ -91,7 +91,9 @@ export default class ProjectAgent extends View {
     this.viewShown = null; // the view the last render drew (this.view, or the one picked for null)
     this.rules = new RulesPane();
     this.push = new PushCards(); // push cards: the last pa-push-main check and run of each (push.js)
-    this.costs = new CostsPane(); // the Costs view: each space's last summary and billed comparison (costs.js)
+    // The Costs view: each space's last summary and billed comparison (costs.js); it reads and runs only while
+    // this check holds (asked live: `asleep` is updated only by the next reload).
+    this.costs = new CostsPane((id) => this.view === "costs" && spaces().find((s) => s.active)?.id === id && onScreen());
     this.costsMarked = {}; // space id -> when this copy last stamped "project-agent.costsShown"
     this.open = new Set(); // expanded task ids
     this.folded = new Set(["done", "parked"]); // task sections folded away (finished work starts folded)

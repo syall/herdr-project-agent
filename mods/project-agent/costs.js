@@ -6,6 +6,8 @@
 //           only while this view is shown in a shown copy (main.js reload(), after its hidden return),
 //           at most once per COSTS_EVERY per space, one in flight per space. The billed comparison:
 //           the local `pa-costs billed compare --json`, at most once per BILLING_EVERY while shown.
+//           `shown(spaceId)` (main.js) is asked live before each read and compare: a run or read that ends
+//           after the view was left starts nothing; the space is marked stale and read at once when shown.
 //   runs:   on a click only: Refresh (`pa-costs collect`), Reconstruct (`pa-costs reconstruct`) on the
 //           space's machine, Turn off (`pa-costs billed disable`, here). Nothing else writes (R12).
 
@@ -81,7 +83,8 @@ function tabFigure(s) {
 }
 
 export class CostsPane {
-  constructor() {
+  constructor(shown = () => true) {
+    this.shown = shown; // (space id) -> this view is on screen for that space now (main.js)
     this.spaces = new Map(); // space id -> its state (most recently shown last; at most CACHE_MAX)
     this.seq = 0;
   }
@@ -89,7 +92,7 @@ export class CostsPane {
   of(id) {
     let st = this.spaces.get(id);
     if (st) { this.spaces.delete(id); this.spaces.set(id, st); return st; }
-    st = { summary: null, readAt: 0, error: null, timedOut: false, missing: null, readFailed: null, busy: false, at: 0, seq: 0,
+    st = { summary: null, readAt: 0, error: null, timedOut: false, missing: null, readFailed: null, busy: false, at: 0, seq: 0, stale: false,
       run: null, billing: { data: null, at: 0, busy: false, error: null }, open: {}, dim: "kind", moreDays: false, problemsOpen: false };
     this.spaces.set(id, st);
     while (this.spaces.size > CACHE_MAX) this.spaces.delete(this.spaces.keys().next().value);
@@ -99,13 +102,15 @@ export class CostsPane {
 
   tabLabel(spaceId) { const f = tabFigure(this.peek(spaceId)?.summary); return f ? `Costs · ${f}` : "Costs"; }
 
-  // A read of the space's summary, unless one is in flight or one started under COSTS_EVERY ago (force: a click).
+  // A read of the space's summary, unless one is in flight or one started under COSTS_EVERY ago (force: a click,
+  // or the space was marked stale). Not shown now: nothing, the space is marked stale (read at once when shown).
   want(space, cx, force = false) {
     const st = this.of(space.id), now = Date.now();
-    if (st.busy && now - st.at < READ_STALE) return;
-    if (!force && st.at && now - st.at < COSTS_EVERY) return;
+    if (!this.shown(space.id)) { st.stale = true; return; }
+    if (st.busy && now - st.at < READ_STALE) { if (force) st.stale = true; return; }
+    if (!force && !st.stale && st.at && now - st.at < COSTS_EVERY) return;
     const mine = ++this.seq;
-    st.busy = true; st.at = now; st.seq = mine;
+    st.busy = true; st.at = now; st.seq = mine; st.stale = false;
     cx.spawn(async (cx) => {
       let r;
       try { r = await loadCosts(space, sleeper(cx)); } catch (e) { r = { failed: String(e?.message ?? e) }; }
@@ -140,6 +145,7 @@ export class CostsPane {
   // remote's `report --account-wide` and the compare again with it ("all spaces here" are that machine's spaces).
   wantBilling(space, cx, force = false) {
     const b = this.of(space.id).billing, now = Date.now(), s = this.of(space.id).summary;
+    if (!this.shown(space.id)) { if (force) b.at = 0; return; } // not shown: none; a forced one runs with the next shown read
     if (b.busy || (!force && b.at && now - b.at < BILLING_EVERY) || !s) return;
     b.busy = true; b.at = now;
     cx.spawn(async (cx) => {
