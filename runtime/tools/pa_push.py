@@ -227,6 +227,11 @@ def base(path, hooks):
 AGENT_VARS = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CODEX_SANDBOX", "CODEX_HOME_SESSION")
 AGENT_PREFIXES = ("CODEX_", "CLAUDE_CODE_")
 AGENT_NAMES = ("claude", "codex")
+# d-069: check and run belong to the panel, so one of these must be among the caller's ancestors. The only place the
+# names live: the Herdr app (Herdr.app/Contents/MacOS/Herdr on macOS) and its core (herdr-core, also inside
+# "Herdr Core.app"), compared with the basename of each ancestor's command, lowercased. No variable or flag adds to
+# them (plan 5: nothing turns C0 off); a name that does not match refuses, it never lets a caller through.
+PANEL_NAMES = ("herdr", "herdr-core")
 DEPTH = 40
 PS = "/bin/ps" if os.path.exists("/bin/ps") else "ps"
 
@@ -281,7 +286,9 @@ def ancestors(pid=None, table=None):
 
 def caller_refusal(env, ancs, strict=True):
     """Why this caller is not the person (C0), or None. env: the environment; ancs: ancestors() (None when ps
-    failed: refused). strict adds C0.3, a Herdr terminal (pa-push-main run belongs to the panel)."""
+    failed: refused). strict (check and run, the panel's) adds C0.3, a Herdr terminal, and C0.4, the Herdr app or
+    its core (PANEL_NAMES) must be among the ancestors. Not strict (pa-push-allow, typed in the person's own
+    terminal): no agent among the ancestors, and not an orphan."""
     for k in AGENT_VARS:
         if k in env:
             return "{} is set: an agent's shell".format(k)
@@ -290,7 +297,7 @@ def caller_refusal(env, ancs, strict=True):
             return "{} is set: an agent's shell".format(k)
     if ancs is None:
         return "the process tree could not be read (ps failed), so the caller is unknown"
-    if all(a.get("pid") == 1 for a in ancs):
+    if not strict and all(a.get("pid") == 1 for a in ancs):
         return "the caller is unknown (an orphaned process): its only ancestor is the system's first process"
     for a in ancs:
         name = os.path.basename(str(a.get("comm") or "")).lower()
@@ -302,6 +309,9 @@ def caller_refusal(env, ancs, strict=True):
                 next(n for n in AGENT_NAMES if n in words), a.get("pid"))
     if strict and "HC_TERMINAL_ID" in env:
         return "HC_TERMINAL_ID is set: a Herdr terminal; pa-push-main run belongs to the panel"
+    if strict and not any(os.path.basename(str(a.get("comm") or "")).lower() in PANEL_NAMES for a in ancs):
+        return "the caller is not the panel: no Herdr app or core process ({}) among its ancestors ({})".format(
+            ", ".join(PANEL_NAMES), ", ".join(ancestor_names(ancs)) or "none")
     return None
 
 
@@ -461,6 +471,9 @@ class Session:
     def gate_git(self, path, *args, timeout=None):
         """pa_hooks.git()'s signature and stripped result, run as self.git runs (hooks and fsmonitor off, no
         GIT_*): the runner the gate evaluation is given, so it runs nothing the task worktree names."""
+        args = list(args)
+        if "status" in args:  # never look inside a nested repository (its own settings could name a program)
+            args.insert(args.index("status") + 1, "--ignore-submodules=all")
         code, out, err = self.git(path, args, timeout or pa_hooks.GIT_TIMEOUT)
         return code, out.strip(), err.strip()
 
@@ -477,8 +490,10 @@ class Session:
 
 
 def tracked_changes(s, path):
-    """Lines of `git status --porcelain --untracked-files=no`, without .claude/ (as the gate counts), or None."""
-    code, out, _err = s.git(path, ["--no-optional-locks", "status", "--porcelain", "--untracked-files=no"])
+    """Lines of `git status --porcelain --untracked-files=no`, without .claude/ (as the gate counts), or None. It
+    never looks inside a nested repository (--ignore-submodules=all), whose own settings could name a program."""
+    code, out, _err = s.git(path, ["--no-optional-locks", "status", "--porcelain", "--untracked-files=no",
+                                   "--ignore-submodules=all"])
     if code:
         return None
     return [l for l in out.splitlines() if l.strip() and not l[3:].strip('"').startswith(".claude/")]
@@ -500,8 +515,9 @@ def task_places(worktree):
 def task_settings_refusal(s, worktree):
     """C8a, before the gate is evaluated: the git settings of every repository in the task's worktree that the gate
     or live_pin runs git status in, read as C7b reads the main checkout's (the local scope, and the worktree scope
-    when extensions.worktreeConfig is on). The worktree is the agent's, so a key that can run a program refuses.
-    The refusal message, or None."""
+    when extensions.worktreeConfig is on). The worktree is the agent's, so a key that can run a program refuses, and
+    so does a nested repository entry (a submodule, staged or committed): git would read that repository's own
+    settings. The refusal message, or None."""
     for place in task_places(worktree):
         code, top, _ = s.git(place, ["rev-parse", "--show-toplevel"])
         if code or os.path.realpath(top.strip()) != place:
@@ -516,6 +532,26 @@ def task_settings_refusal(s, worktree):
                 if RISKY.match(key):
                     return ("the task's worktree {} has git setting {} ({}), which can run a program or redirect git; "
                             "remove it, run pa-gate again and ask for a new card").format(place, key, scope)
+        why = nested_repository(s, place)
+        if why:
+            return why
+    return None
+
+
+def nested_repository(s, place):
+    """The refusal for a nested repository entry (mode 160000, a submodule) in place's index, or None."""
+    code, out, err = s.git(place, ["ls-files", "--stage", "-z"])
+    if code:
+        return "could not list the entries of the task's worktree {} ({}); nothing was pushed".format(place, err.strip()[-200:])
+    for record in out.split("\0"):
+        meta, _tab, name = record.partition("\t")
+        if not meta.startswith("160000 "):
+            continue
+        code, tree, _ = s.git(place, ["--literal-pathspecs", "ls-tree", "-z", "HEAD", "--", name])
+        how = "committed" if not code and tree.startswith("160000 ") else "staged"
+        return ("the task's worktree {} holds a nested repository {} ({}, a submodule entry); git would look inside it "
+                "with that repository's own settings; remove it, run pa-gate again and ask for a new card").format(
+                    place, pa_hooks.cut(pa_hooks.clean(name), 200), how)
     return None
 
 
@@ -722,36 +758,46 @@ def gather(s, directory, space, push, facts, plan=False):
 
 
 REBASED = re.compile(r"^rebase\b.*\(finish\): refs/heads/(\S+) onto ([0-9a-f]{40}|[0-9a-f]{64})$")
+# Reflog entries of the task branch. A move onto main: where main stood then is a base point. The branch's own move:
+# its own commit (or a merge into it), passed over. Any other entry newer than the newest base point: unknown.
+MOVED_ONTO = re.compile(r"^(branch: Created from |reset: moving to |branch: Reset to |(merge|pull)\b[^:]*: Fast-forward$)")
+OWN_MOVE = re.compile(r"^(commit( \([a-z ]+\))?: |(merge|pull)\b[^:]*: Merge made |cherry-pick: |revert: |branch: renamed )")
 
 
 def task_base(s, path, task_branch):
-    """Where the task branch started, from its reflog in path: the newest `rebase (finish): refs/heads/<b> onto
-    <sha>`, else the oldest entry when it is `branch: Created from ...`. None when the reflog does not say."""
+    """(base, points) from the task branch's reflog in path. points: where local main stood each time the branch
+    was put onto it (created from it, reset onto it, fast-forwarded to it: the entry's commit; rebased onto it: the
+    `onto` commit); base: the newest of them, where the branch's own line starts. (None, []) when the reflog does
+    not say: no base point, or an entry newer than the base that is neither a move onto main nor the branch's own."""
     if branch_problem(task_branch):
-        return None
+        return None, []
     code, out, _ = s.git(path, ["reflog", "show", "--format=%H%x1f%gs", "refs/heads/" + task_branch, "--"])
     entries = [l.split("\x1f", 1) for l in out.splitlines() if "\x1f" in l] if not code else []
-    for _sha, subject in entries:
+    points = []
+    for sha, subject in entries:  # newest first
         m = REBASED.match(subject)
         if m and m.group(1) == task_branch:
-            return m.group(2)
-    if entries and entries[-1][1].startswith("branch: Created from ") and HEX.match(entries[-1][0]):
-        return entries[-1][0]
-    return None
+            points.append(m.group(2))
+        elif MOVED_ONTO.match(subject) and HEX.match(sha):
+            points.append(sha)
+        elif not points and not OWN_MOVE.match(subject):
+            return None, []
+    return (points[0], points) if points else (None, [])
 
 
 def commit_list(s, path, remote, commit, task_branch):
     """([{sha, subject, author, fromTask}] of remote..commit, newest first, at most COMMITS_MAX; the full count).
-    fromTask (spec 6.1) is true for a commit on the task branch's own first-parent line since the branch started
-    (task_base), false for any other (on local main before this task, or merged in); null for every commit when
-    where the branch started cannot be read."""
+    fromTask (spec 6.1) is true for a commit on the task branch's own first-parent line since it was last put onto
+    main (task_base) and not reachable from any point where main stood when the branch was put onto it; false for
+    any other (on local main before this task, or merged in); null for every commit when task_base cannot say."""
     code, out, _ = s.git(path, ["log", "-n", str(COMMITS_MAX), "--format=%H%x1f%s%x1f%an <%ae>", remote + ".." + commit])
     rows = [l.split("\x1f") for l in out.splitlines() if l.count("\x1f") == 2] if not code else []
     own = None
-    base = task_base(s, path, task_branch)
+    base, points = task_base(s, path, task_branch)
     if base and s.is_ancestor(path, base, commit):
         code, mine, _ = s.git(path, ["rev-list", "--first-parent", base + ".." + commit])
-        own = set(mine.split()) if not code else None
+        code2, outside, _ = s.git(path, ["rev-list", commit, "--not"] + points)
+        own = set(mine.split()) & set(outside.split()) if not code and not code2 else None
     code, count, _ = s.git(path, ["rev-list", "--count", remote + ".." + commit])
     commits = [{"sha": r[0], "subject": pa_hooks.cut(pa_hooks.clean(r[1]), 200), "author": pa_hooks.cut(pa_hooks.clean(r[2]), 120),
                 "fromTask": None if own is None else r[0] in own} for r in rows]
