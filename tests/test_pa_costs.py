@@ -1641,6 +1641,14 @@ class W_CloseAndGuard(CostsBase):
             self.assertEqual(self.guard(command)[0], 0, command)
 
 
+class I1_Install(unittest.TestCase):
+    def test_i1_install_links_pa_costs(self):
+        with open(os.path.join(HERE, "..", "install.sh")) as f:
+            text = f.read()
+        self.assertRegex(text, r'for n in pa-costs; do ln -sfn "\$PA/tools/pa_costs.py" "\$HOME/.local/bin/\$n"; done')
+        self.assertIn("chmod +x \"$PA\"/tools/*.py", text)  # pa_costs.py is made runnable with the others
+
+
 class ZZ_V1_Privacy(unittest.TestCase):
     """Run last: the canary of every fixture reached no file under costs/ or billing/ and no captured output."""
 
