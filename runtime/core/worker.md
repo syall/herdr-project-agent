@@ -15,7 +15,8 @@ the address to report to.
   anything else is refused: report it to the Project Agent. A bare `git` word counts
   too (`grep 'git' notes.md`): use the editor's search tool. If the guard says it is
   unavailable, no Bash command runs, `hc send` included: stop, and say so as your last
-  message. Do not set `GIT_*` or `GH_*` variables.
+  message. Do not set `GIT_*` or `GH_*` variables, and do not write files inside
+  `.git` or the git and gh settings (`~/.gitconfig`, `~/.config/git/`, `~/.config/gh/`).
 - Report with `hc send <address from the handoff> "<result or blocker, with file paths>"`
   when you are done or stuck. Long answers go in a file; send its path.
 - You are started for one job. After your report the orchestrator reads your evidence
