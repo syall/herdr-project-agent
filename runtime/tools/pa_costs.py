@@ -1021,6 +1021,40 @@ def first_last(path, program):
     return first, last, cwd
 
 
+def first_at_or_after(path, floor):
+    """The first line time of a session file at or after `floor` (epoch), read line by line; times only. None when
+    there is none. For a --continue / --fork-session file that may begin with copied old history (REVIEW L4)."""
+    try:
+        with open(path, "rb") as fh:
+            for raw_line in fh:
+                if b'"timestamp"' not in raw_line:
+                    continue
+                try:
+                    obj = json.loads(raw_line.decode("utf-8"))
+                except (ValueError, UnicodeDecodeError):
+                    continue
+                ts = obj.get("timestamp") if isinstance(obj, dict) else None
+                del obj
+                epoch = parse_ts(ts) if isinstance(ts, str) else None
+                if epoch is not None and epoch >= floor:
+                    return epoch
+    except OSError:
+        return None
+    return None
+
+
+def copied_start(path, at):
+    """The start of a file that a resumed or forked launch at `at` may have written with copied old history: its first
+    line time at or after at - 5 s, when that is within the launch window and the file was written since then."""
+    try:
+        if os.path.getmtime(path) < at - FORK_SLACK:
+            return None
+    except OSError:
+        return None
+    t = first_at_or_after(path, at - FORK_SLACK)
+    return t if t is not None and t <= at + 120 else None
+
+
 def codex_rollouts(days=None):
     """(path, session id) of Codex rollout files; only the given UTC days' folders when days is set."""
     root = os.path.join(CODEX_HOME, "sessions")
@@ -1087,16 +1121,29 @@ def bind_pending(ctx):
             if first is not None:
                 if program == "claude":
                     cwd = next((r.get("cwd") for r in recs if os.path.dirname(path).endswith(pa.claude_slug(r.get("cwd") or ""))), cwd)
-                cands.append((first, sid, cwd))
+                cands.append((first, sid, cwd, path))
         cands.sort()
-        options = {}
+        options, copied = {}, {}
         for r in recs:
             at = parse_ts(r.get("at") or "") or 0
             options[record_key(r)] = [c for c in cands if c[2] == r.get("cwd") and at - FORK_SLACK <= c[0] <= at + 120]
+            # A resumed or forked Claude launch may write a new file that begins with copied old history (old times):
+            # its start is its first line at or after the launch. Taken only when no file starts in the window.
+            late = []
+            if program == "claude" and (r.get("resumed") or r.get("fork")):
+                for c in cands:
+                    if c[2] == r.get("cwd") and c[0] < at - FORK_SLACK:
+                        t = copied_start(c[3], at)
+                        if t is not None:
+                            late.append((t, c[1], c[2], c[3]))
+            copied[record_key(r)] = sorted(late)
         used = set()
         for r in recs:
             key = record_key(r)
             free = [c for c in options[key] if c[1] not in used]
+            late = not free
+            if late:
+                free = [c for c in copied[key] if c[1] not in used]
             if not free:
                 if now - (parse_ts(r.get("at") or "") or now) > 3600:
                     ctx["pending"].append("{} session for {} not found".format(program, r.get("terminal") or "?"))
@@ -1105,7 +1152,8 @@ def bind_pending(ctx):
             used.add(pick[1])
             shared = len(options[key]) > 1 or any(pick in v for k, v in options.items() if k != key)
             events.append({"v": 1, "ev": "bind", "at": iso(now), "session": pick[1], "program": program, "for": key,
-                           "match": "launch-window", "confidence": "medium" if shared else "high"})
+                           "match": "launch-window-copied" if late else "launch-window",
+                           "confidence": "medium" if shared or late else "high"})
     if events:
         ctx["events"].extend(events)
         ctx["records"] = records + events
@@ -1166,7 +1214,8 @@ def reconstruct(directory, dry_run=False, now=None, quiet=False):
             cands[sid] = {"sid": sid, "path": path, "program": "codex", "cwd": None}
     # Launch records still waiting for their file (Codex, --continue): the collect binds those files, not this.
     bound_for = {r.get("for") for r in records if r.get("ev") == "bind" and r.get("for")}
-    waiting = [(r.get("program") or "claude", os.path.normpath(r["cwd"]), parse_ts(r.get("at") or "") or 0) for r in records
+    waiting = [(r.get("program") or "claude", os.path.normpath(r["cwd"]), parse_ts(r.get("at") or "") or 0,
+                bool(r.get("resumed") or r.get("fork"))) for r in records
                if r.get("ev") == "start" and not r.get("session") and r.get("bind") == "launch-window"
                and isinstance(r.get("cwd"), str) and record_key(r) not in bound_for]
     found = []
@@ -1180,8 +1229,10 @@ def reconstruct(directory, dry_run=False, now=None, quiet=False):
             c["cwd"] = os.path.normpath(cwd)
         if first is None or first < created - 60:
             continue
-        if any(p == c["program"] and w == os.path.normpath(c["cwd"] or "") and at - FORK_SLACK <= first <= at + 120
-               for p, w, at in waiting):
+        if any(p == c["program"] and w == os.path.normpath(c["cwd"] or "") and (
+                at - FORK_SLACK <= first <= at + 120
+                or (p == "claude" and again and first < at - FORK_SLACK and copied_start(c["path"], at) is not None))
+               for p, w, at, again in waiting):
             continue
         c.update(first=first, last=last or first)
         found.append(c)
