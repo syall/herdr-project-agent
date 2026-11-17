@@ -41,7 +41,11 @@ import pa  # noqa: E402
 
 
 def _load_guard():
-    """pa_guard.py from this file's own folder, found the same way when run through a symlink or loaded by a test."""
+    """pa_guard.py from this file's own folder, found the same way when run through a symlink or loaded by a test.
+
+    Loaded by hook_guard each time it is needed, not at import, so that a missing or broken pa_guard.py stops only
+    the guard (which then refuses the call) and the other hooks keep working.
+    """
     import importlib.util
     spec = importlib.util.spec_from_file_location("pa_guard", os.path.join(os.path.dirname(os.path.realpath(__file__)), "pa_guard.py"))
     module = importlib.util.module_from_spec(spec)
@@ -49,7 +53,9 @@ def _load_guard():
     return module
 
 
-pa_guard = _load_guard()
+# Card d-038 ("Block"): when the guard cannot load or its check fails, the call is refused, not let through.
+GUARD_UNAVAILABLE = ("Refused by the Project Agent's guard: guard unavailable ({}). Commands and edits cannot be checked, "
+                     "so they do not run. Stop and report this to the Project Agent; it repairs the guard. There is no override.")
 EDIT_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
 
 TASK_FILE = os.path.join(".claude", "pa-task.json")
@@ -234,7 +240,15 @@ def hook_test_lock(data, _args):
     return 0
 
 
-def hook_guard(data, _args):
+def hook_guard(data, args):
+    """The guard fails closed: anything that goes wrong in it refuses the call (block() exits through SystemExit)."""
+    try:
+        return _hook_guard(data, args)
+    except Exception as e:  # noqa: BLE001 - card d-038: every failure refuses
+        block(GUARD_UNAVAILABLE.format("{}: {}".format(type(e).__name__, e)[:200]))
+
+
+def _hook_guard(data, _args):
     record, agent, profile = hook_context(data)
     tool, tool_input = data.get("tool_name"), data.get("tool_input") or {}
     extra_commands = [(p, "a release tool ({} profile)".format(profile.get("name"))) for p in (profile or {}).get("releaseTools", [])]
@@ -253,6 +267,7 @@ def hook_guard(data, _args):
             if branch in mains:
                 block("Blocked by the Project Agent safety hook: a push from the main branch ({}). {}".format(branch, ROUTE))
         # After the refusals above (they are unchanged): git, gh and hc only as the allowlist allows.
+        pa_guard = _load_guard()
         refusal = pa_guard.check_command(command, pa_address=(agent or {}).get("terminal"),
                                          own_address=os.environ.get("HC_TERMINAL_ID"),
                                          extra_rows=lambda: pa_guard.profile_rows(profile), cwd=data.get("cwd"))
@@ -264,7 +279,7 @@ def hook_guard(data, _args):
             if path and re.search(pattern, path):
                 block("Blocked by the Project Agent safety hook: {} ({}). {}".format(what, path, ROUTE))
         if tool in EDIT_TOOLS:
-            refusal = pa_guard.check_edit(path, os.path.join(pa.ROOT, "spaces"), cwd=data.get("cwd"))
+            refusal = _load_guard().check_edit(path, os.path.join(pa.ROOT, "spaces"), cwd=data.get("cwd"), home=pa.ROOT)
             if refusal:
                 block(refusal)
     return 0

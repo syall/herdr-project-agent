@@ -31,7 +31,14 @@ SHOWN = 300  # longest command or path quoted back in a message
 # ---- R1: the plain form --------------------------------------------------------------------------
 
 def split_plain(line):
-    """The simple commands of a plain line, as lists of words (quotes removed); None when the line is not plain.
+    """The simple commands of a plain line, as lists of words (quotes removed); None when the line is not plain."""
+    scanned = split_plain_ops(line)
+    return None if scanned is None else scanned[0]
+
+
+def split_plain_ops(line):
+    """(commands, operators) of a plain line: operators[i] is the ; && || | after commands[i] (None after the last).
+    None when the line is not plain.
 
     Plain: simple commands joined only by ; && || |, each a program word and literal words, quoted or not.
     Not plain: $ and backticks (outside single quotes), < >, a lone &, |&, ( ) { } (except the @{...} of
@@ -39,7 +46,7 @@ def split_plain(line):
     break or line continuation, an unterminated quote, an empty command between operators.
     """
     s = line.strip()
-    commands, words, word = [], [], []
+    commands, ops, words, word = [], [], [], []
     has_word, pending_op = False, None
     i, n = 0, len(s)
     while i < n:
@@ -98,6 +105,7 @@ def split_plain(line):
             if not words:
                 return None
             commands.append(words)
+            ops.append(op)
             words, pending_op = [], op
         elif c == "{" and word and word[-1].endswith("@"):
             m = re.match(r"\{[^{}\s,'\"$`\\;&|<>()*?\[]*\}", s[i:])
@@ -116,24 +124,38 @@ def split_plain(line):
         words.append("".join(word))
     if words:
         commands.append(words)
+        ops.append(None)
     elif pending_op not in (None, ";"):
         return None
-    return commands
+    return commands, ops
 
 
 # ---- R2: involves git, gh or hc ------------------------------------------------------------------
 
+def program(word):
+    """The last part of a path, in lower case: the Mac's file system finds /usr/bin/git for GIT or Git too."""
+    return word.rstrip("/").rsplit("/", 1)[-1].lower()
+
+
 def involves(words):
-    """A word is git, gh or hc, or a path whose last part is one of them."""
-    return any(w in NAMES or w.rstrip("/").rsplit("/", 1)[-1] in NAMES for w in words)
+    """A word is git, gh or hc, or a path whose last part is one of them, in any case."""
+    return any(program(w) in NAMES for w in words)
 
 
-WHOLE_WORD = re.compile(r"(?<![\w.-])(git|gh|hc)(?![\w.-])")
+WHOLE_WORD = re.compile(r"(?<![\w.-])(git|gh|hc)(?![\w.-])", re.IGNORECASE)
+# A shell started with text to run, or eval: its quoted text is a command line of its own.
+WRAPPERS = ("sh", "bash", "zsh", "dash", "ksh", "eval")
 
 
 def involves_text(line):
-    """For a line that is not plain: git, gh or hc appears as a whole word, once quotes and backslashes are taken out."""
+    """git, gh or hc appears as a whole word, in any case, once quotes and backslashes are taken out.
+    Used for a line that is not plain, and for each word of a plain line that starts a shell or eval."""
     return bool(WHOLE_WORD.search(re.sub(r"[\"'\\]", "", line)))
+
+
+def wraps(commands):
+    """A plain line runs a shell or eval somewhere (sh -c '...', echo '...' | sh, env bash -c, eval '...')."""
+    return any(program(w) in WRAPPERS for words in commands for w in words)
 
 
 # ---- R6: the table -------------------------------------------------------------------------------
@@ -149,9 +171,24 @@ def is_ref(a):
     return is_word(a) and ":" not in a and not a.startswith("+")
 
 
+def no_pathspec(a):
+    """A word, with no wildcard and no pathspec magic: git cannot read it as a set of files."""
+    return is_word(a) and not a.startswith(":") and not re.search(r"[*?\[]", a)
+
+
 def explicit_path(a):
     """A path named explicitly: not . or .., no wildcard, no pathspec magic."""
-    return is_word(a) and not a.startswith(":") and not re.search(r"[*?\[]", a) and os.path.normpath(a) not in (".", "..")
+    return no_pathspec(a) and os.path.normpath(a) not in (".", "..")
+
+
+def file_path(a, cwd):
+    """A path named explicitly that is not a folder: no ~, not only . and .. parts, and not an existing folder in cwd.
+    With the folder unknown (None), nothing counts."""
+    if not explicit_path(a) or a.startswith("~") or cwd is None:
+        return False
+    if all(part in ("", ".", "..") for part in os.path.normpath(a).split(os.sep)):
+        return False
+    return not os.path.isdir(os.path.join(cwd, a))
 
 
 def opt_name(a):
@@ -183,7 +220,9 @@ def no_output(args, ctx=None):
 
 
 def archive_args(args, ctx):
-    return no_output(args) and not any(short_cluster(a, "o") for a in args)
+    # --remote with --exec runs a program of the caller's choosing; neither is reading. Abbreviations count (--rem, --e).
+    return (no_output(args) and not any(short_cluster(a, "o") for a in args)
+            and not any(prefix_of(a, "--remote", 3) or prefix_of(a, "--exec", 3) for a in args))
 
 
 def grep_args(args, ctx):
@@ -195,7 +234,10 @@ BRANCH_LIST = {"--list", "-a", "-r", "-v", "-vv", "--show-current", "--contains"
 
 
 def branch_args(args, ctx):
-    """Nothing; or listing options and patterns; or <new-branch> [<start>]."""
+    """Nothing; or listing options with other words; or <new-branch> [<start>].
+
+    With a listing option the other words are patterns (--list) or commits (--contains); with -v / -vv git reads a
+    word as a new branch name, which is allowed anyway."""
     options = [a for a in args if a.startswith("-")]
     for a in options:
         if opt_name(a) not in BRANCH_LIST or ("=" in a and opt_name(a) not in ("--contains", "--merged", "--no-merged")):
@@ -203,9 +245,9 @@ def branch_args(args, ctx):
     return bool(options) or len(args) <= 2
 
 
-def new_branch(args):
+def new_branch(args, word=is_word):
     """-c|-b <new-branch> [<start>] after the flag."""
-    return 1 <= len(args) <= 2 and all(is_word(a) for a in args)
+    return 1 <= len(args) <= 2 and all(word(a) for a in args)
 
 
 def switch_args(args, ctx):
@@ -213,10 +255,11 @@ def switch_args(args, ctx):
 
 
 def checkout_args(args, ctx):
-    """<branch>, or -b <new-branch> [<start>]. A word that names an existing path is a file restore: refused."""
+    """<branch>, or -b <new-branch> [<start>]: branch names only. A word with * ? [ or a leading : is a pathspec, and
+    a word that names an existing path is a file: both would restore files (losing uncommitted work), so refused."""
     if args[:1] == ["-b"]:
-        return new_branch(args[1:])
-    if len(args) != 1 or not is_word(args[0]):
+        return new_branch(args[1:], no_pathspec)
+    if len(args) != 1 or not no_pathspec(args[0]):
         return False
     cwd = ctx.get("cwd")
     return cwd is not None and not os.path.lexists(os.path.join(cwd, os.path.expanduser(args[0])))
@@ -230,9 +273,10 @@ def add_args(args, ctx):
 
 
 def restore_args(args, ctx):
+    """[--staged] [--] <path>...: each a file named explicitly, never a folder (a folder restores all under it)."""
     rest = args[1:] if args[:1] == ["--staged"] else args
     rest = rest[1:] if rest[:1] == ["--"] else rest
-    return bool(rest) and all(explicit_path(a) for a in rest)
+    return bool(rest) and all(file_path(a, ctx.get("cwd")) for a in rest)
 
 
 COMMIT_FLAGS = {"--amend", "--no-edit", "--allow-empty"}
@@ -312,9 +356,15 @@ def worktree_list_args(args, ctx):
     return args in ([], ["--porcelain"])
 
 
+CONFIG_KEY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]*\.(.*\.)?[A-Za-z][A-Za-z0-9-]*$")  # section[.subsection].name
+
+
 def config_args(args, ctx):
-    return (args in (["--list"], ["-l"]) or (len(args) == 2 and args[0] in ("--get", "--get-all") and is_word(args[1]))
-            or (len(args) == 1 and is_word(args[0])))
+    """Reading only: --list / -l / list; --get / --get-all / get <key>; or <key> alone. A key contains a dot, so a
+    subcommand word (edit, set, unset, rename-section, remove-section) is never read as one."""
+    return (args in (["--list"], ["-l"], ["list"])
+            or (len(args) == 2 and args[0] in ("--get", "--get-all", "get") and bool(CONFIG_KEY.match(args[1])))
+            or (len(args) == 1 and bool(CONFIG_KEY.match(args[0]))))
 
 
 def reflog_args(args, ctx):
@@ -348,9 +398,9 @@ def one_of(*subcommands):
 
 
 def hc_send_args(args, ctx):
-    """<Project Agent address> <text>. With no known Project Agent (no task record), one address."""
+    """<Project Agent address> <text>, the text not an option. With no known Project Agent (no task record), one address."""
     pa_address = ctx.get("pa_address")
-    return len(args) == 2 and is_word(args[0]) and (not pa_address or args[0] == pa_address)
+    return len(args) == 2 and is_word(args[0]) and is_word(args[1]) and (not pa_address or args[0] == pa_address)
 
 
 def hc_read_args(args, ctx):
@@ -412,32 +462,54 @@ ALLOWLIST = [
 NEVER_ADD = [
     ("git", "push"), ("git", "remote"), ("git", "config"), ("git", "credential"), ("git", "send-email"),
     ("git", "request-pull"), ("git", "submodule"), ("git", "hook"),
+    # publishing to another server or system, or serving the repository
+    ("git", "lfs", "push"), ("git", "svn"), ("git", "p4"), ("git", "cvsexportcommit"), ("git", "send-pack"),
+    ("git", "http-push"), ("git", "imap-send"), ("git", "daemon"), ("git", "instaweb"),
     ("gh", "pr", "create"), ("gh", "pr", "merge"), ("gh", "pr", "edit"), ("gh", "pr", "ready"), ("gh", "pr", "comment"),
-    ("gh", "pr", "review"), ("gh", "pr", "close"), ("gh", "pr", "reopen"),
+    ("gh", "pr", "review"), ("gh", "pr", "close"), ("gh", "pr", "reopen"), ("gh", "pr", "update-branch"),
+    ("gh", "pr", "revert"), ("gh", "pr", "lock"), ("gh", "pr", "unlock"),
     ("gh", "issue", "create"), ("gh", "issue", "comment"), ("gh", "issue", "edit"), ("gh", "issue", "close"),
+    ("gh", "issue", "reopen"), ("gh", "issue", "delete"), ("gh", "issue", "transfer"), ("gh", "issue", "develop"),
+    ("gh", "issue", "lock"), ("gh", "issue", "unlock"), ("gh", "issue", "pin"), ("gh", "issue", "unpin"),
+    ("gh", "run", "rerun"), ("gh", "run", "cancel"), ("gh", "run", "delete"),
     ("gh", "repo"), ("gh", "release"), ("gh", "api"), ("gh", "auth"), ("gh", "secret"), ("gh", "variable"),
     ("gh", "workflow"), ("gh", "ruleset"), ("gh", "gist"), ("gh", "config"), ("gh", "extension"), ("gh", "alias"),
+    ("gh", "label"), ("gh", "cache"), ("gh", "project"), ("gh", "ssh-key"), ("gh", "gpg-key"), ("gh", "codespace"),
+    ("gh", "org"), ("gh", "agent-task"),
     ("hc", "send"),
 ]
 ADDED_SHAPES = {"any": any_args, "none": no_args}
 
 
 def profile_rows(profile, err=None):
-    """The profile's "guardAllow" rows ({"command": [...], "args": "any" | "none"}) that may be added; a note for the rest."""
+    """The profile's "guardAllow" rows ({"command": [...], "args": "any" | "none"}) that may be added; a note for the rest.
+    Total: whatever the profile holds, this returns a list and never raises."""
     err = err or sys.stderr
+    if not isinstance(profile, dict) or profile.get("guardAllow") is None:
+        return []
+    name, allow = profile.get("name"), profile.get("guardAllow")
+    if not isinstance(allow, list):
+        print("pa-hook guard: ignored guardAllow in profile {}: {!r} (needs a list of rows)".format(name, allow), file=err)
+        return []
     rows = []
-    for row in (profile or {}).get("guardAllow") or []:
+    for row in allow:
         command = row.get("command") if isinstance(row, dict) else None
-        shape = ADDED_SHAPES.get(row.get("args")) if isinstance(row, dict) else None
+        args = row.get("args") if isinstance(row, dict) else None
+        shape = ADDED_SHAPES.get(args) if isinstance(args, str) else None
         if not (isinstance(command, list) and command and all(isinstance(w, str) and w for w in command)
                 and command[0] in NAMES and shape):
             print("pa-hook guard: ignored a guardAllow row in profile {}: {!r} (needs a git, gh or hc command list and "
-                  "args \"any\" or \"none\")".format((profile or {}).get("name"), row), file=err)
+                  "args \"any\" or \"none\")".format(name, row), file=err)
             continue
         command = tuple(command)
+        if any(w.startswith("-") for w in command[1:]):
+            # git -c / -C / --no-pager, gh --repo: an option would let the row reach any subcommand, NEVER_ADD included.
+            print("pa-hook guard: ignored a guardAllow row in profile {}: {} names an option; rows name subcommands "
+                  "only".format(name, " ".join(command)), file=err)
+            continue
         if any(command[:len(never)] == never or never[:len(command)] == command for never in NEVER_ADD):
             print("pa-hook guard: ignored a guardAllow row in profile {}: {} can never be added".format(
-                (profile or {}).get("name"), " ".join(command)), file=err)
+                name, " ".join(command)), file=err)
             continue
         rows.append((command, shape))
     return rows
@@ -463,15 +535,32 @@ def allowed(words, rows, ctx):
     return False
 
 
-def next_cwd(words, cwd):
-    """Where a `cd` in the line leaves the next command (None: not known)."""
-    if words[0] != "cd":
-        return cwd
+def cd_target(words, cwd):
+    """Where `cd` goes (None: not known)."""
     if len(words) == 1:
         return os.path.expanduser("~")
     if len(words) != 2 or words[1] == "-" or cwd is None:
         return None
     return os.path.normpath(os.path.join(cwd, os.path.expanduser(words[1])))
+
+
+def folders(commands, ops, start):
+    """The folder each simple command runs in (None: not known).
+
+    A `cd` moves the next commands only when it surely ran and they run only if it did: it comes first, or after ; or
+    &&, and is followed by &&. From there the folder is known while commands are joined by &&; after any other
+    operator a failed cd could have left the shell where it was. pushd and popd make the folder unknown."""
+    here, moved, prev, result = start, False, None, []
+    for words, op in zip(commands, ops):
+        result.append(here)
+        if words[0] == "cd" and prev in (None, ";", "&&") and op == "&&":
+            here, moved = cd_target(words, here), True
+        elif words[0] in ("cd", "pushd", "popd"):
+            here = None
+        elif moved and op not in ("&&", None):
+            here = None
+        prev = op
+    return result
 
 
 def check_command(line, pa_address=None, own_address=None, extra_rows=(), cwd=None):
@@ -480,20 +569,22 @@ def check_command(line, pa_address=None, own_address=None, extra_rows=(), cwd=No
     extra_rows: the profile's added rows, or a function that returns them; it is called only when a
     command involves git, gh or hc and no row of ALLOWLIST allows it (so its notes come only then).
     """
-    commands = split_plain(line or "")
-    if commands is None:
+    scanned = split_plain_ops(line or "")
+    if scanned is None:
         return NOT_PLAIN if involves_text(line) else None
+    commands, ops = scanned
     extra = None
-    here = cwd if cwd is not None else os.getcwd()
-    for words in commands:
-        if involves(words):
+    wrapped = wraps(commands)
+    places = folders(commands, ops, cwd if cwd is not None else os.getcwd())
+    for words, here in zip(commands, places):
+        # With a shell or eval in the line, git, gh or hc named inside any word's text counts too (it may be run).
+        if involves(words) or (wrapped and any(involves_text(w) for w in words)):
             ctx = {"pa_address": pa_address, "own_address": own_address, "cwd": here}
             if not allowed(words, ALLOWLIST, ctx):
                 if extra is None:
                     extra = list((extra_rows() if callable(extra_rows) else extra_rows) or [])
                 if not allowed(words, extra, ctx):
                     return OFF_TABLE.format(shown(" ".join(shlex.quote(w) for w in words)))
-        here = next_cwd(words, here)
     return None
 
 
@@ -502,23 +593,34 @@ def check_command(line, pa_address=None, own_address=None, extra_rows=(), cwd=No
 STATE_FILES = ("ledger.json", "journal.jsonl", "rules.json", "agent.json")
 
 
-def check_edit(path, spaces_dir, cwd=None):
+def check_edit(path, spaces_dir, cwd=None, home=None):
     """None when Edit/Write/MultiEdit/NotebookEdit may write path; else the refusal message.
 
-    Refused, after resolving links: anything inside a .git folder or a worktree's .git file, and in any
-    space's state folder (<spaces_dir>/<space>/) decisions/, ledger.json, journal.jsonl, rules.json and
-    agent.json. Names are compared without case (the Mac's file system ignores it).
+    Refused, both for the path as written and after resolving links: anything inside a .git folder or a worktree's
+    .git file; anything in <spaces_dir> except a space's evidence folder (<spaces_dir>/<space>/evidence/...), so
+    decisions/, ledger.json, journal.jsonl, rules.json, agent.json (STATE_FILES) and the rest of the state; and,
+    when home (the Project Agent's home) is given, anything else under it (profiles, core texts, tools).
+    Names are compared without case (the Mac's file system ignores it).
     """
     if not path:
         return None
-    full = os.path.realpath(os.path.join(cwd or os.getcwd(), os.path.expanduser(path)))
+    given = os.path.normpath(os.path.join(cwd or os.getcwd(), os.path.expanduser(path)))
     refused = OFF_TABLE.format(shown(path))
-    if ".git" in full.lower().split(os.sep):
-        return refused
-    spaces = os.path.realpath(spaces_dir).lower() + os.sep
-    low = full.lower()
-    if low.startswith(spaces):
-        parts = low[len(spaces):].split(os.sep)
-        if len(parts) >= 2 and (parts[1] == "decisions" or (len(parts) == 2 and parts[1] in STATE_FILES)):
+
+    def forms(folder):
+        return {os.path.normpath(os.path.abspath(folder)).lower(), os.path.realpath(folder).lower()}
+
+    spaces, homes = forms(spaces_dir), forms(home) if home else set()
+    for low in {given.lower(), os.path.realpath(given).lower()}:
+        if ".git" in low.split(os.sep):
             return refused
+        for top in spaces:
+            if low == top or low.startswith(top + os.sep):
+                parts = low[len(top) + 1:].split(os.sep)
+                if len(parts) < 3 or parts[1] != "evidence":
+                    return refused
+                break
+        else:
+            if any(low == top or low.startswith(top + os.sep) for top in homes):
+                return refused
     return None
