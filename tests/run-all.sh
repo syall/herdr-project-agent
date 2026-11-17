@@ -43,7 +43,7 @@ if [ "$affected" = 1 ] && [ -n "${PA_CHANGED_FILES:-}" ]; then
 fi
 
 parse37() { "$PY" -c "import ast,sys
-for f in sys.argv[1:]: ast.parse(open(f).read(), feature_version=(3,7)); print(f, 'parses as Python 3.7')" runtime/tools/pa.py runtime/tools/pa_hooks.py runtime/tools/pa_guard.py; }
+for f in sys.argv[1:]: ast.parse(open(f).read(), feature_version=(3,7)); print(f, 'parses as Python 3.7')" runtime/tools/pa.py runtime/tools/pa_hooks.py runtime/tools/pa_guard.py runtime/tools/pa_costs.py; }
 units() { "$PY" -m unittest discover -s tests -p 'test_*.py' -v; }
 keeper() { [ -n "$NODE" ] || { echo "no node found (set NODE)"; return 1; }; "$NODE" tests/keeper/run.mjs; }
 panel() { [ -n "$NODE" ] || { echo "no node found (set NODE)"; return 1; }; "$NODE" tests/panel/run.mjs; }

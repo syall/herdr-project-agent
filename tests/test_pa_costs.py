@@ -231,3 +231,93 @@ class H1_Harness(Base):
             self.assertIs(pa_costs.pa, pa)
             self.assertTrue(pa_costs.CODEX_HOME.startswith(TMP))
             self.assertTrue(pa_costs.CLAUDE_HOME.startswith(TMP))
+
+
+# ---- step 1: price table and money (R4) ------------------------------------------------------------
+
+ZERO = {"in": 0, "out": 0, "cw5m": 0, "cw1h": 0, "cr": 0}
+
+
+def toks(**kw):
+    out = dict(ZERO)
+    out.update(kw)
+    return out
+
+
+class CostsBase(Base):
+    """Base for the tests of pa_costs itself: they fail (not skip) while pa_costs.py is missing."""
+
+    def setUp(self):
+        self.assertIsNotNone(pa_costs, COSTS_MISSING)
+        super().setUp()
+
+
+class P_Prices(CostsBase):
+    def profile(self):
+        return pa.load_profile("test")
+
+    def table(self, value=None):
+        self.prices(value)
+        table, problem = pa_costs.load_prices(self.profile())
+        self.assertIsNone(problem)
+        return table
+
+    def test_p1_valid_from_on_both_sides_of_a_change(self):
+        t = json.loads(json.dumps(PRICES))
+        t["models"]["model-a"] = [{"validFrom": "2026-11-10", "in": 3.0, "out": 30.0, "cw5m": 6.0, "cw1h": 12.0, "cr": 1.5},
+                                  {"validFrom": "2026-01-01", "in": 1.0, "out": 10.0, "cw5m": 2.0, "cw1h": 4.0, "cr": 0.5}]
+        table = self.table(t)
+        self.assertEqual(pa_costs.price_for(table, "model-a", "2026-11-09T23:59:59Z")["out"], 10.0)
+        self.assertEqual(pa_costs.price_for(table, "model-a", "2026-11-10T00:00:00Z")["out"], 30.0)
+        self.assertEqual(pa_costs.price_for(table, "model-a", "2026-12-01T00:00:00Z")["out"], 30.0)
+        self.assertIsNone(pa_costs.price_for(table, "model-a", "2025-12-31T00:00:00Z"))
+
+    def test_p2_alias_regex(self):
+        table = self.table()
+        self.assertEqual(pa_costs.price_for(table, "model-a-2026", "2026-11-17T00:00:00Z")["in"], 1.0)
+        self.assertIsNone(pa_costs.price_for(table, "model-c", "2026-11-17T00:00:00Z"))
+
+    def test_p3_missing_model_gives_partial_money_and_unpriced_tokens(self):
+        table = self.table()
+        rows = [{"model": "model-a", "from": "2026-11-17T01:00:00Z", "tokens": toks(out=1000000), "long": dict(ZERO)},
+                {"model": "model-c", "from": "2026-11-17T01:00:00Z", "tokens": toks(out=5, cr=7), "long": dict(ZERO)}]
+        total = pa_costs.price_rows(rows, table)
+        self.assertAlmostEqual(total["money"], 10.0)
+        self.assertEqual(total["unpricedTokens"], 12)
+        self.assertEqual(total["missing"], ["model-c"])
+
+    def test_p4_invalid_table_gives_tokens_only_and_a_problem(self):
+        for bad in ("not json", json.dumps(dict(PRICES, models={"model-a": [{"validFrom": "2026-01-01", "in": -1}]})),
+                    json.dumps(dict(PRICES, models={"model-a": [{"validFrom": "soon", "in": 1}]})),
+                    json.dumps(dict(PRICES, models={"model-a": [{"validFrom": "2026-01-01", "in": "cheap"}]}))):
+            write(os.path.join(self.profile_dir, "prices.json"), bad)
+            table, problem = pa_costs.load_prices(self.profile())
+            self.assertIsNone(table, bad)
+            self.assertIn("prices.json", problem)
+        os.unlink(os.path.join(self.profile_dir, "prices.json"))
+        self.assertEqual(pa_costs.load_prices(self.profile()), (None, None))
+        # A null price (the profile has not filled it yet) is not an error: that model is unpriced.
+        t = json.loads(json.dumps(PRICES))
+        t["models"]["model-b"] = [{"validFrom": "2026-01-01", "in": None, "out": None, "cw5m": None, "cw1h": None, "cr": None}]
+        table = self.table(t)
+        total = pa_costs.price_rows([{"model": "model-b", "from": "2026-11-17T01:00:00Z", "tokens": toks(out=3), "long": dict(ZERO)}], table)
+        self.assertIsNone(total["money"])
+        self.assertEqual(total["unpricedTokens"], 3)
+
+    def test_p5_long_context_priced_from_long(self):
+        t = json.loads(json.dumps(PRICES))
+        t["models"]["model-a"][0]["long"] = {"above": 200000, "in": 2.0, "out": 20.0, "cw5m": 4.0, "cw1h": 8.0, "cr": 1.0}
+        table = self.table(t)
+        price = pa_costs.price_for(table, "model-a", "2026-11-17T00:00:00Z")
+        # 2M cache read in total, 1M of it from long calls: 1M x 0.5 + 1M x 1.0 = 1.5
+        self.assertAlmostEqual(pa_costs.money(toks(cr=2000000), toks(cr=1000000), price), 1.5)
+        # without a long block, long tokens are priced like the rest
+        self.assertAlmostEqual(pa_costs.money(toks(cr=2000000), toks(cr=1000000), PRICES["models"]["model-a"][0]), 1.0)
+
+    def test_p6_money_from_tokens_only(self):
+        table = self.table()
+        row = {"model": "model-a", "from": "2026-11-17T01:00:00Z", "tokens": toks(**{"in": 1000000, "out": 1000000, "cw5m": 1000000,
+                                                                                    "cw1h": 1000000, "cr": 1000000}),
+               "long": dict(ZERO), "money": 999.0, "calls": 4}
+        self.assertAlmostEqual(pa_costs.row_money(row, table), 1.0 + 10.0 + 2.0 + 4.0 + 0.5)
+        self.assertIsNone(pa_costs.row_money(dict(row, model="model-c"), table))
