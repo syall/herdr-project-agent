@@ -622,6 +622,7 @@ export default class ProjectAgent extends View {
     const open = this.open.has(task.id), armed = open && this.armedTask(space.id) === task.id;
     // A press on the armed Delete or its Cancel stops here: a press anywhere else in the panel disarms (render's root).
     const keep = (el) => el.on_mouse_down("left", (_e, cx) => cx.stop_propagation());
+    const crew = (task.workers ?? []).filter((w) => !(w?.finished && w?.closed));
     const tone = { "needs-decision": t.blocked, review: t.done, "in-progress": t.working, investigating: t.working, queued: t.muted, parked: t.dim, done: t.dim }[task.state] ?? t.muted;
     return v_flex().id(`task-${task.id}`).flex_none().rounded(7).border(1).border_color(t.border).bg(t.surface)
       .child(h_flex().id(`task-head-${task.id}`).h(32).px(9).gap(7).items_center().cursor_pointer().hover((s) => s.bg(t.hover))
@@ -634,11 +635,12 @@ export default class ProjectAgent extends View {
       .when(open, (el) => el.child(v_flex().px(10).pb(9).gap(6).text_size(12).text_color(t.muted)
         .when(Boolean(task.goal), (e) => e.child(div().child(String(task.goal))))
         .child(div().text_size(11).text_color(t.dim).child([task.type, task.tier && `${task.tier} tier`].filter(Boolean).join(" · ")))
-        // Its workers: a live one opens in the Agents view.
-        .when((task.workers ?? []).length > 0, (e) => e.child(h_flex().gap(6).flex_wrap().children((task.workers ?? []).map((w, i) => {
+        // Its workers: a live one opens in the Agents view. One closed with pa-worker close (finished,
+        // closed set) is not drawn; its ledger entry stays (only the panel leaves it out). None left: no row.
+        .when(crew.length > 0, (e) => e.child(h_flex().gap(6).flex_wrap().children(crew.map((w, i) => {
           const address = space.machine ? `${space.machine}/${w.address}` : w.address;
           const term = terminals().find((x) => x.address === address && x.state === "live");
-          // Read-only marks the tools write: "kept" (pa-worker keep) and "(closed)" (pa-worker close).
+          // Read-only marks the tools write: "kept" (pa-worker keep); "(closed)" only for a finished entry with no closed stamp.
           const label = `${w.role ?? "worker"} ${w.address ?? ""}`.trim() + (w.keep ? " · kept" : "");
           return h_flex().id(`worker-${task.id}-${i}`).flex_none().px(8).h(24).gap(6).items_center().rounded(6).border(1).border_color(t.border).text_size(11.5)
             .text_color(term ? t.foreground : t.dim)

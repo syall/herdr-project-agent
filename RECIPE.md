@@ -64,8 +64,8 @@ A new space opens with a 600 x 440 dialog: a Project Agent card (`Set up for <fo
   for the job (`t-010-tests`, `t-010-fix`), and closes it in the pass where it reads its report,
   with `pa-worker close`. That command refuses a worker that is working or blocked, has no
   recorded evidence, has uncommitted files in its worktree, or that you marked to keep. To keep
-  one open, tell the agent "keep t56". A closed worker's chip reads "(closed)" and stays in the
-  task. The × on a worker (in a task, or in an Agents view that opens this dialog) is still
+  one open, tell the agent "keep t56". A closed worker leaves the task card (its entry stays in
+  the ledger); a task whose workers are all closed shows no workers row. The × on a worker (in a task, or in an Agents view that opens this dialog) is still
   yours: it closes any worker and asks what to delete with it: its terminal, its worktree when
   nobody else uses it (not ticked when it holds unsaved work), and optionally its task.
   (Changed 2026-11-16, t-008: workers used to stay until you closed them.)
@@ -174,5 +174,5 @@ A new space opens with a 600 x 440 dialog: a Project Agent card (`Set up for <fo
 - With no Project Agent running in a configured space, the header says "Not running" and Open
   Project Agent opens one tab `PA: <name>` that resumes the conversation; a second click while it
   runs opens nothing.
-- In a scratch space, each `t-0xx-<job>` worker is closed in the pass that reads its report (journal trigger `close`, its chip reads "(closed)"), and no `d-wt-*` card opens between jobs.
+- In a scratch space, each `t-0xx-<job>` worker is closed in the pass that reads its report (journal trigger `close`, its chip leaves the task card), and no `d-wt-*` card opens between jobs.
 - Marking that task done opens a `d-wt-<task>` card on the next pass listing its tasks, branch, commits, files and uncommitted files, one per line; `WORKTREE.md ↗` opens the full list.
