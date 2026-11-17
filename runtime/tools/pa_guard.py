@@ -812,8 +812,15 @@ def check_command(line, pa_address=None, own_address=None, extra_rows=(), cwd=No
     extra = None
     wrapped = wraps(commands)
     places = folders(commands, ops, starts_of(cwd))
-    for words in commands:
-        # The person's own tools first, with their own message; message texts (git commit -m, hc send) aside.
+    for words, here in zip(commands, places):
+        # The person's own tools first, with their own message; message texts (git commit -m, hc send) aside. A git line
+        # that a built-in row allows runs git, not them: its words are paths (git add pa_push.py; card d-067); one that no
+        # row allows gets the off-table refusal below. A line only a profile row allows is checked here as before.
+        ctx = {"pa_address": pa_address, "own_address": own_address, "cwd": here}
+        if words[0] == "git" and not allowed(words, ALLOWLIST, ctx) and extra is None:
+            extra = list((extra_rows() if callable(extra_rows) else extra_rows) or [])
+        if words[0] == "git" and (allowed(words, ALLOWLIST, ctx) or not allowed(words, extra, ctx)):
+            continue
         skip = message_skips(words)
         if any(i not in skip and (person_only(w) or (ASSIGN.match(w) and person_text(w.split("=", 1)[1]))
                                   or (wrapped and (person_text(w) or person_text(wrapped_text(w)))))
