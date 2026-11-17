@@ -21,7 +21,7 @@ them and names the task.
 
 | Tier | Example | Plan approval | Human reviewers before publishing | Agent checks |
 |---|---|---|---|---|
-| low | Docs, copy, comments | Orchestrator | None beyond green checks; still a publish decision card | One `check` worker; rechecks on the diff; round cap 2 |
+| low | Docs, copy, comments | Orchestrator | None beyond green checks; still a publish decision card | One `check` worker; rechecks on the diff unless Rounds asks for a full check; round cap 2 |
 | normal | Ordinary product change | Orchestrator, or the person by rule | One | A verifier and a reviewer; reviews full until one is clean; round cap 3 |
 | high | Auth, data, infrastructure, migrations, anything hard to undo | The person | Two | A verifier and two reviewers; the check before the first card that asks to publish or merge is full; round cap 4 |
 
