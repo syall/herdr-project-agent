@@ -1,7 +1,8 @@
 """The worker command allowlist, used by `pa-hook guard` (pa_hooks.hook_guard). Python standard library only (3.7+).
 
 A worker may run the ordinary build, file and text tools freely, and git, gh and hc only as the rows of
-ALLOWLIST below allow. Anything else that involves git, gh or hc is refused, so that publishing and
+ALLOWLIST below allow; the five read-only rows of READS (git status, log, rev-parse, diff, show) may also take
+output redirects and one leading -C <dir> (t-016). Anything else that involves git, gh or hc is refused, so that publishing and
 repository settings stay with the person and the Project Agent. The person's own tools (PERSON_ONLY:
 pa-push-main, pa-push-allow and pa_push.py, t-007 part 7b) are refused for a worker in every form, and no row
 can allow them: a main branch is pushed only when the person answers a push card in the panel. Edits inside a .git folder, to the
@@ -71,6 +72,8 @@ def split_plain_ops(line, writes=False, bare=False):
     writes=True (t-016): also plain are > >> < &> &>> (fd digits before them dropped), each followed by a word, and
     >&N N>&M >&- <&N; $HOME or ${HOME} starting a word (unquoted or in double quotes) is the home. Returns (commands,
     operators, targets): targets[i] the output-redirect words of commands[i]; bare=True keeps a command of redirects only.
+    writes="git" (read_redirects): as True, but an input redirect is not plain, $HOME is not expanded and a duplication's
+    text (>&1) is a target.
     """
     s = line.strip()
     commands, ops, words, word = [], [], [], []
@@ -93,7 +96,7 @@ def split_plain_ops(line, writes=False, bare=False):
                 if c == '"':
                     i += 1
                     break
-                if writes and c == "$" and not word and HOME_VAR.match(s, i):
+                if writes is True and c == "$" and not word and HOME_VAR.match(s, i):
                     word.append(os.path.expanduser("~"))
                     i = HOME_VAR.match(s, i).end()
                     continue
@@ -123,11 +126,15 @@ def split_plain_ops(line, writes=False, bare=False):
             word, has_word = [], False
             m = REDIRECT.match(s, i)
             i = m.end()
+            if writes == "git" and m.group(0)[0] == "<":
+                return None  # git mode: no input redirect
             if m.group(0)[-1] not in "-0123456789":  # a duplication has no word
                 if i < n and s[i] in "<>|&":
                     return None  # << <<< <> >| >&word
                 words.append(("<",) if m.group(0) == "<" else (">",))  # a mark: the next word is its target
-        elif writes and c == "$" and not word and HOME_VAR.match(s, i):
+            elif writes == "git":
+                words += [(">&",), m.group(0)]  # git mode: a duplication is a redirect, its text the target
+        elif writes is True and c == "$" and not word and HOME_VAR.match(s, i):
             word.append(os.path.expanduser("~"))
             has_word, i = True, HOME_VAR.match(s, i).end()
         elif c in ";&|":
@@ -178,7 +185,7 @@ def split_plain_ops(line, writes=False, bare=False):
         marks = dict.fromkeys(j for j, w in enumerate(words) if isinstance(w, tuple))  # in order; one lookup each
         if any(j + 1 == len(words) or j + 1 in marks for j in marks) or not bare and len(words) == 2 * len(marks):
             return None  # a redirect without its word, or (bare=False) a command of redirects only
-        targets.append([words[j + 1] for j in marks if words[j] == (">",)])
+        targets.append([words[j + 1] for j in marks if words[j] != ("<",)])
         commands[k] = [w for j, w in enumerate(words) if j not in marks and j - 1 not in marks]
     return commands, ops, targets
 
@@ -611,6 +618,9 @@ ALLOWLIST = [
     (("git", "cherry"), no_output),
     (("git", "tag"), tag_args),
 ]
+# t-016 job 2: these five rows, as they are, may also take output redirects and one leading -C <dir>.
+READS = [row for row in ALLOWLIST
+         if row[0] in (("git", "status"), ("git", "log"), ("git", "rev-parse"), ("git", "diff"), ("git", "show"))]
 # tests/run-all.sh, pa-gate, pa-full-suite and the ordinary tools need no row: they involve no git, gh or hc.
 
 # R10: a profile's "guardAllow" rows can never open these (publishing and configuration), nor anything that contains them.
@@ -688,10 +698,13 @@ def allowed(words, rows, ctx):
     """A simple command that involves git, gh or hc: allowed only as a row of the table."""
     if words[0] not in NAMES:
         return False  # a wrapper (env, xargs, sudo), a path to the program, or a leading VAR=value
-    rest = list(words[1:])
+    moved = words[0] == "git" and words[1:2] == ["-C"] and len(words) > 2 and is_word(words[2])  # one -C <dir>: READS only
+    rest = list(words[3:] if moved else words[1:])
     if words[0] == "git" and rest[:1] == ["--no-pager"]:
         rest = rest[1:]
     for command, shape in rows:
+        if moved and (command, shape) not in READS:
+            continue
         size = len(command) - 1
         if command[0] == words[0] and tuple(rest[:size]) == command[1:] and len(rest) >= size and shape(rest[size:], ctx):
             return True
@@ -819,7 +832,23 @@ def check_command(line, pa_address=None, own_address=None, extra_rows=(), cwd=No
         variable = git_variable(text_commands(line))
         if variable is not None:
             return VARIABLE.format(shown(variable))
-        return NOT_PLAIN if involves_text(line) else None
+        if not involves_text(line):
+            return None
+        redirected = read_redirects(line)  # t-016 job 2: output redirects on the five READS rows only
+        return None if redirected and judge_plain(redirected, pa_address, own_address, extra_rows, cwd) is None else NOT_PLAIN
+    return judge_plain(scanned, pa_address, own_address, extra_rows, cwd)
+
+
+def read_redirects(line):
+    """(commands, operators) of a line plain but for output redirects, each on a command READS allows; else None."""
+    scanned = split_plain_ops(line, writes="git")
+    if scanned is None or any(outs and not allowed(words, READS, {}) for words, outs in zip(scanned[0], scanned[2])):
+        return None
+    return scanned[:2]
+
+
+def judge_plain(scanned, pa_address, own_address, extra_rows, cwd):
+    """check_command's verdict on a plain line (commands, operators)."""
     commands, ops = scanned
     extra = None
     wrapped = wraps(commands)
@@ -952,10 +981,12 @@ def file_targets(words):
             named += [a[2:] for a in args if a.startswith("-t") and a != "-t"] + [b for a, b in zip(args, args[1:]) if a == "-t"]
         return named + operands(args) if p == "mv" or p == "install" and "-d" in args else named or operands(args)[-1:]
     if p in ("rm", "rmdir", "unlink", "touch", "mkdir", "tee", "truncate", "chmod", "chown", "chgrp"):
-        return operands(args)
+        read = [j + 1 for j, a in enumerate(args) if p in ("touch", "truncate") and a in ("-r", "--reference")]
+        return operands([a for j, a in enumerate(args) if j not in read])  # touch/truncate -r <file> reads that file
     if p == "dd":
         return [a[3:] for a in args if a.startswith("of=")]
-    sed, script = p == "sed" and any(a.startswith(("-i", "--in-place")) for a in args), ("-e", "-f", "--expression", "--file")
+    sed = p == "sed" and any(a.startswith("--in-place") or short_cluster(a, "i") for a in args)  # -i, -Ei, -i.bak
+    script = ("-e", "-f", "--expression", "--file")
     if not sed and not (p == "perl" and any(short_cluster(a, "i") for a in args)):
         return []  # sed or perl without in-place: reads
     values = [j + 1 for j, a in enumerate(args) if (a in script if sed else a[-1:] in ("e", "E") and short_cluster(a, a[-1]))]
@@ -967,8 +998,8 @@ def folder_change(words, here, cdpath):
     """A cd or pushd adds its folder to here (it only grows); returns the words that make the folder unknown (R4), or None."""
     p, args, found = program(words[0]), words[1:], operands(words[1:])
     t = found[0] if found else "~"
-    if (p == "popd" or p in ("builtin", "command") and args and program(args[0]) in ("cd", "pushd", "popd")
-            or p in ("cd", "pushd") and ("-" in args or len(found) > 1 or p == "pushd" and not found
+    if (p == "popd" or p in ("builtin", "command") and found and program(found[0]) in ("cd", "pushd", "popd")
+            or p in ("cd", "pushd") and ("-" in args or len(found) > 1 or p == "pushd" and (not found or t[:1] == "+")
                                          or t.startswith("~") and t != "~" and not t.startswith("~/")
                                          or cdpath and not t.startswith((".", "/", "~")))):
         return " ".join(words)
@@ -981,7 +1012,8 @@ def check_writes(line, spaces_dir, cwd=None, home=None):
     """None when a plain Bash line writes nothing check_edit protects; else WRITE or FOLDER_UNKNOWN (spec t-016)."""
     scanned = split_plain_ops(line or "", writes=True, bare=True) or ([], None, [])  # a line that is not plain is not judged
     tops = (forms(spaces_dir), forms(home), personal_settings())
-    here, cdpath, unknown = list(starts_of(cwd)), bool(os.environ.get("CDPATH")), None
+    here, unknown = list(starts_of(cwd)), None
+    cdpath = bool(os.environ.get("CDPATH")) or any("cdpath" in w.lower() for words in scanned[0] for w in words)
     for words, outs in zip(scanned[0], scanned[2]):
         words = from_program(words) or [""]  # [] when the command is redirects only (> x)
         for t in [t for t in dict.fromkeys(outs + file_targets(words)) if t and (t[:1] != "~" or t == "~" or t.startswith("~/"))]:
