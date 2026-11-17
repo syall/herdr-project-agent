@@ -1966,6 +1966,21 @@ cases["P-push-notice"] = async () => { // §8.2: the orchestrator is told the re
   }
 };
 
+cases["P-push-tool-replies"] = async () => { // the tool's own success shapes (Job A): "already on the remote", output as one string, a message led by the card id
+  const already = { ok: true, done: true, answer: "Push", refusal: null, message: `${PID}: already on the remote: ${PURL} main is at cc11000.`,
+    result: { at: "2026-11-16T10:01:00Z", from: PR, to: PC, url: PURL, branch: "main", merged: false, how: "already", output: "" } };
+  const pushed = { ...runPushed, message: `${PID}: pushed ${PURL} main aa22000..cc11000 (2 commits); local main fast-forwarded.`, result: { ...runPushed.result, how: "pushed", output: "line one\nline two" } };
+  const outcomes = [[already, "Already on the remote: file:///tmp/pa-scratch/origin.git main is at cc11000", `decision ${PID} answered Push; result: already on the remote: ${PURL} main is at cc11000.`],
+    [pushed, "line two", `decision ${PID} answered Push; result: pushed ${PURL} main aa22000..cc11000 (2 commits); local main fast-forwarded.`]];
+  for (const [reply, shows, notice] of outcomes) {
+    const { v } = await pushWorld({ opts: { records: alive() }, tool: { run: () => json(0, reply) } });
+    await click(v, `opt-${PID}-0`); await settle();
+    await click(v, `submit-${PID}`); await settle();
+    check(look(v).text.includes(shows), `shows "${shows}" (got ${look(v).text.slice(0, 1500)})`);
+    check(JSON.stringify(sends()) === JSON.stringify([["send", "t4w", notice]]), `notice "${notice}" (got ${JSON.stringify(sends())})`);
+  }
+};
+
 cases["P-push-answered"] = async () => { // an answered push card shows its answer; no check runs for it
   const { v } = await pushWorld({ card: pushCardText({ status: "answered", answer: "Push", answered: "2026-11-16T10:01:00Z", answeredBy: "person, in the panel" }) });
   await click(v, "view-decisions"); await click(v, "pa-older");
