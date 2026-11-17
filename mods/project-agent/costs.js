@@ -1,7 +1,9 @@
 // The Costs view (t-009): a space's spend, from the costs/summary.json that `pa-costs` writes on the
 // space's machine. Tokens are measured; every money figure is an estimate from the profile's price
 // table and says "est."; billed figures say "billed · account-wide". Generic: no currency, price or
-// provider here; the currency code comes from the summary.
+// provider here; the currency code comes from the summary. Where the summary has totals.cc (t-029), Claude Code's own
+// list-price figure is shown beside est. (est. first; alone only where there is no est.), labelled "Claude Code" or
+// "CC", always USD, never added to est.; it is read from the same summary.json (no other read or exec).
 //   reads:  costs/summary.json only (never a session file), and one ls of costs/ when it is missing;
 //           only while this view is shown in a shown copy (main.js reload(), after its hidden return),
 //           at most once per COSTS_EVERY per space, one in flight per space. The billed comparison:
@@ -72,6 +74,11 @@ const clock = (iso) => { const d = new Date(str(iso)); return Number.isNaN(d.get
 // An entry's estimate: "12.34 est.", "12.34 est. + unpriced" (partial: a priced part and unpriced use), "— est." (no price).
 const est = (e, cur) => (e?.money === null || e?.money === undefined ? "— est." : `${money(e.money, cur)} est.${num(e.unpricedTokens) > 0 ? " + unpriced" : ""}`);
 const priceTag = (e) => (e?.money === null || e?.money === undefined ? (num(e?.tokens) > 0 ? "no price" : "") : num(e.unpricedTokens) > 0 ? "partly no price" : "");
+// Claude Code's own figure (t-029 R7): its list-price estimate, always USD (never the summary's currency), shown beside
+// est. and never added to it. Only a summary with totals.cc carries it; without that, nothing of it is drawn (AC7.5).
+const ccOf = (s) => (s?.totals?.cc && typeof s.totals.cc === "object" && !Array.isArray(s.totals.cc) ? s.totals.cc : null);
+const ccNum = (v) => (typeof v === "number" && Number.isFinite(v) ? v : null);
+const ccMoney = (v) => `${money(v, null)} USD`;
 // A summary's own entry list (a key that is not one is an empty list).
 const list = (v) => (Array.isArray(v) ? v.filter((e) => e && typeof e === "object") : []);
 
@@ -248,6 +255,7 @@ export class CostsPane {
     else if (tot.money !== null && num(tot.unpricedTokens) > 0) box.child(line(`${tokens(tot.unpricedTokens)} tokens of ${missingModels.join(", ") || "some models"} have no price: shown as tokens only.`, t.blocked));
     box.child(this.tiles(t, s, tot, cur, priced, totals));
     if (num(tot.reconstructedMoney) > 0) box.child(line(`◌ Includes ${money(tot.reconstructedMoney, cur)} est. reconstructed (best effort) from session files still on disk.`, t.dim));
+    for (const text of this.ccNotes(s)) { totals.push(text); box.child(line(text, t.dim)); }
     box.child(this.sections(t, space, st, s, cur));
     box.child(this.billed(t, space, st, s, cur));
     return box;
@@ -264,25 +272,51 @@ export class CostsPane {
     };
     const day0 = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate() - 6)).toISOString().slice(0, 10);
     const week = sum(list(s.byDay).filter((d) => /^\d{4}-\d{2}-\d{2}$/.test(str(d.key)) && d.key >= day0));
-    const tile = (title, e, small) => {
-      const figure = priced ? est(e, cur) : `${tokens(e.tokens)} tokens`;
+    // alt: the figure instead of est. (Claude Code's, where there is no est.); cc: Claude Code's line under it.
+    const tile = (title, e, small, alt = null, cc = null) => {
+      const figure = alt ?? (priced ? est(e, cur) : `${tokens(e.tokens)} tokens`);
       lines.push(`${title}: ${figure} · ${small}`);
       const i = lines.length; // its row in the copy text: a stable id
+      if (cc) lines.push(cc);
       return v_flex().flex_1().min_w(0).p(8).gap(2).rounded(7).border(1).border_color(t.border).bg(t.surface)
         .child(div().text_size(11).text_color(t.dim).child(sel(`costs-sel-tile-${i}-title`, title)))
         .child(div().text_size(15).font_semibold().text_color(t.foreground).child(sel(`costs-sel-tile-${i}-figure`, figure)))
-        .child(div().text_size(10.5).text_color(t.dim).child(sel(`costs-sel-tile-${i}-small`, small)));
+        .child(div().text_size(10.5).text_color(t.dim).child(sel(`costs-sel-tile-${i}-small`, small)))
+        .when(Boolean(cc), (x) => x.child(div().text_size(10.5).text_color(t.muted).child(sel(`costs-sel-tile-${i}-cc`, cc))));
     };
     const all = num(tot.tokens?.all), cr = num(tot.tokens?.cr);
+    // Claude Code's figure in the Total tile (AC7.1): under est.; where there is no est., the tile's money, never "est.".
+    const cc = ccOf(s), ccM = ccNum(cc?.money), count = cc ? `${num(cc.sessions)} of ${num(cc.claudeSessions)} Claude sessions` : "";
+    const noEst = tot.money === null || tot.money === undefined;
+    const ccAlt = cc && ccM !== null && noEst ? `Claude Code: ${ccMoney(ccM)} (list price)` : null;
+    const ccLine = !cc ? null : ccM === null ? `Claude Code: no figure · ${count}` : noEst ? `Claude Code's figure: ${count}` : `Claude Code: ${ccMoney(ccM)} (list price) · ${count}`;
     return h_flex().gap(6)
-      .child(tile("Total", { money: tot.money, unpricedTokens: tot.unpricedTokens, tokens: all }, `${tokens(all)} tokens${all ? ` · ${Math.round((cr / all) * 100)}% cache read` : ""}`))
+      .child(tile("Total", { money: tot.money, unpricedTokens: tot.unpricedTokens, tokens: all }, `${tokens(all)} tokens${all ? ` · ${Math.round((cr / all) * 100)}% cache read` : ""}`, ccAlt, ccLine))
       .child(tile("Today", sum(mine), `${tokens(sum(mine).tokens)} tokens`))
       .child(tile("Last 7 days (UTC)", week, `${tokens(week.tokens)} tokens`));
+  }
+
+  // The notes under the tiles where the summary has Claude Code's figure: the legend of "CC", how many sessions have it
+  // (AC7.3) and the figures that match no session (AC7.4).
+  ccNotes(s) {
+    const cc = ccOf(s);
+    if (!cc) return [];
+    const out = [];
+    if (ccNum(cc.money) !== null) out.push("CC = Claude Code's own list-price estimate (USD), per session; not the bill");
+    if (num(cc.sessions) < num(cc.claudeSessions)) {
+      const days = list(s.sessions).filter((x) => ccNum(x.cc) !== null && /^\d{4}-\d{2}-\d{2}/.test(str(x.ccAt))).map((x) => x.ccAt.slice(0, 10)).sort();
+      const covers = days.length ? `covers sessions started from ${days[0]}` : num(cc.sessions) ? `covers ${num(cc.sessions)} of ${num(cc.claudeSessions)} Claude sessions` : "covers none of these sessions yet";
+      out.push(`Claude Code's figure ${covers}; older, Codex and killed-at-the-end sessions have none or a partial one.`);
+    }
+    const um = cc.unmatched && typeof cc.unmatched === "object" ? cc.unmatched : {};
+    if (num(um.sessions) > 0) out.push(`Claude Code figures matching no session (not in the totals): ${num(um.sessions)}, ${ccNum(um.money) === null ? "no figure" : `${ccMoney(um.money)} list price`}`);
+    return out;
   }
 
   sections(t, space, st, s, cur) {
     const out = v_flex().gap(6);
     const totalMoney = s.totals?.money;
+    const ccOn = Boolean(ccOf(s)); // Claude Code's figure on session lines and task rows (AC7.2), only with totals.cc
     // Each section's text as drawn, for its Copy: the head, its rows, and the open drill rows (indented).
     const blocks = {}; let lines = [];
     const begin = (key, text) => { lines = blocks[key] = [text]; };
@@ -295,7 +329,8 @@ export class CostsPane {
       const key = str(entry.key), open = st.open[section] === key;
       const share = totalMoney && entry.money !== null && entry.money !== undefined && !num(entry.unpricedTokens) ? ` · ${Math.round((num(entry.money) / totalMoney) * 100)}%` : "";
       const tag = priceTag(entry), mark = num(entry.reconstructed) > 0 ? " ◌" : "";
-      lines.push([`${label}${mark}`, extra, tag, `${tokens(entry.tokens)} tokens`, `${est(entry, cur)}${share}`].filter(Boolean).join(" · "));
+      const ccCell = ccOn && section === "task" && ccNum(entry.cc) !== null ? `CC ${money(entry.cc, null)} (${num(entry.ccSessions)} of ${num(entry.ccOf)} ${num(entry.ccOf) === 1 ? "session" : "sessions"})` : "";
+      lines.push([`${label}${mark}`, extra, tag, `${tokens(entry.tokens)} tokens`, `${est(entry, cur)}${share}`, ccCell].filter(Boolean).join(" · "));
       const el = v_flex().child(h_flex().id(`costs-${section}-${i}`).gap(8).px(4).items_center().cursor_pointer().hover((x) => x.bg(t.hover))
         .on_click((_e, cx) => { st.open[section] = open ? null : key; cx.notify(); })
         .child(div().flex_none().text_size(11).text_color(t.dim).child(drill ? (open ? "▾" : "▸") : " "))
@@ -303,10 +338,11 @@ export class CostsPane {
         .when(Boolean(extra), (x) => x.child(div().flex_none().text_size(10.5).text_color(t.dim).child(extra)))
         .when(Boolean(tag), (x) => x.child(div().flex_none().text_size(10.5).text_color(t.blocked).child(tag)))
         .child(div().flex_none().text_size(11).text_color(t.dim).child(`${tokens(entry.tokens)} tokens`))
-        .child(div().flex_none().text_size(12).text_color(t.foreground).child(`${est(entry, cur)}${share}`)));
+        .child(div().flex_none().text_size(12).text_color(t.foreground).child(`${est(entry, cur)}${share}`))
+        .when(Boolean(ccCell), (x) => x.child(div().flex_none().text_size(11).text_color(t.muted).child(ccCell))));
       return open && drill ? el.children(drill()) : el;
     };
-    const sessionsOf = (pred) => list(s.sessions).filter(pred).map((x) => sub(`${x.source === "reconstructed" ? "◌ " : ""}${str(x.key)} · ${[x.kind, x.role, x.program, x.model].filter(Boolean).map(str).join(" · ")} · ${clock(x.from)} – ${clock(x.to)} · ${est(x, cur)} · ${str(x.state)}${x.source ? ` · ${str(x.source)}` : ""}`));
+    const sessionsOf = (pred) => list(s.sessions).filter(pred).map((x) => sub(`${x.source === "reconstructed" ? "◌ " : ""}${str(x.key)} · ${[x.kind, x.role, x.program, x.model].filter(Boolean).map(str).join(" · ")} · ${clock(x.from)} – ${clock(x.to)} · ${est(x, cur)}${ccOn && ccNum(x.cc) !== null ? ` · CC ${money(x.cc, null)}` : ""} · ${str(x.state)}${x.source ? ` · ${str(x.source)}` : ""}`));
     const entries = (items) => items.map((e) => sub(`${str(e.key)} · ${tokens(e.tokens)} tokens · ${est(e, cur)}${priceTag(e) ? ` · ${priceTag(e)}` : ""}`));
     // By activity: tasks of an activity; unattributed: its reasons; cache rebuild: the passes with a rebuild and its tasks.
     const acts = list(s.byActivity);
