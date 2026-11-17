@@ -353,9 +353,11 @@ class Reader:
         at = parse_ts(first.get("at") or "")
         self.guard = (at - FORK_SLACK) if guarded and at else None
 
-    def settle(self):
+    def settle(self, until=None):
         if self.f.get("open"):
             if self.f["open"]["calls"]:
+                if until:
+                    self.f["open"]["until"] = until
                 self.settled.append(self.f["open"])
             self.f["open"] = None
             for item in self.f.get("tail", []):
@@ -431,12 +433,12 @@ class Reader:
             f["seen"] = e["ts"]
         if e["type"] == "user":
             if e["start"]:
-                self.settle()
+                self.settle(e["ts"])
                 f["turn"] = e["ts"]
         elif e["type"] == "call":
             self.add_call(e["ts"], e["id"], e["model"], e["tokens"])
         elif e["type"] == "turn":
-            self.settle()
+            self.settle(e["ts"])
             f["turn"] = e["ts"]
             f["model"] = e["model"] or f.get("model")
         elif e["type"] == "total":
@@ -482,12 +484,141 @@ def make_row(sess, seg):
             "day": seg["day"], "calls": seg["calls"], "tokens": seg["tokens"], "long": seg["long"], "rebuild": seg["rebuild"],
             "turn": seg["turn"], "task": sess.get("task"), "phase": None, "activity": None, "role": sess.get("role"),
             "pass": None, "trigger": None, "split": None, "reason": None, "source": sess.get("source") or "recorded",
-            "match": sess.get("match") or "launch-record", "confidence": sess.get("confidence") or "high"}
+            "match": sess.get("match") or "launch-record", "confidence": sess.get("confidence") or "high",
+            "until": seg.get("until")}
+
+
+PA_TRIGGERS = ("report", "message", "decision", "scheduled", "manual", "conversation")
+ROLE_WORDS = {"investigate": "investigate", "design": "design", "plan": "plan", "build": "build", "verifier": "verifier",
+              "verify": "verifier", "reviewer": "reviewer", "review": "reviewer"}
+HANDOFF_SLACK = 5  # seconds: a handoff journaled just after the worker's prompt still counts for it
+
+
+def space_facts(ctx):
+    """The ledger and the journal, read once per collect and only when a row needs them. The journal's `why` is
+    looked at only for address tokens; it is never kept."""
+    if "journal" not in ctx:
+        directory = ctx["directory"]
+        try:
+            ctx["ledger"] = pa.read_json(os.path.join(directory, "ledger.json"), {}) or {}
+        except (OSError, ValueError):
+            ctx["ledger"] = {}
+        entries, _bad = read_lines(os.path.join(directory, "journal.jsonl"))
+        journal = []
+        for e in entries:
+            at = parse_ts(e.get("at") or "") if isinstance(e.get("at"), str) else None
+            if at is None:
+                continue
+            journal.append({"at": at, "trigger": e.get("trigger") if isinstance(e.get("trigger"), str) else None,
+                            "task": e.get("task") if isinstance(e.get("task"), str) else None,
+                            "pass": e.get("pass") if isinstance(e.get("pass"), int) and not isinstance(e.get("pass"), bool) else None,
+                            "to": e.get("to") if isinstance(e.get("to"), str) else None,
+                            "why": e.get("why") if isinstance(e.get("why"), str) else ""})
+        journal.sort(key=lambda e: e["at"])
+        ctx["journal"] = journal
+    return ctx["ledger"], ctx["journal"]
 
 
 def attribute(row, sess, ctx):
-    """Fills activity, task, phase, role, pass, trigger, split and reason (spec 3.5). Step 2: nothing known yet."""
+    """Fills activity, task, phase, role, pass, trigger, split and reason (spec 3.5). None: a Project Agent turn whose
+    journal entries may still come (held for up to IDLE seconds)."""
+    kind = sess.get("kind")
+    if kind == "pa":
+        return attribute_pa(row, ctx)
+    if kind == "worker":
+        return attribute_worker(row, sess, ctx)
     row["activity"], row["reason"] = "unattributed", "unknown-session-kind"
+    return row
+
+
+def attribute_pa(row, ctx):
+    _ledger, journal = space_facts(ctx)
+    start = parse_ts(row.get("turn") or row["from"]) or 0
+    end = parse_ts(row.get("until") or "") or ((parse_ts(row["to"]) or start) + IDLE)
+    entries = [e for e in journal if e["at"] + 0.999 >= start and e["at"] < end]
+    row["task"], row["role"] = None, None
+    if not entries:
+        if ctx["now"] - (parse_ts(row["to"]) or 0) < IDLE:
+            return None
+        row["activity"], row["reason"] = "unattributed", "pa-no-journal"
+        return row
+    counts = {}
+    for e in entries:
+        counts[e["trigger"]] = counts.get(e["trigger"], 0) + 1
+    trigger = max(counts, key=lambda k: counts[k])  # ties: the first seen
+    row["trigger"] = trigger
+    row["activity"] = "pass:" + (trigger if trigger in PA_TRIGGERS else "other")
+    passes = [e["pass"] for e in entries if e["pass"] is not None]
+    row["pass"] = max(passes) if passes else None
+    weights = {}
+    for e in entries:
+        if e["task"]:
+            weights[e["task"]] = weights.get(e["task"], 0) + 1
+    if len(weights) == 1:
+        row["task"] = next(iter(weights))
+    elif weights:
+        n = float(sum(weights.values()))
+        row["split"] = [{"task": t, "w": round(c / n, 4)} for t, c in sorted(weights.items(), key=lambda x: (-x[1], x[0]))]
+    return row
+
+
+def worker_entry(ledger, terminal, name):
+    found = [(t, w) for t in ledger.get("tasks", []) or [] for w in t.get("workers") or [] if w.get("address") == terminal]
+    found.sort(key=lambda tw: not (name and tw[1].get("name") == name))
+    return found
+
+
+def attribute_worker(row, sess, ctx):
+    ledger, journal = space_facts(ctx)
+    terminal, name = sess.get("terminal"), sess.get("name")
+    start = parse_ts(row.get("turn") or row["from"]) or 0
+    entries = worker_entry(ledger, terminal, name) if terminal else []
+    task = sess.get("task")
+    if terminal and (task is None or len({t.get("id") for t, _w in entries}) > 1):
+        token = re.compile(r"(?<![A-Za-z0-9_-])" + re.escape(terminal) + r"(?![A-Za-z0-9_-])")
+        handoff = None
+        for e in journal:
+            if e["at"] > start + HANDOFF_SLACK:
+                break
+            if e["task"] and token.search(e["why"]):
+                handoff = e
+        if handoff:
+            task = handoff["task"]
+            row["match"], row["confidence"] = "journal-handoff", "medium"
+    row["task"] = task
+    role = sess.get("role")
+    if not role and entries and entries[0][1].get("role"):
+        role = entries[0][1]["role"]
+        if not sess.get("rolePinned"):
+            ctx["events"].append({"v": 1, "ev": "role", "at": iso(ctx["now"]), "session": sess["session"], "role": role, "from": "ledger"})
+            sess["role"], sess["rolePinned"] = role, True
+    if not role and name:
+        role = ROLE_WORDS.get(name.rsplit("-", 1)[-1])
+    row["role"] = role
+    phase = None
+    for e in journal:
+        if e["at"] > start:
+            break
+        if e["task"] == task and e["to"]:
+            phase = e["to"].split("/")[0]
+    row["phase"] = phase
+    if not task:
+        row["activity"], row["reason"] = "unattributed", "worker-no-task"
+        return row
+    word = ROLE_WORDS.get(role or "", role)
+    if word == "reviewer":
+        activity = "review"
+    elif word == "verifier":
+        activity = "verify"
+    elif word in ("build", "investigate", "plan"):
+        activity = word
+    elif word == "design":
+        activity = {"intent": "investigate", "plan": "plan"}.get(phase, "design")
+    elif name and name.endswith("-investigate"):
+        activity = "investigate"
+    else:
+        activity = "other"
+    row["activity"] = activity
     return row
 
 
@@ -556,6 +687,25 @@ def _collect(directory, folder, now, quiet, resummarize):
     sessions = ctx["sessions"]
     files = state.setdefault("files", {})
     out, rows = [], []
+    held, state["held"] = state.get("held") or [], []
+
+    def settle_rows(sess, segments):
+        for seg in segments:
+            row = make_row(sess, seg)
+            done = attribute(row, sess, ctx)
+            if done is None:
+                state["held"].append(row)
+            else:
+                done.pop("until", None)
+                rows.append(done)
+    for row in held:
+        sess = sessions.get(row["session"]) or {"session": row["session"], "kind": row.get("kind")}
+        done = attribute(row, sess, ctx)
+        if done is None:
+            state["held"].append(row)
+        else:
+            done.pop("until", None)
+            rows.append(done)
     for sid in sorted(sessions):
         sess = sessions[sid]
         f = files.setdefault(sid, {"offset": 0})
@@ -573,7 +723,7 @@ def _collect(directory, folder, now, quiet, resummarize):
                 if not f.get("offset"):
                     f["neverRead"] = True
                 f["done"] = True
-            rows.extend(attribute(make_row(sess, seg), sess, ctx) for seg in settled)
+            settle_rows(sess, settled)
             continue
         st = os.stat(path)
         if (f.get("ino") is not None and (st.st_ino != f["ino"] or st.st_dev != f["dev"])) or st.st_size < f.get("offset", 0):
@@ -590,7 +740,7 @@ def _collect(directory, folder, now, quiet, resummarize):
             seen = parse_ts(f.get("seen") or f["open"]["to"]) or now
             if now - seen >= IDLE or iso(now)[:10] > f["open"]["day"]:
                 reader.settle()
-        rows.extend(attribute(make_row(sess, seg), sess, ctx) for seg in settled)
+        settle_rows(sess, settled)
         seen = parse_ts(f.get("seen") or "") or 0
         if (sess.get("closed") or sess.get("gone")) and not f.get("open") and now - seen >= DONE_AFTER:
             f["done"] = True
