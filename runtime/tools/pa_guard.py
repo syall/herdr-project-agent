@@ -68,10 +68,9 @@ def split_plain_ops(line, writes=False, bare=False):
     Not plain: $ and backticks (outside single quotes), < >, a lone &, |&, ( ) { } (except the @{...} of
     stash@{0} and HEAD@{1}), unquoted glob characters * ? [, a # or = starting a word, an unquoted line
     break or line continuation, an unterminated quote, an empty command between operators.
-    writes=True (t-016): also plain are > >> < &> &>> (an fd's digits before them dropped), each followed by a word, and
+    writes=True (t-016): also plain are > >> < &> &>> (fd digits before them dropped), each followed by a word, and
     >&N N>&M >&- <&N; $HOME or ${HOME} starting a word (unquoted or in double quotes) is the home. Returns (commands,
-    operators, targets): targets[i] the words after commands[i]'s output redirects (an input's word is a read).
-    bare=True (with writes, for check_writes): a command of redirects only (> x) is kept, with no words.
+    operators, targets): targets[i] the output-redirect words of commands[i]; bare=True keeps a command of redirects only.
     """
     s = line.strip()
     commands, ops, words, word = [], [], [], []
