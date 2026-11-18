@@ -71,10 +71,12 @@ export async function readAllow(space, cx) {
 export const readOpen = (c) => Boolean(c && c.status === "open" && c.done !== true && c.refusal?.check !== "C4");
 
 export class PushCards {
-  // share(spaceId, id, label | null, running): main.js's shared mark for the other panel windows (t-045 round 2): set
-  // when a run starts (running) and when it ends answered, removed when the card is known open again.
-  constructor(share = () => {}) {
-    this.share = share;
+  // share(spaceId, id, label | null, running, unknown): main.js's shared mark for the other panel windows (t-045 round 2):
+  // set when a run starts (running) and when it ends answered or unknown, removed when the card is known open again.
+  // opened(spaceId, id, asked): a check from this copy, asked at `asked`, read the card open (t-045 round 3): an unknown
+  // result's shared mark from any window, written before then, goes; nothing else unlocks it, not its age.
+  constructor(share = () => {}, opened = () => {}) {
+    this.share = share; this.opened = opened;
     // `${space id}\0${card id}` -> { check, at, asked, busy, running, result, kept, error, errorFor, unknown, stale }
     //   check: the last check's JSON; at: when that check was asked for; running: the label being answered;
     //   kept: a push from here whose result stays in the Decisions list until the person leaves it.
@@ -116,6 +118,7 @@ export class PushCards {
       st.check = error ? failed(`pa-push-main check could not run: ${error}`) : printed(r) ?? failed(`pa-push-main check printed no result${said(r) ? `: ${said(r)}` : ` (exit ${r?.code})`}`);
       st.at = asked; st.busy = false;
       if (st.unknown && !st.running && !st.result && readOpen(st.check)) this.share(space.id, entry.id, null); // known open again
+      if (readOpen(st.check)) this.opened(space.id, entry.id, asked); // another window's unknown result, before this check
       cx.notify();
     });
   }
@@ -158,7 +161,7 @@ export class PushCards {
         st.unknown = error ?? `pa-push-main run exited with ${r?.code}${r?.code === 0 ? " without a result that says it pushed" : ""}${said(r) ? `: ${said(r)}` : ""}`;
         st.check = null;
         st.kept = true; // the tool may have saved the card answered before it failed: keep it shown with the check's verdict
-        this.share(space.id, entry.id, label, false); // the other windows stay locked until a check reads it open
+        this.share(space.id, entry.id, label, false, true); // every window stays locked until a check of its own reads it open
         notice = `decision ${entry.id} answered ${label}; result unknown (${st.unknown}); the panel checks the card again`;
       } else {
         if (r.code === 0) {
