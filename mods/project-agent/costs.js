@@ -14,9 +14,10 @@
 //   days:   Today, Last 7 days and By day are this machine's local days when the summary's days are in its zone (t-036:
 //           the collect passes it, zone.js); else they are the summary's days, named ("(UTC)" for an older summary).
 //   scopes: (t-032 J1d) where the summary has them (pa-costs of t-032 on): the account beside Total, or an Accounts section
-//           with two or more; with two or more scopes a By scope section, each scope's "priced as" where it was priced from
-//           another (wider) scope, the scopes of a model in its drill and the scope of each session line. An older summary
-//           has none of these keys and draws as before; nothing more is read.
+//           with two or more; with two or more scopes a By scope section, each scope's "priced from" where it was priced from
+//           another (wider) scope, the scopes of a model in its drill and the scope of each session line. Scopes and prices
+//           are said in words (t-050: "provider p, account a, no region recorded"; "the price file's default prices valid
+//           from <date>"), never as "?" or "*". An older summary has none of these keys and draws as before; nothing more is read.
 //   runs:   on a click only: Refresh (`pa-costs collect`, with this panel's zone), Reconstruct (`pa-costs reconstruct`) on the
 //           space's machine, Turn off (`pa-costs billed disable`, here). Nothing else writes (R12).
 
@@ -89,22 +90,47 @@ const ccMoney = (v) => `${money(v, null)} USD`;
 // A summary's own entry list (a key that is not one is an empty list).
 const list = (v) => (Array.isArray(v) ? v.filter((e) => e && typeof e === "object") : []);
 
-// t-032 J1d: the facts a cost was priced under (provider · endpoint · region · account). A fact that is not a label is
-// "?", with its …By where the entry says how it was found ("? (unknown)", "? (refused)", "? (mixed)").
+// t-032 J1d: the facts a cost was priced under (provider · endpoint · region · account). factsText is the key that groups
+// and compares them (a fact that is not a label is "?"); it is never shown. t-050: the view shows them in words.
 const BY = ["providerBy", "endpointBy", "regionBy", "accountBy"];
+const FACT = ["provider", "endpoint", "region", "account"];
 const label = (v) => (typeof v === "string" && v ? v : null);
 const factsOf = (e) => (Array.isArray(e?.scope) && e.scope.length === 4 ? e.scope : [e?.provider, e?.endpoint, e?.region, e?.account]);
-const factsText = (facts, by = null) => facts.map((v, i) => label(v) ?? (by && typeof by === "object" && label(by[BY[i]]) ? `? (${by[BY[i]]})` : "?")).join(" · ");
-// "priced as <scope>" for each pricedAs (one, or a list) whose scope is not the facts themselves (a fact "?" priced from
-// "*" counts as another scope); "" when every one is. from: with the date its row holds from.
-function pricedNote(facts, pricedAs, from = false) {
+const factsText = (facts) => facts.map((v) => label(v) ?? "?").join(" · ");
+const either = (names, last = "or") => (names.length < 2 ? names.join("") : `${names.slice(0, -1).join(", ")} ${last} ${names[names.length - 1]}`);
+// A scope in words (t-050): known facts named ("provider p", "region g"); unknown ones grouped by how they were found,
+// after them: "no provider, endpoint or region recorded" (unknown, default, or not said), "region value refused",
+// "region not recorded or refused" (mixed).
+function scopeWords(facts, by = null) {
+  const known = [], why = { none: [], refused: [], mixed: [] };
+  facts.forEach((v, i) => {
+    if (label(v)) { known.push(`${FACT[i]} ${v}`); return; }
+    const b = by && typeof by === "object" ? by[BY[i]] : null;
+    why[b === "refused" ? "refused" : b === "mixed" ? "mixed" : "none"].push(FACT[i]);
+  });
+  const unknown = [why.none.length ? `no ${either(why.none)} recorded` : "", why.refused.length ? `${either(why.refused, "and")} value refused` : "",
+    why.mixed.length ? `${either(why.mixed, "and")} not recorded or refused` : ""].filter(Boolean);
+  return { known, unknown };
+}
+const scopeText = (facts, by = null) => { const w = scopeWords(facts, by); return [...w.known, ...w.unknown].join(", "); };
+// How a cost was priced, for each pricedAs (one, or a list) whose scope is not the facts themselves (a fact "?" priced
+// from "*" counts as another scope): "the price file's default prices" (every fact "*"), else "the price file's prices
+// for <its named facts>"; "" when every one is the facts. from: with the dates its rows hold from ("valid from d1 and d2").
+function priceWords(facts, pricedAs, from = false) {
   const plain = factsText(facts);
   const as = (Array.isArray(pricedAs) ? pricedAs : [pricedAs]).filter((x) => x && typeof x === "object" && Array.isArray(x.scope) && x.scope.length === 4);
-  return [...new Set(as.map((x) => {
-    const text = x.scope.map((v) => label(v) ?? "*").join(" · ");
-    return text === plain ? null : `priced as ${text}${from && label(x.validFrom) ? ` (from ${x.validFrom})` : ""}`;
-  }).filter(Boolean))].join("; ");
+  const groups = new Map();
+  for (const x of as) {
+    if (x.scope.map((v) => label(v) ?? "*").join(" · ") === plain) continue;
+    const named = x.scope.map((v, i) => (label(v) && v !== "*" ? `${FACT[i]} ${v}` : null)).filter(Boolean);
+    const text = named.length ? `the price file's prices for ${named.join(", ")}` : "the price file's default prices";
+    const dates = groups.get(text) ?? [];
+    if (from && label(x.validFrom) && !dates.includes(x.validFrom)) dates.push(x.validFrom);
+    groups.set(text, dates);
+  }
+  return [...groups].map(([text, dates]) => `${text}${dates.length ? ` valid from ${either(dates, "and")}` : ""}`).join("; ");
 }
+const pricedNote = (facts, pricedAs, from = false) => { const w = priceWords(facts, pricedAs, from); return w ? `priced from ${w}` : ""; };
 // The summary has two or more scopes (then lines say theirs); its one account label (null: none, or two or more).
 const tagged = (s) => num(s?.scopes) > 1 || list(s?.byScope).length > 1;
 const accountsOf = (s) => list(s?.byAccount).filter((e) => label(e.key));
@@ -349,8 +375,9 @@ export class CostsPane {
   scopeNote(s) {
     const sc = list(s.byScope);
     if (tagged(s) || sc.length !== 1) return [];
-    const f = factsOf(sc[0]), note = pricedNote(f, sc[0].pricedAs, true);
-    return note ? [`All costs: ${factsText(f, sc[0].by)} · ${note}`] : [];
+    const f = factsOf(sc[0]), how = priceWords(f, sc[0].pricedAs, true), w = scopeWords(f, sc[0].by);
+    // t-050: "All costs priced from <prices> (<what was not recorded>) · <the facts known>".
+    return how ? [`All costs priced from ${how}${w.unknown.length ? ` (${w.unknown.join("; ")})` : ""}${w.known.length ? ` · ${w.known.join(", ")}` : ""}`] : [];
   }
 
   // The notes under the tiles where the summary has Claude Code's figure: the legend of "CC", how many sessions have it
@@ -402,7 +429,7 @@ export class CostsPane {
     // With two or more scopes (t-032 J1d) a session line says its scope after the model, and how it was priced where that
     // is another scope (or not at all); a session whose rows span scopes shows its largest and says so.
     const tags = tagged(s);
-    const scopeOf = (x) => (tags ? ` (${factsText(factsOf(x))})` : "");
+    const scopeOf = (x) => (tags ? ` (${scopeText(factsOf(x))})` : "");
     const noteOf = (x) => {
       if (!tags) return "";
       const n = [pricedNote(factsOf(x), x.pricedAs) || priceTag(x), num(x.scopes) > 1 ? `rows in ${num(x.scopes)} scopes (the largest shown)` : ""].filter(Boolean).join(" · ");
@@ -426,7 +453,7 @@ export class CostsPane {
       }
       return [...groups.values()].map((g) => {
         const e = { money: g.money, unpricedTokens: g.money === null ? 0 : g.unpricedTokens, tokens: g.tokens };
-        return sub([`${g.model}${withScope ? ` (${factsText(g.facts)})` : ""}`, `${tokens(g.tokens)} tokens`, est(e, cur), pricedNote(g.facts, g.pricedAs), priceTag(e)].filter(Boolean).join(" · "));
+        return sub([`${g.model}${withScope ? ` (${scopeText(g.facts)})` : ""}`, `${tokens(g.tokens)} tokens`, est(e, cur), pricedNote(g.facts, g.pricedAs), priceTag(e)].filter(Boolean).join(" · "));
       });
     };
     const entries = (items) => items.map((e) => sub(`${str(e.key)} · ${tokens(e.tokens)} tokens · ${est(e, cur)}${priceTag(e) ? ` · ${priceTag(e)}` : ""}`));
@@ -465,7 +492,7 @@ export class CostsPane {
       out.child(titled("scope", "By scope (provider · endpoint · region · account)"));
       list(s.byScope).forEach((x, i) => {
         const f = factsOf(x), same = (e) => factsText(factsOf(e)) === factsText(f);
-        out.child(row("scope", i, x, factsText(f, x.by), pricedNote(f, x.pricedAs, true) || null, () => [
+        out.child(row("scope", i, x, scopeText(f, x.by), pricedNote(f, x.pricedAs, true) || null, () => [
           sub(`Models${dmFrom}:`, t.dim), ...modelLines(same, false), sub("Sessions:", t.dim), ...sessionsOf(same)]));
       });
     }

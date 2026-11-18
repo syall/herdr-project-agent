@@ -275,13 +275,14 @@ activity, task, session type and day, each with its drill-down, and `Refresh` (r
 collect`). Nothing in it writes anything except those two buttons and `Turn off` below.
 It says which account and scope each cost belongs to, from the same summary: with one account label,
 the label beside Total (`account <label>`); with two or more, an **Accounts** section (each with its
-sessions). With two or more scopes, a **By scope** section, one row per `provider · endpoint · region ·
-account` (an unknown fact is `?` with how it was found, e.g. `? (unknown)`), with `priced as <scope>
-(from <date>)` where its price came from another, wider scope and `no price` where none applies; each
-session line then names its scope (and `rows in N scopes` when it spans several: the largest is shown),
-and a model's drill lists its scopes. With one scope priced from another, one line under the tiles
-says so (`All costs: <scope> · priced as <scope> (from <date>)`). A summary from before these labels
-draws as before.
+sessions). With two or more scopes, a **By scope** section, one row per scope in words (`provider p,
+endpoint n, account a, no region recorded`: a fact not recorded, or refused, is said so), with `priced
+from the price file's default prices valid from <date>` (or `… prices for provider p`) where its price
+came from another, wider scope and `no price` where none applies; each session line then names its
+scope (and `rows in N scopes` when it spans several: the largest is shown), and a model's drill lists
+its scopes. With one scope priced from another, one line under the tiles says so (`All costs priced
+from the price file's default prices valid from <date> and <date> (no provider, endpoint or region
+recorded) · account <label>`). A summary from before these labels draws as before.
 
 **Billed amounts** (optional): rows in a neutral shape in `<HERDR_PA_HOME>/billing/billed.jsonl` on
 the panel's machine (`{account, from, to, label, model, kind, quantity, unit, amount, currency, final,
