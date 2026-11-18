@@ -4776,6 +4776,126 @@ class J1R3_StartInEffect(Collecting):
             self.assertNotIn(k, row)
 
 
+class J1D_Limits(Collecting):
+    """t-032 J1d, the d-117 limits fixed with the Costs view: 2 (one account label per row), 7 (the rule fallback reads
+    the model of the start record in effect), 8 (a segment open across a later start record is split there), 9 (a
+    session's entry shows its largest scope)."""
+
+    FACTS_A = J1R3_StartInEffect.FACTS_A
+    FACTS_R = J1R3_StartInEffect.FACTS_R
+
+    def machine_account(self, label):
+        dump({"version": 1, "defaultProfile": "test", "costs": {"account": label}}, os.path.join(pa.ROOT, "config.json"))
+
+    def test_j1d1_one_label_per_row(self):
+        # limit 2: a row whose account came from the chain at launch follows today's chain everywhere: the account
+        # bucket, the scope, the account-scoped price, the day drill, byDayModel and the account-wide sum
+        self.prices(scoped_fixture())
+        self.record(session=SID, model="model-a", **dict(self.FACTS_A, account="acct-old", accountBy="machine"))
+        self.record(session=SID2, model="model-a", **dict(self.FACTS_A, account="acct-e", accountBy="env"))
+        self.add(self.prompt(T0 + 10), self.call(T0 + 12, "d1", lines=1, out=1000000))
+        self.add(self.prompt(T0 + 20, sid=SID2), self.call(T0 + 22, "e1", sid=SID2, lines=1, out=1000000), sid=SID2)
+        self.machine_account("acct-b")  # changed after the launch
+        self.collect(T0 + 5000)
+        s = load(self.costs("summary.json"))
+        self.assertEqual(s["account"], "acct-b")
+        acc = {e["key"]: e["money"] for e in s["byAccount"]}
+        self.assertEqual(set(acc), {"acct-b", "acct-e"})
+        self.assertAlmostEqual(acc["acct-b"], 5.0, places=4)  # the acct-b scope's 5.0 per 1M out
+        self.assertAlmostEqual(acc["acct-e"], 10.0, places=4)  # a launch-recorded label (env) keeps its own
+        scopes = {e["key"]: e["money"] for e in s["byScope"]}
+        self.assertAlmostEqual(scopes["provider-a · global · ? · acct-b"], 5.0, places=4)
+        self.assertNotIn("provider-a · global · ? · acct-old", scopes)
+        self.assertAlmostEqual(s["totals"]["money"], 15.0, places=4)
+        day = s["byDay"][0]
+        self.assertAlmostEqual(sum(a["money"] for a in day["activities"]), 15.0, places=4)
+        dm = {(e["account"], e["accountBy"]): e["money"] for e in s["byDayModel"]}
+        self.assertEqual(set(dm), {("acct-b", "machine"), ("acct-e", "env")})
+        self.assertAlmostEqual(dm[("acct-b", "machine")], 5.0, places=4)
+        _r, out, _e = self.run_cmd(pa_costs.report, self.dir, account_wide=True, account="acct-b", now=T0 + 5000)
+        wide = json.loads(out)
+        self.assertAlmostEqual(sum(e["money"] for e in wide["byDayModel"]), 5.0, places=4)
+
+    def test_j1d1b_row_facts_account_rule(self):
+        chain = ("acct-now", "machine")
+        base = {"session": SID, "model": "model-a", "program": "claude", "provider": "provider-a", "providerBy": "launch"}
+        for by in ("space", "machine", "profile", "default", None):
+            f = pa_costs.row_facts(dict(base, account="acct-then", accountBy=by), {}, None, chain)
+            self.assertEqual((f["account"], f["accountBy"]), chain, by)
+        for by in ("env", "rule"):
+            f = pa_costs.row_facts(dict(base, account="acct-then", accountBy=by), {}, None, chain)
+            self.assertEqual((f["account"], f["accountBy"]), ("acct-then", by))
+
+    def test_j1d2_rule_fallback_reads_the_start_in_effect(self):
+        # limit 7 (review-j1-r4/probe.py): after a fallback the started record (m-held) has no provider or endpoint;
+        # the current rules match only the refused launch's model (m-fresh): the row gets the defaults, not them
+        rules, problems = pa_costs.pricing_rules({"pricing": {"providers": [{"program": "claude", "model": "m-fresh", "provider": "provider-fresh"}],
+                                                              "endpoints": [{"model": "m-fresh", "endpoint": "edge"}]}})
+        self.assertEqual(problems, [])
+        none = {"provider": None, "providerBy": "unknown", "endpoint": None, "endpointBy": "default", "region": None,
+                "regionBy": "unknown", "account": "default", "accountBy": "default"}
+        a = dict(none, ev="start", session=SID, at=iso(T0), model="m-fresh", program="claude")
+        b = dict(none, ev="start", session=SID, at=iso(T0), model="m-held", program="claude")
+        sess = pa_costs.sessions_of([a, b])[SID]
+        row = pa_costs.make_row(sess, pa_costs.new_segment(isoms(T0 + 5), isoms(T0 + 5), "m-held"))
+        f = pa_costs.row_facts(row, sess, rules, ("default", "default"))
+        self.assertEqual((f["provider"], f["providerBy"], f["endpoint"], f["endpointBy"]), (None, "default", None, "default"))
+        # and the other way: the record in effect's model matches, the first's does not
+        sess = pa_costs.sessions_of([b, dict(a, at=iso(T0 + 100))])[SID]
+        row = pa_costs.make_row(sess, pa_costs.new_segment(isoms(T0 + 200), isoms(T0 + 200), "m-fresh"))
+        f = pa_costs.row_facts(row, sess, rules, ("default", "default"))
+        self.assertEqual((f["provider"], f["providerBy"], f["endpoint"], f["endpointBy"]), ("provider-fresh", "rule", "edge", "rule"))
+
+    def facts_of(self, rows):
+        return [{k: r.get(k) for k in FACT_KEYS} for r in sorted(rows, key=lambda r: r["from"])]
+
+    def test_j1d3_segment_split_at_a_later_start(self):
+        # limit 8: no prompt between the calls, a start record between them: two rows, one under each record
+        self.prices(scoped_fixture())
+        self.record(session=SID, model="model-a", **self.FACTS_A)
+        self.record(session=SID, at=iso(T0 + 15), model="model-a", resumed=True, **self.FACTS_R)
+        self.add(self.prompt(T0 + 10), self.call(T0 + 12, "s1", lines=1, out=1000000), self.call(T0 + 20, "s2", lines=1, out=1000000))
+        self.collect(T0 + 5000)
+        rows = self.rows()
+        self.assertEqual(self.facts_of(rows), [self.FACTS_A, self.FACTS_R])
+        self.assertEqual(sum(r["tokens"]["out"] for r in rows), 2000000)
+        s = load(self.costs("summary.json"))
+        self.assertAlmostEqual(s["totals"]["money"], 10.0 + 11.0, places=4)
+
+    def test_j1d3b_segment_open_across_collects(self):
+        # the same, with the segment still open in state.json when the second record is written
+        self.prices(scoped_fixture())
+        self.record(session=SID, model="model-a", **self.FACTS_A)
+        self.add(self.prompt(T0 + 10), self.call(T0 + 12, "o1", lines=1, out=1000000))
+        self.collect(T0 + 13)
+        self.assertEqual(self.rows(), [])  # still open
+        self.record(session=SID, at=iso(T0 + 15), model="model-a", resumed=True, **self.FACTS_R)
+        self.add(self.call(T0 + 20, "o2", lines=1, out=1000000))
+        self.collect(T0 + 5000)
+        rows = self.rows()
+        self.assertEqual(self.facts_of(rows), [self.FACTS_A, self.FACTS_R])
+        self.assertEqual(sum(r["tokens"]["out"] for r in rows), 2000000)
+
+    def test_j1d4_session_entry_shows_its_largest_scope(self):
+        # limit 9: rows in two scopes, the larger first: the entry names the larger and says how many
+        self.prices(scoped_fixture())
+        self.record(session=SID, model="model-a", **self.FACTS_A)
+        self.add(self.prompt(T0 + 10), self.call(T0 + 12, "l1", lines=1, out=3000000))
+        self.record(session=SID, at=iso(T0 + 1000), model="model-a", resumed=True, **self.FACTS_R)
+        self.add(self.prompt(T0 + 1010), self.call(T0 + 1012, "l2", lines=1, out=1000000))
+        self.record(session=SID2, model="model-a", **self.FACTS_A)
+        self.add(self.prompt(T0 + 20, sid=SID2), self.call(T0 + 22, "l3", sid=SID2, lines=1, out=1000000), sid=SID2)
+        self.collect(T0 + 5000)
+        s = load(self.costs("summary.json"))
+        e = {x["key"]: x for x in s["sessions"]}
+        one, two = e[SID[:8]], e[SID2[:8]]
+        self.assertEqual([one[k] for k in ("provider", "endpoint", "region", "account")], ["provider-a", "global", None, "acct-a"])
+        self.assertEqual(one["pricedAs"]["scope"], ["provider-a", "global", "*", "*"])
+        self.assertEqual(one["scopes"], 2)
+        self.assertAlmostEqual(one["money"], 30.0 + 11.0, places=4)
+        self.assertNotIn("scopes", two)
+
+
 class J1C_Docs(unittest.TestCase):
     def test_j1c11_readme_names_the_scope_format_and_facts(self):
         with open(os.path.join(HERE, "..", "README.md")) as f:

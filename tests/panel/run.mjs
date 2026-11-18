@@ -3885,6 +3885,161 @@ cases["Z6-old-days"] = async () => { // round 2 (REVIEW MF1): a day older than a
     `capped at 64 (got ${parts.length} parts, from ${a[5]}, second ${parts[1]})`);
 };
 
+// ---- t-032 J1d: the Costs view shows scopes and accounts (R-P4, R-A3, A-V3; d-117 limits 6 and 9). Only new summary keys draw
+// anything new: an older summary draws exactly as before (J1D_OLD: its text captured from the c03c3e9 code). ----
+const J1D_CLOCK = { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }; // costs.js clock(): replaced by {clock}
+function j1dText(v, s) {
+  let text = costsView(v).text;
+  const isos = [...(s.sessions ?? []).flatMap((x) => [x.from, x.to]), ...(s.passes ?? []).map((p) => p.from)].filter(Boolean);
+  for (const iso of [...new Set(isos)]) text = text.split(new Date(iso).toLocaleString(undefined, J1D_CLOCK)).join("{clock}");
+  // costs.js money(): the locale's currency affix around the amount becomes {CUR} (the existing cases assume a "." decimal too)
+  let probe; try { probe = new Intl.NumberFormat(undefined, { style: "currency", currency: CUR }).format(7.5); } catch { probe = `7.50 ${CUR}`; }
+  const [pre, post] = probe.split("7.50");
+  const esc = (x) => x.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  if (post !== undefined) text = text.replace(new RegExp(`${esc(pre)}(<?[\\d,]*\\.?\\d+)${esc(post)}`, "g"), "{CUR}$1");
+  return text;
+}
+// The view's text in nine states: default, each session type, and the first drill of model, task, activity and day.
+async function j1dStates(v, s) {
+  const out = { default: j1dText(v, s) };
+  for (const d of ["kind", "role", "program", "model", "machine"]) { await click(v, `costs-dim-${d}`); await settle(); out[`dim-${d}`] = j1dText(v, s); }
+  await click(v, "costs-dim-model"); await click(v, "costs-kind-0"); await settle(); out["model-open"] = j1dText(v, s); await click(v, "costs-kind-0");
+  await click(v, "costs-dim-kind");
+  for (const k of ["task", "activity", "day"]) { await click(v, `costs-${k}-0`); await settle(); out[`${k}-open`] = j1dText(v, s); await click(v, `costs-${k}-0`); }
+  await settle();
+  return out;
+}
+const J1D_OLD = {
+  "default": "Estimated from test table prices as of 2027-01-01 (XTS) · updated 2 min ago | Refresh | Copy | Total | {CUR}12.50 est. | 1k tokens · 94% cache read | Today | {CUR}1.25 est. | 100 tokens | Last 7 days (UTC) | {CUR}12.50 est. | 1k tokens | ◌ Includes {CUR}2.50 est. reconstructed (best effort) from session files still on disk. | By activity | Copy | ▸ | build ◌ | 600 tokens | {CUR}7.50 est. · 60% | ▸ | cache rebuild after idle | 300 tokens | {CUR}4.00 est. · 32% | ▸ | unattributed | 100 tokens | {CUR}1.00 est. · 8% | By task | Copy | ▸ | t-1 One ≈ | in-progress | 900 tokens | {CUR}11.50 est. · 92% | ▸ | t-0 (deleted) Gone | 0 tokens | {CUR}0.00 est. · 0% | ▸ | (no task) | 100 tokens | {CUR}1.00 est. · 8% | By session type | Copy | kind | role | program | model | machine | ▸ | worker | 900 tokens | {CUR}11.50 est. · 92% | ▸ | pa | 100 tokens | {CUR}1.00 est. · 8% | By day (UTC) | Copy | ▸ | 2027-01-15 | 1k tokens | {CUR}12.50 est. · 100% | Billed amounts: none. The billing query is off; the person turns it on in their own terminal (pa-costs billed enable, see README).",
+  "dim-kind": "Estimated from test table prices as of 2027-01-01 (XTS) · updated 2 min ago | Refresh | Copy | Total | {CUR}12.50 est. | 1k tokens · 94% cache read | Today | {CUR}1.25 est. | 100 tokens | Last 7 days (UTC) | {CUR}12.50 est. | 1k tokens | ◌ Includes {CUR}2.50 est. reconstructed (best effort) from session files still on disk. | By activity | Copy | ▸ | build ◌ | 600 tokens | {CUR}7.50 est. · 60% | ▸ | cache rebuild after idle | 300 tokens | {CUR}4.00 est. · 32% | ▸ | unattributed | 100 tokens | {CUR}1.00 est. · 8% | By task | Copy | ▸ | t-1 One ≈ | in-progress | 900 tokens | {CUR}11.50 est. · 92% | ▸ | t-0 (deleted) Gone | 0 tokens | {CUR}0.00 est. · 0% | ▸ | (no task) | 100 tokens | {CUR}1.00 est. · 8% | By session type | Copy | kind | role | program | model | machine | ▸ | worker | 900 tokens | {CUR}11.50 est. · 92% | ▸ | pa | 100 tokens | {CUR}1.00 est. · 8% | By day (UTC) | Copy | ▸ | 2027-01-15 | 1k tokens | {CUR}12.50 est. · 100% | Billed amounts: none. The billing query is off; the person turns it on in their own terminal (pa-costs billed enable, see README).",
+  "dim-role": "Estimated from test table prices as of 2027-01-01 (XTS) · updated 2 min ago | Refresh | Copy | Total | {CUR}12.50 est. | 1k tokens · 94% cache read | Today | {CUR}1.25 est. | 100 tokens | Last 7 days (UTC) | {CUR}12.50 est. | 1k tokens | ◌ Includes {CUR}2.50 est. reconstructed (best effort) from session files still on disk. | By activity | Copy | ▸ | build ◌ | 600 tokens | {CUR}7.50 est. · 60% | ▸ | cache rebuild after idle | 300 tokens | {CUR}4.00 est. · 32% | ▸ | unattributed | 100 tokens | {CUR}1.00 est. · 8% | By task | Copy | ▸ | t-1 One ≈ | in-progress | 900 tokens | {CUR}11.50 est. · 92% | ▸ | t-0 (deleted) Gone | 0 tokens | {CUR}0.00 est. · 0% | ▸ | (no task) | 100 tokens | {CUR}1.00 est. · 8% | By session type | Copy | kind | role | program | model | machine | ▸ | build | 900 tokens | {CUR}11.50 est. · 92% | ▸ | (none) | 100 tokens | {CUR}1.00 est. · 8% | By day (UTC) | Copy | ▸ | 2027-01-15 | 1k tokens | {CUR}12.50 est. · 100% | Billed amounts: none. The billing query is off; the person turns it on in their own terminal (pa-costs billed enable, see README).",
+  "dim-program": "Estimated from test table prices as of 2027-01-01 (XTS) · updated 2 min ago | Refresh | Copy | Total | {CUR}12.50 est. | 1k tokens · 94% cache read | Today | {CUR}1.25 est. | 100 tokens | Last 7 days (UTC) | {CUR}12.50 est. | 1k tokens | ◌ Includes {CUR}2.50 est. reconstructed (best effort) from session files still on disk. | By activity | Copy | ▸ | build ◌ | 600 tokens | {CUR}7.50 est. · 60% | ▸ | cache rebuild after idle | 300 tokens | {CUR}4.00 est. · 32% | ▸ | unattributed | 100 tokens | {CUR}1.00 est. · 8% | By task | Copy | ▸ | t-1 One ≈ | in-progress | 900 tokens | {CUR}11.50 est. · 92% | ▸ | t-0 (deleted) Gone | 0 tokens | {CUR}0.00 est. · 0% | ▸ | (no task) | 100 tokens | {CUR}1.00 est. · 8% | By session type | Copy | kind | role | program | model | machine | ▸ | claude | 1k tokens | {CUR}12.50 est. · 100% | By day (UTC) | Copy | ▸ | 2027-01-15 | 1k tokens | {CUR}12.50 est. · 100% | Billed amounts: none. The billing query is off; the person turns it on in their own terminal (pa-costs billed enable, see README).",
+  "dim-model": "Estimated from test table prices as of 2027-01-01 (XTS) · updated 2 min ago | Refresh | Copy | Total | {CUR}12.50 est. | 1k tokens · 94% cache read | Today | {CUR}1.25 est. | 100 tokens | Last 7 days (UTC) | {CUR}12.50 est. | 1k tokens | ◌ Includes {CUR}2.50 est. reconstructed (best effort) from session files still on disk. | By activity | Copy | ▸ | build ◌ | 600 tokens | {CUR}7.50 est. · 60% | ▸ | cache rebuild after idle | 300 tokens | {CUR}4.00 est. · 32% | ▸ | unattributed | 100 tokens | {CUR}1.00 est. · 8% | By task | Copy | ▸ | t-1 One ≈ | in-progress | 900 tokens | {CUR}11.50 est. · 92% | ▸ | t-0 (deleted) Gone | 0 tokens | {CUR}0.00 est. · 0% | ▸ | (no task) | 100 tokens | {CUR}1.00 est. · 8% | By session type | Copy | kind | role | program | model | machine | ▸ | model-a | 1k tokens | {CUR}12.50 est. · 100% | By day (UTC) | Copy | ▸ | 2027-01-15 | 1k tokens | {CUR}12.50 est. · 100% | Billed amounts: none. The billing query is off; the person turns it on in their own terminal (pa-costs billed enable, see README).",
+  "dim-machine": "Estimated from test table prices as of 2027-01-01 (XTS) · updated 2 min ago | Refresh | Copy | Total | {CUR}12.50 est. | 1k tokens · 94% cache read | Today | {CUR}1.25 est. | 100 tokens | Last 7 days (UTC) | {CUR}12.50 est. | 1k tokens | ◌ Includes {CUR}2.50 est. reconstructed (best effort) from session files still on disk. | By activity | Copy | ▸ | build ◌ | 600 tokens | {CUR}7.50 est. · 60% | ▸ | cache rebuild after idle | 300 tokens | {CUR}4.00 est. · 32% | ▸ | unattributed | 100 tokens | {CUR}1.00 est. · 8% | By task | Copy | ▸ | t-1 One ≈ | in-progress | 900 tokens | {CUR}11.50 est. · 92% | ▸ | t-0 (deleted) Gone | 0 tokens | {CUR}0.00 est. · 0% | ▸ | (no task) | 100 tokens | {CUR}1.00 est. · 8% | By session type | Copy | kind | role | program | model | machine | ▸ | this computer | 1k tokens | {CUR}12.50 est. · 100% | By day (UTC) | Copy | ▸ | 2027-01-15 | 1k tokens | {CUR}12.50 est. · 100% | Billed amounts: none. The billing query is off; the person turns it on in their own terminal (pa-costs billed enable, see README).",
+  "model-open": "Estimated from test table prices as of 2027-01-01 (XTS) · updated 2 min ago | Refresh | Copy | Total | {CUR}12.50 est. | 1k tokens · 94% cache read | Today | {CUR}1.25 est. | 100 tokens | Last 7 days (UTC) | {CUR}12.50 est. | 1k tokens | ◌ Includes {CUR}2.50 est. reconstructed (best effort) from session files still on disk. | By activity | Copy | ▸ | build ◌ | 600 tokens | {CUR}7.50 est. · 60% | ▸ | cache rebuild after idle | 300 tokens | {CUR}4.00 est. · 32% | ▸ | unattributed | 100 tokens | {CUR}1.00 est. · 8% | By task | Copy | ▸ | t-1 One ≈ | in-progress | 900 tokens | {CUR}11.50 est. · 92% | ▸ | t-0 (deleted) Gone | 0 tokens | {CUR}0.00 est. · 0% | ▸ | (no task) | 100 tokens | {CUR}1.00 est. · 8% | By session type | Copy | kind | role | program | model | machine | ▾ | model-a | 1k tokens | {CUR}12.50 est. · 100% | ◌ aaaa1111 · worker · build · claude · model-a · {clock} – {clock} · {CUR}7.50 est. · closed · reconstructed | bbbb2222 · worker · build · claude · model-a · {clock} – {clock} · {CUR}4.00 est. · gone · recorded | cccc3333 · pa · claude · model-a · {clock} – {clock} · {CUR}1.00 est. · open · recorded | By day (UTC) | Copy | ▸ | 2027-01-15 | 1k tokens | {CUR}12.50 est. · 100% | Billed amounts: none. The billing query is off; the person turns it on in their own terminal (pa-costs billed enable, see README).",
+  "task-open": "Estimated from test table prices as of 2027-01-01 (XTS) · updated 2 min ago | Refresh | Copy | Total | {CUR}12.50 est. | 1k tokens · 94% cache read | Today | {CUR}1.25 est. | 100 tokens | Last 7 days (UTC) | {CUR}12.50 est. | 1k tokens | ◌ Includes {CUR}2.50 est. reconstructed (best effort) from session files still on disk. | By activity | Copy | ▸ | build ◌ | 600 tokens | {CUR}7.50 est. · 60% | ▸ | cache rebuild after idle | 300 tokens | {CUR}4.00 est. · 32% | ▸ | unattributed | 100 tokens | {CUR}1.00 est. · 8% | By task | Copy | ▾ | t-1 One ≈ | in-progress | 900 tokens | {CUR}11.50 est. · 92% | ≈ shared passes split by journal entries | Phases: | build · 900 tokens · {CUR}11.50 est. | Sessions: | ◌ aaaa1111 · worker · build · claude · model-a · {clock} – {clock} · {CUR}7.50 est. · closed · reconstructed | bbbb2222 · worker · build · claude · model-a · {clock} – {clock} · {CUR}4.00 est. · gone · recorded | ▸ | t-0 (deleted) Gone | 0 tokens | {CUR}0.00 est. · 0% | ▸ | (no task) | 100 tokens | {CUR}1.00 est. · 8% | By session type | Copy | kind | role | program | model | machine | ▸ | worker | 900 tokens | {CUR}11.50 est. · 92% | ▸ | pa | 100 tokens | {CUR}1.00 est. · 8% | By day (UTC) | Copy | ▸ | 2027-01-15 | 1k tokens | {CUR}12.50 est. · 100% | Billed amounts: none. The billing query is off; the person turns it on in their own terminal (pa-costs billed enable, see README).",
+  "activity-open": "Estimated from test table prices as of 2027-01-01 (XTS) · updated 2 min ago | Refresh | Copy | Total | {CUR}12.50 est. | 1k tokens · 94% cache read | Today | {CUR}1.25 est. | 100 tokens | Last 7 days (UTC) | {CUR}12.50 est. | 1k tokens | ◌ Includes {CUR}2.50 est. reconstructed (best effort) from session files still on disk. | By activity | Copy | ▾ | build ◌ | 600 tokens | {CUR}7.50 est. · 60% | Tasks: | t-1 · 600 tokens · {CUR}7.50 est. | ▸ | cache rebuild after idle | 300 tokens | {CUR}4.00 est. · 32% | ▸ | unattributed | 100 tokens | {CUR}1.00 est. · 8% | By task | Copy | ▸ | t-1 One ≈ | in-progress | 900 tokens | {CUR}11.50 est. · 92% | ▸ | t-0 (deleted) Gone | 0 tokens | {CUR}0.00 est. · 0% | ▸ | (no task) | 100 tokens | {CUR}1.00 est. · 8% | By session type | Copy | kind | role | program | model | machine | ▸ | worker | 900 tokens | {CUR}11.50 est. · 92% | ▸ | pa | 100 tokens | {CUR}1.00 est. · 8% | By day (UTC) | Copy | ▸ | 2027-01-15 | 1k tokens | {CUR}12.50 est. · 100% | Billed amounts: none. The billing query is off; the person turns it on in their own terminal (pa-costs billed enable, see README).",
+  "day-open": "Estimated from test table prices as of 2027-01-01 (XTS) · updated 2 min ago | Refresh | Copy | Total | {CUR}12.50 est. | 1k tokens · 94% cache read | Today | {CUR}1.25 est. | 100 tokens | Last 7 days (UTC) | {CUR}12.50 est. | 1k tokens | ◌ Includes {CUR}2.50 est. reconstructed (best effort) from session files still on disk. | By activity | Copy | ▸ | build ◌ | 600 tokens | {CUR}7.50 est. · 60% | ▸ | cache rebuild after idle | 300 tokens | {CUR}4.00 est. · 32% | ▸ | unattributed | 100 tokens | {CUR}1.00 est. · 8% | By task | Copy | ▸ | t-1 One ≈ | in-progress | 900 tokens | {CUR}11.50 est. · 92% | ▸ | t-0 (deleted) Gone | 0 tokens | {CUR}0.00 est. · 0% | ▸ | (no task) | 100 tokens | {CUR}1.00 est. · 8% | By session type | Copy | kind | role | program | model | machine | ▸ | worker | 900 tokens | {CUR}11.50 est. · 92% | ▸ | pa | 100 tokens | {CUR}1.00 est. · 8% | By day (UTC) | Copy | ▾ | 2027-01-15 | 1k tokens | {CUR}12.50 est. · 100% | build · {CUR}7.50 est. | cache rebuild after idle · {CUR}4.00 est. | unattributed · {CUR}1.00 est. | Billed amounts: none. The billing query is off; the person turns it on in their own terminal (pa-costs billed enable, see README).",
+};
+cases["P-costs-j1d-old"] = async () => { // V-J1d-1: a summary without the J1 keys draws exactly as before J1d, in every state
+  const s = costsSummary();
+  const { v } = await costsWorld({ summary: s });
+  const got = await j1dStates(v, s);
+  for (const [k, want] of Object.entries(J1D_OLD)) check(got[k] === want, `${k}: the same text as before J1d (got ${got[k]}\nwant ${want})`);
+  for (const [k, text] of Object.entries(got)) check(!/By scope|Accounts|priced as|· account /.test(text), `${k}: nothing of J1d (got ${text})`);
+};
+
+// A J1 summary: three scopes (global with the region unknown, priced from the default scope; regional priced as its own
+// facts; another provider without a price), one account.
+const J1D_GLOBAL = ["provider-a", "global", null, "acct1"], J1D_REGIONAL = ["provider-a", "regional", "region-a", "acct1"], J1D_OTHER = ["provider-b", "global", null, "acct1"];
+const j1dKey = (f) => f.map((x) => x ?? "?").join(" · ");
+const j1dFacts = (f) => ({ provider: f[0], endpoint: f[1], region: f[2], account: f[3] });
+function j1dSummary(over = {}) {
+  const base = costsSummary(), day = isoAt(T0).slice(0, 10);
+  const asDefault = { scope: ["provider-a", "global", "*", "*"], validFrom: "2026-01-01" }, asRegional = { scope: J1D_REGIONAL, validFrom: "2026-01-01" };
+  return costsSummary({
+    totals: { ...base.totals, money: 12.5, unpricedTokens: 100 },
+    byScope: [
+      { key: j1dKey(J1D_GLOBAL), scope: J1D_GLOBAL, tokens: 600, money: 7.5, calls: 3, pricedAs: [asDefault], by: { providerBy: "launch", endpointBy: "rule", regionBy: "unknown", accountBy: "env" } },
+      { key: j1dKey(J1D_REGIONAL), scope: J1D_REGIONAL, tokens: 300, money: 5, calls: 2, pricedAs: [asRegional], by: { providerBy: "launch", endpointBy: "rule", regionBy: "machine", accountBy: "env" } },
+      { key: j1dKey(J1D_OTHER), scope: J1D_OTHER, tokens: 100, money: null, calls: 2, pricedAs: [], by: { providerBy: "rule", endpointBy: "rule", regionBy: "refused", accountBy: "env" } }],
+    scopes: 3, account: "acct1", accountBy: "env",
+    byAccount: [{ key: "acct1", tokens: 1000, money: 12.5, unpricedTokens: 100, calls: 7 }],
+    byDayModel: [
+      { day, model: "model-a", tokens: { in: 6, out: 12, cw5m: 18, cw1h: 0, cr: 564 }, money: 7.5, ...j1dFacts(J1D_GLOBAL), accountBy: "env", pricedAs: asDefault },
+      { day, model: "model-a", tokens: { in: 3, out: 6, cw5m: 9, cw1h: 0, cr: 282 }, money: 5, ...j1dFacts(J1D_REGIONAL), accountBy: "env", pricedAs: asRegional },
+      { day, model: "model-a", tokens: { in: 1, out: 2, cw5m: 3, cw1h: 0, cr: 94 }, money: null, ...j1dFacts(J1D_OTHER), accountBy: "env", pricedAs: null }],
+    sessions: [
+      { ...base.sessions[0], ...j1dFacts(J1D_GLOBAL), pricedAs: asDefault },
+      { ...base.sessions[1], ...j1dFacts(J1D_REGIONAL), pricedAs: asRegional },
+      { ...base.sessions[2], money: null, ...j1dFacts(J1D_OTHER), pricedAs: null }],
+    ...over });
+}
+const section = (text, head, next) => { const at = text.indexOf(head); if (at < 0) return ""; const rest = text.slice(at + head.length); const end = next.map((n) => rest.indexOf(n)).filter((x) => x >= 0); return rest.slice(0, end.length ? Math.min(...end) : undefined); };
+const AFTER = ["| By day", "| Billed", "Billed amounts", "| Accounts", "| By scope"];
+
+cases["P-costs-j1d-one"] = async () => { // R-A3: one account: its label beside Total (and in the totals Copy); one scope: no By scope, no tags
+  const s = j1dSummary({ byScope: [{ key: j1dKey(J1D_GLOBAL), scope: J1D_GLOBAL, tokens: 1000, money: 12.5, calls: 7, pricedAs: [{ scope: J1D_GLOBAL, validFrom: "2026-01-01" }], by: {} }],
+    scopes: 1, byAccount: [{ key: "acct1", tokens: 1000, money: 12.5, calls: 7 }], totals: costsSummary().totals,
+    sessions: costsSummary().sessions.map((x) => ({ ...x, ...j1dFacts(J1D_GLOBAL), pricedAs: { scope: J1D_GLOBAL, validFrom: "2026-01-01" } })) });
+  const { v } = await costsWorld({ summary: s });
+  await click(v, "costs-task-0"); await settle();
+  const text = costsView(v).text;
+  check(/1k tokens · 94% cache read · account acct1 \|/.test(text), `the account beside Total (got ${text.slice(0, 900)})`);
+  check(!/By scope|\| Accounts|priced as|provider-a/.test(text), `one scope, one account: no section, no tag (got ${text})`);
+  const copied = await j1dCopy(v, "costs-copy-totals");
+  check(/Total: [^\n]* · account acct1/.test(copied), `the totals Copy says it (got ${copied})`);
+};
+// The text a Copy button puts on the clipboard (the stub's __clipboard): a click on it, then the last write.
+async function j1dCopy(v, id) { clipReset(); await press(v, id); await settle(); return lastClip() ?? ""; }
+
+cases["P-costs-j1d-scopes"] = async () => { // A-V3 AC: two or more scopes: By scope, rows summing to the total; ? with its …By; the priced-as note; tags on session lines
+  const s = j1dSummary();
+  const { v } = await costsWorld({ summary: s });
+  let text = costsView(v).text;
+  const sc = section(text, "| By scope (provider · endpoint · region · account) | Copy", ["| By day"]);
+  check(sc, `a By scope section with Copy (got ${text})`);
+  check(sc.includes("provider-a · global · ? (unknown) · acct1"), `the unknown region as ? with its regionBy (got ${sc})`);
+  check(sc.includes("provider-b · global · ? (refused) · acct1"), `a refused region (got ${sc})`);
+  check(/provider-a · global · \? \(unknown\) · acct1 \| priced as provider-a · global · \* · \* \(from 2026-01-01\) \|/.test(sc), `the default scope's row says priced as (got ${sc})`);
+  check(/provider-a · regional · region-a · acct1 \| 300 tokens/.test(sc), `a row priced as its own facts: no note (got ${sc})`);
+  check(/provider-b · global · \? \(refused\) · acct1 \| no price \| 100 tokens \| — est\./.test(sc), `no price (got ${sc})`);
+  const money = [...sc.matchAll(/(\d+\.\d\d) est\./g)].map((m) => Number(m[1])), toks = [...sc.matchAll(/\| (\d+) tokens/g)].map((m) => Number(m[1]));
+  check(Math.abs(money.reduce((a, b) => a + b, 0) - 12.5) < 1e-9 && toks.reduce((a, b) => a + b, 0) === 1000, `the rows sum to the Total (got ${money}, ${toks})`);
+  check(!/\| Accounts \|/.test(text) && /account acct1 \|/.test(text), `one account: beside Total, no Accounts (got ${text.slice(0, 900)})`);
+  // the drill: models of the scope (from byDayModel), then its sessions
+  await click(v, "costs-scope-0"); await settle(); text = costsView(v).text;
+  const d = section(text, "| By scope (provider · endpoint · region · account) | Copy", ["| By day"]);
+  check(/Models \(from \d{4}-\d{2}-\d{2}\): \| model-a · 600 tokens · [^|]*7\.50[^|]* est\. · priced as provider-a · global · \* · \* \|/.test(d), `the scope's models (got ${d})`);
+  check(/Sessions: \| ◌ aaaa1111 /.test(d) && !d.includes("bbbb2222"), `the scope's sessions (got ${d})`);
+  const copied = await j1dCopy(v, "costs-copy-scope");
+  check(/^By scope[^\n]*\nprovider-a · global · \? \(unknown\) · acct1 · priced as/.test(copied), `the section's Copy (got ${copied})`);
+  // session lines are tagged, with the note where it applies
+  await click(v, "costs-task-0"); await settle(); text = costsView(v).text;
+  check(/aaaa1111 · worker · build · claude · model-a \(provider-a · global · \? · acct1\) · [^|]* est\. · priced as provider-a · global · \* · \* · closed/.test(text), `a tagged session line with its note (got ${text})`);
+  check(/bbbb2222 · worker · build · claude · model-a \(provider-a · regional · region-a · acct1\) · [^|]* est\. · gone/.test(text), `no note where priced as its facts (got ${text})`);
+  // a model row's drill starts with its scopes
+  await click(v, "costs-task-0"); await click(v, "costs-dim-model"); await click(v, "costs-kind-0"); await settle(); text = costsView(v).text;
+  const m = section(text, "| By session type", ["| By day"]);
+  check(/Scopes \(from \d{4}-\d{2}-\d{2}\): \| model-a \(provider-a · global · \? · acct1\) · 600 tokens · [^|]* est\. · priced as provider-a · global · \* · \* \| model-a \(provider-a · regional · region-a · acct1\) · 300 tokens · [^|]* est\. \| model-a \(provider-b · global · \? · acct1\) · 100 tokens · — est\. · no price \|/.test(m), `the model's scopes (got ${m})`);
+  check(moneyLabelled(v).length === 0, `labelled (${JSON.stringify(moneyLabelled(v))})`);
+};
+
+cases["P-costs-j1d-accounts"] = async () => { // R-A3 AC: two accounts: an Accounts section summing to the total, its drill; none beside Total
+  const s = j1dSummary({ byAccount: [{ key: "acct-a", tokens: 900, money: 9.5, calls: 5 }, { key: "acct-b", tokens: 100, money: 3, calls: 2 }],
+    sessions: j1dSummary().sessions.map((x, i) => ({ ...x, account: i === 2 ? "acct-b" : "acct-a" })) });
+  const { v } = await costsWorld({ summary: s });
+  let text = costsView(v).text;
+  check(!/· account /.test(text), `no single account beside Total (got ${text.slice(0, 900)})`);
+  const a = section(text, "| Accounts | Copy", ["| By scope", "| By day"]);
+  check(/acct-a \| 900 tokens \| [^|]*9\.50[^|]* est\. · 76% \|/.test(a) && /acct-b \| 100 tokens \| [^|]*3\.00[^|]* est\. · 24% \|/.test(a), `one row per account (got ${a})`);
+  check(text.indexOf("| Accounts |") > text.indexOf("| By session type") && text.indexOf("| Accounts |") < text.indexOf("| By scope"), "after session type, before By scope");
+  await click(v, "costs-account-1"); await settle(); text = costsView(v).text;
+  const d = section(text, "| Accounts | Copy", ["| By scope", "| By day"]);
+  check(/Sessions: \| cccc3333 /.test(d) && !d.includes("aaaa1111"), `the account's sessions (got ${d})`);
+};
+
+cases["P-costs-j1d-spans"] = async () => { // d-117 limit 9: a session whose rows span scopes says so
+  const s = j1dSummary(); s.sessions[0].scopes = 2;
+  const { v } = await costsWorld({ summary: s });
+  await click(v, "costs-task-0"); await settle();
+  const text = costsView(v).text;
+  check(/aaaa1111 [^|]* · rows in 2 scopes \(the largest shown\)/.test(text), `rows in 2 scopes (got ${text})`);
+  check(!/bbbb2222 [^|]*rows in/.test(text), `not on a one-scope session (got ${text})`);
+};
+
+cases["P-costs-j1d-reads"] = async () => { // V-J1d-4: the same reads and execs as an older summary; malformed keys draw nothing and throw nothing
+  const count = async (summary) => { const { v } = await costsWorld({ summary }); for (let i = 0; i < 3; i++) { advance(11000); v.reload(cx); look(v); await settle(); } return { v, reads: costsReads().map((x) => x.path), execs: costsExecs().map(([, a]) => a.join(" ")) }; };
+  const old = await count(costsSummary()), now = await count(j1dSummary());
+  check(JSON.stringify(old.reads) === JSON.stringify(now.reads) && JSON.stringify(old.execs) === JSON.stringify(now.execs), `the same reads and execs (old ${JSON.stringify(old)} new ${JSON.stringify({ reads: now.reads, execs: now.execs })})`);
+  const bad = costsSummary({ byScope: { a: 1 }, scopes: "2", byAccount: [null, 5, "x"], byDayModel: [7, { model: "model-a", pricedAs: 7, provider: {} }],
+    sessions: costsSummary().sessions.map((x) => ({ ...x, pricedAs: 7, provider: { x: 1 }, scopes: "many" })) });
+  const { v } = await costsWorld({ summary: bad });
+  await click(v, "costs-task-0"); await click(v, "costs-dim-model"); await click(v, "costs-kind-0"); await settle();
+  const text = costsView(v).text;
+  check(!/By scope|\| Accounts|priced as|\[object|rows in|· account /.test(text), `malformed keys draw nothing (got ${text})`);
+};
+
 // Which cases run (t-031): every case, or the named ones; --shard=<k>/<n> keeps every n-th case by definition
 // order (index mod n == k - 1), so n shards together run each case once, and a case added later lands in one.
 // --list prints the names that would run and runs none. An unknown name or option exits 2.
