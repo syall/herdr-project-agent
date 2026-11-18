@@ -110,12 +110,15 @@ Agent but does not run under its launcher (tab name or pane title `PA: <name>`, 
 project, or the space's label) gets a confirm in the panel first.
 (`project-agent.open` is something else: the number of open decision cards per space.)
 
-Shared `project-agent.answering` = `{ "<space id>\u0000<card id>": { "label", "note", "at": <ms>, "by": "<panel copy>" } }`.
+Shared `project-agent.answering` = `{ "<space id>\u0000<card id>": { "label", "note", "at": <ms>, "by": "<panel copy>", "ttl"?, "unknown"? } }`.
 A panel copy writes an entry when the person submits a decision card there; every other copy draws that
-card answered ("Answered in another panel window.") and offers no option or Submit, for at most 120 s
-from `at`. The copy that submitted draws the card answered from the click until a read of the card file
-shows the answer (or a change made after it); only a write that really failed (the file still open)
-unlocks the card, with "Not saved: …".
+card answered ("Answered in another panel window.") and offers no option or Submit while the entry lasts.
+For an ordinary or rule card that is 120 s from `at`. A push card's entry lasts while its push run is in
+flight (its `ttl`, at most 725 s), then 120 s once the run ends answered; a refused run removes it. An
+unknown push result (`unknown: true`) never expires: every copy keeps the card locked, with only Check
+again, until a check from that copy, asked after the result, reads the card open. The copy that submitted
+draws the card answered from the click until a read of the card file shows the answer (or a change made
+after it); only a write that really failed (the file still open) unlocks the card, with "Not saved: …".
 
 ## Messages go only to a live launcher
 
