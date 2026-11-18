@@ -125,6 +125,14 @@ file. Writing any entry also drops entries that have expired. The copy that subm
 draws the card answered from the click until a read of the card file shows the answer (or a change made
 after it); only a write that really failed (the file still open) unlocks the card, with "Not saved: …".
 
+Every card in the Decisions tab also has an **Other** row under its options: pick it, write your own
+answer in the card's text field (at most 2000 characters) and submit. The card is written
+`"answer": "Other", "other": true` with your words in `"note"`, and the notice to the Project Agent
+carries them (on one line, cut at 400 characters; the card keeps them all). No tool acts on an Other
+answer: a rule card answered Other leaves the rule proposed, and on a push card Other runs
+`pa-push-main run --answer Other`, which closes the card and pushes nothing. A card withdrawn after an
+Other answer keeps it as `previousAnswer` / `previousNote`, and a card asked again after it shows it.
+
 ## Messages go only to a live launcher
 
 The panel's "decision … answered" and "rule …" notices are sent to the record whose `alive` is true,

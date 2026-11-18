@@ -12,12 +12,13 @@
 
 import { div } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
-import { isPush, localId, capped, gaveUp, TIMED_OUT } from "./store.js";
+import { isPush, isOther, oneLine, OTHER, localId, capped, gaveUp, TIMED_OUT } from "./store.js";
 import { run as hostRun } from "./host.js";
 import { sel } from "./copy.js";
 
 export { isPush };
 export const PUSH = "Push", NOT_NOW = "Not now";
+const OTHER_SAID = "Answered Other: nothing was pushed."; // t-046: a push card answered in the person's own words
 export const CHECK_EVERY = 30000; // checks not asked for by a click: at most one per card this often
 export const FRESH = 120000; // Push needs a check started less than this long ago
 const CHECK_TIMEOUT = 60000, ALLOW_TIMEOUT = 30000;
@@ -146,9 +147,12 @@ export class PushCards {
   run(space, entry, label, note, cx, told) {
     const st = this.of(space.id, entry.id);
     if (shownOnly(entry)) return false;
-    // Not now while a check runs: not run, and said (t-028); not queued: a run starts only from a Submit click.
-    if (label === NOT_NOW && st.busy && !st.running) { st.notNowWait = true; cx.notify(); return false; }
-    if (this.locked(space.id, entry.id) || st.busy || (label !== PUSH && label !== NOT_NOW)) return false; // never a second run from here
+    // Not now (or Other, t-046) while a check runs: not run, and said (t-028); not queued: a run starts only from a Submit click.
+    // Other pushes nothing: it is run like Not now, with the person's words as --note (one argv element), never --seen.
+    const closes = label === NOT_NOW || label === OTHER;
+    if (closes && st.busy && !st.running) { st.notNowWait = label; cx.notify(); return false; }
+    if (this.locked(space.id, entry.id) || st.busy || (label !== PUSH && !closes)) return false; // never a second run from here
+    if (label === OTHER && !String(note ?? "").trim()) return false; // an Other answer is its words
     if (label === PUSH && !this.canSubmit(space.id, entry.id)) { st.stale = true; cx.notify(); return false; }
     const args = ["run", entry.id, "--answer", label, "--space", localId(space.id), ...(label === PUSH ? ["--seen", st.check.seen] : []), "--json", ...(note ? ["--note", note] : [])];
     st.running = label; st.result = null; st.error = null; st.errorFor = label; st.unknown = null; st.stale = false; st.notNowWait = false;
@@ -160,7 +164,7 @@ export class PushCards {
       const out = error ? null : printed(r);
       // The answer the card has, as the tool says (t-045): a card answered before this run (Push, say, when Not now
       // was asked) is shown and told as that answer, never as the label asked.
-      const answer = r?.code === 0 && [PUSH, NOT_NOW].includes(out?.answer) ? out.answer : label;
+      const answer = r?.code === 0 && [PUSH, NOT_NOW, OTHER].includes(out?.answer) ? out.answer : label;
       // Exit 0 of a Push is done only when the tool's JSON says so (ok, done, and its result).
       const pushedSaid = out?.ok === true && out.done === true && out.result !== null && typeof out.result === "object";
       if (error || ![0, 1, 2].includes(r?.code) || (r.code !== 0 && out?.ok !== false) || (r.code === 0 && answer === PUSH && !pushedSaid)) {
@@ -176,7 +180,8 @@ export class PushCards {
           let what = String(out?.message || resultLine(out?.result) || "pushed");
           if (what.startsWith(`${entry.id}: `)) what = what.slice(entry.id.length + 2); // the tool's message starts with the card id
           notice = answer !== label ? `decision ${entry.id} was already answered ${answer}; ${what}`
-            : label === PUSH ? `decision ${entry.id} answered Push; result: ${what}` : `decision ${entry.id} answered Not now`;
+            : label === PUSH ? `decision ${entry.id} answered Push; result: ${what}`
+            : label === OTHER ? `decision ${entry.id} answered Other (nothing was pushed), in the person's own words: "${oneLine(note)}"` : `decision ${entry.id} answered Not now`;
         } else {
           st.error = text(out?.refusal?.message || out?.message) || said(r) || `pa-push-main run exited with ${r.code}`;
           st.check = null;
@@ -216,7 +221,7 @@ export class PushCards {
         if (st.busy) box.child(line("Checking…", t.dim));
         else if (st.check) box.child(line(st.check.ok === true ? "The check found the card open." : `The check found (${text(st.check.refusal?.check)}): ${text(st.check.refusal?.message)}`));
       }
-      box.child(small(r ? `Recorded on the card: pushed ${text(r.url)} ${text(r.branch)} ${short(r.from)}..${short(r.to)} at ${stamp(r.at)}` : "Nothing was pushed from this card."));
+      if (!(isOther(c) && st?.result)) box.child(small(r ? `Recorded on the card: pushed ${text(r.url)} ${text(r.branch)} ${short(r.from)}..${short(r.to)} at ${stamp(r.at)}` : isOther(c) ? OTHER_SAID : "Nothing was pushed from this card."));
       if (st?.kept) box.child(div().id(`push-done-${entry.id}`).flex_none().text_size(11.5).text_color(t.accent).cursor_pointer().on_click(onDone).child("Done"));
       return box;
     }
@@ -245,9 +250,9 @@ export class PushCards {
     if (chk?.caller) box.child(line(chk.caller.ok ? "This panel may push: yes" : `This panel may push: no (${text(chk.caller.why)})`, chk.caller.ok ? t.muted : t.blocked));
     // State: what this copy did last, then the check's verdict.
     if (st?.result) this.shown(t, box, st, f, lines, entry.id);
-    if (st?.error) box.child(line(`${st.errorFor === NOT_NOW ? "Not saved" : "Not pushed"}: ${st.error}`, t.blocked));
+    if (st?.error) box.child(line(`${st.errorFor !== PUSH ? "Not saved" : "Not pushed"}: ${st.error}`, t.blocked));
     if (st?.unknown) box.child(line(`The result is unknown (${st.unknown}); checking the card again.`, t.blocked));
-    if (st?.notNowWait) box.child(line("Not now was not saved: a check was running. Submit it again.", t.blocked));
+    if (st?.notNowWait) box.child(line(`${st.notNowWait === OTHER ? OTHER : NOT_NOW} was not saved: a check was running. Submit it again.`, t.blocked));
     if (busy) box.child(line("Checking…", t.dim));
     else if (!chk) box.child(small(st?.running ? "" : "Not checked yet."));
     else if (chk.ok !== true) box.child(line(`Push is not possible now (${text(chk.refusal?.check)}): ${text(chk.refusal?.message)}`, t.blocked));
@@ -263,7 +268,7 @@ export class PushCards {
   shown(t, box, st, f, lines = [], cardId = "") {
     const r = st.result.result;
     const where = `${text(r?.url ?? f.url)} ${text(r?.branch ?? f.branch)}`;
-    const said = st.result.label !== PUSH ? "Answered Not now: nothing was pushed."
+    const said = st.result.label === OTHER ? OTHER_SAID : st.result.label !== PUSH ? "Answered Not now: nothing was pushed."
       : r?.how && r.how !== "pushed" ? `Already on the remote: ${where} is at ${short(r?.to)} (recorded at ${clock(r?.at, false)})`
       : `Pushed ${where} ${short(r?.from)}..${short(r?.to)} at ${clock(r?.at, false)}`;
     const id = () => `sel-push-${cardId}-${lines.length}`; // the block's scheme: one id per row
