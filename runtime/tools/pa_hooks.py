@@ -2028,7 +2028,9 @@ def trust_read(text, width=None):
 
 def trust_project(project, home, pa_home=None):
     """(real project folder, None), or (None, why) when it cannot be the base of a trust: also when the home folder
-    or the Project Agent's home is inside it (every folder in them, the Claude home among them, would be inside)."""
+    is inside it (every folder in it, the Claude home among them, would be inside), or when it overlaps the Project
+    Agent's home or its spaces folder either way, on real paths (holds it, is it, or lies inside it: its state
+    folders would be inside it)."""
     if not isinstance(project, str) or not project.strip():
         return None, "agent.json names no project folder"
     if not os.path.isabs(project):
@@ -2039,8 +2041,9 @@ def trust_project(project, home, pa_home=None):
     if real == os.path.realpath(os.sep) or trust_inside(home, real):
         return None, "the project folder is /, the home folder or a folder holding it: every folder in the home " \
                      "folder would be inside it"
-    if pa_home and trust_inside(pa_home, real):
-        return None, "the project folder is the Project Agent's home or a folder holding it: its state would be inside it"
+    if pa_home and any(trust_inside(x, real) or trust_inside(real, x) for x in (pa_home, os.path.join(pa_home, "spaces"))):
+        return None, "the project folder overlaps the Project Agent's home (holds it or its spaces folder, or lies " \
+                     "inside it): its state would be inside it"
     return real, None
 
 
@@ -2070,19 +2073,28 @@ def git_top(folder):
     return os.path.realpath(out) if code == 0 and out else None
 
 
-def trust_key(folder):
-    """The folder Claude Code records the trust for (spec D2), as a real path: in a git repository its root, and
-    in a worktree its main checkout's root; outside git the folder itself. None when git names a repository whose
-    main checkout it cannot tell (a bare repository's worktree, a submodule)."""
+def trust_key_why(folder):
+    """(the folder Claude Code records the trust for (spec D2), as a real path, None), or (None, why). In a git
+    repository its root, and in a worktree its main checkout's root; outside git the folder itself. Outside git
+    only when git says so (exit 128, 'not a git repository'): a timeout, 'dubious ownership' or any other failure,
+    and a repository whose main checkout git cannot tell (a bare repository's worktree, a submodule), give a why."""
     real = os.path.realpath(folder)
-    top = git_top(real)
-    if not top:
-        return real
+    code, out, err = git(real, "rev-parse", "--show-toplevel")
+    if code == 128 and "not a git repository" in err:
+        return real, None
+    if code != 0 or not out:
+        return None, "git could not say whether the folder is in a repository (exit {}: {})".format(
+            code, (err or "no output").splitlines()[0][:200])
     code, common, _ = git(real, "rev-parse", "--git-common-dir")
-    if code != 0 or not common:
-        return None
-    common = os.path.realpath(os.path.join(real, common))
-    return os.path.dirname(common) if os.path.basename(common) == ".git" else None
+    if code == 0 and common:
+        common = os.path.realpath(os.path.join(real, common))
+        if os.path.basename(common) == ".git":
+            return os.path.dirname(common), None
+    return None, "git names a repository for the folder but not its main checkout"
+
+
+def trust_key(folder):
+    return trust_key_why(folder)[0]
 
 
 def trust_area(folder, project, state_dir, task_ids):
@@ -2223,10 +2235,9 @@ def cmd_trust(args):
     if not area:
         done("outside", "on real paths the folder is neither the project folder or inside it (outside the state "
              "folder), nor a task's evidence folder")
-    key = trust_key(real)
+    key, why = trust_key_why(real)
     if not key:
-        done("uncertain", "git names a repository for the folder but not its main checkout, so where the trust "
-             "would be recorded is not known")
+        done("uncertain", why + ", so where the trust would be recorded is not known")
     if key != real and not trust_area(key, project, directory, ids):
         done("outside", "Claude Code would record the trust for {}, the folder's repository (or its main checkout), "
              "which is neither the project folder or inside it nor a task's evidence folder".format(key))
