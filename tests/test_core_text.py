@@ -89,6 +89,29 @@ class Orchestrator(unittest.TestCase):
                       "a hold is on, do neither and only report it.", self.text)  # t-034
         self.assertNotIn("while passes are paused or a hold is on", self.text)
 
+    def test_t039_outside_stop_is_a_restart(self):  # t-039 intent items 1 and 4
+        restart = flat(self.raw[self.raw.index("## After a restart or a compaction"):self.raw.index("## Files")])
+        new = ("A session that stopped, or a turn that was cut off, for any other outside reason counts as a "
+               "restart: the machine slept or restarted, the network or the API failed, the session sat idle, or "
+               "its terminal was closed and restored. Continuing never answers a prompt, a permission or a card "
+               "for the person: those still wait for them.")
+        self.assertIn(new, restart)
+        self.assertLess(restart.index("do neither and only report it."), restart.index(new))
+        self.assertLess(restart.index(new), restart.index("After a restart or a compaction, continue where"))
+
+    def test_t039_alive_but_stopped_worker(self):  # t-039 intent items 2 and 4
+        workers = self.raw[self.raw.index("## Workers"):self.raw.index("## Phases and gates")]
+        bullet = ("- A worker that is alive but stopped mid-job for an outside reason (its screen shows an API, "
+                  "connection or sleep error, it waits at its prompt, and it sent no report) gets one follow-up "
+                  "for its own job saying to continue where it left off. If it stops the same way again right "
+                  "away, that is the job failing twice at the same step. The follow-up answers no prompt, "
+                  "permission or card: a `blocked` worker still goes to the person.")
+        flat_workers = flat(workers)
+        self.assertIn(bullet, flat_workers)
+        # its own place: after the report bullet (fails twice), before closing workers; away from t-035's line
+        self.assertLess(flat_workers.index("see Rounds)."), flat_workers.index(bullet))
+        self.assertLess(flat_workers.index(bullet), flat_workers.index("- Close each worker once its job is over"))
+
     def test_t017_j10_gate_reads_task_tier(self):  # RL-J5-1 / RL-J5-2
         self.assertIn("the gate counts it as the reviewer only for a low-tier task.", self.text)
         self.assertNotIn("counts it as the reviewer for low tier only", self.text)
@@ -271,6 +294,15 @@ class Worker(unittest.TestCase):
                       "that worker left the same way first.", self.text)
         rules = self.raw[self.raw.index("## Rules of the job"):self.raw.index("## Roles")]
         self.assertIn("continue your own job without asking", flat(rules))
+
+    def test_t039_outside_stop_continues_own_job(self):  # t-039 intent items 1, 3 and 4
+        rules = flat(self.raw[self.raw.index("## Rules of the job"):self.raw.index("## Roles")])
+        new = ("read what that worker left the same way first. Do the same when your session stopped or your turn "
+               "was cut off for any other outside reason (the machine slept or restarted, the network or the API "
+               "failed, the session sat idle, its terminal was closed and restored), or the Project Agent tells "
+               "you to continue: do not redo work you already committed. Resuming answers no prompt, permission "
+               "or card: those still go to the person.")
+        self.assertIn(new, rules)
 
     def test_r1_one_job(self):  # AC1.3
         self.assertIn("You are started for one job.", self.text)
