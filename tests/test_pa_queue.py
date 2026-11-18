@@ -1,0 +1,669 @@
+"""Unit tests for pa-queue (t-052 J2): the merge queue's plan, add, show, out, restack, verify and refresh, and the
+gate's content check with the queue (onto from queue.json; change lines only moved, with a short review).
+
+Run: python3 -m unittest -v tests/test_pa_queue.py
+Every case runs in scratch repositories under a mkdtemp folder and a fake space (tests/queue_fixtures.py).
+"""
+import fcntl
+import json
+import os
+import subprocess
+import sys
+import unittest
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from queue_fixtures import *  # noqa: F401,F403
+from queue_fixtures import setUpModule, tearDownModule  # noqa: F401
+
+
+def review_text(tip, reviewer, start=None, end=None, verdict="pass", checked=True):
+    start = start or pa.now()
+    end = end or pa.now()
+    lines = ["# short review", ""]
+    if start != "-":
+        lines.append("Start: " + start)
+    lines.append("End: " + end)
+    if reviewer:
+        lines.append("Reviewer: " + reviewer)
+    lines += ["", "- a.txt: yes, the change still means what was reviewed.", ""]
+    if checked:
+        lines.append("Checked: " + tip)
+    if verdict:
+        lines.append("Verdict: " + verdict)
+    return "\n".join(lines) + "\n"
+
+
+class Q1Plan(QBase):
+    def test_q1_shared_file_starts_from_the_branch(self):
+        self.task("t-A", [("README", "a readme\n")])
+        code, out, err = self.queue("plan", "t-A", "--repo", self.proj, "--files", "README")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("start from main", out)
+        code, out, err = self.queue("plan", "t-B", "--repo", self.proj, "--files", "README", "x.txt")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("start from t-A-x", out)
+        code, out, err = self.queue("plan", "t-C", "--repo", self.proj, "--files", "b.txt")
+        self.assertIn("start from main", out)
+        planned = {p["task"]: p for p in self.qrepo()["planned"]}
+        self.assertEqual(planned["t-B"]["dependsOn"], {"task": "t-A", "job": None})
+        self.assertIsNone(planned["t-C"]["dependsOn"])
+        self.assertEqual(len(self.journal("plan")), 3)
+
+
+class Q2Q3Add(QBase):
+    def test_q2_empty_queue_joins_on_main(self):
+        self.task("t-A", [("a.txt", (10, "ten"))])
+        tip = self.tip("t-A")
+        self.add("t-A")
+        e = self.entry("t-A")
+        self.assertEqual((e["state"], e["onto"], e["tip"], e["rebases"]), ("checking", "main", tip, []))
+        self.assertEqual(e["base"], self.ref("main"))
+        self.assertEqual(e["checked"]["commit"], tip)
+        self.assertEqual(len(self.journal("add")), 1)
+
+    def test_q3_second_task_is_stacked_clean(self):
+        self.task("t-A", [("a.txt", (10, "ten"))])
+        self.add("t-A")
+        self.task("t-B", [("b.txt", "bee\n")])
+        old = self.tip("t-B")
+        code, out, err = self.add("t-B")
+        e = self.entry("t-B")
+        self.assertEqual(e["onto"], "t-A-x")
+        self.assertEqual(e["state"], "checking")
+        self.assertEqual(e["rebases"][0]["result"], "clean")
+        self.assertEqual(e["rebases"][0]["from"], old)
+        self.assertNotEqual(self.tip("t-B"), old)
+        self.assertEqual(self.base_of("t-B", "t-A-x"), self.ref("t-A-x"))
+        self.assertEqual(e["base"], self.ref("t-A-x"))
+        self.assertEqual(e["checked"]["commit"], old)
+        self.assertEqual(len(self.journal("rebase")), 1)
+        code, out, _ = self.gate("t-B")  # the gate takes onto from the queue (C14)
+        self.assertEqual(code, 0, out)
+        self.assertIn("same content as the checked", out)
+
+
+class Q4Refusals(QBase):
+    def setUp(self):
+        super().setUp()
+        self.task("t-A", [("a.txt", (10, "ten"))])
+
+    def refused(self, tid, word):
+        before, refs = snapshot(self.qfile()), self.refs()
+        code, out, err = self.queue("add", tid, "--repo", self.proj)
+        self.assertEqual(code, 1, out + err)
+        self.assertIn(word, err)
+        self.assertEqual(snapshot(self.qfile()), before)
+        self.assertEqual(self.refs(), refs)
+
+    def test_q4a_gate_fails(self):
+        os.remove(os.path.join(self.evidence("t-A"), "REVIEW.md"))
+        self.refused("t-A", "gate")
+
+    def test_q4b_pin_not_tip(self):
+        g = os.path.join(self.evidence("t-A"), "GATE.json")
+        data = pa.read_json(g)
+        data["commits"][0]["commit"] = "0" * 40
+        dump(data, g)
+        self.refused("t-A", "pin")
+
+    def test_q4c_dirty(self):
+        write(os.path.join(self.trees["t-A"], "b.txt"), "dirty\n")
+        self.refused("t-A", "uncommitted")
+
+    def test_q4d_no_checked_line(self):
+        write(os.path.join(self.evidence("t-A"), "VERIFY.md"), "text\nVerdict: pass\n")
+        self.refused("t-A", "Checked")
+
+    def test_q4d2_no_checked_line_in_flight(self):
+        os.remove(os.path.join(self.dir, "content", "since.json"))
+        write(os.path.join(self.evidence("t-A"), "VERIFY.md"), "text\nVerdict: pass\n")
+        self.assertEqual(self.gate("t-A")[0], 0)
+        self.refused("t-A", "no Checked: line")
+
+    def test_q4e_merge_commit(self):
+        wt = self.trees["t-A"]
+        sh(wt, "git", "checkout", "-q", "-b", "side", "main")
+        write(os.path.join(wt, "s.txt"), "s\n")
+        sh(wt, "git", "add", "s.txt")
+        sh(wt, "git", "commit", "-q", "-m", "side")
+        sh(wt, "git", "checkout", "-q", "t-A-x")
+        sh(wt, "git", "merge", "-q", "--no-ff", "-m", "merge", "side")
+        self.checked("t-A")
+        self.gate("t-A")
+        self.refused("t-A", "merge commit")
+
+    def test_q4f_depends_on_not_ahead(self):
+        self.queue("plan", "t-A", "--repo", self.proj, "--files", "a.txt")
+        self.queue("plan", "t-B", "--repo", self.proj, "--files", "a.txt")
+        self.task("t-B", [("b.txt", "bee\n")])
+        self.refused("t-B", "t-A")
+
+    def test_q4g_already_queued(self):
+        self.add("t-A")
+        self.refused("t-A", "already")
+
+    def test_q4h_open_worker_when_a_rebase_is_needed(self):
+        self.add("t-A")
+        self.task("t-B", [("b.txt", "bee\n")])
+        self.add_worker("t-B", "t-Bx", "build", finished=False)
+        self.refused("t-B", "open worker")
+
+    def test_q4i_risky_setting_when_a_rebase_is_needed(self):
+        self.add("t-A")
+        self.task("t-B", [("b.txt", "bee\n")])
+        sh(self.trees["t-B"], "git", "config", "merge.x.driver", "touch {}".format(os.path.join(self.tmp, "marker")))
+        self.refused("t-B", "merge.x.driver")
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "marker")))
+
+
+class Q5Q6Q7Decide(QBase):
+    def test_q5_conflict_leaves_the_branch_unchanged(self):
+        self.task("t-A", [("a.txt", (2, "two A"))])
+        self.add("t-A")
+        self.task("t-B", [("a.txt", (2, "two B"))])
+        old = self.tip("t-B")
+        code, out, err = self.add("t-B", ok=False)
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("needs a rebase worker onto t-A-x", err)
+        self.assertEqual(self.tip("t-B"), old)
+        gitdir = sh(self.trees["t-B"], "git", "rev-parse", "--absolute-git-dir")
+        self.assertFalse(any(os.path.exists(os.path.join(gitdir, n)) for n in ("rebase-merge", "rebase-apply")))
+        self.assertEqual([e["task"] for e in self.entries()], ["t-A"])
+        self.assertEqual(self.journal("refused")[-1]["task"], "t-B")
+
+    def test_q6a_moved_joins_with_a_short_review_needed(self):
+        self.task("t-A", [("a.txt", (30, "thirty"))])
+        self.add("t-A")
+        self.task("t-B", [("a.txt", (100, "hundred"))])
+        code, out, err = self.add("t-B")
+        e = self.entry("t-B")
+        self.assertEqual(e["rebases"][0]["result"], "moved")
+        self.assertEqual(e["state"], "checking")
+        need = e["needs"]["shortReview"]
+        self.assertEqual(need["tip"], self.tip("t-B"))
+        self.assertEqual([f["path"] for f in need["files"]], ["a.txt"])
+        self.assertTrue(need["file"].startswith("SHORT-REVIEW-t-B"))
+        self.assertIn("short review", out)
+        self.assertIn(need["file"], out)
+
+    def test_q6b_changed_is_refused_and_kept_rebased(self):
+        self.task("t-A", [("a.txt", (100, "hundred"))])
+        self.add("t-A")
+        self.task("t-B", [("a.txt", (100, "hundred")), ("c.txt", "c\n")])
+        old = self.tip("t-B")
+        code, out, err = self.add("t-B", ok=False)
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("needs the R8 check on", err)
+        self.assertIn("a.txt", err)
+        self.assertNotEqual(self.tip("t-B"), old)
+        self.assertEqual([e["task"] for e in self.entries()], ["t-A"])
+
+    def test_q7_near_places(self):
+        self.task("t-A", [("a.txt", (90, "ninety"))])
+        self.add("t-A")
+        self.task("t-B", [("a.txt", (100, "hundred"))])
+        self.add("t-B")
+        f = self.entry("t-B")["needs"]["shortReview"]["files"][0]
+        self.assertTrue(f["near"], f)
+        self.assertTrue(f["mainHunks"] and f["changeHunks"])
+
+    def test_q7b_far_still_needs_a_review(self):
+        self.task("t-A", [("a.txt", (10, "ten"))])
+        self.add("t-A")
+        self.task("t-B", [("a.txt", (150, "one fifty"))])
+        self.add("t-B")
+        f = self.entry("t-B")["needs"]["shortReview"]["files"][0]
+        self.assertEqual(f["near"], [])
+
+
+class Q6MovedOnly(QBase):
+    """pa_hooks.moved_only on blob pairs."""
+
+    def blob(self, text):
+        p = subprocess.run(["git", "hash-object", "-w", "--stdin"], cwd=self.proj, input=text.encode("utf-8") if isinstance(text, str) else text,
+                           stdout=subprocess.PIPE, check=True)
+        return p.stdout.decode().strip()
+
+    def rec(self, base, tip, mode="100644", commits=None):
+        return {"files": [{"path": "f", "status": "M", "baseMode": "100644", "tipMode": mode, "baseBlob": base, "tipBlob": tip}],
+                "commits": commits or []}
+
+    def moved(self, a, b):
+        run = pa_hooks.content_git(pa_hooks.git)
+        return pa_hooks.moved_only(run, self.proj, a, b)
+
+    def test_q6c_cases(self):
+        ten = "".join("l{}\n".format(i) for i in range(10))
+        b0, t0 = self.blob(ten), self.blob(ten.replace("l5\n", "five\n"))
+        b1, t1 = self.blob("new\n" + ten), self.blob("new\n" + ten.replace("l5\n", "five\n"))
+        ok, why, shared = self.moved(self.rec(b0, t0), self.rec(b1, t1))
+        self.assertTrue(ok, why)
+        self.assertEqual([s["path"] for s in shared], ["f"])
+        ws = self.blob("new\n" + ten.replace("l5\n", "five \n"))
+        self.assertFalse(self.moved(self.rec(b0, t0), self.rec(b1, ws))[0])
+        last = self.blob("new\n" + ten.replace("l9\n", "nine \n"))
+        last0 = self.blob(ten.replace("l9\n", "nine\n"))
+        self.assertFalse(self.moved(self.rec(b0, last0), self.rec(b1, last))[0], "trailing whitespace on the last line")
+        binary = self.blob(b"\0bin\n")
+        binary2 = self.blob(b"\0bin2\n")
+        self.assertFalse(self.moved(self.rec(binary, t0), self.rec(binary2, t1))[0])
+        self.assertFalse(self.moved(self.rec(b0, t0), self.rec(b1, t1, mode="100755"))[0])
+        self.assertFalse(self.moved(self.rec(b0, t0), self.rec(b0, t1))[0], "same base, other tip: the branch changed it")
+        missing = [{"sha": "1" * 40, "raw": "x", "message": "m"}]
+        self.assertFalse(self.moved(self.rec(b0, t0, commits=missing), self.rec(b1, t1, commits=[{"sha": "2" * 40, "raw": "y", "message": "m"}]))[0])
+
+
+class Q8Q9Review(QBase):
+    def setUp(self):
+        super().setUp()
+        self.task("t-A", [("a.txt", (30, "thirty"))])
+        self.add("t-A")
+        self.task("t-B", [("a.txt", (100, "hundred"))])
+        self.add("t-B")
+        self.need = self.entry("t-B")["needs"]["shortReview"]
+        self.path = os.path.join(self.evidence("t-B"), self.need["file"])
+
+    def reviews(self):
+        p = os.path.join(self.dir, "content", "reviews.jsonl")
+        return [json.loads(l) for l in read(p).splitlines()] if os.path.exists(p) else []
+
+    def test_q8_valid_review_is_recorded_with_its_times(self):
+        self.add_worker("t-B", "t-Bs", "reviewer")
+        write(self.path, review_text(self.tip("t-B"), "t-Bs"))
+        self.suite("t-B", 0)
+        code, out, err = self.queue("refresh", "--repo", self.proj)
+        self.assertEqual(code, 0, out + err)
+        lines = self.reviews()
+        self.assertEqual(len(lines), 1, lines)
+        r = lines[0]
+        self.assertEqual((r["kind"], r["task"], r["tip"], r["verdict"], r["worker"]), ("short-review", "t-B", self.tip("t-B"), "pass", "t-Bs"))
+        for k in ("started", "ended", "seconds", "tree", "fileSha256"):
+            self.assertIn(k, r)
+        timing = [l for l in self.journal() if l.get("timing")]
+        self.assertTrue(timing)
+        self.assertIn(timing[-1]["timing"]["bottleneck"], ("suite", "review"))
+        code, out, err = self.queue("show", "--repo", self.proj)
+        self.assertIn("bottleneck", out)
+        self.queue("refresh", "--repo", self.proj)
+        self.assertEqual(len(self.reviews()), 1, "recorded once")
+
+    def test_q8_invalid_reviews_are_not_recorded(self):
+        tip = self.tip("t-B")
+        self.add_worker("t-B", "t-Bs", "reviewer")
+        self.add_worker("t-B", "t-Bold", "reviewer", started=SINCE)
+        cases = [("no start", review_text(tip, "t-Bs", start="-")),
+                 ("not the tip", review_text("f" * 40, "t-Bs")),
+                 ("an author", review_text(tip, "t-Bb")),
+                 ("started before the rebase", review_text(tip, "t-Bold")),
+                 ("no verdict", review_text(tip, "t-Bs", verdict=None)),
+                 ("no reviewer", review_text(tip, None))]
+        for what, text in cases:
+            with self.subTest(what):
+                write(self.path, text)
+                code, out, err = self.queue("refresh", "--repo", self.proj)
+                self.assertEqual(self.reviews(), [], what)
+                self.assertEqual(self.entry("t-B")["state"], "checking")
+
+    def test_q9_gate_and_moved(self):  # C15
+        code, out, _ = self.gate("t-B")
+        self.assertEqual(code, 1, out)
+        self.assertIn("a short review is needed", out)
+        self.assertIn("a.txt", out)
+        self.add_worker("t-B", "t-Bs", "reviewer")
+        write(self.path, review_text(self.tip("t-B"), "t-Bs"))
+        self.queue("refresh", "--repo", self.proj)
+        code, out, _ = self.gate("t-B")
+        self.assertEqual(code, 0, out)
+        self.assertIn("short review", out)
+        good = self.reviews()
+        path = os.path.join(self.dir, "content", "reviews.jsonl")
+        for what, change in (("must fix", {"verdict": "must fix"}), ("started before HEAD", {"started": SINCE}),
+                             ("an author", {"worker": "t-Bb"}), ("another tree", {"tree": "0" * 40})):
+            with self.subTest(what):
+                write(path, json.dumps(dict(good[0], **change)) + "\n")
+                code, out, _ = self.gate("t-B")
+                self.assertEqual(code, 1, out)
+
+    def test_q9b_content_change_with_a_review_still_fails(self):
+        self.add_worker("t-B", "t-Bs", "reviewer")
+        write(self.path, review_text(self.tip("t-B"), "t-Bs"))
+        self.queue("refresh", "--repo", self.proj)
+        self.change("t-B", "a.txt", (150, "more"))
+        code, out, _ = self.gate("t-B")
+        self.assertEqual(code, 1, out)
+
+
+class ChainBase(QBase):
+    """Four entries A, B, C, D, each its own file, each stacked on the one ahead; gates passed at their tips."""
+
+    def build(self, c_edits=None, c_start=None):
+        self.task("t-A", [("fa.txt", "a\n")])
+        self.add("t-A")
+        self.task("t-B", [("fb.txt", "b\n"), ("a.txt", (30, "thirty"))])
+        self.add("t-B")
+        self.gate("t-B")
+        if c_start:
+            self.task("t-C", c_edits, start=c_start)
+        else:
+            self.task("t-C", c_edits or [("fc.txt", "c\n")])
+        self.add("t-C")
+        self.gate("t-C")
+        self.task("t-D", [("fd.txt", "d\n")])
+        self.add("t-D")
+        self.gate("t-D")
+        self.set_entries(lambda r: [e.update(approval={"card": "d-q", "void": None}) for e in r["entries"]])
+
+
+class Chain(ChainBase):
+    def test_q10_suite_counts_for_its_own_tree(self):
+        self.task("t-A", [("fa.txt", "a\n")])
+        self.add("t-A")
+        self.task("t-B", [("fb.txt", "b\n")])
+        self.suite("t-B", 0)  # its tree before the stack
+        self.add("t-B")
+        self.gate("t-B")
+        self.suite("t-A", 0)
+        code, out, err = self.queue("refresh", "--repo", self.proj)
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(self.entry("t-A")["state"], "passed")
+        self.assertEqual(self.entry("t-B")["state"], "checking")
+        self.assertIn("mergeable: t-A", out)
+
+    def test_q11_failure_restacks_the_chain(self):
+        self.build()
+        a_tip, a_entry = self.tip("t-A"), self.entry("t-A")
+        c_checked, d_checked = self.entry("t-C")["checked"], self.entry("t-D")["checked"]
+        for t in ("t-A", "t-C", "t-D"):
+            self.suite(t, 0)
+        self.suite("t-B", 3)
+        code, out, err = self.queue("refresh", "--repo", self.proj)
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual([e["task"] for e in self.entries()], ["t-A", "t-C", "t-D"])
+        self.assertEqual(self.tip("t-A"), a_tip)
+        self.assertEqual(self.entry("t-A")["approval"], a_entry["approval"])
+        left = self.qrepo()["left"]
+        self.assertEqual(left[-1]["task"], "t-B")
+        self.assertTrue(left[-1]["approval"]["void"])
+        self.assertEqual(self.base_of("t-C", "t-A-x"), a_tip)
+        self.assertEqual(self.entry("t-C")["onto"], "t-A-x")
+        self.assertEqual(self.base_of("t-D", "t-C-x"), self.tip("t-C"), "the chain: D on C's new tip")
+        self.assertEqual(self.entry("t-D")["onto"], "t-C-x")
+        self.assertEqual(self.entry("t-C")["checked"], c_checked)
+        self.assertEqual(self.entry("t-D")["checked"], d_checked)
+        for t in ("t-C", "t-D"):
+            self.assertEqual(self.entry(t)["state"], "checking")
+            self.assertIsNone(self.entry(t)["approval"].get("void"))
+        self.assertEqual(self.gate("t-C")[0], 0)  # C14: a cleanly restacked stacked entry passes
+        self.assertEqual(self.gate("t-D")[0], 0)
+        self.assertFalse(os.path.exists(os.path.join(self.trees["t-D"], "fb.txt")), "B's commits dropped from D")
+
+    def test_q12_dependents_leave_with_it(self):
+        self.task("t-A", [("fa.txt", "a\n")])
+        self.add("t-A")
+        self.queue("plan", "t-B", "--repo", self.proj, "--files", "fb.txt")
+        self.queue("plan", "t-C", "--repo", self.proj, "--files", "fb.txt")
+        self.task("t-B", [("fb.txt", "b\n")])
+        self.add("t-B")
+        self.gate("t-B")
+        self.task("t-C", [("fb.txt", "b c\n")], start="t-B-x")
+        self.add("t-C")
+        self.task("t-D", [("fd.txt", "d\n")])
+        self.add("t-D")
+        self.gate("t-D")
+        self.suite("t-B", 1)
+        code, out, err = self.queue("refresh", "--repo", self.proj)
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual([e["task"] for e in self.entries()], ["t-A", "t-D"])
+        self.assertEqual([l["task"] for l in self.qrepo()["left"]], ["t-B", "t-C"])
+        self.assertEqual(self.base_of("t-D", "t-A-x"), self.tip("t-A"))
+
+    def test_q13_conflict_in_restack_leaves(self):
+        self.task("t-A", [("fa.txt", "a\n")])
+        self.add("t-A")
+        self.queue("plan", "t-B", "--repo", self.proj, "--files", "a.txt")
+        self.queue("plan", "t-C", "--repo", self.proj, "--files", "a.txt")
+        self.task("t-B", [("a.txt", (2, "two B"))])
+        self.add("t-B")
+        self.gate("t-B")
+        self.task("t-C", [("a.txt", (2, "two C"))], start="t-B-x")
+        self.add("t-C")
+        self.task("t-D", [("fd.txt", "d\n")])
+        self.add("t-D")
+        self.gate("t-D")
+        self.set_entries(lambda r: [e.update(approval={"card": "d-q", "void": None}) for e in r["entries"]])
+        c_tip = self.tip("t-C")
+        code, out, err = self.queue("out", "t-B", "--repo", self.proj, "--why", "held")
+        self.assertEqual(code, 0, out + err)
+        code, out, err = self.queue("restack", "--repo", self.proj)
+        self.assertEqual([e["task"] for e in self.entries()], ["t-A", "t-D"])
+        c = self.qrepo()["left"][-1]
+        self.assertEqual((c["task"], c["why"]), ("t-C", "conflict"))
+        self.assertTrue(c["approval"]["void"])
+        self.assertEqual(self.tip("t-C"), c_tip)
+        self.assertEqual(self.base_of("t-D", "t-A-x"), self.tip("t-A"))
+
+    def test_q14_out_dry_run_then_restack(self):
+        self.build(c_edits=[("a.txt", (100, "hundred"))])
+        code, out, err = self.queue("out", "t-B", "--repo", self.proj, "--why", "pulled")
+        self.assertEqual(code, 0, out + err)
+        states = {e["task"]: e["state"] for e in self.entries()}
+        self.assertEqual(states, {"t-A": "checking", "t-C": "invalidated", "t-D": "invalidated"})
+        watch = (self.qfile(), os.path.join(self.dir, "content"), os.path.join(self.dir, "journal.jsonl"))
+        before, refs = snapshot(*watch), self.refs()
+        code, out, err = self.queue("restack", "--repo", self.proj, "--dry-run")
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(snapshot(*watch), before)
+        self.assertEqual(self.refs(), refs)
+        lines = [l for l in out.splitlines() if "git rebase --onto" in l]
+        self.assertEqual(len(lines), 2, out)
+        self.assertIn("t-C-x", lines[0])
+        self.assertIn("t-D-x", lines[1])
+        self.assertIn("shared: a.txt", out)
+        code, out, err = self.queue("restack", "--repo", self.proj)
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(self.entry("t-C")["rebases"][-1]["result"], "moved")
+        self.assertEqual(self.entry("t-D")["rebases"][-1]["result"], "clean")
+
+
+class Q15Q16Restack(ChainBase):
+    def pulled(self):
+        self.build()
+        self.queue("out", "t-B", "--repo", self.proj, "--why", "pulled")
+        return self.tip("t-C"), self.tip("t-D")
+
+    def stops(self, word):
+        c, d = self.tip("t-C"), self.tip("t-D")
+        code, out, err = self.queue("restack", "--repo", self.proj)
+        self.assertEqual(code, 1, out + err)
+        self.assertIn(word, err)
+        self.assertEqual((self.tip("t-C"), self.tip("t-D")), (c, d))
+        self.assertEqual({e["task"]: e["state"] for e in self.entries()}, {"t-A": "checking", "t-C": "invalidated", "t-D": "invalidated"})
+
+    def test_q15a_dirty(self):
+        self.pulled()
+        write(os.path.join(self.trees["t-C"], "fc.txt"), "dirty\n")
+        self.stops("uncommitted")
+
+    def test_q15b_open_worker(self):
+        self.pulled()
+        self.add_worker("t-C", "t-Cs", "verifier", finished=False)
+        self.stops("open worker")
+
+    def test_q15c_in_progress(self):
+        self.pulled()
+        gitdir = sh(self.trees["t-C"], "git", "rev-parse", "--absolute-git-dir")
+        write(os.path.join(gitdir, "MERGE_HEAD"), self.tip("t-C") + "\n")
+        self.stops("in progress")
+
+    def test_q15d_merge_driver(self):
+        self.pulled()
+        sh(self.trees["t-C"], "git", "config", "merge.x.driver", "true")
+        self.stops("merge.x.driver")
+
+    def test_q16_never_main_a_remote_hooks_rerere_or_gpg(self):
+        remote = os.path.join(self.tmp, "remote.git")
+        sh(self.tmp, "git", "clone", "-q", "--bare", self.proj, remote)
+        sh(self.proj, "git", "remote", "add", "origin", remote)
+        self.build()
+        marker = os.path.join(self.tmp, "marker")
+        hooks = sh(self.proj, "git", "rev-parse", "--git-path", "hooks")
+        hooks = hooks if os.path.isabs(hooks) else os.path.join(self.proj, hooks)
+        for name in ("pre-rebase", "post-rewrite", "post-checkout", "pre-commit"):
+            write(os.path.join(hooks, name), "#!/bin/sh\necho {} >> {}\n".format(name, marker))
+            os.chmod(os.path.join(hooks, name), 0o755)
+        gpg = os.path.join(self.tmp, "gpg.sh")
+        write(gpg, "#!/bin/sh\necho gpg >> {}\nexit 1\n".format(marker))
+        os.chmod(gpg, 0o755)
+        write(os.path.join(TEST_ENV["HOME"], ".gitconfig"),
+              "[rerere]\n\tenabled = true\n\tautoupdate = true\n[commit]\n\tgpgsign = true\n[gpg]\n\tprogram = {}\n".format(gpg))
+        main, reflog = self.ref("main"), sh(self.proj, "git", "reflog", "show", "main")
+        remote_refs = sh(remote, "git", "for-each-ref")
+        self.queue("out", "t-B", "--repo", self.proj, "--why", "pulled")
+        code, out, err = self.queue("restack", "--repo", self.proj)
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(self.base_of("t-C", "t-A-x"), self.tip("t-A"))
+        self.assertEqual(self.ref("main"), main)
+        self.assertEqual(sh(self.proj, "git", "reflog", "show", "main"), reflog)
+        self.assertEqual(sh(remote, "git", "for-each-ref"), remote_refs)
+        self.assertFalse(os.path.exists(marker), read(marker) if os.path.exists(marker) else "")
+        common = sh(self.proj, "git", "rev-parse", "--path-format=absolute", "--git-common-dir")
+        self.assertFalse(os.path.exists(os.path.join(common, "rr-cache")))
+
+
+class Q17HandMerges(QBase):
+    def setUp(self):
+        super().setUp()
+        self.task("t-A", [("fa.txt", "a\n")])
+        self.add("t-A")
+        self.task("t-B", [("fb.txt", "b\n")])
+        self.add("t-B")
+        self.gate("t-B")
+
+    def test_q17a_hand_fast_forward_is_read_in_queue_order(self):
+        sh(self.proj, "git", "merge", "-q", "--ff-only", "t-A-x")
+        code, out, err = self.queue("refresh", "--repo", self.proj)
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual([e["task"] for e in self.entries()], ["t-B"])
+        m = self.qrepo()["merged"][-1]
+        self.assertEqual((m["task"], m["by"]), ("t-A", "hand"))
+        self.assertEqual(self.entry("t-B")["onto"], "main")
+        self.assertNotEqual(self.entry("t-B")["state"], "invalidated")
+        self.assertEqual(self.journal("hand-merge")[-1]["task"], "t-A")
+
+    def test_q17b_order_broken(self):
+        self.set_entries(lambda r: r["entries"].reverse())
+        sh(self.proj, "git", "merge", "-q", "--ff-only", "t-A-x")
+        before = snapshot(self.qfile())
+        code, out, err = self.queue("refresh", "--repo", self.proj)
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("order", err)
+        self.assertEqual(snapshot(self.qfile()), before)
+
+    def test_q17c_main_rewound(self):
+        first = self.ref("main")
+        self.on_main("README", "moved\n")
+        self.queue("refresh", "--repo", self.proj)  # mainAt is the new main now
+        sh(self.proj, "git", "reset", "-q", "--hard", first)
+        before = snapshot(self.qfile())
+        code, out, err = self.queue("refresh", "--repo", self.proj)
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("by hand", err)
+        self.assertEqual(snapshot(self.qfile()), before)
+
+
+class Q18Q19Callers(QBase):
+    def test_q18_worker_shells_are_refused(self):
+        self.task("t-A", [("fa.txt", "a\n")])
+        inside = os.path.join(self.tmp, "w")
+        dump({"task": "t-A", "space": SPACE}, os.path.join(inside, ".claude", "pa-task.json"))
+        os.chdir(inside)
+        code, out, err = self.queue("add", "t-A", "--repo", self.proj)
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("worker", err)
+        os.chdir(self.tmp)
+        os.environ["HC_TERMINAL_ID"] = "t-Ab"
+        try:
+            code, out, err = self.queue("add", "t-A", "--repo", self.proj)
+        finally:
+            os.environ.pop("HC_TERMINAL_ID", None)
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("worker", err)
+        self.assertFalse(os.path.exists(self.qfile()))
+
+    def test_q19a_lock_held(self):
+        self.task("t-A", [("fa.txt", "a\n")])
+        pa_queue.LOCK_WAIT = 0.3
+        with open(os.path.join(self.dir, ".queue.lock"), "a") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            code, out, err = self.queue("add", "t-A", "--repo", self.proj)
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("another pa-queue", err)
+        self.assertFalse(os.path.exists(self.qfile()))
+
+    def test_q19b_concurrent_adds(self):
+        self.task("t-A", [("fa.txt", "a\n")])
+        self.task("t-B", [("fb.txt", "b\n")])
+        script = os.path.join(TOOLS, "pa_queue.py")
+        procs = [subprocess.Popen([sys.executable, script, "add", t, "--repo", self.proj, "--space", SPACE], cwd=self.tmp,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True) for t in ("t-A", "t-B")]
+        results = [p.communicate(timeout=120) + (p.returncode,) for p in procs]
+        for out, err, code in results:
+            self.assertEqual(code, 0, out + err)
+        self.assertEqual(sorted(e["task"] for e in self.entries()), ["t-A", "t-B"])
+        self.assertEqual(sorted(l["task"] for l in self.journal("add")), ["t-A", "t-B"])
+
+
+class Q20Show(QBase):
+    def test_q20_show_derives_and_writes_nothing(self):
+        self.task("t-A", [("fa.txt", "a\n")])
+        self.add("t-A")
+        self.on_main("README", "moved\n")
+        before = snapshot(self.qfile(), os.path.join(self.dir, "journal.jsonl"))
+        code, out, err = self.queue("show", "--repo", self.proj, "--json")
+        self.assertEqual(code, 0, out + err)
+        shown = json.loads(out)
+        e = shown["entries"][0]
+        self.assertEqual((e["state"], e["now"]["state"]), ("checking", "invalidated"))
+        self.assertEqual(snapshot(self.qfile(), os.path.join(self.dir, "journal.jsonl")), before)
+
+
+class Q21GateOnto(QBase):
+    def test_q21_branch_out_of_the_queue_is_against_main(self):  # C14
+        self.task("t-A", [("fa.txt", "a\n")])
+        self.add("t-A")
+        self.task("t-B", [("fb.txt", "b\n")])
+        self.add("t-B")
+        self.assertEqual(self.gate("t-B")[0], 0)
+        self.queue("out", "t-B", "--repo", self.proj, "--why", "pulled")
+        code, out, _ = self.gate("t-B")
+        self.assertEqual(code, 1, out)
+        self.assertIn("fa.txt", out)
+
+
+class Q22Install(unittest.TestCase):
+    def test_q22_install_and_parse(self):
+        lines = [l for l in read(os.path.join(REPO, "install.sh")).splitlines() if "pa_queue.py" in l]
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn("for n in pa-queue; do", lines[0])
+        line = next(l for l in read(os.path.join(REPO, "tests", "run-all.sh")).splitlines() if "parses as Python 3.7" in l)
+        self.assertIn("runtime/tools/pa_queue.py", line)
+
+
+class V8SuiteRuns(QBase):
+    def test_suite_runs_reads_both_shapes(self):
+        os.makedirs(os.path.join(self.dir, "content"), exist_ok=True)
+        j1 = {"at": "2026-11-18T10:00:10Z", "task": "t-A", "worker": "t1", "repo": "/r", "commit": "c", "tree": "t",
+              "uncommitted": 0, "exit": 0, "seconds": 10.0, "command": "x"}
+        t056 = dict(j1, kind="suite", started="2026-11-18T10:00:00Z", ended="2026-11-18T10:00:10Z",
+                    parts=[{"name": "unit", "started": "2026-11-18T10:00:00Z", "ended": "2026-11-18T10:00:10Z", "seconds": 10.0, "exit": 0}])
+        write(os.path.join(self.dir, "content", "suites.jsonl"), json.dumps(j1) + "\n" + json.dumps(t056) + "\nnot json\n")
+        runs = pa_hooks.suite_runs(self.dir)
+        self.assertEqual(len(runs), 2)
+        keys = ("kind", "task", "tree", "exit", "uncommitted", "started", "ended", "seconds")
+        self.assertEqual([r[k] for k in keys], [runs[1][k] for k in keys])
+        self.assertIsNone(runs[0]["parts"])
+        self.assertEqual(len(runs[1]["parts"]), 1)
+
+
+if __name__ == "__main__":
+    unittest.main()
