@@ -27,6 +27,9 @@ DENY_TOOLS = refusal(". pa-push-main and pa-push-allow are the person's commands
                      "person answers a push card in the panel. Say in your report that the work is ready to release.", False)
 DENY_RESTART = refusal(". pa-restart is the person's command, or the Project Agent's at their word: a worker never "
                        "restarts a Project Agent. Say in your report what should be restarted and why.", False)
+DENY_CONTEXT = refusal(". pa-context is the person's command (its other subcommands are the Project Agent's own hooks): "
+                       "a worker never changes a Project Agent's context settings. Say in your report what should change "
+                       "and why.", False)
 EDIT = refusal(" is inside a .git folder, the Project Agent's files or the person's git and gh settings, which workers do "
                "not edit. Write reports, logs and notes in your task's evidence folder (evidence/<task-id>/ in the Project "
                "Agent's state folder). If the edit is needed, stop and report it to the Project Agent with hc send.", False)
@@ -121,6 +124,8 @@ def row_of(words):
             i += 1
     deleting = max([k for k, w in enumerate(words) if BRANCH_DELETE.match(w)], default=-1)  # the last delete option
     removing = max([k for k, w in enumerate(words) if w in ("-d", "--delete")], default=-1)
+    tool = next((word(k + 1) for k in range(first, n) if names[k] == "pa.py" and (k == first or PYTHON.match(names[first]))),
+                names[first][3:] if first < n and names[first][:3] == "pa-" else "")  # pa-<tool>, or pa.py <tool>
     if any(word(j) in ("push", "send-pack", "http-push") or word(j) in ("subtree", "lfs") and after(j) == "push"
            for j in subs) or first < n and names[first] in ("git-push", "git-send-pack", "git-http-push"):
         row = DENY_PUSH
@@ -132,9 +137,8 @@ def row_of(words):
     elif first < n and (names[first] in ("pa-push-main", "pa-push-allow", "pa_push.py")
                         or PYTHON.match(names[first]) and "pa_push.py" in names[first + 1:]):
         row = DENY_TOOLS
-    elif first < n and (names[first] == "pa-restart" or any(names[k] == "pa.py" and word(k + 1) == "restart" for k in
-                        range(first, n) if k == first or PYTHON.match(names[first]))):  # t-037 J2: pa.py restart too
-        row = DENY_RESTART
+    elif tool in ("restart", "context"):  # pa-restart (t-037 J2), pa-context (t-041 J3), or pa.py restart|context
+        row = DENY_RESTART if tool == "restart" else DENY_CONTEXT
     else:
         return None
     return row.format(shown(" ".join(shlex.quote(w) for w in words)))

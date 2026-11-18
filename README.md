@@ -378,9 +378,45 @@ Any other value sets nothing and `pa-doctor` notes it. `PA_NO_CC_STATUSLINE=1` d
   provider has none, the session runs with five minutes. A profile for such a provider sets `"5m"` or
   `"default"`.
 - Idle compaction: with the one-hour cache, Claude Code can compact a long conversation (200,000 tokens by
-  default) after about an hour idle. The Project Agent's `--settings` is the place to turn that off
-  (`"idleCompaction": false`) where the Project Agent resets at its own clean points instead.
+  default) after about an hour idle. The Project Agent's `--settings` turns that off (`"idleCompaction":
+  false`, see The Project Agent's context).
 - Takes effect for Project Agents started (or restarted) after the update.
+
+## The Project Agent's context
+
+Chat history is not state: the Project Agent keeps what matters in its state folder, and since t-041 also
+`standing.md` there: your standing words (quoted, with the date and what they apply to), its open asks to
+you, the current hold, and a few working notes. Four fixed headings, at most 6,000 characters; `pa-doctor`
+shows its size and any problem. Business data only: no secrets, no customer content.
+
+Claude Code compacts a conversation by itself when it fills its window (about 967,000 tokens for a 1M
+model), which makes every call before that expensive. For the Project Agent's own session only,
+`pa-session` adds:
+- `--autocompact 400000` (the net): Claude Code compacts at 400,000 tokens instead. A flag, not an
+  environment variable, so the workers it starts get nothing of it. Needs Claude Code v2.1.221 or later.
+- In its one `--settings`: `"idleCompaction": false` (v2.1.290 or later) and three hooks, added to your own
+  hooks, not replacing them. Before a compaction, `pa-context compact-instructions` tells the summary what to
+  keep (open asks, your words, running workers, the next step per task, a hold); after it, `pa-context
+  start-pack` gives the new context what to read again, with `standing.md` inlined; `pa-context compacted`
+  adds a `compact` record to the space's `costs/sessions.jsonl` (ids and times only; `pa-costs report`
+  counts them). The hooks always exit 0, so they never block a compaction.
+- The launcher reads `<claude> --version` once (10 s at most) and leaves out what that version does not
+  support; when the version is not known it leaves out both, and `session.log` says so. Each `start` line
+  in `session.log` ends `net=<tokens|none|off> idle=<off|kept>`.
+
+`context.json` in the state folder holds the settings; no file means the defaults. Set them in a terminal
+(not in an agent's session; workers are refused it too):
+
+```sh
+pa-context set                    # show the settings
+pa-context set --net 450k         # the net, from 100k to 900k
+pa-context set --mode off         # the back-out: no net, no hooks, idle compaction as Claude Code has it
+pa-context set --mode fresh       # back on (the default)
+```
+
+`--task-cap` and `--pass-cap` (defaults 150k and 250k) are kept for the fresh-context reset that comes
+later (t-041 J4); they must stay below the net. A change applies at the Project Agent's next start, or a
+restart in place.
 
 ## Checks
 

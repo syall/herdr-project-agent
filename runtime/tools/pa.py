@@ -21,6 +21,8 @@ One file, selected by the name it is invoked as (symlinks in ~/.local/bin):
   pa-stamp [--commit C] [--dirty]                write installed.json: hashes of the installed tools, core, mods
   pa-restart [--space ID] [--on M] [--now] [--fresh] [--why TEXT] [--wait S] [--dry-run]
                                                  restart the space's Project Agent in place (terminal, workers stay)
+  pa-context set [--mode fresh|off] [--net N] ...   the Project Agent's context settings (t-041; the person's)
+  pa-context compact-instructions|start-pack|compacted   the Project Agent's compaction hooks (Claude Code runs them)
 
 In pa_costs.py (see its docstring), linked as pa-costs: cost tracking per space (collect, report,
 reconstruct, prices, billed ...). Tokens are measured; money is an estimate from the profile's price table.
@@ -619,6 +621,19 @@ def handoff_file(directory, task_id, worker):
     return next((p for p in tries if os.path.isfile(p)), None), expected
 
 
+def checkpoint_line(ledger):
+    """One line on the ledger's `context` checkpoint, as pa-doctor and the start pack (t-041 J3) say it."""
+    ctx = ledger.get("context") if isinstance(ledger, dict) else None
+    if ctx is None:
+        return "checkpoint: none yet"
+    if checkpoint_problems(ctx):
+        return "checkpoint malformed: {}".format(checkpoint_problems(ctx)[0])
+    if ctx["clean"]:
+        return "checkpoint: pass {} at {}, clean, boundary {}{}".format(
+            ctx["pass"], ctx["at"], ctx["boundary"], ", session " + ctx["session"][:8] if ctx.get("session") else "")
+    return "checkpoint: pass {} at {}, not clean ({})".format(ctx["pass"], ctx["at"], ctx["why"][:80])
+
+
 def context_notes(directory, ledger, environ=None):
     """pa-doctor's notes on what must be on disk (t-041 J2): this session's id, the checkpoint, standing.md, tasks whose
     `due` passed, and workers not finished without a handoff file. Notes only, never problems. Never raises."""
@@ -629,16 +644,7 @@ def context_notes(directory, ledger, environ=None):
         if re.match(r"^[A-Za-z0-9-]{8,64}$", sid):
             notes.append("this session: {}".format(sid))
         ledger = ledger if isinstance(ledger, dict) else {}
-        ctx = ledger.get("context")
-        if ctx is None:
-            notes.append("checkpoint: none yet")
-        elif checkpoint_problems(ctx):
-            notes.append("checkpoint malformed: {}".format(checkpoint_problems(ctx)[0]))
-        elif ctx["clean"]:
-            notes.append("checkpoint: pass {} at {}, clean, boundary {}{}".format(
-                ctx["pass"], ctx["at"], ctx["boundary"], ", session " + ctx["session"][:8] if ctx.get("session") else ""))
-        else:
-            notes.append("checkpoint: pass {} at {}, not clean ({})".format(ctx["pass"], ctx["at"], ctx["why"][:80]))
+        notes.append(checkpoint_line(ledger))
         text, _sections, problems, warnings = read_standing(directory)
         if not problems and text is not None:
             notes.append("standing.md: {:,} of {:,} characters".format(len(text), STANDING_CAP))
@@ -825,9 +831,11 @@ def cache_in_effect(p, env):
     return "default", "claude-code"
 
 
-def pa_settings(p, space):
+def pa_settings(p, space, directory=None, version=None):
     """The Project Agent's own Claude Code settings: the recording status line (when there is one) and promptCacheTtl
-    (t-040). One dict, given as one --settings, so another setting for the Project Agent only is added here."""
+    (t-040). One dict, given as one --settings, so another setting for the Project Agent only is added here. With the
+    state folder (t-041 J3, R5/R12): the compaction hooks and, from Claude Code 2.1.290, idleCompaction false, unless
+    context.json says mode off."""
     out = {}
     status = cc_statusline_setting(p, space)
     if status:
@@ -838,13 +846,312 @@ def pa_settings(p, space):
         ttl = None
     if ttl:
         out["promptCacheTtl"] = ttl
+    if directory is not None:
+        try:
+            plan = context_launch(directory, version)
+            if plan["idle"]:
+                out["idleCompaction"] = False
+            hooks = context_hooks(space) if plan["hooks"] else None
+            if hooks:
+                out["hooks"] = hooks
+        except Exception:  # noqa: BLE001 - the launch goes on without them
+            pass
     return out
 
 
-def pa_settings_args(p, space):
+def pa_settings_args(p, space, directory=None, version=None):
     """["--settings", <json>] for the Project Agent's own launch, or [] when there is nothing to set."""
-    settings = pa_settings(p, space)
+    settings = pa_settings(p, space, directory, version)
     return ["--settings", json.dumps(settings, separators=(",", ":"))] if settings else []
+
+
+# ---- t-041 J3: the Project Agent's context settings and the 400k net (R5, R12, R13) ------------------------------
+# context.json in the state folder holds the person's settings (pa-context set; later the panel). With mode fresh
+# (also when there is no file) the Project Agent's Claude gets --autocompact <net> (a flag: nothing it starts
+# inherits it), and in its one --settings three hooks (PreCompact: what the summary keeps; SessionStart after a
+# compaction: the start pack; PostCompact: a `compact` record) and idleCompaction false. The flag and the key need
+# a minimum Claude Code version, read once per launcher process with `<claude> --version`; unknown: left out.
+# mode off is the back-out: none of it.
+
+CONTEXT_FILE = "context.json"
+CONTEXT_DEFAULTS = {"mode": "fresh", "taskCap": 150000, "passCap": 250000, "net": 400000}
+CONTEXT_MODES = ("fresh", "off")
+CONTEXT_BY = ("person", "panel")
+CONTEXT_CAPS = ("taskCap", "passCap", "net")
+CAP_MIN, CAP_MAX = 100000, 900000
+VERSION_TIMEOUT = 10  # seconds for `<claude> --version` (approved on the J3 plan: 10, as t-037's --help probe)
+AUTOCOMPACT_SINCE = (2, 1, 221)  # --autocompact (cli-reference)
+IDLE_COMPACTION_SINCE = (2, 1, 290)  # the idleCompaction setting (settings-reference)
+START_PACK_MAX = 9000  # characters (R10)
+HOOK_TIMEOUT = 10  # seconds, each hook command
+HOOK_STDIN_MAX = 1 << 20  # bytes a hook reads from its stdin
+PA_FILE = os.path.realpath(__file__)
+AGENT_VARS = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CODEX_SANDBOX", "CODEX_HOME_SESSION")
+VERSION = re.compile(r"(?<![\d.])(\d+)\.(\d+)\.(\d+)(?![\d.])")
+
+
+def context_problems(value):
+    """What is wrong with context.json's content (merged over the defaults); [] when it is valid."""
+    if not isinstance(value, dict):
+        return ["not an object"]
+    out = []
+    if value.get("v") != 1 or isinstance(value.get("v"), bool):
+        out.append("v must be 1")
+    if value.get("mode") not in CONTEXT_MODES:
+        out.append("mode must be fresh or off")
+    caps_ok = True
+    for k in CONTEXT_CAPS:
+        n = value.get(k)
+        if isinstance(n, bool) or not isinstance(n, int) or not CAP_MIN <= n <= CAP_MAX:
+            out.append("{} must be a whole number of tokens from {:,} to {:,}".format(k, CAP_MIN, CAP_MAX))
+            caps_ok = False
+    if caps_ok and not value["taskCap"] <= value["passCap"] < value["net"]:
+        out.append("taskCap <= passCap < net must hold")
+    at = value.get("enabledAt")
+    if at is not None and (not isinstance(at, str) or parse_time(at) is None):
+        out.append("enabledAt must be a UTC time or null")
+    if value.get("by") is not None and value.get("by") not in CONTEXT_BY:
+        out.append("by must be person or panel")
+    return out
+
+
+def context_defaults():
+    return dict(CONTEXT_DEFAULTS, v=1, enabledAt=None, by=None)
+
+
+def read_context(directory):
+    """(settings, problem): context.json over the defaults; the defaults with problem None when there is no file (or
+    no folder), with the reason when it is not valid. Never raises."""
+    try:
+        if directory is None:
+            return context_defaults(), None
+        path = os.path.join(directory, CONTEXT_FILE)
+        if not os.path.isfile(path):
+            return context_defaults(), None
+        try:
+            value = json.loads(read_text(path))
+        except ValueError:
+            return context_defaults(), "not JSON"
+        if not isinstance(value, dict):
+            return context_defaults(), "not an object"
+        merged = dict(context_defaults(), **value)
+        problems = context_problems(merged)
+        return (context_defaults(), problems[0]) if problems else (merged, None)
+    except Exception as e:  # noqa: BLE001 - unreadable: the defaults
+        return context_defaults(), "unreadable ({})".format(type(e).__name__)
+
+
+def parse_cc_version(text):
+    """(major, minor, patch) from `claude --version` output: the first X.Y.Z on a line that names Claude Code, else on
+    the first line when that line starts with it (a wrapper's banner with its own version does not count); else None."""
+    if not isinstance(text, str):
+        return None
+    lines = text.splitlines()
+    for line in lines:
+        if "Claude Code" in line:
+            m = VERSION.search(line)
+            if m:
+                return tuple(int(g) for g in m.groups())
+    if lines:
+        m = VERSION.match(lines[0].strip())
+        if m:
+            return tuple(int(g) for g in m.groups())
+    return None
+
+
+def probe_version(p):
+    """The profile's Claude Code version, from `<claude> --version` bounded by VERSION_TIMEOUT; None when unknown."""
+    try:
+        _code, output = run_bounded(resolve(list(p["claude"]) + ["--version"], p), VERSION_TIMEOUT)
+        return parse_cc_version(output.decode("utf-8", "replace"))
+    except Exception:  # noqa: BLE001 - not known: the version-gated flag and key are left out
+        return None
+
+
+def cc_version(p, ctx=None):
+    """probe_version once per launcher process and claude command (cached in ctx, as snapshot_flag is)."""
+    cache = (ctx if ctx is not None else {}).setdefault("versionProbe", {})
+    key = json.dumps(p.get("claude"))
+    if key not in cache:
+        cache[key] = probe_version(p)
+    return cache[key]
+
+
+def version_at_least(version, since):
+    return isinstance(version, tuple) and version >= since
+
+
+def context_launch(directory, version):
+    """What J3 adds to one Project Agent launch: {"mode", "net" (the --autocompact value or None), "idle" (set
+    idleCompaction false), "hooks", "notes" (lines for session.log)}. Never raises."""
+    settings, problem = read_context(directory)
+    notes = ["context.json ignored ({}); using the defaults".format(problem)] if problem else []
+    if settings["mode"] == "off":
+        return {"mode": "off", "net": None, "idle": False, "hooks": False, "notes": notes}
+    if version is None:
+        notes.append("claude --version not known: --autocompact and idleCompaction left out")
+    else:
+        shown = ".".join(map(str, version))
+        if not version_at_least(version, AUTOCOMPACT_SINCE):
+            notes.append("claude {} is older than 2.1.221: no --autocompact".format(shown))
+        if not version_at_least(version, IDLE_COMPACTION_SINCE):
+            notes.append("claude {} is older than 2.1.290: idleCompaction left out".format(shown))
+    return {"mode": "fresh", "net": settings["net"] if version_at_least(version, AUTOCOMPACT_SINCE) else None,
+            "idle": version_at_least(version, IDLE_COMPACTION_SINCE), "hooks": True, "notes": notes}
+
+
+def hook_command(space, sub):
+    """The command line of one compaction hook for this space, or None when the space is not an id."""
+    space = local_id(space or "")
+    if not ID.match(space) or not sys.executable:
+        return None
+    return " ".join(shlex.quote(a) for a in (sys.executable, PA_FILE, "context", sub, "--space", space))
+
+
+def context_hooks(space):
+    """The "hooks" setting: PreCompact (manual and auto) prints what the summary keeps, SessionStart after a
+    compaction prints the start pack, PostCompact records it. None when a command cannot be built."""
+    out = {}
+    for event, sub, matcher in (("PreCompact", "compact-instructions", None), ("SessionStart", "start-pack", "compact"),
+                                ("PostCompact", "compacted", None)):
+        command = hook_command(space, sub)
+        if not command:
+            return None
+        entry = {"hooks": [{"type": "command", "command": command, "timeout": HOOK_TIMEOUT}]}
+        if matcher:
+            entry = dict({"matcher": matcher}, **entry)
+        out[event] = [entry]
+    return out
+
+
+def compact_instructions():
+    """PreCompact's stdout: what the compaction summary must keep (Claude Code reads it as instructions)."""
+    return ("This is the Project Agent's conversation. In the summary, keep: the open asks (what was asked of or "
+            "promised to the person and is not answered yet, with what waits on it); the person's own words since the "
+            "last ledger checkpoint, quoted exactly; each running worker's address, task and job; the next step per "
+            "task; and any hold or resume the person said. The ledger, the journal and standing.md are read again "
+            "after the compaction, so do not copy them.\n")
+
+
+START_PACK_BODY = ("Your state is on disk. This is not a new space. Do as orchestrator.md says under 'After a restart "
+                   "or a compaction': run `pa-doctor`, read ledger.json, `standing.md`, the last 30 journal lines, the "
+                   "open decisions and `hc ls`; read the reports that came in; take the next step the ledger's `next` "
+                   "sets; start nothing else until asked. If the last hold or resume line in the journal is a hold, "
+                   "start nothing. Your standing notes follow, the person's words in quotes; they stand as said.")
+
+
+def start_pack(directory, head):
+    """head, the body, standing.md verbatim (or why it is not there), and the checkpoint line, in at most
+    START_PACK_MAX characters. J4's fresh-context prompt reuses it with its own head (R10). Never raises."""
+    parts = [head + " " + START_PACK_BODY]
+    try:
+        text, _sections, problems, _warnings = read_standing(directory)
+    except Exception as e:  # noqa: BLE001
+        text, problems = None, ["unreadable ({})".format(type(e).__name__)]
+    block = []
+    if text is not None:
+        block.append(text if len(text) <= STANDING_CAP else text[:STANDING_CAP] + "\n(cut: over the cap)")
+    block.extend("standing.md: {}".format(p) for p in problems[:5])
+    parts.append("\n".join(b.rstrip("\n") for b in block))
+    try:
+        ledger = read_json(os.path.join(directory, "ledger.json"), {})
+        parts.append(checkpoint_line(ledger))
+    except Exception:  # noqa: BLE001
+        parts.append("checkpoint: ledger not readable")
+    return "\n\n".join(parts)[:START_PACK_MAX]
+
+
+def parse_amount(text):
+    """A token count from the command line: a whole number, or one with k (400k = 400,000)."""
+    m = re.match(r"^(\d+)([kK]?)$", text or "")
+    if not m:
+        raise Problem("{!r} is not a whole number of tokens (like 400000 or 400k)".format(text))
+    return int(m.group(1)) * (1000 if m.group(2) else 1)
+
+
+def hook_input():
+    """The hook's JSON on stdin (at most HOOK_STDIN_MAX bytes) as a dict; {} when it is anything else."""
+    try:
+        stream = getattr(sys.stdin, "buffer", sys.stdin)
+        data = stream.read(HOOK_STDIN_MAX)
+        value = json.loads(data.decode("utf-8") if isinstance(data, bytes) else data)
+        return value if isinstance(value, dict) else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def hook_directory(space):
+    """The state folder of an existing space, or None (a hook never creates one)."""
+    try:
+        directory = space_dir(space)
+        return directory if os.path.isfile(os.path.join(directory, "agent.json")) else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def cmd_context(args):
+    if args.action == "set":
+        return context_set(args)
+    # The hooks: Claude Code runs them in the Project Agent's session. Each exits 0 whatever happens (PreCompact must
+    # never block a compaction: exit 2 would postpone it to the 967k default).
+    try:
+        if args.action == "compact-instructions":
+            sys.stdout.write(compact_instructions())
+        elif args.action == "start-pack":
+            directory = hook_directory(args.space) or os.path.join(ROOT, "spaces", "-")
+            sys.stdout.write(start_pack(directory, "Your context was compacted.") + "\n")
+        elif args.action == "compacted":
+            value = hook_input()
+            directory = hook_directory(args.space)
+            trigger = value.get("trigger") if value.get("trigger") in ("manual", "auto") else None
+            sid = value.get("session_id")
+            sid = sid if isinstance(sid, str) and re.match(r"^[A-Za-z0-9_-]{1,80}$", sid) else None
+            costs = costs_module() if directory else None
+            if costs:
+                costs.append_session(directory, {"v": 1, "ev": "compact", "trigger": trigger, "session": sid, "at": now()})
+    except Exception as e:  # noqa: BLE001 - a hook never fails the session
+        if args.action == "start-pack":
+            sys.stdout.write("Your context was compacted. " + START_PACK_BODY + "\n")
+        print("pa-context {}: {}".format(args.action, ascii(e)[:200]), file=sys.stderr)
+    sys.stdout.flush()
+
+
+def context_set(args):
+    """pa-context set: the person's command. Merges the options over the current settings, checks them and writes
+    context.json; with no option it shows them."""
+    if any(os.environ.get(k) for k in AGENT_VARS):
+        raise Problem("pa-context set is the person's command: type it in a terminal, not in an agent's session")
+    directory, _agent = space_for_command(args.space)
+    path = os.path.join(directory, CONTEXT_FILE)
+    current, problem = read_context(directory)
+    had = os.path.isfile(path) and problem is None
+    if problem and os.path.isfile(path):
+        print("context.json was not valid ({}); starting from the defaults".format(problem))
+    changes = {}
+    if args.mode is not None:
+        changes["mode"] = args.mode
+    for flag, key in (("task_cap", "taskCap"), ("pass_cap", "passCap"), ("net", "net")):
+        if getattr(args, flag) is not None:
+            changes[key] = parse_amount(getattr(args, flag))
+    if not changes:
+        print(context_summary(current, had))
+        return
+    new = dict(current, **changes)
+    new["v"], new["by"] = 1, "person"
+    if new["mode"] == "fresh" and (not had or current.get("mode") == "off"):
+        new["enabledAt"] = now()
+    problems = context_problems(new)
+    if problems:
+        raise Problem("; ".join(problems))
+    write_json(path, {k: new.get(k) for k in ("v", "mode", "taskCap", "passCap", "net", "enabledAt", "by")})
+    print(context_summary(new, True))
+    print("This applies at the Project Agent's next start (a restart in place loads it).")
+
+
+def context_summary(settings, saved):
+    return "mode {}  taskCap {:,}  passCap {:,}  net {:,}  enabledAt {}  by {}{}".format(
+        settings["mode"], settings["taskCap"], settings["passCap"], settings["net"], settings.get("enabledAt") or "-",
+        settings.get("by") or "-", "" if saved else "  (the defaults: no context.json)")
 
 
 def exec_plain(p, extra=()):
@@ -1364,9 +1671,10 @@ def reload_profile(p):
         return p
 
 
-def launch_command(p, agent, resume, directory, snapshot=False):
+def launch_command(p, agent, resume, directory, snapshot=False, version=None):
     """(argv, model) for one launch of the Project Agent from profile p; raises when p cannot give one (also when
-    the exec would refuse the argv: an element not a str, or with a NUL byte)."""
+    the exec would refuse the argv: an element not a str, or with a NUL byte). version: the claude command's Claude
+    Code version (cc_version), which gates --autocompact and idleCompaction (t-041 J3); None leaves both out."""
     argv = list(p["claude"])
     model = (agent.get("models") or {}).get("orchestrator") or (p.get("models") or {}).get("orchestrator")
     if model:
@@ -1376,6 +1684,9 @@ def launch_command(p, agent, resume, directory, snapshot=False):
     argv += ["--name", "PA: " + agent["name"], "--append-system-prompt", layered(p, "orchestrator", directory, agent)]
     if snapshot:  # t-037 S2: the appended text reaches the model on a resume too (not the one recorded at its start)
         argv += ["--system-prompt-snapshot", "off"]
+    net = context_launch(directory, version)["net"]
+    if net:  # t-041 R5: the 400k net, a flag (not inherited by anything the Project Agent starts), before the prompt
+        argv += ["--autocompact", str(net)]
     if resume:
         argv += ["Your session was restarted. Read your state folder (ledger.json, journal.jsonl, decisions/, "
                  "rules.json), then say in one line where things stand. Continue where you left off without "
@@ -1385,7 +1696,7 @@ def launch_command(p, agent, resume, directory, snapshot=False):
                  "the person, no worker for a task with an open card. If the last hold or resume line in the "
                  "journal is a hold, start nothing at all until the person says go. `paused` in "
                  "`schedule.json` stops timed passes only; it is not a hold."]
-    argv += pa_settings_args(p, agent.get("space") or os.path.basename(directory))  # last (t-029 R4, t-040)
+    argv += pa_settings_args(p, agent.get("space") or os.path.basename(directory), directory, version)  # last (t-029 R4, t-040, t-041)
     argv = resolve(argv, p)
     # The exec refuses anything else (TypeError / ValueError); refuse it here, so run_agent's trial build of a
     # re-read profile fails and the loop keeps the one in hand (t-033 round 3). A no-op for every valid profile.
@@ -1907,19 +2218,26 @@ def run_agent(args, address, project, p, directory, agent, ctx, started):
             # The re-read profile is used only when a launch can be built from it (t-033 round 2): a file that
             # loads but has a wrong shape in a key read here (models a list, path a number, ...) keeps the old one.
             try:
-                snap = snapshot_flag(fresh, ctx)
-                argv, model = launch_command(fresh, agent, resume, directory, snapshot=snap)
+                snap, ver = snapshot_flag(fresh, ctx), cc_version(fresh, ctx)  # t-041 J3: the version gates the net
+                argv, model = launch_command(fresh, agent, resume, directory, snapshot=snap, version=ver)
                 p, adopted = fresh, fresh != held
             except Exception:  # noqa: BLE001 - a restart never fails because of the reload
                 fresh = p
         if fresh is p:
-            snap = snapshot_flag(p, ctx)
-            argv, model = launch_command(p, agent, resume, directory, snapshot=snap)
+            snap, ver = snapshot_flag(p, ctx), cc_version(p, ctx)  # t-041 J3: the version gates the net
+            argv, model = launch_command(p, agent, resume, directory, snapshot=snap, version=ver)
 
         def starting(model):  # what is written as a launch starts; returns its start time
             ttl, by = cache_in_effect(p, os.environ)  # t-040: the cache lifetime this start asks for
-            session_log(directory, "start resume={} session={} reason={} cache={} cacheBy={}".format(
-                resume, agent["sessionId"], why, ttl, by))
+            plan = context_launch(directory, ver)  # t-041 J3: what this start asks for (net=, idle=); notes once, before
+            said = ctx.setdefault("contextSaid", set())
+            for note in plan["notes"]:
+                if note not in said:
+                    said.add(note)
+                    session_log(directory, note)
+            session_log(directory, "start resume={} session={} reason={} cache={} cacheBy={} net={} idle={}".format(
+                resume, agent["sessionId"], why, ttl, by, plan["net"] or ("off" if plan["mode"] == "off" else "none"),
+                "off" if plan["idle"] else "kept"))
             began = time.time()
             running.update(since=began, session=agent["sessionId"], marked=False)
             launcher_session(ctx, directory, agent, resume, snapshot=snap)
@@ -1948,8 +2266,8 @@ def run_agent(args, address, project, p, directory, agent, ctx, started):
             session_log(directory, "the re-read profile did not start ({}); launching with the profile in hand"
                         .format(ascii(e)[:200]))
             p, adopted = held, False
-            snap = snapshot_flag(p, ctx)
-            argv, model = launch_command(p, agent, resume, directory, snapshot=snap)
+            snap, ver = snapshot_flag(p, ctx), cc_version(p, ctx)  # t-041 J3: the version gates the net
+            argv, model = launch_command(p, agent, resume, directory, snapshot=snap, version=ver)
             began = starting(model)
             code = run_child(ctx, argv, project)
         running["since"] = None
@@ -3217,12 +3535,22 @@ def main():
         parser.add_argument("--dry-run", action="store_true", help="run the checks and show the summary only")
         parser.add_argument("--json", action="store_true")
         return cmd_restart(parser.parse_args())
+    if kind == "pa-context":
+        parser.description = ("set: the Project Agent's context settings (context.json; the person's command, applied at "
+                              "its next start). compact-instructions, start-pack, compacted: its compaction hooks (t-041).")
+        parser.add_argument("action", choices=("set", "compact-instructions", "start-pack", "compacted"))
+        parser.add_argument("--space", help="a space id (default: this terminal's)")
+        parser.add_argument("--mode", choices=CONTEXT_MODES, help="fresh: the net and the hooks; off: none of them")
+        parser.add_argument("--task-cap", help="tokens, like 150k (read by the fresh reset, t-041 J4)")
+        parser.add_argument("--pass-cap", help="tokens, like 250k (read by the fresh reset, t-041 J4)")
+        parser.add_argument("--net", help="tokens, like 400k: Claude Code's auto-compact window for the Project Agent")
+        return cmd_context(parser.parse_args())
     if kind == "pa-stamp":
         parser.add_argument("--commit", help="the repo commit installed from")
         parser.add_argument("--dirty", action="store_true", help="the checkout had uncommitted changes")
         parser.add_argument("--synced-from", help="the machine pa-sync copied from")
         return cmd_stamp(parser.parse_args())
-    raise Problem("invoke as pa-start, pa-session, pa-claude, pa-codex, pa-profile, pa-peers, pa-pass, pa-cleanup, pa-doctor, pa-task, pa-decide, pa-sync, pa-core-check, pa-stamp or pa-restart")
+    raise Problem("invoke as pa-start, pa-session, pa-claude, pa-codex, pa-profile, pa-peers, pa-pass, pa-cleanup, pa-doctor, pa-task, pa-decide, pa-sync, pa-core-check, pa-stamp, pa-restart or pa-context")
 
 
 if __name__ == "__main__":

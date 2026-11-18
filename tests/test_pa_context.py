@@ -482,10 +482,19 @@ class J3Base(Base):
         self.env_j3 = {k: os.environ.get(k) for k in ("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "PA_NO_CC_STATUSLINE")}
         for k in self.env_j3:
             os.environ.pop(k, None)
+        # pa_costs imports pa: as in a real run (pa.py is __main__ there), this module must be the one it gets
+        self.mod_j3 = sys.modules.get("pa")
+        sys.modules["pa"] = pa
+        pa._COSTS.clear()
 
     def tearDown(self):
         for k, v in self.saved_j3.items():
             setattr(pa, k, v)
+        pa._COSTS.clear()
+        if self.mod_j3 is None:
+            sys.modules.pop("pa", None)
+        else:
+            sys.modules["pa"] = self.mod_j3
         for k, v in self.env_j3.items():
             if v is None:
                 os.environ.pop(k, None)
