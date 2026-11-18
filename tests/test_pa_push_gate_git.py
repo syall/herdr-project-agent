@@ -92,6 +92,39 @@ class GateGit(Runs):
         self.assertTrue(all("core.fsmonitor=false" in a and any(x.startswith("core.hooksPath=") for x in a) for a in status), status)
         self.assertTrue(all("--ignore-submodules=all" in a for a in status), status)
 
+    def require_content(self, checked):
+        """t-052 J1: the task's verifier started after the content stamp, and VERIFY.md names `checked`."""
+        dump({"version": 1, "at": "2026-01-01T00:00:00Z"}, os.path.join(self.dir, "content", "since.json"))
+        self.ledger_task(workers=WORKERS + [{"address": "t33", "role": "verifier", "started": "2026-06-01T00:00:00Z"}])
+        write(os.path.join(self.dir, "evidence", TASK, "VERIFY.md"), "text\nChecked: {}\nVerdict: pass\n".format(checked))
+
+    def test_g08_content_check_runs_nothing_the_worktree_names(self):  # t-052 J1 P1
+        prog = self.program("content")
+        first = self.head(self.wt)
+        self.commit_on(self.wt, "d.txt", "later work")
+        self.require_content(first)
+        self.worktree_scope()
+        for key, value in (("diff.external", prog), ("diff.planted.textconv", prog), ("log.showSignature", "true"),
+                           ("core.pager", prog)):
+            sh(self.wt, "git", "config", "--worktree", key, value)
+        write(os.path.join(self.main, ".git", "info", "attributes"), "* diff=planted\n")
+        self.assertEqual(self.gate(), 1)  # pa-gate (plain git): compared, differs, fails
+        self.assertNeverRan()
+        result = pa_push.pa_hooks.evaluate_gate(self.dir, load(os.path.join(self.dir, "ledger.json"))["tasks"][0], "review",
+                                                runner=pa_push.Session().gate_git)
+        self.assertIn("the checks saw this content", [c["check"] for c in result["checks"]])
+        self.assertNeverRan()
+        self.check()
+        self.assertNeverRan()
+
+    def test_g09_c8a_refuses_content_the_checks_did_not_see(self):  # t-052 J1 P2 (spec 3.3)
+        self.require_content(self.task_commit)
+        r = self.check()
+        self.assertTrue(r["ok"], r)  # same commit: the card stands
+        self.commit_on(self.wt, "d.txt", "after the check")
+        r = self.assertRefused(self.run_push(), "C8a", "the checks saw this content")
+        self.assertIn("1 commit checked, 2 now", r["refusal"]["message"])
+
     def nested_repo(self, commit=True):
         """A nested repository wt/sub (a submodule entry), committed or only staged in the task worktree."""
         sub = os.path.join(self.wt, "sub")

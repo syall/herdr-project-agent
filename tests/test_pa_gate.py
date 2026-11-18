@@ -179,7 +179,7 @@ class G0Unchanged(Base):
                     "pa-gate t-1 (review phase, normal tier): PASSED"]
         self.assertEqual(out.splitlines(), expected)
         result = self.gate_json("t-1")
-        self.assertEqual(list(result), ["task", "phase", "tier", "passed", "at", "checks", "commits"])
+        self.assertEqual(list(result), ["task", "phase", "tier", "passed", "at", "checks", "commits", "content"])
         self.assertEqual(result["commits"], [])
         self.assertTrue(result["passed"])
 
@@ -464,6 +464,439 @@ class D077ReviewerAddresses(Base):  # t-020 J1, card d-077 limit 2: only workers
     def test_d077_an_author_with_no_address_is_no_author(self):
         # a build entry without an address cannot make an addressed reviewer its own author
         self.assertTrue(self.review_check([{"role": "build"}, {"address": "t32", "role": "reviewer"}])["ok"])
+
+
+# ---- t-052 J1: checks valid by content (R4, R5, R7 AC7.1) ---------------------------------------
+
+NINE = "".join("line {}\n".format(i) for i in range(1, 10))
+SINCE = "2026-01-01T00:00:00Z"
+AFTER, BEFORE = "2026-06-01T00:00:00Z", "2025-06-01T00:00:00Z"
+CHECK = "the checks saw this content"
+
+
+class ContentBase(Base):
+    """main with a.txt (nine lines) and b.txt; the task branch t-1-x in a linked worktree changes line 2 of a.txt (f1)
+    and adds c.txt (f2). The task's verifier started after the space's content stamp, so the check is required."""
+
+    def setUp(self):
+        super().setUp()
+        self.proj = os.path.join(self.tmp, "proj")
+        os.makedirs(self.proj)
+        sh(self.proj, "git", "init", "-q", "-b", "main")
+        write(os.path.join(self.proj, "a.txt"), NINE)
+        write(os.path.join(self.proj, "b.txt"), "b\n")
+        sh(self.proj, "git", "add", "a.txt", "b.txt")
+        sh(self.proj, "git", "commit", "-q", "-m", "base")
+        self.wt = self.linked(self.proj, "t-1-x", os.path.join(self.tmp, "wt"))
+        self.f1 = self.commit(self.wt, "a.txt", NINE.replace("line 2\n", "line two\n"))
+        self.f2 = self.commit(self.wt, "c.txt", "c\n")
+        self.task = self.add_task("t-1", worktree=self.wt, type="feature", workers=WORKERS + [
+            {"address": "t33", "role": "verifier", "started": AFTER}])
+        self.evidence("t-1")
+        self.stamp(SINCE)
+
+    def stamp(self, at):
+        dump({"version": 1, "at": at}, os.path.join(self.dir, "content", "since.json"))
+
+    def checked(self, *shas, name="VERIFY.md"):
+        write(os.path.join(self.dir, "evidence", "t-1", name),
+              "text\n" + "".join("Checked: {}\n".format(s) for s in shas) + "Verdict: pass\n")
+
+    def on_main(self, file, text, subject="main moves"):
+        write(os.path.join(self.proj, file), text)
+        sh(self.proj, "git", "add", file)
+        sh(self.proj, "git", "commit", "-q", "-m", subject)
+
+    def rebase(self):
+        sh(self.wt, "git", "rebase", "-q", "main")
+        return sh(self.wt, "git", "rev-parse", "HEAD")
+
+    def head(self, path=None):
+        return sh(path or self.wt, "git", "rev-parse", "HEAD")
+
+    def content_line(self, out):
+        lines = [l for l in out.splitlines() if CHECK in l]
+        self.assertEqual(len(lines), 1, out)
+        return lines[0]
+
+    def assertContentOk(self, *note):
+        code, out, err = self.run_gate("t-1")
+        line = self.content_line(out)
+        self.assertEqual(code, 0, out + err)
+        self.assertTrue(line.startswith("ok    " + CHECK), line)
+        for n in note:
+            self.assertIn(n, line)
+        return line
+
+    def assertContentFails(self, *why):
+        code, out, err = self.run_gate("t-1")
+        line = self.content_line(out)
+        self.assertEqual(code, 1, out + err)
+        self.assertTrue(line.startswith("FAIL  " + CHECK), line)
+        for w in why:
+            self.assertIn(w, line)
+        return line
+
+    def records(self):
+        return pa.read_json(os.path.join(self.dir, "content", "t-1.json"), {}) or {}
+
+
+class C1SameCommit(ContentBase):
+    def test_c1_checked_is_head(self):
+        self.checked(self.f2)
+        self.assertContentOk()
+        content = self.gate_json("t-1")["content"]
+        self.assertEqual(len(content), 1)
+        self.assertIs(content[0]["same"], True)
+        self.assertEqual(content[0]["checked"], self.f2)
+        self.assertEqual(content[0]["onto"], "main")
+        self.assertEqual(content[0]["repo"], os.path.realpath(self.wt))
+
+
+class C2CleanRebase(ContentBase):
+    def test_c2_one_and_three_clean_rebases_keep_the_content(self):
+        self.checked(self.f2)
+        self.assertContentOk()
+        first = self.gate_json("t-1")["content"][0]
+        for n in range(3):
+            self.on_main("b.txt", "b {}\n".format(n))
+            tip = self.rebase()
+            self.assertNotEqual(tip, self.f2)
+            line = self.assertContentOk("same content as the checked " + self.f2[:7])
+            now = self.gate_json("t-1")["content"][0]
+            self.assertEqual((now["change"], now["sequence"]), (first["change"], first["sequence"]), n)
+            self.assertIs(now["same"], True)
+            self.assertNotEqual(now["base"], first["base"])
+            self.assertTrue(line)
+
+
+class C3BaseTouchedAFile(ContentBase):
+    def test_c3_main_changed_a_touched_file_outside_the_hunk(self):
+        self.checked(self.f2)
+        self.assertContentOk()
+        self.on_main("a.txt", NINE.replace("line 8\n", "line eight\n"))
+        self.rebase()  # no conflict: line 8 is outside f1's context
+        self.assertContentFails("a.txt")
+        content = self.gate_json("t-1")["content"][0]
+        self.assertIs(content["same"], False)
+        self.assertFalse(self.gate_json("t-1")["passed"])
+
+    def test_c4_patch_id_stays_the_same_where_the_gate_fails(self):  # probe finding 3, as a regression
+        def patch_id(sha):
+            show = subprocess.run(["git", "show", sha], cwd=self.wt, stdout=subprocess.PIPE, check=True).stdout
+            out = subprocess.run(["git", "patch-id", "--stable"], cwd=self.wt, input=show, stdout=subprocess.PIPE, check=True).stdout
+            return out.split()[0]
+        self.checked(self.f2)
+        before = patch_id(self.f1)
+        self.on_main("a.txt", NINE.replace("line 8\n", "line eight\n"))
+        self.rebase()
+        after = patch_id(sh(self.wt, "git", "rev-parse", "HEAD~1"))
+        self.assertEqual(before, after)
+        self.assertContentFails("a.txt")
+
+
+class C5Sequence(ContentBase):
+    def test_c5_an_empty_commit_after_the_check(self):
+        self.checked(self.f2)
+        sh(self.wt, "git", "commit", "-q", "--allow-empty", "-m", "later")
+        line = self.assertContentFails("2 commits checked, 3 now")
+        self.assertNotIn("a.txt", line)
+
+    def test_c5b_a_reword(self):
+        self.checked(self.f2)
+        sh(self.wt, "git", "commit", "-q", "--amend", "-m", "reworded")
+        self.assertContentFails("commits changed")
+
+    def test_c5c_a_squash(self):
+        self.checked(self.f2)
+        sh(self.wt, "git", "reset", "-q", "--soft", "HEAD~2")
+        sh(self.wt, "git", "commit", "-q", "-m", "both")
+        self.assertContentFails("2 commits checked, 1 now")
+
+
+class C6Files(ContentBase):
+    ODD = ("sp ace.txt", "new\nline.txt", 'qu"ote.txt')
+
+    def test_c6_rename_is_a_delete_and_an_add(self):
+        sh(self.wt, "git", "mv", "c.txt", "d.txt")
+        sh(self.wt, "git", "commit", "-q", "-m", "rename")
+        self.checked(self.head())
+        self.assertContentOk()
+        head = [r for r in self.records()["records"] if r["source"] == "head"][-1]
+        statuses = {(f["path"], f["status"]) for f in head["files"]}
+        self.assertIn(("a.txt", "M"), statuses)
+        self.assertIn(("d.txt", "A"), statuses)  # c.txt was added on the branch, so only d.txt is in base..tip
+        sh(self.wt, "git", "mv", "b.txt", "e.txt")
+        sh(self.wt, "git", "commit", "-q", "-m", "rename a base file")
+        self.checked(self.head())
+        self.assertContentOk()
+        head = [r for r in self.records()["records"] if r["source"] == "head"][-1]
+        statuses = {(f["path"], f["status"]) for f in head["files"]}
+        self.assertIn(("b.txt", "D"), statuses)
+        self.assertIn(("e.txt", "A"), statuses)
+        self.assertFalse(any(s.startswith("R") for _p, s in statuses))
+
+    def test_c6b_a_mode_change_is_caught(self):
+        self.checked(self.f2)
+        os.chmod(os.path.join(self.wt, "c.txt"), 0o755)
+        sh(self.wt, "git", "commit", "-q", "-am", "mode")
+        sh(self.wt, "git", "reset", "-q", "--soft", "HEAD~1")
+        sh(self.wt, "git", "commit", "-q", "--amend", "--no-edit")  # same sequence of messages, other mode
+        self.assertContentFails("c.txt")
+
+    def test_c6c_binary_file(self):
+        with open(os.path.join(self.wt, "bin.dat"), "wb") as f:
+            f.write(b"\x00\x01\x02binary\xff")
+        sh(self.wt, "git", "add", "bin.dat")
+        sh(self.wt, "git", "commit", "-q", "-m", "binary")
+        self.checked(self.head())
+        self.on_main("b.txt", "b moved\n")
+        self.rebase()
+        self.assertContentOk()
+        with open(os.path.join(self.wt, "bin.dat"), "wb") as f:
+            f.write(b"\x00\x01\x02binarY\xff")
+        sh(self.wt, "git", "commit", "-q", "--amend", "-a", "--no-edit")
+        self.assertContentFails("bin.dat")
+
+    def test_c6d_paths_with_spaces_newlines_and_quotes(self):
+        for name in self.ODD:
+            write(os.path.join(self.wt, name), name + "\n")
+            sh(self.wt, "git", "add", "--", name)
+        sh(self.wt, "git", "commit", "-q", "-m", "odd names")
+        self.checked(self.head())
+        self.assertContentOk()
+        head = [r for r in self.records()["records"] if r["source"] == "head"][-1]
+        self.assertTrue(set(self.ODD) <= {f["path"] for f in head["files"]}, head["files"])
+        self.on_main("b.txt", "b moved\n")
+        self.rebase()
+        self.assertContentOk()
+        write(os.path.join(self.wt, "new\nline.txt"), "changed\n")
+        sh(self.wt, "git", "commit", "-q", "--amend", "-a", "--no-edit")
+        line = self.assertContentFails(pa_hooks.clean("new\nline.txt"))
+        self.assertNotIn("sp ace.txt", line)
+
+
+class C7Transition(ContentBase):
+    def test_c7_no_checked_line_in_flight_without_a_stamp(self):
+        os.remove(os.path.join(self.dir, "content", "since.json"))
+        self.assertContentOk("content not recorded")
+        self.assertTrue(os.path.isfile(os.path.join(self.dir, "content", "since.json")))  # written by this first run
+        self.assertContentOk("content not recorded")  # the stamp is now, after this verifier's start
+        content = self.gate_json("t-1")["content"][0]
+        self.assertIsNone(content["checked"])
+        self.assertIsNone(content["same"])
+        self.assertTrue(content["change"])
+
+    def test_c7b_no_checked_line_verifier_started_before_the_stamp(self):
+        self.ledger_workers([{"address": "t33", "role": "verifier", "started": BEFORE}])
+        self.assertContentOk("content not recorded")
+
+    def test_c7c_no_checked_line_verifier_with_no_start(self):
+        self.ledger_workers([{"address": "t33", "role": "verifier"}])
+        self.assertContentOk("content not recorded")
+
+    def test_c7d_no_checked_line_required_fails(self):
+        self.assertContentFails("VERIFY.md has no Checked: line")
+        self.ledger_workers([{"address": "t33", "role": "verifier", "started": BEFORE},
+                             {"address": "t34", "role": "Check", "started": AFTER}])
+        self.assertContentFails("VERIFY.md has no Checked: line")
+
+    def test_c7e_short_id_and_decorated_lines_do_not_count(self):
+        write(os.path.join(self.dir, "evidence", "t-1", "VERIFY.md"),
+              "Checked: {}\n**Checked: {}**\n  Checked: {}\nChecked: `{}`\nVerdict: pass\n".format(
+                  self.f2[:12], self.f2, self.f2, self.f2))
+        self.assertContentFails("VERIFY.md has no Checked: line")
+
+    def test_c7f_checked_not_a_commit(self):
+        missing = "0123456789abcdef" * 2 + "01234567"
+        self.checked(missing)
+        self.assertContentFails("not a commit")
+
+    def test_c7g_checked_not_a_commit_but_stored(self):
+        self.checked(self.f2)
+        self.assertContentOk()
+        data = self.records()
+        missing = "0123456789abcdef" * 2 + "01234567"
+        verify = [r for r in data["records"] if r["source"] == "verify"][-1]
+        data["records"].append(dict(verify, commit=missing))
+        dump(data, os.path.join(self.dir, "content", "t-1.json"))
+        self.checked(missing)
+        self.assertContentOk()
+
+    def test_c7h_computed_and_stored_differ_fails(self):  # the orchestrator's addition to point 4
+        self.checked(self.f2)
+        self.assertContentOk()
+        data = self.records()
+        mine = [r for r in data["records"] if r["source"] == "verify" and r["commit"] == self.f2]
+        self.assertTrue(mine, data)
+        self.on_main("b.txt", "b moved\n")
+        self.rebase()
+        self.assertContentOk("same content")  # computed now and stored agree
+        for r in mine:
+            r["change"] = "0" * 64
+        dump(data, os.path.join(self.dir, "content", "t-1.json"))
+        self.assertContentFails("differs from the record stored")
+
+    def test_c7i_in_flight_with_a_checked_line_is_compared(self):
+        self.ledger_workers([{"address": "t33", "role": "verifier", "started": BEFORE}])
+        self.checked(self.f1)
+        self.assertContentFails("c.txt", "1 commit checked, 2 now")
+
+    def ledger_workers(self, extra):
+        path = os.path.join(self.dir, "ledger.json")
+        led = pa.read_json(path)
+        led["tasks"][0]["workers"] = WORKERS + extra
+        dump(led, path)
+
+
+class C8Records(ContentBase):
+    def test_c8_gate_json_keys_and_old_fields(self):
+        self.checked(self.f2)
+        self.assertContentOk()
+        result = self.gate_json("t-1")
+        self.assertEqual(list(result), ["task", "phase", "tier", "passed", "at", "checks", "commits", "content"])
+        self.assertEqual(result["commits"][0]["commit"], self.f2)
+        self.assertEqual(set(result["content"][0]), {"repo", "common", "onto", "base", "change", "sequence", "checked", "review", "same"})
+        self.assertRegex(result["content"][0]["change"], "^[0-9a-f]{64}$")
+
+    def test_c8b_records_are_stored_once(self):
+        self.checked(self.f1)
+        self.commit(self.wt, "d.txt", "d\n")
+        self.run_gate("t-1")
+        self.run_gate("t-1")
+        data = self.records()
+        self.assertEqual(data["version"], 1)
+        keys = [(r["commit"], r["source"]) for r in data["records"]]
+        self.assertEqual(sorted(keys), sorted([(self.f1, "verify"), (self.head(), "head")]))
+        head = [r for r in data["records"] if r["source"] == "head"][0]
+        self.assertEqual([f["path"] for f in head["files"]], ["a.txt", "c.txt", "d.txt"])
+        self.assertEqual(len(head["commits"]), 3)
+        for k in ("repo", "common", "commit", "tree", "onto", "base", "files", "commits", "change", "sequence", "at", "by", "source"):
+            self.assertIn(k, head)
+        self.assertEqual(head["by"], "pa-gate")
+
+    def test_c8c_review_checked_is_recorded_never_failed(self):
+        self.checked(self.f2)
+        self.checked(self.f1, name="REVIEW.md")
+        self.assertContentOk()
+        self.assertEqual(self.gate_json("t-1")["content"][0]["review"], self.f1)
+
+    def test_c8d_stamp_written_once(self):
+        os.remove(os.path.join(self.dir, "content", "since.json"))
+        self.run_gate("t-1", "--phase", "build")
+        first = pa.read_json(os.path.join(self.dir, "content", "since.json"))
+        self.assertRegex(first["at"], r"^\d{4}-\d\d-\d\dT")
+        self.stamp(SINCE)
+        self.run_gate("t-1")
+        self.assertEqual(pa.read_json(os.path.join(self.dir, "content", "since.json"))["at"], SINCE)
+
+    def test_c8e_other_phases_carry_no_content_check(self):
+        code, out, _ = self.run_gate("t-1", "--phase", "build")
+        self.assertNotIn(CHECK, out)
+        self.assertEqual(self.gate_json("t-1")["content"], [])
+
+    def test_c8f_evaluate_gate_writes_nothing(self):
+        self.checked(self.f1)
+        before = {os.path.join(f, n): os.stat(os.path.join(f, n)).st_mtime_ns for f, _d, ns in os.walk(pa.ROOT) for n in ns}
+        result = pa_hooks.evaluate_gate(self.dir, self.task, "review")
+        after = {os.path.join(f, n): os.stat(os.path.join(f, n)).st_mtime_ns for f, _d, ns in os.walk(pa.ROOT) for n in ns}
+        self.assertEqual(before, after)
+        self.assertIn(CHECK, [c["check"] for c in result["checks"]])
+        self.assertFalse(os.path.exists(os.path.join(self.dir, "content", "t-1.json")))
+
+
+class C9Packages(Base):
+    def test_c9_one_checked_line_per_package(self):
+        wt = os.path.join(self.tmp, "ws")
+        heads = {}
+        for name in ("A", "B"):
+            path = os.path.join(wt, "src", name)
+            os.makedirs(path)
+            sh(path, "git", "init", "-q", "-b", "main")
+            self.commit(path, "base.txt", "base\n")
+            sh(path, "git", "checkout", "-q", "-b", "t-1-x")
+            heads[name] = self.commit(path, name.lower() + ".txt", name + "\n")
+        self.add_task("t-1", worktree=wt, type="feature", workers=WORKERS + [{"address": "t33", "role": "verifier", "started": AFTER}])
+        self.evidence("t-1")
+        dump({"version": 1, "at": SINCE}, os.path.join(self.dir, "content", "since.json"))
+        write(os.path.join(self.dir, "evidence", "t-1", "VERIFY.md"), "Checked: {}\nChecked: {}\nVerdict: pass\n".format(heads["A"], heads["B"]))
+        code, out, err = self.run_gate("t-1")
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual([c["checked"] for c in self.gate_json("t-1")["content"]], [heads["A"], heads["B"]])
+        self.commit(os.path.join(wt, "src", "B"), "b.txt", "B changed\n")
+        code, out, err = self.run_gate("t-1")
+        self.assertEqual(code, 1, out)
+        line = [l for l in out.splitlines() if CHECK in l][0]
+        self.assertIn("B: ", line)
+        self.assertIn("b.txt", line)
+        self.assertNotIn("A: ", line)
+
+
+class C10Refusals(ContentBase):
+    def test_c10_a_merge_commit(self):
+        sh(self.wt, "git", "checkout", "-q", "-b", "side", self.f1)
+        self.commit(self.wt, "s.txt", "s\n")
+        sh(self.wt, "git", "checkout", "-q", "t-1-x")
+        sh(self.wt, "git", "merge", "-q", "--no-ff", "-m", "merge side", "side")
+        self.checked(self.f2)
+        self.assertContentFails("merge commit")
+
+    def test_c10b_no_base_branch(self):
+        self.checked(self.f1)
+        sh(self.proj, "git", "branch", "-m", "main", "elsewhere")
+        self.assertContentFails("no base branch")
+
+    def test_c10c_profile_main_branch(self):
+        dump({"name": "test", "claude": ["true"], "codex": ["true"], "mainBranches": ["elsewhere"]},
+             os.path.join(pa.ROOT, "profiles", "test", "profile.json"))
+        self.checked(self.f2)
+        sh(self.proj, "git", "branch", "-m", "main", "elsewhere")
+        self.on_main("b.txt", "b moved\n")
+        self.rebase_onto("elsewhere")
+        self.assertContentOk("same content")
+        self.assertEqual(self.gate_json("t-1")["content"][0]["onto"], "elsewhere")
+
+    def rebase_onto(self, branch):
+        sh(self.wt, "git", "rebase", "-q", branch)
+
+
+class S1FullSuiteRecord(Base):
+    def test_s1_each_run_is_recorded(self):
+        proj = self.repo()
+        wt = self.linked(proj, "t-1-x", os.path.join(self.tmp, "wt"))
+        head = self.commit(wt, "a.txt", "a\n")
+        self.add_task("t-1", worktree=wt)
+        write(os.path.join(wt, ".claude", "pa-task.json"), json.dumps({"task": "t-1", "space": "sp1"}))
+        agent = pa.read_json(os.path.join(self.dir, "agent.json"))
+        saved_cwd = os.getcwd()
+        os.chdir(wt)
+        try:
+            for command, exit_code in (("true", 0), ("exit 3", 3)):
+                agent["commands"] = {"full": command}
+                dump(agent, os.path.join(self.dir, "agent.json"))
+                out, err = io.StringIO(), io.StringIO()
+                saved, sys.argv = sys.argv, ["pa-full-suite"]
+                os.environ["HC_TERMINAL_ID"] = "t77"
+                try:
+                    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                        with self.assertRaises(SystemExit) as e:
+                            pa_hooks.main()
+                finally:
+                    sys.argv = saved
+                    os.environ.pop("HC_TERMINAL_ID", None)
+                self.assertEqual(e.exception.code, exit_code)
+        finally:
+            os.chdir(saved_cwd)
+        with open(os.path.join(self.dir, "content", "suites.jsonl")) as f:
+            lines = [json.loads(l) for l in f if l.strip()]
+        self.assertEqual([l["exit"] for l in lines], [0, 3])
+        tree = sh(wt, "git", "rev-parse", "HEAD^{tree}")
+        for l in lines:
+            self.assertEqual((l["task"], l["worker"], l["repo"], l["commit"], l["tree"], l["uncommitted"]),
+                             ("t-1", "t77", os.path.realpath(wt), head, tree, 0))
+            for k in ("at", "seconds", "command"):
+                self.assertIn(k, l)
+        self.assertIn("full suite: `exit 3`", pa.read_text(os.path.join(self.dir, "evidence", "t-1", "build.log")))
 
 
 if __name__ == "__main__":

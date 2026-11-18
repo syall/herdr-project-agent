@@ -654,6 +654,13 @@ class AC6EditorRule(GuardTest):
             with self.subTest(path=path):
                 self.assertEqual(self.edit(path), EDIT.format(path))
 
+    def test_t052_content_records_are_tool_written(self):  # t-052 J1: content/ is state, never a worker's edit
+        self.assertIn("content/", guard.STATE_FILES)
+        for path in [os.path.join(self.state, "content", "t-1.json"), os.path.join(self.state, "content", "suites.jsonl"),
+                     os.path.join(self.state, "content", "since.json")]:
+            with self.subTest(path=path):
+                self.assertEqual(self.edit(path), EDIT.format(path))
+
     def test_links_are_resolved(self):
         link = os.path.join(self.repo, "src", "innocent.txt")
         if not os.path.lexists(link):

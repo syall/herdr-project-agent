@@ -314,12 +314,19 @@ class Worker(unittest.TestCase):
         self.assertIn("- Verifiers, reviewers and check workers label every finding **Must fix** (it breaks a "
                       "requirement, the plan, a verification point, safety or security; say why it blocks the "
                       "merge), **Recorded limit** (real, but not Must fix; name a "
-                      "follow-up) or **Nit**, and end the file with `Verdict: pass` or `Verdict: must fix (<n>)`.",
+                      "follow-up) or **Nit**, and end the file with `Checked: <full id of the commit you checked>` and, on the "
+                      "next line, `Verdict: pass` or `Verdict: must fix (<n>)`.",  # t-052 J1 (spec 5.6)
                       self.text)
         self.assertIn("compliance with `spec.md` and `plan.md`, and write `REVIEW.md`. On a diff recheck, review "
                       "the diff from the base commit the handoff names.", self.text)
         self.assertNotIn("Important or Nit", self.text)
         self.assertNotIn("outside the handoff's must-fix bar", self.text)  # J1 fix M1
+
+    def test_t052_j1_checked_line(self):  # t-052 R4 AC4.1 (spec 5.6)
+        roles = flat(self.raw[self.raw.index("## Roles"):self.raw.index("## Verification")])
+        self.assertIn("end the file with `Checked: <full id of the commit you checked>` and, on the next line, "
+                      "`Verdict: pass` or `Verdict: must fix (<n>)`.", roles)
+        self.assertNotIn("and end the file with `Verdict: pass`", self.text)
 
     def test_t017_r9_no_background_shell(self):  # AC9.1, G1: in Rules of the job, not Safety
         rules = flat(self.raw[self.raw.index("## Rules of the job"):self.raw.index("## Roles")])
@@ -445,6 +452,14 @@ class Sdlc(unittest.TestCase):  # t-017 J1 (R1)
                       "accept) |", text)
         self.assertNotIn("merge card", text)  # J1 fix M2
         self.assertNotIn("Important findings", text)
+
+    def test_t052_j1_gate_compares_content(self):  # t-052 R5, R14 (spec 5.5, first sentence)
+        raw = read("runtime", "core", "sdlc.md")
+        part = flat(raw[raw.index("## Evidence the gate checks"):raw.index("## Practices")])
+        self.assertIn("Files must exist and not be empty. At `review` the gate also compares content: the commit on "
+                      "the last `Checked:` line of `VERIFY.md` must make the same change as HEAD (the same content on "
+                      "the base and the tip for every file it touches, and the same commits), or the gate fails and "
+                      "names the files that differ.", part)
 
     # t-017 J2 (R2, R4, R6; amendments B1, B3)
     def test_t017_r2_r6_test_row(self):
