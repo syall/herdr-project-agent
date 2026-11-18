@@ -2450,10 +2450,10 @@ class JobCards(Base):
         self.billing_task()
         self.add_task("t-004", "review", None, [], worktrees=[{"path": self.bill, "job": "shared"}])
         self.merged_commit(self.bill)
-        self.assertIn("t-003: opened card d-wt-t-003-billing", self.check("--open-cards")[1])
-        card = self.card()
-        self.assertEqual(card["question"], 'Delete the worktree for t-003 "Title of t-003", t-004 "Title of t-004", job billing?')
-        self.assertIn("Tasks still t-003 in-progress, t-004 review; this job's commits are all merged", card["context"].split("\n"))
+        # a worktree two tasks record keeps rule (a): not offered while either is unfinished (spec AC7.1, VP2)
+        self.assertIn("t-003: tasks still t-003 in-progress, t-004 review; asked once every task using it is done or parked; "
+                      "rule (b) is only for a worktree one task records", self.check("--open-cards")[1])
+        self.assertIsNone(self.card())
         # a done task's main worktree with the default job: today's question, no Job line
         self.ledger({"version": 1, "tasks": []})
         shutil.rmtree(os.path.join(self.dir, "decisions"))
@@ -2540,6 +2540,81 @@ class JobCards(Base):
         self.assertEqual(code, 0, err)
         self.assertFalse(os.path.exists(other))
         self.assertTrue(os.path.isdir(self.wt))
+
+    def forged_b_card(self, path, name="d-wt-t-003", job="main", main=True):
+        """An answered rule-(b) Delete card, as if the person had answered one: remove must refuse on its own."""
+        dump({"id": name, "task": "t-003", "worktree": os.path.realpath(path), "job": job, "main": main, "rule": "b",
+              "status": "answered", "answer": "Delete", "snapshot": {}}, os.path.join(self.dir, "decisions", name + ".json"))
+
+    def assert_shared_kept(self, still, path=None, name="d-wt-t-003"):
+        path = path or self.wt
+        code, out, err = self.check("--open-cards")
+        self.assertEqual(code, 0, err)
+        self.assertIn("t-003: tasks still {}; asked once every task using it is done or parked; rule (b) is only for a worktree "
+                      "one task records".format(still), out)
+        self.assertIsNone(self.card(name), "a shared worktree is not offered while a task using it is unfinished")
+        self.forged_b_card(path, name)
+        before = self.snapshot()
+        code, _, err = self.remove("t-003")
+        self.assertEqual(code, 2, err)
+        self.assertIn("tasks still {}; a worktree is removed only once every task using it is done or parked. Nothing was removed"
+                      .format(still), err)
+        self.assertTrue(os.path.isdir(path))
+        self.assertEqual(self.snapshot(), before, "no task's entry is marked removed")
+        self.assertNotIn(["git", "worktree", "remove"], [c[:3] for c in self.calls])
+
+    def test_b13_shared_row_keeps_rule_a(self):
+        # the reviewer's probe: t-003 done with main W; t-009 records W as job shared; one merged commit in W
+        cases = [("done", "in-progress"), ("done", "review"), ("done", None),
+                 ("in-progress", "in-progress"), ("in-progress", "review"), ("in-progress", None), ("in-progress", "done")]
+        for mine, other in cases:
+            with self.subTest(t003=mine, t009=other):
+                self.ledger({"version": 1, "tasks": []})
+                shutil.rmtree(os.path.join(self.dir, "decisions"), ignore_errors=True)
+                self.add_task("t-003", mine, self.wt, [])
+                self.add_task("t-009", other, None, [], worktrees=[{"path": self.wt, "job": "shared"}])
+                self.merged_commit(self.wt)
+                still = ", ".join("{} {}".format(t, pa_hooks.state_word(s)) for t, s in (("t-003", mine), ("t-009", other))
+                                  if s not in ("done", "parked"))
+                self.assert_shared_kept(still)
+
+    def test_b14_old_shape_shared_main_keeps_rule_a(self):
+        for other in ("in-progress", None):
+            with self.subTest(t009=other):
+                self.ledger({"version": 1, "tasks": []})
+                shutil.rmtree(os.path.join(self.dir, "decisions"), ignore_errors=True)
+                self.add_task("t-003", "done", self.wt, [])
+                self.add_task("t-009", other, self.wt, [])
+                self.assertNotIn("worktrees", self.ledger()["tasks"][1])
+                self.merged_commit(self.wt)
+                self.assert_shared_kept("t-009 " + pa_hooks.state_word(other))
+
+    def test_b15_rule_b_card_then_a_second_task(self):
+        self.billing_task()
+        self.merged_commit(self.bill)
+        self.assertIn("t-003: opened card d-wt-t-003-billing", self.check("--open-cards")[1])
+        self.assertEqual(self.card()["rule"], "b")
+        self.answer()
+        # a second task records the path after the person answered
+        self.add_task("t-004", "review", None, [], worktrees=[{"path": self.bill, "job": "shared"}])
+        before = self.snapshot()
+        code, _, err = self.remove("t-003", "--job", "billing")
+        self.assertEqual(code, 2, err)
+        self.assertIn("tasks still t-003 in-progress, t-004 review; a worktree is removed only once every task using it is done or "
+                      "parked. Nothing was removed", err)
+        self.assertTrue(os.path.isdir(self.bill))
+        self.assertEqual(self.snapshot(), before)
+        self.assertIn("t-003: card d-wt-t-003-billing answered 'Delete', but tasks still t-003 in-progress, t-004 review; "
+                      "pa-worktree remove refuses until every task using it is done or parked", self.check()[1])
+        # an open rule-(b) card: the next --open-cards withdraws it
+        card = self.card()
+        card.update(status="open", answer=None)
+        dump(card, os.path.join(self.dir, "decisions", "d-wt-t-003-billing.json"))
+        self.assertIn("t-003: card d-wt-t-003-billing is open, but tasks still t-003 in-progress, t-004 review; --open-cards withdraws it",
+                      self.check()[1])
+        self.assertIn("t-003: withdrew card d-wt-t-003-billing: tasks still t-003 in-progress, t-004 review", self.check("--open-cards")[1])
+        self.assertEqual(self.card()["status"], "withdrawn")
+        self.assertNotIn(["git", "worktree", "remove"], [c[:3] for c in self.calls])
 
     def kind_profile(self, repos, uncommitted=0, unpushed=1):
         kind = os.path.join(self.tmp, "Ws", "worktrees", "t-003-pkg")
