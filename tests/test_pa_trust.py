@@ -562,6 +562,115 @@ class R4OwnFolder(Base):
                 self.assertNoPress()
 
 
+
+# ---- R3c (fix round 2) where Claude Code records the trust, the state folder, the project folder's reach ------
+
+class R3cTrustKey(Base):
+    """Review F1: Claude Code records trust on the git repository root, for a worktree on its main checkout's root
+    (spec D2). That folder, too, must be inside the project folder or a task's evidence folder.
+    Verify F1: the state folder and everything in it but a ledger task's evidence folder are refused, whichever
+    check would otherwise pass. Verify L1 (t124: Must fix): a project folder holding HOME or the Project Agent's
+    home is refused."""
+
+    def run_on(self, shown, cwd):
+        self.terminal(cwd)
+        self.screens(fx.new_screen(shown), fx.new_screen(shown))
+
+    def test_worktree_in_project_with_main_checkout_outside(self):  # the dialog names the worktree itself
+        outer = make_repo(os.path.join(self.home, "outer"))
+        tree = os.path.join(self.P, "worktrees", "b")
+        git(outer, "worktree", "add", "-q", "-b", "b", tree)
+        self.run_on(tree, tree)
+        out = self.expect("outside", os.path.realpath(outer))
+        self.assertEqual(os.path.realpath(tree), out["real"])
+
+    def test_project_folder_inside_a_larger_repository(self):
+        big = make_repo(os.path.join(self.root, "big"))
+        project = os.path.join(big, "proj")
+        notes = os.path.join(project, "notes")
+        os.makedirs(notes)
+        self.agent({"space": "sp1", "terminal": "t0", "profile": "test", "project": project})
+        for shown in (project, notes):
+            with self.subTest(shown):
+                shutil.rmtree(self.hc)
+                os.makedirs(self.hc)
+                self.run_on(shown, shown)
+                self.expect("outside", os.path.realpath(big))
+
+    def test_state_folder_inside_a_larger_repository(self):
+        folder = os.path.join(self.space, "evidence", "t-1")
+        os.makedirs(folder)
+        git(self.pa_home, "init", "-q", "-b", "main")
+        self.run_on(folder, folder)
+        self.expect("outside", os.path.realpath(self.pa_home))
+
+    def test_usual_worktree_still_accepted(self):  # main checkout P/repo is inside P
+        self.accepts(self.tree, cwd=self.tree)
+        self.assertEqual(os.path.realpath(self.repo), pa_hooks.trust_key(self.tree))
+
+    def test_folder_outside_git_still_accepted(self):
+        notes = os.path.join(self.P, "notes")
+        os.makedirs(notes)
+        self.accepts(notes, cwd=notes)
+        self.assertEqual(os.path.realpath(notes), pa_hooks.trust_key(notes))
+
+    def test_unit_trust_key(self):
+        sub = os.path.join(self.tree, "pkg")
+        os.makedirs(sub)
+        for folder in (self.tree, sub, self.repo, os.path.join(self.repo)):
+            self.assertEqual(os.path.realpath(self.repo), pa_hooks.trust_key(folder), folder)
+
+    def project_parent_of_state(self):
+        project = os.path.join(self.pa_home, "spaces")
+        self.agent({"space": "sp1", "terminal": "t0", "profile": "test", "project": project})
+        return project
+
+    def test_state_folder_refused_when_the_project_folder_holds_it(self):
+        self.project_parent_of_state()
+        decisions = os.path.join(self.space, "decisions")
+        os.makedirs(decisions)
+        os.makedirs(os.path.join(self.space, "evidence"))
+        for shown in (self.space, decisions, os.path.join(self.space, "evidence")):
+            with self.subTest(shown):
+                shutil.rmtree(self.hc)
+                os.makedirs(self.hc)
+                self.run_on(shown, shown)
+                self.expect("outside")
+
+    def test_project_folder_holding_the_state_folder_still_allowed(self):  # t124: only the state folder is refused
+        project = self.project_parent_of_state()
+        self.assertIsNone(pa_hooks.trust_project(project, self.home, self.pa_home)[1])
+        other = os.path.join(project, "notes")
+        os.makedirs(other)
+        self.accepts(other, cwd=other)
+        shutil.rmtree(self.hc)
+        os.makedirs(self.hc)
+        folder = os.path.join(self.space, "evidence", "t-1")
+        os.makedirs(folder)
+        out = self.accepts(folder, cwd=folder)
+        self.assertIn("evidence", out["why"])
+
+    def test_project_folder_holding_home_refused(self):  # Verify L1: P is HOME's parent
+        parent = os.path.dirname(self.home)
+        self.agent({"space": "sp1", "terminal": "t0", "profile": "test", "project": parent})
+        self.run_on(self.tree, self.tree)
+        self.expect("refused", "home")
+        self.assertIsNotNone(pa_hooks.trust_project(parent, self.home, os.path.join(self.root, "x", "pa"))[1])
+
+    def test_project_folder_holding_the_pa_home_refused(self):
+        for project in (self.pa_home, self.pa_home + "/"):
+            with self.subTest(project):
+                shutil.rmtree(self.hc)
+                os.makedirs(self.hc)
+                self.agent({"space": "sp1", "terminal": "t0", "profile": "test", "project": project})
+                folder = os.path.join(self.space, "evidence", "t-1")
+                os.makedirs(folder, exist_ok=True)
+                self.run_on(folder, folder)
+                self.expect("refused", "Project Agent's home")
+        other_home = os.path.join(self.root, "elsewhere-home")
+        self.assertIsNotNone(pa_hooks.trust_project(self.pa_home, other_home, self.pa_home)[1])
+        self.assertIsNone(pa_hooks.trust_project(self.P, self.home, self.pa_home)[1])
+
 # ---- R5 no grants of its own --------------------------------------------------------------------------------
 
 class R5NoGrants(Base):
