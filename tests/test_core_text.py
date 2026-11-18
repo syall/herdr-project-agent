@@ -748,5 +748,86 @@ class T035FolderTrust(unittest.TestCase):  # t-035 spec section 6, P1-P5 (with i
         self.assertIn(" pa-trust", line[0].split(";")[0])
 
 
+class T041DiskState(unittest.TestCase):  # t-041 J2: R7, R8, R9 (text), R10 (AC10.2), R16 markers
+    def setUp(self):
+        self.raw = read("runtime", "core", "orchestrator.md")
+        self.text = flat(self.raw)
+
+    def part(self, start, end):
+        return flat(self.raw[self.raw.index(start):self.raw.index(end)])
+
+    def test_tc1_checkpoint_fields(self):  # AC7.1
+        files = self.part("## Files", "## Decision cards")
+        self.assertIn('"context": { "pass": 12, "at": "<UTC time>", "session": "<id>", "clean": true, '
+                      '"boundary": "task|pass|null", "why": null }', files)
+        self.assertIn('"next": "<one line>", "after": [ "t-002" ], "why": "...", "due": "<UTC time or null>"', files)
+        disk = self.part("## What must be on disk", "## Files")
+        self.assertIn("Write `\"clean\": false`, with `why`, while you wait for the person's yes on a restated "
+                      "outward-facing step, are between two steps of one answered card, or must judge a worker's "
+                      "answer with this pass's reading in mind.", disk)
+        self.assertIn("`boundary` is `\"task\"` when a task went done or parked in this pass or nothing is in "
+                      "flight, else `\"pass\"`; null when not clean.", disk)
+        self.assertIn("`context.session` is the id `pa-doctor` prints as `this session:`, else null.", disk)
+
+    def test_tc2_destinations(self):  # AC8.1
+        disk = self.part("## What must be on disk", "## Files")
+        self.assertIn("Before you mark a checkpoint clean, all of the above is on disk.", disk)
+        for phrase in ("under `# Standing words`, quoted, with what they apply to and until when",
+                       'tell them "noted in standing notes", and propose a rule too if it should bind workers or the gate',
+                       "The current hold under `# Hold`.",
+                       "under `# Open asks` (id, question, what waits on it); remove it once answered, the answer to "
+                       "the journal or `pa-decide`.",
+                       "under `# Working notes`, at most 10.",
+                       "The task: `next` (the next step, one line), `after` (task ids it waits for), `why`, and "
+                       "`due` (UTC) for a promise with a time.",
+                       "Each worker's handoff file (see Workers).",
+                       "Worker updates, peer messages and the judgement behind a state change: the journal line's `why`."):
+            self.assertIn(phrase, disk)
+
+    def test_tc3_standing_file(self):  # R9
+        disk = self.part("## What must be on disk", "## Files")
+        self.assertIn("`standing.md` keeps exactly those four headings; each entry is a `- ` line starting with its "
+                      "UTC date, the person's words in \"...\". Keep it under 6,000 characters (fold old entries "
+                      "into the journal or a rule proposal); no secrets, no customer content.", disk)
+
+    def test_tc4_fresh_context_is_a_restart(self):  # AC10.2
+        self.assertEqual(self.raw.count("## After a restart or a compaction\n"), 1)
+        restart = self.part("## After a restart or a compaction", "## What must be on disk")
+        self.assertIn("Your session can be restarted (the tab reopens and resumes it), your context can be "
+                      "compacted at any time, and the launcher can start you in a fresh context. Either way, what "
+                      "you remember may be wrong or gone.", restart)
+        line = ("A fresh context counts as a restart: continue without asking exactly as after a restart, and "
+                "take each task's next step from its `next` and the journal.")
+        self.assertIn(line, restart)
+        self.assertLess(restart.index("those still wait for them."), restart.index(line))
+        self.assertLess(restart.index(line), restart.index("After a restart or a compaction, continue where"))
+        self.assertIn("Chat history is not state: it is lost on compaction or a fresh context.", self.text)
+
+    def test_tc5_markers(self):  # AC16.1 (text)
+        disk = self.part("## What must be on disk", "## Files")
+        for phrase in ('`"repeat": "<their words>"` when the person repeats something in `standing.md` or says you forgot it',
+                       '`"reask": "<ask or card id>"` when you asked something already answered',
+                       '`"redo": "<what>"` when, after a fresh context, you find a step already taken',
+                       'Journal each change: `"standing": "added"|"removed"`, `"entry": "<first 80 characters>"`.'):
+            self.assertIn(phrase, disk)
+
+    def test_tc6_handoff_file_rule(self):  # R8 I4
+        workers = self.part("## Workers", "## Phases and gates")
+        self.assertIn("Write it first to `evidence/<task-id>/handoff-<job>.md` and give `hc run` the prompt "
+                      "\"Read <path> and do the job it describes.\"", workers)
+
+    def test_tc7_section_order(self):
+        a, b, c = (self.raw.index(h) for h in ("## After a restart or a compaction", "## What must be on disk", "## Files"))
+        self.assertLess(a, b)
+        self.assertLess(b, c)
+
+    def test_tc8_pass_writes_the_checkpoint(self):  # R7
+        p = self.part("## The pass", "## After a restart or a compaction")
+        self.assertIn("4. Write the ledger again, with its `context` checkpoint, before you end your turn, and "
+                      "before any long wait.", p)
+        self.assertIn("write nothing but the `passCount` and the checkpoint's `pass` and `at`, and end the turn in "
+                      "one line.", p)
+
+
 if __name__ == "__main__":
     unittest.main()
