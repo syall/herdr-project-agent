@@ -299,6 +299,7 @@ export class CostsPane {
     else if (tot.money !== null && num(tot.unpricedTokens) > 0) box.child(line(`${tokens(tot.unpricedTokens)} tokens of ${missingModels.join(", ") || "some models"} have no price: shown as tokens only.`, t.blocked));
     box.child(this.tiles(t, s, tot, cur, priced, totals));
     if (num(tot.reconstructedMoney) > 0) box.child(line(`◌ Includes ${money(tot.reconstructedMoney, cur)} est. reconstructed (best effort) from session files still on disk.`, t.dim));
+    for (const text of this.scopeNote(s)) { totals.push(text); box.child(line(text, t.dim)); }
     for (const text of this.ccNotes(s)) { totals.push(text); box.child(line(text, t.dim)); }
     box.child(this.sections(t, space, st, s, cur));
     box.child(this.billed(t, space, st, s, cur));
@@ -342,6 +343,14 @@ export class CostsPane {
       .child(tile("Total", { money: tot.money, unpricedTokens: tot.unpricedTokens, tokens: all }, `${tokens(all)} tokens${all ? ` · ${Math.round((cr / all) * 100)}% cache read` : ""}${acct ? ` · account ${acct}` : ""}`, ccAlt, ccLine))
       .child(tile("Today", sum(mine), `${tokens(sum(mine).tokens)} tokens`))
       .child(tile(z.local ? "Last 7 days" : `Last 7 days (${z.label})`, week, `${tokens(week.tokens)} tokens`));
+  }
+
+  // One scope priced from another (A-V3 "always a priced as note", t-032 J1d): said once here, since no line names a scope.
+  scopeNote(s) {
+    const sc = list(s.byScope);
+    if (tagged(s) || sc.length !== 1) return [];
+    const f = factsOf(sc[0]), note = pricedNote(f, sc[0].pricedAs, true);
+    return note ? [`All costs: ${factsText(f, sc[0].by)} · ${note}`] : [];
   }
 
   // The notes under the tiles where the summary has Claude Code's figure: the legend of "CC", how many sessions have it
