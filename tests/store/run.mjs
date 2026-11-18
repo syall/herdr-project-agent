@@ -579,7 +579,7 @@ cases["S54-archive-folder"] = async () => { // R5: the archive is read with the 
   }
   const list = await store.loadDecisions(remote, { cx });
   check(list.length === 1 && list[0].id === "d-1", `a load reads decisions/ only (got ${list.map((c) => c.id)})`);
-  check(!g.__issued.some((x) => JSON.stringify(x).includes("decisions-archive")), "no call names the archive");
+  check(![...g.__issued, ...g.__execs].some((x) => JSON.stringify(x).includes("decisions-archive")), "no call names the archive");
   const arch = await store.loadDecisions(remote, { cx, batchOnly: true, folder: "decisions-archive" });
   check(arch?.length === 1 && arch[0].id === "d-0" && arch[0].path === `${rdir}/decisions-archive/d-0.json`, `the archive's cards (got ${JSON.stringify(arch?.map((c) => c.path))})`);
   check(remoteCalls("batch").length === 2, "one batch each");

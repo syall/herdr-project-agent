@@ -13,7 +13,7 @@ One file, selected by the name it is invoked as (symlinks in ~/.local/bin):
   pa-pass --pause | --resume                     pause or resume scheduled passes for the space
   pa-cleanup [--kill] [--dry-run] [--space ID]   remove finished workers whose evidence is recorded
   pa-doctor [--space ID]                         check a space's state files; exit 1 if any is broken
-  pa-task list|done|reopen|park|delete|restore|purge   the person's own changes to tasks (see pa-task --help)
+  pa-task list|done|reopen|park|delete|restore|purge|archive   the person's own changes to tasks (see pa-task --help)
   pa-decide <card> --answer LABEL|Other --quote TEXT   record a decision the person made in conversation
   pa-decide <card> --withdraw --why TEXT         close a card the conversation made moot (or answered Other)
   pa-sync --on MACHINE [--dry-run]               copy core/, tools/ and profiles/ to another Herdr machine
@@ -91,6 +91,57 @@ def write_text(path, text):
 
 def write_json(path, value):
     write_text(path, json.dumps(value, indent=2) + "\n")
+
+
+# ---- decision cards and their archive (t-054) ------------------------------------------------------------------
+# Old answered and withdrawn cards are moved by the person (pa-task archive) from decisions/ to decisions-archive/, a
+# sibling the panel reads only on request. Open cards never move. Every tool that reads a card by id reads it through
+# card_file, so an archived card still counts (an answered Keep is never asked again); every tool that writes one
+# writes through card_for_write, so a card a tool changes is in decisions/ again and an open card is never archived.
+ARCHIVE = "decisions-archive"
+ARCHIVE_DAYS = 14
+
+
+def card_file(directory, card_id):
+    """Where card `card_id` is: decisions/<id>.json, else decisions-archive/<id>.json if only that exists."""
+    live = os.path.join(directory, "decisions", card_id + ".json")
+    old = os.path.join(directory, ARCHIVE, card_id + ".json")
+    return old if not os.path.lexists(live) and os.path.lexists(old) else live
+
+
+def move_card(src, dst):
+    """One card file moved as is (a rename: a writer's replace after it makes a new file and loses nothing)."""
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    os.rename(src, dst)
+
+
+def archive_lock(directory):
+    """<space>/.archive.lock, held while pa-task archive runs and while a card comes back from the archive.
+    Returns the open file; close it to unlock."""
+    f = open(os.path.join(directory, ".archive.lock"), "a")
+    fcntl.flock(f, fcntl.LOCK_EX)
+    return f
+
+
+def card_for_write(directory, card_id):
+    """decisions/<id>.json, the only place a tool writes a card: an archived copy, when it is the only one, is moved
+    back there first."""
+    live = os.path.join(directory, "decisions", card_id + ".json")
+    if not os.path.lexists(live):
+        old = os.path.join(directory, ARCHIVE, card_id + ".json")
+        if os.path.lexists(old):
+            lock = archive_lock(directory)
+            try:
+                if not os.path.lexists(live) and os.path.lexists(old):
+                    move_card(old, live)
+            finally:
+                lock.close()
+    return live
+
+
+def write_card(directory, path, card):
+    """Writes a card read from `path` (in decisions/ or the archive) to decisions/ (card_for_write)."""
+    write_json(card_for_write(directory, os.path.basename(path)[:-len(".json")]), card)
 
 
 def backup(path, change):
@@ -2546,6 +2597,19 @@ def cmd_doctor(args):
         elif card["status"] == "open":
             open_cards += 1
     notes.append("{} open decision(s)".format(open_cards))
+    archived = os.path.join(directory, ARCHIVE)
+    if os.path.isdir(archived):
+        count = 0
+        for name in sorted(os.listdir(archived)):
+            if not name.endswith(".json"):
+                continue
+            card = load(os.path.join(ARCHIVE, name))
+            if card is None:
+                continue
+            count += 1
+            if not isinstance(card.get("question"), str) or not isinstance(card.get("options"), list) or card.get("status") not in ("answered", "withdrawn"):
+                problems.append("{}/{}: needs question, options and status answered|withdrawn".format(ARCHIVE, name))
+        notes.append("{} archived decision(s) in {}/".format(count, ARCHIVE))
     costs = os.path.join(directory, "costs")
     if os.path.isdir(costs):  # the Costs view's records (pa-costs); a note only, never a problem
         summary = read_json(os.path.join(costs, "summary.json"), None) if os.path.isfile(os.path.join(costs, "summary.json")) else None
@@ -2655,6 +2719,80 @@ def task_worktrees(task):
     return out
 
 
+def card_stamp(card):
+    """When a closed card was answered or withdrawn, as a UTC datetime, or None when it cannot be read."""
+    for key in ("answered", "withdrawnAt"):
+        m = re.match(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)", str(card.get(key) or ""))
+        if m:
+            try:
+                return datetime.datetime.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S").replace(tzinfo=datetime.timezone.utc)
+            except ValueError:
+                return None
+    return None
+
+
+def archive_cards(directory, args):
+    """pa-task archive (t-054): the person's command. Moves answered and withdrawn cards of every kind, answered more
+    than --days ago, from decisions/ to decisions-archive/. Stays: open cards, any other status, a card whose stamp
+    cannot be read, a file that is not a card, the cards of a task in the ledger that is not done or parked, and a name
+    already in the archive (never overwritten). Nothing is deleted. --dry-run lists and moves nothing (an agent may
+    run it). Each moved card is read again in the archive: one a writer reopened meanwhile goes back."""
+    if not args.dry_run and any(os.environ.get(k) for k in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CODEX_SANDBOX")):
+        raise Problem("pa-task archive is the person's command; an agent asks them instead (pa-task archive --dry-run shows what would move)")
+    if args.task:
+        raise Problem("pa-task archive takes no task id")
+    if args.days is None or args.days < 0:
+        raise Problem("--days must be 0 or more")
+    states = {t.get("id"): t.get("state") for t in (read_json_safe(os.path.join(directory, "ledger.json")) or {}).get("tasks") or [] if isinstance(t, dict)}
+    cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=args.days)
+    folder, archive = os.path.join(directory, "decisions"), os.path.join(directory, ARCHIVE)
+    moved, taken, back = [], [], []
+    locks = [] if args.dry_run else [archive_lock(directory), push_card_lock(directory)]
+    try:
+        for name in sorted(os.listdir(folder)) if os.path.isdir(folder) else []:
+            if not name.endswith(".json") or not ID.match(name[:-5]):
+                continue
+            src, dst = os.path.join(folder, name), os.path.join(archive, name)
+            card = read_json_safe(src)
+            if not isinstance(card, dict) or card.get("status") not in ("answered", "withdrawn") or not isinstance(card.get("question"), str):
+                continue
+            stamp = card_stamp(card)
+            if stamp is None or stamp > cutoff:
+                continue
+            task = card.get("task")
+            if task in states and states[task] not in ("done", "parked"):
+                continue
+            if os.path.lexists(dst):
+                taken.append(name[:-5])
+                continue
+            if args.dry_run:
+                moved.append(name[:-5])
+                continue
+            move_card(src, dst)
+            again = read_json_safe(dst)
+            if not (isinstance(again, dict) and again.get("status") in ("answered", "withdrawn")):
+                if not os.path.lexists(src):
+                    move_card(dst, src)
+                back.append(name[:-5])
+                continue
+            moved.append(name[:-5])
+        if moved and not args.dry_run:
+            with open(os.path.join(directory, "journal.jsonl"), "a") as journal:
+                ids = ", ".join(moved)
+                journal.write(json.dumps({"at": now(), "by": "person", "trigger": "archive",
+                                          "why": "archived {} decision card(s) answered more than {:g} days ago to {}/: {}".format(
+                                              len(moved), args.days, ARCHIVE, ids if len(ids) <= 2000 else ids[:1999] + "…")}) + "\n")
+    finally:
+        for lock in reversed(locks):
+            lock.close()
+    verb = "Would move" if args.dry_run else "Moved"
+    print("{} {} card(s) to {}/{}".format(verb, len(moved), ARCHIVE, ": " + ", ".join(moved) if moved else "."))
+    if taken:
+        print("Left in decisions/, a card of the same name is already in {}: {}".format(ARCHIVE, ", ".join(taken)))
+    if back:
+        print("Left in decisions/, changed while it was moved: {}".format(", ".join(back)))
+
+
 def cmd_task(args):
     """The person's own changes to tasks, from the panel or a terminal. The orchestrator is told,
     so it re-reads the ledger instead of writing an old copy over the change.
@@ -2677,6 +2815,8 @@ def cmd_task(args):
         return
     if args.action in ("delete", "purge") and any(os.environ.get(k) for k in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CODEX_SANDBOX")):
         raise Problem("pa-task {} is the person's command; an agent asks them instead".format(args.action))
+    if args.action == "archive":
+        return archive_cards(directory, args)
     if args.action == "purge":
         gone = 0
         for name in sorted(os.listdir(trash)) if os.path.isdir(trash) else []:
@@ -2728,11 +2868,12 @@ def cmd_task(args):
                 evidence = os.path.join(directory, "evidence", args.task)
                 if os.path.isdir(evidence):
                     os.rename(evidence, os.path.join(target, "evidence"))
-                decisions = os.path.join(directory, "decisions")
-                for name in os.listdir(decisions) if os.path.isdir(decisions) else []:
-                    card = read_json(os.path.join(decisions, name)) if name.endswith(".json") else None
-                    if card and card.get("task") == args.task:
-                        os.rename(os.path.join(decisions, name), os.path.join(target, "decisions", name))
+                for sub in ("decisions", ARCHIVE):  # its archived cards too (t-054); restore puts every one in decisions/
+                    decisions = os.path.join(directory, sub)
+                    for name in os.listdir(decisions) if os.path.isdir(decisions) else []:
+                        card = read_json_safe(os.path.join(decisions, name)) if name.endswith(".json") else None
+                        if isinstance(card, dict) and card.get("task") == args.task and not os.path.lexists(os.path.join(target, "decisions", name)):
+                            os.rename(os.path.join(decisions, name), os.path.join(target, "decisions", name))
                 ledger["tasks"] = [t for t in ledger["tasks"] if t.get("id") != args.task]
                 after = "deleted"
                 trees = task_worktrees(task)
@@ -2818,7 +2959,7 @@ def cmd_decide(args):
     A push card is read and written under the space's push lock."""
     directory, agent = space_for_command(args.space)
     ident(args.card, "card id")
-    path = os.path.join(directory, "decisions", args.card + ".json")
+    path = card_file(directory, args.card)  # an archived card too (t-054)
     card = read_json(path)
     if not card:
         raise Problem("no decision card {}".format(args.card))
@@ -2887,7 +3028,7 @@ def decide_card(directory, path, args):
                     r.setdefault("history", []).append({"at": stamp, "by": "person", "change": ("approved" if decided == "active" else "declined") + " in conversation"})
             if rules.get("rules") is not None:
                 write_json(rules_path, rules)
-    write_json(path, card)
+    write_card(directory, path, card)  # in decisions/: one that was archived comes back
     with open(os.path.join(directory, "journal.jsonl"), "a") as journal:
         journal.write(json.dumps({"at": stamp, "by": "orchestrator", "trigger": "conversation", "task": card.get("task"), "decision": args.card,
                                   "why": "{}{}: {}".format(what, ' (was Other: "{}")'.format(words_cut(card.get("previousNote"))) if withdraw_other else "",
@@ -3039,10 +3180,14 @@ def main():
     if kind == "pa-task":
         parser.description = ("list: tasks with their evidence size, and the trash. done / park / reopen <id>: change a task's state. "
                               "delete <id>: move the task, its evidence and its decision cards to the trash. restore <id>: bring it back. "
-                              "purge [<id>]: permanently delete what is in the trash.")
-        parser.add_argument("action", choices=("list", "done", "reopen", "park", "delete", "restore", "purge"))
+                              "purge [<id>]: permanently delete what is in the trash. archive [--days N] [--dry-run]: move answered and withdrawn "
+                              "decision cards older than N days (default 14) to decisions-archive/; open cards and the cards of a task that is not "
+                              "done or parked stay; nothing is deleted.")
+        parser.add_argument("action", choices=("list", "done", "reopen", "park", "delete", "restore", "purge", "archive"))
         parser.add_argument("task", nargs="?")
         parser.add_argument("--space")
+        parser.add_argument("--days", type=float, default=ARCHIVE_DAYS, help="archive: cards answered more than this many days ago (default {})".format(ARCHIVE_DAYS))
+        parser.add_argument("--dry-run", action="store_true", help="archive: list what would move, move nothing")
         return cmd_task(parser.parse_args())
     if kind == "pa-decide":
         parser.add_argument("card")

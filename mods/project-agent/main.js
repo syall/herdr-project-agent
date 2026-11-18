@@ -118,6 +118,7 @@ export default class ProjectAgent extends View {
     this.open = new Set(); // expanded task ids
     this.folded = new Set(["done", "parked"]); // task sections folded away (finished work starts folded)
     this.older = false; // answered cards shown
+    this.archive = {}; // t-054: space id -> { open, busy, cards, error }: decisions-archive/, read only on a click
     this.output = {}; // `${task}:${label}` -> { text, code, running }
     this.armed = null; // arm() (rules.js): the task whose Delete was clicked once (a second click deletes); see armedTask()
     this.taskError = {}; // task id -> why the last change failed
@@ -265,6 +266,30 @@ export default class ProjectAgent extends View {
       }
     }, { what: "the hidden panel's read" });
     if (!ok) mine.busy = false;
+  }
+
+  // The archive (t-054): old answered cards pa-task archive moved to decisions-archive/. Never read on a reload; each
+  // click that opens it reads it once (batch only), newest first, at most 50 shown.
+  archiveLine(t, space) {
+    const a = this.archive[space.id];
+    const said = a?.busy ? " · reading…" : a?.error ? ` · ${a.error}` : a?.cards ? ` · ${a.cards.length}${a.cards.omitted ? ` (${a.cards.omitted} older not shown)` : ""}` : "";
+    return div().id("pa-archive").px(4).py(4).text_size(11.5).text_color(t.dim).cursor_pointer().hover((s) => s.text_color(t.foreground))
+      .on_click((_e, cx) => { this.toggleArchive(space, cx); cx.notify(); }).child(`${a?.open ? "▾" : "▸"} Archive${said}`);
+  }
+  toggleArchive(space, cx) {
+    const a = (this.archive[space.id] ??= { open: false, busy: false, cards: null, error: null });
+    a.open = !a.open;
+    if (!a.open || a.busy) return;
+    a.busy = true;
+    const ok = this.host.spawn(cx, async (cx) => {
+      const out = {};
+      let r = null;
+      try { r = await loadDecisions(space, { cx: this.host.ctx(cx, { origin: "archive", background: false }), batchOnly: true, folder: "decisions-archive", out }); } catch {}
+      a.busy = false;
+      if (r) { a.cards = r; a.error = null; } else if (!out.busy) a.error = "could not read it now";
+      cx.notify();
+    }, { what: "the archive read", background: false });
+    if (!ok) { a.busy = false; a.error = "could not read it now"; }
   }
 
   // While hidden with no kept load whose profile answered: the space's profile, for "project-agent.mainBranches". Read once
@@ -1179,6 +1204,8 @@ export default class ProjectAgent extends View {
         .children(listed.map((c) => this.card(t, c, space)))
         .when(answered.length > 0 || this.cards.omitted > 0, (e) => e.child(div().id("pa-older").px(4).py(4).text_size(11.5).text_color(t.dim).cursor_pointer().hover((s) => s.text_color(t.foreground))
           .on_click((_e, cx) => { this.older = !this.older; cx.notify(); }).child(`${this.older ? "▾" : "▸"} ${answered.length} answered${this.cards.omitted > 0 ? ` · ${this.cards.omitted} older not shown` : ""}`)))
-        .when(this.older, (e) => e.children(answered.slice(0, 50).map((c) => this.card(t, c, space))))));
+        .when(this.older, (e) => e.children(answered.slice(0, 50).map((c) => this.card(t, c, space))))
+        .when(this.older, (e) => e.child(this.archiveLine(t, space)))
+        .when(this.older && Boolean(this.archive[space.id]?.open), (e) => e.children((this.archive[space.id]?.cards ?? []).slice(0, 50).map((c) => this.card(t, c, space))))));
   }
 }

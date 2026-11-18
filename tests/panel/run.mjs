@@ -4615,7 +4615,7 @@ cases["P54-archive-on-request"] = async () => { // R5: reloads never read decisi
   g.__files[`:${DIR}/decisions-archive/d-000.json`] = JSON.stringify({ id: "d-000", status: "answered", answer: "Yes", question: "An archived question?", options: [{ label: "Yes" }], created: "2026-01-01T10:00:00Z" });
   g.__ls[`:${DIR}/decisions-archive`] = ["d-000.json"];
   const v = await mount(); await settle();
-  const archiveCalls = () => g.__issued.filter((x) => JSON.stringify(x).includes("decisions-archive")).length;
+  const archiveCalls = () => [...g.__issued, ...(g.__execs ?? [])].filter((x) => JSON.stringify(x).includes("decisions-archive")).length; // __issued has no exec args
   advance(60000); await settle();
   check(archiveCalls() === 0, `no load reads the archive (got ${archiveCalls()})`);
   check(!/An archived question/.test(look(v).text), "not shown before it is asked for");

@@ -162,6 +162,10 @@ only `pa-push-main plan` writes one):
 ```
 `evidence` names the files in the task's evidence folder the decision is about, the one to
 read first at the front; the card's link opens that file.
+Old answered and withdrawn cards are in `decisions-archive/`, beside `decisions/`: the
+person moves them there with `pa-task archive` (you may run it with `--dry-run` only).
+When a card id is not in `decisions/`, read it there; the tools do. A new card's id must
+be in neither folder. Never write or move a file in `decisions-archive/`.
 The card that asks to publish or merge lists every Recorded limit, each with its follow-up
 task, or for the person to accept. A commit after the last check needs a recheck before
 that card. The person's approval on that card is for the commit the gate recorded: if

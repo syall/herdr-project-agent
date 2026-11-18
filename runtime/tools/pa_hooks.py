@@ -1364,7 +1364,9 @@ def md_name(job, main=True):
 
 
 def card_path(directory, task, job=None, main=True):
-    return os.path.join(directory, "decisions", card_id(task, job, main) + ".json")
+    """Where the card is (t-054: in decisions-archive/ when only there, so an archived answer still counts). Write it
+    with pa.write_card, which puts it in decisions/."""
+    return pa.card_file(directory, card_id(task, job, main))
 
 
 def card_owner(row):
@@ -1467,7 +1469,7 @@ def card_mismatch(row, card, answered):
 def withdraw_card(directory, path, card, task, why):
     card.update(status="withdrawn", answer=None, note="Withdrawn by pa-worktree check: " + why, answered=pa.now(),
                 answeredBy="pa-worktree check: withdrawn")
-    pa.write_json(path, card)
+    pa.write_card(directory, path, card)
     append_journal(directory, {"by": "agent" if by_an_agent() else "person", "trigger": "worktree", "task": task,
                                "why": "withdrew card {}: {}".format(card["id"], why)})
     print("{}: withdrew card {}: {}".format(task, card["id"], why))
@@ -1502,7 +1504,7 @@ def open_worktree_card(directory, row, facts, profile, owner, rule, gone, desc=N
     squash = (" " + SQUASH if any(c["merged"] is False for r in desc["repos"] for c in r["commits"]) else "")
     titles = ", ".join('{} "{}"'.format(clean(t), cut(clean(row["titles"].get(t, "")), 60)) for t in row.get("counted") or row["tasks"])
     path = card_path(directory, task, job, main)
-    pa.write_json(path, dict(carried(pa.read_json(path)), **{
+    pa.write_card(directory, path, dict(carried(pa.read_json(path)), **{
         "id": cid, "task": task, "worktree": row["path"], "job": job, "main": main, "rule": rule, "tasks": row_tasks(row),
         "question": "Delete the worktree for {}{}?".format(titles, ", job {}".format(clean(job)) if named else ""),
         "context": card_context(desc, row, facts, gone, extra, md_file),
@@ -1701,7 +1703,7 @@ def withdraw_answered(directory, path, card, task, why):
     pa.keep_previous(card, card.get("answer"))
     card.update(status="withdrawn", answer=None, answered=pa.now(),
                 answeredBy="pa-worktree remove: withdrawn", note="Withdrawn by pa-worktree remove: " + why)
-    pa.write_json(path, card)
+    pa.write_card(directory, path, card)
     append_journal(directory, {"by": "agent" if by_an_agent() else "person", "trigger": "worktree", "task": task,
                                "why": "withdrew card {}: {}".format(card["id"], why)})
 
@@ -2357,7 +2359,7 @@ def shown_before(directory, policy):
     """Workers on earlier leftovers cards that the person answered: they are not offered again."""
     seen = set()
     for card_id in (policy or {}).get("cards") or []:
-        card = pa.read_json(os.path.join(directory, "decisions", card_id + ".json")) or {}
+        card = pa.read_json(pa.card_file(directory, card_id)) or {}
         if card.get("status") == "answered":
             seen |= {(w.get("address"), w.get("task"), w.get("name")) for w in card.get("workers") or []}
     return seen
@@ -2373,7 +2375,7 @@ def close_leftovers(directory, agent, profile, dry_run):
     policy = ledger.get("workerPolicy")
     if policy:
         last_id = policy.get("card")
-        last = pa.read_json(os.path.join(directory, "decisions", last_id + ".json")) if last_id else None
+        last = pa.read_json(pa.card_file(directory, last_id)) if last_id else None
         again = last and (last.get("status") == "withdrawn" or (last.get("status") == "answered" and last.get("more")))
         if not again:
             print("--leftovers already ran (workerPolicy since {}; card {}{}); nothing was done.".format(
@@ -2397,13 +2399,13 @@ def close_leftovers(directory, agent, profile, dry_run):
             print("No old-style workers to list.")
         return
     by = "agent" if by_an_agent() else "person"
-    path = os.path.join(directory, "decisions", card_id + ".json")
+    path = pa.card_file(directory, card_id)  # an archived card of that name counts as there (t-054)
     with ledger_lock(directory):
         ledger = read_ledger(directory)
         opened = bool(on_card) and not os.path.exists(path)
         if opened:
-            before = carried(pa.read_json(os.path.join(directory, "decisions", last_id + ".json")) if policy and last_id else None)
-            pa.write_json(path, dict(dict(before, previousCard=last_id) if before else {}, **{
+            before = carried(pa.read_json(pa.card_file(directory, last_id)) if policy and last_id else None)
+            pa.write_card(directory, path, dict(dict(before, previousCard=last_id) if before else {}, **{
                 "id": card_id, "kind": "leftovers", "task": None,
                 "question": "Close the {} worker(s) left from before one-worker-per-job that are listed here?".format(len(on_card)),
                 "context": context,
@@ -2437,7 +2439,8 @@ def close_leftovers(directory, agent, profile, dry_run):
 
 def leftovers_card(directory, card_id):
     """The answered leftovers card that lets `pa-worker close --card` close workers, or a refusal."""
-    card = pa.read_json(os.path.join(directory, "decisions", card_id + ".json")) if pa.ID.match(card_id or "") else None
+    path = pa.card_file(directory, card_id) if pa.ID.match(card_id or "") else None
+    card = pa.read_json(path) if path else None
     if not card or card.get("kind") != "leftovers":
         raise pa.Problem("no leftovers card {}; nothing was closed".format(card_id))
     if card.get("status") == "open":
@@ -2452,7 +2455,7 @@ def leftovers_card(directory, card_id):
         pa.keep_previous(card, pa.OTHER)
         card.update(status="withdrawn", answer=None, answeredBy="pa-worker close: withdrawn", withdrawnAt=pa.now())
         card.pop("other", None)
-        pa.write_json(os.path.join(directory, "decisions", card_id + ".json"), card)
+        pa.write_card(directory, path, card)
         append_journal(directory, {"by": "agent" if by_an_agent() else "person", "trigger": "leftovers",
                                    "why": "withdrew card {}: it was answered Other ({}); nothing was closed".format(card_id, words)})
         raise pa.Problem('card {} was answered Other, in the person\'s own words: "{}". Nothing was closed; the words are not read by '
@@ -2464,7 +2467,7 @@ def leftovers_card(directory, card_id):
         # A note is never parsed: it could name a worker to keep in any words. Close nothing and ask again.
         pa.keep_previous(card, card.get("answer"))
         card.update(status="withdrawn", answer=None, answeredBy="pa-worker close: withdrawn", withdrawnAt=pa.now())
-        pa.write_json(os.path.join(directory, "decisions", card_id + ".json"), card)
+        pa.write_card(directory, path, card)
         append_journal(directory, {"by": "agent" if by_an_agent() else "person", "trigger": "leftovers",
                                    "why": "withdrew card {}: it was answered with a note ({}); nothing was closed".format(card_id, cut(clean(card["note"]), 200))})
         raise pa.Problem('card {} has a note, so nothing was closed: "{}". The note is not read. Ask the person to say "keep tNN" for each '

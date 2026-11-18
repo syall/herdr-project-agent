@@ -324,8 +324,9 @@ const byteOrder = (a, b) => (a < b ? -1 : a > b ? 1 : 0); // names are ASCII: co
 // answer and `ls` timed out or failed): unknown, not "no cards". A listing that answered (no folder,
 // an empty one) is [].
 export const CARD_READS = 8;
-export async function loadDecisions(space, { cx, batchOnly = false, live, known = [], out = {} } = {}) {
-  const on = space.machine ?? null, dir = `${stateDir(space)}/decisions`;
+// folder (t-054): "decisions-archive" reads the archive pa-task archive fills, on request only (main.js readArchive).
+export async function loadDecisions(space, { cx, batchOnly = false, live, known = [], out = {}, folder = "decisions" } = {}) {
+  const on = space.machine ?? null, dir = `${stateDir(space)}/${folder === "decisions-archive" ? folder : "decisions"}`;
   let r = null;
   try { r = await capped(cx, () => run("sh", ["-c", CARDS_SCRIPT, "sh", dir], { on, timeout: READ_LIMIT }), { key: `batch:${on ?? ""}:${dir}`, what: "the decision cards read" }); } catch { r = null; }
   if (r?.busy) { out.busy = true; return null; } // the last batch is still pending: skipped, quietly
