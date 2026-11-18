@@ -735,6 +735,138 @@ class ProfileReload(Base):
         expected = [a.replace("model-a", "model-b") for a in self.masked(first)]  # the steering names the model too
         self.assertEqual(self.masked(second), expected)
 
+    # Round 4 (check round 3 M1, M2; card d-102): the launch itself is the check. A re-read profile whose command
+    # the exec refuses (raises) falls back to the profile in hand for that launch; a command that starts and exits
+    # non-zero is not a failed start; when the profile in hand cannot be started either, it fails as before.
+    def full_profile(self):
+        v = self.good_profile()
+        v.update(changeRequest={"name": "CR", "tool": "cr"}, ci=["a", "b"], tests={"affected": "t a", "full": "t f"})
+        return v
+
+    def real_launches(self, between, path, stop_after=2, first=None):
+        """run_agent's loop with the real subprocess.call: attempts (every argv handed to it) and starts (those it
+        started). Stops at the start number stop_after (the code of the starts before it: 0)."""
+        attempts, starts = [], []
+        real = pa.subprocess.call
+
+        class Stop(Exception):
+            pass
+
+        def fake_call(argv, cwd=None):
+            attempts.append(list(argv))
+            code = real(argv, cwd=cwd)  # raises when the program cannot be started
+            starts.append(list(argv))
+            if len(starts) == 1:
+                between()
+                if path == "resume":
+                    agent = load(os.path.join(self.dir, "agent.json"))
+                    agent["sessionStarted"] = True
+                    dump(agent, os.path.join(self.dir, "agent.json"))
+                return 0
+            if len(starts) >= stop_after:
+                raise Stop()
+            return code
+        self.fresh_agent()
+        dump(first or self.full_profile(), os.path.join(self.prof, "profile.json"))
+        saved = (pa.subprocess.call, pa.time.sleep, os.environ.pop("PA_NO_CC_STATUSLINE", None))
+        pa.subprocess.call, pa.time.sleep = fake_call, (lambda s: None)
+        p = pa.load_profile("test")
+        err = None
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                pa.run_agent(types.SimpleNamespace(fresh=True), "t1", self.project, p, self.dir,
+                             load(os.path.join(self.dir, "agent.json")), {"beat": True, "previous": None}, time.time())
+        except Stop:
+            pass
+        except Exception as e:  # noqa: BLE001 - reported to the test
+            err = e
+        finally:
+            pa.subprocess.call, pa.time.sleep = saved[0], saved[1]
+            if saved[2] is not None:
+                os.environ["PA_NO_CC_STATUSLINE"] = saved[2]
+        return attempts, starts, err
+
+    def test_r4_a_new_profile_the_exec_refuses_launches_with_the_one_in_hand(self):
+        # The 10 round 3 shapes (VERIFY R3.4) x restart/resume: lone surrogates (UnicodeEncodeError) and execve
+        # errors (a directory, ~, a non-program: PermissionError / ENOEXEC; 3 MB: E2BIG).
+        home = os.path.join(TMP, "r4home")
+        adir = os.path.join(TMP, "r4dir")
+        notbin = os.path.join(TMP, "r4notbin")
+        os.makedirs(home, exist_ok=True)
+        os.makedirs(adir, exist_ok=True)
+        with open(notbin, "w") as f:
+            f.write("not a script\n")
+        os.chmod(notbin, 0o755)
+
+        def raw(old, new):
+            def write():
+                text = json.dumps(self.full_profile())
+                self.assertIn(old, text)
+                with open(os.path.join(self.prof, "profile.json"), "w") as f:
+                    f.write(text.replace(old, new))
+            return write
+
+        def with_(**kw):
+            return lambda: dump(dict(self.full_profile(), **kw), os.path.join(self.prof, "profile.json"))
+        cases = {"models.orchestrator lone surrogate": raw('"model-a"', '"\\ud800"'),
+                 "claude arg lone surrogate": raw('"claude": ["true"]', '"claude": ["true", "\\ud800"]'),
+                 "changeRequest.name lone surrogate": raw('"CR"', '"\\ud800"'),
+                 "ci lone surrogate": raw('["a", "b"]', '["\\ud800"]'),
+                 "tests.affected lone surrogate": raw('"t a"', '"\\ud800"'),
+                 "claude[0] a directory": with_(claude=[adir, "--x"]),
+                 "claude[0] a dir via ~": with_(claude=["~", "--x"]),
+                 "claude[0] exec format": with_(claude=[notbin, "--x"]),
+                 "claude arg 3 MB": with_(claude=["true", "x" * 3000000]),
+                 "models.orchestrator 3 MB": with_(models={"orchestrator": "m" * 3000000})}
+        saved_home = os.environ.get("HOME")
+        os.environ["HOME"] = home  # "~" is a temp folder
+        try:
+            for path in ("restart", "resume"):
+                _, starts, err = self.real_launches(lambda: None, path)
+                self.assertIsNone(err)
+                expected = self.masked(starts[1])
+                self.assertEqual("--resume" in expected, path == "resume")
+                for name, between in cases.items():
+                    with self.subTest(name, path=path):
+                        attempts, starts, err = self.real_launches(between, path)
+                        self.assertIsNone(err, "the launcher died at the restart: {!r}".format(err)[:300])
+                        self.assertEqual(len(starts), 2)
+                        self.assertIn("model-a", starts[0])
+                        self.assertEqual(self.masked(starts[1]), expected)
+        finally:
+            if saved_home is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = saved_home
+
+    def test_r4_a_new_profile_that_starts_and_exits_non_zero_is_not_a_failed_start(self):
+        def between():
+            dump(dict(self.full_profile(), claude=["false"]), os.path.join(self.prof, "profile.json"))
+        attempts, starts, err = self.real_launches(between, "restart", stop_after=3)
+        self.assertIsNone(err)
+        self.assertEqual(len(attempts), 3, "a non-zero exit made a second launch")
+        self.assertEqual(attempts, starts)
+        self.assertTrue(starts[1][0].endswith("/false"), starts[1][0])
+        self.assertTrue(starts[2][0].endswith("/false"), "the restart after a non-zero exit fell back")
+
+    def test_r4_when_the_profile_in_hand_cannot_start_either_it_fails_as_before(self):
+        agent_bin = os.path.join(TMP, "r4agent")
+        with open(agent_bin, "w") as f:
+            f.write("#!/bin/sh\nexit 0\n")
+        os.chmod(agent_bin, 0o755)
+        adir = os.path.join(TMP, "r4dir")
+        os.makedirs(adir, exist_ok=True)
+
+        def between():
+            with open(agent_bin, "w") as f:  # the profile in hand's program is no longer one
+                f.write("not a script\n")
+            dump(dict(self.full_profile(), claude=[adir]), os.path.join(self.prof, "profile.json"))
+        attempts, starts, err = self.real_launches(between, "restart", first=dict(self.full_profile(), claude=[agent_bin]))
+        self.assertEqual(len(starts), 1)
+        self.assertEqual([a[0] for a in attempts], [agent_bin, adir, agent_bin])
+        self.assertIsInstance(err, OSError)
+        self.assertEqual(err.errno, 8, "the in-hand profile's own start error, as before t-033: {!r}".format(err))
+
 
 def tearDownModule():
     shutil.rmtree(TMP, ignore_errors=True)
