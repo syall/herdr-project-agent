@@ -1463,14 +1463,17 @@ def worker_facts(directory, agent, profile, address):
     if row and task["id"] not in row["tasks"]:  # never another task's worktree (worker_tree gives only its own; a second guard)
         row = None
     if row and row["facts"] and not row["facts"].get("main") and not row["facts"].get("unreadable"):
-        # Another task that records this worktree and is not done or parked keeps it (rule (a), every ledger shape: card d-094).
-        held = [t for t in row["tasks"] if t != task["id"] and row["states"].get(t) not in ("done", "parked")]
+        # Another task that counts on this worktree and is not done or parked keeps it (rule (a), every ledger shape: card d-094).
+        # It counts the way pa-worktree does (row_tasks): it records the worktree, a folder inside it or its container
+        # (t-048, t-020 RL-V5). row["counted"] is that set with the exact ones first, in ledger order.
+        held = [t for t in row.get("counted") or row["tasks"] if t != task["id"] and row["states"].get(t) not in ("done", "parked")]
         others = [w["address"] for w in row["workers"] if w["fate"] == "live" and w["address"] != address] + row["others"]
         others += ["task {} ({})".format(clean(t), state_word(row["states"].get(t))) for t in held]
         out["worktree"] = {"path": row["path"], "kind": row["facts"].get("kind", "worktree"), "uncommitted": row["facts"]["uncommitted"],
                            "unpushed": row["facts"]["unpushed"], "removesBranches": bool(row["facts"].get("removesBranches")),
                            "branch": row["facts"]["branch"], "sharedWith": others, "keep": row["keep"], "heldBy": held,
-                           "tasks": list(row["tasks"])}  # whose ledger entries a removal marks
+                           "tasks": list(row["tasks"]),  # whose ledger entries a removal marks
+                           "related": {t: list(p) for t, p in (row.get("related") or {}).items()}}  # marked once each path is gone
     return out, row
 
 
@@ -2185,6 +2188,13 @@ def cmd_worker(args):
                     t["updated"] = pa.now()
                 if tree and tree.get("removed") and t.get("id") in tree["tasks"]:  # every task that recorded it
                     mark_removed(t, tree["path"], pa.now())
+                    t["updated"] = pa.now()
+                # a task that counts through a folder inside the worktree or its container: that path, once it is gone
+                # (inside: with the worktree; the container: only once remove_container took it), as mark_removed_everywhere
+                gone = [p for p in (tree or {}).get("related", {}).get(t.get("id"), []) if not os.path.lexists(p)] if tree and tree.get("removed") else []
+                for p in gone:
+                    mark_removed(t, p, pa.now())
+                if gone:
                     t["updated"] = pa.now()
             if ledger:
                 pa.write_json(path, ledger)
