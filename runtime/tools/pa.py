@@ -882,6 +882,15 @@ def claim(args, address, labels, space, project, p, existing, directory):
     return directory, agent, previous
 
 
+def reload_profile(p):
+    """The profile as it is now, by the same name, so a restart in run_agent's loop sees an edit made since the
+    launcher began (t-033); the one in hand when it cannot be read now (missing, malformed, wrong shape)."""
+    try:
+        return load_profile(p["name"])
+    except Exception:  # noqa: BLE001 - a restart never fails because of it
+        return p
+
+
 def run_agent(args, address, project, p, directory, agent, ctx, started):
     running = ctx.setdefault("running", {"since": None, "session": None, "marked": False})
     ctx["directory"] = directory
@@ -915,6 +924,7 @@ def run_agent(args, address, project, p, directory, agent, ctx, started):
         ctx["beat"] = True
     quick, quick_resume_fails = 0, 0
     while True:
+        p = reload_profile(p)
         agent = read_json(os.path.join(directory, "agent.json"), agent)
         resume, why = should_resume(agent, directory, project, before=started, heartbeat=ctx.get("previous"))
         if args.fresh:
