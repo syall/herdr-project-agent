@@ -21,6 +21,7 @@ import { PushCards, isPush, shownOnly, PUSH, PUSH_OPTIONS, RUN_TIMEOUT, GRACE } 
 import { CostsPane } from "./costs.js";
 import { Copier, sel } from "./copy.js";
 import { tick, cadence, holdReason, setSchedule, requestPass, PRESETS, MIN_MINUTES } from "./timer.js";
+import { Awake } from "./awake.js";
 
 const ACTIVE = ["needs-decision", "review", "in-progress", "investigating", "queued"];
 const ORDER = [...ACTIVE, "parked", "done"];
@@ -162,6 +163,8 @@ export default class ProjectAgent extends View {
     cx.timer.every(250, (cx) => { if (mine() && this.keeper.busy()) this.keeper.syncPA(cx); }); // while a restore runs
     cx.timer.every(400, () => { if (mine()) this.keeper.offerSetup(); });
     cx.timer.every(15000, (cx) => { if (mine()) this.keeper.readBeats(cx); });
+    this.awake = new Awake(mine, this.host); // t-060: keep the Mac awake while Herdr runs (the lease holder only)
+    cx.timer.every(1000, (cx) => this.awake.tick(cx));
     if (props()?.timer) return; // the always-on copy only keeps time; it shows nothing
     this.reload(cx);
     cx.timer.every(10000, (cx) => { this.reload(cx, BG); this.resend(cx); });
@@ -1171,6 +1174,7 @@ export default class ProjectAgent extends View {
       .when((data.stale ?? []).length > 0 && Boolean(live), (el) => el.child(div().px(12).py(6).border_b(1).border_color(t.border).bg(t.working + "1a").text_size(11.5).text_color(t.foreground)
         .child(`Its instructions changed since this agent started (${data.stale.slice(0, 3).join(", ")}). Type /exit in its tab: it restarts in place, keeps the conversation and loads them.`)))
       .child(this.scheduleBar(t, space, data))
+      .child(this.awake.bar(t))
       .child(h_flex().px(8).py(6).gap(4).flex_none().border_b(1).border_color(t.border)
         .child(tab("decisions", openCards.length ? `Decisions · ${openCards.length}` : "Decisions"))
         .child(tab("tasks", `Tasks · ${tasks.length}`))
