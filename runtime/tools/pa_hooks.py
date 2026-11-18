@@ -2030,7 +2030,7 @@ def trust_project(project, home, pa_home=None):
     """(real project folder, None), or (None, why) when it cannot be the base of a trust: also when the home folder
     is inside it (every folder in it, the Claude home among them, would be inside), or when it overlaps the Project
     Agent's home or its spaces folder either way, on real paths (holds it, is it, or lies inside it: its state
-    folders would be inside it)."""
+    folders would be inside it), or holds the real path of any space folder (<pa home>/spaces/<id>, a symlink)."""
     if not isinstance(project, str) or not project.strip():
         return None, "agent.json names no project folder"
     if not os.path.isabs(project):
@@ -2044,6 +2044,15 @@ def trust_project(project, home, pa_home=None):
     if pa_home and any(trust_inside(x, real) or trust_inside(real, x) for x in (pa_home, os.path.join(pa_home, "spaces"))):
         return None, "the project folder overlaps the Project Agent's home (holds it or its spaces folder, or lies " \
                      "inside it): its state would be inside it"
+    if pa_home:
+        spaces = os.path.join(pa_home, "spaces")
+        try:
+            names = os.listdir(spaces)
+        except OSError:
+            names = []
+        if any(trust_inside(os.path.join(spaces, n), real) for n in names):
+            return None, "the project folder holds a space folder of the Project Agent's home (through a symlink): " \
+                         "its state would be inside it"
     return real, None
 
 
@@ -2068,24 +2077,49 @@ def trust_evidence(folder, state_dir, task_ids):
     return False
 
 
+TRUST_GIT_DROP = ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_CEILING_DIRECTORIES",
+                  "GIT_DISCOVERY_ACROSS_FILESYSTEM")
+
+
+def trust_git_env(environ):
+    """pa-trust's git environment: without the variables that move git's repository discovery, and LC_ALL=C so its
+    messages are matched in one language."""
+    env = {k: v for k, v in environ.items() if k not in TRUST_GIT_DROP}
+    env["LC_ALL"] = "C"
+    return env
+
+
+def trust_git(path, *args):
+    """git() for pa-trust: the same (exit code, stdout, stderr), run with trust_git_env."""
+    try:
+        r = subprocess.run(["git", "-C", path] + list(args), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           universal_newlines=True, timeout=GIT_TIMEOUT, env=trust_git_env(os.environ))
+    except subprocess.TimeoutExpired:
+        return 124, "", "git {} timed out after {} s".format(args[0] if args else "", GIT_TIMEOUT)
+    except OSError as e:
+        return 127, "", str(e)
+    return r.returncode, r.stdout.strip(), r.stderr.strip()
+
+
 def git_top(folder):
-    code, out, _ = git(folder, "rev-parse", "--show-toplevel")
+    code, out, _ = trust_git(folder, "rev-parse", "--show-toplevel")
     return os.path.realpath(out) if code == 0 and out else None
 
 
 def trust_key_why(folder):
     """(the folder Claude Code records the trust for (spec D2), as a real path, None), or (None, why). In a git
     repository its root, and in a worktree its main checkout's root; outside git the folder itself. Outside git
-    only when git says so (exit 128, 'not a git repository'): a timeout, 'dubious ownership' or any other failure,
-    and a repository whose main checkout git cannot tell (a bare repository's worktree, a submodule), give a why."""
+    only when git finds no repository at all (exit 128, 'not a git repository (or any ...'): a broken .git file
+    ('not a git repository: <gitdir>'), a timeout, 'dubious ownership' or any other failure, and a repository whose
+    main checkout git cannot tell (a bare repository's worktree, a submodule), give a why."""
     real = os.path.realpath(folder)
-    code, out, err = git(real, "rev-parse", "--show-toplevel")
-    if code == 128 and "not a git repository" in err:
+    code, out, err = trust_git(real, "rev-parse", "--show-toplevel")
+    if code == 128 and "not a git repository (or any" in err:
         return real, None
     if code != 0 or not out:
         return None, "git could not say whether the folder is in a repository (exit {}: {})".format(
             code, (err or "no output").splitlines()[0][:200])
-    code, common, _ = git(real, "rev-parse", "--git-common-dir")
+    code, common, _ = trust_git(real, "rev-parse", "--git-common-dir")
     if code == 0 and common:
         common = os.path.realpath(os.path.join(real, common))
         if os.path.basename(common) == ".git":
@@ -2114,7 +2148,7 @@ def worker_dirs(folder):
     top = git_top(real)
     if top:
         out.append(top)
-        code, common, _ = git(real, "rev-parse", "--git-common-dir")
+        code, common, _ = trust_git(real, "rev-parse", "--git-common-dir")
         if code == 0 and common:
             common = os.path.realpath(os.path.join(real, common))
             if os.path.basename(common) == ".git":
@@ -2167,7 +2201,7 @@ def folder_grants(dirs):
         if os.path.islink(claude) or os.path.islink(local):
             found.append("{} reaches its settings.local.json through a symlink".format(d))
             continue
-        code, _, _ = git(d, "ls-files", "--error-unmatch", "--", os.path.join(".claude", "settings.local.json"))
+        code, _, _ = trust_git(d, "ls-files", "--error-unmatch", "--", os.path.join(".claude", "settings.local.json"))
         if code == 0:
             found.append("{} tracks its .claude/settings.local.json in git".format(d))
             continue
