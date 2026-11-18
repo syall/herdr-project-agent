@@ -5385,6 +5385,95 @@ class PX_PaContext(Collecting):
             else:  # not even [] fits in the room left (K = 154, N = 80: cf0de90 wrote 65,532 bytes)
                 self.assertGreater(len(pa_costs.compact(dict(new, paContext=[])).encode()), pa_costs.SUMMARY_MAX, (k, n))
 
+    def ctx_report(self, **kw):
+        _r, out, _e = self.run_cmd(pa_costs.report, self.dir, **kw)
+        return out
+
+    def la_reset_case(self):
+        """REVIEW MF-4's probe A: SID reset at 11-17T03:00Z (LA 11-16 19:00); its first row then, a later row at 10:00Z."""
+        self.put_record({"v": 1, "ev": "reset", "at": D1 + "T03:00:00Z", "session": "old", "from": "old", "to": SID,
+                         "reason": "probe"})
+        self.put_rows({"from": D1 + "T03:00:30Z", "to": D1 + "T03:05:00Z", "tokens": toks(cr=80000), "peak": 80000,
+                       "first": 80000},
+                      {"from": D1 + "T10:00:00Z", "to": D1 + "T10:05:00Z", "tokens": toks(cr=290000), "peak": 290000,
+                       "first": 290000})
+
+    def test_px17_report_window_is_the_reports_local_days(self):
+        """t-041 J1 round 5 (REVIEW MF-4, review_j1r5_probe A): 'pa-costs report --since/--until' are local days
+        (t-036); pa_context takes the same window, so a fresh session's first call counts only when its start is
+        known and inside that window, a reset counts when its local day is inside it, and rows of the window's last
+        local evening (after UTC midnight) are kept. paContext's days stay UTC days."""
+        self.la_reset_case()
+        now = T0 + 86400 + 3600
+
+        def entry(**kw):
+            with tz("America/Los_Angeles"):
+                s = json.loads(self.ctx_report(as_json=True, now=now, **kw))
+            found = [e for e in s["paContext"] if e["day"] == D1]
+            self.assertEqual(len(found), 1, (kw, s["paContext"]))
+            e = found[0]
+            return {k: e[k] for k in ("calls", "firstCall", "firstCalls", "resets")}
+
+        # LA --since 11-17: the reset (LA 11-16 19:00) and the first row are before the window: no first call is known
+        self.assertEqual(entry(since=D1), {"calls": 1, "firstCall": None, "firstCalls": 0,
+                                           "resets": {"fresh": 0, "compact": 0}})
+        # LA --since 11-16: the start is inside the window: the true first call
+        self.assertEqual(entry(since=D0), {"calls": 2, "firstCall": 80000, "firstCalls": 1,
+                                           "resets": {"fresh": 1, "compact": 0}})
+        # LA --until 11-16: the row of LA 11-16's evening (UTC 11-17) is kept, on its UTC day
+        self.assertEqual(entry(since=D0, until=D0), {"calls": 1, "firstCall": 80000, "firstCalls": 1,
+                                                     "resets": {"fresh": 1, "compact": 0}})
+        # --utc --since 11-17 and no window: as before
+        for kw in (dict(utc=True, since=D1), dict()):
+            self.assertEqual(entry(**kw), {"calls": 2, "firstCall": 80000, "firstCalls": 1,
+                                           "resets": {"fresh": 1, "compact": 0}}, kw)
+
+    def test_px18_money_is_priced_as_summarize_prices_the_row(self):
+        """t-041 J1 round 5 (REVIEW MF-5, review_j1r5_probe C): paContext's money and perPass are the rows' money
+        as summarize prices them (t-032's row_facts, the account chain and the lookup), so they agree with byKind
+        pa, passes and byAccount under a scoped price file."""
+        self.prices(scoped_fixture())
+        agent = load(os.path.join(self.dir, "agent.json"))
+        agent["costs"] = {"account": "acct-b"}
+        dump(agent, os.path.join(self.dir, "agent.json"))
+        self.put_rows({"tokens": toks(**{"in": 1000000}), "pass": "p1", "trigger": "report"})
+        s = self.summary()
+        pa_kind = [e for e in s["byKind"]["kind"] if e["key"] == "pa"]
+        self.assertEqual(pa_kind[0]["money"], 0.5)
+        self.assertEqual([p["money"] for p in s["passes"]], [0.5])
+        e = self.day(s)
+        self.assertEqual((e["money"], e["perPass"]), (0.5, 0.5))
+        with tz("UTC"):
+            out = self.ctx_report(by="context", now=T0 + 5000)
+        row = [x for x in out.splitlines() if x.strip().startswith(D1)]
+        self.assertEqual(len(row), 1, out)
+        self.assertEqual(row[0].split()[-2:], ["0.50", "0.50"])
+
+    def test_px19_the_pa_context_line_names_its_utc_day_under_a_local_today(self):
+        """t-041 J1 round 5 (REVIEW MF-6, review_j1r5_probe B): under 'Today (local day, <zone>)' the PA context line
+        says plainly that it is the UTC day, and which; under a UTC Today it is as before. paContext stays on UTC days."""
+        self.put_record({"v": 1, "ev": "reset", "at": D0 + "T21:00:00Z", "session": "old", "from": "old", "to": SID})
+        self.put_rows({"from": D0 + "T20:00:00Z", "to": D0 + "T20:05:00Z", "day": D0, "calls": 4,
+                       "tokens": toks(cr=400000), "peak": 120000, "first": 90000},
+                      {"from": D1 + "T01:00:00Z", "to": D1 + "T01:05:00Z", "calls": 1, "tokens": toks(cr=250000),
+                       "peak": 250000, "first": 250000})
+        now = T0 + 3 * 3600  # LA 11-16 19:00 PST
+        with tz("America/Los_Angeles"):
+            out = self.ctx_report(now=now).splitlines()
+        today = [x for x in out if x.startswith("Today")]
+        self.assertIn("(local day, ", today[0])
+        line = [x for x in out if x.startswith("PA context")]
+        self.assertEqual(line, ["PA context (UTC day {})  mean 250k  peak 250k  resets 0 (fresh 0, compact 0)".format(D1)])
+        with tz("America/Los_Angeles"):
+            out = self.ctx_report(now=now, utc=True).splitlines()
+        self.assertEqual([x for x in out if x.startswith("PA context")],
+                         ["PA context  mean 250k  peak 250k  resets 0 (fresh 0, compact 0)"])
+        # no PA call on that UTC day: the label stays, and the message names that day, not today
+        with tz("America/Los_Angeles"):
+            out = self.ctx_report(now=T0 + 2 * 86400 + 3 * 3600).splitlines()
+        self.assertEqual([x for x in out if x.startswith("PA context")],
+                         ["PA context (UTC day 2026-11-19)  — (no Project Agent calls that day)"])
+
     def test_px13_readme_names_the_report(self):
         with open(os.path.join(HERE, "..", "README.md")) as f:
             readme = f.read()
