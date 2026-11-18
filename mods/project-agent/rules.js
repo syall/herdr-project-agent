@@ -47,7 +47,7 @@ export class RulesPane {
     if (a.busy || (!force && a.asked && Date.now() - a.asked < ALLOW_EVERY)) return;
     a.busy = true; a.asked = Date.now();
     cx.spawn(async (cx) => {
-      try { a.data = await readAllow(space, cx); } catch (e) { a.data = { error: String(e.message ?? e) }; }
+      try { const got = await readAllow(space, cx, this.host, force); if (!got?.busy) a.data = got; } catch (e) { a.data = { error: String(e.message ?? e) }; } // busy (t-053): the last read still pending; keep what is shown
       a.busy = false;
       cx.notify();
     });

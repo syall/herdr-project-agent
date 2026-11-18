@@ -12,8 +12,9 @@
 // Runs in one copy of the mod only (the one holding the timer lease); a keeper.lock file in the
 // space's state folder keeps two Herdr clients from restoring the same Project Agent at once.
 
-import { spaces, panes, terminals, machines, focused, run, openOverlay, notify, readTextFile, home, shared, setShared } from "herdr";
-import { replaceFile, OPEN_REQUESTS as REQUESTS, KEEPER_MARK } from "./store.js";
+import { spaces, panes, terminals, machines, focused, run, openOverlay, notify, home, shared, setShared } from "herdr";
+import { replaceFile, OPEN_REQUESTS as REQUESTS, KEEPER_MARK, capped, gaveUp } from "./store.js";
+import { read as hostRead } from "./host.js";
 
 const localId = (id) => String(id ?? "").split("/").pop();
 const tabs = () => shared("project-agent.tabs") ?? {};
@@ -74,8 +75,10 @@ function isLauncher(term, space) {
 }
 
 export class Keeper {
-  constructor(me = `keeper-${Date.now()}`) {
+  constructor(me = `keeper-${Date.now()}`, host = null) {
     this.me = me; // this copy's id (the timer lease's), written into keeper.lock
+    this.host = host; // t-053: the copy's Host (host.js): its reads keyed and capped, its tasks counted; null: as is (tests)
+    this.beating = false; // a heartbeat round is still running (one at a time)
     this.missing = {}; // PA tab id -> when its tab or terminal was first seen gone
     this.beat = {}; // PA tab id -> { value, same, at }: its launcher's heartbeat, how many spaced reads it hasn't changed
     this.hb = {}; // space id -> the heartbeat text last read (any read)
@@ -135,6 +138,15 @@ export class Keeper {
   // agent.json of every space with a record or a labelled terminal (what "configured" means).
   readBeats(cx) { this.read(cx, true); }
 
+  // t-053: a background task (the copy's Host counts it; false when it did not start) and one keyed, capped read
+  // (a give-up throws, as an unreachable machine's read does: the callers keep what was known).
+  task(cx, fn, what) { if (this.host) return this.host.spawn(cx, fn, { what }); cx.spawn(fn); return true; }
+  async readFile(cx, path, on) {
+    const text = await capped(this.host ? this.host.ctx(cx, { origin: "keeper" }) : null, () => hostRead(path, { on }), { key: `read:${on ?? ""}:${path}`, what: `the ${path.split("/").pop()} read` });
+    if (gaveUp(text)) throw new Error("did not answer");
+    return text;
+  }
+
   read(cx, beats) {
     const records = tabs(), sp = spaces(), ps = panes();
     for (const tab of Object.keys(this.beat)) if (!records[tab]) delete this.beat[tab];
@@ -148,13 +160,14 @@ export class Keeper {
     }
     for (const sid of Object.keys(shared(REQUESTS) ?? {})) { const s = sp.find((x) => x.id === sid); if (s) wanted.set(s.id, s); }
     const list = [...wanted.values()].filter((s) => this.machineReady(s));
-    if (!beats) this.reading = true;
-    cx.spawn(async () => {
+    if (beats) { if (this.beating) return; this.beating = true; } // t-053: a round still waiting on a read is not joined by another
+    else this.reading = true;
+    const started = this.task(cx, async () => {
       try {
         for (const space of list) {
           const on = space.machine ?? null, dir = dirOf(space);
           try {
-            const text = await readTextFile(`${dir}/agent.json`, { on });
+            const text = await this.readFile(cx, `${dir}/agent.json`, on);
             if (text === null) this.config[space.id] = { state: "absent", at: Date.now() };
             else {
               try { const v = JSON.parse(text); this.config[space.id] = { state: v?.closed ? "closed" : "open", at: Date.now(), info: { project: v?.project, profile: v?.profile, name: v?.name } }; }
@@ -163,7 +176,7 @@ export class Keeper {
           } catch { /* unreachable: keep what was known */ }
           if (!beats) continue;
           let value;
-          try { value = await readTextFile(`${dir}/heartbeat`, { on }); } catch { continue; }
+          try { value = await this.readFile(cx, `${dir}/heartbeat`, on); } catch { continue; }
           this.hb[space.id] = value;
           const now = Date.now();
           for (const [tab, r] of Object.entries(tabs())) {
@@ -174,15 +187,16 @@ export class Keeper {
             else if (now - last.at >= MIN_GAP) { last.same += 1; last.at = now; } // closer reads (overlaps) are not counted
           }
         }
-      } finally { if (!beats) this.reading = false; }
-    });
+      } finally { if (beats) this.beating = false; else this.reading = false; }
+    }, beats ? "the heartbeat read" : "the agent.json read");
+    if (!started) { if (beats) this.beating = false; else this.reading = false; }
   }
 
   // A heartbeat read only (no staleness counting), while a restore waits for the new launcher.
   peek(cx, space, now) {
     if (!cx || now - (this.peeked[space.id] ?? 0) < PEEK) return;
     this.peeked[space.id] = now;
-    cx.spawn(async () => { try { this.hb[space.id] = await readTextFile(`${dirOf(space)}/heartbeat`, { on: space.machine ?? null }); } catch { /* next time */ } });
+    this.task(cx, async () => { try { this.hb[space.id] = await this.readFile(cx, `${dirOf(space)}/heartbeat`, space.machine ?? null); } catch { /* next time */ } }, "the heartbeat peek");
   }
 
   // keeper.lock in the space's state folder: true once this keeper holds it (taking it is async).
@@ -195,20 +209,20 @@ export class Keeper {
       if (cx && now - l.at > LOCK_TTL / 2 && !l.refreshing && now - (l.tried ?? 0) >= 5000) { // a long wait: keep it from looking abandoned
         l.refreshing = true; l.tried = now;
         const text = JSON.stringify({ client: this.me, at: new Date(now).toISOString(), tab });
-        cx.spawn(async () => {
+        this.task(cx, async () => {
           try { await replaceFile(path, text, l.text, on); l.text = text; l.at = now; }
           catch { if (this.locks[space.id] === l) this.locks[space.id] = { state: "busy", at: Date.now() }; } // taken over: not ours any more
           l.refreshing = false;
-        });
+        }, "the lock refresh") || (l.refreshing = false);
       }
       return true;
     }
     if (!cx || (l?.state === "taking" && now - l.at < 20000) || (l?.state === "busy" && now - l.at < 5000)) return false;
     const take = { state: "taking", at: now };
     this.locks[space.id] = take;
-    cx.spawn(async () => {
+    const started = this.task(cx, async () => {
       try {
-        const old = await readTextFile(path, { on });
+        const old = await this.readFile(cx, path, on);
         let info = null;
         try { info = old ? JSON.parse(old) : null; } catch { /* unreadable: free */ }
         const t = Date.now();
@@ -220,7 +234,8 @@ export class Keeper {
         // Released while writing: give it back at once.
         try { await replaceFile(path, JSON.stringify({ released: true, at: new Date(Date.now()).toISOString() }), text, on); } catch { /* expires */ }
       } catch { if (this.locks[space.id] === take) this.locks[space.id] = { state: "busy", at: Date.now() }; }
-    });
+    }, "the lock");
+    if (!started && this.locks[space.id] === take) this.locks[space.id] = { state: "busy", at: now };
     return false;
   }
 
@@ -229,7 +244,7 @@ export class Keeper {
     delete this.locks[space.id];
     if (l?.state !== "held" || !cx) return;
     const text = JSON.stringify({ released: true, at: new Date(Date.now()).toISOString() });
-    cx.spawn(async () => { try { await replaceFile(`${dirOf(space)}/keeper.lock`, text, l.text, space.machine ?? null); } catch { /* expires */ } });
+    this.task(cx, async () => { try { await replaceFile(`${dirOf(space)}/keeper.lock`, text, l.text, space.machine ?? null); } catch { /* expires */ } }, "the lock release");
   }
 
   // A restore that was given up. The next one comes a minute after the last start (RETRY),

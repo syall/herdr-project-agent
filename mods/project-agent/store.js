@@ -2,7 +2,9 @@
 // space's machine. This mod writes nothing here except decision answers and rule
 // changes (later milestones); the orchestrator owns the ledger and the journal.
 
-import { home, readTextFile, writeTextFile, exec, hc, shared, panes, terminals } from "herdr";
+import { home, shared, panes, terminals } from "herdr";
+import { Host, TIMED_OUT, gaveUp, read, write, run, send } from "./host.js";
+export { TIMED_OUT, gaveUp };
 
 export const localId = (id) => String(id ?? "").split("/").pop();
 
@@ -62,20 +64,26 @@ export const stateDir = (space) => `${paHome(space.machine)}/spaces/${localId(sp
 
 // A remote read that has not answered by then is given up (a load must not stay stuck).
 export const READ_LIMIT = 10000;
-export const TIMED_OUT = Object.freeze({ timedOut: true });
-// `p`, or TIMED_OUT after `ms` on the cx of the task that waits (cx.sleep: mods have no setTimeout).
-// Without a cx it is just `p`. When it settles either way, `cx.progress()` (if given) is called: the
-// panel's load counts it as progress, so a slow but working load is never given up. The losing
-// sleep is not cancelled (mods cannot cancel one): it runs out on its own, at most READ_LIMIT later,
-// one per capped read (up to 200 on the card fallback); a pending sleep holds no call to the machine.
-export function withTimeout(cx, p, ms = READ_LIMIT) {
-  if (!cx?.sleep) return p;
-  return Promise.race([p, cx.sleep(ms).then(() => TIMED_OUT, () => TIMED_OUT)]).then((v) => { cx.progress?.(); return v; }, (e) => { cx.progress?.(); throw e; });
+export const GRACE = 5000; // an exec still unsettled this long after its own timeout is given up here
+// One capped call of a task (t-053, host.js): `start()` makes it; the answer, or a give-up (gaveUp: TIMED_OUT after
+// `limit`, BUSY while a call of its key is still pending, SKIPPED over the budget, REFUSED by the runtime). With the
+// copy's Host (cx.host, from Host-made task contexts: { host, origin, background, wait, spawn, sleep, progress }) the call is
+// keyed `<origin>:<key>`; a cx without one gets a Host of its own (no key, the limit only); no cx: just the call.
+// cx.progress() is called when it settles or is given up: the panel's load counts it as progress.
+export function capped(cx, start, { limit = READ_LIMIT, key = null, what = "a call", onLate = null } = {}) {
+  if (!cx) return start();
+  const host = cx.host ?? new Host();
+  return host.call(cx, cx.host && key ? `${cx.origin ?? "load"}:${key}` : null, start, { limit, what, background: cx.background !== false, wait: Boolean(cx.wait), onLate });
 }
+// `p` (already started), or TIMED_OUT after `ms` (no key): kept for callers that hold a started call.
+export const withTimeout = (cx, p, ms = READ_LIMIT) => capped(cx ? { ...cx, host: undefined } : cx, () => p, { limit: ms });
 
+// A read's give-up as a result: "timed out" only for a real timeout; BUSY, SKIPPED and REFUSED say nothing here (the
+// last known value stays, and a refusal is said once by the panel).
+const unanswered = (v) => ({ value: null, text: null, error: v === TIMED_OUT ? "timed out" : null, timedOut: true, ...(v.busy ? { busy: true } : {}), ...(v.refused || v.skipped ? { refused: true } : {}) });
 async function readJson(path, on, cx) {
-  const text = await withTimeout(cx, readTextFile(path, { on: on ?? null }));
-  if (text === TIMED_OUT) return { value: null, text: null, error: "timed out", timedOut: true };
+  const text = await capped(cx, () => read(path, { on: on ?? null }), { key: `read:${on ?? ""}:${path}`, what: `the ${path.split("/").pop()} read` });
+  if (gaveUp(text)) return unanswered(text);
   if (text === null) return { value: null, text: null, error: null };
   try { return { value: JSON.parse(text), text, error: null }; }
   catch (e) { return { value: null, text, error: String(e.message ?? e) }; }
@@ -89,15 +97,15 @@ async function readJson(path, on, cx) {
 export const costsDir = (space) => `${stateDir(space)}/costs`;
 export async function loadCosts(space, cx, live = () => true) {
   const on = space.machine ?? null, r = await readJson(`${costsDir(space)}/summary.json`, on, cx);
-  if (r.timedOut) return { summary: null, error: null, timedOut: true, missing: null };
+  if (r.timedOut) return { summary: null, error: null, timedOut: true, missing: null, ...(r.busy || r.refused ? { busy: true } : {}) };
   if (r.error) return { summary: null, error: r.error, timedOut: false, missing: null };
   if (r.text !== null) {
     const ok = r.value && typeof r.value === "object" && !Array.isArray(r.value);
     return ok ? { summary: r.value, error: null, timedOut: false, missing: null } : { summary: null, error: "not a summary (not a JSON object)", timedOut: false, missing: null };
   }
   if (!live()) return { summary: null, error: null, timedOut: false, missing: null, left: true };
-  const ls = await withTimeout(cx, exec("ls", ["-1", costsDir(space)], { on, timeout: READ_LIMIT }));
-  if (ls === TIMED_OUT) return { summary: null, error: null, timedOut: true, missing: null };
+  const ls = await capped(cx, () => run("ls", ["-1", costsDir(space)], { on, timeout: READ_LIMIT }), { key: `ls:${on ?? ""}:${costsDir(space)}`, what: "the costs listing" });
+  if (gaveUp(ls)) return { summary: null, error: null, timedOut: true, missing: null, ...(ls.busy || ls.refused || ls.skipped ? { busy: true } : {}) };
   const names = ls.code === 0 ? String(ls.stdout ?? "").split("\n") : [];
   return { summary: null, error: null, timedOut: false, missing: names.includes("sessions.jsonl") ? "pending" : "none" };
 }
@@ -133,12 +141,12 @@ export async function loadSpace(space, profileProp, cx) {
   const errors = [];
   const agent = await readJson(`${dir}/agent.json`, on, cx);
   if (agent.error) errors.push(`agent.json: ${agent.error}`);
-  if (!agent.value) return { agent: null, ledger: null, profile: null, errors, dir, ...(agent.timedOut ? { timedOut: true } : {}) };
+  if (!agent.value) return { agent: null, ledger: null, profile: null, errors, dir, ...(agent.timedOut ? { timedOut: true } : {}), ...(agent.busy ? { busy: true } : {}), ...(agent.refused ? { refused: true } : {}) };
   let name = agent.value.profile || profileProp, nameUnknown = false;
   const profileRead = async () => {
     if (!name) {
       const config = await readJson(`${root}/config.json`, on, cx);
-      if (config.timedOut || config.error) nameUnknown = config.timedOut ? "timed out" : true;
+      if (config.timedOut || config.error) nameUnknown = config.error === "timed out" ? "timed out" : true;
       name = config.value?.defaultProfile;
     }
     return name ? readJson(`${root}/profiles/${name}/profile.json`, on, cx) : { value: null };
@@ -191,10 +199,12 @@ export function taskActions(profile, profileDir, task, platform) {
 
 // Instruction files changed since the agent's session last started: the names, or []. The
 // launcher writes session.log at each start, and the agent reads its instructions only then.
-export async function staleInstructions(space, profile) {
+// With a cx: capped at READ_LIMIT; a give-up is returned as is (the caller keeps the last known).
+export async function staleInstructions(space, profile, cx) {
   const root = paHome(space.machine), script = 'cd "$1" 2>/dev/null || exit 0; [ -f "$2/session.log" ] || exit 0; find core "profiles/$3/context.md" -name "*.md" -newer "$2/session.log" 2>/dev/null';
   try {
-    const r = await exec("sh", ["-c", script, "sh", root, `spaces/${localId(space.id)}`, profile ?? ""], { on: space.machine ?? null, timeout: 10000 });
+    const r = await capped(cx, () => run("sh", ["-c", script, "sh", root, `spaces/${localId(space.id)}`, profile ?? ""], { on: space.machine ?? null, timeout: 10000 }), { key: `stale:${space.machine ?? ""}:${localId(space.id)}`, what: "the instructions check" });
+    if (gaveUp(r)) return r;
     return r.stdout.split("\n").filter(Boolean).map((p) => p.split("/").pop());
   } catch { return []; }
 }
@@ -227,11 +237,12 @@ export function taskLinks(profile, task) {
 
 // Each task's evidence files that are not empty, newest first: Map(task id -> [file names]).
 // A task without such a file is not in the map.
-export async function evidenceTasks(space) {
+export async function evidenceTasks(space, cx) {
   const script = 'cd "$1" 2>/dev/null || exit 0; for t in */; do [ -d "$t" ] || continue; ls -t "$t" 2>/dev/null | while read -r f; do [ -s "$t$f" ] && [ -f "$t$f" ] && printf "%s\\t%s\\n" "${t%/}" "$f"; done; done';
   const out = new Map();
   try {
-    const r = await exec("sh", ["-c", script, "sh", `${stateDir(space)}/evidence`], { on: space.machine ?? null, timeout: 10000 });
+    const r = await capped(cx, () => run("sh", ["-c", script, "sh", `${stateDir(space)}/evidence`], { on: space.machine ?? null, timeout: 10000 }), { key: `evidence:${space.machine ?? ""}:${localId(space.id)}`, what: "the evidence listing" });
+    if (gaveUp(r)) return r; // with a cx: the caller keeps the last known
     for (const line of r.stdout.split("\n").filter(Boolean)) { const [task, file] = line.split("\t"); if (!out.has(task)) out.set(task, []); out.get(task).push(file); }
   } catch {}
   return out;
@@ -287,43 +298,50 @@ function splitBatch(stdout) {
 }
 const byteOrder = (a, b) => (a < b ? -1 : a > b ? 1 : 0); // names are ASCII: code units are bytes
 
-// Every card in decisions/ (the first 200 names): see parseCards. On another machine one call reads
-// them all; if that call fails, times out or prints something unreadable, they are read one by one,
-// in parallel (as before, but not in sequence). On this computer the files are read directly.
-// Options: cx (each call gives up after READ_LIMIT), batchOnly (no fallback: null when the call
+// Every card in decisions/ (the first 200 names): see parseCards. One call reads them all, on this computer or another
+// machine (t-053: here too); if that call fails, times out or prints something unreadable, they are read one by one,
+// at most CARD_READS at a time, all within READ_LIMIT of the fallback's start.
+// Options: cx (each call capped; with the copy's Host, keyed), batchOnly (no fallback: null when the call
 // fails), live() (false: the caller no longer wants the result; the fallback is skipped and the
 // result is null, which the caller must not take for "no cards"), known (the last known cards,
 // [{ path, text }]: a card whose own read times out or fails on the fallback path is that copy, else
 // left out; such a card has fallback: true, and the list's `unread` (a Set of paths) names every card not read now,
-// t-045). Only exit 0 is a whole batch (exit 3 with no output: no folder); a call killed part way
+// t-045), out (an object: out.busy is set when the null came from a call of its kind still pending: say nothing).
+// Only exit 0 is a whole batch (exit 3 with no output: no folder); a call killed part way
 // can print whole-looking pairs. null also when the listing never answered (the batch gave no whole
 // answer and `ls` timed out or failed): unknown, not "no cards". A listing that answered (no folder,
 // an empty one) is [].
-export async function loadDecisions(space, { cx, batchOnly = false, live, known = [] } = {}) {
+export const CARD_READS = 8;
+export async function loadDecisions(space, { cx, batchOnly = false, live, known = [], out = {} } = {}) {
   const on = space.machine ?? null, dir = `${stateDir(space)}/decisions`;
-  if (on) {
-    let r = null;
-    try { r = await withTimeout(cx, exec("sh", ["-c", CARDS_SCRIPT, "sh", dir], { on, timeout: READ_LIMIT })); } catch { r = null; }
-    if (r && r !== TIMED_OUT && r.code === 3 && !r.stdout) return []; // no decisions folder: no cards (as a failing ls)
-    const files = r && r !== TIMED_OUT && r.code === 0 ? splitBatch(r.stdout) : null;
-    if (files) return parseCards(files.sort((a, b) => byteOrder(a.name, b.name)).slice(0, MAX_CARDS).map((f) => ({ ...f, path: `${dir}/${f.name}` })));
-    if (batchOnly || (live && !live())) return null;
-  }
+  let r = null;
+  try { r = await capped(cx, () => run("sh", ["-c", CARDS_SCRIPT, "sh", dir], { on, timeout: READ_LIMIT }), { key: `batch:${on ?? ""}:${dir}`, what: "the decision cards read" }); } catch { r = null; }
+  if (r?.busy) { out.busy = true; return null; } // the last batch is still pending: skipped, quietly
+  if (r && !gaveUp(r) && r.code === 3 && !r.stdout) return []; // no decisions folder: no cards (as a failing ls)
+  const files = r && !gaveUp(r) && r.code === 0 ? splitBatch(r.stdout) : null;
+  if (files) return parseCards(files.sort((a, b) => byteOrder(a.name, b.name)).slice(0, MAX_CARDS).map((f) => ({ ...f, path: `${dir}/${f.name}` })));
+  if (batchOnly || (live && !live())) return null;
   let names = [];
   try {
-    const r = await withTimeout(cx, exec("ls", ["-1", dir], { on, timeout: READ_LIMIT }));
-    if (r === TIMED_OUT) return null;
-    if (r.code === 0) names = r.stdout.split("\n").filter((n) => CARD_NAME.test(n));
+    const ls = await capped(cx, () => run("ls", ["-1", dir], { on, timeout: READ_LIMIT }), { key: `ls:${on ?? ""}:${dir}`, what: "the decision cards listing" });
+    if (ls?.busy) { out.busy = true; return null; }
+    if (gaveUp(ls)) return null;
+    if (ls.code === 0) names = ls.stdout.split("\n").filter((n) => CARD_NAME.test(n));
   } catch { return null; }
   const picked = names.slice(0, MAX_CARDS);
   const last = new Map((known ?? []).filter((c) => c?.path && typeof c.text === "string").map((c) => [c.path, c.text]));
-  const unread = new Set();
-  const texts = await Promise.all(picked.map(async (name) => {
-    let text;
-    try { text = await withTimeout(cx, readTextFile(`${dir}/${name}`, { on })); } catch { text = TIMED_OUT; }
-    if (text === TIMED_OUT) unread.add(`${dir}/${name}`);
-    return text === TIMED_OUT ? last.get(`${dir}/${name}`) ?? null : text; // a read that hangs or fails: its last known copy, else left out
-  }));
+  const unread = new Set(), texts = new Array(picked.length), until = Date.now() + READ_LIMIT;
+  let next = 0;
+  const worker = async () => {
+    while (next < picked.length) {
+      const i = next++, path = `${dir}/${picked[i]}`, left = until - Date.now();
+      let text = TIMED_OUT;
+      if (left > 0) { try { text = await capped(cx, () => read(path, { on }), { key: `read:${on ?? ""}:${path}`, limit: left, what: `the ${picked[i]} read` }); } catch { text = TIMED_OUT; } }
+      if (gaveUp(text)) unread.add(path);
+      texts[i] = gaveUp(text) ? last.get(path) ?? null : text; // a read that hangs or fails: its last known copy, else left out
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(CARD_READS, picked.length) }, worker));
   const list = parseCards(picked.map((name, i) => ({ name, path: `${dir}/${name}`, text: texts[i], fallback: unread.has(`${dir}/${name}`) && texts[i] !== null })));
   list.unread = unread; // t-045: a card's mark is resolved only by a read made now (main.js resolveMarks)
   return list;
@@ -352,11 +370,11 @@ os.replace(tmp, path)
 // Replaces a file only if it still reads `expected` (null: it must not exist yet, here only).
 export async function replaceFile(path, text, expected, on) {
   if (!on) {
-    try { await writeTextFile(path, text, expected); }
+    try { await write(path, text, expected); }
     catch (e) { throw new Error(/stale|match|changed/i.test(String(e.message ?? e)) ? "The file changed on disk while you were editing; reloaded, try again." : String(e.message ?? e)); }
     return;
   }
-  const r = await exec("python3", ["-c", REMOTE_WRITE, path, expected ?? "", text], { on, timeout: 20000 });
+  const r = await run("python3", ["-c", REMOTE_WRITE, path, expected ?? "", text], { on, timeout: 20000 });
   if (r.code !== 0) throw new Error(r.code === 3 ? "The file changed on disk while you were editing; reloaded, try again." : r.stderr || "Could not write the file.");
 }
 
@@ -370,7 +388,7 @@ export const isPush = (card) => Boolean(card && typeof card === "object" && ((ca
 // is never changed. Returns { card, before, after }: the answered card, the file text it replaced, the text written.
 export async function answerDecision(space, entry, label, note) {
   const on = space.machine ?? null;
-  const now = await readTextFile(entry.path, { on });
+  const now = await read(entry.path, { on });
   if (now === null) throw new Error("The card file is gone.");
   let card;
   try { card = JSON.parse(now); } catch { throw new Error("The card file is not valid JSON; fix it by hand."); }
@@ -392,11 +410,15 @@ export const missingTool = (why, program) => NOT_FOUND.test(String(why)) && Stri
 // hc holds a message while someone is typing there, and refuses while the agent is blocked on a
 // question; the caller keeps the notice and tries again later. With `cx` (the sending task's), a send
 // that has not answered in SEND_LIMIT is given up (t-028): hc waits up to 60 s for a draft, so this is
-// longer. Giving up stops only the waiting: the text may still be typed, so a retry can repeat it.
+// longer. Giving up stops only the waiting: the text may still be typed, so a retry can repeat it. With the copy's
+// Host (t-053) no second send to an address starts while one is still pending there: the error has `busy: true`
+// (the caller keeps the notice and says nothing new).
 export const SEND_LIMIT = 90000;
 export async function notifyOrchestrator(address, message, cx) {
-  const r = await withTimeout(cx, hc(["send", address, message]), SEND_LIMIT);
+  const r = await capped(cx, () => send(["send", address, message]), { key: `hc:${address}`, limit: SEND_LIMIT, what: "the hc send" });
+  if (r?.busy) throw Object.assign(new Error("hc send: still waiting on the last send to this agent"), { busy: true });
   if (r === TIMED_OUT) throw new Error(`hc send did not answer in ${SEND_LIMIT / 1000} s; it may still arrive`);
+  if (gaveUp(r)) throw new Error("hc send was not started: too many calls waiting; it is tried again later");
   if (r.code !== 0) throw new Error((r.stderr || r.stdout || "hc send failed").trim().slice(0, 300));
 }
 
@@ -407,9 +429,12 @@ const stamp = () => new Date().toISOString().replace(/\.\d+Z$/, "Z");
 
 // { path, text, rules, error }: error set (and rules empty) when the file is invalid. An invalid
 // file is shown as such and never written over.
-export async function loadRules(space) {
+// With a cx (a load's): capped; a give-up returns TIMED_OUT (the caller keeps the last known).
+export async function loadRules(space, cx) {
   const on = space.machine ?? null, path = `${stateDir(space)}/rules.json`;
-  const { value, text, error } = await readJson(path, on);
+  const r = await readJson(path, on, cx);
+  if (r.timedOut) return TIMED_OUT;
+  const { value, text, error } = r;
   if (text === null) return { path, text: null, rules: [], error: "rules.json is missing" };
   if (error) return { path, text, rules: [], error: `rules.json is not valid JSON: ${error}` };
   const rules = value?.rules;
@@ -456,7 +481,7 @@ export const newRuleId = (rules, title) => {
 
 export async function exportRules(space, rules) {
   const dir = `${paHome(space.machine)}/exports`, path = `${dir}/rules-${localId(space.id).slice(-8)}-${stamp().replace(/[:]/g, "")}.json`;
-  await exec("mkdir", ["-p", dir], { on: space.machine ?? null });
+  await run("mkdir", ["-p", dir], { on: space.machine ?? null });
   await replaceFile(path, `${JSON.stringify({ version: 1, rules: rules.map(({ history, needsAttention, ...r }) => r) }, null, 2)}\n`, null, space.machine ?? null);
   return path;
 }

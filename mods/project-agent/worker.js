@@ -6,7 +6,8 @@
 
 import { div } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
-import { props, closeOverlay, theme, exec } from "herdr";
+import { props, closeOverlay, theme } from "herdr";
+import { run } from "./host.js";
 import { localId } from "./store.js";
 
 export class WorkerPane {
@@ -18,7 +19,7 @@ export class WorkerPane {
     const w = props().deleteWorker;
     cx.spawn(async (cx) => {
       try {
-        const r = await exec("pa-worker", ["info", localId(w.address), "--space", localId(w.space)], { on: w.machine ?? null, timeout: 30000 });
+        const r = await run("pa-worker", ["info", localId(w.address), "--space", localId(w.space)], { on: w.machine ?? null, timeout: 30000 });
         if (r.code !== 0) throw new Error((r.stderr || r.stdout).trim());
         this.info = JSON.parse(r.stdout);
         // Work that exists nowhere else is kept unless you tick the box yourself.
@@ -42,7 +43,7 @@ export class WorkerPane {
     cx.notify();
     cx.spawn(async (cx) => {
       try {
-        const r = await exec("pa-worker", args, { on: w.machine ?? null, timeout: 120000 });
+        const r = await run("pa-worker", args, { on: w.machine ?? null, timeout: 120000 });
         if (r.code !== 0) throw new Error((r.stderr || r.stdout).trim().slice(0, 400));
         closeOverlay(props().overlay);
       } catch (e) { this.error = String(e.message ?? e); this.busy = false; cx.notify(); }

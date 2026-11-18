@@ -23,8 +23,8 @@
 
 import { div } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
-import { exec } from "herdr";
-import { loadCosts, localId, withTimeout, TIMED_OUT, READ_LIMIT, missingTool } from "./store.js";
+import { loadCosts, localId, capped, gaveUp, TIMED_OUT, READ_LIMIT, missingTool } from "./store.js";
+import { run } from "./host.js";
 import { Copier, sel } from "./copy.js";
 import { zoneArgs, oldTool, localDate, daysBefore, summaryZone } from "./zone.js";
 
@@ -41,15 +41,17 @@ const ACTIVITY = { "cache-rebuild": "cache rebuild after idle", unattributed: "u
 
 const str = (v) => (v === null || v === undefined ? "" : String(v));
 const num = (v) => (typeof v === "number" && Number.isFinite(v) ? v : 0);
-const sleeper = (cx) => ({ sleep: (ms) => cx.sleep(ms) });
 const firstLine = (s) => str(s).trim().split("\n").find((l) => l.trim()) ?? "";
 const NOT_FOUND = /not found|no such file|ENOENT|cannot (start|find)/i;
 export const notInstalled = (machine) => (machine ? `pa-costs is not installed on ${machine}; run pa-sync --on ${machine}.` : "pa-costs is not installed here; run ./install.sh.");
 
-// One pa-costs exec, on `machine` (null: here), given up GRACE after its own timeout. { r } or { error, missing }.
-async function call(cx, machine, args, timeout) {
+// One pa-costs exec, on `machine` (null: here), given up GRACE after its own timeout. { r } or { error, missing }, or
+// { busy: true } when one of its kind is still pending (t-053: nothing started; the caller says nothing).
+// hcx: the task's context (CostsPane.ctx: the copy's Host, keyed per machine and command).
+async function call(hcx, machine, args, timeout) {
   try {
-    const r = await withTimeout(sleeper(cx), exec("pa-costs", args, { on: machine ?? null, timeout }), timeout + GRACE);
+    const r = await capped(hcx, () => run("pa-costs", args, { on: machine ?? null, timeout }), { key: `pa-costs:${machine ?? ""}:${args.slice(0, 2).join(" ")}`, limit: timeout + GRACE, what: `pa-costs ${args[0]}` });
+    if (gaveUp(r) && r !== TIMED_OUT) return { busy: true, error: "skipped" };
     if (r === TIMED_OUT) return { error: `pa-costs ${args[0]} did not answer in ${Math.round((timeout + GRACE) / 1000)} s` };
     if (r.code === 127) return { error: notInstalled(machine), missing: true };
     return { r };
@@ -146,12 +148,18 @@ function tabFigure(s) {
 }
 
 export class CostsPane {
-  constructor(shown = () => true) {
+  constructor(shown = () => true, host = null) {
+    this.host = host; // t-053: the copy's Host (host.js); null: each call as is
     this.copier = new Copier(); // the Copy of the totals, each section and the billed table (copy.js, t-026)
     this.shown = shown; // (space id) -> this view is on screen for that space now (main.js)
     this.spaces = new Map(); // space id -> its state (most recently shown last; at most CACHE_MAX)
     this.seq = 0;
   }
+
+  // A task's context for its calls: background (a read or compare the view asked for itself) or a click's (waits for a
+  // call of its kind still pending, never skipped).
+  ctx(cx, click = false) { return this.host ? this.host.ctx(cx, { origin: "costs", background: !click, wait: click }) : cx; }
+  task(cx, fn, what) { if (this.host) return this.host.spawn(cx, fn, { what }); cx.spawn(fn); return true; }
 
   of(id) {
     let st = this.spaces.get(id);
@@ -176,11 +184,12 @@ export class CostsPane {
     if (!force && !st.stale && st.at && now - st.at < COSTS_EVERY) { if (st.billing.due) this.wantBilling(space, cx, true); return; }
     const mine = ++this.seq;
     st.busy = true; st.at = now; st.seq = mine; st.stale = false;
-    cx.spawn(async (cx) => {
+    const started = this.task(cx, async (cx) => {
       let r;
-      try { r = await loadCosts(space, sleeper(cx), () => this.shown(space.id)); } catch (e) { r = { failed: String(e?.message ?? e) }; }
+      try { r = await loadCosts(space, this.ctx(cx, force), () => this.shown(space.id)); } catch (e) { r = { failed: String(e?.message ?? e) }; }
       if (st.seq !== mine) return; // a newer read of this space started (this one was given up)
       st.busy = false;
+      if (r.busy) { cx.notify(); return; } // t-053: the last read is still pending: skipped, the kept copy stays as it is; the next 10 s read tries again
       if (r.left) { st.stale = true; cx.notify(); return; } // the view was left before the ls: the kept copy stays; read at once when shown
       if (r.timedOut || r.failed) { st.timedOut = true; st.readFailed = r.failed ?? null; } // the kept copy stays
       else if (r.error) { st.error = r.error; st.timedOut = false; st.readFailed = null; }
@@ -188,7 +197,8 @@ export class CostsPane {
       if (st.summary?.totals) this.wantBilling(space, cx);
       if (st.stale) this.want(space, cx); // asked for while this read ran (a Refresh ended): reread now (t-028), if shown
       cx.notify();
-    });
+    }, "the costs read");
+    if (!started) st.busy = false;
   }
 
   // From main.js's 1 s tick while this view is chosen (t-028): shown again with a reread or a billed compare that was
@@ -209,8 +219,9 @@ export class CostsPane {
     if (st.run?.busy) return;
     st.run = { what, busy: true, error: null };
     cx.spawn(async (cx) => {
-      let { r, error } = await call(cx, space.machine, withZone ? [...args, ...zoneArgs(Date.now())] : args, timeout);
-      if (withZone && !error && oldTool(r)) ({ r, error } = await call(cx, space.machine, args, timeout)); // a pa-costs from before t-036
+      const hcx = this.ctx(cx, true);
+      let { r, error } = await call(hcx, space.machine, withZone ? [...args, ...zoneArgs(Date.now())] : args, timeout);
+      if (withZone && !error && oldTool(r)) ({ r, error } = await call(hcx, space.machine, args, timeout)); // a pa-costs from before t-036
       st.run = { what, busy: false, error: error ?? (r.code !== 0 ? said(r) : null) };
       this.want(space, cx, true);
       cx.notify();
@@ -227,12 +238,15 @@ export class CostsPane {
     if (b.busy || (!force && b.at && now - b.at < BILLING_EVERY) || !s) return;
     const mine = (b.seq ?? 0) + 1; // the newest compare: an older one that ends later commits nothing (Turn off, t-028)
     b.busy = true; b.at = now; b.seq = mine; b.due = false;
-    cx.spawn(async (cx) => {
+    const started = this.task(cx, async (cx) => {
+      const hcx = this.ctx(cx, force);
+      let skipped = false; // t-053: a call of its kind still pending: this compare ends, says nothing, and the next one asks again
       // Asked before each step after the first: a newer compare started -> stop; the view was left -> stop, and the
       // next shown read runs the whole chain.
       const left = () => { if (b.seq !== mine) return true; if (this.shown(space.id)) return false; b.busy = false; b.at = 0; st.stale = true; cx.notify(); return true; };
       const compare = async (extra) => {
-        const { r, error } = await call(cx, null, ["billed", "compare", "--json", ...extra], TOOL_TIMEOUT);
+        const { r, error, busy } = await call(hcx, null, ["billed", "compare", "--json", ...extra], TOOL_TIMEOUT);
+        if (busy) { skipped = true; return { error: "skipped" }; }
         if (error) return { error };
         return printed(r) ?? { error: said(r) };
       };
@@ -245,7 +259,8 @@ export class CostsPane {
           got = await compare(["--summary-json", trimmed]);
           if (!got.error && num(got.rows) > 0) {
             if (left()) return;
-            const { r, error } = await call(cx, space.machine, ["report", "--account-wide"], TOOL_TIMEOUT);
+            const { r, error, busy } = await call(hcx, space.machine, ["report", "--account-wide"], TOOL_TIMEOUT);
+            if (busy) skipped = true;
             const here = error ? null : r.code === 0 ? str(r.stdout).trim() : null;
             if (!here || here.length > ARG_MAX) got = { ...got, comparison: null, hereError: error ?? (here ? "over 100 KB" : said(r)) };
             else { if (left()) return; got = await compare(["--summary-json", trimmed, "--here-json", here]); }
@@ -254,9 +269,11 @@ export class CostsPane {
       }
       if (b.seq !== mine) return; // a newer compare started (Turn off): this result is older than its
       b.busy = false;
+      if (skipped) { b.at = 0; cx.notify(); return; }
       if (got.error) b.error = got.error; else { b.data = got; b.error = null; }
       cx.notify();
-    });
+    }, "the billed compare");
+    if (!started) b.busy = false;
   }
 
   // Turn off: `pa-costs billed disable`, here (the billing query runs only on this machine), then the status again.
@@ -265,7 +282,7 @@ export class CostsPane {
     if (b.off) return;
     b.off = true;
     cx.spawn(async (cx) => {
-      const { r, error } = await call(cx, null, ["billed", "disable"], TOOL_TIMEOUT);
+      const { r, error } = await call(this.ctx(cx, true), null, ["billed", "disable"], TOOL_TIMEOUT);
       b.off = false;
       b.offError = error ?? (r.code !== 0 ? said(r) : null);
       b.busy = false;

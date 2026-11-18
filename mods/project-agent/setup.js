@@ -5,7 +5,8 @@
 
 import { div, svg, image } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input } from "gpui-base";
-import { props, closeOverlay, theme, hc, pickFolder, home } from "herdr";
+import { props, closeOverlay, theme, pickFolder, home } from "herdr";
+import { send } from "./host.js";
 import { PathField } from "./pathfield.js";
 
 export class SetupPane {
@@ -23,7 +24,7 @@ export class SetupPane {
     cx.notify();
     cx.spawn(async (cx) => {
       try {
-        const r = await hc(["send", s.terminal, word]);
+        const r = await send(["send", s.terminal, word]);
         if (r.code !== 0) throw new Error((r.stderr || r.stdout || "hc send failed").trim().slice(0, 200));
         closeOverlay(props().overlay);
       } catch (e) { this.error = `Couldn't reach the tab: ${e.message ?? e}. You can type the choice there.`; this.busy = false; cx.notify(); }

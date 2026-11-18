@@ -11,9 +11,14 @@
 // "project-agent.costsShown"), else every 30 min; and `pa-costs billed fetch --scheduled --quiet`
 // here at most once an hour (the tool itself queries at most once a day, and only once the person
 // turned it on). Neither is awaited: a slow or hung machine never delays a pass.
+//
+// t-053: with the copy's Host (tick's host and cx) every read, listing, send and pa-costs run is keyed and capped: a call
+// still pending (a hung machine) starts no second one of its kind, and a pass that waits on one gives up at its limit,
+// so the other spaces' passes still go out.
 
-import { terminals, hc, readTextFile, exec, shared, setShared, notify, spaces } from "herdr";
-import { paHome, replaceFile, localId, keeperJudging, missingTool } from "./store.js";
+import { terminals, shared, setShared, notify, spaces } from "herdr";
+import { paHome, replaceFile, localId, keeperJudging, missingTool, capped, gaveUp, SEND_LIMIT, GRACE } from "./store.js";
+import { read, run as hostRun, send as hcSend } from "./host.js";
 import { zoneArgs, oldTool } from "./zone.js";
 
 export const MIN_MINUTES = 5;
@@ -60,14 +65,21 @@ export function projectAgents() {
   return [...byDir.values()];
 }
 
-async function send(agent, message) {
-  const r = await hc(["send", agent.address, message]);
+// A send given up whose call answered 0 later (the pass did go out): address -> message. The next tick stamps it and
+// never sends it again.
+const lateSent = {};
+async function send(agent, message, timerCx) {
+  if (lateSent[agent.address] === message) { delete lateSent[agent.address]; return; }
+  const r = await capped(timerCx, () => hcSend(["send", agent.address, message]), { key: `hc:${agent.address}`, limit: SEND_LIMIT, what: "the hc send",
+    onLate: (v) => { if (v?.code === 0) lateSent[agent.address] = message; } });
+  if (gaveUp(r)) throw new Error(r.busy ? "an earlier hc send there is still waiting" : "hc send did not answer");
   if (r.code !== 0) throw new Error((r.stderr || r.stdout || "hc send failed").trim().slice(0, 200));
 }
 
 // Changes fields of a JSON file on the agent's machine, against what is on disk now.
-export async function patchJson(path, machine, change, fallback) {
-  const text = await readTextFile(path, { on: machine });
+export async function patchJson(path, machine, change, fallback, timerCx = null) {
+  const text = await capped(timerCx, () => read(path, { on: machine }), { key: `read:${machine ?? ""}:${path}`, what: `the ${path.split("/").pop()} read` });
+  if (gaveUp(text)) throw new Error(`${path.split("/").pop()} did not answer`);
   const value = text === null ? fallback : parse(text);
   if (!value) throw new Error(`${path.split("/").pop()} is not valid JSON; fix it by hand.`);
   await replaceFile(path, `${JSON.stringify(change({ ...value }), null, 2)}\n`, text, machine);
@@ -76,15 +88,17 @@ export async function patchJson(path, machine, change, fallback) {
 // A notification for each decision card that is new and open, for every Project Agent (not only
 // the space on screen). The cards seen per agent are kept in shared "project-agent.cards"; the
 // first look at an agent only records what is there.
-async function announceCards(agent) {
-  const r = await exec("ls", ["-1", `${agent.dir}/decisions`], { on: agent.machine, timeout: 10000 });
-  if (r.code !== 0) return;
+async function announceCards(agent, timerCx) {
+  const r = await capped(timerCx, () => hostRun("ls", ["-1", `${agent.dir}/decisions`], { on: agent.machine, timeout: 10000 }), { key: `ls:${agent.machine ?? ""}:${agent.dir}/decisions`, limit: 10000 + GRACE, what: "the decision cards listing" });
+  if (gaveUp(r) || r.code !== 0) return;
   const ids = r.stdout.split("\n").filter((n) => /^[A-Za-z0-9_.-]+\.json$/.test(n)).map((n) => n.slice(0, -5));
   const all = { ...(shared("project-agent.cards") ?? {}) }, seen = all[agent.dir];
   const fresh = seen ? ids.filter((id) => !seen.includes(id)) : [];
   if (seen && !fresh.length && seen.length === ids.length) return;
   for (const id of fresh.slice(0, 5)) {
-    const card = parse((await readTextFile(`${agent.dir}/decisions/${id}.json`, { on: agent.machine })) ?? "");
+    const path = `${agent.dir}/decisions/${id}.json`, text = await capped(timerCx, () => read(path, { on: agent.machine }), { key: `read:${agent.machine ?? ""}:${path}`, what: `the ${id}.json read` });
+    if (gaveUp(text)) return; // not recorded: the next tick looks again
+    const card = parse(text ?? "");
     if (card?.status !== "open") continue;
     const space = spaces().find((s) => s.tabs.some((t) => t.id === agent.tab));
     // Say which task, the question, and what is recommended.
@@ -95,11 +109,13 @@ async function announceCards(agent) {
   setShared("project-agent.cards", all);
 }
 
-async function tickOne(agent, now) {
-  await announceCards(agent).catch(() => {});
+async function tickOne(agent, now, timerCx) {
+  await announceCards(agent, timerCx).catch(() => {});
   if (!agent.alive) return; // no launcher known to run there: nothing is typed into that terminal
   const busy = agent.status === "working" || agent.status === "blocked";
-  const [scheduleText, ledgerText, requestText] = await Promise.all(["schedule.json", "ledger.json", "pass-request.json"].map((f) => readTextFile(`${agent.dir}/${f}`, { on: agent.machine })));
+  const texts = await Promise.all(["schedule.json", "ledger.json", "pass-request.json"].map((f) => capped(timerCx, () => read(`${agent.dir}/${f}`, { on: agent.machine }), { key: `read:${agent.machine ?? ""}:${agent.dir}/${f}`, what: `the ${f} read` })));
+  if (texts.some(gaveUp)) return; // did not answer: the next tick tries again
+  const [scheduleText, ledgerText, requestText] = texts;
   const schedule = parse(scheduleText ?? ""), ledger = parse(ledgerText ?? ""), request = parse(requestText ?? "");
   if (!schedule) return;
   const every = cadence(schedule) * 60000;
@@ -107,26 +123,26 @@ async function tickOne(agent, now) {
   // On demand: runs even when passes are paused, off or in quiet hours, and resets the timer.
   if (request?.pending) {
     if (busy) return;
-    await send(agent, request.retro ? "manual pass with retrospective" : "manual pass");
-    await patchJson(`${agent.dir}/pass-request.json`, agent.machine, (r) => ({ ...r, pending: false, sent: iso(now) }), {});
-    await patchJson(`${agent.dir}/schedule.json`, agent.machine, stamp, null);
+    await send(agent, request.retro ? "manual pass with retrospective" : "manual pass", timerCx);
+    await patchJson(`${agent.dir}/pass-request.json`, agent.machine, (r) => ({ ...r, pending: false, sent: iso(now) }), {}, timerCx);
+    await patchJson(`${agent.dir}/schedule.json`, agent.machine, stamp, null, timerCx);
     return;
   }
   const hold = holdReason(schedule, ledger);
   if (hold) {
-    if (schedule.nextPass) await patchJson(`${agent.dir}/schedule.json`, agent.machine, (s) => ({ ...s, nextPass: null }), null);
+    if (schedule.nextPass) await patchJson(`${agent.dir}/schedule.json`, agent.machine, (s) => ({ ...s, nextPass: null }), null, timerCx);
     return;
   }
   // A changed cadence applies from the next pass: one cadence after the last one.
   const last = Date.parse(schedule.lastPass ?? "") || null;
   const due = last ? last + every : Date.parse(schedule.nextPass ?? "") || now + every;
   if (now < due) {
-    if (Date.parse(schedule.nextPass ?? "") !== Math.floor(due / 1000) * 1000) await patchJson(`${agent.dir}/schedule.json`, agent.machine, (s) => ({ ...s, nextPass: iso(due) }), null);
+    if (Date.parse(schedule.nextPass ?? "") !== Math.floor(due / 1000) * 1000) await patchJson(`${agent.dir}/schedule.json`, agent.machine, (s) => ({ ...s, nextPass: iso(due) }), null, timerCx);
     return;
   }
   if (busy) return; // still due: goes out as soon as the turn ends
-  await send(agent, "scheduled pass");
-  await patchJson(`${agent.dir}/schedule.json`, agent.machine, stamp, null);
+  await send(agent, "scheduled pass", timerCx);
+  await patchJson(`${agent.dir}/schedule.json`, agent.machine, stamp, null, timerCx);
 }
 
 // ---- costs (t-009) ----
@@ -144,7 +160,7 @@ const failure = (e) => { const why = String(e?.message ?? e).slice(0, 200); retu
 
 // The space's collect, when due (shared "project-agent.costsRun": { [space]: { at, busy } }, kept across a takeover).
 // The result goes to shared "project-agent.costs" ({ [space]: { at, ok, code?, error?, missing? } }), written on change only.
-export function collectCosts(agent, now) {
+export function collectCosts(agent, now, timerCx = null) {
   const id = agent.space;
   if (!id) return;
   const runs = shared("project-agent.costsRun") ?? {}, run = runs[id];
@@ -155,11 +171,14 @@ export function collectCosts(agent, now) {
   setShared("project-agent.costsRun", { ...runs, [id]: { at: now, busy: true } });
   let p;
   // With this panel's zone (t-036, zone.js); a pa-costs from before it refuses that: run again without it.
-  const args = ["collect", "--space", localId(id), "--quiet"], collectWith = (a) => exec("pa-costs", a, { on: agent.machine, timeout: COLLECT_TIMEOUT });
-  try { p = Promise.resolve(collectWith([...args, ...zoneArgs(now)])).then((r) => (oldTool(r) ? collectWith(args) : r)); } catch (e) { p = Promise.reject(e); }
-  Promise.resolve(p).then(outcome, failure).then((res) => {
+  const args = ["collect", "--space", localId(id), "--quiet"];
+  const collectWith = (a) => capped(timerCx, () => hostRun("pa-costs", a, { on: agent.machine, timeout: COLLECT_TIMEOUT }), { key: `collect:${id}`, limit: COLLECT_TIMEOUT + GRACE, what: "pa-costs collect" });
+  try { p = Promise.resolve(collectWith([...args, ...zoneArgs(now)])).then((r) => (!gaveUp(r) && oldTool(r) ? collectWith(args) : r)); } catch (e) { p = Promise.reject(e); }
+  // A collect that did not answer is a failure; one skipped (the last still pending, or no room) records nothing.
+  Promise.resolve(p).then((r) => (gaveUp(r) ? (r.busy || r.skipped || r.refused ? null : { ok: false, error: "pa-costs collect did not answer" }) : outcome(r)), failure).then((res) => {
     const all = { ...(shared("project-agent.costsRun") ?? {}) };
     if (all[id]?.at === now) { all[id] = { at: now, busy: false }; setShared("project-agent.costsRun", all); }
+    if (!res) return;
     const kept = { ...(shared("project-agent.costs") ?? {}) }, was = kept[id];
     const same = was && was.ok === res.ok && was.code === res.code && was.error === res.error && was.missing === res.missing;
     if (!same) { kept[id] = { at: iso(now), ...res }; setShared("project-agent.costs", kept); }
@@ -168,25 +187,28 @@ export function collectCosts(agent, now) {
 }
 
 // The scheduled billing query, here only: at most once per BILLING_EVERY (a shared stamp, so a takeover inside the hour runs none).
-export function billingTick(now) {
+export function billingTick(now, timerCx = null) {
   const last = Number(shared("project-agent.billingTick")?.at) || 0;
   if (now - last < BILLING_EVERY) return;
   setShared("project-agent.billingTick", { at: now });
   let p;
-  try { p = exec("pa-costs", ["billed", "fetch", "--scheduled", "--quiet"], { timeout: FETCH_TIMEOUT }); } catch (e) { p = Promise.reject(e); }
-  Promise.resolve(p).then(outcome, failure).then((res) => { if (!res.ok) logOnce("billing", `pa-costs billed fetch: ${res.missing ? "pa-costs is not installed here" : res.error || `exit ${res.code}`}`, now); }, () => {});
+  try { p = capped(timerCx, () => hostRun("pa-costs", ["billed", "fetch", "--scheduled", "--quiet"], { timeout: FETCH_TIMEOUT }), { key: "billing", limit: FETCH_TIMEOUT + GRACE, what: "the scheduled billing query" }); } catch (e) { p = Promise.reject(e); }
+  // Did not answer: a failure (logged); skipped (the last one still pending, or no room): nothing to say.
+  Promise.resolve(p).then((r) => (gaveUp(r) ? (r.busy || r.skipped || r.refused ? { ok: true } : { ok: false, error: "did not answer" }) : outcome(r)), failure).then((res) => { if (!res.ok) logOnce("billing", `pa-costs billed fetch: ${res.missing ? "pa-costs is not installed here" : res.error || `exit ${res.code}`}`, now); }, () => {});
 }
 
 // One copy of the mod holds the lease and does the sending, so a pass is never sent twice.
-export async function tick(me) {
+// host, cx (t-053): the copy's Host and the tick task's cx; without them each call is made as is (tests).
+export async function tick(me, host = null, cx = null) {
+  const timerCx = host ? host.ctx(cx, { origin: "timer" }) : null;
   const now = Date.now(), lease = shared("project-agent.timer");
   // Renewed about every 30 s; taken over after 50 s of silence (the holder's copy was reloaded or closed).
   if (lease && lease.id !== me && now - lease.at < 50000) return;
   if (!lease || lease.id !== me || now - lease.at > 20000) setShared("project-agent.timer", { id: me, at: now });
-  billingTick(now);
+  billingTick(now, timerCx);
   for (const agent of projectAgents()) {
-    collectCosts(agent, now); // not awaited: it runs beside the pass, also for an agent that is not alive
-    try { await tickOne(agent, now); } catch (e) { console.log(`project-agent timer: ${agent.name}: ${e.message ?? e}`); }
+    collectCosts(agent, now, timerCx); // not awaited: it runs beside the pass, also for an agent that is not alive
+    try { await tickOne(agent, now, timerCx); } catch (e) { console.log(`project-agent timer: ${agent.name}: ${e.message ?? e}`); }
   }
 }
 

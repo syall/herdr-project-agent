@@ -10,8 +10,9 @@
 
 import { View, div } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, ScrollHandle } from "gpui-base";
-import { spaces, panes, agents, terminals, machines, theme, run, exec, props, home, watchFolder, notify, shared, setShared, closeOverlay, openOverlay, window, layout, readTextFile } from "herdr";
-import { loadSpace, loadLedger, loadProfile, loadDecisions, loadRules, withTimeout, TIMED_OUT, READ_LIMIT, answerDecision, notifyOrchestrator, changeRules, touched, localId, paHome, stateDir, taskActions, taskLinks, evidenceTasks, cardEvidence, staleInstructions, liveTarget, lookAlike, OPEN_REQUESTS, keeperJudging, startingLabels } from "./store.js";
+import { spaces, panes, agents, terminals, machines, theme, run, props, home, notify, shared, setShared, closeOverlay, openOverlay, window, layout } from "herdr";
+import { Host, gaveUp, read as hostRead, run as hostRun, watch, refusalLine } from "./host.js";
+import { loadSpace, loadLedger, loadProfile, loadDecisions, loadRules, TIMED_OUT, READ_LIMIT, answerDecision, notifyOrchestrator, changeRules, touched, localId, paHome, stateDir, taskActions, taskLinks, evidenceTasks, cardEvidence, staleInstructions, liveTarget, lookAlike, OPEN_REQUESTS, keeperJudging, startingLabels } from "./store.js";
 import { RulesPane, arm, armHolds, fieldState } from "./rules.js"; // arm, armHolds: the two-click Delete (ARM_WAIT, 10 s)
 import { SetupPane } from "./setup.js";
 import { Keeper, idleShell } from "./keeper.js";
@@ -32,6 +33,11 @@ const CACHE_OLD = 60000; // a kept load older than this says "updating…" while
 const COSTS_MARK = 20000; // while Costs is shown: shared "project-agent.costsShown" is stamped at most this often (the timer collects faster then)
 const COUNT_EVERY = 10000; // while hidden: at most one card read and one ledger read per space this often
 const PROFILE_RETRY = 60000; // while hidden: a profile read that failed is tried again no sooner than this
+const COALESCE = 2000; // t-053: a background trigger (timer, watch) starts at most one load per space this often; the rest wait for its end
+const BG = Object.freeze({ background: true });
+// t-053: the watch batch paths, under the shown local space's folder, that the panel shows (a heartbeat, a log, the lock,
+// the session log, the cost records and other spaces' folders reload nothing; the root itself: everything).
+const SHOWN_PATH = /^(agent\.json|ledger\.json|schedule\.json|pass-request\.json|rules\.json|decisions(\/[^/]+)?|evidence(\/[^/]+(\/(?!build\.log$)[^/]+)?)?|costs\/summary\.json)$/;
 // A part of loadSpace's result that did not answer (its `unknown`), and the fields it fills.
 const PARTS = { ledger: ["ledger"], profile: ["profile", "profileDir"], schedule: ["schedule"], request: ["request"] };
 const NOTE = "Note for the Project Agent (optional)";
@@ -81,6 +87,9 @@ export default class ProjectAgent extends View {
       });
       return;
     }
+    this.host = new Host(); // t-053: this copy's host calls (host.js): their keys, limits and budget
+    this.started = {}; // space id -> when its last load started (the 2 s window, COALESCE)
+    this.deferred = {}; // space id -> a background reload came inside the window: one load at its end (the 1 s timer)
     this.data = null; // loadSpace() result for this.space (after the first paint, the cards and the rest are still coming)
     this.cards = []; // loadDecisions() result
     this.space = null;
@@ -98,12 +107,13 @@ export default class ProjectAgent extends View {
     this.view = null; // "decisions" | "tasks" | "rules" | "costs"; null: decisions when any is open
     this.viewShown = null; // the view the last render drew (this.view, or the one picked for null)
     this.rules = new RulesPane((options) => this.field(options));
+    this.rules.host = this.host;
     this.copier = new Copier(); // the Copy controls of cards and tasks (copy.js, t-026)
     // push cards: the last pa-push-main check and run of each (push.js); its runs take the shared mark (t-045 round 2)
-    this.push = new PushCards((spaceId, id, label, running, unknown) => this.sharePush(spaceId, id, label, running, unknown), (spaceId, id, asked) => this.openedPush(spaceId, id, asked));
+    this.push = new PushCards((spaceId, id, label, running, unknown) => this.sharePush(spaceId, id, label, running, unknown), (spaceId, id, asked) => this.openedPush(spaceId, id, asked), this.host);
     // The Costs view: each space's last summary and billed comparison (costs.js); it reads and runs only while
     // this check holds (asked live: `asleep` is updated only by the next reload).
-    this.costs = new CostsPane((id) => this.view === "costs" && spaces().find((s) => s.active)?.id === id && onScreen());
+    this.costs = new CostsPane((id) => this.view === "costs" && spaces().find((s) => s.active)?.id === id && onScreen(), this.host);
     this.costsMarked = {}; // space id -> when this copy last stamped "project-agent.costsShown"
     this.open = new Set(); // expanded task ids
     this.folded = new Set(["done", "parked"]); // task sections folded away (finished work starts folded)
@@ -128,13 +138,21 @@ export default class ProjectAgent extends View {
     this.confirmOpen = {}; // space id -> { tab, terminal }: a look-alike agent runs; asking first
     this.me = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`; // this copy, for the timer lease
     this.schedule = { open: false, error: null, custom: null, quietFrom: null, quietTo: null }; // the schedule bar
-    cx.timer.every(15000, (cx) => cx.spawn(async (cx) => { await tick(this.me); if (!props()?.timer) this.reload(cx); }));
+    // The 15 s pass: one at a time (t-053: a tick still waiting on a call is not joined by another).
+    this.ticking = false;
+    const pass = (cx, then) => {
+      if (this.ticking) return;
+      this.ticking = true;
+      const ok = this.host.spawn(cx, async (cx) => { try { await tick(this.me, this.host, cx); } finally { this.ticking = false; } then?.(cx); }, { what: "the timer's pass" });
+      if (!ok) this.ticking = false;
+    };
+    cx.timer.every(15000, (cx) => pass(cx, (cx) => { if (!props()?.timer) this.reload(cx, BG); }));
     // The keeper (Project Agent tabs: tracking, ordering, reopening, the new-space dialog) runs in
     // the copy that holds the timer lease, so it runs once however many copies a layout has.
-    this.keeper = new Keeper(this.me);
+    this.keeper = new Keeper(this.me, this.host);
     const mine = () => shared("project-agent.timer")?.id === this.me;
     let keeping = false; // this copy held the lease last tick: read heartbeats and agent.json at once when it takes it
-    cx.spawn(async (cx) => { await tick(this.me); if (mine()) { keeping = true; this.keeper.readBeats(cx); } });
+    pass(cx, (cx) => { if (mine()) { keeping = true; this.keeper.readBeats(cx); } });
     cx.timer.every(1500, (cx) => {
       if (!mine()) { keeping = false; return; }
       if (!keeping) { keeping = true; this.keeper.readBeats(cx); }
@@ -145,14 +163,43 @@ export default class ProjectAgent extends View {
     cx.timer.every(15000, (cx) => { if (mine()) this.keeper.readBeats(cx); });
     if (props()?.timer) return; // the always-on copy only keeps time; it shows nothing
     this.reload(cx);
-    cx.timer.every(10000, (cx) => { this.reload(cx); this.resend(cx); });
-    cx.timer.every(1000, (cx) => { this.wake(cx); this.costsDue(cx); if ((this.armed && !this.armedTask(this.space)) || (this.rules.armed && !this.rules.armedRule(this.space))) cx.notify(); }); // shown again (render may not run for a hidden copy); an armed Delete timed out
-    cx.spawn(async (cx) => {
+    cx.timer.every(10000, (cx) => { this.reload(cx, BG); this.resend(cx); });
+    cx.timer.every(1000, (cx) => { this.wake(cx); this.costsDue(cx); this.deferredDue(cx); if ((this.armed && !this.armedTask(this.space)) || (this.rules.armed && !this.rules.armedRule(this.space))) cx.notify(); }); // shown again (render may not run for a hidden copy); an armed Delete timed out
+    // Changes under spaces/ (one watch, D3): a batch reloads only for what the panel shows (watched()), coalesced.
+    this.host.spawn(cx, async (cx) => {
       for (;;) {
-        try { await watchFolder(`${paHome(null)}/spaces`); } catch { return; }
-        this.reload(cx);
+        let paths;
+        try { paths = await watch(`${paHome(null)}/spaces`, this.host); } catch { return; }
+        if (this.watched(paths)) this.reload(cx, BG);
       }
-    });
+    }, { what: "the folder watch", background: false });
+  }
+
+  // Whether a watch batch names something the panel shows (t-053 R4): the watched root itself ("refresh everything"),
+  // or the shown local space's folder or a shown name under it. [] (a cancelled watch): nothing. A space on another
+  // machine changes nothing here: its 10 s timer reads it.
+  watched(paths) {
+    if (!Array.isArray(paths) || !paths.length) return false;
+    const root = `${paHome(null)}/spaces`, trim = (p) => String(p ?? "").replace(/\/+$/, "");
+    if (paths.some((p) => trim(p) === root)) return true;
+    const space = spaces().find((s) => s.active);
+    if (!space || space.machine) return false;
+    const dir = `${root}/${localId(space.id)}`;
+    return paths.some((p) => { const x = trim(p); return x === dir || (x.startsWith(`${dir}/`) && SHOWN_PATH.test(x.slice(dir.length + 1))); });
+  }
+
+  // A background reload that waited for its space's 2 s window (COALESCE): from the 1 s timer, once the window ended.
+  deferredDue(cx) {
+    const space = spaces().find((s) => s.active);
+    if (space && this.deferred[space.id] && Date.now() - (this.started[space.id] ?? 0) >= COALESCE) this.reload(cx, BG);
+  }
+
+  // The runtime refused (or the budget skipped) a call this copy needed: one plain line on what is shown (R6).
+  showRefusal(space, cx) {
+    const r = this.host.refusal;
+    if (!r || this.space !== space.id || !this.data) return;
+    this.data = { ...this.data, errors: [...(this.data.errors ?? []).filter((e) => !/^Too many calls waiting/.test(e)), refusalLine(r, this.dataAt)] };
+    cx.notify();
   }
 
   // A load in flight for this space that is not yet given up: one of its reads settled or reached its
@@ -182,7 +229,7 @@ export default class ProjectAgent extends View {
   wake(cx) {
     if (!this.asleep || !onScreen()) return;
     this.asleep = false;
-    this.reload(cx);
+    this.reload(cx, BG);
   }
 
   // While hidden: the open-card count on the panel's button (shared "project-agent.open") from one
@@ -197,14 +244,15 @@ export default class ProjectAgent extends View {
     if (h && (now - h.at < COUNT_EVERY || (h.busy && now - h.at < LOAD_LIMIT))) return;
     const mine = { at: now, busy: true, seq: ++this.seq };
     this.hidden[space.id] = mine;
-    cx.spawn(async (cx) => {
-      const rcx = { sleep: (ms) => cx.sleep(ms) }; // only what the store's cap uses
+    const ok = this.host.spawn(cx, async (cx) => {
+      const rcx = this.host.ctx(cx, { origin: "hidden" }), out = {}; // keyed, capped (host.js)
       const [cards, ledger] = await Promise.all([
-        loadDecisions(space, { cx: rcx, batchOnly: true }).catch(() => null),
+        loadDecisions(space, { cx: rcx, batchOnly: true, out }).catch(() => null),
         loadLedger(space, rcx).catch(() => null),
       ]);
       mine.busy = false;
       if (!this.asleep || mine.seq < (this.wrote[space.id] ?? 0)) return;
+      if (out.busy && ledger?.busy) return; // t-053: both skipped (the last read still pending): this read read nothing, so it hides no older one
       this.wrote[space.id] = mine.seq;
       if (cards) {
         const open = cards.filter((x) => x.card?.status === "open").length;
@@ -215,7 +263,8 @@ export default class ProjectAgent extends View {
         const known = this.cache.get(space.id)?.data ?? (this.space === space.id ? this.data : null);
         this.share(space, { ledger: ledger.value, evidence: known?.evidence, profile: known?.profile }, { mains: Boolean(known?.agent && !(known.unknown ?? []).includes("profile")) });
       }
-    });
+    }, { what: "the hidden panel's read" });
+    if (!ok) mine.busy = false;
   }
 
   // While hidden with no kept load whose profile answered: the space's profile, for "project-agent.mainBranches". Read once
@@ -224,14 +273,15 @@ export default class ProjectAgent extends View {
     const p = this.profiles[space.id] ??= {}, now = Date.now();
     if (p.done || p.busy || (p.at && now - p.at < PROFILE_RETRY)) return;
     p.at = now; p.busy = true;
-    cx.spawn(async (cx) => {
+    const ok = this.host.spawn(cx, async (cx) => {
       let r = { answered: false };
-      try { r = await loadProfile(space, props()?.profile, { sleep: (ms) => cx.sleep(ms) }); } catch {}
+      try { r = await loadProfile(space, props()?.profile, this.host.ctx(cx, { origin: "profile" })); } catch {}
       p.busy = false;
       if (!r.answered || p.done) return;
       p.done = true; p.profile = r.profile;
       if (this.asleep && r.profile !== undefined && !this.knownProfile(space.id)) this.shareMains(space, r.profile);
-    });
+    }, { what: "the profile read" });
+    if (!ok) p.busy = false;
   }
 
   // Whether the space's kept load has a profile that answered (else the hidden panel reads it itself).
@@ -251,7 +301,10 @@ export default class ProjectAgent extends View {
   // that times out or fails never stands for "none": its part keeps the last known value (the kept
   // entry's, else what is shown for the space), or stays unknown, and an unknown part writes none of
   // the shared keys it feeds.
-  reload(cx) {
+  // t-053: { background: true } (the timers, the watch, wake): at most one load per space per COALESCE, the rest deferred
+  // to the window's end; its reads skip a call still pending (BUSY: quietly). A reload from a click or a write starts at
+  // once, and its reads wait for a call still pending of their kind, then read again.
+  reload(cx, { background = false } = {}) {
     const space = spaces().find((s) => s.active);
     if (!space) { this.data = null; this.space = null; cx.notify(); return; }
     if (space.id !== this.space) { this.disarm(); this.adopt(space, cx); }
@@ -259,12 +312,17 @@ export default class ProjectAgent extends View {
     this.asleep = false;
     if (this.view === "costs") this.costsShown(space, cx); // its own read, outside the load (costs.js); never while hidden
     if (this.inFlight(space.id)) { this.again[space.id] = true; return; }
-    const token = ++this.seq, load = { token, at: Date.now() };
+    const at0 = Date.now();
+    if (background && at0 - (this.started[space.id] ?? -Infinity) < COALESCE) { this.deferred[space.id] = true; return; }
+    delete this.deferred[space.id];
+    this.started[space.id] = at0;
+    const token = ++this.seq, load = { token, at: at0 };
     this.loads[space.id] = load;
     const current = () => this.loads[space.id] === load;
     const shown = () => spaces().find((s) => s.active)?.id === space.id;
-    cx.spawn(async (cx) => {
-      const rcx = { sleep: (ms) => cx.sleep(ms), progress: () => { load.at = Date.now(); } }; // the store's reads move `at`
+    const started = this.host.spawn(cx, async (cx) => {
+      const rcx = this.host.ctx(cx, { origin: "load", background, wait: !background, progress: () => { load.at = Date.now(); } }); // the store's reads move `at`
+      const cardsOut = {}; // cardsOut.busy: the card read was skipped (a call of its kind still pending): no "did not answer" line
       let data, cards = [], rules = null, missed = []; // missed: the parts that did not answer (shown from the last known value, written nowhere)
       const kept = this.cache.get(space.id);
       const shownNow = () => (this.space === space.id && this.data?.agent ? this.data : null); // what is shown for this space, if it is
@@ -286,14 +344,14 @@ export default class ProjectAgent extends View {
         }
         if (data.agent) {
           // A read that times out or fails keeps the last known value: the kept load's, else what is shown for the space.
-          const cap = (p, fallback) => withTimeout(rcx, p).then((v) => (v === TIMED_OUT ? fallback() : v), () => fallback());
+          const cap = (p, fallback) => p.then((v) => (gaveUp(v) ? fallback() : v), () => fallback()); // each read capped in the store
           const known = [...(kept && !kept.cardsUnknown ? kept.cards : []), ...(this.space === space.id && this.cardsFor === space.id ? this.cards : [])];
           let evidence, stale;
           [cards, rules, evidence, stale] = await Promise.all([
-            loadDecisions(space, { cx: rcx, live: current, known }),
-            cap(loadRules(space), () => kept?.rules ?? (this.space === space.id && this.cardsFor === space.id ? this.rules.data : null) ?? null), // null: the Rules view says Loading…
-            cap(evidenceTasks(space), () => kept?.data?.evidence ?? shownNow()?.evidence), // undefined: unknown
-            cap(staleInstructions(space, data.agent.profile), () => kept?.data?.stale ?? shownNow()?.stale ?? []),
+            loadDecisions(space, { cx: rcx, live: current, known, out: cardsOut }),
+            cap(loadRules(space, rcx), () => kept?.rules ?? (this.space === space.id && this.cardsFor === space.id ? this.rules.data : null) ?? null), // null: the Rules view says Loading…
+            cap(evidenceTasks(space, rcx), () => kept?.data?.evidence ?? shownNow()?.evidence), // undefined: unknown
+            cap(staleInstructions(space, data.agent.profile, rcx), () => kept?.data?.stale ?? shownNow()?.stale ?? []),
           ]);
           data.evidence = evidence; data.stale = stale;
         }
@@ -301,10 +359,16 @@ export default class ProjectAgent extends View {
       catch (e) { data = { agent: null, errors: [String(e.message ?? e)], failed: true }; } // a read in the first round threw
       const wasCurrent = current();
       if (wasCurrent) delete this.loads[space.id];
+      // t-053: agent.json skipped (its last read still pending): nothing commits, nothing is said; the next trigger reads.
+      if (data.busy) { if (wasCurrent && this.again[space.id]) { delete this.again[space.id]; if (shown()) this.reload(cx); } return; }
+      // The runtime refused a call of this load (or the budget skipped one): one plain line, never its own text (R6).
+      const refused = this.host.refusalSince(at0);
+      if (refused) data.errors = [...(data.errors ?? []).filter((e) => !/^Too many calls waiting/.test(e)), refusalLine(refused, this.space === space.id ? this.dataAt : null)];
       // Given up with its card fallback skipped (no result), or a newer load of this space has committed.
-      if (!((cards === null && !wasCurrent) || token < (this.committed[space.id] ?? 0))) this.commit(space, token, data, cards, rules, cx, missed);
+      if (!((cards === null && !wasCurrent) || token < (this.committed[space.id] ?? 0))) this.commit(space, token, data, cards, rules, cx, missed, Boolean(cardsOut.busy));
       if (wasCurrent && this.again[space.id]) { delete this.again[space.id]; if (shown()) this.reload(cx); }
-    });
+    }, { what: "the panel's load" });
+    if (!started) { if (current()) delete this.loads[space.id]; this.showRefusal(space, cx); }
   }
 
   // The Costs view chosen: a reread or a billed compare asked for while it was left starts once it is shown (costs.js due()).
@@ -335,7 +399,7 @@ export default class ProjectAgent extends View {
   //   cards that did not answer write no count and leave the kept cards as they were;
   // - not shown: only kept (for the way back); nothing drawn or written;
   // - shown: drawn, kept, and the shared keys written unless a newer read of the space wrote them.
-  commit(space, token, data, cards, rules, cx, missed = []) {
+  commit(space, token, data, cards, rules, cx, missed = [], quiet = false) {
     const kept = this.cache.get(space.id), same = this.space === space.id;
     const shown = spaces().find((s) => s.active)?.id === space.id;
     if (data.timedOut || data.failed) {
@@ -355,7 +419,7 @@ export default class ProjectAgent extends View {
     if (!listed) {
       const src = kept && !kept.cardsUnknown ? kept.cards : same && this.cardsFor === space.id ? this.cards : null;
       if (src) cards = src; else { cards = []; cardsUnknown = true; }
-      data.errors = [...(data.errors ?? []), src ? "decision cards: did not answer; the last known are shown" : "decision cards: did not answer"];
+      if (!quiet) data.errors = [...(data.errors ?? []), src ? "decision cards: did not answer; the last known are shown" : "decision cards: did not answer"]; // quiet: skipped (BUSY), t-053
     }
     this.committed[space.id] = token;
     if (listed) this.resolveMarks(space, token, cards); // t-045
@@ -539,7 +603,7 @@ export default class ProjectAgent extends View {
   async notSaved(space, entry, m, why, cx) {
     const k = noteKey(space.id, entry.id);
     let text;
-    try { text = await withTimeout({ sleep: (ms) => cx.sleep(ms) }, readTextFile(entry.path, { on: space.machine ?? null })); } catch { text = TIMED_OUT; }
+    try { text = await this.host.call(this.host.ctx(cx), null, () => hostRead(entry.path, { on: space.machine ?? null }), { limit: READ_LIMIT, background: false, what: "the card read" }); } catch { text = TIMED_OUT; }
     let card = null;
     if (typeof text === "string") { try { card = JSON.parse(text); } catch { card = null; } }
     Object.assign(m, { why, seq: this.seq });
@@ -618,8 +682,8 @@ export default class ProjectAgent extends View {
             const item = items[at];
             const target = !held.has(item.spaceId) && liveTarget(item.spaceId);
             if (!target) { held.add(item.spaceId); left.push(item); continue; }
-            try { await notifyOrchestrator(target.address, item.message, { sleep: (ms) => cx.sleep(ms) }); } // capped (store.js SEND_LIMIT)
-            catch (e) { held.add(item.spaceId); left.push({ ...item, why: String(e.message ?? e) }); }
+            try { await notifyOrchestrator(target.address, item.message, this.host.ctx(cx, { origin: "send" })); } // capped (store.js SEND_LIMIT), one send per address in flight
+            catch (e) { held.add(item.spaceId); left.push(e?.busy ? item : { ...item, why: String(e.message ?? e) }); } // busy: the last send there still waits; the notice keeps its line
           }
         } finally {
           this.unsent = [...left, ...items.slice(at), ...this.unsent]; // kept ones first: anything queued meanwhile comes after
@@ -717,7 +781,7 @@ export default class ProjectAgent extends View {
     cx.notify();
     cx.spawn(async (cx) => {
       try {
-        const r = await exec("pa-task", [action, String(task.id), "--space", localId(space.id)], { on: space.machine ?? null, timeout: 30000 });
+        const r = await hostRun("pa-task", [action, String(task.id), "--space", localId(space.id)], { on: space.machine ?? null, timeout: 30000 });
         if (r.code !== 0) this.taskError[task.id] = (r.stderr || r.stdout || `pa-task exited with ${r.code}`).trim().slice(0, 300);
       } catch (e) { this.taskError[task.id] = String(e.message ?? e); }
       this.reload(cx); cx.notify();
@@ -741,7 +805,7 @@ export default class ProjectAgent extends View {
   // Opens a link on this computer (wherever the space lives).
   openLink(url, cx) {
     const opener = window()?.platform === "macos" ? "open" : "xdg-open";
-    cx.spawn(async () => { try { await exec(opener, [url], { timeout: 20000 }); } catch (e) { notify({ title: "Couldn't open the link", body: String(e.message ?? e), level: "error" }); } });
+    cx.spawn(async () => { try { await hostRun(opener, [url], { timeout: 20000 }); } catch (e) { notify({ title: "Couldn't open the link", body: String(e.message ?? e), level: "error" }); } });
   }
 
   // Shows a worker's live terminal: in the layout's Agents view when it has one (a stack child
@@ -772,8 +836,8 @@ export default class ProjectAgent extends View {
     cx.spawn(async (cx) => {
       try {
         // A link opens on this computer; a command runs where the space lives.
-        const r = action.local ? await exec(action.argv[0], action.argv.slice(1), { timeout: 20000 })
-          : await exec(action.argv[0], action.argv.slice(1), { cwd: this.data?.agent?.project, on: space.machine ?? null, timeout: 60000 });
+        const r = action.local ? await hostRun(action.argv[0], action.argv.slice(1), { timeout: 20000 })
+          : await hostRun(action.argv[0], action.argv.slice(1), { cwd: this.data?.agent?.project, on: space.machine ?? null, timeout: 60000 });
         this.output[key] = { code: r.code, text: `${r.stdout}${r.stderr}`.trim().slice(0, 4000) };
       } catch (e) { this.output[key] = { code: -1, text: String(e.message ?? e) }; }
       cx.notify();

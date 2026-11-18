@@ -12,8 +12,8 @@
 
 import { div } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
-import { exec } from "herdr";
-import { isPush, localId, withTimeout, TIMED_OUT } from "./store.js";
+import { isPush, localId, capped, gaveUp, TIMED_OUT } from "./store.js";
+import { run as hostRun } from "./host.js";
 import { sel } from "./copy.js";
 
 export { isPush };
@@ -34,7 +34,6 @@ const short = (sha) => (typeof sha === "string" && sha ? sha.slice(0, 7) : "none
 const clock = (iso, seconds = true) => { const d = new Date(iso); return Number.isNaN(d.getTime()) ? "?" : d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", ...(seconds ? { second: "2-digit" } : {}) }); };
 const stamp = (iso) => { const d = new Date(iso); return Number.isNaN(d.getTime()) ? String(iso ?? "?") : d.toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }); };
 const text = (v) => (v === null || v === undefined ? "" : String(v));
-const sleeper = (cx) => ({ sleep: (ms) => cx.sleep(ms) });
 const failed = (message) => ({ ok: false, refusal: { check: "panel", message } });
 // Why a push card is shown only (store.js parseCards, t-028): its own id is not its file name, or the name reads as
 // an option. Such a card is never checked or run, whatever is clicked. null: none.
@@ -51,17 +50,21 @@ function printed(r) {
 const said = (r) => String(r?.stderr || r?.stdout || "").trim().slice(0, 600);
 
 // One exec of the tool on the space's machine, given up GRACE after its own timeout (an exec that never
-// settles). { r } or { error }.
-async function call(cx, space, command, args, timeout) {
+// settles). { r } or { error }, or { busy: true } (t-053: one of its kind still pending; nothing started, nothing to say).
+// hcx: the task's context (a Host's ctx: keyed `key`; a plain cx: capped only).
+async function call(hcx, space, command, args, timeout, key = null) {
   try {
-    const r = await withTimeout(sleeper(cx), exec(command, args, { on: space.machine ?? null, timeout }), timeout + GRACE);
+    const r = await capped(hcx, () => hostRun(command, args, { on: space.machine ?? null, timeout }), { key, limit: timeout + GRACE, what: `${command} ${args[0]}` });
+    if (gaveUp(r) && r !== TIMED_OUT) return { busy: true };
     return r === TIMED_OUT ? { error: `${command} ${args[0]} did not answer in ${Math.round((timeout + GRACE) / 1000)} s` } : { r };
   } catch (e) { return { error: String(e.message ?? e) }; }
 }
+const ctxOf = (host, cx, click) => (host ? host.ctx(cx, { origin: "push", background: !click, wait: click }) : cx);
 
 // `pa-push-allow show --json` (read-only), for the Rules view: its report, or { error }.
-export async function readAllow(space, cx) {
-  const { r, error } = await call(cx, space, "pa-push-allow", ["show", "--json", "--space", localId(space.id)], ALLOW_TIMEOUT);
+export async function readAllow(space, cx, host = null, click = false) {
+  const { r, error, busy } = await call(ctxOf(host, cx, click), space, "pa-push-allow", ["show", "--json", "--space", localId(space.id)], ALLOW_TIMEOUT, `allow:${space.id}`);
+  if (busy) return { busy: true }; // t-053: the last one is still pending: the caller keeps what it has
   if (error) return { error };
   return printed(r) ?? { error: said(r) || `pa-push-allow exited with ${r?.code}` };
 }
@@ -75,8 +78,9 @@ export class PushCards {
   // set when a run starts (running) and when it ends answered or unknown, removed when the card is known open again.
   // opened(spaceId, id, asked): a check from this copy, asked at `asked`, read the card open (t-045 round 3): an unknown
   // result's shared mark from any window, written before then, goes; nothing else unlocks it, not its age.
-  constructor(share = () => {}, opened = () => {}) {
+  constructor(share = () => {}, opened = () => {}, host = null) {
     this.share = share; this.opened = opened;
+    this.host = host; // t-053: the copy's Host (host.js); null: each call as is
     // `${space id}\0${card id}` -> { check, at, asked, busy, running, result, kept, error, errorFor, unknown, stale }
     //   check: the last check's JSON; at: when that check was asked for; running: the label being answered;
     //   kept: a push from here whose result stays in the Decisions list until the person leaves it.
@@ -104,17 +108,19 @@ export class PushCards {
     if (!isPush(entry?.card) || entry.card.status !== "open" || shownOnly(entry)) return;
     const st = this.of(space.id, entry.id);
     if (st.check || st.busy || st.running || (st.asked && Date.now() - st.asked < CHECK_EVERY)) return;
-    this.check(space, entry, cx);
+    this.check(space, entry, cx, { auto: true });
   }
 
   // `pa-push-main check <id> --space <id> --json`: read-only; its facts are what the block shows.
-  check(space, entry, cx) {
+  // auto (t-053): the panel's own first check (wantCheck), which skips quietly while an older check is still pending.
+  check(space, entry, cx, { auto = false } = {}) {
     const st = this.of(space.id, entry.id);
     if (st.busy || st.running || shownOnly(entry)) return;
     const asked = Date.now();
     st.busy = true; st.asked = asked; st.stale = false;
     cx.spawn(async (cx) => {
-      const { r, error } = await call(cx, space, "pa-push-main", ["check", entry.id, "--space", localId(space.id), "--json"], CHECK_TIMEOUT);
+      const { r, error, busy } = await call(ctxOf(this.host, cx, !auto), space, "pa-push-main", ["check", entry.id, "--space", localId(space.id), "--json"], CHECK_TIMEOUT, `check:${space.id}:${entry.id}`);
+      if (busy) { st.busy = false; cx.notify(); return; } // the last check still pending: nothing read, nothing said (never "open")
       st.check = error ? failed(`pa-push-main check could not run: ${error}`) : printed(r) ?? failed(`pa-push-main check printed no result${said(r) ? `: ${said(r)}` : ` (exit ${r?.code})`}`);
       st.at = asked; st.busy = false;
       if (st.unknown && !st.running && !st.result && readOpen(st.check)) this.share(space.id, entry.id, null); // known open again
@@ -148,7 +154,7 @@ export class PushCards {
     st.running = label; st.result = null; st.error = null; st.errorFor = label; st.unknown = null; st.stale = false; st.notNowWait = false;
     this.share(space.id, entry.id, label, true);
     cx.spawn(async (cx) => {
-      const { r, error } = await call(cx, space, "pa-push-main", args, RUN_TIMEOUT);
+      const { r, error } = await call(ctxOf(this.host, cx, true), space, "pa-push-main", args, RUN_TIMEOUT, `run:${space.id}:${entry.id}`);
       st.running = null;
       let notice;
       const out = error ? null : printed(r);

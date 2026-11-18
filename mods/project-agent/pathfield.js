@@ -5,7 +5,8 @@
 
 import { div, svg } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input } from "gpui-base";
-import { exec, home } from "herdr";
+import { home } from "herdr";
+import { run } from "./host.js";
 
 const MAX_ROWS = 200;
 
@@ -52,7 +53,7 @@ export class PathField {
       let names = null;
       try {
         // -p marks folders with "/", -L follows links, -A shows dot-folders (hidden unless typed).
-        const r = await exec("ls", ["-1pAL", this.real(dir)], { on: this.machine, timeout: 8000 });
+        const r = await run("ls", ["-1pAL", this.real(dir)], { on: this.machine, timeout: 8000 });
         if (r.stdout || r.code === 0) names = r.stdout.split("\n").filter((n) => n.endsWith("/")).map((n) => n.slice(0, -1)).sort((a, b) => a.localeCompare(b));
       } catch {}
       this.cache[dir] = names;
@@ -75,7 +76,7 @@ export class PathField {
     const path = this.value();
     if (path !== "~" && !path.startsWith("~/")) return path;
     if (!this.homeDir) {
-      try { this.homeDir = (await exec("sh", ["-c", "printf %s \"$HOME\""], { on: this.machine, timeout: 8000 })).stdout.trim() || null; } catch {}
+      try { this.homeDir = (await run("sh", ["-c", "printf %s \"$HOME\""], { on: this.machine, timeout: 8000 })).stdout.trim() || null; } catch {}
     }
     return this.homeDir ? `${this.homeDir}${path.slice(1)}` : null;
   }
@@ -103,7 +104,7 @@ export class PathField {
     if (!path) return "Type or pick a folder.";
     if (!(path.startsWith("/") || path === "~" || path.startsWith("~/"))) return "Give a full path (it starts with / or ~/).";
     try {
-      const r = await exec("test", ["-d", this.real(path.endsWith("/") ? path : `${path}/`)], { on: this.machine, timeout: 8000 });
+      const r = await run("test", ["-d", this.real(path.endsWith("/") ? path : `${path}/`)], { on: this.machine, timeout: 8000 });
       return r.code === 0 ? null : "That folder doesn't exist.";
     } catch (e) { return String(e.message ?? e); }
   }
