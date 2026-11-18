@@ -4620,6 +4620,7 @@ cases["P46-other-push"] = async () => { // R7 AC5-AC6, R4 AC2, R12 AC1/AC3: Othe
   check(runs.length === 1, `one run (got ${runs.length})`);
   check(JSON.stringify(runs[0][1]) === JSON.stringify(["run", PID, "--answer", "Other", "--space", S, "--json", "--note", "do X first"]), `its argv (got ${JSON.stringify(runs[0][1])})`);
   check(!runs[0][1].includes("--seen"), "never --seen");
+  await click(v, "view-decisions"); v.older = true; // answered Other, not kept (as Not now): in the answered fold
   const { text } = look(v);
   check(text.includes("answered: Other") && text.includes("Answered Other: nothing was pushed."), `shown (got ${text.slice(0, 1500)})`);
   check(!text.includes("Answered Not now"), "not called Not now");
@@ -4650,7 +4651,7 @@ cases["P46-other-push"] = async () => { // R7 AC5-AC6, R4 AC2, R12 AC1/AC3: Othe
 
 cases["P46-push-other-closed"] = async () => { // R3 AC4: a push card answered Other on file
   const { v } = await pushWorld({ card: pushOtherCard("not this week") });
-  v.older = true;
+  await click(v, "view-decisions"); v.older = true;
   const { text } = look(v);
   check(text.includes("Answered Other: nothing was pushed.") && text.includes("Your answer: “not this week”"), `shown (got ${text.slice(0, 1500)})`);
   check(!text.includes("Nothing was pushed from this card."), "not the plain line");
