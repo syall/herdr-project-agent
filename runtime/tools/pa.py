@@ -2702,7 +2702,7 @@ def cmd_restart(args):
     what the new launcher loaded. It ends nothing itself; the launcher ends its own Claude and execs."""
     in_claude = os.environ.get("CLAUDECODE") not in (None, "", "0")
     if getattr(args, "end_terminal", False):  # t-037 J3, R10: the person's command only, also with --on
-        if in_claude:
+        if in_agent():  # every agent marker, as pa-task (round 2, RL-J3-2)
             raise Problem("pa-restart --end-terminal is the person's command: it ends the Project Agent's terminal and "
                           "its workers. Ask the person to run it.")
         return end_terminal(args)
@@ -2814,6 +2814,14 @@ def cmd_restart(args):
 KEEPER_WAIT = 45  # seconds to wait for the keeper's restore before pa-start (the Mac restores an ended PA in seconds)
 END_WAIT = 15  # seconds for hc kill's terminal to finish
 END_POLL = 0.5
+END_TOKEN = "end-terminal-token.json"  # the --on relay's one-time binding of the confirmed answer (J3 round 2)
+END_TOKEN_TTL = 600  # seconds the person has to answer between the relay's dry run and its bound run
+AGENT_ENV = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CODEX_SANDBOX")  # what an agent's shell carries (Claude, Codex)
+
+
+def in_agent():
+    """True when this runs in an agent's shell: any marker in AGENT_ENV is set (the person's commands refuse it)."""
+    return any(os.environ.get(k) for k in AGENT_ENV)
 PYTHON_NAME = re.compile(r"python[0-9.]*$")
 
 
@@ -2906,12 +2914,14 @@ def relay_output(argv):
     return r.returncode, r.stdout
 
 
-def end_result(args, outcome, code, terminal=None, workers=(), restored=None, why=None, err=None):
+def end_result(args, outcome, code, terminal=None, workers=(), restored=None, why=None, err=None, token=None):
     if err:
         print(err, file=sys.stderr)
     if getattr(args, "json", False):
-        print(json.dumps({"outcome": outcome, "terminal": terminal, "workers": list(workers), "restoredBy": restored,
-                          "why": why}))
+        data = {"outcome": outcome, "terminal": terminal, "workers": list(workers), "restoredBy": restored, "why": why}
+        if token:
+            data["token"] = token
+        print(json.dumps(data))
     if code:
         sys.exit(code)
 
@@ -2934,14 +2944,60 @@ def end_summary(agent, terminal, workers, note, installed, turn):
     return lines
 
 
+def relay_form(args):
+    """(issue, bound) for the --on relay's own flags (round 2, RL-J3-2). Both are the remote side's only: refused on
+    a run that has a terminal (a tty, or HC_TERMINAL_ID: hc exec runs without one) and with --on."""
+    issue = bool(getattr(args, "relay_issue", False))
+    parts = [getattr(args, k, None) for k in ("relay_token", "confirmed_terminal", "confirmed_workers")]
+    bound = any(p is not None for p in parts)
+    if not (issue or bound):
+        return False, False
+    if getattr(args, "on", None) or os.environ.get("HC_TERMINAL_ID") or interactive():
+        raise Problem("--relay-issue, --relay-token and --confirmed-* are pa-restart --on's relay only (hc exec on the "
+                      "space's machine, no terminal); run pa-restart --end-terminal yourself and type yes")
+    if issue and (bound or not args.dry_run):
+        raise Problem("--relay-issue goes with --dry-run only (the relay's checks)")
+    if bound and not all(parts):
+        raise Problem("the relay's bound form needs --relay-token, --confirmed-terminal and --confirmed-workers")
+    return issue, bound
+
+
+def take_end_token(directory):
+    """The relay's token record, removed from the folder whatever it holds (one try per token); {} if none."""
+    path = os.path.join(directory, END_TOKEN)
+    taken = "{}.taken.{}".format(path, os.getpid())
+    try:
+        os.rename(path, taken)
+    except OSError:
+        return {}
+    try:
+        return as_dict(read_json_safe(taken))
+    finally:
+        try:
+            os.unlink(taken)
+        except OSError:
+            pass
+
+
+def end_token_matches(record, given, terminal, workers):
+    import hmac
+    secret, expires = record.get("token"), record.get("expires")
+    return (isinstance(secret, str) and len(secret) >= 32 and isinstance(given, str)
+            and hmac.compare_digest(secret.encode(), given.encode())
+            and isinstance(expires, (int, float)) and time.time() < expires
+            and record.get("terminal") == terminal and record.get("workers") == list(workers))
+
+
 def end_terminal(args):
     """pa-restart --end-terminal (R10): the steps of plan.md J3.2. The one ending call is `hc kill <terminal>`."""
     if getattr(args, "now", False) or getattr(args, "fresh", False):
         raise Problem("--end-terminal takes neither --now nor --fresh: the terminal ends at once and the new launcher "
                       "resumes the same session")
+    issue, bound = relay_form(args)
     if getattr(args, "on", None):
         return end_terminal_on(args)
     directory, agent = space_for_command(args.space)
+    token = take_end_token(directory) if bound else None  # used up by any try, before anything else is read
     terminal, term, note = identify_old_launcher(directory, agent)
     if called_from(terminal):
         raise Problem("run it from another tab: this one is terminal {} or one of its children and would end with "
@@ -2953,14 +3009,23 @@ def end_terminal(args):
         print(line)
     if args.dry_run:
         print("Dry run: nothing ended.")
+        if issue:  # the relay's own dry run: the one-time token its bound run must bring back
+            secret = uuid.uuid4().hex + uuid.uuid4().hex
+            write_json(os.path.join(directory, END_TOKEN), {"token": secret, "terminal": terminal, "workers": addresses,
+                                                            "at": now(), "expires": time.time() + END_TOKEN_TTL})
+            return end_result(args, "dry-run", 0, terminal, addresses, token=secret)
         return end_result(args, "dry-run", 0, terminal, addresses)
     if workers and not getattr(args, "anyway", False):
         return end_result(args, "refused", 1, terminal, addresses, why="workers running",
                           err="refused: {} worker(s) running (listed above). Run it again when they are done, or add "
                               "--anyway to end them too.".format(len(workers)))
     confirmed = getattr(args, "confirmed_terminal", None)
-    if confirmed is not None:  # the --on relay: the person answered yes on the other machine for exactly these
+    if bound:  # the --on relay: the person answered yes on the other machine for exactly these
         want = sorted(w for w in (getattr(args, "confirmed_workers", None) or "").split(",") if w and w != "-")
+        if not end_token_matches(token, args.relay_token, terminal, addresses):
+            return end_result(args, "refused", 1, terminal, addresses, why="no relay token",
+                              err="refused: the relay's token is missing, used, expired or not this one; nothing "
+                                  "ended. Run pa-restart --end-terminal --on <machine> again")
         if confirmed != terminal or want != addresses:
             return end_result(args, "refused", 1, terminal, addresses, why="changed",
                               err="refused: it changed since you answered (you confirmed terminal {} and workers {}; "
@@ -3012,12 +3077,16 @@ def end_terminal(args):
     deadline = time.time() + END_WAIT
     while as_dict(hc_get(terminal)).get("state") == "live" and time.time() < deadline:
         time.sleep(END_POLL)
-    if as_dict(hc_get(terminal)).get("state") == "live":
+    state = as_text(as_dict(hc_get(terminal)).get("state"))
+    # a failed hc kill counts as ended only when hc says the terminal finished; no answer is not an end (round 2, M1)
+    if (state != "finished") if error else (state == "live"):
+        seen = "it is still live" if state == "live" else "hc says its state is {}".format(state or "unknown")
         with open(os.path.join(directory, "session.log"), "a") as log:
             log.write("{} end-terminal not-ended terminal={}\n".format(now(), terminal))
         return end_result(args, "not-ended", 1, terminal, addresses, why=error or "still live",
-                          err="hc kill did not end terminal {} ({}); nothing new was started. Its tab may still run: run "
-                              "pa-restart --end-terminal again, or close it by hand.".format(terminal, error or "it is still live"))
+                          err="hc kill did not end terminal {} ({}{}); nothing new was started. Its tab may still run: "
+                              "run pa-restart --end-terminal again, or close it by hand.".format(
+                                  terminal, error + "; " if error else "", seen))
     print("Terminal {} ended{}.".format(terminal, " (hc kill said: {})".format(error) if error else ""), flush=True)
     deadline = time.time() + KEEPER_WAIT
     while True:
@@ -3056,7 +3125,7 @@ def end_terminal_on(args):
         script = '"$HOME/.config/herdr-pa/tools/pa.py" restart ' + " ".join(shlex.quote(a) for a in flags)
         return ["hc", "exec", "--on", args.on, "--timeout", str(timeout), "--", "sh", "-c", script]
 
-    code, out = relay_output(remote(base + ["--dry-run", "--json"], 60))
+    code, out = relay_output(remote(base + ["--dry-run", "--json", "--relay-issue"], 60))
     if code == 127:
         print("pa-restart is not installed on {}: run pa-sync --on {} first".format(args.on, args.on), file=sys.stderr)
         sys.exit(127)
@@ -3074,6 +3143,11 @@ def end_terminal_on(args):
         sys.exit(code or 1)
     terminal = as_text(data.get("terminal"))
     workers = sorted(w for w in data.get("workers") or [] if isinstance(w, str))
+    token = as_text(data.get("token"))
+    if not token:
+        print("pa-restart on {} gave no relay token (an older pa-restart there? run pa-sync --on {}); nothing "
+              "ended.".format(args.on, args.on), file=sys.stderr)
+        sys.exit(1)
     if workers and not getattr(args, "anyway", False):
         print("refused: {} worker(s) running on {} (listed above). Run it again when they are done, or add --anyway to "
               "end them too.".format(len(workers), args.on), file=sys.stderr)
@@ -3085,7 +3159,8 @@ def end_terminal_on(args):
     if (answer or "").strip().lower() != "yes":
         print("Not ended.")
         sys.exit(1)
-    flags = base + ["--confirmed-terminal", terminal, "--confirmed-workers", ",".join(workers) or "-"]
+    flags = base + ["--confirmed-terminal", terminal, "--confirmed-workers", ",".join(workers) or "-",
+                    "--relay-token", token]
     code = relay(remote(flags + (["--json"] if args.json else []), 120))
     if code:
         sys.exit(code)
@@ -3388,7 +3463,7 @@ def archive_cards(directory, args):
     cannot be read, a file that is not a card, the cards of a task in the ledger that is not done or parked, and a name
     already in the archive (never overwritten). Nothing is deleted. --dry-run lists and moves nothing (an agent may
     run it). Each moved card is read again in the archive: one a writer reopened meanwhile goes back."""
-    if not args.dry_run and any(os.environ.get(k) for k in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CODEX_SANDBOX")):
+    if not args.dry_run and in_agent():
         raise Problem("pa-task archive is the person's command; an agent asks them instead (pa-task archive --dry-run shows what would move)")
     if args.task:
         raise Problem("pa-task archive takes no task id")
@@ -3464,7 +3539,7 @@ def cmd_task(args):
         for name in sorted(os.listdir(trash)) if os.path.isdir(trash) else []:
             print("trash\t{}\t{}".format(name, human(folder_size(os.path.join(trash, name)))))
         return
-    if args.action in ("delete", "purge") and any(os.environ.get(k) for k in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CODEX_SANDBOX")):
+    if args.action in ("delete", "purge") and in_agent():
         raise Problem("pa-task {} is the person's command; an agent asks them instead".format(args.action))
     if args.action == "archive":
         return archive_cards(directory, args)
@@ -3873,6 +3948,8 @@ def main():
         parser.add_argument("--anyway", action="store_true", help="with --end-terminal: also while workers run (they end)")
         parser.add_argument("--confirmed-terminal", help=argparse.SUPPRESS)  # the --on relay's bound answer (J3.5)
         parser.add_argument("--confirmed-workers", help=argparse.SUPPRESS)
+        parser.add_argument("--relay-issue", action="store_true", help=argparse.SUPPRESS)  # the relay's dry run (round 2)
+        parser.add_argument("--relay-token", help=argparse.SUPPRESS)  # its one-time token, for the bound run
         return cmd_restart(parser.parse_args())
     if kind == "pa-context":
         parser.description = ("set: the Project Agent's context settings (context.json; the person's command, applied at "
