@@ -3609,6 +3609,134 @@ cases["B4-push-result-shapes"] = async () => { // item 4: the four shapes the te
   check(text.includes(C4_DONE) && !text.includes("Checking…"), `then the verdict (got ${text.slice(0, 1500)})`);
 };
 
+// ---- t-028 group C: Costs view display (t-027 items 1, 3, 4, 5, 11). Every pa-costs call is the stand-in (costsTool). ----
+const dayKey = (ms) => isoAt(ms).slice(0, 10);
+cases["C1-day-activities"] = async () => { // item 1: the day drill's activities carry the unpriced mark; a wholly unpriced one is listed
+  const day = dayKey(T0);
+  const s = costsSummary({ byDay: [{ key: day, tokens: 1077, money: 7, unpricedTokens: 127, calls: 7, byActivity: { build: 3, "cache-rebuild": 4 },
+    activities: [{ key: "cache-rebuild", tokens: 400, money: 4 }, { key: "build", tokens: 600, money: 3, unpricedTokens: 50 }, { key: "review", tokens: 77, money: null }] }] });
+  const { v } = await costsWorld({ summary: s });
+  await click(v, "costs-day-0");
+  const text = costsView(v).text, drill = text.split("By day")[1] ?? "";
+  check(/build · 600 tokens · [^|]*3\.00[^|]* est\. \+ unpriced · partly no price/.test(drill), `a partly unpriced activity is marked (got ${drill.slice(0, 1200)})`);
+  check(/review · 77 tokens · — est\. · no price/.test(drill), `a wholly unpriced activity is listed (got ${drill.slice(0, 1200)})`);
+  check(/cache rebuild after idle · 400 tokens · [^|]*4\.00[^|]* est\. \|/.test(`${drill} |`) , `a priced one has no mark (got ${drill.slice(0, 1200)})`);
+  check(!/(^|[^\d.])0\.00\b/.test(drill), `no zero (got ${drill.slice(0, 1200)})`);
+  check(moneyLabelled(v).length === 0, `labelled (${JSON.stringify(moneyLabelled(v))})`);
+};
+cases["C3-turnoff-race"] = async () => { // item 3: a compare from before Turn off that ends after the one after it never shows the query on again
+  const h = hold(); let n = 0, off = false;
+  const { v } = await costsWorld({ tool: {
+    "billed compare": () => { n++; if (off) return json0(noRows()); if (n === 2) return h.p.then(() => json0(noRows(statusOn()))); return json0(noRows(statusOn())); },
+    "billed disable": () => { off = true; return { code: 0, stdout: "off", stderr: "" }; } } });
+  check(costsView(v).text.includes("Billing query: on"), `on at first (got ${costsView(v).text.slice(-400)})`);
+  advance(61000); v.reload(cx); await settle(); // a later read: its compare (the 2nd) is held
+  check(n === 2, `the 2nd compare is in flight (got ${n})`);
+  await click(v, "costs-billing-off"); await settle();
+  check(costsView(v).text.includes("The billing query is off"), `off after Turn off (got ${costsView(v).text.slice(-400)})`);
+  h.release(); await settle(); await settle();
+  const text = costsView(v).text;
+  check(text.includes("The billing query is off") && !text.includes("Billing query: on"), `the older compare does not bring "on" back (got ${text.slice(-400)})`);
+};
+cases["C4-billed-due-on-show"] = async () => { // item 4 (RL-R5): a read that ends while hidden: shown again, the billed compare starts at once
+  g.__layout = panelLayout("project-agent");
+  const { v } = await costsWorld({ machine: M, open: false });
+  g.__remoteDelay = 3000;
+  await click(v, "view-costs"); await settle();
+  await leaveCosts(v, "hide");
+  for (let s = 1; s <= 4; s++) { advance(1000); await settle(); }
+  await settle();
+  g.__remoteDelay = 0;
+  check(costsExecs("billed compare").length === 0, "no compare while hidden");
+  await backToCosts(v, "hide"); await settle();
+  check(costsExecs("billed compare").length === 1, `shown again: the compare at once (got ${costsExecs("billed compare").length})`);
+};
+cases["C4-stale-read-on-show"] = async () => { // item 4 (RL-R6): hidden and shown again before a reload saw it hidden: the stale read starts at once
+  g.__layout = panelLayout("project-agent");
+  const h = hold();
+  const { v } = await costsWorld({ tool: { collect: () => h.p.then(() => ({ code: 0, stdout: "", stderr: "" })) } });
+  await click(v, "costs-refresh"); await settle();
+  await leaveCosts(v, "hide"); // no reload while hidden
+  h.release(); await settle(); await settle();
+  const n = costsReads().length;
+  check(v.costs.peek(S)?.stale === true, "the run ended while hidden: stale");
+  g.__layout = panelLayout("project-agent"); advance(1000); await fire(1000); await settle();
+  check(costsReads().length === n + 1, `shown again: read at the next 1 s tick (reads ${n} -> ${costsReads().length})`);
+};
+cases["C4-refresh-during-read"] = async () => { // item 4 (RL-R6, RL-V5 N5): a Refresh that ends while a read is in flight: the reread starts when that read ends
+  const { v } = await costsWorld({ machine: M });
+  advance(11000); g.__remoteDelay = 3000;
+  await click(v, "costs-refresh"); await settle(); // the collect: ends in 3 s
+  advance(1000); v.reload(cx); await settle(); // a read: in flight when the collect ends, ends 1 s after it
+  const n = costsReads().length;
+  for (let s = 1; s <= 5; s++) { advance(1000); await settle(); } // no reload, no tick
+  check(costsReads().length === n + 1, `one reread when the in-flight read ends, without a 10 s reload (reads ${n} -> ${costsReads().length})`);
+  g.__remoteDelay = 0;
+};
+cases["C4-turnoff-hidden"] = async () => { // item 4 (RL-V4): Turn off ends while hidden: shown again, the status compare at once
+  g.__layout = panelLayout("project-agent");
+  const h = hold(); let off = false;
+  const { v } = await costsWorld({ tool: { "billed compare": () => json0(off ? noRows() : noRows(statusOn())), "billed disable": () => h.p.then(() => { off = true; return { code: 0, stdout: "off", stderr: "" }; }) } });
+  await click(v, "costs-billing-off"); await settle();
+  await leaveCosts(v, "hide");
+  h.release(); await settle(); await settle();
+  const n = costsExecs("billed compare").length;
+  await backToCosts(v, "hide"); await settle();
+  check(costsExecs("billed compare").length === n + 1 && costsView(v).text.includes("The billing query is off"), `shown again: the status compare at once (compares ${n} -> ${costsExecs("billed compare").length}; ${costsView(v).text.slice(-300)})`);
+};
+cases["C5-unreachable-not-missing"] = async () => { // item 5: an unreachable or unknown machine is not "not installed"
+  const { v } = await costsWorld({ machine: M, tool: { collect: () => { throw new Error(`machine ${M} not found`); } } });
+  await click(v, "costs-refresh"); await settle();
+  let text = costsView(v).text;
+  check(text.includes(`Refresh failed: machine ${M} not found`) && !text.includes("not installed"), `the machine's error, not the install hint (got ${text.slice(0, 1200)})`);
+  timerWorld({ machine: M, tool: { collect: () => { throw new Error(`machine ${M} not found`); } } });
+  const { tick } = await timerMod();
+  await tickAt(tick, T0);
+  const rec = (g.__shared["project-agent.costs"] ?? {})[RS];
+  check(rec && rec.ok === false && rec.missing !== true && rec.error === `machine ${M} not found`, `the timer's record (got ${JSON.stringify(g.__shared["project-agent.costs"])})`);
+  // Still "not installed" when the tool is what is missing.
+  const { v: w } = await costsWorld({ machine: M, tool: { collect: () => { throw new Error("spawn pa-costs ENOENT"); } } });
+  await click(w, "costs-refresh"); await settle();
+  text = costsView(w).text;
+  check(text.includes(`Refresh failed: pa-costs is not installed on ${M}`), `the install hint (got ${text.slice(0, 1200)})`);
+};
+cases["C6-tile-ranges"] = async () => { // item 11 (RL-V2): Today is this local day's hours only; Last 7 days is today and the 6 UTC days before
+  const utc = new Date(T0), d = (back) => new Date(Date.UTC(utc.getUTCFullYear(), utc.getUTCMonth(), utc.getUTCDate() - back)).toISOString().slice(0, 10);
+  const s = costsSummary({
+    hours: [[isoAt(T0 - 30 * 3600000).slice(0, 13), { tokens: 1000, money: 50 }], [isoAt(T0).slice(0, 13), { tokens: 100, money: 1.25 }]],
+    byDay: [{ key: d(0), tokens: 100, money: 12.5, calls: 1, byActivity: {} }, { key: d(6), tokens: 10, money: 2, calls: 1, byActivity: {} }, { key: d(7), tokens: 10, money: 100, calls: 1, byActivity: {} }] });
+  const { v } = await costsWorld({ summary: s });
+  const text = costsView(v).text;
+  check(/Today \| [^|]*1\.25[^|]* est\. \| 100 tokens/.test(text), `Today: this local day's hour only (got ${text.slice(0, 1500)})`);
+  check(/Last 7 days \(UTC\) \| [^|]*14\.50[^|]* est\. \| 110 tokens/.test(text), `Last 7 days: today and 6 days back, not 7 (got ${text.slice(0, 1500)})`);
+};
+cases["C6-chain-left-no-partial"] = async () => { // item 11 (RL-V3-1): a chain stopped because the view was left commits no partial comparison
+  g.__layout = panelLayout("project-agent");
+  const h = hold(); let first = true;
+  const { v } = await costsWorld({ machine: M, open: false, tool: {
+    "billed compare": (args) => { if (args.includes("--here-json")) return json0(withRows()); if (first) { first = false; return h.p.then(() => json0({ ...noRows(statusOn()), rows: 4 })); } return json0({ ...noRows(statusOn()), rows: 4 }); } } });
+  await click(v, "view-costs"); await settle();
+  const before = JSON.stringify(v.costs.peek(RS).billing.data);
+  await leaveCosts(v, "tasks");
+  h.release(); await settle(); await settle();
+  check(JSON.stringify(v.costs.peek(RS).billing.data) === before, `no partial result kept (got ${JSON.stringify(v.costs.peek(RS).billing.data)})`);
+  check(!/Billed \(account-wide/.test(costsView(v).text), "nothing drawn from it");
+};
+cases["C6-left-keeps-copy"] = async () => { // item 11 (RL-V3-2): summary gone, read in flight when the view is left: the kept copy stays
+  g.__layout = panelLayout("project-agent");
+  const { v, file } = await costsWorld({ machine: M });
+  check(v.costs.peek(RS)?.summary?.totals, "a summary read");
+  delete g.__files[file];
+  advance(11000); g.__remoteDelay = 3000;
+  v.reload(cx); await settle(); // the read of the now missing file is in flight
+  await leaveCosts(v, "tasks");
+  for (let s = 1; s <= 4; s++) { advance(1000); await settle(); }
+  g.__remoteDelay = 0; await settle();
+  const st = v.costs.peek(RS);
+  check(st.summary?.totals?.money === 12.5 && st.missing === null && st.stale === true, `the kept copy stays, marked stale (got ${JSON.stringify({ money: st.summary?.totals?.money, missing: st.missing, stale: st.stale })})`);
+  check(costsLs().length === 0, "no ls while left");
+};
+
 // Which cases run (t-031): every case, or the named ones; --shard=<k>/<n> keeps every n-th case by definition
 // order (index mod n == k - 1), so n shards together run each case once, and a case added later lands in one.
 // --list prints the names that would run and runs none. An unknown name or option exits 2.

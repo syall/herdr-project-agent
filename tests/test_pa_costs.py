@@ -3716,6 +3716,40 @@ class CC_Limits(CCBase):
         self.assertTrue(any("skipped" in p for p in problems), problems)
 
 
+class T28_DayActivities(Collecting):
+    """t-028 C1 (t-009 REVIEW-PANEL RL-R1): byDay[].activities lists each activity of the day with its tokens, money
+    and unpricedTokens (a partly unpriced one is marked, a wholly unpriced one is listed); byActivity stays as it was."""
+    mixed_space = F4_Partial.mixed_space
+
+    def test_c1_partly_unpriced_activity_is_marked(self):
+        s = self.mixed_space()
+        day = s["byDay"][0]
+        acts = {a["key"]: a for a in day["activities"]}
+        self.assertIsNotNone(acts["build"]["money"])
+        self.assertEqual(acts["build"]["unpricedTokens"], 3000000)
+        self.assertEqual(sum(a["tokens"] for a in day["activities"]), day["tokens"])
+        for a in day["activities"]:
+            self.assertEqual(sorted(k for k in a if k in ("key", "tokens", "money")), ["key", "money", "tokens"])
+        self.assertIsInstance(day["byActivity"]["build"], float)  # the old field: priced money only, as before
+
+    def test_c1_wholly_unpriced_activity_is_listed(self):
+        self.prices()
+        self.ledger({"version": 1, "tasks": [{"id": "t-001", "state": "in-progress",
+                                              "workers": [{"address": "t5", "role": "build", "name": "t-001-build"}]}]})
+        self.record(session=SID, task="t-001", name="t-001-build", terminal="t5")
+        self.add(self.prompt(T0 + 1), self.call(T0 + 2, "m1", lines=1, out=300, model="model-c"))
+        self.collect(T0 + 2000)
+        s = load(self.costs("summary.json"))
+        day = s["byDay"][0]
+        acts = {a["key"]: a for a in day["activities"]}
+        self.assertTrue(acts, day)
+        for a in acts.values():
+            self.assertIsNone(a["money"], a)
+            self.assertGreater(a["tokens"], 0, a)
+        self.assertEqual(sum(a["tokens"] for a in acts.values()), day["tokens"])
+        self.assertEqual(day["byActivity"], {})  # the old field leaves it out (no price)
+
+
 class ZZ_V1_Privacy(unittest.TestCase):
     """Run last: the canary of every fixture reached no file under costs/ or billing/ and no captured output."""
 
