@@ -1552,10 +1552,18 @@ class Describe(Base):
         kind = self.profile_kind()
         repos = [self.feature_repo(os.path.join(kind, "src", "r{:02d}".format(i)), commits=0) for i in range(25)]
         self.profile_kind(repos=repos)
-        card = self.open_card(worktree=kind)
+        # This tests the count cap alone. Describing 20 repositories takes ~41 s at load 18 (16 git calls
+        # each), so the 60 s whole-description deadline would cut it short on a busier machine; d15 tests
+        # that deadline.
+        saved, pa_hooks.DESCRIBE_DEADLINE = pa_hooks.DESCRIBE_DEADLINE, 3600
+        try:
+            card = self.open_card(worktree=kind)
+        finally:
+            pa_hooks.DESCRIBE_DEADLINE = saved
         self.assertLessEqual(len(card["changes"]["repos"]), 6)
         self.assertTrue(card["changes"]["truncated"])
         md = self.md()
+        self.assertNotIn("time limit", md)
         self.assertEqual(md.count("\n## r"), 20)
         self.assertIn("Not described (more than 20 repositories): r20, r21, r22, r23, r24", md)
         self.assertIn("Unchanged: ", card["context"])
