@@ -3235,5 +3235,218 @@ class WorkerDeleteCounts(Base):
         self.assertEqual(pa.task_worktrees(led["tasks"][0]), [])
 
 
+
+class CloseWhenIdle(Base):
+    """t-042: pa-worker close <t> --evidence F --when-idle closes now, or leaves one background waiter that closes the
+    worker once it is idle, under the same guards, and journals the result with no message to the Project Agent."""
+
+    def setUp(self):
+        super().setUp()
+        self.proj = self.repo()
+        self.wt = self.worktree(self.proj, "t-003-x")
+        self.add_task("t-003", "in-progress", self.wt, [{"address": "t31", "role": "build", "name": "t-003-tests"}])
+        self.term("t31", "t-003-tests")
+        self.evidence("t-003")
+        pa_hooks.by_an_agent = lambda: True
+        self.spawned = []
+        self.saved_idle = {k: getattr(pa_hooks, k) for k in ("spawn_idle_closer", "WHEN_IDLE_POLL", "WHEN_IDLE_LIMIT")}
+        pa_hooks.spawn_idle_closer = lambda *a, **k: self.spawned.append((a, k))
+        pa_hooks.WHEN_IDLE_POLL = 0.01
+        pa_hooks.WHEN_IDLE_LIMIT = 3
+
+    def tearDown(self):
+        for k, v in self.saved_idle.items():
+            setattr(pa_hooks, k, v)
+        super().tearDown()
+
+    def when_idle(self, *extra):
+        return self.worker("close", "t31", "--evidence", "FINDINGS.md", "--when-idle", *extra)
+
+    def waiter(self):
+        """The background waiter's own run, in-process, against the fake hc."""
+        return self.worker("close", "t31", "--evidence", "FINDINGS.md", "--idle-waiter")
+
+    def flip_after(self, reads, status, then=None):
+        """hc get of t31 reports `working` until it was read `reads` times, then `status` (and runs `then` once)."""
+        real, seen = self.fake_get, []
+        self.terms["t31"]["status"] = "working"
+
+        def get(address):
+            if address == "t31" and address in self.terms:
+                seen.append(address)
+                if len(seen) == reads:
+                    self.terms["t31"]["status"] = status
+                    if then:
+                        then()
+            return real(address)
+        pa.hc_get = get
+        return seen
+
+    def no_send(self):
+        self.assertEqual([c for c in self.calls if c[:2] == ["hc", "send"]], [], "the waiter starts no Project Agent pass")
+
+    def assertNotClosed(self):
+        self.assertEqual(self.ended(), [])
+        self.assertFalse(self.entry("t-003", "t31").get("finished"))
+
+    # R1
+    def test_i1_an_idle_worker_is_closed_at_once(self):
+        code, out, err = self.when_idle()
+        self.assertEqual(code, 0, err)
+        self.assertIn("Closed worker t31 (t-003-tests, task t-003)", out)
+        self.assertEqual(self.ended(), [["hc", "kill", "t31"], ["hc", "rm", "t31"]])
+        self.assertEqual(self.spawned, [])
+        self.assertEqual(self.journal()[0]["trigger"], "close")
+
+    # R2
+    def test_i2_a_working_worker_leaves_one_waiter_and_closes_nothing_now(self):
+        self.terms["t31"]["status"] = "working"
+        before = self.snapshot()
+        code, out, err = self.when_idle()
+        self.assertEqual(code, 0, err)
+        self.assertIn("t31 (t-003-tests) is working; it will be closed once it is idle", out)
+        self.assertEqual(len(self.spawned), 1)
+        self.assertEqual(self.spawned[0][0][1:], ("sp1", "t31", "FINDINGS.md"))
+        self.assertEqual(self.snapshot(), before)
+        self.assertNotClosed()
+        self.no_send()
+
+    # R3
+    def test_i3_other_refusals_are_given_at_once(self):
+        led = self.ledger()
+        led["tasks"][0]["workers"][0].update(keep=True, keptAt="2026-11-16T10:00:00Z", keepQuote="leave it")
+        self.ledger(led)
+        self.terms["t31"]["status"] = "working"
+        self.assertRefused(self.when_idle(), "is marked keep")
+        led["tasks"][0]["workers"][0]["keep"] = False
+        self.ledger(led)
+        self.assertRefused(self.worker("close", "t31", "--evidence", "NOPE.md", "--when-idle"), "evidence NOPE.md is missing")
+        self.terms["t31"]["status"] = "blocked"
+        self.assertRefused(self.when_idle(), "is blocked on a question or a permission")
+        self.assertEqual(self.spawned, [])
+
+    def test_i3b_evidence_older_than_the_worker_is_refused_at_once(self):
+        led = self.ledger()
+        led["tasks"][0]["workers"][0]["started"] = "2099-01-01T00:00:00Z"
+        self.ledger(led)
+        self.terms["t31"]["status"] = "working"
+        self.assertRefused(self.when_idle(), "was last written before t31 started")
+        self.assertEqual(self.spawned, [])
+
+    def test_i3c_usage(self):
+        for argv in (("close", "--leftovers", "--when-idle"), ("close", "--card", "d-leftovers", "--when-idle"),
+                     ("close", "t31", "--when-idle")):
+            code, _, err = self.worker(*argv)
+            self.assertEqual(code, 2, argv)
+        self.assertEqual(self.spawned, [])
+        self.assertEqual(self.ended(), [])
+
+    # R2, R4: the waiter
+    def test_i4_waiter_closes_once_idle_and_journals_it(self):
+        seen = self.flip_after(4, "idle")
+        code, _, err = self.waiter()
+        self.assertEqual(code, 0, err)
+        self.assertGreaterEqual(len(seen), 4)
+        self.assertEqual(self.ended(), [["hc", "kill", "t31"], ["hc", "rm", "t31"]])
+        w = self.entry("t-003", "t31")
+        self.assertEqual((w["finished"], w["closedBy"], w["report"]), (True, "agent", "FINDINGS.md"))
+        lines = self.journal()
+        self.assertEqual(len(lines), 1)
+        self.assertEqual((lines[0]["trigger"], lines[0]["task"]), ("close-when-idle", "t-003"))
+        self.assertIn("closed worker t31 (t-003-tests) after reading its report FINDINGS.md", lines[0]["why"])
+        self.no_send()
+
+    def test_i5_waiter_never_closes_a_blocked_worker(self):
+        self.flip_after(3, "blocked")
+        code, _, err = self.waiter()
+        self.assertEqual(code, 0, err)
+        self.assertNotClosed()
+        lines = self.journal()
+        self.assertEqual(len(lines), 1)
+        self.assertEqual((lines[0]["trigger"], lines[0]["task"]), ("close-when-idle", "t-003"))
+        self.assertIn("t31 (t-003-tests) is blocked on a question or a permission", lines[0]["why"])
+        self.assertIn("left for the person; not closed", lines[0]["why"])
+        self.no_send()
+
+    def test_i6_waiter_gives_up_at_its_limit(self):
+        self.terms["t31"]["status"] = "working"
+        pa_hooks.WHEN_IDLE_LIMIT = 0.2
+        start = time.monotonic()
+        code, _, err = self.waiter()
+        self.assertEqual(code, 0, err)
+        self.assertLess(time.monotonic() - start, 10)
+        self.assertNotClosed()
+        lines = self.journal()
+        self.assertEqual(len(lines), 1)
+        self.assertIn("still working after", lines[0]["why"])
+        self.assertIn("not closed", lines[0]["why"])
+        self.no_send()
+
+    def test_i7_waiter_rechecks_uncommitted_files_at_the_close(self):
+        write(os.path.join(self.wt, "half.txt"), "x\n")
+        self.flip_after(3, "idle")
+        code, _, err = self.waiter()
+        self.assertEqual(code, 0, err)
+        self.assertNotClosed()
+        lines = self.journal()
+        self.assertEqual(len(lines), 1)
+        self.assertIn("has 1 uncommitted file(s) (half.txt)", lines[0]["why"])
+        self.assertIn("not closed", lines[0]["why"])
+
+    def test_i7b_work_committed_while_it_waited_does_not_stop_the_close(self):
+        write(os.path.join(self.wt, "half.txt"), "x\n")
+        self.flip_after(3, "idle", then=lambda: (sh(self.wt, "git", "add", "half.txt"), sh(self.wt, "git", "commit", "-q", "-m", "w")))
+        self.assertEqual(self.when_idle_spawn_then_wait(), 0)
+        self.assertTrue(self.entry("t-003", "t31")["finished"])
+
+    def when_idle_spawn_then_wait(self):
+        code, out, err = self.when_idle()  # working, with uncommitted files: not refused, a waiter is left
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(self.spawned), 1, out)
+        return self.waiter()[0]
+
+    def test_i8_one_waiter_per_worker(self):
+        import fcntl
+        self.terms["t31"]["status"] = "idle"
+        with open(os.path.join(self.dir, ".close-when-idle-t31.lock"), "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            code, _, err = self.waiter()
+        self.assertEqual(code, 0, err)
+        self.assertNotClosed()
+        self.assertEqual(self.journal(), [])
+
+    def test_i9_waiter_journals_a_worker_that_was_kept_meanwhile(self):
+        def keep():
+            led = self.ledger()
+            led["tasks"][0]["workers"][0].update(keep=True, keptAt="2026-11-18T10:00:00Z", keepQuote="stay")
+            self.ledger(led)
+        self.flip_after(2, "idle", then=keep)
+        self.assertEqual(self.waiter()[0], 0)
+        self.assertNotClosed()
+        self.assertIn("is marked keep", self.journal()[0]["why"])
+
+    def test_i10_spawn_is_detached_and_silent(self):
+        got = []
+
+        class FakePopen(object):
+            def __init__(self, argv, **kw):
+                got.append((argv, kw))
+        fake = type("S", (), {"Popen": FakePopen, "DEVNULL": subprocess.DEVNULL})
+        saved_sub, saved_argv = pa_hooks.subprocess, sys.argv
+        pa_hooks.subprocess, sys.argv = fake, ["/opt/bin/pa-worker"]
+        try:
+            self.saved_idle["spawn_idle_closer"](self.dir, "sp1", "t31", "FINDINGS.md")
+        finally:
+            pa_hooks.subprocess, sys.argv = saved_sub, saved_argv
+        self.assertEqual(len(got), 1)
+        argv, kw = got[0]
+        self.assertEqual(argv, [sys.executable, "/opt/bin/pa-worker", "close", "t31", "--evidence", "FINDINGS.md",
+                                "--space", "sp1", "--idle-waiter"])
+        self.assertTrue(kw.get("start_new_session"))
+        for k in ("stdin", "stdout", "stderr"):
+            self.assertEqual(kw.get(k), subprocess.DEVNULL, k)
+        self.assertEqual(kw.get("cwd"), self.dir)
+
+
 if __name__ == "__main__":
     unittest.main()

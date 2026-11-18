@@ -44,7 +44,7 @@ class Orchestrator(unittest.TestCase):
         self.assertIn("a fix round after a review or a verification is a new worker", self.text)
 
     def test_r2_close_after_the_report(self):  # AC2.4
-        self.assertIn("run `pa-worker close <t> --evidence <file>`", self.text)
+        self.assertIn("run `pa-worker close <t> --evidence <file>", self.text)  # t-042: now with --when-idle
         self.assertIn("Never end a worker with `hc kill` or `hc rm` yourself", self.text)
         self.assertIn("When the person asks you to close a worker, use `pa-worker close` too", self.text)
         self.assertIn("Committed work that is not pushed or merged does not stop a close", self.text)
@@ -53,6 +53,19 @@ class Orchestrator(unittest.TestCase):
         self.assertIn("A worker that has reported, but whose report you have not read yet, does not count; close it once read.", self.text)
         self.assertNotIn("A worker whose report you have not read yet does not count", self.text)
         self.assertNotIn("A worker that has finished and sits idle does not count", self.text)
+
+    def test_t042_close_when_idle(self):  # t-042 R6: closing costs no extra pass
+        workers = flat(self.raw[self.raw.index("- Close each worker once its job is over"):self.raw.index("- When the person says to keep a worker open")])
+        self.assertIn("run `pa-worker close <t> --evidence <file> --when-idle` (the file in its task's evidence folder that holds "
+                      "its report: a file that worker wrote after it started).", workers)
+        self.assertIn("The command refuses a worker that is blocked, is not recorded in this space, has no evidence, has uncommitted "
+                      "files in its worktree, or that the person marked to keep; it then closes nothing", workers)
+        self.assertIn("A worker still finishing its turn is not refused: `--when-idle` closes it by itself once it is idle "
+                      "(within 10 minutes), under the same checks, and journals the result without a message to you; do not "
+                      "start a pass only to close it.", workers)
+        self.assertIn("A `close-when-idle` journal line saying it was not closed is for your next pass.", workers)
+        self.assertNotIn("refuses a worker that is working or blocked", workers)
+        self.assertIn("Committed work that is not pushed or merged does not stop a close", workers)
 
     def test_r2_closed_workers_are_not_stopped_ones(self):  # spec 2.1 b
         self.assertIn("A worker in the ledger that no longer runs and is not `finished` has stopped", self.text)
