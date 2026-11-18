@@ -227,7 +227,13 @@ ships none, so without one the figures are tokens only).
   this terminal's local days (`--since`/`--until` too), or UTC days with `--utc`;
   `--by provider|endpoint|region|account|scope` groups by what each cost was priced under (`--by scope`
   also says which price scope priced it). `pa-costs report --account-wide [--account LABEL]` prints the
-  estimates of that account label (default: this machine's) from every space on the machine.
+  estimates of that account label (default: this machine's) from every space on the machine. Under
+  Today it prints the Project Agent's context
+  (`PA context  mean 158k  peak 254k  resets 6 (fresh 6, compact 0)`: prompt tokens per call of its
+  own conversation, its subagents left out, and its fresh starts and compactions that day);
+  `pa-costs report --by context` prints it per UTC day with calls, mean, peak, resets, the first
+  call of fresh sessions, est. and est. per pass. A peak marked `≥` is a lower bound (rows recorded
+  before per-call peaks were kept).
 - `pa-costs reconstruct [--dry-run]` finds the space's sessions from before launch records existed,
   best effort, marked `reconstructed` (◌ in the view). The view's `Reconstruct from session files` runs it.
 - `pa-costs prices` shows the table in use, each price scope as a heading, each row's `source`, and the

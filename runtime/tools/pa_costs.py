@@ -496,7 +496,8 @@ CODEX_MARKS = (b"token_count", b"session_meta", b"turn_context")
 
 def new_segment(ts, turn, model):
     return {"from": ts, "to": ts, "day": ts[:10], "calls": 0, "tokens": zero(), "long": zero(),
-            "rebuild": {"calls": 0, "cw5m": 0, "cw1h": 0, "gapS": 0}, "model": model, "turn": turn}
+            "rebuild": {"calls": 0, "cw5m": 0, "cw1h": 0, "gapS": 0}, "model": model, "turn": turn,
+            "peak": 0, "first": None}  # t-041 R15: the largest single-call prompt, and the first call's prompt
 
 
 class Reader:
@@ -568,7 +569,12 @@ class Reader:
                 seg["pre"] = True
         for k in KINDS:
             seg["tokens"][k] += tokens[k]
-        if tokens["in"] + tokens["cw5m"] + tokens["cw1h"] + tokens["cr"] > LONG:
+        prompt = tokens["in"] + tokens["cw5m"] + tokens["cw1h"] + tokens["cr"]
+        if "peak" in seg:  # an open segment from before t-041 (state.json) has neither field: its row stays an old row
+            seg["peak"] = max(seg["peak"], prompt)
+            if not seg["calls"]:
+                seg["first"] = prompt
+        if prompt > LONG:
             for k in KINDS:
                 seg["long"][k] += tokens[k]
         if last is not None:
@@ -754,7 +760,8 @@ def make_row(sess, seg):
             "match": "resumed-history" if pre else (sess.get("match") or "launch-record"),
             "confidence": sess.get("confidence") or "high", "until": seg.get("until"),
             **({"sub": sess["sub"]} if sess.get("sub") else {}),
-            **{k: start[k] for k in FACT_KEYS if k in start}}  # the launch record's facts (t-032), when it has them
+            **{k: start[k] for k in FACT_KEYS if k in start},  # the launch record's facts (t-032), when it has them
+            **({"peak": seg["peak"], "first": seg["first"]} if "peak" in seg else {})}
 
 
 PA_TRIGGERS = ("report", "message", "decision", "scheduled", "manual", "conversation")
@@ -2151,9 +2158,98 @@ def summarize(directory, rows, records, table, price_problem, profile_name, now,
                            **({"unpricedTokens": p["unpricedTokens"]} if p["money"] is not None and p["unpricedTokens"] else {})}
                           for p in passes.values()), key=lambda p: -(p["money"] or 0))[:PASSES],
         "sessions": sess_list[:SESSIONS],
+        "paContext": pa_context(rows, records, sessions, table, since, until),
         "unmatched": {"sessions": um[-1].get("sessions", 0), "tokens": um[-1].get("tokens", 0)} if um else {"sessions": 0, "tokens": 0},
         "problems": problems[:20],
     }
+
+
+def context_day(stamp):
+    """The day a row or record of paContext counts on: its UTC day (YYYY-MM-DD of an ISO time). The one place
+    paContext buckets by day (t-036 moves the day tables to local time and picks this up)."""
+    return stamp[:10] if isinstance(stamp, str) and parse_ts(stamp) is not None else None
+
+
+def pa_context(rows, records, sessions, table, since=None, until=None):
+    """t-041 R15: the Project Agent's context per UTC day, newest first, at most DAYS days. Rows of kind pa (not its
+    subagents' `sub` rows) with calls; reset and compact records of sessions.jsonl (R16: J3 and J4 write them)."""
+    days = {}
+
+    def entry(day):
+        e = days.get(day)
+        if e is None:
+            e = days[day] = {"day": day, "calls": 0, "prompt": 0, "peak": 0, "peakExact": True, "fresh": 0, "compact": 0,
+                             "reasons": {}, "money": None, "passes": set()}
+        return e
+
+    def inside(day):
+        return day is not None and (not since or day >= since) and (not until or day <= until)
+
+    fresh = {r.get("to") for r in records if r.get("ev") == "reset" and isinstance(r.get("to"), str)}
+    fresh.update(r.get("session") for r in records if r.get("ev") == "start" and r.get("kind") == "pa"
+                 and r.get("resumed") is False and isinstance(r.get("session"), str))
+    earliest = {}  # fresh session -> its earliest row
+    for r in rows:
+        calls = num(r.get("calls"))
+        if r.get("kind") != "pa" or r.get("sub") or calls <= 0:
+            continue
+        day = r.get("day") or context_day(r.get("from"))
+        if not inside(day):
+            continue
+        t = r["tokens"]
+        prompt = num(t.get("in")) + num(t.get("cw5m")) + num(t.get("cw1h")) + num(t.get("cr"))
+        e = entry(day)
+        e["calls"] += calls
+        e["prompt"] += prompt
+        if isinstance(r.get("peak"), (int, float)) and not isinstance(r.get("peak"), bool):
+            e["peak"] = max(e["peak"], r["peak"])
+        else:  # a row from before t-041: its mean is a lower bound of its peak
+            e["peak"] = max(e["peak"], prompt / calls)
+            e["peakExact"] = False
+        m = row_money(r, table)
+        if m is not None:
+            e["money"] = (e["money"] or 0.0) + m
+        if r.get("pass") is not None:
+            e["passes"].add(r["pass"])
+        sid = r.get("session")
+        if sid in fresh and (sid not in earliest or (r.get("from") or "") < (earliest[sid].get("from") or "")):
+            earliest[sid] = r
+    for rec in records:
+        ev = rec.get("ev")
+        if ev not in ("reset", "compact"):
+            continue
+        day = context_day(rec.get("at"))
+        if not inside(day):
+            continue
+        if ev == "compact":
+            known = sessions.get(rec.get("session")) or {}
+            if known.get("kind") not in (None, "pa"):
+                continue  # only the Project Agent has the hook; a known other session's record is not its context
+            entry(day)["compact"] += 1
+        else:
+            e = entry(day)
+            e["fresh"] += 1
+            reason = rec.get("reason") if isinstance(rec.get("reason"), str) else "(none)"
+            e["reasons"][reason] = e["reasons"].get(reason, 0) + 1
+    firsts = {}
+    for r in earliest.values():
+        day = r.get("day") or context_day(r.get("from"))
+        if isinstance(r.get("first"), (int, float)) and not isinstance(r.get("first"), bool):
+            firsts.setdefault(day, []).append(r["first"])
+    out = []
+    for day in sorted(days, reverse=True)[:DAYS]:
+        e = days[day]
+        f = firsts.get(day) or []
+        d = {"day": day, "calls": int(round(e["calls"])), "mean": int(round(e["prompt"] / e["calls"])) if e["calls"] else None,
+             "peak": int(round(e["peak"])) if e["calls"] else None, "peakExact": e["peakExact"],
+             "resets": {"fresh": e["fresh"], "compact": e["compact"]},
+             "firstCall": int(round(sum(f) / len(f))) if f else None, "firstCalls": len(f),
+             "money": round(e["money"], 6) if e["money"] is not None else None, "passes": len(e["passes"]),
+             "perPass": round(e["money"] / len(e["passes"]), 6) if e["money"] is not None and e["passes"] else None}
+        if e["reasons"]:
+            d["reasons"] = dict(sorted(e["reasons"].items()))
+        out.append(d)
+    return out
 
 
 FAILED_MARK = ".collect-failed"  # in costs/: the next good collect rewrites summary.json, which clears the entry
@@ -2222,6 +2318,8 @@ def shrink(s):
         s["byTask"] = fold_tasks(s["byTask"], len(s["byTask"]) * 3 // 4)
     elif s["byDayModel"]:
         s["byDayModel"] = s["byDayModel"][:len(s["byDayModel"]) * 3 // 4]
+    elif len(s.get("paContext") or []) > 1:  # the newest days are kept
+        s["paContext"] = s["paContext"][:len(s["paContext"]) // 2]
     else:
         return False
     s["truncated"] = True
@@ -2263,7 +2361,41 @@ def fmt_tokens(n):
 
 
 REPORT_BY = ("activity", "task", "phase", "kind", "role", "program", "model", "machine", "day", "pass", "session",
-             "provider", "endpoint", "region", "account", "scope")
+             "provider", "endpoint", "region", "account", "scope", "context")
+
+
+def fmt_ctx(n):
+    """A context size in whole thousands of tokens ("158k"); "—" when there is none."""
+    return "—" if n is None else "{:.0f}k".format(n / 1000.0)
+
+
+def context_lines(s, by):
+    """t-041 R15: the PA context line under Today (by None), or the --by context table."""
+    pc = s.get("paContext") or []
+
+    def peak(e):
+        return ("" if e.get("peakExact") else "≥") + fmt_ctx(e.get("peak"))
+
+    if by is None:
+        days = [e for e in pc if e["day"] == s["updated"][:10]]
+        if not days or not days[0].get("calls"):
+            e = days[0] if days else None
+            if e and (e["resets"]["fresh"] or e["resets"]["compact"]):
+                return ["PA context  — (no Project Agent calls today)  resets {} (fresh {}, compact {})".format(
+                    e["resets"]["fresh"] + e["resets"]["compact"], e["resets"]["fresh"], e["resets"]["compact"])]
+            return ["PA context  — (no Project Agent calls today)"]
+        e = days[0]
+        return ["PA context  mean {}  peak {}  resets {} (fresh {}, compact {})".format(
+            fmt_ctx(e["mean"]), peak(e), e["resets"]["fresh"] + e["resets"]["compact"], e["resets"]["fresh"], e["resets"]["compact"])]
+    out = ["{:<28} {:>6} {:>8} {:>8} {:>7} {:>11} {:>10} {:>10}".format(
+        "PA context by day (UTC)", "calls", "mean", "peak", "resets", "first call", "est.", "est./pass")]
+    for e in pc:
+        out.append("  {:<26} {:>6} {:>8} {:>8} {:>7} {:>11} {:>10} {:>10}".format(
+            e["day"], e["calls"], fmt_ctx(e["mean"]), peak(e) if e["calls"] else "—", e["resets"]["fresh"] + e["resets"]["compact"],
+            fmt_ctx(e.get("firstCall")), fmt_money(e.get("money")), fmt_money(e.get("perPass"))))
+    if any(e["calls"] and not e.get("peakExact") for e in pc):
+        out.append("  ≥ marks a lower bound: rows recorded before per-call peaks were kept")
+    return out
 
 
 def report_lines(s, by=None):
@@ -2293,6 +2425,7 @@ def report_lines(s, by=None):
         today = days[0]["money"] if days else (0.0 if p.get("source") or p.get("currency") else None)
         out.append("Today     {}{} est. ({})".format(fmt_money(today), "+" if days and days[0].get("unpricedTokens") else "",
                                                      "UTC day" if zone["offsets"] == [[0, 0]] else "local day, " + zone["zone"]))
+        out.extend(context_lines(s, None))
 
     def table(title, entries, label=lambda e: str(e["key"]), with_cc=False, ratio=False):
         total = sum(e["money"] or 0 for e in entries) or 0  # shares are of est. only, never of CC (AC6.4)
@@ -2321,6 +2454,8 @@ def report_lines(s, by=None):
                  ("session", "Sessions", s["sessions"], lambda e: "{} {} {}".format(e["key"], e.get("role") or e.get("kind"), e.get("task") or ""))]
     sections += [(f, "By " + f, s.get("by" + f.capitalize()) or [], None) for f in SCOPE_FIELDS]
     sections += [("scope", "By scope (provider · endpoint · region · account)", s.get("byScope") or [], None)]
+    if by == "context":
+        out.extend(context_lines(s, by))
     for key, title, entries, label in sections:
         if by is None and key in ("phase", "session", "pass", "program", "machine") + SCOPE_FIELDS:
             continue
@@ -3524,7 +3659,8 @@ CC_MAX_FILES = 5000  # costs/cc/ files a summary reads, newest first
 CC_SESSION = re.compile(r"^[0-9A-Za-z-]{8,64}$")
 CC_VERSION = re.compile(r"^[0-9A-Za-z.+-]{1,32}$")
 CC_KEYS = ("v", "session", "cost", "base", "segments", "durationMs", "apiDurationMs", "model", "version", "terminal",
-           "first", "at")
+           "first", "at", "ctx")
+CC_CTX_TOP = 1e8  # ctx (context_window.total_input_tokens, t-041 R15) is a token count below this
 
 
 def cc_number(value, top=None):
@@ -3551,10 +3687,17 @@ def cc_fields(obj, terminal, at):
         return None
     cost = obj.get("cost") if isinstance(obj.get("cost"), dict) else {}
     model = obj.get("model") if isinstance(obj.get("model"), dict) else {}
+    window = obj.get("context_window") if isinstance(obj.get("context_window"), dict) else {}
     return {"session": session, "cost": cc_number(cost.get("total_cost_usd"), 1e6),
             "durationMs": cc_number(cost.get("total_duration_ms")), "apiDurationMs": cc_number(cost.get("total_api_duration_ms")),
             "model": cc_text(model.get("id"), MODEL), "version": cc_text(obj.get("version"), CC_VERSION),
-            "terminal": cc_text(terminal, pa.ID), "at": at}
+            "terminal": cc_text(terminal, pa.ID), "at": at, "ctx": cc_int(window.get("total_input_tokens"), CC_CTX_TOP)}
+
+
+def cc_int(value, top):
+    """An integer token count from cc_number (a whole number >= 0, < top), else None."""
+    value = cc_number(value, top)
+    return int(value) if value is not None and value == int(value) else None
 
 
 def cc_clean(rec, session=None):
@@ -3573,7 +3716,8 @@ def cc_clean(rec, session=None):
            "durationMs": cc_number(rec.get("durationMs")), "apiDurationMs": cc_number(rec.get("apiDurationMs")),
            "model": cc_text(rec.get("model"), MODEL), "version": cc_text(rec.get("version"), CC_VERSION),
            "terminal": cc_text(rec.get("terminal"), pa.ID),
-           "first": first if isinstance(first, str) and parse_ts(first) is not None else at, "at": at}
+           "first": first if isinstance(first, str) and parse_ts(first) is not None else at, "at": at,
+           "ctx": cc_int(rec.get("ctx"), CC_CTX_TOP)}
     held_cost, held_ms = cc_number(rec.get("heldCost"), 1e6), cc_number(rec.get("heldMs"))
     if held_cost is not None and held_ms is not None:  # a drop record_cc holds until it knows it a resume or a restart
         out["heldCost"], out["heldMs"] = held_cost, held_ms
@@ -3655,6 +3799,8 @@ def record_cc(directory, fields, now):
             rec["first"] = old["first"]
             if rec["cost"] is None:  # a reading without a valid cost never takes the figure away; other fields are the latest
                 rec["cost"] = old["cost"]
+            if rec["ctx"] is None:  # nor a reading without a valid ctx the last context size
+                rec["ctx"] = old["ctx"]
             then = parse_ts(old["at"]) or 0
             if (fields["cost"] is not None and old["cost"] is not None and fields["cost"] < old["cost"] - CC_DROP
                     and fields["durationMs"] is not None and old["durationMs"] is not None and fields["durationMs"] < old["durationMs"]):
@@ -3673,7 +3819,8 @@ def record_cc(directory, fields, now):
                 else:
                     rec["heldCost"], rec["heldMs"] = old["heldCost"], old["heldMs"]
             if (rec["cost"] == old["cost"] and rec["model"] == old["model"] and rec["segments"] == old["segments"]
-                    and rec.get("heldCost") == old.get("heldCost") and not old.get("corrected") and now - then < CC_WRITE_EVERY):
+                    and rec["ctx"] == old["ctx"] and rec.get("heldCost") == old.get("heldCost") and not old.get("corrected")
+                    and now - then < CC_WRITE_EVERY):
                 return False
         text = json.dumps({k: rec[k] for k in CC_KEYS + ("heldCost", "heldMs") if k in rec}, separators=(",", ":")) + "\n"
         tmp = os.path.join(folder, ".{}.{}.tmp".format(fields["session"], os.getpid()))
