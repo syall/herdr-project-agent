@@ -3973,6 +3973,20 @@ cases["P-costs-j1d-one"] = async () => { // R-A3: one account: its label beside 
 // The text a Copy button puts on the clipboard (the stub's __clipboard): a click on it, then the last write.
 async function j1dCopy(v, id) { clipReset(); await press(v, id); await settle(); return lastClip() ?? ""; }
 
+cases["P-costs-j1d-one-note"] = async () => { // A-V3 "always a priced as note": one scope priced from another: said once under the tiles
+  const facts = ["provider-a", "global", null, "acct1"], as = { scope: ["*", "*", "*", "*"], validFrom: "2026-01-01" };
+  const s = j1dSummary({ byScope: [{ key: j1dKey(facts), scope: facts, tokens: 1000, money: 12.5, calls: 7, pricedAs: [as], by: { regionBy: "unknown" } }],
+    scopes: 1, byAccount: [{ key: "acct1", tokens: 1000, money: 12.5, calls: 7 }], totals: costsSummary().totals,
+    sessions: costsSummary().sessions.map((x) => ({ ...x, ...j1dFacts(facts), pricedAs: as })) });
+  const { v } = await costsWorld({ summary: s });
+  await click(v, "costs-task-0"); await settle();
+  const text = costsView(v).text;
+  check(/\| All costs: provider-a · global · \? \(unknown\) · acct1 · priced as \* · \* · \* · \* \(from 2026-01-01\) \|/.test(text), `the one scope's note (got ${text.slice(0, 1200)})`);
+  check((text.match(/priced as/g) ?? []).length === 1 && !/By scope/.test(text), `said once, no section, no session tags (got ${text})`);
+  const copied = await j1dCopy(v, "costs-copy-totals");
+  check(copied.includes("All costs: provider-a · global · ? (unknown) · acct1 · priced as * · * · * · * (from 2026-01-01)"), `in the totals Copy (got ${copied})`);
+};
+
 cases["P-costs-j1d-scopes"] = async () => { // A-V3 AC: two or more scopes: By scope, rows summing to the total; ? with its …By; the priced-as note; tags on session lines
   const s = j1dSummary();
   const { v } = await costsWorld({ summary: s });
