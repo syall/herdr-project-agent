@@ -117,7 +117,9 @@ a step already taken.
                    "started": "<UTC time>",
                    "finished": true, "closed": "<UTC time>", "closedBy": "agent",
                    "report": "FINDINGS.md" } ],
-    "worktree": "<path or null>", "evidence": "evidence/t-003",
+    "worktree": "<path or null>",
+    "worktrees": [ { "path": "<path>", "job": "main", "created": "<UTC time>" } ],
+    "evidence": "evidence/t-003",
     "changeRequest": { "id": "...", "url": "..." },
     "links": [ { "label": "<short name>", "url": "https://..." } ],
     "next": "<one line>", "after": [ "t-002" ], "why": "...", "due": "<UTC time or null>",
@@ -126,6 +128,10 @@ a step already taken.
 `links` lists every artifact of the task the person may want to open: each change request,
 issue, document or dashboard, one entry each. The panel draws one button per link.
 `evidence` is relative to the state folder (the folder can move when a space is reopened).
+`worktrees` lists every worktree the task uses, each with the job it was made for (a short
+slug, unique in the task); `worktree` is the first of them. Mark an entry
+`"removed": "<UTC time>"` once its worktree is removed, and `"keep": true` to keep that one
+whatever happens. A worker's `worktree` is the folder it was started in.
 A worker's `finished`, `closed`, `closedBy`, `report`, `keep`, `keptAt`, `keepQuote`,
 `unkeptAt` and `unkeepQuote` are written by `pa-worker close` and `pa-worker keep`, and
 the top-level `workerPolicy` by `pa-worker close --leftovers`; never write them by hand,
@@ -318,7 +324,11 @@ Run `hc --skill` once to learn `hc`. Start workers with the profile's commands (
   most 15 mutations; high, what the plan's verification points ask. Record a `check`
   worker in the ledger with role `check`; the gate counts it as the reviewer only for a
   low-tier task.
-- One git worktree per code task. Parallel workers only when they touch different files.
+- One git worktree per job. Record it in the task's `worktrees` with its job in the same
+  ledger write as creating it, before starting a worker in it, and record the worker's
+  `worktree` (its `--cwd`) in its entry. A task's `extraWorktrees` list is the old form:
+  rewrite it as `worktrees` entries the next time you write that task. Parallel workers
+  only when they touch different files.
 - Before starting the first worker in a worktree, install the verification hooks there:
   `pa-hooks install <worktree> --task <task-id>` (add `--fix` for a bug fix: it locks test
   files). They lint after each edit, run the affected tests when a task is marked complete
@@ -401,21 +411,32 @@ Run `hc --skill` once to learn `hc`. Start workers with the profile's commands (
   worker, once you have read its report. Act on the answer (or the withdrawal), then
   run `pa-worker close --leftovers` again: it opens the next card when some workers did
   not fit or the card was withdrawn, and otherwise says it already ran.
-- Worktrees outlive their workers: a task's worktree stays while its workers come and
-  go. Only when every task using a worktree is done or parked, and no worker or other
-  terminal is working in it, does the person get asked: each pass, run
-  `pa-worktree check --open-cards`. It opens a decision card (`d-wt-<task>`, Delete or
-  Keep) for each such worktree, saying what is in it (tasks, branch, commits and
-  whether they are merged or pushed, files changed, anything uncommitted) and what
-  deleting would cost; the full list is in `WORKTREE.md` in the task's evidence folder.
-  When that card is answered
-  Delete, run `pa-worktree remove <task-id>`, then set the task's `worktree` to null and
-  journal it. Answered Keep: leave it, it is not asked again. Answered Other:
+- Worktrees outlive their workers: a task's worktrees stay while its workers come and
+  go. Each pass, run `pa-worktree check --open-cards`. It opens a Delete/Keep card for
+  each recorded worktree whose job is over: `d-wt-<task>` for the task's main worktree,
+  `d-wt-<task>-<job>` for any other. Only when every task using a worktree is done or
+  parked, and no worker or other terminal is working in it, is it offered whatever its
+  commits are. While a task is still in progress, a worktree of it is offered only when
+  every repository in it has commits, all of them merged into the main branch, nothing is
+  uncommitted and no terminal is working in it; a new commit, file or terminal withdraws
+  that card. Each card says what is in it (tasks, job, branch, commits and whether they
+  are merged or pushed, files changed, anything uncommitted) and what deleting would cost;
+  the full list is in `WORKTREE.md` in the task's evidence folder (`WORKTREE-<job>.md` for
+  a job's card). When that card is answered Delete, run `pa-worktree remove <task-id>`
+  (add `--job <job>` for a job's card); it also removes the empty folder the worktree
+  leaves. Then mark that entry `removed`, set the task's `worktree` to null if it was that
+  one, and journal it. Answered Keep: leave it, it is not asked again. Answered Other:
   nothing is removed; act on their words, and if they ask for it to go, withdraw the
   card (`pa-decide <card-id> --withdraw`) so the next check asks again. If the person
-  says to keep a worktree whatever happens, set `"keepWorktree": true` on the task.
-  Never remove a worktree or delete a branch any other way; the tool refuses without
-  the card.
+  says to keep a worktree whatever happens, set `"keep": true` on its entry, or
+  `"keepWorktree": true` on the task for all of them. Never remove a worktree or delete a
+  branch any other way; the tool refuses without the card.
+- Worktrees no task records: `pa-worktree check --open-cards` lists them on one card,
+  `d-wt-unrecorded-<n>`, with the task each seems to belong to. It is answered by
+  recording or by leaving them alone, never by deleting: for each one the person records,
+  add a `worktrees` entry to that task with the job they gave or the guessed one, and
+  nothing else; the ones they leave are not listed again. A worktree whose name starts
+  with no task id is the person's: it is only counted, never on a card, never touched.
 
 ## Phases and gates
 
