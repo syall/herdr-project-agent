@@ -701,5 +701,52 @@ class Docs(unittest.TestCase):  # AC6.1
         self.assertIn("pa-worker keep <address> --quote TEXT [--off]", text)
 
 
+TRUST_BULLET = (
+    "One prompt is an exception: Claude Code's folder trust prompt. When a blocked worker's screen shows it, run "
+    "`pa-trust <t>` once. It accepts the prompt only when the folder it names is, on real paths, the project folder "
+    "or a folder inside it, or the evidence folder of a task in the ledger (`evidence/<task-id>/` in your state "
+    "folder) or a folder inside that; is the worker's own folder or its repository's; brings no permission rules, "
+    "extra folders, hooks or MCP servers of its own; and the screen leaves no doubt. Never the state folder itself "
+    "or its other files. The dialog opens with the cursor on No, exit: it moves the cursor to the yes choice, reads "
+    "the screen again, presses Enter only when the cursor is on it, then reads the screen again to confirm. "
+    "Journal what it printed: the worker, the folder and the result. If it accepted nothing, bring the screen to "
+    "the person as above, and do not run it again for that prompt. Answer a trust prompt no other way: no `hc "
+    "keys`, no `--force`. Every other prompt, a Codex worker's trust prompt included, goes to the person.")
+
+
+class T035FolderTrust(unittest.TestCase):  # t-035 spec section 6, P1-P5 (with intent item 4: evidence folders)
+    def setUp(self):
+        self.raw = read("runtime", "core", "orchestrator.md")
+        self.workers = flat(self.raw[self.raw.index("## Workers"):self.raw.index("## Phases and gates")])
+
+    def test_p1_bullet(self):
+        for sentence in re.split(r"(?<=[.:;]) (?=[A-Z`])", TRUST_BULLET):
+            with self.subTest(sentence=sentence):
+                self.assertIn(sentence, self.workers)
+        self.assertIn(TRUST_BULLET, self.workers)
+
+    def test_p2_blocked_sentence_kept_and_first(self):
+        old = ("A worker that is `blocked` is waiting on a permission or a question: read its screen and bring it to "
+               "the person. Never `--force` a send past it.")
+        self.assertIn(old + " - " + TRUST_BULLET[:60], self.workers)
+        self.assertLess(self.workers.index(old), self.workers.index("One prompt is an exception: Claude Code's folder trust prompt."))
+
+    def test_p3_not_in_safety_or_worker(self):
+        self.assertNotIn("pa-trust", ORCHESTRATOR_SAFETY)
+        self.assertNotIn("pa-trust", WORKER_SAFETY)
+        self.assertNotIn("pa-trust", read("runtime", "core", "worker.md"))
+        self.assertNotIn("trust prompt", flat(section(self.raw, "## Safety")))
+
+    def test_p4_safety_unchanged(self):
+        self.assertEqual(ORCHESTRATOR_SAFETY, section(self.raw, "## Safety"))
+        self.assertEqual(WORKER_SAFETY, section(read("runtime", "core", "worker.md"), "## Safety"))
+
+    def test_p5_tool_listed_and_linked(self):
+        self.assertIn("pa-trust <address>", read("runtime", "tools", "pa_hooks.py").split('"""')[1])
+        line = [l for l in read("install.sh").splitlines() if "pa_hooks.py" in l and l.startswith("for n in")]
+        self.assertEqual(1, len(line))
+        self.assertIn(" pa-trust", line[0].split(";")[0])
+
+
 if __name__ == "__main__":
     unittest.main()
