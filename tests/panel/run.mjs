@@ -4367,6 +4367,56 @@ cases["P45-push-second-window"] = async () => { // REVIEW MF3: a push answered i
   check(Boolean(look(w2).clicks[`opt-${PID}-1`]), "refused: the other window can answer again");
 };
 
+// Round 3 (VERIFY MF-A): a push whose result is unknown. Every window keeps the card locked until a check from that
+// window, asked after the unknown result, reads it open; the shared mark's 120 s never unlocks it.
+const W3 = (w) => optClicks(look(w).clicks, PID);
+async function pushUnknownTwoWindows(checkMode) {
+  let ran = 0;
+  const { v } = await pushWorld({ tool: { run: () => { ran++; return ran === 1 ? new Promise(() => {}) : json(0, { ...runPushed, answer: "Not now", done: false, result: null, message: "answered Not now" }); },
+    check: () => (!ran ? json(0, checkReply()) : checkMode.now === "fail" ? (() => { throw new Error("unreachable"); })() : json(1, checkReply({ ok: false, refusal: { check: "C9", message: "remote moved" }, seen: null }))) } });
+  return v;
+}
+cases["P45-push-unknown-other-window"] = async () => { // V2-push-unknown-other-window-runs: w never unlocks on the mark's expiry
+  const mode = { now: "fail" };
+  const v = await pushUnknownTwoWindows(mode);
+  const w = await mount(); await settle();
+  await click(v, `opt-${PID}-0`); await settle(); await click(v, `submit-${PID}`); await settle();
+  await step(600000); await step(5000); await step(1000); await settle(); await settle();
+  check(W3(v).length === 0 && W3(w).length === 0, `both locked after the unknown result (v ${W3(v)}, w ${W3(w)})`);
+  for (const ms of [125000, 600000, 3600000]) {
+    advance(ms); await fire(10000); w.reload(cx); await settle();
+    check(W3(w).length === 0, `w locked ${ms / 1000} s later, no check read it open (got ${W3(w)})`);
+  }
+  check(look(w).text.includes("unknown"), `w says the result is unknown (got ${look(w).text.slice(0, 800)})`);
+  w.answer(g.__spaces[0], w.cards.find((c) => c.id === PID), "Not now", cx); await settle(); // a stale click there
+  await click(w, `push-check-${PID}`); await settle(); await settle(); // w's check cannot run: still locked
+  check(W3(w).length === 0, `w's check could not run: locked (got ${W3(w)})`);
+  check(pushExecs("run").length === 1, `one run (got ${pushExecs("run").length})`);
+  mode.now = "open"; await click(w, `push-check-${PID}`); await settle(); await settle(); // w's own check reads it open (C9)
+  check(W3(w).includes(`opt-${PID}-1`), `w's check read it open: Not now can be picked (got ${W3(w)})`);
+  check(W3(v).length === 0, `v keeps its own rule: no check of its read it open (got ${W3(v)})`);
+  await click(w, `opt-${PID}-1`); await settle(); await click(w, `submit-${PID}`); await settle(); await settle();
+  check(pushExecs("run").length === 2, `a run only after w's check read it open (got ${pushExecs("run").length})`);
+};
+
+cases["P45-push-unknown-owner-gone"] = async () => { // the same with the owner window gone: a later window applies the rule itself
+  const mode = { now: "fail" };
+  let v = await pushUnknownTwoWindows(mode);
+  await click(v, `opt-${PID}-0`); await settle(); await click(v, `submit-${PID}`); await settle();
+  await step(600000); await step(5000); await step(1000); await settle(); await settle();
+  v = null; // the owner window is gone; its shared mark stays
+  advance(600000);
+  const w = await mount(); await settle(); await settle(); // a window opened later: its first check cannot run
+  check(look(w).text.includes("check could not run") && W3(w).length === 0, `w locked, its first check could not run (got ${W3(w)})`);
+  for (let i = 0; i < 4; i++) { advance(1800000); await fire(10000); w.reload(cx); await settle(); }
+  check(W3(w).length === 0, `w locked 2 h later (got ${W3(w)})`);
+  w.answerPush(g.__spaces[0], w.cards.find((c) => c.id === PID), "Not now", cx); await settle(); // a stale call
+  check(pushExecs("run").length === 1, `one run (got ${pushExecs("run").length})`);
+  mode.now = "open"; await click(w, `push-check-${PID}`); await settle(); await settle();
+  check(W3(w).includes(`opt-${PID}-1`), `w's check read it open: unlocked (got ${W3(w)})`);
+  check(!g.__shared["project-agent.answering"]?.[`${S}\0${PID}`], "the shared mark is gone");
+};
+
 // Which cases run (t-031): every case, or the named ones; --shard=<k>/<n> keeps every n-th case by definition
 // order (index mod n == k - 1), so n shards together run each case once, and a case added later lands in one.
 // --list prints the names that would run and runs none. An unknown name or option exits 2.
