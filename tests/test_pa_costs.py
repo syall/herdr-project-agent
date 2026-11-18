@@ -6502,6 +6502,190 @@ class J2F_Flow(J2Base):
             self.assertIn(want, readme)
 
 
+class J2R2_Fixes(J2Base):
+    """J2 round 2 (REVIEW.md J2 M1-M3): a null long price never removes the file's, a region scope that converges is
+    updated, and every read of the download is bounded by the budget left. In-memory streams only: no socket."""
+
+    def serve_global(self, model, prices):
+        """Both regions' lists: model's global rows get prices (kind → price, None = no price), new kinds added."""
+        for url in (URL_A, URL_B):
+            value = json.loads(json.dumps(self.served[url]))
+            rows = [r for r in value["rows"] if r["model"] == model and r["endpoint"] == "global"]
+            have = {r["kind"]: r for r in rows}
+            for kind, price in prices.items():
+                if kind in have:
+                    have[kind]["price"] = price
+                else:
+                    r = {"provider": "provider-a", "endpoint": "global", "model": model, "kind": kind, "price": price}
+                    value["rows"].append(r)
+                    have[kind] = r
+                if price is None:
+                    have[kind]["why"] = "no long row"
+            self.served[url] = value
+
+    def with_long(self, long):
+        value = fetch_sample("prices-before.json")
+        value["defaultScope"] = {"provider": "provider-a", "endpoint": "global", "region": None, "account": None}
+        value["models"]["model-a"][0]["long"] = long
+        self.prices(value)
+        return value
+
+    def test_j2r2_m1a_a_null_long_price_keeps_the_files_and_is_noted(self):
+        self.with_long({"in": 2.0, "out": 20.0, "cr": 0.2, "above": 100000})
+        self.serve_global("model-a", {"in": 1.5, "long.in": None, "long.out": 25.0})
+        code, out, err = self.fetch(source="src-a", yes=True)
+        self.assertEqual(code, 0, err)
+        rows = self.written()["models"]["model-a"]
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[-1]["long"], {"in": 2.0, "out": 25.0, "cr": 0.2, "above": 100000})
+        self.assertIn("model-a / long.out: 20.0 → 25.0 (validFrom 2026-11-01)", out)
+        self.assertIn("model-a / long.in: kept 2.0 (source has no price: no long row)", out)
+        table, problem = pa_costs.load_prices(pa.load_profile("test"))
+        self.assertIsNone(problem)
+        price = pa_costs.price_for(table, "model-a", "2026-11-17T10:00:00Z", ("provider-a", "global", None, None))
+        self.assertEqual(price["long"]["in"], 2.0)
+        self.assertIsNotNone(pa_costs.money({"in": 10}, {"in": 10}, price))
+
+    def test_j2r2_m1b_long_kinds_and_above_the_source_did_not_send_are_carried(self):
+        self.with_long({"in": 2.0, "cr": 0.2, "above": 100000})
+        self.serve_global("model-a", {"in": 1.5, "long.out": 25.0})
+        code, out, err = self.fetch(source="src-a", yes=True)
+        self.assertEqual(code, 0, err)
+        row = self.written()["models"]["model-a"][-1]
+        self.assertEqual(row["in"], 1.5)
+        self.assertEqual(row["long"], {"in": 2.0, "cr": 0.2, "out": 25.0, "above": 100000})
+
+    def test_j2r2_m1c_only_a_null_long_price_changes_nothing(self):
+        self.with_long({"in": 2.0, "above": 100000})
+        self.serve_global("model-a", {"long.in": None})
+        code, out, err = self.fetch(source="src-a", yes=True)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(self.written()["models"]["model-a"]), 1)
+        self.assertIn("model-a / long.in: kept 2.0 (source has no price: no long row)", out)
+
+    def test_j2r2_m2_a_region_scope_that_converges_gets_a_row(self):
+        value = fetch_sample("prices-before.json")
+        value["defaultScope"] = {"provider": "provider-a", "endpoint": "global", "region": None, "account": None}
+        old = dict(value["models"]["model-a"][0], **{"in": 0.9})
+        value["scoped"] = [{"provider": "provider-a", "endpoint": "global", "region": "region-b", "account": None,
+                            "models": {"model-a": [old]}}]
+        self.prices(value)
+        code, out, err = self.fetch(source="src-a", yes=True)
+        self.assertEqual(code, 0, err)
+        after = self.written()
+        self.assertEqual(len(after["models"]["model-a"]), 1)  # the default region's row is unchanged
+        rb = self.scoped(after, ("provider-a", "global", "region-b", None))["model-a"]
+        self.assertEqual(rb[0], old)
+        self.assertEqual(len(rb), 2)
+        self.assertEqual((rb[1]["validFrom"], rb[1]["in"], rb[1]["region"]), ("2026-11-01", 1.0, "region-b"))
+        self.assertEqual(rb[1]["fetched"]["url"], URL_B)
+        self.assertIn("provider-a · global · region-b · * / model-a / in: 0.9 → 1.0 (validFrom 2026-11-01)", out)
+        table, problem = pa_costs.load_prices(pa.load_profile("test"))
+        self.assertIsNone(problem)
+        when = "2026-11-17T10:00:00Z"
+        self.assertEqual(pa_costs.price_for(table, "model-a", when, ("provider-a", "global", "region-b", None))["in"], 1.0)
+        self.assertEqual(pa_costs.price_for(table, "model-a", "2026-10-01T00:00:00Z", ("provider-a", "global", "region-b", None))["in"], 0.9)
+        before = self.snapshot()
+        code, out, _err = self.fetch(source="src-a", yes=True)
+        self.assertEqual(code, 0)
+        self.assertIn("no change", out)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_j2r2_m3a_a_body_dripping_through_a_buffered_reader_stops_at_the_budget(self):
+        import http.client
+        body = b"x" * 1000
+        wire = b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n" + body
+        now = [0.0]
+
+        class Drip(io.RawIOBase):  # one byte per raw read, each a fake second (under the 20 s per-read timeout)
+            pos = 0
+
+            def readable(self):
+                return True
+
+            def readinto(self, b):
+                if self.pos >= len(wire):
+                    return 0
+                if self.pos >= len(wire) - len(body):
+                    now[0] += 1.0
+                b[0] = wire[self.pos]
+                self.pos += 1
+                return 1
+
+        class Sock:
+            def makefile(self, mode):
+                return io.BufferedReader(Drip())
+        resp = http.client.HTTPResponse(Sock(), method="GET")
+        resp.begin()
+        clock = lambda: now[0]  # noqa: E731
+        dest = os.path.join(tempfile.mkdtemp(dir=TMP), "drip.download")
+        with self.assertRaises(pa_costs.FetchFailed) as e:
+            pa_costs.download(URL_A, 5000, dest, clock() + pa_costs.FETCH_BUDGET, lambda req, t: resp, clock)
+        self.assertEqual(e.exception.code, 3)
+        self.assertLessEqual(now[0], pa_costs.FETCH_BUDGET + 1)
+
+    def test_j2r2_m3b_every_tls_read_waits_at_most_the_budget_left(self):
+        import ssl
+        import urllib.request
+        ticks = {"t": 0.0}
+        opener = pa_costs.http_opener(100.0, lambda: ticks["t"])
+        https = [h for h in opener.handlers if isinstance(h, urllib.request.HTTPSHandler)][0]
+        cls = https._context.sslsocket_class
+        self.assertTrue(issubclass(cls, ssl.SSLSocket))
+        self.assertIsNot(cls, ssl.SSLSocket)
+        self.assertEqual(https._context.verify_mode, ssl.CERT_REQUIRED)
+        self.assertTrue(https._context.check_hostname)
+        sock = cls.__new__(cls)  # no file descriptor: nothing is opened
+        with mock.patch.object(ssl.SSLSocket, "recv_into", return_value=3) as recv_into, \
+                mock.patch.object(ssl.SSLSocket, "recv", return_value=b"abc") as recv, \
+                mock.patch.object(ssl.SSLSocket, "read", return_value=b"abc") as read, \
+                mock.patch.object(ssl.SSLSocket, "settimeout") as settimeout:
+            ticks["t"] = 10.0
+            self.assertEqual(sock.recv_into(bytearray(8)), 3)
+            self.assertEqual(settimeout.call_args[0][-1], 20)
+            ticks["t"] = 95.0
+            self.assertEqual(sock.recv(8), b"abc")
+            self.assertEqual(settimeout.call_args[0][-1], 5.0)
+            ticks["t"] = 99.5
+            self.assertEqual(sock.read(8), b"abc")
+            self.assertEqual(settimeout.call_args[0][-1], 0.5)
+            ticks["t"] = 100.5
+            for call in (lambda: sock.recv_into(bytearray(8)), lambda: sock.recv(8), lambda: sock.read(8)):
+                with self.assertRaises(pa_costs.FetchFailed) as e:
+                    call()
+                self.assertEqual(e.exception.code, 3)
+                self.assertIn("120", e.exception.why)
+            self.assertEqual((recv_into.call_count, recv.call_count, read.call_count), (1, 1, 1))
+        plain = pa_costs.http_opener()  # no deadline: the plain class
+        https = [h for h in plain.handlers if isinstance(h, urllib.request.HTTPSHandler)][0]
+        self.assertIs(https._context.sslsocket_class, ssl.SSLSocket)
+
+    def test_j2r2_m3c_the_fetch_builds_its_opener_with_its_deadline(self):
+        fake = mock.Mock()
+        fake.open = lambda request, timeout: self.opener(request, timeout)
+        ticks = {"t": 1000.0}
+        with mock.patch.object(pa_costs, "http_opener", return_value=fake) as built:
+            code, _out, err = self.fetch(source="src-a", yes=True, opener=None, clock=lambda: ticks["t"])
+        self.assertEqual(code, 0, err)
+        args = built.call_args[0]
+        self.assertEqual(args[0], 1000.0 + pa_costs.FETCH_BUDGET)
+        self.assertEqual(args[1](), 1000.0)
+
+    def test_j2r2_m3d_a_read_timing_out_past_the_deadline_is_refused_as_the_budget(self):
+        now = [0.0]
+
+        class Slow(FakeResponse):
+            def read1(self, n=-1):
+                now[0] = 121.0
+                raise OSError("timed out")
+        resp = Slow(200, FakeHeaders({"Content-Length": "10"}), b"0123456789")
+        dest = os.path.join(tempfile.mkdtemp(dir=TMP), "slow.download")
+        with self.assertRaises(pa_costs.FetchFailed) as e:
+            pa_costs.download(URL_A, 5000, dest, pa_costs.FETCH_BUDGET, lambda req, t: resp, lambda: now[0])
+        self.assertEqual(e.exception.code, 3)
+        self.assertTrue(resp.closed)
+
+
 class ZZ_V1_Privacy(unittest.TestCase):
     """Run last: the canary of every fixture reached no file under costs/ or billing/ and no captured output."""
 
