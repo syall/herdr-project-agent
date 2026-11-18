@@ -2323,11 +2323,18 @@ def fold_tasks(entries, keep):
 
 def fit_summary(s):
     """summary.json's form of a summary, as compact text ≤ SUMMARY_MAX: paContext cut to its newest
-    PA_CONTEXT_SUMMARY_DAYS days first (not a truncation), then shrink until it fits."""
+    PA_CONTEXT_SUMMARY_DAYS days first; if still over the cap, to its newest day (neither is a truncation); only then
+    shrink until it fits; that last day goes only as the final resort, so the other lists stay as before J1."""
     if "paContext" in s:
         s["paContext"] = s["paContext"][:PA_CONTEXT_SUMMARY_DAYS]
     text = compact(s)
+    if len(text.encode()) > SUMMARY_MAX and len(s.get("paContext") or []) > 1:
+        s["paContext"] = s["paContext"][:1]
+        text = compact(s)
     while len(text.encode()) > SUMMARY_MAX and shrink(s):
+        text = compact(s)
+    if len(text.encode()) > SUMMARY_MAX and s.get("paContext"):
+        s["paContext"] = []
         text = compact(s)
     return text
 
