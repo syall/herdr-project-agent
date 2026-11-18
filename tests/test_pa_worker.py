@@ -1898,7 +1898,8 @@ class TaskWorktrees(Base):
         code, out, err = self.run_cmd("pa-worktree", "check", "--open-cards", "--space", "sp1")
         self.assertEqual(code, 0, err)
         self.assertIn("opened card d-wt-t-003", out)
-        self.assertIn("t-003: {} (job billing) is not the task's main worktree; not offered yet".format(os.path.realpath(self.wt2)), out)
+        # J2: the other job's worktree is checked on its own and refused a card outside a worktrees folder (was "not offered yet" in J1)
+        self.assertIn("t-003: {} is not under a worktrees folder; not offered".format(os.path.realpath(self.wt2)), out)
         card = pa.read_json(os.path.join(self.dir, "decisions", "d-wt-t-003.json"))
         self.assertEqual(card["worktree"], os.path.realpath(self.wt))
         self.assertEqual(sorted(os.listdir(os.path.join(self.dir, "decisions"))), ["d-wt-t-003.json"])
@@ -2202,6 +2203,408 @@ class TaskWorktrees(Base):
         self.assertEqual(code, 2)
         self.assertIn("tasks still t-009 in-progress; a worktree is removed only once every task using it is done or parked. Nothing was removed", err)
         self.assertTrue(os.path.isdir(self.wt))
+
+
+class JobCards(Base):
+    """t-020 J2 (R2, R3, AC6.1): each recorded worktree gets its own Delete/Keep card; rule (b) offers one of a task still in
+    progress once every commit in it is merged, nothing is uncommitted and no terminal works in it."""
+
+    def setUp(self):
+        super().setUp()
+        self.proj = self.repo()
+        self.wt = self.worktree(self.proj, "t-003-x")
+        self.bill = self.job_tree("t-003-billing")
+
+    def job_tree(self, name, branch=None):
+        """A worktree in the layout <project>/worktrees/<container>/<repo>."""
+        path = os.path.join(self.tmp, "worktrees", name, "proj")
+        sh(self.proj, "git", "worktree", "add", "-q", "-b", branch or name, path, "main")
+        return path
+
+    def merged_commit(self, path, file="a.txt", message="billing work"):
+        sha = self.commit(path, file, file + "\n", message)
+        sh(self.proj, "git", "merge", "-q", "--ff-only", sh(path, "git", "rev-parse", "HEAD"))
+        return sha
+
+    def billing_task(self, state="in-progress", workers=(), **extra):
+        self.add_task("t-003", state, self.wt, workers, worktrees=[{"path": self.bill, "job": "billing"}], **extra)
+
+    def check(self, *extra):
+        return self.run_cmd("pa-worktree", "check", "--space", "sp1", *extra)
+
+    def card(self, name="d-wt-t-003-billing"):
+        return pa.read_json(os.path.join(self.dir, "decisions", name + ".json"))
+
+    def answer(self, name="d-wt-t-003-billing", label="Delete"):
+        path = os.path.join(self.dir, "decisions", name + ".json")
+        card = load(path)
+        card.update(status="answered", answer=label)
+        dump(card, path)
+        return card
+
+    def remove(self, task="t-003", *extra):
+        return self.run_cmd("pa-worktree", "remove", task, "--space", "sp1", *extra)
+
+    def test_b1_merged_job_of_in_progress_task_opens_a_job_card(self):
+        self.billing_task()
+        self.merged_commit(self.bill)
+        code, out, err = self.check()
+        self.assertEqual(code, 0, err)
+        self.assertIn("t-003: candidate, job billing is over (every commit merged); --open-cards asks the person", out)
+        self.assertIsNone(self.card())
+        code, out, err = self.check("--open-cards")
+        self.assertEqual(code, 0, err)
+        self.assertIn("t-003: opened card d-wt-t-003-billing (recommends Delete)", out)
+        self.assertIn("t-003: tasks still t-003 in-progress; asked once every task using it is done or parked; job main not over yet "
+                      "(no commits since its fork)", out)
+        card = self.card()
+        self.assertEqual((card["id"], card["task"], card["job"], card["main"], card["rule"], card["worktree"]),
+                         ("d-wt-t-003-billing", "t-003", "billing", False, "b", os.path.realpath(self.bill)))
+        self.assertEqual(card["question"], 'Delete the worktree for t-003 "Title of t-003", job billing?')
+        lines = card["context"].split("\n")
+        self.assertEqual(lines[1], 'Tasks: t-003 "Title of t-003" (in-progress)')
+        self.assertEqual(lines[2], "Job: billing")
+        self.assertEqual(lines[3], "Task still in-progress; this job's commits are all merged")
+        self.assertEqual(lines[-1], "Full list: WORKTREE-billing.md")
+        self.assertEqual((card["recommendation"], card["status"], card["evidence"]), ("Delete", "open", ["WORKTREE-billing.md"]))
+        self.assertTrue(os.path.isfile(os.path.join(self.dir, "evidence", "t-003", "WORKTREE-billing.md")))
+        self.assertFalse(os.path.exists(os.path.join(self.dir, "evidence", "t-003", "WORKTREE.md")))
+        self.assertIsNone(self.card("d-wt-t-003"), "the main worktree has no commits: not offered")
+        self.assertIn("card d-wt-t-003-billing is open", self.check("--open-cards")[1])
+
+    def test_b2_no_commits_is_never_offered(self):
+        self.billing_task()
+        code, out, err = self.check("--open-cards")
+        self.assertEqual(code, 0, err)
+        self.assertIn("t-003: tasks still t-003 in-progress; asked once every task using it is done or parked; job billing not over yet "
+                      "(no commits since its fork)", out)
+        self.assertFalse(os.path.isdir(os.path.join(self.dir, "decisions")) and os.listdir(os.path.join(self.dir, "decisions")))
+
+    def test_b3_unmerged_or_unknown_or_cut_is_not_offered(self):
+        cases = {"unmerged": "1 of 2 commits not merged into main", "uncommitted": "1 uncommitted file(s)",
+                 "unknown": "merged unknown", "cut": "cannot tell (more commits than described)",
+                 "error": "cannot tell (git broke)", "not described": "cannot tell (not every repository was described)"}
+        for case, why in cases.items():
+            with self.subTest(case=case):
+                self.ledger({"version": 1, "tasks": []})
+                shutil.rmtree(os.path.join(self.dir, "decisions"), ignore_errors=True)
+                sh(self.proj, "git", "worktree", "remove", "--force", self.bill)
+                sh(self.proj, "git", "branch", "-q", "-D", "t-003-billing")
+                self.bill = self.job_tree("t-003-billing")
+                self.billing_task()
+                self.merged_commit(self.bill)
+                saved = pa_hooks.describe_worktree, pa_hooks.MD_COMMITS
+                if case == "unmerged":
+                    self.commit(self.bill, "b.txt", "b\n", "not merged yet")
+                elif case == "uncommitted":
+                    write(os.path.join(self.bill, "u.txt"), "x\n")
+                elif case == "cut":
+                    self.merged_commit(self.bill, "c.txt", "second")
+                    pa_hooks.MD_COMMITS = 1
+                else:
+                    def fake(row, facts, profile, _real=saved[0], case=case):
+                        desc = _real(row, facts, profile)
+                        if case == "unknown":
+                            desc["repos"][0]["commits"][0]["merged"] = None
+                        elif case == "error":
+                            desc["repos"][0]["error"] = "git broke"
+                        else:
+                            desc["notDescribed"] = ["other"]
+                        return desc
+                    pa_hooks.describe_worktree = fake
+                try:
+                    code, out, err = self.check("--open-cards")
+                finally:
+                    pa_hooks.describe_worktree, pa_hooks.MD_COMMITS = saved
+                self.assertEqual(code, 0, err)
+                self.assertIn("job billing not over yet ({})".format(why), out)
+                self.assertIsNone(self.card())
+
+    def test_b4_pushed_only_is_not_enough_while_in_progress(self):
+        bare = os.path.join(self.tmp, "remote.git")
+        sh(self.tmp, "git", "init", "-q", "--bare", bare)
+        sh(self.proj, "git", "remote", "add", "origin", bare)
+        self.billing_task()
+        self.commit(self.bill, "a.txt", "a\n", "pushed, not merged")
+        sh(self.bill, "git", "push", "-q", "origin", "HEAD:refs/heads/t-003-billing")
+        code, out, err = self.check("--open-cards")
+        self.assertEqual(code, 0, err)
+        self.assertIn("job billing not over yet (1 of 1 commits not merged into main)", out)
+        self.assertIsNone(self.card())
+        # once the task is done, rule (a): offered, and the card says it is pushed
+        led = self.ledger()
+        led["tasks"][0]["state"] = "done"
+        self.ledger(led)
+        self.assertIn("opened card d-wt-t-003-billing", self.check("--open-cards")[1])
+        self.assertEqual(self.card()["rule"], "a")
+        self.assertIn("(not merged, pushed)", self.card()["context"])
+
+    def test_b5_a_terminal_inside_blocks_a_sibling_worker_does_not(self):
+        self.billing_task(workers=[{"address": "t31", "role": "build", "name": "t-003-main"}])
+        self.merged_commit(self.bill)
+        self.term("t31", "t-003-main", cwd=self.wt)  # live, in the main worktree
+        self.term("t77", "someone", cwd=os.path.join(self.bill, "sub"))
+        code, out, err = self.check("--open-cards")
+        self.assertEqual(code, 0, err)
+        self.assertIn("job billing not over yet (another terminal is working in it: t77)", out)
+        self.assertIsNone(self.card())
+        del self.terms["t77"]
+        self.assertIn("opened card d-wt-t-003-billing", self.check("--open-cards")[1])
+        # a live worker of this job's worktree blocks it
+        shutil.rmtree(os.path.join(self.dir, "decisions"))
+        led = self.ledger()
+        led["tasks"][0]["workers"].append({"address": "t32", "role": "build", "name": "t-003-billing", "worktree": self.bill})
+        self.ledger(led)
+        self.term("t32", "t-003-billing", cwd=self.tmp)
+        self.assertIn("job billing not over yet (in use by t32)", self.check("--open-cards")[1])
+        self.assertIsNone(self.card())
+
+    def test_b6_open_b_card_withdrawn_on_new_commit_file_or_terminal(self):
+        for case in ("commit", "file", "terminal"):
+            with self.subTest(case=case):
+                self.ledger({"version": 1, "tasks": []})
+                self.terms.clear()
+                shutil.rmtree(os.path.join(self.dir, "decisions"), ignore_errors=True)
+                self.bill = self.job_tree("t-003-b6-" + case)
+                self.billing_task()
+                self.merged_commit(self.bill)
+                self.assertIn("opened card d-wt-t-003-billing", self.check("--open-cards")[1])
+                why = {"commit": "1 of 2 commits not merged into main", "file": "1 uncommitted file(s)",
+                       "terminal": "another terminal is working in it: t77"}[case]
+                if case == "commit":
+                    self.commit(self.bill, "b.txt", "b\n", "more work")
+                elif case == "file":
+                    write(os.path.join(self.bill, "u.txt"), "x\n")
+                else:
+                    self.term("t77", "someone", cwd=self.bill)
+                before = raw(os.path.join(self.dir, "decisions", "d-wt-t-003-billing.json"))
+                self.assertIn("t-003: card d-wt-t-003-billing is open, but the job is no longer over ({}); --open-cards withdraws it".format(why),
+                              self.check()[1])
+                self.assertEqual(raw(os.path.join(self.dir, "decisions", "d-wt-t-003-billing.json")), before)
+                out = self.check("--open-cards")[1]
+                self.assertIn("t-003: withdrew card d-wt-t-003-billing: the job is no longer over: {}".format(why), out)
+                card = self.card()
+                self.assertEqual((card["status"], card["answer"]), ("withdrawn", None))
+                self.assertIn("the job is no longer over: " + why, card["note"])
+                self.assertEqual((self.journal()[-1]["trigger"], self.journal()[-1]["task"]), ("worktree", "t-003"))
+                self.assertIn("withdrew card d-wt-t-003-billing", self.journal()[-1]["why"])
+                self.assertIn("job billing not over yet ({})".format(why), self.check("--open-cards")[1])
+                self.assertEqual(self.card()["status"], "withdrawn")
+
+    def test_b7_main_worktree_of_in_progress_task_same_rule(self):
+        self.add_task("t-003", "in-progress", self.wt, [{"address": "t31", "role": "build", "name": "t-003-main", "finished": True}])
+        self.merged_commit(self.wt)
+        code, out, err = self.check("--open-cards")
+        self.assertEqual(code, 0, err)
+        self.assertIn("t-003: opened card d-wt-t-003 (recommends Delete)", out)
+        card = self.card("d-wt-t-003")
+        self.assertEqual((card["job"], card["main"], card["rule"]), ("main", True, "b"))
+        self.assertEqual(card["question"], 'Delete the worktree for t-003 "Title of t-003", job main?')
+        self.assertIn("Task still in-progress; this job's commits are all merged", card["context"].split("\n"))
+        self.assertEqual(card["evidence"], ["WORKTREE.md"])
+        self.assertEqual(card["context"].split("\n")[-1], "Full list: WORKTREE.md")
+
+    def test_b8_card_ids_and_md_names_per_job_old_d_wt_card_still_valid(self):
+        self.assertEqual(pa_hooks.card_id("t-003", "billing", False), "d-wt-t-003-billing")
+        self.assertEqual(pa_hooks.card_id("t-003", "tool", True), "d-wt-t-003")
+        self.assertEqual(pa_hooks.md_name("billing", False), "WORKTREE-billing.md")
+        self.assertEqual(pa_hooks.md_name("tool", True), "WORKTREE.md")
+        self.assertEqual(pa_hooks.card_path(self.dir, "t-003", "billing", False), os.path.join(self.dir, "decisions", "d-wt-t-003-billing.json"))
+        self.assertEqual(pa_hooks.card_path(self.dir, "t-003"), os.path.join(self.dir, "decisions", "d-wt-t-003.json"))
+        self.assertTrue(pa_hooks.tool_file(pa_hooks.md_name("billing-script", False)))
+        # a card from before J2 (no job, main or rule) on the main worktree still counts, for check and for remove
+        self.add_task("t-003", "done", self.wt, [])
+        dump({"id": "d-wt-t-003", "task": "t-003", "worktree": self.wt, "status": "answered", "answer": "Delete", "snapshot": {}},
+             os.path.join(self.dir, "decisions", "d-wt-t-003.json"))
+        self.assertIn("t-003: card d-wt-t-003 answered 'Delete': run `pa-worktree remove t-003`", self.check()[1])
+        code, out, err = self.remove()
+        self.assertEqual(code, 0, err)
+        self.assertIn("(card d-wt-t-003)", out)
+        self.assertFalse(os.path.isdir(self.wt))
+
+    def test_b9_question_and_job_lines(self):
+        legacy = self.job_tree("t-007b-tool")
+        self.add_task("t-007", "in-progress", None, [], extraWorktrees=[legacy])
+        self.merged_commit(legacy)
+        self.assertIn("t-007: opened card d-wt-t-007-t-007b-tool", self.check("--open-cards")[1])
+        card = self.card("d-wt-t-007-t-007b-tool")
+        self.assertEqual(card["question"], 'Delete the worktree for t-007 "Title of t-007", job t-007b-tool?')
+        self.assertIn("Job: t-007b-tool (named from its folder; not recorded)", card["context"].split("\n"))
+        self.assertTrue(os.path.isfile(os.path.join(self.dir, "evidence", "t-007", "WORKTREE-t-007b-tool.md")))
+        # two tasks on one job worktree, both unfinished
+        self.ledger({"version": 1, "tasks": []})
+        shutil.rmtree(os.path.join(self.dir, "decisions"))
+        self.billing_task()
+        self.add_task("t-004", "review", None, [], worktrees=[{"path": self.bill, "job": "shared"}])
+        self.merged_commit(self.bill)
+        self.assertIn("t-003: opened card d-wt-t-003-billing", self.check("--open-cards")[1])
+        card = self.card()
+        self.assertEqual(card["question"], 'Delete the worktree for t-003 "Title of t-003", t-004 "Title of t-004", job billing?')
+        self.assertIn("Tasks still t-003 in-progress, t-004 review; this job's commits are all merged", card["context"].split("\n"))
+        # a done task's main worktree with the default job: today's question, no Job line
+        self.ledger({"version": 1, "tasks": []})
+        shutil.rmtree(os.path.join(self.dir, "decisions"))
+        self.add_task("t-005", "done", self.wt, [])
+        self.check("--open-cards")
+        card = self.card("d-wt-t-005")
+        self.assertEqual((card["question"], card["rule"], card["job"], card["main"]), ('Delete the worktree for t-005 "Title of t-005"?', "a", "main", True))
+        self.assertFalse(any(l.startswith("Job: ") for l in card["context"].split("\n")))
+
+    def test_b10_remove_job_refusals(self):
+        self.billing_task()
+        self.merged_commit(self.bill)
+        self.check("--open-cards")
+        self.answer()
+        before = self.snapshot()
+        # unknown job
+        code, _, err = self.remove("t-003", "--job", "nope")
+        self.assertEqual(code, 2)
+        self.assertIn("task t-003 has no worktree for job nope", err)
+        # wrong card: it names another folder
+        card = self.card()
+        card["worktree"] = self.wt
+        dump(card, os.path.join(self.dir, "decisions", "d-wt-t-003-billing.json"))
+        code, _, err = self.remove("t-003", "--job", "billing")
+        self.assertEqual(code, 2)
+        self.assertIn("the card is for {}, not {}".format(self.wt, os.path.realpath(self.bill)), err)
+        card["worktree"] = os.path.realpath(self.bill)
+        dump(card, os.path.join(self.dir, "decisions", "d-wt-t-003-billing.json"))
+        # not over any more: a new commit
+        self.commit(self.bill, "b.txt", "b\n", "more")
+        code, _, err = self.remove("t-003", "--job", "billing")
+        self.assertEqual(code, 2)
+        self.assertIn("tasks still t-003 in-progress and job billing is not over (1 of 2 commits not merged into main); nothing was removed", err)
+        self.assertTrue(os.path.isdir(self.bill))
+        # a rule (a) card while a task is unfinished: today's refusal
+        sh(self.proj, "git", "merge", "-q", "--ff-only", sh(self.bill, "git", "rev-parse", "HEAD"))
+        card = self.card()
+        card["rule"] = "a"
+        dump(card, os.path.join(self.dir, "decisions", "d-wt-t-003-billing.json"))
+        code, _, err = self.remove("t-003", "--job", "billing")
+        self.assertEqual(code, 2)
+        self.assertIn("tasks still t-003 in-progress; a worktree is removed only once every task using it is done or parked. Nothing was removed", err)
+        # several worktrees and no main one: name the job
+        self.ledger({"version": 1, "tasks": []})
+        other = self.job_tree("t-003-other")
+        self.add_task("t-003", "done", None, [], worktrees=[{"path": self.bill, "job": "billing"}, {"path": other, "job": "other"}])
+        code, _, err = self.remove("t-003")
+        self.assertEqual(code, 2)
+        self.assertIn("task t-003 has no main worktree; name one: --job billing, --job other", err)
+        # a job's worktree outside any worktrees folder
+        self.ledger({"version": 1, "tasks": []})
+        loose = self.worktree(self.proj, "t-003-loose")
+        self.add_task("t-003", "done", self.wt, [], worktrees=[{"path": loose, "job": "loose"}])
+        self.assertIn("t-003: {} is not under a worktrees folder; not offered".format(os.path.realpath(loose)), self.check("--open-cards")[1])
+        self.assertIsNone(self.card("d-wt-t-003-loose"))
+        dump({"id": "d-wt-t-003-loose", "task": "t-003", "worktree": os.path.realpath(loose), "job": "loose", "main": False, "rule": "a",
+              "status": "answered", "answer": "Delete", "snapshot": {}}, os.path.join(self.dir, "decisions", "d-wt-t-003-loose.json"))
+        code, _, err = self.remove("t-003", "--job", "loose")
+        self.assertEqual(code, 2)
+        self.assertIn("{} is not under a worktrees folder; nothing was removed".format(os.path.realpath(loose)), err)
+        for path in (self.bill, other, loose, self.wt):
+            self.assertTrue(os.path.isdir(path))
+        self.assertNotIn(["git", "worktree", "remove"], [c[:3] for c in self.calls])
+
+    def test_b11_remove_job_removes_only_that_worktree(self):
+        self.billing_task()
+        self.merged_commit(self.bill)
+        self.check("--open-cards")
+        self.answer()
+        self.assertIn("t-003: card d-wt-t-003-billing answered 'Delete': run `pa-worktree remove t-003 --job billing`; it re-checks",
+                      self.check()[1])
+        code, out, err = self.remove("t-003", "--job", "billing")
+        self.assertEqual(code, 0, err)
+        self.assertIn("Removed the worktree {}. Branch t-003-billing is kept. (card d-wt-t-003-billing)".format(os.path.realpath(self.bill)), out)
+        self.assertFalse(os.path.exists(self.bill))
+        self.assertTrue(os.path.isdir(self.wt))
+        # one worktree and no main one: remove without --job takes it
+        self.ledger({"version": 1, "tasks": []})
+        other = self.job_tree("t-003-other")
+        self.add_task("t-003", "done", None, [], worktrees=[{"path": other, "job": "other"}])
+        self.check("--open-cards")
+        self.answer("d-wt-t-003-other")
+        code, out, err = self.remove("t-003")
+        self.assertEqual(code, 0, err)
+        self.assertFalse(os.path.exists(other))
+        self.assertTrue(os.path.isdir(self.wt))
+
+    def kind_profile(self, repos, uncommitted=0, unpushed=1):
+        kind = os.path.join(self.tmp, "Ws", "worktrees", "t-003-pkg")
+        write(os.path.join(kind, "marker.txt"), "")
+        status = os.path.join(self.tmp, "status.sh")
+        write(status, "#!/bin/sh\ncat <<'JSON'\n{}\nJSON\n".format(json.dumps(
+            {"uncommitted": uncommitted, "unpushed": unpushed, "branch": "A:feat, B:feat", "removesBranches": True, "kind": "custom worktree",
+             "repos": [os.path.join(kind, "src", r) for r in repos]})))
+        os.chmod(status, 0o755)
+        dump({"name": "test2", "claude": ["true"], "codex": ["true"],
+              "worktree": {"marker": "marker.txt", "status": status, "remove": status}}, os.path.join(pa.ROOT, "profiles", "test2", "profile.json"))
+        agent = load(os.path.join(self.dir, "agent.json"))
+        agent["profile"] = "test2"
+        dump(agent, os.path.join(self.dir, "agent.json"))
+        return kind
+
+    def package(self, kind, name, commits, merged):
+        folder = os.path.join(kind, "src", name)
+        os.makedirs(folder)
+        sh(folder, "git", "init", "-q", "-b", "main")
+        self.commit(folder, "README", "base\n", "base")
+        sh(folder, "git", "checkout", "-q", "-b", "feat")
+        for i in range(commits):
+            self.commit(folder, "f{}.txt".format(i), "x\n", "{} commit {}".format(name, i))
+        if merged:  # merged into the local main branch only, on no remote
+            sh(folder, "git", "checkout", "-q", "main")
+            sh(folder, "git", "merge", "-q", "--ff-only", "feat")
+            sh(folder, "git", "checkout", "-q", "feat")
+        return folder
+
+    def kind_card(self, kind, state="done"):
+        shutil.rmtree(os.path.join(self.dir, "decisions"), ignore_errors=True)
+        self.ledger({"version": 1, "tasks": []})
+        self.add_task("t-003", state, kind, [])
+        code, out, err = self.check("--open-cards")
+        self.assertEqual(code, 0, err)
+        return self.card("d-wt-t-003"), out
+
+    def test_b12_branch_deleting_kind_lost_merged_locally_kept_unknown_keep(self):
+        kind = self.kind_profile(["A", "B"], uncommitted=2)
+        self.package(kind, "A", 1, merged=True)
+        self.package(kind, "B", 2, merged=False)
+        card, _ = self.kind_card(kind)
+        lines = card["context"].split("\n")
+        self.assertIn("  kept if deleted: all 1 commits merged or pushed", lines)
+        self.assertIn("  LOST if deleted: 2 of 2 commits neither merged nor on a remote", lines)
+        self.assertLess(lines.index("  kept if deleted: all 1 commits merged or pushed"), lines.index("  LOST if deleted: 2 of 2 commits neither merged nor on a remote"))
+        self.assertIn("Deleting also deletes its branches (A:feat, B:feat); 2 commits (B) are neither merged nor on a remote and would be LOST; "
+                      "the 2 uncommitted files are DISCARDED.", lines)
+        self.assertEqual(card["recommendation"], "Keep")
+        self.assertIn("would be LOST", self.md_text("t-003", "WORKTREE.md"))
+        # every commit merged (locally): kept, Delete recommended although the script counts 1 commit on no remote
+        kind = self.kind_profile(["A"])
+        card, _ = self.kind_card(kind)
+        self.assertIn("  kept if deleted: all 1 commits merged or pushed", card["context"].split("\n"))
+        self.assertIn("Deleting also deletes its branches (A:feat, B:feat); all their commits are merged or pushed.", card["context"].split("\n"))
+        self.assertEqual(card["recommendation"], "Delete")
+        # a package that cannot be read: unknown, Keep
+        os.makedirs(os.path.join(kind, "src", "Broken"))
+        kind = self.kind_profile(["A", "Broken"])
+        card, _ = self.kind_card(kind)
+        lines = card["context"].split("\n")
+        self.assertTrue(any(l.startswith("  unknown if deleted: ") and l.endswith("; Keep is recommended") for l in lines), lines)
+        self.assertIn("Deleting also deletes its branches (A:feat, B:feat); whether every commit is merged or pushed is unknown.", lines)
+        self.assertEqual(card["recommendation"], "Keep")
+        # rule (b) on a worktree whose delete takes its branches: offered only with every package's commits merged
+        shutil.rmtree(os.path.join(kind, "src", "Broken"))
+        kind = self.kind_profile(["A"])
+        card, out = self.kind_card(kind, state="in-progress")
+        self.assertEqual((card["rule"], card["recommendation"]), ("b", "Delete"))
+        kind = self.kind_profile(["A", "B"])
+        card, out = self.kind_card(kind, state="in-progress")
+        self.assertIsNone(card)
+        self.assertIn("job main not over yet (2 of 2 commits not merged into main)", out)
+
+    def md_text(self, task, name):
+        with open(os.path.join(self.dir, "evidence", task, name)) as f:
+            return f.read()
 
 
 if __name__ == "__main__":
