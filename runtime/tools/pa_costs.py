@@ -1931,6 +1931,7 @@ def summarize(directory, rows, records, table, price_problem, profile_name, now,
     sess_tasks, sess_split = {}, set()  # the tasks of each session's rows; sessions with a split row
     fact_b = {f: {} for f in SCOPE_FIELDS}  # t-032: by provider, endpoint, region, account
     scope_b, scope_info, day_model_as = {}, {}, {}
+    row_m = {}  # t-041: each row's money as priced here, for paContext (never priced a second way)
     hour_floor = iso(now - HOURS * 3600)[:13]
     for r in rows:
         tokens = {k: num(r["tokens"].get(k)) for k in KINDS}
@@ -1947,6 +1948,7 @@ def summarize(directory, rows, records, table, price_problem, profile_name, now,
             if rf["providerBy"] == "default" and facts[0] is None:
                 facts = ((table.get("defaultScope") or (None,))[0],) + facts[1:]
         m = money(r["tokens"] or {}, r.get("long") or {}, entry)
+        row_m[id(r)] = m
         rec = r.get("source") == "reconstructed"
         calls = num(r.get("calls"))
         if m is None and t:
@@ -2159,7 +2161,7 @@ def summarize(directory, rows, records, table, price_problem, profile_name, now,
                            **({"unpricedTokens": p["unpricedTokens"]} if p["money"] is not None and p["unpricedTokens"] else {})}
                           for p in passes.values()), key=lambda p: -(p["money"] or 0))[:PASSES],
         "sessions": sess_list[:SESSIONS],
-        "paContext": pa_context(rows, records, sessions, table, since, until),
+        "paContext": pa_context(rows, records, sessions, row_m, since, until, zone),
         "unmatched": {"sessions": um[-1].get("sessions", 0), "tokens": um[-1].get("tokens", 0)} if um else {"sessions": 0, "tokens": 0},
         "problems": problems[:20],
     }
@@ -2171,10 +2173,13 @@ def context_day(stamp):
     return stamp[:10] if isinstance(stamp, str) and parse_ts(stamp) is not None else None
 
 
-def pa_context(rows, records, sessions, table, since=None, until=None):
+def pa_context(rows, records, sessions, row_m, since=None, until=None, zone=None):
     """t-041 R15: the Project Agent's context per UTC day, newest first, at most DAYS days. Rows of kind pa (not its
-    subagents' `sub` rows) with calls; reset and compact records of sessions.jsonl (R16: J3 and J4 write them)."""
+    subagents' `sub` rows) with calls; reset and compact records of sessions.jsonl (R16: J3 and J4 write them).
+    row_m: each row's money as summarize priced it (by id). since/until: the report's window, in `zone`'s days (the
+    same days the report cut its rows by); the buckets stay UTC days."""
     days = {}
+    zone = zone or UTC_ZONE
 
     def entry(day):
         e = days.get(day)
@@ -2183,22 +2188,23 @@ def pa_context(rows, records, sessions, table, since=None, until=None):
                              "reasons": {}, "money": None, "passes": set()}
         return e
 
-    def inside(day):
+    def inside(stamp, day=None):  # the window is the report's (zone) days; a row's own `day` when its from is not a time
+        day = day_in(zone, stamp) or day
         return day is not None and (not since or day >= since) and (not until or day <= until)
 
     def bad(rec):  # a reset or compact record with a field that is not a string: skipped (one line never stops a summary)
         return any(k in rec and not isinstance(rec[k], str) for k in ("session", "at", "to", "from"))
 
     records = [r for r in records if isinstance(r, dict) and not (r.get("ev") in ("reset", "compact") and bad(r))]
-    began = {}  # fresh session -> the UTC day it began (its reset or start record), None when that day is not known
+    began = {}  # fresh session -> when it began (its earliest reset or start record), None when that is not known
     for r in records:
         sid = r.get("to") if r.get("ev") == "reset" else r.get("session")
         if not isinstance(sid, str) or not (r.get("ev") == "reset" or (r.get("ev") == "start" and r.get("kind") == "pa"
                                                                          and r.get("resumed") is False)):
             continue
-        day = context_day(r.get("at"))
-        if sid not in began or (day and (began[sid] is None or day < began[sid])):
-            began[sid] = day
+        at = parse_ts(r.get("at")) if isinstance(r.get("at"), str) else None
+        if sid not in began or (at is not None and (began[sid] is None or at < began[sid])):
+            began[sid] = at
     fresh = set(began)
     earliest = {}  # fresh session -> its earliest row
     for r in rows:
@@ -2206,7 +2212,7 @@ def pa_context(rows, records, sessions, table, since=None, until=None):
         if r.get("kind") != "pa" or r.get("sub") or calls <= 0:
             continue
         day = r.get("day") or context_day(r.get("from"))
-        if not inside(day):
+        if not inside(r.get("from"), r.get("day")):
             continue
         t = r["tokens"]
         prompt = num(t.get("in")) + num(t.get("cw5m")) + num(t.get("cw1h")) + num(t.get("cr"))
@@ -2218,7 +2224,7 @@ def pa_context(rows, records, sessions, table, since=None, until=None):
         else:  # a row from before t-041: its mean is a lower bound of its peak
             e["peak"] = max(e["peak"], prompt / calls)
             e["peakExact"] = False
-        m = row_money(r, table)
+        m = row_m.get(id(r))
         if m is not None:
             e["money"] = (e["money"] or 0.0) + m
         if r.get("pass") is not None:
@@ -2231,7 +2237,7 @@ def pa_context(rows, records, sessions, table, since=None, until=None):
         if ev not in ("reset", "compact"):
             continue
         day = context_day(rec.get("at"))
-        if not inside(day):
+        if day is None or not inside(rec.get("at")):
             continue
         if ev == "compact":
             known = sessions.get(rec.get("session")) or {}
@@ -2245,9 +2251,10 @@ def pa_context(rows, records, sessions, table, since=None, until=None):
             e["reasons"][reason] = e["reasons"].get(reason, 0) + 1
     firsts = {}
     for sid, r in earliest.items():
-        # A session's first call is its first row of all. Rows reach here cut to [since, until] (report): when the
-        # session began before `since`, or its start day is not known, its first row may be cut, so it counts no first call.
-        if since and not (began.get(sid) and began[sid] >= since):
+        # A session's first call is its first row of all. Rows reach here cut to the report's window: unless the
+        # session's start is known and inside that window (in the report's days), its first row may be cut, so it
+        # counts no first call.
+        if (since or until) and not (began.get(sid) is not None and inside(iso(began[sid]))):
             continue
         day = r.get("day") or context_day(r.get("from"))
         if isinstance(r.get("first"), (int, float)) and not isinstance(r.get("first"), bool):
@@ -2417,16 +2424,20 @@ def context_lines(s, by):
         return ("" if e.get("peakExact") else "≥") + fmt_ctx(e.get("peak"))
 
     if by is None:
-        days = [e for e in pc if e["day"] == s["updated"][:10]]
+        # paContext's days are UTC days; under a local Today the line says so, and which day (t-041 round 5, MF-6)
+        utc_day = s["updated"][:10]
+        local = zone_of(s)["offsets"] != [[0, 0]]
+        head, when = ("PA context (UTC day {})".format(utc_day), "that day") if local else ("PA context", "today")
+        days = [e for e in pc if e["day"] == utc_day]
         if not days or not days[0].get("calls"):
             e = days[0] if days else None
             if e and (e["resets"]["fresh"] or e["resets"]["compact"]):
-                return ["PA context  — (no Project Agent calls today)  resets {} (fresh {}, compact {})".format(
-                    e["resets"]["fresh"] + e["resets"]["compact"], e["resets"]["fresh"], e["resets"]["compact"])]
-            return ["PA context  — (no Project Agent calls today)"]
+                return ["{}  — (no Project Agent calls {})  resets {} (fresh {}, compact {})".format(
+                    head, when, e["resets"]["fresh"] + e["resets"]["compact"], e["resets"]["fresh"], e["resets"]["compact"])]
+            return ["{}  — (no Project Agent calls {})".format(head, when)]
         e = days[0]
-        return ["PA context  mean {}  peak {}  resets {} (fresh {}, compact {})".format(
-            fmt_ctx(e["mean"]), peak(e), e["resets"]["fresh"] + e["resets"]["compact"], e["resets"]["fresh"], e["resets"]["compact"])]
+        return ["{}  mean {}  peak {}  resets {} (fresh {}, compact {})".format(
+            head, fmt_ctx(e["mean"]), peak(e), e["resets"]["fresh"] + e["resets"]["compact"], e["resets"]["fresh"], e["resets"]["compact"])]
     out = ["{:<28} {:>6} {:>8} {:>8} {:>7} {:>11} {:>10} {:>10}".format(
         "PA context by day (UTC)", "calls", "mean", "peak", "resets", "first call", "est.", "est./pass")]
     for e in pc:
