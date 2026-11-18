@@ -201,5 +201,37 @@ if wait_for $START_WAIT has_lines $((before + 1)); then
   tail -n 1 "$S/pa/spaces/$SP4/session.log" | grep -q "start resume=True session=$X4 reason=ran" && pass "S4 session.log reason=ran" || fail S4 "session.log: $(tail -n 1 "$S/pa/spaces/$SP4/session.log")"
 else fail S4 "stub never started; n8: $(scratch hc read n8 2>&1 | tail -n 5)"; fi
 
+# R (t-044): the reap ends only what this run started. Two decoys this script starts itself, which the run's
+# core and launchers did not: a `tail -f` on a file in the scratch folder, and the leader of a group of its
+# own (setsid) whose command line names the folder, as a caller's tool shell does. Both must outlive the
+# reap. A decoy ends its tail and itself on TERM and when this script goes (a killed run leaves neither).
+: > "$S/decoy.log"
+python3 - "$$" "$S/decoy.log" "$S/" > "$S/decoy.pids" 2>/dev/null <<'PY' &
+import os, signal, subprocess, sys, time
+check, log = int(sys.argv[1]), sys.argv[2]
+os.setsid()
+tail = subprocess.Popen(["tail", "-f", log], stdout=subprocess.DEVNULL)
+print(os.getpid(), tail.pid, flush=True)
+def end(*_):
+    tail.terminate()
+    tail.wait()
+    os._exit(0)
+signal.signal(signal.SIGTERM, end)
+began = time.time()
+while os.getppid() == check and time.time() - began < 120:
+    time.sleep(0.2)
+end()
+PY
+decoys_written() { [ -n "$(cat "$S/decoy.pids" 2>/dev/null)" ]; }
+wait_for 10 decoys_written
+read -r dlead dtail < "$S/decoy.pids"
+cleanup
+trap - EXIT
+kill -0 "$dtail" 2>/dev/null && pass "R the reap left a tail -f on a file in the scratch folder" || fail R "tail -f $dtail was ended"
+kill -0 "$dlead" 2>/dev/null && pass "R the reap left a group leader naming the scratch folder" || fail R "decoy leader $dlead was ended"
+left=$(sh "$here/pa_session_reap.sh" list "$S" "$SESSION" "$pid" "$core_began")
+[ -z "$left" ] && pass "R nothing this run started still runs" || fail R "still running: $left"
+ps -o command= -p "$dlead" 2>/dev/null | grep -qF "$S/decoy.log" && kill -TERM "$dlead" 2>/dev/null
+
 [ "$fails" = 0 ] && echo "all pa-session checks passed" || echo "$fails pa-session check(s) failed"
 [ "$fails" = 0 ]
