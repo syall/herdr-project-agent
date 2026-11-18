@@ -653,7 +653,7 @@ class SelfCheck(Base):
             return sorted(os.path.relpath(os.path.join(d, f), pa.ROOT) for d, _s, fs in os.walk(pa.ROOT) for f in fs
                           if "__pycache__" not in d)
         before = listing()
-        env = dict(os.environ, PATH="/usr/bin:/bin")  # no hc on PATH: a call to it would fail the check
+        env = dict(os.environ, PATH="/usr/bin:/bin", HERDR_PA_HOME=pa.ROOT, HERDR_APP_HOME=pa.APP)  # no hc on PATH
         r = subprocess.run([sys.executable, os.path.join(pa.ROOT, "tools", "pa.py"), "session", "--self-check",
                             "--space", SP, "--profile", "test"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                            universal_newlines=True, timeout=60)
@@ -667,7 +667,8 @@ class SelfCheck(Base):
     def test_self_check_fails_on_a_bad_profile(self):
         real_tools()
         r = subprocess.run([sys.executable, os.path.join(pa.ROOT, "tools", "pa.py"), "session", "--self-check",
-                            "--space", SP, "--profile", "nope"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            "--space", SP, "--profile", "nope"], env=dict(os.environ, HERDR_PA_HOME=pa.ROOT),
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                            universal_newlines=True, timeout=60)
         self.assertNotEqual(r.returncode, 0)
 

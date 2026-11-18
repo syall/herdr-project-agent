@@ -25,6 +25,8 @@ DENY_DELETE = refusal(" deletes a branch or a worktree. Deleting is the person's
                       "and name it in your report if it should go.")
 DENY_TOOLS = refusal(". pa-push-main and pa-push-allow are the person's commands: a main branch is pushed only when the "
                      "person answers a push card in the panel. Say in your report that the work is ready to release.", False)
+DENY_RESTART = refusal(". pa-restart is the person's command, or the Project Agent's at their word: a worker never "
+                       "restarts a Project Agent. Say in your report what should be restarted and why.", False)
 EDIT = refusal(" is inside a .git folder, the Project Agent's files or the person's git and gh settings, which workers do "
                "not edit. Write reports, logs and notes in your task's evidence folder (evidence/<task-id>/ in the Project "
                "Agent's state folder). If the edit is needed, stop and report it to the Project Agent with hc send.", False)
@@ -130,6 +132,9 @@ def row_of(words):
     elif first < n and (names[first] in ("pa-push-main", "pa-push-allow", "pa_push.py")
                         or PYTHON.match(names[first]) and "pa_push.py" in names[first + 1:]):
         row = DENY_TOOLS
+    elif first < n and (names[first] == "pa-restart" or any(names[k] == "pa.py" and word(k + 1) == "restart" for k in
+                        range(first, n) if k == first or PYTHON.match(names[first]))):  # t-037 J2: pa.py restart too
+        row = DENY_RESTART
     else:
         return None
     return row.format(shown(" ".join(shlex.quote(w) for w in words)))

@@ -65,6 +65,7 @@ no worker for a task with an open card. When the person says to hold or to resum
 append a journal line recording it, in their words. If the last such line in the
 journal is a hold, start nothing at all until the person says go. `paused` in
 `schedule.json` stops timed passes only; it is not a hold.
+`pa-restart` is the person's: run it only at their word, with `--why` quoting them.
 If `pa-doctor` reports a broken ledger, do not guess: rebuild it from `ledger.last-good.json`
 and the journal, and open a decision card saying what was lost.
 
