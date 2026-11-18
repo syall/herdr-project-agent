@@ -3958,10 +3958,10 @@ function j1dSummary(over = {}) {
 const section = (text, head, next) => { const at = text.indexOf(head); if (at < 0) return ""; const rest = text.slice(at + head.length); const end = next.map((n) => rest.indexOf(n)).filter((x) => x >= 0); return rest.slice(0, end.length ? Math.min(...end) : undefined); };
 const AFTER = ["| By day", "| Billed", "Billed amounts", "| Accounts", "| By scope"];
 
-cases["P-costs-j1d-one"] = async () => { // R-A3: one account: its label beside Total (and in the totals Copy); one scope: no By scope, no tags
-  const s = j1dSummary({ byScope: [{ key: j1dKey(J1D_GLOBAL), scope: J1D_GLOBAL, tokens: 1000, money: 12.5, calls: 7, pricedAs: [{ scope: J1D_GLOBAL, validFrom: "2026-01-01" }], by: {} }],
+cases["P-costs-j1d-one"] = async () => { // R-A3: one account: its label beside Total (and in the totals Copy); one scope priced as its own facts: no By scope, no tags, no note
+  const s = j1dSummary({ byScope: [{ key: j1dKey(J1D_REGIONAL), scope: J1D_REGIONAL, tokens: 1000, money: 12.5, calls: 7, pricedAs: [{ scope: J1D_REGIONAL, validFrom: "2026-01-01" }], by: {} }],
     scopes: 1, byAccount: [{ key: "acct1", tokens: 1000, money: 12.5, calls: 7 }], totals: costsSummary().totals,
-    sessions: costsSummary().sessions.map((x) => ({ ...x, ...j1dFacts(J1D_GLOBAL), pricedAs: { scope: J1D_GLOBAL, validFrom: "2026-01-01" } })) });
+    sessions: costsSummary().sessions.map((x) => ({ ...x, ...j1dFacts(J1D_REGIONAL), pricedAs: { scope: J1D_REGIONAL, validFrom: "2026-01-01" } })) });
   const { v } = await costsWorld({ summary: s });
   await click(v, "costs-task-0"); await settle();
   const text = costsView(v).text;
