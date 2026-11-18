@@ -57,6 +57,10 @@ def now():
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def iso_time(epoch):
+    return datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def read_json(path, default=None):
     try:
         with open(path) as f:
@@ -1027,6 +1031,12 @@ def launcher_update(ctx, directory, change):
     return True
 
 
+def profile_record(p):
+    folder = p.get("_folder") or os.path.join(ROOT, "profiles", p["name"])
+    return {"name": p["name"], "readAt": now(), "mtime": mtime_or_none(os.path.join(folder, "profile.json")),
+            "hash": hash_or_none(folder)}
+
+
 def launcher_start(ctx, address, space, directory, p):
     """launcher.json for this launcher, written after claim (R2). Never stops the launch (AC2.2)."""
     try:
@@ -1037,13 +1047,17 @@ def launcher_start(ctx, address, space, directory, p):
         installed = as_dict(installed_stamp())
         commit = (as_text(as_dict(installed.get("source")).get("commit"))
                   if tools is not None and installed.get("tools") == tools else None)
-        folder = p.get("_folder") or os.path.join(ROOT, "profiles", p["name"])
-        record = {"version": LAUNCHER_VERSION, "accepts": list(ACCEPTS), "instance": instance, "pid": os.getpid(), "terminal": address, "space": space,
+        record = {"version": LAUNCHER_VERSION, "accepts": list(ACCEPTS), "instance": instance, "pid": os.getpid(),
+                  "terminal": address, "space": space,
                   "started": ctx.get("startedAt") or ctx.setdefault("startedAt", now()),
                   "code": {"tools": tools, "file": me, "installed": as_text(installed.get("tools")), "commit": commit},
-                  "profile": {"name": p["name"], "readAt": now(), "mtime": mtime_or_none(os.path.join(folder, "profile.json")),
-                              "hash": hash_or_none(folder)},
+                  "profile": profile_record(p),
                   "session": None, "restart": None, "restartedFrom": None}
+        restarted = ctx.get("restarted")
+        if restarted:  # this process was exec'd by a restart (R6): what it came from
+            record["restartedFrom"] = restarted.get("from")
+            record["restart"] = {"request": restarted.get("request"), "outcome": "ok", "at": now(),
+                                 "by": restarted.get("by"), "why": None}
         ctx["launcher"] = record
         session_log(directory, "launcher instance={} tools={} core={} profile={}@{}".format(
             instance, (tools or "none")[:12], (hash_or_none(os.path.join(ROOT, "core")) or "none")[:12], p["name"],
@@ -1057,16 +1071,33 @@ def launcher_start(ctx, address, space, directory, p):
             pass
 
 
-def launcher_session(ctx, directory, agent, resume):
-    """Rewrites launcher.json's session at each Claude start: core text and context are read then (R2)."""
+def launcher_session(ctx, directory, agent, resume, snapshot=False):
+    """Rewrites launcher.json's session at each Claude start: core text and context are read then (R2). `prompt`
+    says what the model runs with (spec S1): new (a new session), rebuilt (a resume with --system-prompt-snapshot
+    off) or recorded (a resume that keeps the prompt recorded at the session's first request); promptCore and
+    promptContext are that prompt's core hash and context.md mtime, kept in agent.json `prompt` across launchers."""
     record = ctx.get("launcher")
     if not record:
         return
     try:
         folder = os.path.join(ROOT, "profiles", as_text(as_dict(record.get("profile")).get("name")) or "")
-        session = {"id": agent.get("sessionId"), "resume": bool(resume), "at": now(),
-                   "core": hash_or_none(os.path.join(ROOT, "core")),
-                   "context": mtime_or_none(os.path.join(folder, "context.md"))}
+        sid = agent.get("sessionId")
+        core, context = hash_or_none(os.path.join(ROOT, "core")), mtime_or_none(os.path.join(folder, "context.md"))
+        mode = "new" if not resume else ("rebuilt" if snapshot else "recorded")
+        path = os.path.join(directory, "agent.json")
+        current = read_json_safe(path)
+        current = current if isinstance(current, dict) else {}
+        before = as_dict(current.get("prompt"))
+        if mode == "recorded":
+            prompt_core, prompt_context = ((before.get("core"), before.get("context")) if before.get("session") == sid
+                                           else (None, None))
+        else:
+            prompt_core, prompt_context = core, context
+            if current:
+                current["prompt"] = {"session": sid, "core": core, "context": context, "at": now()}
+                write_json(path, current)
+        session = {"id": sid, "resume": bool(resume), "at": now(), "core": core, "context": context,
+                   "prompt": mode, "promptCore": prompt_core, "promptContext": prompt_context}
         launcher_update(ctx, directory, lambda r: r.__setitem__("session", session))
     except Exception as e:  # noqa: BLE001 - never stops the Project Agent
         print("[Project Agent] launcher.json not written: {}".format(e), flush=True)
@@ -1081,13 +1112,21 @@ def code_state(launcher, installed, terminal):
     if terminal and launcher.get("terminal") != terminal:
         return "unknown", "launcher.json is from another terminal ({})".format(launcher.get("terminal"))
     tools = as_text(as_dict(launcher.get("code")).get("tools"))
-    core = as_text(as_dict(launcher.get("session")).get("core"))
+    session = as_dict(launcher.get("session"))
+    recorded = session.get("prompt") == "recorded"
+    # The core text the model runs with (spec S1): on a resume without --system-prompt-snapshot off it is the one
+    # recorded when the session began, not the one read at this start. A J1 record has no promptCore: its core.
+    core = as_text(session.get("promptCore") if "promptCore" in session else session.get("core"))
     if not tools or not core:
+        if tools and recorded:
+            return "unknown", "the core text this resumed session runs with is not known (pa-restart --fresh loads the current one)"
         return "unknown", "launcher.json has no {} hash".format("tools" if not tools else "core")
     older = [n for n, a in (("tools", tools), ("core", core)) if a != installed.get(n)]
     if older:
-        return "older ({})".format(", ".join(older)), "runs tools {} core {}; installed tools {} core {}".format(
-            tools[:12], core[:12], (installed.get("tools") or "")[:12], (installed.get("core") or "")[:12])
+        return "older ({})".format(", ".join(older)), "runs tools {} core {}; installed tools {} core {}{}".format(
+            tools[:12], core[:12], (as_text(installed.get("tools")) or "")[:12], (as_text(installed.get("core")) or "")[:12],
+            "; the resumed session keeps the core text it began with until it compacts (pa-restart --fresh loads it now)"
+            if recorded and "core" in older else "")
     return "current", "tools {} core {}".format(tools[:12], core[:12])
 
 
@@ -1143,12 +1182,23 @@ def run_session(args, address, labels, space, project, ctx):
             exec_plain(p)
     if not os.path.isdir(project):
         raise Problem("project folder does not exist: " + project)
+    if getattr(args, "restarted", None) and "restarted" not in ctx:  # exec'd by a restart (t-037 R6)
+        ctx["restarted"] = {"request": args.restarted, "from": getattr(args, "from_instance", None),
+                            "by": getattr(args, "restart_by", None) or "pa-restart", "done": False}
     lock = launch_lock(space)
     try:
         directory, agent, previous = claim(args, address, labels, space, project, p, existing, directory)
         launcher_start(ctx, address, space, directory, p)  # t-037 R2: what this launcher loaded
     finally:
         lock.close()  # releases the lock
+    restarted = ctx.get("restarted")
+    if restarted and not restarted["done"]:
+        restarted["done"] = True
+        ctx.setdefault("formerInstances", set()).add(restarted.get("from"))
+        remove_request(directory, restarted["request"])
+        call(["hc", "label", address, "herdr.pa.restarting="], check=False)
+        session_log(directory, "restarted request={} from={} by={}".format(restarted["request"], restarted.get("from"),
+                                                                           restarted.get("by")))
     # The heartbeat the previous launcher left: the only sign that a killed session ran. Kept from
     # this launcher's first claim; on a retry the file holds this launcher's own beats.
     ctx.setdefault("previous", previous)
@@ -1187,7 +1237,7 @@ def reload_profile(p):
         return p
 
 
-def launch_command(p, agent, resume, directory):
+def launch_command(p, agent, resume, directory, snapshot=False):
     """(argv, model) for one launch of the Project Agent from profile p; raises when p cannot give one (also when
     the exec would refuse the argv: an element not a str, or with a NUL byte)."""
     argv = list(p["claude"])
@@ -1197,6 +1247,8 @@ def launch_command(p, agent, resume, directory):
     argv += mcp_args(p)
     argv += ["--resume", agent["sessionId"]] if resume else ["--session-id", agent["sessionId"]]
     argv += ["--name", "PA: " + agent["name"], "--append-system-prompt", layered(p, "orchestrator", directory, agent)]
+    if snapshot:  # t-037 S2: the appended text reaches the model on a resume too (not the one recorded at its start)
+        argv += ["--system-prompt-snapshot", "off"]
     if resume:
         argv += ["Your session was restarted. Read your state folder (ledger.json, journal.jsonl, decisions/, "
                  "rules.json), then say in one line where things stand. Continue where you left off without "
@@ -1281,6 +1333,312 @@ def end_child(ctx, why, grace=None):
         return child.wait()
 
 
+# ---- the restart in place (t-037 R4, R6, R7; spec S1-S5) ---------------------------------------------------------
+# pa-restart (or the panel) writes spaces/<id>/restart-request.json naming this launcher's instance. The watcher
+# thread takes it when the turn has ended, checks that the installed code loads (restart_precheck), ends its own
+# Claude child (end_child) and leaves ctx["after"]; the main loop then execs the installed pa.py in this process
+# (exec_restart): the pid, the terminal, its address and its workers stay. A request names no command, path or pid.
+
+REQUEST = "restart-request.json"
+REQUEST_MAX = 3600  # a request expires at most 60 min after it was written
+WATCH_EVERY = 2  # seconds between two looks at the request file
+SELF_CHECK_TIMEOUT = 20
+PROBE_TIMEOUT = 10  # `<claude> --help`, to learn whether it knows --system-prompt-snapshot
+
+
+def snapshot_flag(p, ctx=None):
+    """Whether this launch passes --system-prompt-snapshot off (spec S2): the profile key systemPromptSnapshot
+    ("off" | "keep") decides when set; else whether `<the profile's claude command> --help` lists the flag, probed
+    once per launcher process and command. Never raises: unknown means not passed."""
+    value = p.get("systemPromptSnapshot")
+    if value == "off":
+        return True
+    if value == "keep":
+        return False
+    cache = (ctx if ctx is not None else {}).setdefault("snapshotProbe", {})
+    key = json.dumps(p.get("claude"))
+    if key not in cache:
+        cache[key] = probe_snapshot(p)
+    return cache[key]
+
+
+def run_bounded(argv, timeout):
+    """(exit code, output bytes) of argv, ended by its own handle after `timeout` s (TimeoutExpired). Output goes to
+    a temp file, not a pipe, so a program that leaves a child holding its output cannot hold the wait past it."""
+    with tempfile.TemporaryFile() as out:
+        r = subprocess.run(argv, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, timeout=timeout)
+        out.seek(0)
+        return r.returncode, out.read()
+
+
+def probe_snapshot(p):
+    try:
+        _code, output = run_bounded(resolve(list(p["claude"]) + ["--help"], p), PROBE_TIMEOUT)
+        return b"--system-prompt-snapshot" in output
+    except Exception:  # noqa: BLE001 - not known: the flag is not passed
+        return False
+
+
+def read_request(directory):
+    """(request, None) when restart-request.json holds a well-formed request; (None, why) when it is not; (None,
+    None) when there is none."""
+    path = os.path.join(directory, REQUEST)
+    try:
+        text = read_text(path)
+    except OSError as e:
+        return None, "unreadable: {}".format(e)
+    if not text and not os.path.exists(path):
+        return None, None
+    try:
+        req = json.loads(text)
+    except ValueError:
+        return None, "not JSON"
+    if not isinstance(req, dict):
+        return None, "not an object"
+    for key in ("id", "space", "instance", "terminal", "at", "expires", "by"):
+        if not isinstance(req.get(key), str) or not req[key]:
+            return None, "field {!r} missing or not text".format(key)
+    if not ID.match(req["id"]):
+        return None, "bad request id"
+    for key in ("now", "fresh"):
+        if not isinstance(req.get(key, False), bool):
+            return None, "field {!r} is not true or false".format(key)
+    if req.get("why") is not None and not isinstance(req["why"], str):
+        return None, "field 'why' is not text"
+    at, expires = parse_time(req["at"]), parse_time(req["expires"])
+    if at is None or expires is None:
+        return None, "at/expires are not times"
+    req["_at"], req["_expires"] = at, expires
+    return req, None
+
+
+def remove_request(directory, request_id=None, text=None):
+    """Deletes restart-request.json when it is still the one meant (same id, or same text): a newer request written
+    meanwhile stays."""
+    path = os.path.join(directory, REQUEST)
+    try:
+        current = read_text(path)
+        if request_id is not None:
+            try:
+                if as_dict(json.loads(current)).get("id") != request_id:
+                    return False
+            except ValueError:
+                return False
+        elif text is not None and current != text:
+            return False
+        os.remove(path)
+        return True
+    except OSError:
+        return False
+
+
+def restart_outcome(ctx, directory, request_id, outcome, why, by=None):
+    entry = {"request": request_id, "outcome": outcome, "why": why, "at": now(), "by": by}
+    try:
+        launcher_update(ctx, directory, lambda r: r.__setitem__("restart", entry))
+    except Exception:  # noqa: BLE001 - never stops the Project Agent
+        pass
+    session_log(directory, "restart {} request={}: {}".format(outcome, request_id, why))
+
+
+def agent_turn(address):
+    """idle | working | blocked | unknown: the Project Agent's turn, from hc's status of its terminal."""
+    word = status_word(hc_get(address))
+    if word in ("working", "blocked"):
+        return word
+    return "idle" if word else "unknown"
+
+
+def restart_precheck(ctx, space, profile):
+    """({tools, core}, None) when the installed launcher may be exec'd: installed.json matches the installed files
+    (no install half done) and `pa.py session --self-check` of the installed file passes within SELF_CHECK_TIMEOUT
+    s. (None, why) otherwise; nothing is ended either way."""
+    installed = as_dict(installed_stamp())
+    if not as_text(installed.get("tools")):
+        return None, "no installed.json on this machine (run install.sh or pa-sync)"
+    tools = hash_or_none(os.path.join(ROOT, "tools"), top_py_only=True)
+    core = hash_or_none(os.path.join(ROOT, "core"))
+    if tools != installed.get("tools"):
+        return None, "the installed tools do not match installed.json (an install not finished?)"
+    if core != installed.get("core"):
+        return None, "the installed core text does not match installed.json (an install not finished?)"
+    target = os.path.join(ROOT, "tools", "pa.py")
+    try:
+        code, output = run_bounded([sys.executable, target, "session", "--self-check", "--space", space or "",
+                                    "--profile", profile or ""], SELF_CHECK_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return None, "the installed launcher's self-check did not finish within {} s".format(SELF_CHECK_TIMEOUT)
+    except (OSError, ValueError) as e:
+        return None, "the installed launcher's self-check could not run: {}".format(e)
+    last = output.decode("utf-8", "replace").strip().splitlines()[-1:] or [""]
+    if code:
+        return None, "the installed launcher's self-check failed (exit {}): {}".format(code, last[0][:200])
+    try:
+        result = as_dict(json.loads(last[0]))
+    except ValueError:
+        result = {}
+    if result.get("ok") is not True or result.get("tools") != tools:
+        return None, "the installed launcher's self-check printed no matching result: {}".format(last[0][:200])
+    return {"tools": tools, "core": core}, None
+
+
+def cmd_self_check(args):
+    """pa.py session --self-check: what a restart runs before it ends anything. Imports and runs, without starting
+    or writing anything and without hc, what the launcher uses after its start (C2): the cost module, the profile,
+    the launch command, the hashes. Prints one JSON line; exit 0 only when all of it worked."""
+    import hashlib  # noqa: F401 - imported later by the launcher (tree_hash)
+    import importlib.util  # noqa: F401 - costs_module
+    import socket  # noqa: F401 - stamp_script
+    import stat  # noqa: F401 - hash_file
+    p = load_profile(args.profile)
+    space = local_id(args.space or "") or "self-check"
+    directory = os.path.join(ROOT, "spaces", space)
+    agent = {"sessionId": str(uuid.uuid4()), "name": "self-check", "space": space, "terminal": "", "project": ""}
+    launch_command(p, agent, True, directory, snapshot=True)
+    launch_command(p, agent, False, directory)
+    costs = costs_module()
+    tools = tree_hash(os.path.join(ROOT, "tools"), top_py_only=True)
+    core = tree_hash(os.path.join(ROOT, "core"))
+    print(json.dumps({"ok": True, "tools": tools, "core": core, "profile": p["name"], "costs": costs is not None,
+                      "file": os.path.realpath(__file__)}))
+
+
+def watch_once(ctx, directory, address, space):
+    """One look at restart-request.json (the watcher thread, every WATCH_EVERY s)."""
+    if ctx.get("restarting") or ctx.get("after"):
+        return
+    path = os.path.join(directory, REQUEST)
+    if not os.path.exists(path):
+        ctx.pop("waitingFor", None)
+        return
+    try:
+        text = read_text(path)
+    except OSError:
+        return
+    req, why = read_request(directory)
+    if req is None:
+        if why:
+            restart_outcome(ctx, directory, None, "refused", "unreadable request: " + why)
+            remove_request(directory, text=text)
+        return
+    rid, by = req["id"], req["by"]
+    me = as_dict(ctx.get("launcher"))
+
+    def refuse(reason):
+        ctx.pop("waitingFor", None)
+        restart_outcome(ctx, directory, rid, "refused", reason, by)
+        remove_request(directory, rid)
+    if req["instance"] in ctx.get("formerInstances", ()):
+        remove_request(directory, rid)  # left from before this launcher's exec: silently
+        return
+    if req["space"] != space:
+        return refuse("the request is for space {}, not {}".format(req["space"], space))
+    if req["instance"] != me.get("instance"):
+        return refuse("the request is for launcher instance {}, not this one".format(req["instance"]))
+    if req["terminal"] != address:
+        return refuse("the request is for terminal {}, not {}".format(req["terminal"], address))
+    if req["_expires"] - req["_at"] > REQUEST_MAX:
+        return refuse("the request expires more than {} min after it was written".format(REQUEST_MAX // 60))
+    if time.time() > req["_expires"]:
+        return refuse("still mid-turn at expiry" if ctx.get("waitingFor") == rid else "the request expired")
+    if not req.get("now"):
+        turn = agent_turn(address)
+        if turn in ("working", "blocked"):
+            ctx["waitingFor"] = rid  # it restarts when this turn ends
+            return
+    ctx.pop("waitingFor", None)
+    agent = read_json_safe(os.path.join(directory, "agent.json"))
+    profile = as_text(as_dict(agent).get("profile")) or as_text(as_dict(me.get("profile")).get("name"))
+    pre, why = restart_precheck(ctx, space, profile)
+    if not pre:
+        restart_outcome(ctx, directory, rid, "failed", why, by)
+        remove_request(directory, rid)
+        return
+    begin_restart(ctx, directory, address, req, pre)
+
+
+def begin_restart(ctx, directory, address, req, pre):
+    ctx["restarting"] = req["id"]
+    call(["hc", "label", address, "herdr.pa.restarting=" + req["id"]], check=False)
+    session_log(directory, "restart taken request={} by={} now={}: ending the agent".format(req["id"], req["by"],
+                                                                                           bool(req.get("now"))))
+    ctx["after"] = {"kind": "exec", "request": {k: v for k, v in req.items() if not k.startswith("_")}, "pre": pre,
+                    "by": req["by"]}
+    end_child(ctx, "restart")  # no child running (between two launches): the loop takes ctx["after"] at its top
+
+
+def watcher(ctx, directory, address, space):
+    while True:
+        try:
+            watch_once(ctx, directory, address, space)
+        except Exception:  # noqa: BLE001 - the watcher never stops the launcher
+            pass
+        time.sleep(WATCH_EVERY)
+
+
+def exec_restart(ctx, after, project, directory, address):
+    """Execs the installed pa.py in this process (R6). Returns only when it could not: the outcome is `failed`,
+    the label and the request are removed, and the loop goes on (resuming as after /exit)."""
+    req = as_dict(after.get("request"))
+    rid, by = req.get("id"), after.get("by") or req.get("by") or "pa-restart"
+    pre = as_dict(after.get("pre"))
+    agent = as_dict(read_json_safe(os.path.join(directory, "agent.json")))
+    record = as_dict(ctx.get("launcher"))
+    failed = None
+    if pre.get("tools") and hash_or_none(os.path.join(ROOT, "tools"), top_py_only=True) != pre["tools"]:
+        failed = "the installed tools changed after the check (an install running?)"
+    else:
+        argv = [sys.executable, os.path.join(ROOT, "tools", "pa.py"), "session",
+                "--space", as_text(agent.get("space")) or os.path.basename(directory), "--project", project,
+                "--profile", as_text(agent.get("profile")) or as_text(as_dict(record.get("profile")).get("name")) or ""]
+        if as_text(agent.get("name")):
+            argv += ["--name", agent["name"]]
+        argv += ["--restarted", rid, "--from-instance", as_text(record.get("instance")) or "", "--restart-by", by]
+        if req.get("fresh") is True:
+            argv += ["--fresh"]
+        session_log(directory, "restart exec request={} from={}".format(rid, record.get("instance")))
+        print("\n[Project Agent] Restarting in place (request {}): loading the installed launcher.".format(rid), flush=True)
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+            # SIGINT stays ignored across the exec (spec S5): a Ctrl-C before the new launcher's claim cannot end
+            # the terminal and its workers. The new process ignores it again in run_session.
+            os.execv(sys.executable, argv)
+        except OSError as e:
+            failed = "exec: {}".format(e)
+    restart_outcome(ctx, directory, rid, "failed", failed, by)
+    remove_request(directory, rid)
+    call(["hc", "label", address, "herdr.pa.restarting="], check=False)
+    ctx.pop("restarting", None)
+    print("[Project Agent] The restart did not happen: {}. The agent resumes here.".format(failed), flush=True)
+
+
+def take_after(ctx, project, directory, address):
+    after = ctx.pop("after", None)
+    if after and after.get("kind") == "exec":
+        exec_restart(ctx, after, project, directory, address)
+
+
+def reload_after_exit(ctx, project, directory, address, space):
+    """R7: Claude exited on its own and an install changed the tools since this launcher started: the same
+    pre-check and exec as a restart (by "exit"). Otherwise, or when the pre-check fails (said once), nothing."""
+    record = as_dict(ctx.get("launcher"))
+    mine = as_text(as_dict(record.get("code")).get("tools"))
+    installed = as_text(as_dict(installed_stamp()).get("tools"))
+    if not record or not mine or not installed or installed == mine:
+        return
+    agent = as_dict(read_json_safe(os.path.join(directory, "agent.json")))
+    pre, why = restart_precheck(ctx, space, as_text(agent.get("profile")) or as_text(as_dict(record.get("profile")).get("name")))
+    if not pre:
+        if ctx.get("reloadSaid") != installed:
+            ctx["reloadSaid"] = installed
+            print("[Project Agent] The tools were installed again, but not reloading them: {}".format(why), flush=True)
+            session_log(directory, "not reloading after exit: {}".format(why))
+        return
+    exec_restart(ctx, {"kind": "exec", "request": {"id": "exit-" + str(uuid.uuid4()), "by": "exit"}, "pre": pre,
+                       "by": "exit"}, project, directory, address)
+
+
 def run_agent(args, address, project, p, directory, agent, ctx, started):
     running = ctx.setdefault("running", {"since": None, "session": None, "marked": False})
     ctx["directory"], ctx["project"] = directory, project
@@ -1309,11 +1667,15 @@ def run_agent(args, address, project, p, directory, agent, ctx, started):
             except (OSError, ValueError, AttributeError):
                 pass
             time.sleep(10)
+    space = agent.get("space") or os.path.basename(directory)
     if not ctx["beat"]:  # one heartbeat thread, also when a start is retried after an error
         threading.Thread(target=beat, daemon=True).start()
+        if ctx.get("launcher"):  # the request watcher (t-037 R6); a separate thread keeps the heartbeat's pace
+            threading.Thread(target=lambda: watcher(ctx, directory, address, space), daemon=True).start()
         ctx["beat"] = True
     quick, quick_resume_fails = 0, 0
     while True:
+        take_after(ctx, project, directory, address)  # a restart taken while no Claude ran (returns if it failed)
         fresh = reload_profile(p)
         agent = read_json(os.path.join(directory, "agent.json"), agent)
         resume, why = should_resume(agent, directory, project, before=started, heartbeat=ctx.get("previous"))
@@ -1329,12 +1691,14 @@ def run_agent(args, address, project, p, directory, agent, ctx, started):
             # The re-read profile is used only when a launch can be built from it (t-033 round 2): a file that
             # loads but has a wrong shape in a key read here (models a list, path a number, ...) keeps the old one.
             try:
-                argv, model = launch_command(fresh, agent, resume, directory)
+                snap = snapshot_flag(fresh, ctx)
+                argv, model = launch_command(fresh, agent, resume, directory, snapshot=snap)
                 p, adopted = fresh, fresh != held
             except Exception:  # noqa: BLE001 - a restart never fails because of the reload
                 fresh = p
         if fresh is p:
-            argv, model = launch_command(p, agent, resume, directory)
+            snap = snapshot_flag(p, ctx)
+            argv, model = launch_command(p, agent, resume, directory, snapshot=snap)
 
         def starting(model):  # what is written as a launch starts; returns its start time
             ttl, by = cache_in_effect(p, os.environ)  # t-040: the cache lifetime this start asks for
@@ -1342,7 +1706,9 @@ def run_agent(args, address, project, p, directory, agent, ctx, started):
                 resume, agent["sessionId"], why, ttl, by))
             began = time.time()
             running.update(since=began, session=agent["sessionId"], marked=False)
-            launcher_session(ctx, directory, agent, resume)
+            launcher_session(ctx, directory, agent, resume, snapshot=snap)
+            if adopted:  # t-033's re-read profile is the one running now (J1 Recorded limit L1)
+                launcher_update(ctx, directory, lambda r: r.__setitem__("profile", profile_record(p)))
             costs = costs_module()
             if costs:
                 try:
@@ -1362,8 +1728,9 @@ def run_agent(args, address, project, p, directory, agent, ctx, started):
                 raise
             session_log(directory, "the re-read profile did not start ({}); launching with the profile in hand"
                         .format(ascii(e)[:200]))
-            p = held
-            argv, model = launch_command(p, agent, resume, directory)
+            p, adopted = held, False
+            snap = snapshot_flag(p, ctx)
+            argv, model = launch_command(p, agent, resume, directory, snapshot=snap)
             began = starting(model)
             code = run_child(ctx, argv, project)
         running["since"] = None
@@ -1372,6 +1739,7 @@ def run_agent(args, address, project, p, directory, agent, ctx, started):
         session_log(directory, "exit code={} after={:.0f}s{}".format(code, lasted, " ended=" + ended if ended else ""))
         if ended:
             print("\n[Project Agent] The agent was ended by its launcher ({}).".format(ended), flush=True)
+            take_after(ctx, project, directory, address)  # the restart's exec; returns only when it failed
             continue
         if lasted >= RAN:
             quick, quick_resume_fails = 0, 0
@@ -1384,6 +1752,7 @@ def run_agent(args, address, project, p, directory, agent, ctx, started):
         agent = after_exit(agent, resume, code, lasted, quick_resume_fails, transcript)
         write_json(os.path.join(directory, "agent.json"), agent)
         print("\n[Project Agent] The agent exited (code {}). It restarts here; close the space to end it.".format(code), flush=True)
+        reload_after_exit(ctx, project, directory, address, space)  # R7: an install since this launcher began
         if quick >= 3:
             print("[Project Agent] It exited {} times within seconds, so it is not restarting by itself.\n"
                   "               Fix the cause (see the output above), then press Enter to try again.".format(quick), flush=True)
@@ -2231,7 +2600,14 @@ def main():
         parser.add_argument("--auto", action="store_true", help="a plain Claude tab when the folder is home")
         parser.add_argument("--ask", action="store_true", help="a new space: ask whether to set one up, or what to open instead")
         parser.add_argument("--fresh", action="store_true", help="start a new conversation")
-        return cmd_session(parser.parse_args())
+        parser.add_argument("--self-check", action="store_true", help=argparse.SUPPRESS)  # t-037: a restart's pre-check
+        parser.add_argument("--restarted", help=argparse.SUPPRESS)  # the request id that exec'd this process
+        parser.add_argument("--from-instance", help=argparse.SUPPRESS)
+        parser.add_argument("--restart-by", help=argparse.SUPPRESS)
+        args = parser.parse_args()
+        if args.self_check:
+            return cmd_self_check(args)
+        return cmd_session(args)
     if kind == "pa-profile":
         parser.add_argument("action", nargs="?", default="show", choices=("show", "apply", "set"))
         parser.add_argument("name", nargs="?")

@@ -4,8 +4,8 @@ Spec R4-R9, R11 with the accepted changes S1-S6 (spec.md, card d-108); plan.md J
 
 Run: python3 -m unittest -v tests/test_pa_restart.py
 Temp homes only: HERDR_PA_HOME, HERDR_APP_HOME and CLAUDE_CONFIG_DIR point at a temp folder before pa.py is loaded;
-hc is never called (pa.call, hc_get and live_terminals are replaced); os.execv and os.kill are replaced by recorders
-that raise when a test did not expect them; no real Claude, no real launcher, no signal to any process but a test's
+hc is never called (pa.call, hc_get and live_terminals are replaced); os.execv is replaced by a recorder that
+raises when a test did not expect it; no real Claude, no real launcher, no signal to any process but a test's
 own stand-in.
 """
 import argparse
@@ -99,7 +99,7 @@ class Base(unittest.TestCase):
         self.project = os.path.join(TMP, "proj")
         os.makedirs(self.project, exist_ok=True)
         self.saved = {k: getattr(pa, k) for k in ("live_terminals", "hc_get", "call", "__file__")}
-        self.saved_os = (os.execv, getattr(os, "kill"))
+        self.saved_os = os.execv
         self.calls = []
         pa.call = lambda argv, check=True: self.calls.append(list(argv)) or ""
         pa.hc_get = lambda address: {}
@@ -108,14 +108,12 @@ class Base(unittest.TestCase):
         def no_exec(*a):
             raise AssertionError("os.execv called unexpectedly: {}".format(a))
 
-        def no_kill(*a):
-            raise AssertionError("os.kill called: {}".format(a))
-        os.execv, os.kill = no_exec, no_kill
+        os.execv = no_exec  # os.kill is not trapped: subprocess ends its own timed-out child with it (AC9.1 greps pa.py)
 
     def tearDown(self):
         for k, v in self.saved.items():
             setattr(pa, k, v)
-        os.execv, os.kill = self.saved_os
+        os.execv = self.saved_os
 
     def stamp(self, commit=None):
         code, _out, err = quiet(pa.cmd_stamp, argparse.Namespace(commit=commit, dirty=False, synced_from=None))
@@ -457,15 +455,15 @@ class Requests(Base):
             self.execs.append((path, list(argv)))
             raise Execd()
         self.recorder = recorder
-        self.saved_timeouts = (pa.SELF_CHECK_TIMEOUT, pa.PROBE_TIMEOUT)
+        self.saved_timeouts = (pa.SELF_CHECK_TIMEOUT, pa.PROBE_TIMEOUT, pa.restart_precheck)
 
     def tearDown(self):
-        pa.SELF_CHECK_TIMEOUT, pa.PROBE_TIMEOUT = self.saved_timeouts
+        pa.SELF_CHECK_TIMEOUT, pa.PROBE_TIMEOUT, pa.restart_precheck = self.saved_timeouts
         super().tearDown()
 
     def ctx(self, child=None):
         ctx = self.record()
-        ctx.update(child=child if child is not None else FakeChild(), directory=self.dir, project=self.project,
+        ctx.update(beat=True, previous=None, child=child if child is not None else FakeChild(), directory=self.dir, project=self.project,
                    running={"since": time.time() - pa.RAN - 5, "session": SID, "marked": False})
         return ctx
 
@@ -900,8 +898,8 @@ class AC7_1_ExitReloads(Requests):
         old = pa.hash_or_none(os.path.join(pa.ROOT, "tools"), True)
         write(os.path.join(pa.ROOT, "tools", "pa_costs.py"), "z = 3\n")
         self.stamp()  # installed differs; tools/pa.py prints 'pa': the self-check fails
-        starts, how, out = self.run_loop_with_record_exits(old, exits=3)
-        self.assertEqual((len(starts), how, self.execs), (4, "Stop", []))
+        starts, how, out = self.run_loop_with_record_exits(old, exits=2)
+        self.assertEqual((len(starts), how, self.execs), (3, "Stop", []))
         self.assertEqual(out.count("not reloading"), 1, out)
 
     def run_loop_with_record_exits(self, tools, exits):

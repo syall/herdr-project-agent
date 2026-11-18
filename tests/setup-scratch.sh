@@ -12,7 +12,7 @@ repo=$(cd "$here/.." && pwd)
 mkdir -p "$S/pa/profiles/test" "$S/bin" "$S/state" "$S/config" "$S/run" "$S/app" "$S/claude" "$S/proj"
 rm -rf "$S/pa/core"
 cp -R "$repo/runtime/core" "$S/pa/core"
-printf '{"name":"test","claude":["%s/bin/stub-claude"],"codex":["true"]}\n' "$S" > "$S/pa/profiles/test/profile.json"
+printf '{"name":"test","claude":["%s/bin/stub-claude"],"codex":["true"],"systemPromptSnapshot":"keep"}\n' "$S" > "$S/pa/profiles/test/profile.json"
 printf '{"defaultProfile":"test"}\n' > "$S/pa/config.json"
 ln -sf "$repo/runtime/tools/pa.py" "$S/bin/pa-session"
 ln -sf "$repo/runtime/tools/pa.py" "$S/bin/pa-start"
