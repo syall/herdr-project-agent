@@ -4077,6 +4077,203 @@ cases["P-costs-t050-words"] = async () => { // t-050: the one-scope note in plai
   check(t2.includes("| All costs priced from the price file's prices for provider provider-a valid from 2026-01-01 · provider provider-a, endpoint regional, region region-a, account acct1 |"), `every fact known: named, no parentheses (got ${t2.slice(0, 1200)})`);
 };
 
+// ---- t-045: a decision card stays answered once the person submits (Wanted 1-4) ----
+// The card's write on m1 (python3 -c REMOTE_WRITE) held until release(); `after` runs when it is called.
+function holdWrite({ reply = null, after = null } = {}) {
+  let release; const held = new Promise((r) => { release = r; });
+  const prior = g.__execFn;
+  g.__execFn = (command, args, on, options) => {
+    if (command === "python3" && args[0] === "-c" && args.length === 5) {
+      after?.();
+      return held.then(() => {
+        if (reply) return reply;
+        g.__files[`${on ?? ""}:${args[2]}`] = args[4]; (g.__writes ??= []).push(`${on ?? ""}:${args[2]}`);
+        return { code: 0, stdout: "", stderr: "" };
+      });
+    }
+    return prior ? prior(command, args, on, options) : undefined;
+  };
+  return () => release();
+}
+// Whether a tree has a text field (a note input) anywhere.
+const hasInput = (x) => Boolean(x && typeof x === "object" && (x.kind === "input" || (x.kids ?? []).some(hasInput)));
+const optClicks = (clicks, id) => Object.keys(clicks).filter((k) => k.startsWith(`opt-${id}-`) || k === `submit-${id}`);
+const R1 = `${M}:${RDIR}/decisions/d-01.json`;
+async function remoteCardWorld() {
+  world({ machine: M }); remoteCards(1);
+  const v = await mount(); await settle();
+  await click(v, "view-decisions");
+  return v;
+}
+const locked = (v, id, label, what) => {
+  const tree = v.render(cx), { text, clicks } = inspect(tree);
+  check(text.includes(`answered: ${label}`), `${what}: the chip says answered: ${label} (got ${text.slice(0, 600)})`);
+  check(!/\| open \|/.test(text), `${what}: no open chip (got ${text.slice(0, 600)})`);
+  check(optClicks(clicks, id).length === 0, `${what}: no option or Submit to click (got ${optClicks(clicks, id)})`);
+  check(!hasInput(tree), `${what}: no note field`);
+  return text;
+};
+
+cases["P45-locked-while-saving"] = async () => { // W1: from the Submit click: answered, no option, no Submit, no note; also after the write while the reload is slow
+  const v = await remoteCardWorld();
+  const release = holdWrite();
+  await click(v, "opt-d-01-0"); await click(v, "submit-d-01"); await settle();
+  const t = locked(v, "d-01", "Yes", "write in flight");
+  check(t.includes("Saving…"), `says Saving… (got ${t.slice(0, 600)})`);
+  check(JSON.parse(g.__files[R1]).status === "open", "the file is not written yet");
+  g.__remoteDelay = 1e9; // the reload after the write: every read on m1 waits
+  release(); await settle(); await settle();
+  check(JSON.parse(g.__files[R1]).answer === "Yes", "the file is answered Yes");
+  const t2 = locked(v, "d-01", "Yes", "written, reload slow");
+  check(!t2.includes("Saving…"), `no Saving… once written (got ${t2.slice(0, 600)})`);
+  g.__remoteDelay = 0; await step(1e9); await settle(); await settle(); await settle();
+  for (let i = 0; i < 4 && !look(v).text.includes("1 answered"); i++) await step(D);
+  const t3 = look(v).text;
+  check(t3.includes("1 answered") && !/\| open \|/.test(t3) && optClicks(look(v).clicks, "d-01").length === 0, `the read confirms: in the answered fold (got ${t3.slice(0, 600)})`);
+};
+
+cases["P45-old-read-after-write"] = async () => { // W2: a refresh that read the open card before the write commits after it; the timer; a space switch and back
+  world({ machine: M }); remoteCards(1); addRemoteSpace("sp2", "other", ledgerOf(1, "o"));
+  const v = await mount(); await settle();
+  await click(v, "view-decisions");
+  let releaseRead; const heldRead = new Promise((r) => { releaseRead = r; });
+  g.__execFn = (command, args) => {
+    if (stubs.execKind(command, args) !== "batch" || !String(args[3]).includes(`/${S}/`)) return undefined;
+    const old = g.__files[R1];
+    return heldRead.then(() => ({ code: 0, stdout: `d-01.json\0${old}\0`, stderr: "" }));
+  };
+  advance(11000); v.reload(cx); await settle(); // the 10 s refresh: its card read holds the open copy
+  await click(v, "opt-d-01-0"); await click(v, "submit-d-01"); await settle();
+  check(JSON.parse(g.__files[R1]).answer === "Yes", "the file is answered Yes");
+  locked(v, "d-01", "Yes", "before the old read lands");
+  g.__remoteDelay = D; releaseRead(); await settle(); await settle();
+  locked(v, "d-01", "Yes", "the old read landed");
+  // Another old read, from the timer, while the mark is not yet resolved.
+  let releaseRead2; const heldRead2 = new Promise((r) => { releaseRead2 = r; });
+  g.__execFn = (command, args) => (stubs.execKind(command, args) === "batch" && String(args[3]).includes(`/${S}/`)
+    ? heldRead2.then(() => ({ code: 0, stdout: `d-01.json\0${openCard("d-01")}\0`, stderr: "" })) : undefined);
+  await fire(10000);
+  locked(v, "d-01", "Yes", "timer refresh in flight");
+  // A space switch away and back: the kept copy of sp1 (read open) is shown at once.
+  show(`${M}/sp2`); v.reload(cx); await settle();
+  show(RS); v.reload(cx); await settle();
+  await click(v, "view-decisions");
+  locked(v, "d-01", "Yes", "back from another space (the kept copy)");
+  releaseRead2(); await settle(); await settle();
+  locked(v, "d-01", "Yes", "the timer's old read landed");
+  g.__execFn = null;
+  for (let i = 0; i < 12 && !look(v).text.includes("1 answered"); i++) { advance(11000); v.reload(cx); await step(D); await step(D); await step(D); }
+  const t = look(v).text;
+  check(t.includes("1 answered") && !/\| open \|/.test(t), `a read after the write: in the answered fold (got ${t.slice(0, 600)})`);
+};
+
+cases["P45-second-window"] = async () => { // W2: a second panel window draws the card answered from the submit, and refuses a click
+  const v = await cardsWorld({}, ["d-x"]);
+  const w = await mount();
+  await click(v, "opt-d-x-0"); await click(v, "submit-d-x");
+  check(JSON.parse(g.__files[`:${DIR}/decisions/d-x.json`]).answer === "A", "written A");
+  const t = locked(w, "d-x", "A", "the other window, before its own read");
+  check(t.includes("Answered in another panel window."), `says where (got ${t.slice(0, 600)})`);
+  w.reload(cx); await settle();
+  const t2 = look(w).text;
+  check(t2.includes("1 answered") && !/\| open \|/.test(t2), `its own read: in the answered fold (got ${t2.slice(0, 600)})`);
+  // The shared mark ends: after ANSWERING_TTL (120 s) a window that never read the card shows the file it has.
+  const u = await mount();
+  u.cards = u.cards.map((c) => (c.id === "d-x" ? { ...c, card: { ...c.card, status: "open", answer: null } } : c));
+  advance(121000);
+  check(/\| open \|/.test(look(u).text), `after the TTL the shared mark no longer locks (got ${look(u).text.slice(0, 400)})`);
+};
+
+cases["P45-reopened"] = async () => { // W2: a real change after the answer (the card reopened with new text) is shown by a newer read
+  const v = await cardsWorld({}, ["d-x"]);
+  g.__delay = { [`:${DIR}/agent.json`]: 5000 };
+  await click(v, "opt-d-x-0"); await click(v, "submit-d-x");
+  locked(v, "d-x", "A", "reload slow");
+  g.__files[`:${DIR}/decisions/d-x.json`] = JSON.stringify({ id: "d-x", status: "open", question: "Q d-x, asked again?", options: [{ label: "A" }, { label: "B" }], created: "2026-11-16T11:00:00Z" });
+  await step(5000); await settle();
+  const { text, clicks } = look(v);
+  check(/\| open \|/.test(text) && text.includes("Q d-x, asked again?") && Boolean(clicks["opt-d-x-1"]), `the reopened card is drawn open (got ${text.slice(0, 600)})`);
+};
+
+cases["P45-write-failed"] = async () => { // W3: only a write that really failed unlocks the card, saying so
+  const v = await remoteCardWorld();
+  const text0 = g.__files[R1];
+  const release = holdWrite({ reply: { code: 3, stdout: "", stderr: "" } }); // the compare failed: nothing written
+  await click(v, "opt-d-01-0"); await click(v, "submit-d-01"); await settle();
+  locked(v, "d-01", "Yes", "in flight");
+  release(); await settle(); await settle();
+  const { text, clicks } = look(v);
+  check(g.__files[R1] === text0, "the file is unchanged");
+  check(/Not saved: .*Pick an option and submit again\./.test(text), `says Not saved (got ${text.slice(0, 800)})`);
+  check(/\| open \|/.test(text) && Boolean(clicks["opt-d-01-1"]), `the card is open again (got ${Object.keys(clicks)})`);
+  // A failure the panel cannot tell: the write failed and the re-read failed too.
+  const v2 = await remoteCardWorld();
+  const release2 = holdWrite({ reply: { code: 1, stdout: "", stderr: "disk full" }, after: () => { g.__fail = [R1]; } });
+  await click(v2, "opt-d-01-0"); await click(v2, "submit-d-01"); await settle();
+  g.__remoteDelay = 1e9; release2(); await settle(); await settle();
+  const t2 = locked(v2, "d-01", "Yes", "unsure");
+  check(t2.includes("Could not tell whether the answer was saved; reading the card again."), `says it could not tell (got ${t2.slice(0, 800)})`);
+  g.__fail = []; g.__remoteDelay = 0; await step(1e9); await settle(); await settle();
+  for (let i = 0; i < 4 && !/Not saved/.test(look(v2).text); i++) await step(D);
+  const t3 = look(v2).text;
+  check(/Not saved: disk full/.test(t3) && Boolean(look(v2).clicks["opt-d-01-1"]), `a fresh open read: Not saved, open again (got ${t3.slice(0, 800)})`);
+};
+
+cases["P45-rule-change-fails"] = async () => { // W3: the answer saved, the rule not changed: the card stays answered with its own message
+  world();
+  g.__files[RULES] = "{ not json";
+  g.__files[`:${DIR}/decisions/d-r.json`] = JSON.stringify({ id: "d-r", status: "open", rule: "r-p", question: "Adopt rule r-p?",
+    options: [{ label: "Approve" }, { label: "Decline" }], created: "2026-11-16T10:00:00Z" });
+  g.__ls[`:${DIR}/decisions`] = ["d-r.json"];
+  const v = await mount(); await settle();
+  g.__delay = { [`:${DIR}/agent.json`]: 5000 };
+  await click(v, "opt-d-r-0"); await click(v, "submit-d-r");
+  check(JSON.parse(g.__files[`:${DIR}/decisions/d-r.json`]).answer === "Approve", "the answer is written");
+  const t = locked(v, "d-r", "Approve", "rule change failed");
+  check(t.includes("The answer was saved; the rule was not changed:"), `its own message (got ${t.slice(0, 800)})`);
+  check(!/Not saved/.test(t), "not called Not saved");
+};
+
+cases["P45-push-in-flight"] = async () => { // W1 (t124): while pa-push-main run is in flight, no option is clickable and no Submit
+  const gate = deferred();
+  const { v } = await pushWorld({ tool: { run: () => gate.promise } });
+  await click(v, `opt-${PID}-0`); await settle();
+  await click(v, `submit-${PID}`); await settle();
+  const { text, clicks } = look(v);
+  check(text.includes("Pushing…") && optClicks(clicks, PID).length === 0, `no option or Submit while it runs (got ${optClicks(clicks, PID)})`);
+  gate.resolve(json(1, { ok: false, refusal: { check: "C9", message: "remote moved" } })); await settle(); await settle();
+  check(Boolean(look(v).clicks[`opt-${PID}-1`]), "a refusal: the card is open again");
+};
+
+cases["P45-push-no-second-run"] = async () => { // W1/W4: after a Push from here, while the reload is slow: no option, no Submit, one run
+  let file;
+  const { v, file: f } = await pushWorld({ tool: { run: () => { g.__files[file] = answeredByTool(); return json(0, toolPushed); } } });
+  file = f;
+  await click(v, `opt-${PID}-0`); await settle();
+  g.__delay = { [`:${DIR}/agent.json`]: 5000 };
+  await click(v, `submit-${PID}`); await settle(); await settle();
+  const { text, clicks } = look(v);
+  check(JSON.parse(g.__files[file]).answer === "Push", "the tool wrote Push");
+  check(text.includes("answered: Push") && optClicks(clicks, PID).length === 0, `answered: Push, no option or Submit (got ${optClicks(clicks, PID)}; ${text.slice(0, 600)})`);
+  // Even called directly (a stale click), this copy runs pa-push-main once.
+  v.push.run(g.__spaces[0], v.cards.find((c) => c.id === PID), "Not now", "", cx, () => {}); await settle();
+  check(pushExecs("run").length === 1, `one run (got ${pushExecs("run").length})`);
+};
+
+cases["P45-push-answer-differs"] = async () => { // W4: a run whose exit 0 says another answer is shown and told as that answer, never as the label asked
+  let file;
+  const already = { ...toolPushed, message: `${PID} was already pushed at 2026-11-16T10:01:00Z (aa22000..cc11000); nothing to do.` };
+  const { v, file: f } = await pushWorld({ tool: { run: () => { g.__files[file] = answeredByTool(); return json(0, already); } } });
+  file = f;
+  await click(v, `opt-${PID}-1`); await settle();
+  await click(v, `submit-${PID}`); await settle(); await settle();
+  const { text } = look(v);
+  check(!text.includes("Answered Not now"), `not shown as Not now (got ${text.slice(0, 1200)})`);
+  check(text.includes(`Pushed ${PURL} main aa22000..cc11000`), `shown as pushed (got ${text.slice(0, 1200)})`);
+  const told = v.unsent.map((x) => x.message);
+  check(told.length === 1 && told[0].startsWith(`decision ${PID} was already answered Push; `) && !told.some((m) => /answered Not now/.test(m)), `the notice (got ${JSON.stringify(told)})`);
+};
+
 // Which cases run (t-031): every case, or the named ones; --shard=<k>/<n> keeps every n-th case by definition
 // order (index mod n == k - 1), so n shards together run each case once, and a case added later lands in one.
 // --list prints the names that would run and runs none. An unknown name or option exits 2.

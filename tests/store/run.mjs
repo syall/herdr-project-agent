@@ -445,6 +445,53 @@ cases["S-push-id-file-name"] = async () => {
   check(by["/d/d-a.json"].id === "d-other" && !by["/d/d-a.json"].mismatch && !by["/d/d-a.json"].dash, "an ordinary card keeps its own id, as before");
 };
 
+// ---- t-045 W4: an answer already written is never changed; two remote writers are serialised ----
+cases["S45-answered-refused"] = async () => {
+  for (const space of [local, remote]) {
+    world();
+    const k = keyOf(space, "/decisions/d-1.json"), path = `${space.machine ? rdir : ldir}/decisions/d-1.json`;
+    const done = card("d-1", { status: "answered", answer: "A", options: [{ label: "A" }, { label: "B" }] });
+    g.__files[k] = done;
+    let err = null;
+    try { await store.answerDecision(space, { id: "d-1", path }, "B", "changed my mind"); } catch (e) { err = e; }
+    check(err?.message === "This card was already answered.", `${space.machine ?? "local"}: refused (got ${err?.message ?? "no error"})`);
+    check(g.__files[k] === done && !(g.__writes ?? []).length, `${space.machine ?? "local"}: the file is unchanged, nothing written`);
+    const open = card("d-1", { options: [{ label: "A" }, { label: "B" }] });
+    g.__files[k] = open;
+    const r = await store.answerDecision(space, { id: "d-1", path }, "B", "");
+    check(r && r.before === open && r.after === g.__files[k] && r.card?.status === "answered" && r.card.answer === "B",
+      `${space.machine ?? "local"}: returns { card, before, after } (got ${JSON.stringify(r)?.slice(0, 300)})`);
+  }
+};
+
+cases["S45-remote-write-lock"] = async () => { // the real REMOTE_WRITE under python3: compare-and-write, and a writer that holds the lock wins
+  check(typeof store.REMOTE_WRITE === "string", "REMOTE_WRITE is exported");
+  const { spawn, spawnSync } = await import("child_process");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "t045-write-")), file = path.join(dir, "d-1.json");
+  try {
+    const put = (s) => fs.writeFileSync(file, s), run = (expected, text) => spawnSync("python3", ["-c", store.REMOTE_WRITE, file, expected, text], { encoding: "utf8" });
+    put("OPEN");
+    let r = run("OPEN", "ANSWERED");
+    check(r.status === 0 && fs.readFileSync(file, "utf8") === "ANSWERED", `a match is replaced (got ${r.status} ${r.stderr})`);
+    r = run("OPEN", "OTHER");
+    check(r.status === 3 && fs.readFileSync(file, "utf8") === "ANSWERED", `a mismatch exits 3, unchanged (got ${r.status})`);
+    put("OPEN");
+    const ready = path.join(dir, "ready");
+    const holder = spawn("python3", ["-c", `
+import fcntl, os, sys, time
+f = open(sys.argv[1], "rb"); fcntl.flock(f, fcntl.LOCK_EX)
+open(sys.argv[2], "w").close(); time.sleep(0.6)
+tmp = sys.argv[1] + ".tmp"; open(tmp, "w").write("HOLDER"); os.replace(tmp, sys.argv[1])
+`, file, ready]);
+    const ended = new Promise((res) => holder.on("exit", res));
+    for (let i = 0; i < 400 && !fs.existsSync(ready); i++) await new Promise((res) => setTimeout(res, 10));
+    check(fs.existsSync(ready), "the holder has the lock");
+    r = run("OPEN", "SECOND");
+    await ended;
+    check(r.status === 3 && fs.readFileSync(file, "utf8") === "HOLDER", `the waiting write sees the holder's answer and exits 3 (got ${r.status}, file ${fs.readFileSync(file, "utf8")})`);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+};
+
 const pick = process.argv.slice(2);
 let failed = 0;
 for (const [name, fn] of Object.entries(cases)) {
