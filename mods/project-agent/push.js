@@ -35,6 +35,13 @@ const stamp = (iso) => { const d = new Date(iso); return Number.isNaN(d.getTime(
 const text = (v) => (v === null || v === undefined ? "" : String(v));
 const sleeper = (cx) => ({ sleep: (ms) => cx.sleep(ms) });
 const failed = (message) => ({ ok: false, refusal: { check: "panel", message } });
+// Why a push card is shown only (store.js parseCards, t-028): its own id is not its file name, or the name reads as
+// an option. Such a card is never checked or run, whatever is clicked. null: none.
+export function shownOnly(entry) {
+  if (entry?.dash) return `This card's file name (${entry.id}) starts with a dash: shown only, never checked or run.`;
+  if (entry?.mismatch) return `This card's id (${entry.mismatch}) is not its file name (${entry.id}): shown only, never checked or run.`;
+  return null;
+}
 
 // The JSON object a pa-push-main/pa-push-allow command printed, or null.
 function printed(r) {
@@ -75,7 +82,7 @@ export class PushCards {
 
   // From a shown copy's commit (main.js): the first check of an open push card, at most one per CHECK_EVERY.
   wantCheck(space, entry, cx) {
-    if (!isPush(entry?.card) || entry.card.status !== "open") return;
+    if (!isPush(entry?.card) || entry.card.status !== "open" || shownOnly(entry)) return;
     const st = this.of(space.id, entry.id);
     if (st.check || st.busy || st.running || (st.asked && Date.now() - st.asked < CHECK_EVERY)) return;
     this.check(space, entry, cx);
@@ -84,7 +91,7 @@ export class PushCards {
   // `pa-push-main check <id> --space <id> --json`: read-only; its facts are what the block shows.
   check(space, entry, cx) {
     const st = this.of(space.id, entry.id);
-    if (st.busy || st.running) return;
+    if (st.busy || st.running || shownOnly(entry)) return;
     const asked = Date.now();
     st.busy = true; st.asked = asked; st.stale = false;
     cx.spawn(async (cx) => {
@@ -111,10 +118,13 @@ export class PushCards {
   // After a refusal or an unknown result the card is checked again. Returns whether it started.
   run(space, entry, label, note, cx, told) {
     const st = this.of(space.id, entry.id);
+    if (shownOnly(entry)) return false;
+    // Not now while a check runs: not run, and said (t-028); not queued: a run starts only from a Submit click.
+    if (label === NOT_NOW && st.busy && !st.running) { st.notNowWait = true; cx.notify(); return false; }
     if (st.running || st.busy || (label !== PUSH && label !== NOT_NOW)) return false;
     if (label === PUSH && !this.canSubmit(space.id, entry.id)) { st.stale = true; cx.notify(); return false; }
     const args = ["run", entry.id, "--answer", label, "--space", localId(space.id), ...(label === PUSH ? ["--seen", st.check.seen] : []), "--json", ...(note ? ["--note", note] : [])];
-    st.running = label; st.result = null; st.error = null; st.errorFor = label; st.unknown = null; st.stale = false;
+    st.running = label; st.result = null; st.error = null; st.errorFor = label; st.unknown = null; st.stale = false; st.notNowWait = false;
     cx.spawn(async (cx) => {
       const { r, error } = await call(cx, space, "pa-push-main", args, RUN_TIMEOUT);
       st.running = null;
@@ -158,10 +168,14 @@ export class PushCards {
     const small = (s, color) => { if (s) lines.push(String(s)); return div().text_size(11).text_color(color ?? t.dim).child(sel(id(lines.length), s)); };
     const sub = (s, color, size = 11.5) => { lines.push(`  ${s}`); return div().pl(12).text_size(size).text_color(color).child(sel(id(lines.length), s)); };
     const box = v_flex().id(`push-${entry.id}`).gap(3).p(8).rounded(6).border(1).border_color(t.border).bg(t.background);
+    const only = shownOnly(entry);
+    if (only) return box.child(line(only, t.blocked)); // never checked or run: nothing else to show
     if (!open) {
       const r = c.push?.result;
       if (st?.result) this.shown(t, box, st, {}, lines, entry.id);
-      if (st?.unknown) {
+      // The last check found the card open, and it has closed since (another route, t-028): that verdict is old.
+      if (st?.unknown && !st.busy && st.check?.ok === true) box.child(line(`The result was unknown (${st.unknown}); the card was open when checked and has closed since.`, t.blocked));
+      else if (st?.unknown) {
         // A run whose result is unknown, after which the card was read answered: the one check's verdict.
         box.child(line(`The result is unknown (${st.unknown}); checking the card again.`, t.blocked));
         if (st.busy) box.child(line("Checking…", t.dim));
@@ -198,6 +212,7 @@ export class PushCards {
     if (st?.result) this.shown(t, box, st, f, lines, entry.id);
     if (st?.error) box.child(line(`${st.errorFor === NOT_NOW ? "Not saved" : "Not pushed"}: ${st.error}`, t.blocked));
     if (st?.unknown) box.child(line(`The result is unknown (${st.unknown}); checking the card again.`, t.blocked));
+    if (st?.notNowWait) box.child(line("Not now was not saved: a check was running. Submit it again.", t.blocked));
     if (busy) box.child(line("Checking…", t.dim));
     else if (!chk) box.child(small(st?.running ? "" : "Not checked yet."));
     else if (chk.ok !== true) box.child(line(`Push is not possible now (${text(chk.refusal?.check)}): ${text(chk.refusal?.message)}`, t.blocked));

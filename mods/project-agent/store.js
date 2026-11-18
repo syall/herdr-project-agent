@@ -263,7 +263,11 @@ export function parseCards(files) {
     let value = null, error = null;
     try { value = JSON.parse(text); } catch (e) { error = String(e.message ?? e); }
     const valid = value && typeof value === "object" && typeof value.question === "string" && Array.isArray(value.options);
-    cards.push({ id: value?.id ?? name.replace(/\.json$/, ""), path, text, card: valid ? value : null, error: error ?? (valid ? null : "not a decision card (needs question and options)") });
+    // A push card's id is its file name (t-028): the panel checks and runs that id, never the file's own `id`.
+    // mismatch: its own id when that differs (shown only, never checked or run); dash: a name that reads as an option.
+    const fileId = name.replace(/\.json$/, ""), push = Boolean(valid && isPush(value));
+    const flags = !push ? {} : { ...(value.id !== undefined && String(value.id) !== fileId ? { mismatch: String(value.id) } : {}), ...(fileId.startsWith("-") ? { dash: true } : {}) };
+    cards.push({ id: push ? fileId : value?.id ?? fileId, path, text, card: valid ? value : null, error: error ?? (valid ? null : "not a decision card (needs question and options)"), ...flags });
   }
   const when = (c) => String(c.card?.created ?? "");
   return cards.sort((a, b) => Number(b.card?.status === "open") - Number(a.card?.status === "open") || when(b).localeCompare(when(a)) || b.id.localeCompare(a.id));

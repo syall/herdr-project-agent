@@ -16,7 +16,7 @@ import { RulesPane, arm, armHolds, fieldState } from "./rules.js"; // arm, armHo
 import { SetupPane } from "./setup.js";
 import { Keeper, idleShell } from "./keeper.js";
 import { WorkerPane } from "./worker.js";
-import { PushCards, isPush, PUSH, PUSH_OPTIONS } from "./push.js";
+import { PushCards, isPush, shownOnly, PUSH, PUSH_OPTIONS } from "./push.js";
 import { CostsPane } from "./costs.js";
 import { Copier, sel } from "./copy.js";
 import { tick, cadence, holdReason, setSchedule, requestPass, PRESETS, MIN_MINUTES } from "./timer.js";
@@ -780,7 +780,7 @@ export default class ProjectAgent extends View {
     const open = c.status === "open", busy = Boolean(this.busy[entry.id]) || Boolean(running);
     const task = c.task && (this.data?.ledger?.tasks ?? []).find((x) => x.id === c.task);
     const picked = open ? this.choice[entry.id] ?? null : null;
-    const ready = Boolean(picked) && !busy && (!push || picked !== PUSH || this.push.canSubmit(space.id, entry.id)); // Push: a fresh check that passed
+    const ready = Boolean(picked) && !busy && !(push && shownOnly(entry)) && (!push || picked !== PUSH || this.push.canSubmit(space.id, entry.id)); // Push: a fresh check that passed; a shown-only card: never
     const evidence = Boolean(c.task) && Boolean(this.data?.evidence?.has(c.task)) ? cardEvidence(c, this.data?.evidence?.get(c.task)) ?? `${c.task} evidence` : null;
     const pushLines = []; // filled by the push block below, in this render; read by Copy at its click
     return v_flex().id(`card-${entry.id}`).flex_none().p(10).gap(7).rounded(7).border(1).border_color(this.spotlight === entry.id ? t.accent : open ? t.input : t.border).bg(t.surface)
