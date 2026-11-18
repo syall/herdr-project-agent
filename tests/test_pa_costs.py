@@ -5249,9 +5249,9 @@ class PX_PaContext(Collecting):
     def test_px10e_the_rest_is_shrunk_as_without_paContext(self):
         """t-041 J1 round 4: when the rest is over the cap by itself, shrink runs on it exactly as without paContext
         (same steps, same truncated), then the newest days that fit in the room left go back, in paContext's place."""
-        for n_sessions, pad in ((400, 200), (330, 200), (300, 210)):
+        for n_sessions, pad, day_pad in ((400, 200, 1500), (330, 200, 1500), (300, 210, 150)):  # 8, 5, 14 days go back
             sessions = [{"session": "s{:04d}".format(i), "pad": "y" * pad} for i in range(n_sessions)]
-            days = self.pc_days(14, 150)
+            days = self.pc_days(14, day_pad)
             big = {"sessions": list(sessions), "byTask": [], "passes": [{"pass": 1}], "byDayModel": [],
                    "paContext": list(days), "unmatched": {}}
             ref = json.loads(json.dumps(big))
@@ -5352,7 +5352,7 @@ class PX_PaContext(Collecting):
         write_summary loop; shrink is cf0de90's). The grid: K = 150, 165, 175, 200 at N = 20, 40, 50, 60, 80, and the
         reviewer's sweep K = 100..259 step 3 at N = 60 and 80, which holds K = 154 and 244..256 at N = 80 (round 3 cut
         the Sessions list there: 155 -> 116 sessions and truncated). paContext is the newest days that fit in the
-        room left; 'pa-costs report' keeps all N days."""
+        room left, or left out where not even [] fits (K = 154, N = 80); 'pa-costs report' keeps all N days."""
         cases = [(k, n) for k in (150, 165, 175, 200) for n in (20, 40, 50, 60, 80)]
         cases += [(k, n) for n in (60, 80) for k in range(100, 261, 3)]
         self.assertIn((154, 80), cases)
@@ -5375,13 +5375,15 @@ class PX_PaContext(Collecting):
             old = load(self.costs("summary.json"))
             self.summary()
             new = load(self.costs("summary.json"))
-            self.assertIn("paContext", new, (k, n))
             self.assertEqual({key: v for key, v in new.items() if key != "paContext"}, old, (k, n))
             _r, out, _e = self.run_cmd(pa_costs.report, self.dir, as_json=True, now=T0 + 5000)
             every = json.loads(out)["paContext"]
             self.assertEqual(len(every), n, (k, n))  # report keeps all days
             self.assertEqual(every[0]["day"], D0, (k, n))
-            self.assert_newest_days_that_fit(new, every[:pa_costs.PA_CONTEXT_SUMMARY_DAYS])
+            if "paContext" in new:
+                self.assert_newest_days_that_fit(new, every[:pa_costs.PA_CONTEXT_SUMMARY_DAYS])
+            else:  # not even [] fits in the room left (K = 154, N = 80: cf0de90 wrote 65,532 bytes)
+                self.assertGreater(len(pa_costs.compact(dict(new, paContext=[])).encode()), pa_costs.SUMMARY_MAX, (k, n))
 
     def test_px13_readme_names_the_report(self):
         with open(os.path.join(HERE, "..", "README.md")) as f:
