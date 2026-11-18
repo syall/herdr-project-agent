@@ -152,7 +152,7 @@ export const cx = makeCx();
 export const agents = () => g.__agents ?? [];
 export const props = () => g.__als?.getStore()?.props ?? g.__props ?? {};
 export const theme = () => new Proxy({}, { get: () => "#808080" });
-export const window = () => ({ platform: "macos" });
+export const window = () => ({ platform: g.__platform ?? "macos" }); // __platform (t-060): "linux" | "windows" for a case
 export const layout = () => g.__layout ?? {};
 // Never changes, unless a case keeps __watchers (t-053): then each call waits for a batch the case gives it.
 export const watchFolder = (path) => {

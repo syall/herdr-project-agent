@@ -4813,6 +4813,9 @@ cases["P53-grep-host-calls"] = async () => { // AC1.3, AC6.2: no cx.sleep outsid
   check(!imports.length && fs.existsSync(path.join(src, "host.js")), `only host.js imports them (got ${imports})`);
 };
 
+// t-060 keep awake: its cases live in tests/panel/awake.mjs.
+await (await import("./awake.mjs")).register(cases, { world, mount, look, click, check, settle, fire, advance, dst });
+
 // Which cases run (t-031): every case, or the named ones; --shard=<k>/<n> keeps every n-th case by definition
 // order (index mod n == k - 1), so n shards together run each case once, and a case added later lands in one.
 // --list prints the names that would run and runs none. An unknown name or option exits 2.
