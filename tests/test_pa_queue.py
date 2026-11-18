@@ -643,6 +643,92 @@ class Q21GateOnto(QBase):
         self.assertIn("fa.txt", out)
 
 
+class Q23Rejoin(QBase):
+    """MF-J2-1 (review round 1, probe F): a task refused for a conflict, or a 'changed' rebase add keeps rebased, gets
+    the check R8 asks for on the last entry's branch and joins with pa-queue add again (spec-amendment R3 step 3, R8);
+    the gate and add agree on what was checked (the record's onto is the entry's branch it sits on)."""
+
+    def recheck(self, tid):
+        self.add_worker(tid, tid + "v2", "verifier")
+        self.checked(tid)
+        code, out, _err = self.gate(tid)
+        self.assertEqual(code, 0, out)
+
+    def rebase_worker(self, tid, onto, f, line, text):
+        wt = self.trees[tid]
+        subprocess.run(["git", "rebase", onto], cwd=wt, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        write(os.path.join(wt, f), line_edit(LINES, line, text))
+        sh(wt, "git", "add", f)
+        sh(wt, "git", "-c", "core.editor=true", "rebase", "--continue")
+
+    def stored_onto(self, tid):
+        tip = self.tip(tid)
+        return [r.get("onto") for r in pa_hooks.stored_records(self.dir, tid) if r.get("commit") == tip]
+
+    def test_q23a_conflict_rebase_worker_then_add_joins(self):  # probe F f1
+        self.task("t-A", [("a.txt", (2, "two A"))])
+        self.add("t-A")
+        self.task("t-B", [("a.txt", (2, "two B")), ("fb.txt", "b\n")])
+        code, out, err = self.add("t-B", ok=False)
+        self.assertIn("needs a rebase worker onto t-A-x", err)
+        self.rebase_worker("t-B", "t-A-x", "a.txt", 2, "two AB")
+        self.assertEqual(self.base_of("t-B", "t-A-x"), self.tip("t-A"))
+        self.recheck("t-B")
+        self.assertEqual(set(self.stored_onto("t-B")), {"t-A-x"})
+        tip = self.tip("t-B")
+        code, out, err = self.add("t-B")
+        e = self.entry("t-B")
+        self.assertEqual([x["task"] for x in self.entries()], ["t-A", "t-B"])
+        self.assertEqual(e["state"], "checking")
+        self.assertEqual(e["onto"], "t-A-x")
+        self.assertEqual(e["tip"], tip)
+        self.assertEqual(e["checked"]["base"], self.tip("t-A"))
+        self.assertEqual(e["rebases"], [])
+        self.assertEqual(self.gate("t-B")[0], 0)
+        code, out, err = self.queue("verify", "t-B", "--repo", self.proj)
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("clean", out)
+
+    def test_q23b_changed_kept_rebased_then_add_joins(self):  # probe F f2
+        self.task("t-A", [("a.txt", (100, "hundred"))])
+        self.add("t-A")
+        self.task("t-B", [("a.txt", (100, "hundred")), ("c.txt", "c\n")])
+        code, out, err = self.add("t-B", ok=False)
+        self.assertIn("needs the R8 check on", err)
+        self.recheck("t-B")
+        self.assertEqual(set(self.stored_onto("t-B")), {"t-A-x"})
+        tip = self.tip("t-B")
+        self.add("t-B")
+        e = self.entry("t-B")
+        self.assertEqual([x["task"] for x in self.entries()], ["t-A", "t-B"])
+        self.assertEqual((e["state"], e["onto"], e["tip"]), ("checking", "t-A-x", tip))
+
+    def test_q23c_rejoins_after_another_entry_joined_behind_it(self):
+        """The rebase worker put it on t-A-x; t-C joined after: add rebases it onto t-C-x, clean."""
+        self.task("t-A", [("a.txt", (2, "two A"))])
+        self.add("t-A")
+        self.task("t-B", [("a.txt", (2, "two B"))])
+        self.add("t-B", ok=False)
+        self.rebase_worker("t-B", "t-A-x", "a.txt", 2, "two AB")
+        self.recheck("t-B")
+        self.task("t-C", [("fc.txt", "c\n")])
+        self.add("t-C")
+        self.assertEqual(self.gate("t-B")[0], 0)
+        code, out, err = self.add("t-B")
+        e = self.entry("t-B")
+        self.assertEqual([x["task"] for x in self.entries()], ["t-A", "t-C", "t-B"])
+        self.assertEqual((e["state"], e["onto"]), ("checking", "t-C-x"))
+        self.assertEqual(e["rebases"][0]["result"], "clean")
+        self.assertEqual(self.base_of("t-B", "t-C-x"), self.tip("t-C"))
+
+    def test_q23d_task_on_main_still_checked_against_main(self):
+        """A task not queued that does not sit on an entry's branch: the record stays against main (J1)."""
+        self.task("t-A", [("fa.txt", "a\n")])
+        self.add("t-A")
+        self.task("t-B", [("fb.txt", "b\n")])
+        self.assertEqual(set(self.stored_onto("t-B")), {"main"})
+
+
 class Q22Install(unittest.TestCase):
     def test_q22_install_and_parse(self):
         lines = [l for l in read(os.path.join(REPO, "install.sh")).splitlines() if "pa_queue.py" in l]
