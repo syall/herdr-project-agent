@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -54,6 +55,18 @@ for _k, _v in _saved_env.items():
     else:
         os.environ[_k] = _v
 assert pa.ROOT.startswith(TMP), "pa.py must use the temp homes"
+
+
+def _load_pa_suite():
+    """runtime/tools/pa_suite.py as pa-full-suite loads it (pa_hooks.cmd_full_suite): its own module, given pa."""
+    spec = importlib.util.spec_from_file_location("pa_suite", os.path.join(TOOLS, "pa_suite.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    module.pa = pa
+    return module
+
+
+pa_suite_module = _load_pa_suite()
 
 TEST_ENV = {"HOME": os.path.join(TMP, "home"), "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid", "GIT_COMMITTER_NAME": "t",
@@ -283,7 +296,12 @@ class QBase(unittest.TestCase):
         return code, out, err
 
     def suite(self, tid, code):
-        pa_hooks.suite_record(self.dir, {"task": tid, "root": self.trees[tid]}, "full", code, 1.0)
+        """One suites.jsonl line as t-056's pa-full-suite writes it: pins (with untracked) from pa_suite.pins, start
+        and end, written by pa_hooks.suite_record (t-052 J3a A6: a line with no untracked count is not reusable)."""
+        found = pa_suite_module.pins(types.SimpleNamespace(**vars(pa_hooks)), self.trees[tid])
+        stamp = pa.now()
+        pa_hooks.suite_record(self.dir, {"task": tid, "root": self.trees[tid]}, "full", code, 1.0, found,
+                              {"start": stamp, "end": stamp})
 
     # ---- the files ----
     def qfile(self):

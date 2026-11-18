@@ -423,8 +423,9 @@ class Chain(ChainBase):
     def test_q13_conflict_in_restack_leaves(self):
         self.task("t-A", [("fa.txt", "a\n")])
         self.add("t-A")
+        # C is not planned on B (no dependsOn): `out` would take a dependent with it (J3a A4), and this case is the
+        # conflict in the restack of an entry built on B's branch that stays in the queue.
         self.queue("plan", "t-B", "--repo", self.proj, "--files", "a.txt")
-        self.queue("plan", "t-C", "--repo", self.proj, "--files", "a.txt")
         self.task("t-B", [("a.txt", (2, "two B"))])
         self.add("t-B")
         self.gate("t-B")
@@ -807,7 +808,8 @@ def t056_suite(test, tid, code, moved=False, untracked=None):
 class V8SuiteRuns(QBase):
     def test_suite_runs_reads_both_shapes(self):
         """J1's line and t-056's real line (pa_suite.full_suite's keys: start/end, parts {name, ok, seconds},
-        untracked, moved) come out in one shape; the t-056 times are its own start and end."""
+        untracked, moved) come out in one shape; the t-056 times are its own start and end. A J1 line has no untracked
+        count, so it is not reusable (pa_suite.clean's rule; t-052 J3a A6, Q-J3-6)."""
         self.task("t-A", [("fa.txt", "a\n")])
         os.makedirs(os.path.join(self.dir, "content"), exist_ok=True)
         j1 = {"at": "2026-11-18T10:00:10Z", "task": "t-A", "worker": "t1", "repo": "/r", "commit": "c", "tree": "t",
@@ -828,7 +830,7 @@ class V8SuiteRuns(QBase):
         self.assertEqual(runs[1]["parts"], [{"name": "unit", "ok": True, "seconds": 10}])
         self.assertEqual([r["moved"] for r in runs], [False, False, True, False])
         self.assertEqual([r["untracked"] for r in runs], [None, 0, 0, 2])
-        self.assertEqual([r["reusable"] for r in runs], [True, True, False, False])
+        self.assertEqual([r["reusable"] for r in runs], [False, True, False, False])  # J3a A6: J1's line has no untracked count
 
 
 class Q24NonReusableSuite(QBase):
