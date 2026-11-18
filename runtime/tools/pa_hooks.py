@@ -2779,7 +2779,23 @@ def trust_project(project, home, pa_home=None):
         if any(trust_inside(os.path.join(spaces, n), real) for n in names):
             return None, "the project folder holds a space folder of the Project Agent's home (through a symlink): " \
                          "its state would be inside it"
+        for n in names:
+            link = trust_link_into(os.path.join(spaces, n), real)
+            if link:
+                return None, "a symlink in a space folder of the Project Agent's home ({}) lands in the project " \
+                             "folder: its state would be inside it".format(link)
     return real, None
+
+
+def trust_link_into(folder, base):
+    """The first symlink found under folder's real path (walked without following links) whose real path is base
+    or inside it, else None (t-047 W1: a space folder's evidence/, ledger.json or any deeper entry linked into P)."""
+    for top, dirs, files in os.walk(os.path.realpath(folder)):
+        for name in dirs + files:
+            path = os.path.join(top, name)
+            if os.path.islink(path) and trust_inside(path, base):
+                return path
+    return None
 
 
 def trust_inside(folder, base):
@@ -2808,9 +2824,11 @@ TRUST_GIT_DROP = ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE"
 
 
 def trust_git_env(environ):
-    """pa-trust's git environment: without the variables that move git's repository discovery, and LC_ALL=C so its
-    messages are matched in one language."""
-    env = {k: v for k, v in environ.items() if k not in TRUST_GIT_DROP}
+    """pa-trust's git environment: without the variables that move git's repository discovery or its index, without
+    any GIT_CONFIG* variable (config injected by GIT_CONFIG_PARAMETERS, GIT_CONFIG_COUNT/KEY_n/VALUE_n or another
+    config file: GIT_CONFIG_GLOBAL, GIT_CONFIG_SYSTEM, GIT_CONFIG_NOSYSTEM, GIT_CONFIG), so git reads its default
+    config files as a plain git would, and LC_ALL=C so its messages are matched in one language."""
+    env = {k: v for k, v in environ.items() if k not in TRUST_GIT_DROP and not k.startswith("GIT_CONFIG")}
     env["LC_ALL"] = "C"
     return env
 
@@ -2841,6 +2859,10 @@ def trust_key_why(folder):
     real = os.path.realpath(folder)
     code, out, err = trust_git(real, "rev-parse", "--show-toplevel")
     if code == 128 and "not a git repository (or any" in err:
+        dot = trust_dot_git(real)
+        if dot:
+            return None, "git finds no repository, yet {} holds a .git entry that a lookup for .git would take " \
+                         "for one".format(dot)
         return real, None
     if code != 0 or not out:
         return None, "git could not say whether the folder is in a repository (exit {}: {})".format(
@@ -2849,8 +2871,26 @@ def trust_key_why(folder):
     if code == 0 and common:
         common = os.path.realpath(os.path.join(real, common))
         if os.path.basename(common) == ".git":
-            return os.path.dirname(common), None
+            key = os.path.dirname(common)
+            top = git_top(key)
+            if top != key:
+                return None, "the repository at {} has its working tree at {} (core.worktree), not there".format(
+                    key, top or "a place git does not name")
+            return key, None
     return None, "git names a repository for the folder but not its main checkout"
+
+
+def trust_dot_git(real):
+    """The first of real and its ancestors that holds a .git entry (file, folder or link), else None. Used only
+    when git finds no repository: such an entry is an empty or broken .git (t-047 W2a)."""
+    folder = real
+    while True:
+        if os.path.lexists(os.path.join(folder, ".git")):
+            return folder
+        parent = os.path.dirname(folder)
+        if parent == folder:
+            return None
+        folder = parent
 
 
 def trust_key(folder):
