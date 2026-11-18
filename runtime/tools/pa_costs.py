@@ -715,8 +715,27 @@ def short(sid):
     return (sid or "?")[:8]
 
 
+def start_in_effect(sess, when):
+    """The start record of a session in effect at `when` (t-032 fix round 3): its latest start at or before that time,
+    the later line of two in one second; the first when `when` is earlier than all, or not a time. A session has more
+    than one start record after t-033's fallback (the refused attempt's, then the one that started) or a resume."""
+    starts = sess.get("starts") or [sess]
+    at = parse_ts(when or "") if isinstance(when, str) else None
+    best = starts[0]
+    if at is None or len(starts) == 1:
+        return best
+    best_at = None
+    for r in starts:
+        t = parse_ts(r.get("at") or "") if isinstance(r.get("at"), str) else None
+        if t is not None and t <= at and (best_at is None or t >= best_at):
+            best, best_at = r, t
+    return best
+
+
 def make_row(sess, seg):
-    """A ledger row from a settled segment: tokens only, attributed by attribute() (step 4 rules)."""
+    """A ledger row from a settled segment: tokens only, attributed by attribute() (step 4 rules). Its facts are those
+    of the start record in effect at the segment's start."""
+    start = start_in_effect(sess, seg.get("from"))
     pre = seg.get("pre")  # calls of a resumed session from before its first record: its past, best effort (R7)
     return {"v": 1, "seq": None, "session": sess["session"], "program": sess.get("program") or "claude",
             "kind": sess.get("kind") or "unknown", "model": seg["model"], "from": seg["from"], "to": seg["to"],
@@ -727,7 +746,7 @@ def make_row(sess, seg):
             "match": "resumed-history" if pre else (sess.get("match") or "launch-record"),
             "confidence": sess.get("confidence") or "high", "until": seg.get("until"),
             **({"sub": sess["sub"]} if sess.get("sub") else {}),
-            **{k: sess[k] for k in FACT_KEYS if k in sess}}  # the launch record's facts (t-032), when it has them
+            **{k: start[k] for k in FACT_KEYS if k in start}}  # the launch record's facts (t-032), when it has them
 
 
 PA_TRIGGERS = ("report", "message", "decision", "scheduled", "manual", "conversation")
