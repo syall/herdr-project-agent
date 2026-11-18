@@ -4221,6 +4221,279 @@ class J1A_Snapshot(Collecting):
         self.assertEqual(self.restrict(new, old), old)
 
 
+# ---- t-032 J1b: facts at launch, in rows and for old rows; one account chain (R-P3, R-A1, R-A2, R-A6, A-R1-A-R3) ----
+
+J1_PRICING = {"defaultProvider": "provider-a",
+              "providers": [{"program": "claude", "model": None, "provider": "provider-a"},
+                            {"program": "codex", "model": "^model-x", "provider": "provider-x"}],
+              "endpoints": [{"model": r"^global\.", "endpoint": "global"}, {"model": r"^(us|eu)\.", "endpoint": "geo"},
+                            {"model": r"^model-", "endpoint": "regional"}],
+              "region": {"env": ["J1_REGION_A", "J1_REGION_B"], "match": "^region-[a-z]$"}}
+J1_ENV = ("PA_COST_ACCOUNT", "PA_COST_REGION", "J1_REGION_A", "J1_REGION_B", "J1_PROFILE", "J1_REGION_SECRET", "J1_TOKEN", "J1_ENDPOINT")
+FACT_KEYS = ("provider", "providerBy", "endpoint", "endpointBy", "region", "regionBy", "account", "accountBy")
+
+
+def every_file_bytes(root):
+    out = b""
+    for folder, _dirs, names in os.walk(root):
+        for name in names:
+            out += raw(os.path.join(folder, name)) or b""
+    return out
+
+
+class J1B_Launch(Base):
+    """Launch records of pa-claude / pa-codex workers and the Project Agent carry the facts (labels only)."""
+
+    launch = L_LaunchRecords.launch
+    records = L_LaunchRecords.records
+
+    def setUp(self):
+        super().setUp()
+        self.assertIsNotNone(pa_costs, COSTS_MISSING)
+        for k in J1_ENV:
+            self.addCleanup(os.environ.pop, k, None)
+            os.environ.pop(k, None)
+        self.set_profile(J1_PRICING)
+        self.ledger({"version": 1, "tasks": [{"id": "t-010", "state": "in-progress", "workers": []}]})
+        self.hc.terminals["t5"] = {"address": "t5", "name": "t-010-build", "parent": "t0", "state": "live", "labels": {"herdr.space": "sp1"}}
+        os.environ["HC_TERMINAL_ID"] = "t5"
+        os.environ["PA_PRINT"] = "1"
+        self.addCleanup(os.environ.pop, "HC_TERMINAL_ID", None)
+        self.addCleanup(os.environ.pop, "PA_PRINT", None)
+
+    def set_profile(self, pricing, **extra):
+        prof = {"name": "test", "claude": ["true"], "codex": ["true"], "models": {"worker": "global.model-a"}}
+        if pricing is not None:
+            prof["pricing"] = pricing
+        prof.update(extra)
+        dump(prof, os.path.join(self.profile_dir, "profile.json"))
+
+    def machine(self, **costs):
+        dump({"version": 1, "defaultProfile": "test", "costs": costs}, os.path.join(pa.ROOT, "config.json"))
+
+    def last(self, kind="claude", *argv):
+        if os.path.exists(self.costs("sessions.jsonl")):
+            os.unlink(self.costs("sessions.jsonl"))
+        self.launch(kind, *(argv or ("do the job",)))
+        recs = self.records()
+        self.assertEqual(len(recs), 1)
+        return recs[0]
+
+    def facts(self, rec):
+        return {k: rec.get(k) for k in FACT_KEYS}
+
+    def test_j1b1_provider_and_endpoint_from_the_model_id_form(self):
+        r = self.last()
+        self.assertEqual(r["model"], "global.model-a")
+        self.assertEqual((r["provider"], r["providerBy"], r["endpoint"], r["endpointBy"]), ("provider-a", "launch", "global", "rule"))
+        self.assertEqual((self.last("claude", "--model", "us.model-a", "x")["endpoint"]), "geo")
+        self.assertEqual((self.last("claude", "--model", "model-a", "x")["endpoint"]), "regional")
+        r = self.last("claude", "--model", "other-1", "x")
+        self.assertEqual((r["endpoint"], r["endpointBy"]), (None, "default"))
+        r = self.last("codex", "go")  # a Codex worker with no --model: no codex rule matches
+        self.assertEqual((r["provider"], r["providerBy"]), (None, "unknown"))
+        r = self.last("codex", "--model", "model-x1", "go")
+        self.assertEqual((r["provider"], r["providerBy"], r["endpoint"]), ("provider-x", "launch", "regional"))
+
+    def test_j1b2_region_from_the_declared_variables_in_order(self):
+        r = self.last()
+        self.assertEqual((r["region"], r["regionBy"]), (None, "unknown"))
+        os.environ["J1_REGION_B"] = "region-b"
+        self.assertEqual((self.last()["region"], self.last()["regionBy"]), ("region-b", "env:J1_REGION_B"))
+        os.environ["J1_REGION_A"] = "region-a"
+        self.assertEqual((self.last()["region"], self.last()["regionBy"]), ("region-a", "env:J1_REGION_A"))
+        os.environ["PA_COST_REGION"] = "region-q"
+        self.assertEqual((self.last()["region"], self.last()["regionBy"]), ("region-q", "env:PA_COST_REGION"))
+        os.environ.pop("PA_COST_REGION")
+        os.environ.pop("J1_REGION_A")
+        os.environ.pop("J1_REGION_B")
+        self.machine(region="region-m")
+        self.assertEqual((self.last()["region"], self.last()["regionBy"]), ("region-m", "machine"))
+
+    def test_j1b3_a_value_that_is_not_a_region_is_never_stored(self):
+        secret = "secret-profile-" + fx.CANARY
+        os.environ["J1_REGION_A"] = secret
+        os.environ["J1_REGION_B"] = "region-b"
+        r = self.last()
+        self.assertEqual((r["region"], r["regionBy"]), (None, "refused"))
+        self.assertIn("J1_REGION_A", r.get("refused") or [])
+        os.environ["PA_COST_REGION"] = "12345" + "6789012"
+        r = self.last()
+        self.assertNotEqual(r["region"], os.environ["PA_COST_REGION"])
+        self.assertIn("PA_COST_REGION", r.get("refused") or [])
+        self.assertNotIn(secret.encode(), every_file_bytes(pa.ROOT))
+        self.assertNotIn(b"6789012", every_file_bytes(pa.ROOT))
+
+    def test_j1b4_declared_names_that_look_like_credentials_are_refused(self):
+        bad = dict(J1_PRICING, region={"env": ["J1_REGION_SECRET"], "match": ".*"},
+                   endpoints=[{"env": "J1_TOKEN", "match": ".*", "endpoint": "global"}])
+        self.set_profile(bad)
+        os.environ["J1_REGION_SECRET"] = "region-a"
+        os.environ["J1_TOKEN"] = "x"
+        r = self.last()
+        self.assertEqual((r["region"], r["regionBy"]), (None, "unknown"))
+        self.assertEqual(r["endpointBy"], "default")
+        _rules, problems = pa_costs.pricing_rules(pa.load_profile("test"))
+        self.assertTrue(any("J1_REGION_SECRET" in p for p in problems), problems)
+        self.assertTrue(any("J1_TOKEN" in p for p in problems), problems)
+        self.machine(accountRules=[{"env": "J1_TOKEN", "match": ".*", "account": "acct-t"}])
+        self.assertNotEqual(self.last()["account"], "acct-t")
+
+    def test_j1b5_endpoint_env_rule(self):
+        self.set_profile(dict(J1_PRICING, endpoints=[{"env": "J1_ENDPOINT", "match": "^1$", "endpoint": "edge-a"}] + J1_PRICING["endpoints"]))
+        os.environ["J1_ENDPOINT"] = "1"
+        r = self.last()
+        self.assertEqual((r["endpoint"], r["endpointBy"]), ("edge-a", "rule"))
+        os.environ["J1_ENDPOINT"] = "0"
+        self.assertEqual(self.last()["endpoint"], "global")
+
+    def test_j1b6_account_from_env_then_rules_then_the_chain(self):
+        r = self.last()
+        self.assertEqual((r["account"], r["accountBy"]), ("default", "default"))
+        self.set_profile(J1_PRICING, billing={"account": "acct-p"})
+        self.assertEqual((self.last()["account"], self.last()["accountBy"]), ("acct-p", "profile"))
+        self.machine(account="acct-m")
+        self.assertEqual((self.last()["account"], self.last()["accountBy"]), ("acct-m", "machine"))
+        agent = load(os.path.join(self.dir, "agent.json"))
+        dump(dict(agent, costs={"account": "acct-s"}), os.path.join(self.dir, "agent.json"))
+        self.assertEqual((self.last()["account"], self.last()["accountBy"]), ("acct-s", "space"))
+        secret = "secret-profile-" + fx.CANARY
+        self.machine(account="acct-m", accountRules=[{"env": "J1_PROFILE", "match": "^secret-profile-", "account": "acct-b"}])
+        os.environ["J1_PROFILE"] = secret
+        self.assertEqual((self.last()["account"], self.last()["accountBy"]), ("acct-b", "rule"))
+        os.environ["PA_COST_ACCOUNT"] = "acct-a"
+        self.assertEqual((self.last()["account"], self.last()["accountBy"]), ("acct-a", "env"))
+        os.environ["PA_COST_ACCOUNT"] = "12345" + "6789012"
+        r = self.last()
+        self.assertEqual((r["account"], r["accountBy"]), ("acct-b", "rule"))
+        self.assertIn("PA_COST_ACCOUNT", r.get("refused") or [])
+        self.assertNotIn(secret.encode(), every_file_bytes(pa.ROOT))
+        self.assertNotIn(b"6789012", every_file_bytes(pa.ROOT))
+
+    def test_j1b7_two_workers_with_different_accounts(self):
+        os.environ["PA_COST_ACCOUNT"] = "acct-a"
+        self.launch("claude", "one")
+        os.environ["PA_COST_ACCOUNT"] = "acct-b"
+        self.launch("claude", "two")
+        self.assertEqual([r["account"] for r in self.records()], ["acct-a", "acct-b"])
+
+    def test_j1b8_malformed_rules_never_stop_a_launch(self):
+        self.set_profile({"providers": "x", "endpoints": [{"model": "(", "endpoint": "global"}], "region": {"env": "J1_REGION_A", "match": "("},
+                          "defaultProvider": 7})
+        self.machine(accountRules="nope", region=["x"], account={"a": 1})
+        os.environ["J1_REGION_A"] = "region-a"
+        argv = self.launch("claude", "go")
+        self.assertIn("--session-id", argv)
+        r = self.records()[-1]
+        self.assertEqual((r["provider"], r["endpointBy"], r["regionBy"], r["account"]), (None, "default", "unknown", "default"))
+        _rules, problems = pa_costs.pricing_rules(pa.load_profile("test"))
+        self.assertTrue(problems)
+
+    def test_j1b9_facts_function_never_raises(self):
+        saved = pa_costs.account_chain
+
+        def boom(directory=None):
+            raise RuntimeError("x")
+        pa_costs.account_chain = boom
+        self.addCleanup(setattr, pa_costs, "account_chain", saved)
+        argv = self.launch("claude", "go")
+        self.assertIn("--session-id", argv)
+        r = self.records()[-1]
+        self.assertEqual((r["providerBy"], r["account"], r["accountBy"]), ("unknown", "default", "default"))
+
+    def test_j1b10_project_agent_start_record(self):
+        prof = pa.load_profile("test")
+        pa_costs.record_agent_start(self.dir, {"sessionId": "s-pa-1", "space": "sp1"}, "t0", self.project, "us.model-a", False, profile=prof)
+        r = self.records()[-1]
+        self.assertEqual((r["kind"], r["provider"], r["endpoint"], r["account"]), ("pa", "provider-a", "geo", "default"))
+        pa_costs.record_agent_start(self.dir, {"sessionId": "s-pa-2", "space": "sp1"}, "t0", self.project, "us.model-a", False)
+        r = self.records()[-1]  # an older caller without the profile: facts unknown, the record still written
+        self.assertEqual((r["session"], r["providerBy"]), ("s-pa-2", "unknown"))
+
+
+class J1B_Facts(Collecting):
+    """make_row copies the facts of the session record; rows without them get them at summarize time."""
+
+    def test_j1b11_rows_carry_the_record_facts(self):
+        self.prices()
+        self.record(session=SID, model="global.model-a", provider="provider-a", providerBy="launch", endpoint="global",
+                    endpointBy="rule", region="region-a", regionBy="env:J1_REGION_A", account="acct-a", accountBy="env")
+        self.add(self.prompt(T0 + 10), self.call(T0 + 12, "m1", lines=1, out=100))
+        self.collect(T0 + 5000)
+        rows = self.rows()
+        self.assertTrue(rows)
+        for r in rows:
+            self.assertEqual((r["provider"], r["endpoint"], r["region"], r["account"], r["regionBy"]),
+                             ("provider-a", "global", "region-a", "acct-a", "env:J1_REGION_A"))
+
+    def test_j1b12_rows_of_records_without_facts_have_no_fact_keys(self):
+        self.prices()
+        self.record(session=SID)
+        self.add(self.prompt(T0 + 10), self.call(T0 + 12, "m1", lines=1, out=100))
+        self.collect(T0 + 5000)
+        for r in self.rows():
+            for k in FACT_KEYS:
+                self.assertNotIn(k, r)
+
+    def test_j1b13_old_rows_get_facts_from_the_rules(self):
+        prof = {"name": "test", "claude": ["true"], "codex": ["true"], "pricing": J1_PRICING}
+        dump(prof, os.path.join(self.profile_dir, "profile.json"))
+        rules, problems = pa_costs.pricing_rules(pa.load_profile("test"))
+        self.assertEqual(problems, [])
+        chain = ("acct-c", "machine")
+        row = {"session": SID, "model": "model-a", "program": "claude"}
+        f = pa_costs.row_facts(row, {"program": "claude", "model": "global.model-a"}, rules, chain)
+        self.assertEqual(f, {"provider": "provider-a", "providerBy": "rule", "endpoint": "global", "endpointBy": "rule",
+                             "region": None, "regionBy": "unknown", "account": "acct-c", "accountBy": "machine"})
+        f = pa_costs.row_facts(row, {}, rules, chain)  # no record model: the default provider and endpoint
+        self.assertEqual((f["provider"], f["providerBy"], f["endpoint"], f["endpointBy"]), ("provider-a", "rule", None, "default"))
+        f = pa_costs.row_facts(dict(row, program="codex"), {"program": "codex"}, rules, chain)
+        self.assertEqual((f["provider"], f["providerBy"]), ("provider-a", "default"))
+        launched = dict(row, provider="provider-b", providerBy="launch", endpoint="geo", endpointBy="rule", region="region-a",
+                        regionBy="machine", account="acct-a", accountBy="env")
+        f = pa_costs.row_facts(launched, {"model": "global.model-a"}, rules, chain)
+        self.assertEqual({k: f[k] for k in FACT_KEYS}, {k: launched[k] for k in FACT_KEYS})
+        f = pa_costs.row_facts(dict(row), {"model": "global.model-a"}, None, ("default", "default"))
+        self.assertEqual((f["provider"], f["providerBy"], f["endpoint"], f["endpointBy"]), (None, "default", None, "default"))
+
+
+class J1B_Account(CostsBase):
+    """R-A1/R-A6: one chain for estimates and billed rows."""
+
+    def test_j1b14_one_chain_on_a_home_with_only_billing_account(self):
+        dump({"name": "test", "claude": ["true"], "codex": ["true"], "billing": {"account": "acct-a"}}, os.path.join(self.profile_dir, "profile.json"))
+        self.assertEqual(pa_costs.costs_account(), "acct-a")
+        self.assertEqual(pa_costs.default_account(), "acct-a")
+        self.assertEqual(pa_costs.account_chain(self.dir), ("acct-a", "profile"))
+        dump({"version": 1, "defaultProfile": "test", "costs": {"account": "acct-m"}}, os.path.join(pa.ROOT, "config.json"))
+        self.assertEqual((pa_costs.costs_account(), pa_costs.default_account()), ("acct-m", "acct-m"))
+        agent = load(os.path.join(self.dir, "agent.json"))
+        dump(dict(agent, costs={"account": "acct-s"}), os.path.join(self.dir, "agent.json"))
+        self.assertEqual(pa_costs.account_chain(self.dir), ("acct-s", "space"))
+        self.assertEqual(pa_costs.account_chain(), ("acct-m", "machine"))
+        dump(dict(agent, costs={"account": "12345" + "6789012"}), os.path.join(self.dir, "agent.json"))
+        self.assertEqual(pa_costs.account_chain(self.dir), ("acct-m", "machine"))
+
+    def test_j1b15_summary_account_follows_the_chain(self):
+        dump({"name": "test", "claude": ["true"], "codex": ["true"], "billing": {"account": "acct-a"}}, os.path.join(self.profile_dir, "profile.json"))
+        s = pa_costs.summarize(self.dir, [], [], None, None, "test", T0, cc=[])
+        self.assertEqual((s["account"], s["accountBy"]), ("acct-a", "profile"))
+
+
+class J1B_Doctor(Base):
+    def test_j1b16_doctor_notes_refused_rules_and_records(self):
+        import argparse
+        dump({"name": "test", "claude": ["true"], "codex": ["true"], "pricing": {"region": {"env": ["J1_REGION_SECRET"], "match": ".*"}}},
+             os.path.join(self.profile_dir, "profile.json"))
+        os.makedirs(os.path.join(self.dir, "costs"), exist_ok=True)
+        write(os.path.join(self.dir, "costs", "sessions.jsonl"),
+              json.dumps({"v": 1, "ev": "start", "session": "s1", "regionBy": "refused", "refused": ["J1_REGION_A"]}) + "\n")
+        _r, out, _e = self.run_cmd(pa.cmd_doctor, argparse.Namespace(space="sp1"))
+        self.assertIn("J1_REGION_SECRET", out)
+        self.assertRegex(out, r"1 launch record\(s\) with a refused .*J1_REGION_A")
+        self.assertNotIn("PROBLEM", out)
+
+
 class ZZ_V1_Privacy(unittest.TestCase):
     """Run last: the canary of every fixture reached no file under costs/ or billing/ and no captured output."""
 
