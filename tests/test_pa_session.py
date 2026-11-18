@@ -1004,11 +1004,13 @@ class PromptCache(Base):
             raise Stop()
         saved = (pa.subprocess.call, pa.time.sleep)
         pa.subprocess.call, pa.time.sleep = fake_call, (lambda s: None)
+        undo_child = child_fakes.patch(pa, fake_call)  # t-037 J2: the launcher starts Claude with pa.spawn
         try:
             with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(Stop):
                 pa.run_agent(types.SimpleNamespace(fresh=True), "t1", self.project, p, self.dir,
                              load(os.path.join(self.dir, "agent.json")), {"beat": True, "previous": None}, time.time())
         finally:
+            undo_child()
             pa.subprocess.call, pa.time.sleep = saved
         with open(os.path.join(self.dir, "session.log")) as f:
             line = [l for l in f.read().splitlines() if " start " in l][-1]
