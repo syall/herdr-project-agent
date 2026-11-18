@@ -7,12 +7,14 @@
 // read-only `pa-push-allow show`; `pa-push-main run` runs only from a push card's Submit.
 // The Costs view (costs.js, t-009) reads costs/summary.json only while it is shown, and runs the
 // read-only `pa-costs billed compare`; its Refresh, Reconstruct and Turn off run `pa-costs` on a click.
+// Restart (t-037 J4) runs `pa-restart --dry-run` on its click and `pa-restart` (in place, once) on its confirm, on the
+// space's machine; never `--end-terminal`: the panel ends no terminal.
 
 import { View, div } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, ScrollHandle } from "gpui-base";
 import { spaces, panes, agents, terminals, machines, theme, run, props, home, notify, shared, setShared, closeOverlay, openOverlay, window, layout } from "herdr";
 import { Host, gaveUp, read as hostRead, run as hostRun, watch, refusalLine } from "./host.js";
-import { loadSpace, loadLedger, loadProfile, loadDecisions, loadRules, TIMED_OUT, READ_LIMIT, answerDecision, notifyOrchestrator, changeRules, touched, localId, paHome, stateDir, taskActions, taskLinks, evidenceTasks, cardEvidence, staleInstructions, liveTarget, lookAlike, OPEN_REQUESTS, keeperJudging, startingLabels, OTHER, OTHER_MAX, OTHER_TOO_LONG, isOther, oneLine } from "./store.js";
+import { loadSpace, loadLedger, loadProfile, loadDecisions, loadRules, TIMED_OUT, READ_LIMIT, answerDecision, notifyOrchestrator, changeRules, touched, localId, paHome, stateDir, taskActions, taskLinks, evidenceTasks, cardEvidence, staleInstructions, liveTarget, lookAlike, OPEN_REQUESTS, keeperJudging, startingLabels, OTHER, OTHER_MAX, OTHER_TOO_LONG, isOther, oneLine, codeState, codeBadge, loadCode, restartArgs, runRestart, restartOutcome, endTerminalLine, RESTART_MARK, RESTART_MARK_TTL, RESTARTED_FOR, RESTART_TIMEOUT, DRY_TIMEOUT } from "./store.js";
 import { RulesPane, arm, armHolds, fieldState } from "./rules.js"; // arm, armHolds: the two-click Delete (ARM_WAIT, 10 s)
 import { SetupPane } from "./setup.js";
 import { Keeper, idleShell } from "./keeper.js";
@@ -38,7 +40,7 @@ const COALESCE = 2000; // t-053: a background trigger (timer, watch) starts at m
 const BG = Object.freeze({ background: true });
 // t-053: the watch batch paths, under the shown local space's folder, that the panel shows (a heartbeat, a log, the lock,
 // the session log, the cost records and other spaces' folders reload nothing; the root itself: everything).
-const SHOWN_PATH = /^(agent\.json|ledger\.json|schedule\.json|pass-request\.json|rules\.json|decisions(\/[^/]+)?|evidence(\/[^/]+(\/(?!build\.log$)[^/]+)?)?|costs\/summary\.json)$/;
+const SHOWN_PATH = /^(agent\.json|launcher\.json|ledger\.json|schedule\.json|pass-request\.json|rules\.json|decisions(\/[^/]+)?|evidence(\/[^/]+(\/(?!build\.log$)[^/]+)?)?|costs\/summary\.json)$/;
 // A part of loadSpace's result that did not answer (its `unknown`), and the fields it fills.
 const PARTS = { ledger: ["ledger"], profile: ["profile", "profileDir"], schedule: ["schedule"], request: ["request"] };
 const NOTE = "Note for the Project Agent (optional)";
@@ -155,6 +157,10 @@ export default class ProjectAgent extends View {
     this.opening = {}; // space id -> { at, before }: when this copy asked the keeper to open its Project Agent, and the record terminals then
     this.openMsg = {}; // space id -> why the last Open did not start anything
     this.confirmOpen = {}; // space id -> { tab, terminal }: a look-alike agent runs; asking first
+    // t-037 J4, the Restart button: the confirm (its dry run's lines), this copy's run in flight, the result line.
+    this.restartAsk = {}; // space id -> { busy, lines, refused, capable, instance, prompt, older }
+    this.restarting = {}; // space id -> { at, instance }: this copy's one run, set before it starts (never twice)
+    this.restartMsg = {}; // space id -> { ok, text, at }
     this.me = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`; // this copy, for the timer lease
     this.schedule = { open: false, error: null, custom: null, quietFrom: null, quietTo: null }; // the schedule bar
     // The 15 s pass: one at a time (t-053: a tick still waiting on a call is not joined by another).
@@ -382,7 +388,7 @@ export default class ProjectAgent extends View {
         }
         if (data.agent && current() && shown()) { // first paint: the header and the tasks
           const same = this.space === space.id;
-          this.data = { ...data, evidence: same ? this.data?.evidence : undefined, stale: same ? this.data?.stale : undefined };
+          this.data = { ...data, evidence: same ? this.data?.evidence : undefined, stale: same ? this.data?.stale : undefined, code: same ? this.data?.code : undefined };
           if (this.cardsFor !== space.id) { this.cards = []; this.cardsFor = null; this.rules.data = null; }
           if (!same) this.dataAt = Date.now();
           this.space = space.id;
@@ -392,14 +398,15 @@ export default class ProjectAgent extends View {
           // A read that times out or fails keeps the last known value: the kept load's, else what is shown for the space.
           const cap = (p, fallback) => p.then((v) => (gaveUp(v) ? fallback() : v), () => fallback()); // each read capped in the store
           const known = [...(kept && !kept.cardsUnknown ? kept.cards : []), ...(this.space === space.id && this.cardsFor === space.id ? this.cards : [])];
-          let evidence, stale;
-          [cards, rules, evidence, stale] = await Promise.all([
+          let evidence, stale, code;
+          [cards, rules, evidence, stale, code] = await Promise.all([
             loadDecisions(space, { cx: rcx, live: current, known, out: cardsOut }),
             cap(loadRules(space, rcx), () => kept?.rules ?? (this.space === space.id && this.cardsFor === space.id ? this.rules.data : null) ?? null), // null: the Rules view says Loading…
             cap(evidenceTasks(space, rcx), () => kept?.data?.evidence ?? shownNow()?.evidence), // undefined: unknown
             cap(staleInstructions(space, data.agent.profile, rcx), () => kept?.data?.stale ?? shownNow()?.stale ?? []),
+            cap(loadCode(space, rcx), () => kept?.data?.code ?? shownNow()?.code ?? null), // t-037 J4: launcher.json + installed.json
           ]);
-          data.evidence = evidence; data.stale = stale;
+          data.evidence = evidence; data.stale = stale; data.code = code;
         }
       }
       catch (e) { data = { agent: null, errors: [String(e.message ?? e)], failed: true }; } // a read in the first round threw
@@ -553,6 +560,112 @@ export default class ProjectAgent extends View {
     const el = div().id(id).flex_none().px(8).h(24).flex().items_center().rounded(6).border(1).border_color(waiting ? t.border : t.accent).text_size(11.5)
       .text_color(waiting ? t.dim : t.foreground);
     return waiting ? el.child("Opening…") : el.cursor_pointer().hover((s) => s.bg(t.hover)).on_click((_e, cx) => this.requestOpen(space, agent, cx, false)).child("Open Project Agent");
+  }
+
+  // ---- t-037 J4: Restart (R13). Only the restart tool in place, on the space's machine; never a terminal ended here. ----
+  // What the launcher runs (launcher.json vs installed.json), from this space's last load, or null.
+  codeOf(space, data) {
+    const c = data?.code;
+    return c && typeof c === "object" && "launcher" in c ? codeState(c.launcher, c.installed, data.agent?.terminal ?? null) : null;
+  }
+
+  // Another panel window's run for this space, while its mark is fresh.
+  restartElsewhere(space) {
+    const m = (shared(RESTART_MARK) ?? {})[space.id];
+    return Boolean(m && m.by !== this.me && typeof m.at === "number" && Date.now() - m.at < RESTART_MARK_TTL);
+  }
+  restartBusy(space) { return Boolean(this.restarting[space.id]) || this.restartElsewhere(space); }
+  shareRestart(space, mark) {
+    const all = { ...(shared(RESTART_MARK) ?? {}) };
+    if (mark) all[space.id] = mark;
+    else if (all[space.id]?.by === this.me) delete all[space.id];
+    else return;
+    setShared(RESTART_MARK, all);
+  }
+
+  // The button: asks first (a dry run). A launcher from before restart support says what Restart means for it.
+  restartButton(t, space, code, id) {
+    const label = code && !code.capable ? "Restart (ends workers)" : "Restart";
+    return div().id(id).flex_none().px(8).h(24).flex().items_center().rounded(6).border(1).border_color(t.border).text_size(11.5)
+      .text_color(t.foreground).cursor_pointer().hover((s) => s.bg(t.hover)).on_click((_e, cx) => this.askRestart(space, cx)).child(label);
+  }
+
+  // The confirm: one dry run of the tool (read-only: every identification check, the summary), its lines shown.
+  askRestart(space, cx) {
+    if (this.restartBusy(space) || this.restartAsk[space.id]?.busy) return;
+    const code = this.space === space.id ? this.codeOf(space, this.data) : null;
+    const ask = { busy: true, lines: [], refused: false, capable: code ? code.capable : true, instance: code?.instance ?? null, prompt: code?.prompt ?? null, older: code?.word ?? null };
+    this.restartAsk[space.id] = ask;
+    delete this.restartMsg[space.id];
+    cx.notify();
+    const started = this.host.spawn(cx, async (cx) => {
+      const res = await runRestart(this.host.ctx(cx, { origin: "restart", background: false }), space, restartArgs(space, { dry: true }), DRY_TIMEOUT);
+      if (this.restartAsk[space.id] !== ask) return; // cancelled meanwhile
+      if (res.r && res.r.code === 0) ask.lines = String(res.r.stdout ?? "").split("\n").filter((l) => l.trim() && !/^Dry run/.test(l));
+      else { ask.refused = true; ask.lines = [res.r ? String(res.r.stderr || res.r.stdout || `exit ${res.r.code}`).trim() : restartOutcome(res, space)?.text ?? "The check did not answer; try again."]; }
+      if (ask.refused && /started before restart support/.test(ask.lines.join(" "))) ask.capable = false;
+      ask.busy = false;
+      cx.notify();
+    }, { what: "the restart check", background: false });
+    if (!started) { ask.busy = false; ask.refused = true; ask.lines = ["Too many calls waiting; try again."]; cx.notify(); }
+  }
+
+  // Confirmed: one run bound to the instance the confirm showed. this.restarting and the shared mark are set before it
+  // starts, so a second click (here or in another window) runs nothing.
+  confirmRestart(space, { now = false, fresh = false }, cx) {
+    const ask = this.restartAsk[space.id];
+    if (this.restartBusy(space) || !ask || ask.busy || ask.refused || !ask.capable) return;
+    const args = restartArgs(space, { instance: ask.instance, now, fresh });
+    if (!args) { ask.refused = true; ask.lines = ["Its launcher.json names no instance: not restarted. Try again after the next refresh."]; cx.notify(); return; }
+    delete this.restartAsk[space.id];
+    const mark = { at: Date.now(), instance: ask.instance };
+    this.restarting[space.id] = mark;
+    this.shareRestart(space, { by: this.me, at: mark.at, instance: ask.instance });
+    cx.notify();
+    const end = (msg, cx) => {
+      if (this.restarting[space.id] === mark) delete this.restarting[space.id];
+      this.shareRestart(space, null);
+      if (msg) this.restartMsg[space.id] = { ...msg, at: Date.now() };
+      cx.notify();
+    };
+    const started = this.host.spawn(cx, async (cx) => {
+      let msg;
+      try { msg = restartOutcome(await runRestart(this.host.ctx(cx, { origin: "restart", background: false }), space, args, RESTART_TIMEOUT), space); }
+      catch (e) { msg = { ok: false, text: `The restart could not run: ${String(e?.message ?? e)}` }; }
+      end(msg, cx);
+      this.reload(cx);
+    }, { what: "the restart", background: false });
+    if (!started) end({ ok: false, text: "The restart was not started: too many calls waiting. Try again." }, cx);
+  }
+
+  // The confirm box, the run in flight, or the result.
+  restartBox(t, space, live) {
+    const ask = this.restartAsk[space.id], box = () => v_flex().px(12).py(8).gap(4).flex_none().border_b(1).border_color(t.border).text_size(11.5).text_color(t.foreground);
+    if (this.restarting[space.id]) return box().bg(t.working + "1a").child(div().child(["working", "blocked"].includes(live?.status) ? "Restarting… (waiting for its turn to end)" : "Restarting…"));
+    if (this.restartElsewhere(space)) return box().child(div().child("Restarting… (from another panel window)"));
+    if (ask) {
+      const b = box().bg(t.working + "1a");
+      if (ask.busy) return b.child(div().text_color(t.dim).child("Checking what a restart does…"));
+      const lines = b.children(ask.lines.map((l, i) => div().child(sel(`pa-restart-line-${i}`, l))));
+      if (ask.refused) {
+        const line = endTerminalLine(space);
+        return lines
+          .when(!ask.capable, (e) => e.child(div().text_color(t.dim).child("The panel never ends a terminal. When its workers are done, run this in a terminal (it asks before it ends anything):"))
+            .child(h_flex().gap(6).items_center().child(div().flex_1().min_w(0).child(sel("pa-restart-end-line", line))).child(this.copier.button(t, "copy-end-terminal", () => line))))
+          .child(h_flex().gap(6).child(this.button(t, "pa-restart-cancel", "Cancel", (_e, cx) => { delete this.restartAsk[space.id]; cx.notify(); })));
+      }
+      const fresh = ask.prompt === "recorded" || /core/.test(String(ask.older ?? ""));
+      return lines
+        .child(div().text_color(t.dim).child(`Restart: when its current turn ends. Restart now: its current turn is cut off.${fresh ? " A new conversation loads the current core text; the previous one stays in /resume." : ""}`))
+        .child(h_flex().gap(6)
+          .child(this.button(t, "pa-restart-go", "Restart", (_e, cx) => this.confirmRestart(space, {}, cx), true))
+          .child(this.button(t, "pa-restart-now", "Restart now", (_e, cx) => this.confirmRestart(space, { now: true }, cx)))
+          .when(fresh, (e) => e.child(this.button(t, "pa-restart-fresh", "Restart in a new conversation", (_e, cx) => this.confirmRestart(space, { fresh: true }, cx))))
+          .child(this.button(t, "pa-restart-cancel", "Cancel", (_e, cx) => { delete this.restartAsk[space.id]; cx.notify(); })));
+    }
+    const m = this.restartMsg[space.id];
+    if (m && (!m.ok || Date.now() - m.at < RESTARTED_FOR)) return box().child(div().text_color(m.ok ? t.foreground : t.blocked).child(sel("pa-restart-result", m.text)));
+    return null;
   }
 
   start(space, folder) {
@@ -1138,6 +1251,7 @@ export default class ProjectAgent extends View {
     const target = offline ? null : liveTarget(space.id);
     const recs = Object.entries(shared("project-agent.tabs") ?? {}).filter(([, r]) => r?.space === space.id);
     const known = offline ? "offline" : !keeperJudging() ? "unknown" : target ? "live"
+      : recs.some(([, r]) => r.restarting) ? "restarting" // t-037 R15: its launcher restarts in place (the keeper holds it)
       : recs.some(([, r]) => r.recovering) ? "restoring" // the keeper restores it in its tab
       : recs.some(([tab, r]) => !r.stopped && !space.tabs.some((x) => x.id === tab)) ? "reopening" // its tab vanished: the keeper reopens it (unless it has stopped: then Open)
       : "down";
@@ -1162,7 +1276,7 @@ export default class ProjectAgent extends View {
     }
     const waiting = known === "down" && (Boolean(this.opening[space.id]) || Boolean(req && now - Number(req.at) < OPEN_WAIT) || Boolean(startingNow));
     const like = known === "down" ? this.confirmOpen[space.id] : null;
-    const stateText = { offline: "Machine offline · status unknown", unknown: "Status unknown", restoring: "Restoring…", reopening: "Reopening…", down: "Not running" }[known];
+    const stateText = { offline: "Machine offline · status unknown", unknown: "Status unknown", restarting: "Restarting…", restoring: "Restoring…", reopening: "Reopening…", down: "Not running" }[known];
     // Newest first: by when a task last changed (else when it was made), then by id.
     const stamp = (x) => String(x.updated ?? x.created ?? "");
     const tasks = [...(data.ledger?.tasks ?? [])].sort((x, y) => stamp(y).localeCompare(stamp(x)) || String(y.id ?? "").localeCompare(String(x.id ?? ""), undefined, { numeric: true }));
@@ -1188,11 +1302,18 @@ export default class ProjectAgent extends View {
       .bg(view === id ? t.selected : t.chrome).text_color(view === id ? t.foreground : t.muted).hover((s) => s.bg(t.hover))
       .on_click((_e, cx) => { this.view = id; this.disarm(); if (id !== "decisions") this.push.leave(space.id); if (id === "rules") this.rules.wantAllow(space, cx); if (id === "costs") this.costsShown(space, cx, true); cx.notify(); }).child(label);
     const unsent = this.unsent.filter((u) => u.spaceId === space.id);
+    // t-037 J4 (R14): what the launcher runs against what is installed; the Restart button (R13) while it is live.
+    const code = this.codeOf(space, data), badge = codeBadge(code), restartable = known === "live" && !this.restartBusy(space);
+    const older = /^older/.test(code?.word ?? ""), changed = [...(data.stale ?? []).slice(0, 3), ...(/tools/.test(older ? code.word : "") ? ["tools"] : []), ...(/core/.test(older ? code.word : "") && !(data.stale ?? []).length ? ["core text"] : [])];
+    const restartBox = this.restartBox(t, space, live);
     return root
       .child(head(`PA: ${a.name ?? space.name}`, h_flex().flex_none().gap(6).items_center()
         .child(div().size(7).rounded(4).bg(live ? t[live.status] ?? t.idle : t.dim))
         .child(div().text_size(11).text_color(t.dim).child(live ? live.status ?? "running" : stateText))
+        .when(Boolean(badge) && known !== "down", (el) => el.child(div().text_size(11).text_color(older || !code?.capable ? t.working : t.dim).child(badge ?? "")))
+        .when(restartable, (el) => el.child(this.restartButton(t, space, code, "pa-restart")))
         .when(known === "down", (el) => el.child(this.openButton(t, space, a, "pa-open", waiting)))))
+      .when(Boolean(restartBox), (el) => el.child(restartBox))
       .when((known === "down" || known === "restoring") && Boolean(startingNow?.error), (el) => el.child(div().px(12).py(6).border_b(1).border_color(t.border).text_size(11.5).text_color(t.blocked)
         .child(`The Project Agent is waiting: ${startingNow?.error}. Fix it, then press Enter in its tab.`)))
       .when(Boolean(like), (el) => el.child(v_flex().px(12).py(8).gap(6).flex_none().border_b(1).border_color(t.border).bg(t.working + "1a").text_size(11.5).text_color(t.foreground)
@@ -1204,9 +1325,10 @@ export default class ProjectAgent extends View {
       .child(v_flex().px(12).py(8).gap(2).flex_none().border_b(1).border_color(t.border).text_size(11.5).text_color(t.dim)
         .child(div().truncate().child(String(a.project ?? "").replace(home(), "~")))
         .child(div().child(`profile ${a.profile ?? "?"} · ${active} active of ${tasks.length} tasks · pass ${data.ledger?.passCount ?? 0}${this.inFlight(space.id) && now - this.dataAt > CACHE_OLD ? " · updating…" : ""}`)))
-      // The agent reads its instructions when its session starts; say when they have changed since.
-      .when((data.stale ?? []).length > 0 && Boolean(live), (el) => el.child(div().px(12).py(6).border_b(1).border_color(t.border).bg(t.working + "1a").text_size(11.5).text_color(t.foreground)
-        .child(`Its instructions changed since this agent started (${data.stale.slice(0, 3).join(", ")}). Type /exit in its tab: it restarts in place, keeps the conversation and loads them.`)))
+      // Its instructions or its tools changed since its launcher started (R14): Restart reloads them (R7: /exit too).
+      .when(changed.length > 0 && Boolean(live), (el) => el.child(h_flex().px(12).py(6).gap(8).items_center().border_b(1).border_color(t.border).bg(t.working + "1a").text_size(11.5).text_color(t.foreground)
+        .child(div().flex_1().min_w(0).child(`Its instructions or tools changed since it started (${changed.join(", ")}). Restart reloads them (or /exit in its tab).${code?.prompt === "recorded" ? " Restart in place keeps the core text this conversation began with; Restart in a new conversation loads it." : ""}`))
+        .when(restartable, (e) => e.child(this.restartButton(t, space, code, "pa-restart-notice")))))
       .child(this.scheduleBar(t, space, data))
       .child(this.awake.bar(t))
       .child(h_flex().px(8).py(6).gap(4).flex_none().border_b(1).border_color(t.border)

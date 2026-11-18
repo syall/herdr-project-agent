@@ -2693,6 +2693,9 @@ def restart_flags(args):
     if args.wait is not None:
         wait = restart_wait(args.wait)
         flags += ["--wait", str(int(wait)) if wait == int(wait) else str(wait)]
+    for name in ("expect_instance", "by"):  # t-037 J4: the panel's two hidden flags, passed through
+        if getattr(args, name, None) is not None:
+            flags += ["--" + name.replace("_", "-"), getattr(args, name)]
     return flags
 
 
@@ -2708,6 +2711,9 @@ def cmd_restart(args):
         return end_terminal(args)
     if in_claude and not (args.why or "").strip():  # also for --on (round 2, REVIEW A M4)
         raise Problem("inside Claude, pa-restart needs --why quoting the person's own words")
+    by_panel = getattr(args, "by", None) == "panel"
+    if by_panel and in_claude:  # t-037 J4: the orchestrator's requests keep their own `by`
+        raise Problem("--by panel is the panel's own flag; it is refused inside Claude")
     if args.on:
         if not args.space:
             raise Problem("--on needs --space <id> (the space's id on that machine)")
@@ -2734,7 +2740,12 @@ def cmd_restart(args):
     directory, agent = space_for_command(args.space)
     record, term = identify_launcher(directory, agent)
     space, terminal = agent.get("space"), agent.get("terminal")
-    by = "orchestrator" if in_claude and os.environ.get("HC_TERMINAL_ID") == terminal else "pa-restart"
+    expected = getattr(args, "expect_instance", None)
+    if expected is not None and record.get("instance") != expected:  # t-037 J4: only the launcher the panel showed
+        raise Problem("cannot restart: its launcher restarted since you looked (now instance {}, not {}); look "
+                      "again".format(record.get("instance"), expected))
+    by = ("orchestrator" if in_claude and os.environ.get("HC_TERMINAL_ID") == terminal
+          else "panel" if by_panel else "pa-restart")
     installed = as_dict(installed_stamp())
     workers = live_workers(directory, agent)
     turn = agent_turn(terminal)
@@ -3955,6 +3966,8 @@ def main():
         parser.add_argument("--confirmed-workers", help=argparse.SUPPRESS)
         parser.add_argument("--relay-issue", action="store_true", help=argparse.SUPPRESS)  # the relay's dry run (round 2)
         parser.add_argument("--relay-token", help=argparse.SUPPRESS)  # its one-time token, for the bound run
+        parser.add_argument("--expect-instance", help=argparse.SUPPRESS)  # t-037 J4: the panel's click, bound
+        parser.add_argument("--by", choices=("panel",), help=argparse.SUPPRESS)  # t-037 J4: the request's `by`
         return cmd_restart(parser.parse_args())
     if kind == "pa-context":
         parser.description = ("set: the Project Agent's context settings (context.json; the person's command, applied at "

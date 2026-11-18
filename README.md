@@ -92,6 +92,50 @@ New spaces start the launcher with `space.new { argv: ["pa-session", "--ask"] }`
   again unless a launcher really starts there later (a new heartbeat, fresh, naming it).
 - `pa-session` and `pa-start` refuse to start a second Project Agent only while another terminal's
   launcher is alive; a labelled terminal whose heartbeat stopped is replaced.
+- **Restarting in place:** while a launcher restarts in place (see "Restarting a Project Agent") it labels
+  its terminal `herdr.pa.restarting=<request id>`. The keeper holds such a terminal for at most 2 minutes
+  from when it first sees the label: it is never restored, an Open is refused ("it is restarting"), and
+  it is not marked `alive`, so no notice is typed into the few seconds between the two Claude sessions
+  (the panel keeps them and sends them after). The record carries `restarting: true` and the header says
+  "Restarting…". A label on an idle shell does not hold, a finished terminal is restored as always, and a
+  label kept past the 2 minutes is judged as any other terminal.
+
+## Restarting a Project Agent
+
+A restart makes a Project Agent run what is installed now, in the same terminal, with the same workers,
+resuming the same conversation. Its launcher (`pa-session`) ends its own Claude and starts the installed
+`pa.py` again in the same process: the pid, the terminal, its address and every worker tied to it stay.
+
+- **What reloads:** the launcher's code (`tools/`), the profile (command, models, MCP servers, status line)
+  and Claude Code itself. The core text (`core/orchestrator.md`) and the profile's `context.md` reach the
+  model on a resume only when Claude Code rebuilds the system prompt: the launcher passes
+  `--system-prompt-snapshot off` when the profile's `systemPromptSnapshot` is `off`, or, with no key, when
+  `claude --help` lists the flag (`keep` never passes it). Otherwise the resumed conversation keeps the
+  text it began with until it compacts, and a restart into a new conversation (`--fresh`) loads it now.
+  Rules (`rules.json`) are read from disk each pass. Whether a resume re-reads your own `CLAUDE.md` files
+  is not documented; it is not claimed.
+- **From a terminal:** `pa-restart --space <id>` checks that the terminal's program is that space's
+  launcher (agent.json, `launcher.json`, a fresh heartbeat, hc's label and pid), says what it runs now
+  and what is installed, lists the workers (each keeps running), waits for the current turn to end
+  (`--now` cuts it off), and prints what the new launcher loaded. `--dry-run` only checks and says;
+  `--fresh` starts a new conversation (the previous one stays in `/resume`); `--on <machine>` runs it
+  there. The Project Agent runs it only at your word, with `--why` quoting you. Workers are refused it.
+- **From the panel:** **Restart** in the Project view's header (and beside the "Its instructions or tools
+  changed" notice) asks first: it runs `pa-restart --dry-run` on the space's machine and shows its lines.
+  **Restart** waits for the turn, **Restart now** cuts it off, and **Restart in a new conversation**
+  shows when the resumed conversation would keep older core text. Confirming runs `pa-restart` once,
+  tied to the launcher it showed (a hidden `--expect-instance`): a second click, or another window or
+  Herdr client, after a restart finds a new launcher and restarts nothing. The header then says
+  "Restarted: tools …, core …, profile read …" for a minute, or why it did not happen.
+- **What runs, against what is installed:** each launcher writes `spaces/<id>/launcher.json` (what it
+  loaded); `install.sh` and `pa-sync` write `installed.json`. The header shows "older code (tools)",
+  "(core)", or "(tools, core)", or "started before restart support"; after an install,
+  `pa-peers --older` lists the Project Agents still running older code. `/exit` in the Project Agent's
+  tab also reloads the code when the installed tools changed.
+- **Launchers from before restart support** cannot take a restart. The panel's button reads "Restart
+  (ends workers)"; it shows `pa-restart --space <id> --end-terminal` (with `--on <machine>` for a remote
+  space) to copy and run yourself. That ends the terminal and its workers, after it asks; the panel never
+  ends a terminal.
 
 ## Open requests: `project-agent.openAgent`
 

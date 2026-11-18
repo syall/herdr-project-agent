@@ -13,7 +13,7 @@
 // space's state folder keeps two Herdr clients from restoring the same Project Agent at once.
 
 import { spaces, panes, terminals, machines, focused, run, openOverlay, notify, home, shared, setShared } from "herdr";
-import { replaceFile, OPEN_REQUESTS as REQUESTS, KEEPER_MARK, capped, gaveUp } from "./store.js";
+import { replaceFile, OPEN_REQUESTS as REQUESTS, KEEPER_MARK, capped, gaveUp, restartingLabel, RESTART_HOLD } from "./store.js";
 import { read as hostRead } from "./host.js";
 
 const localId = (id) => String(id ?? "").split("/").pop();
@@ -94,6 +94,7 @@ export class Keeper {
     this.retired = new Map(); // old PA terminals replaced by a restore or an Open -> the heartbeat text then: not adopted again unless a launcher really starts there (a new, fresh beat names it)
     this.ready = {}; // machine name -> its layout state last tick
     this.peeked = {}; // space id -> last fast heartbeat read
+    this.restartSeen = {}; // t-037 J4: terminal address -> when its herdr.pa.restarting label was first seen
     this.reading = false;
     this.asked = new Set(); // terminals whose new-space setup dialog was already opened
     // One time: carry over the records an older tab bar kept under its own key.
@@ -265,12 +266,24 @@ export class Keeper {
   classify(tab, r, ts, ps, now) {
     const term = ts.find((x) => x.address === r.terminal);
     if (!term || term.state !== "live") return "ended";
+    // A launcher restarting in place (t-037 R15): at work, never judged; its beats are counted afresh after the hold.
+    if (this.holding(term, ps.find((p) => p.terminal === term.address), now)) { delete this.beat[tab]; return "alive"; }
     if (now - (this.seen[term.address] ?? now) < YOUNG) return "alive";
     const b = this.beat[tab];
     if (!b) return "alive"; // not read yet
     if (b.same < STALE_READS) return beatAddress(b.value) === localId(term.address) ? "alive" : "elsewhere";
     // The launcher is gone. Only an idle shell is restored; when unsure, leave it and tell (foreign).
     return idleShell(term, ps.find((p) => p.terminal === term.address)) ? "shell" : "foreign";
+  }
+
+  // t-037 J4 (R15): the terminal carries herdr.pa.restarting (its launcher ends its Claude and execs in place), is not
+  // an idle shell, and this keeper first saw the label less than RESTART_HOLD ago. Then it is never restored or opened
+  // again and not marked alive (nothing is sent into the gap). A label kept longer is judged as today.
+  holding(term, pane, now) {
+    if (!term || !restartingLabel(term)) { if (term) delete this.restartSeen[term.address]; return false; }
+    if (idleShell(term, pane)) return false;
+    this.restartSeen[term.address] ??= now;
+    return now - this.restartSeen[term.address] < RESTART_HOLD;
   }
 
   // Runs on a timer, not in render: adopts labelled terminals, keeps each Project Agent tab
@@ -290,7 +303,7 @@ export class Keeper {
     }
     const live = new Set(ts.map((t) => t.address));
     for (const t of ts) this.seen[t.address] ??= typeof t.created_ms === "number" ? Math.min(t.created_ms, now) : now;
-    for (const a of Object.keys(this.seen)) if (!live.has(a)) { delete this.seen[a]; this.retired.delete(a); }
+    for (const a of Object.keys(this.seen)) if (!live.has(a)) { delete this.seen[a]; this.retired.delete(a); delete this.restartSeen[a]; }
 
     for (const term of ts) {
       if (term.state !== "live" || !term.labels?.["herdr.pa"] || term.parent) continue;
@@ -348,6 +361,7 @@ export class Keeper {
       const space = sp.find((s) => s.id === r.space);
       if (!space) { delete records[tab]; delete this.missing[tab]; delete this.beat[tab]; continue; } // its space closed: the one way a Project Agent ends
       delete r.alive; // set again below, only for a launcher known to run in the record's terminal
+      delete r.restarting; // likewise: set below while its launcher restarts in place (t-037 R15)
       if (!this.machineReady(space)) { delete this.beat[tab]; delete this.missing[tab]; continue; } // offline: keep the record, count afresh later
       const c = cfg(space);
       if (c === "unknown") { wantRead = true; continue; }
@@ -367,7 +381,9 @@ export class Keeper {
       // alive: labelled for the space, a fresh heartbeat naming it, and not positively an idle shell
       // (a launcher that died leaves one: from that tick on nothing is sent there).
       const term = ts.find((x) => x.address === r.terminal);
-      if (state === "alive" && term?.labels?.["herdr.pa"] === localId(space.id) && beatFresh(this.hb[space.id], now, ALIVE_BEAT) === localId(r.terminal)
+      const held = state === "alive" && this.holding(term, ps.find((p) => p.terminal === r.terminal), now);
+      if (held) r.restarting = true; // the panel says Restarting…; not alive, so no notice is typed into the gap
+      else if (state === "alive" && term?.labels?.["herdr.pa"] === localId(space.id) && beatFresh(this.hb[space.id], now, ALIVE_BEAT) === localId(r.terminal)
         && !idleShell(term, ps.find((p) => p.terminal === r.terminal))) r.alive = true;
       if (state !== "foreign") delete this.noticed[space.id]; // the next "something else" is a new episode
       if (state === "alive" || state === "elsewhere") { delete this.missing[tab]; if (state === "alive") delete this.stopped[space.id]; continue; }
@@ -421,6 +437,8 @@ export class Keeper {
       if (conf.state === "absent") { done(); continue; } // not a Project Agent space
       const mine = Object.entries(records).filter(([, r]) => r.space === sid);
       if (this.pending[sid] || mine.some(([, r]) => r.recovering)) { done("Project Agent already opening", "it is being opened or restored already."); continue; }
+      // Restarting in place (t-037 R15): the same terminal comes back; a second one would be refused by its claim.
+      if (mine.some(([, r]) => { const term = ts.find((t) => t.address === r.terminal && t.state === "live"); return term && this.holding(term, ps.find((p) => p.terminal === r.terminal), now); })) { done("Project Agent restarting", "it is restarting in its tab; it is back in a few seconds."); continue; }
       // A starting or error label counts only on a terminal that is not an idle shell: a launcher killed
       // while starting leaves its label on the shell it falls back to.
       if (mine.some(([, r]) => { const term = ts.find((t) => t.address === r.terminal && t.state === "live"); return starting(term) && !idleShell(term, ps.find((p) => p.terminal === r.terminal)); })) { done("Project Agent already opening", "its launcher is starting (or waiting for Enter in its tab)."); continue; }

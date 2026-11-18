@@ -26,6 +26,12 @@ export function keeperJudging() {
 // A launcher that has begun and not finished starting (or waits for Enter on an error).
 export const startingLabels = (term) => (term?.labels?.["herdr.pa.starting"] || term?.labels?.["herdr.pa.error"] ? { error: term.labels["herdr.pa.error"] ?? null } : null);
 
+// t-037 J4 (R15): a launcher restarting in place labels its terminal herdr.pa.restarting=<request id> while it ends its
+// Claude and execs; pa.py clears it by setting it empty, so "" is absent. The keeper holds such a terminal (never
+// restored, never opened again, not marked alive) for at most RESTART_HOLD from when it first saw the label.
+export const restartingLabel = (term) => Boolean(term?.labels?.["herdr.pa.restarting"]);
+export const RESTART_HOLD = 120000;
+
 // The space's Project Agent terminal that its launcher is known to run in (the keeper's record
 // with alive: true, from the current keeper), or null. Messages for the agent go only here.
 export function liveTarget(spaceId) {
@@ -207,6 +213,108 @@ export async function staleInstructions(space, profile, cx) {
     if (gaveUp(r)) return r;
     return r.stdout.split("\n").filter(Boolean).map((p) => p.split("/").pop());
   } catch { return []; }
+}
+
+// ---- t-037 J4: what the Project Agent's launcher runs, and the Restart button (R13, R14) ---------------------------
+// launcher.json (written by the launcher only) and installed.json (by install.sh / pa-sync), read on the space's
+// machine. codeState is pa.code_state exactly (tests/samples/code-state-cases.json checks both), restartCapable is
+// pa.restart_capable. The button runs only the restart tool in place on the space's machine (runRestart): a dry run for
+// the confirm, then one run bound to the launcher instance the confirm showed. It never ends a terminal.
+const isObj = (v) => Boolean(v) && typeof v === "object" && !Array.isArray(v);
+const asObj = (v) => (isObj(v) ? v : {});
+const asText = (v) => (typeof v === "string" ? v : null);
+export const restartCapable = (rec) => {
+  const r = asObj(rec), version = r.version;
+  return typeof version === "number" && Number.isInteger(version) && version >= 2 && Array.isArray(r.accepts) && r.accepts.includes("restart");
+};
+// { word, detail, capable, instance, prompt }: word as pa.code_state (current | older (tools|core|tools, core) | unknown).
+export function codeState(launcher, installed, terminal) {
+  const capable = restartCapable(launcher), instance = asText(asObj(launcher).instance), prompt = asText(asObj(asObj(launcher).session).prompt);
+  const out = (word, detail) => ({ word, detail, capable, instance, prompt });
+  if (!isObj(installed) || !asText(installed.tools)) return out("unknown", "no installed.json on this machine (run install.sh or pa-sync)");
+  if (!isObj(launcher)) return out("unknown", "started before restart support (no launcher.json)");
+  if (terminal && launcher.terminal !== terminal) return out("unknown", `launcher.json is from another terminal (${launcher.terminal})`);
+  const tools = asText(asObj(launcher.code).tools), session = asObj(launcher.session), recorded = session.prompt === "recorded";
+  const core = asText("promptCore" in session ? session.promptCore : session.core);
+  if (!tools || !core) {
+    if (tools && recorded) return out("unknown", "the core text this resumed session runs with is not known (a new conversation loads the current one)");
+    return out("unknown", `launcher.json has no ${!tools ? "tools" : "core"} hash`);
+  }
+  const older = [["tools", tools], ["core", core]].filter(([n, a]) => a !== installed[n]).map(([n]) => n);
+  if (older.length) return out(`older (${older.join(", ")})`, `runs tools ${tools.slice(0, 12)} core ${core.slice(0, 12)}; installed tools ${String(asText(installed.tools) ?? "").slice(0, 12)} core ${String(asText(installed.core) ?? "").slice(0, 12)}`);
+  return out("current", `tools ${tools.slice(0, 12)} core ${core.slice(0, 12)}`);
+}
+// The header's words: nothing for current (or nothing read yet).
+export function codeBadge(state) {
+  if (!state) return null;
+  if (!state.capable) return "started before restart support";
+  if (state.word === "current") return null;
+  const m = /^older \((.+)\)$/.exec(state.word);
+  return m ? `older code (${m[1]})` : "code unknown";
+}
+// { launcher, installed } (null where missing or not JSON, as read_json_safe), or a give-up when either did not answer.
+export async function loadCode(space, cx) {
+  const on = space.machine ?? null;
+  const [l, i] = await Promise.all([readJson(`${stateDir(space)}/launcher.json`, on, cx), readJson(`${paHome(on)}/installed.json`, on, cx)]);
+  if (l.timedOut) return TIMED_OUT;
+  if (i.timedOut) return TIMED_OUT;
+  return { launcher: isObj(l.value) ? l.value : null, installed: isObj(i.value) ? i.value : null };
+}
+
+export const RESTART_TOOL = "pa-restart";
+export const RESTART_WAIT = 180; // seconds the tool waits for the new launcher (its default, spec R13's 3 minutes)
+export const RESTART_TIMEOUT = 210000; // ms: its exec's timeout, the wait plus 30 s (an exec still unsettled GRACE later is given up)
+export const DRY_TIMEOUT = 30000; // ms
+export const RESTART_WHY = "the Restart button in the Project Agent panel"; // recorded only (a Herdr started from a Claude shell needs a why)
+export const RESTART_MARK = "project-agent.restarting"; // shared: { "<space id>": { by, at, instance } } while a copy's run is in flight
+export const RESTART_MARK_TTL = 240000;
+export const RESTARTED_FOR = 60000; // "Restarted: …" stays this long
+// The argv after the tool's name: the dry run, or the one run bound to `instance`. null without a usable instance.
+export function restartArgs(space, { instance = null, now = false, fresh = false, dry = false } = {}) {
+  const base = ["--space", localId(space.id)];
+  if (dry) return [...base, "--dry-run"];
+  if (typeof instance !== "string" || !instance || instance.startsWith("-")) return null;
+  return [...base, "--json", "--wait", String(RESTART_WAIT), "--expect-instance", instance, "--by", "panel", "--why", RESTART_WHY, ...(now ? ["--now"] : []), ...(fresh ? ["--fresh"] : [])];
+}
+// The line the person copies for a launcher from before restart support (the panel never runs it): J3's form.
+export const endTerminalLine = (space) => `${RESTART_TOOL} --space ${localId(space.id)} --end-terminal${space.machine ? ` --on ${space.machine}` : ""}`;
+// One exec of the tool on the space's machine (timeout in ms): { r } | { error } | { busy } (one already pending) | { timedOut }.
+export async function runRestart(hcx, space, args, timeout) {
+  const on = space.machine ?? null;
+  try {
+    const r = await capped(hcx, () => run(RESTART_TOOL, args, { on, timeout }), { key: `restart:${on ?? ""}:${localId(space.id)}`, limit: timeout + GRACE, what: `${RESTART_TOOL} ${args.includes("--dry-run") ? "--dry-run" : "run"}` });
+    if (r === TIMED_OUT) return { timedOut: true };
+    if (gaveUp(r)) return { busy: true };
+    return { r };
+  } catch (e) { return { error: String(e?.message ?? e) }; }
+}
+const lastJson = (stdout) => {
+  for (const line of String(stdout ?? "").split("\n").reverse()) {
+    if (!line.trim().startsWith("{")) continue;
+    try { const v = JSON.parse(line); if (isObj(v)) return v; } catch { /* not this line */ }
+  }
+  return null;
+};
+const toolSaid = (r) => String(r?.stderr || r?.stdout || "").trim().split("\n").filter(Boolean).slice(-3).join(" ").slice(0, 600);
+const utcClock = (iso) => { const d = new Date(String(iso ?? "")); return Number.isNaN(d.getTime()) ? "?" : `${String(d.getUTCHours()).padStart(2, "0")}:${String(d.getUTCMinutes()).padStart(2, "0")} UTC`; };
+const h7 = (v) => (asText(v) || "unknown").slice(0, 7);
+export function restartedLine(launcher) {
+  const code = asObj(asObj(launcher).code), session = asObj(asObj(launcher).session), profile = asObj(asObj(launcher).profile);
+  const core = "promptCore" in session ? session.promptCore : session.core, commit = asText(code.commit);
+  return `Restarted: tools ${h7(code.tools)} (${commit ? commit.slice(0, 7) : "no commit"}), core ${h7(core)}${session.prompt === "recorded" ? " (still the text this conversation began with)" : ""}, profile ${asText(profile.name) ?? "?"} read ${utcClock(profile.readAt)}`;
+}
+const notInstalled = (space) => (space.machine ? `${RESTART_TOOL} is not installed on ${space.machine}; run pa-sync --on ${space.machine}.` : `${RESTART_TOOL} is not installed here; run ./install.sh.`);
+// What runRestart's answer means, as one line: { ok, text, launcher?, unknown? }, or null (busy: nothing to say).
+export function restartOutcome(res, space) {
+  if (!res || res.busy) return null;
+  if (res.timedOut) return { ok: false, unknown: true, text: `The restart's result is not known (${RESTART_TOOL} did not answer in ${(RESTART_TIMEOUT + GRACE) / 1000} s); the header shows what it runs now.` };
+  if (res.error !== undefined) return { ok: false, text: missingTool(res.error, RESTART_TOOL) ? notInstalled(space) : `${RESTART_TOOL} could not run: ${String(res.error).slice(0, 300)}` };
+  const r = res.r ?? {}, out = lastJson(r.stdout);
+  if (r.code === 127 || (r.code !== 0 && missingTool(toolSaid(r), RESTART_TOOL))) return { ok: false, text: notInstalled(space) };
+  if (r.code === 0) return out?.outcome === "ok" && isObj(out.launcher) ? { ok: true, text: restartedLine(out.launcher), launcher: out.launcher } : { ok: true, text: "Restarted; the header shows what it runs now." };
+  if (out && (out.outcome === "refused" || out.outcome === "failed")) return { ok: false, text: `The restart did not happen: ${asText(out.why) ?? out.outcome}` };
+  if (r.code === 2) return { ok: false, text: `Not restarted: ${toolSaid(r) || `exit ${r.code}`}` };
+  return { ok: false, text: toolSaid(r) || `${RESTART_TOOL} exited with ${r.code}` };
 }
 
 // A task's artifacts as links: [{ label, url }], https only, each once. From the task itself

@@ -5431,7 +5431,7 @@ cases["P37-badge-four-cases"] = async () => { // R14 AC14.1: the header's words
     [LREC({ code: { tools: "X" } }), INSTALLED, "older code (tools)"],
     [LREC({ session: { promptCore: "Y" } }), INSTALLED, "older code (core)"],
     [LREC({ code: { tools: "X" }, session: { promptCore: "Y" } }), INSTALLED, "older code (tools, core)"],
-    [undefined, INSTALLED, "started before restart support"],
+    [null, INSTALLED, "started before restart support"], // null: launcher.json holds no record (missing reads the same)
     [LREC(), null, "code unknown"],
   ];
   for (const [launcher, installed, word] of want) {
