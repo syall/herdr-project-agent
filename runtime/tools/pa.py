@@ -1005,7 +1005,9 @@ def hook_command(space, sub):
     space = local_id(space or "")
     if not ID.match(space) or not sys.executable:
         return None
-    return " ".join(shlex.quote(a) for a in (sys.executable, PA_FILE, "context", sub, "--space", space))
+    # Shell form (sh -c). `|| true`: the line itself never exits 2, which would block a compaction (PreCompact): a
+    # missing PA_FILE, or a pa.py that does not know `context` (installed while this session runs), both exit 2.
+    return " ".join(shlex.quote(a) for a in (sys.executable, PA_FILE, "context", sub, "--space", space)) + " || true"
 
 
 def context_hooks(space):
@@ -2169,11 +2171,14 @@ def run_agent(args, address, project, p, directory, agent, ctx, started):
     running = ctx.setdefault("running", {"since": None, "session": None, "marked": False})
     ctx["directory"], ctx["project"] = directory, project
 
+    wake = ctx.setdefault("beatWake", threading.Event())  # set by starting(): a session's RAN mark is timed from it
+
     def beat():
         # The tab bar reads this: a live terminal whose heartbeat stopped has lost its launcher.
         # Also keeps the last ledger that parsed, so a half-written or mangled one can be restored.
         ledger, seen = os.path.join(directory, "ledger.json"), None
         while True:
+            pause = 10
             try:
                 write_text(os.path.join(directory, "heartbeat"), "{} {}\n".format(int(time.time()), address))
                 # A session that has run for 20 s exists: record it now, so a tab that is killed
@@ -2192,7 +2197,14 @@ def run_agent(args, address, project, p, directory, agent, ctx, started):
                         write_text(os.path.join(directory, "ledger.last-good.json"), text)
             except (OSError, ValueError, AttributeError):
                 pass
-            time.sleep(10)
+            # t-041 J3 round 2: the RAN mark is not left to the 10 s beat's phase (the probes before a start shift it,
+            # and a beat just short of RAN, the next after the tab was killed, left a session that ran unresumed):
+            # wake at the start + RAN, or at a new start.
+            since = running["since"]
+            if since and not running["marked"]:
+                pause = min(pause, max(0.05, since + RAN - time.time() + 0.05))
+            wake.wait(pause)
+            wake.clear()
     space = agent.get("space") or os.path.basename(directory)
     child_lock(ctx)  # made before the watcher thread exists
     if not ctx["beat"]:  # one heartbeat thread, also when a start is retried after an error
@@ -2240,6 +2252,7 @@ def run_agent(args, address, project, p, directory, agent, ctx, started):
                 "off" if plan["idle"] else "kept"))
             began = time.time()
             running.update(since=began, session=agent["sessionId"], marked=False)
+            wake.set()  # the heartbeat times this session's RAN mark from now
             launcher_session(ctx, directory, agent, resume, snapshot=snap)
             if adopted:  # t-033's re-read profile is the one running now (J1 Recorded limit L1)
                 launcher_update(ctx, directory, lambda r: r.__setitem__("profile", profile_record(p)))
