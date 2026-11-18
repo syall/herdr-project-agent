@@ -1146,10 +1146,17 @@ def worker_facts(directory, agent, profile, address):
     if row and task["id"] not in row["tasks"]:  # never another task's worktree (worker_tree gives only its own; a second guard)
         row = None
     if row and row["facts"] and not row["facts"].get("main") and not row["facts"].get("unreadable"):
+        # Another task that records this worktree and is not done or parked keeps it. Old shape (every task has it as its
+        # main `worktree`, the worker has no `worktree` field): as before J1, the other tasks are not looked at.
+        field = entry.get("worktree")
+        legacy = (field is None or (isinstance(field, str) and not field.strip())) and all(row["mains"].get(t) for t in row["tasks"])
+        held = [] if legacy else [t for t in row["tasks"] if t != task["id"] and row["states"].get(t) not in ("done", "parked")]
         others = [w["address"] for w in row["workers"] if w["fate"] == "live" and w["address"] != address] + row["others"]
+        others += ["task {} ({})".format(clean(t), clean(row["states"].get(t))) for t in held]
         out["worktree"] = {"path": row["path"], "kind": row["facts"].get("kind", "worktree"), "uncommitted": row["facts"]["uncommitted"],
                            "unpushed": row["facts"]["unpushed"], "removesBranches": bool(row["facts"].get("removesBranches")),
-                           "branch": row["facts"]["branch"], "sharedWith": others, "keep": row["keep"]}
+                           "branch": row["facts"]["branch"], "sharedWith": others, "keep": row["keep"], "heldBy": held,
+                           "tasks": [task["id"]] if legacy else list(row["tasks"])}  # whose ledger entries a removal marks
     return out, row
 
 
@@ -1853,8 +1860,9 @@ def cmd_worker(args):
             for t in (ledger or {}).get("tasks", []):
                 if t.get("id") == facts["task"]:
                     t["workers"] = [w for w in t.get("workers") or [] if w.get("address") != facts["address"]]
-                    if tree and tree.get("removed"):
-                        mark_removed(t, tree["path"], pa.now())
+                    t["updated"] = pa.now()
+                if tree and tree.get("removed") and t.get("id") in tree["tasks"]:  # every task that recorded it (old shape: its own)
+                    mark_removed(t, tree["path"], pa.now())
                     t["updated"] = pa.now()
             if ledger:
                 pa.write_json(path, ledger)
