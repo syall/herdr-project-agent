@@ -3127,5 +3127,105 @@ class D094Limits(Base):
         self.assertTrue(os.path.isdir(self.wt))
 
 
+class WorkerDeleteCounts(Base):
+    """t-048 (t-020 RL-V5): pa-worker delete counts the tasks on a worktree the way pa-worktree does (row_tasks: the
+    worktree, a folder inside it, its container): an unfinished one keeps it; a removal marks their entries once gone."""
+    job_tree, reset = JobCards.job_tree, JobCards.reset  # not a subclass: JobCards' own tests would run again
+
+    def setUp(self):
+        super().setUp()
+        self.proj = self.repo()
+
+    def setup_case(self, name, t009, where, extra_file=False):
+        """t-003 (done) has the worktree <tmp>/worktrees/<name>/proj as its main, its worker w-1 finished; t-009 (t009)
+        records a folder inside it ("inside") or its container ("container")."""
+        self.reset()
+        self.terms.clear()
+        bill = self.job_tree(name)
+        container = os.path.dirname(bill)
+        inner = os.path.join(bill, "sub")
+        os.makedirs(inner)
+        if extra_file:
+            write(os.path.join(container, "notes.txt"), "kept\n")
+        path = inner if where == "inside" else container
+        self.add_task("t-003", "done", bill, [{"address": "w-1", "role": "build", "name": "t-003 build", "finished": True}])
+        self.add_task("t-009", t009, None, [], worktrees=[{"path": path, "job": "o"}])
+        return bill, container, path
+
+    def t009(self):
+        return next(t for t in self.ledger()["tasks"] if t["id"] == "t-009")
+
+    def assert_kept(self, bill, path, state):
+        before = json.dumps(self.t009(), sort_keys=True)
+        facts, _row = pa_hooks.worker_facts(self.dir, {"terminal": "t0"}, None, "w-1")
+        self.assertEqual(facts["worktree"]["heldBy"], ["t-009"])
+        self.assertEqual(facts["worktree"]["sharedWith"], ["task t-009 ({})".format(pa_hooks.state_word(state))])
+        code, out, err = self.worker("delete", "w-1")
+        self.assertEqual(code, 0, err)
+        self.assertIn("Kept the worktree: still used by task t-009 ({}).".format(pa_hooks.state_word(state)), out)
+        self.assertNotIn("Removed the worktree", out)
+        self.assertTrue(os.path.isdir(bill))
+        self.assertTrue(os.path.isdir(path))
+        self.assertEqual(json.dumps(self.t009(), sort_keys=True), before, "t-009's entry is untouched")
+        t3 = next(t for t in self.ledger()["tasks"] if t["id"] == "t-003")
+        self.assertEqual((t3["worktree"], t3["workers"]), (bill, []))
+
+    def test_d1_an_unfinished_task_inside_the_worktree_keeps_it(self):  # RL-V5's case
+        for state in ("in-progress", "review", None):
+            with self.subTest(t009=state):
+                bill, _c, inner = self.setup_case("t-003-d1-{}".format(state), state, "inside")
+                self.assert_kept(bill, inner, state)
+
+    def test_d2_a_finished_task_inside_is_marked_with_the_removal(self):
+        for state in ("done", "parked"):
+            with self.subTest(t009=state):
+                bill, container, inner = self.setup_case("t-003-d2-" + state, state, "inside")
+                code, out, err = self.worker("delete", "w-1")
+                self.assertEqual(code, 0, err)
+                self.assertIn("Removed the worktree {}".format(os.path.realpath(bill)), out)
+                self.assertFalse(os.path.exists(bill))
+                t9 = self.t009()
+                self.assertTrue(t9["worktrees"][0].get("removed"), "the folder inside is gone: t-009's entry is marked")
+                self.assertEqual(pa.task_worktrees(t9), [])
+                t3 = next(t for t in self.ledger()["tasks"] if t["id"] == "t-003")
+                self.assertIsNone(t3["worktree"])
+
+    def test_d3_a_task_that_records_the_container(self):
+        bill, container, _p = self.setup_case("t-003-d3-a", "in-progress", "container")
+        self.assert_kept(bill, container, "in-progress")
+        bill, container, _p = self.setup_case("t-003-d3-b", "done", "container")
+        code, out, err = self.worker("delete", "w-1")
+        self.assertEqual(code, 0, err)
+        self.assertIn("Removed the empty folder {}.".format(container), out)
+        self.assertFalse(os.path.exists(container))
+        self.assertTrue(self.t009()["worktrees"][0].get("removed"), "the container is gone: t-009's entry is marked")
+
+    def test_d3b_a_container_that_stays_is_not_marked(self):
+        bill, container, _p = self.setup_case("t-003-d3c", "done", "container", extra_file=True)
+        code, out, err = self.worker("delete", "w-1")
+        self.assertEqual(code, 0, err)
+        self.assertFalse(os.path.exists(bill))
+        self.assertTrue(os.path.isdir(container))
+        self.assertFalse(self.t009()["worktrees"][0].get("removed"), "the container is still there: t-009's entry still names it")
+        t3 = next(t for t in self.ledger()["tasks"] if t["id"] == "t-003")
+        self.assertIsNone(t3["worktree"])
+        self.assertTrue(t3["worktrees"][0]["removed"])
+
+    def test_d4_plain_case_unchanged(self):
+        self.reset()
+        bill = self.job_tree("t-003-d4")
+        self.add_task("t-003", "done", bill, [{"address": "w-1", "role": "build", "name": "t-003 build", "finished": True}])
+        facts, _row = pa_hooks.worker_facts(self.dir, {"terminal": "t0"}, None, "w-1")
+        self.assertEqual((facts["worktree"]["heldBy"], facts["worktree"]["sharedWith"]), ([], []))
+        code, out, err = self.worker("delete", "w-1")
+        self.assertEqual(code, 0, err)
+        self.assertFalse(os.path.exists(bill))
+        self.assertIn("Removed the empty folder {}.".format(os.path.dirname(bill)), out)
+        led = self.ledger()
+        self.assertEqual(len(led["tasks"]), 1)
+        self.assertIsNone(led["tasks"][0]["worktree"])
+        self.assertEqual(pa.task_worktrees(led["tasks"][0]), [])
+
+
 if __name__ == "__main__":
     unittest.main()
