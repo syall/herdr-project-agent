@@ -2074,6 +2074,18 @@ class AC10_1_Identification(EndTerminal):
         self.term["argv"] = ["pa-session", "--space", "sp9", "--project", "/p"]
         self.refused("not this space's pa-session")
 
+    def test_e_first_tab_ask_is_refused_and_named(self):
+        # card d-161 'B: keep strict': a space's first tab started with `pa-session --ask` stays refused (no --space),
+        # and the refusal says so plainly, with "close it by hand"
+        self.term["argv"] = ["pa-session", "--ask"]
+        c, out, err = self.run_end()
+        self.assertEqual(c, 2, out + err)
+        self.assertIn("first tab", err)
+        self.assertIn("--ask", err)
+        self.assertIn("close it by hand", err)
+        self.assertEqual(self.kills(), [])
+        self.nothing_written()
+
     def test_e_no_argv(self):
         self.term.pop("argv")
         self.refused("not this space's pa-session")
