@@ -3522,6 +3522,93 @@ cases["A11-redraw-at-10s"] = async () => { // A4: the 1 s tick asks for a redraw
   check((g.__notifies ?? 0) - n0 === 1, `rule: one redraw at 10.5 s (got ${(g.__notifies ?? 0) - n0})`);
 };
 
+// ---- t-028 group B: push card edge cases (t-022 items 1-4). The push tool is the stand-in (__execFn) only. ----
+const MISMATCH = (fileId, own) => `This card's id (${own}) is not its file name (${fileId}): shown only, never checked or run.`;
+cases["B1-push-id-from-file-name"] = async () => { // item 1: a push card's id is its file name; one whose own id differs is shown, never checked or run
+  const { v } = await pushWorld({ card: pushCardText({ id: "d-push-t-9-9" }) });
+  check(v.cards.some((c) => c.id === PID), `the entry's id is the file name (got ${JSON.stringify(v.cards.map((c) => c.id))})`);
+  look(v).clicks[`opt-${PID}-1`]?.({}, cx); await settle(); // Not now
+  const { text, clicks } = look(v);
+  check(text.includes(MISMATCH(PID, "d-push-t-9-9")), `says why it is shown only (got ${text.slice(0, 1500)})`);
+  check(!clicks[`submit-${PID}`] && !clicks[`push-check-${PID}`], `no Submit, no Check again (have ${Object.keys(clicks)})`);
+  look(v).clicks[`opt-${PID}-0`]?.({}, cx); await settle(); // picking Push checks nothing
+  const space = g.__spaces.find((x) => x.active), entry = v.cards.find((c) => c.id === PID);
+  v.answer(space, entry, "Not now", cx); v.answer(space, entry, "Push", cx); await settle(); // even a direct answer runs nothing
+  check(allExecsOfTool().length === 0, `the push tool never ran (got ${JSON.stringify(allExecsOfTool().map((x) => x[1]))})`);
+  // A file name that reads as an option is refused the same way.
+  world(); g.__files[`:${DIR}/decisions/-x.json`] = pushCardText({ id: "-x" }); g.__ls[`:${DIR}/decisions`] = ["-x.json"];
+  g.__files[`:${DIR}/ledger.json`] = JSON.stringify({ tasks: [] }); pushTool();
+  const w = await mount(); await settle();
+  check(look(w).text.includes("This card's file name (-x) starts with a dash: shown only, never checked or run."), `a leading dash (got ${look(w).text.slice(0, 1200)})`);
+  check(allExecsOfTool().length === 0, `nothing ran (got ${JSON.stringify(allExecsOfTool().map((x) => x[1]))})`);
+  // The same file id and name: checked as before.
+  const { v: u } = await pushWorld();
+  check(pushExecs("check").length === 1 && !look(u).text.includes("never checked or run"), "a matching card is checked");
+};
+cases["B2-push-notnow-while-checking"] = async () => { // item 2: Not now during a running check says so; Submit again after it runs it once
+  const hold = deferred();
+  let n = 0;
+  const { v } = await pushWorld({ tool: { check: () => (++n === 1 ? hold.promise : json(0, checkReply())), run: () => json(0, { ok: true, done: false, answer: "Not now", refusal: null, result: null, message: "answered Not now" }) } });
+  check(look(v).text.includes("Checking…"), "the first check runs");
+  await click(v, `opt-${PID}-1`); await settle();
+  await click(v, `submit-${PID}`); await settle();
+  const SAID = "Not now was not saved: a check was running. Submit it again.";
+  check(pushExecs("run").length === 0, "no run while the check runs");
+  check(look(v).text.includes(SAID), `says so (got ${look(v).text.slice(0, 1500)})`);
+  hold.resolve(json(0, checkReply())); await settle();
+  check(look(v).text.includes(SAID) && pushExecs("run").length === 0, "still said after the check, nothing run by itself");
+  if (!v.choice[PID]) { await click(v, `opt-${PID}-1`); await settle(); }
+  await click(v, `submit-${PID}`); await settle();
+  check(pushExecs("run").length === 1 && pushExecs("run")[0][1].includes("Not now"), `Submit again runs Not now once (got ${JSON.stringify(pushExecs("run").map((x) => x[1]))})`);
+  check(!look(v).text.includes(SAID), "the line goes");
+};
+cases["B3-push-unknown-then-closed"] = async () => { // item 3: unknown result, the check found the card open, then it closed by another route: no stale "checking again"
+  let file;
+  const { v, file: f } = await pushWorld({ opts: { records: alive() }, tool: { run: () => ({ code: 1, stdout: "", stderr: "Traceback (most recent call last):\nOSError: boom" }) } });
+  file = f;
+  await click(v, `opt-${PID}-0`); await settle();
+  await click(v, `submit-${PID}`); await settle(); await settle();
+  check(/The result is unknown/.test(look(v).text) && /Ready: Push pushes exactly this\./.test(look(v).text), `unknown, then the check found it open (got ${look(v).text.slice(0, 1500)})`);
+  g.__files[file] = JSON.stringify({ ...JSON.parse(pushCardText()), status: "withdrawn", note: "not needed", answered: "2026-11-16T10:05:00Z", answeredBy: "Project Agent" });
+  advance(10000); await fire(10000); await settle();
+  const text = look(v).text;
+  check(v.cards.some((c) => c.id === PID && c.card?.status === "withdrawn"), "the reload read it withdrawn");
+  check(!text.includes("checking the card again") && !text.includes("The check found the card open."), `no stale line (got ${text.slice(0, 1500)})`);
+  check(/The result was unknown \([\s\S]*boom[\s\S]*\); the card was open when checked and has closed since\./.test(text), `says what is known (got ${text.slice(0, 1500)})`);
+  check(pushExecs("run").length === 1, "one run");
+};
+cases["B4-push-result-shapes"] = async () => { // item 4: the four shapes the tests did not pin
+  // ok:true, done:false with a result object, exit 0; and a result that is not an object: unknown, never Pushed.
+  const res = { at: "2026-11-16T10:01:00Z", from: PR, to: PC, url: PURL, branch: "main" };
+  for (const [name, reply] of [["ok, not done, a result", { ok: true, done: false, answer: "Push", refusal: null, result: res, message: "" }],
+    ["result not an object", { ok: true, done: true, answer: "Push", refusal: null, result: "pushed", message: "" }]]) {
+    const { v } = await pushWorld({ opts: { records: alive() }, tool: { run: () => json(0, reply) } });
+    await click(v, `opt-${PID}-0`); await settle();
+    await click(v, `submit-${PID}`); await settle();
+    const { text } = look(v);
+    check(/The result is unknown \(/.test(text) && !text.includes("Pushed "), `${name}: unknown, never Pushed (got ${text.slice(0, 1500)})`);
+    // The exit-0 reason's own words.
+    const why = "run exited with 0 without a result that says it pushed";
+    check(text.includes(why), `${name}: the reason (got ${text.slice(0, 1500)})`);
+    check(sends().map((x) => x[2]).some((m) => m.startsWith(`decision ${PID} answered Push; result unknown (`) && m.includes(why)), `${name}: told so (got ${JSON.stringify(sends())})`);
+  }
+  // "Checking…" on the answered card while the follow-up check runs, then its verdict.
+  let file, ran = false;
+  const hold = deferred();
+  const { v, file: f } = await pushWorld({ tool: { check: () => (ran ? hold.promise : json(0, checkReply())),
+    run: () => { ran = true; g.__files[file] = answeredByTool(); return { code: 1, stdout: "", stderr: "crash" }; } } });
+  file = f;
+  await click(v, `opt-${PID}-0`); await settle();
+  await click(v, `submit-${PID}`); await settle(); await settle();
+  let text = look(v).text;
+  check(v.cards.some((c) => c.id === PID && c.card?.status === "answered"), "read answered");
+  const u = text.indexOf("The result is unknown"), c = text.indexOf("Checking…");
+  check(u >= 0 && c > u && !text.includes(C4_DONE), `unknown, then Checking… (got ${text.slice(0, 1500)})`);
+  hold.resolve(checkDone()); await settle();
+  text = look(v).text;
+  check(text.includes(C4_DONE) && !text.includes("Checking…"), `then the verdict (got ${text.slice(0, 1500)})`);
+};
+
 // Which cases run (t-031): every case, or the named ones; --shard=<k>/<n> keeps every n-th case by definition
 // order (index mod n == k - 1), so n shards together run each case once, and a case added later lands in one.
 // --list prints the names that would run and runs none. An unknown name or option exits 2.

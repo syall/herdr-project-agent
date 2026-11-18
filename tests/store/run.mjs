@@ -430,6 +430,21 @@ cases["S-costs-timeout"] = async () => { // D3: a hung read is given up after RE
   check(r.done && r.value.timedOut === true && r.value.missing === null, `a hung ls times out (got ${JSON.stringify(r.value)})`);
 };
 
+// t-028 B1: a push card's id is its file name; one whose own id differs, or whose name starts with "-", is flagged.
+cases["S-push-id-file-name"] = async () => {
+  const push = (id) => JSON.stringify({ id, kind: "push", question: "Push?", options: [{ label: "Push" }, { label: "Not now" }], status: "open", push: { version: 1 } });
+  const cards = store.parseCards([
+    { name: "d-push-t-1-1.json", path: "/d/d-push-t-1-1.json", text: push("d-push-t-9-9") },
+    { name: "d-push-t-2-1.json", path: "/d/d-push-t-2-1.json", text: push("d-push-t-2-1") },
+    { name: "-x.json", path: "/d/-x.json", text: push("-x") },
+    { name: "d-a.json", path: "/d/d-a.json", text: JSON.stringify({ id: "d-other", question: "Q?", options: [{ label: "A" }], status: "open" }) }]);
+  const by = Object.fromEntries(cards.map((c) => [c.path, c]));
+  check(by["/d/d-push-t-1-1.json"].id === "d-push-t-1-1" && by["/d/d-push-t-1-1.json"].mismatch === "d-push-t-9-9", `file name, own id kept as mismatch (got ${JSON.stringify(by["/d/d-push-t-1-1.json"])})`);
+  check(by["/d/d-push-t-2-1.json"].id === "d-push-t-2-1" && !by["/d/d-push-t-2-1.json"].mismatch, "a matching one is not flagged");
+  check(by["/d/-x.json"].id === "-x" && by["/d/-x.json"].dash === true, `a leading dash is flagged (got ${JSON.stringify(by["/d/-x.json"])})`);
+  check(by["/d/d-a.json"].id === "d-other" && !by["/d/d-a.json"].mismatch && !by["/d/d-a.json"].dash, "an ordinary card keeps its own id, as before");
+};
+
 const pick = process.argv.slice(2);
 let failed = 0;
 for (const [name, fn] of Object.entries(cases)) {
