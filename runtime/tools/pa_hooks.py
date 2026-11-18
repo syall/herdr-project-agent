@@ -2026,8 +2026,9 @@ def trust_read(text, width=None):
     return None, "", {"wording": wording["name"], "shown": shown, "grants": grants, "cursor": cursor, "move": move}
 
 
-def trust_project(project, home):
-    """(real project folder, None), or (None, why) when it cannot be the base of a trust."""
+def trust_project(project, home, pa_home=None):
+    """(real project folder, None), or (None, why) when it cannot be the base of a trust: also when the home folder
+    or the Project Agent's home is inside it (every folder in them, the Claude home among them, would be inside)."""
     if not isinstance(project, str) or not project.strip():
         return None, "agent.json names no project folder"
     if not os.path.isabs(project):
@@ -2035,8 +2036,11 @@ def trust_project(project, home):
     real = os.path.realpath(project)
     if not os.path.isdir(real):
         return None, "the project folder is not a folder: " + project
-    if real == os.path.realpath(os.sep) or real == os.path.realpath(home):
-        return None, "the project folder is / or the home folder: every folder would be inside it"
+    if real == os.path.realpath(os.sep) or trust_inside(home, real):
+        return None, "the project folder is /, the home folder or a folder holding it: every folder in the home " \
+                     "folder would be inside it"
+    if pa_home and trust_inside(pa_home, real):
+        return None, "the project folder is the Project Agent's home or a folder holding it: its state would be inside it"
     return real, None
 
 
@@ -2064,6 +2068,29 @@ def trust_evidence(folder, state_dir, task_ids):
 def git_top(folder):
     code, out, _ = git(folder, "rev-parse", "--show-toplevel")
     return os.path.realpath(out) if code == 0 and out else None
+
+
+def trust_key(folder):
+    """The folder Claude Code records the trust for (spec D2), as a real path: in a git repository its root, and
+    in a worktree its main checkout's root; outside git the folder itself. None when git names a repository whose
+    main checkout it cannot tell (a bare repository's worktree, a submodule)."""
+    real = os.path.realpath(folder)
+    top = git_top(real)
+    if not top:
+        return real
+    code, common, _ = git(real, "rev-parse", "--git-common-dir")
+    if code != 0 or not common:
+        return None
+    common = os.path.realpath(os.path.join(real, common))
+    return os.path.dirname(common) if os.path.basename(common) == ".git" else None
+
+
+def trust_area(folder, project, state_dir, task_ids):
+    """Where folder lies, or None: in the state folder only a ledger task's evidence folder counts (whatever holds
+    the state folder), else the project folder or inside it."""
+    if trust_inside(folder, state_dir):
+        return "a task's evidence folder in the state folder" if trust_evidence(folder, state_dir, task_ids) else None
+    return "inside the project folder" if trust_inside(folder, project) else None
 
 
 def worker_dirs(folder):
@@ -2152,7 +2179,7 @@ def cmd_trust(args):
         print(json.dumps(out))
         sys.exit(0 if result == "accepted" else 1)
 
-    project, why = trust_project(agent.get("project"), home)
+    project, why = trust_project(agent.get("project"), home, pa.ROOT)
     if why:
         done("refused", why)
     out["project"] = project
@@ -2192,12 +2219,17 @@ def cmd_trust(args):
     real = os.path.realpath(path)
     out["real"] = real
     ids = [t.get("id") for t in ledger.get("tasks", []) if isinstance(t, dict)]
-    if trust_inside(real, project):
-        area = "inside the project folder"
-    elif trust_evidence(real, directory, ids):
-        area = "a task's evidence folder in the state folder"
-    else:
-        done("outside", "on real paths the folder is neither the project folder or inside it, nor a task's evidence folder")
+    area = trust_area(real, project, directory, ids)
+    if not area:
+        done("outside", "on real paths the folder is neither the project folder or inside it (outside the state "
+             "folder), nor a task's evidence folder")
+    key = trust_key(real)
+    if not key:
+        done("uncertain", "git names a repository for the folder but not its main checkout, so where the trust "
+             "would be recorded is not known")
+    if key != real and not trust_area(key, project, directory, ids):
+        done("outside", "Claude Code would record the trust for {}, the folder's repository (or its main checkout), "
+             "which is neither the project folder or inside it nor a task's evidence folder".format(key))
     cwd = (info.get("foreground") or {}).get("cwd") or info.get("cwd")
     dirs = worker_dirs(cwd)
     if not dirs:
