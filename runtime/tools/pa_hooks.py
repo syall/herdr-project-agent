@@ -1244,6 +1244,9 @@ def cmd_worktree(args):
                                    "why": "withdrew card {}: {}".format(card["id"], why)})
         raise pa.Problem(changed + "; the card is withdrawn and the next `pa-worktree check --open-cards` asks again. Nothing was removed")
     print(remove_worktree(row["path"], facts) + " (card {})".format(card["id"]))
+    tidy = remove_container(row["given"])
+    if tidy:
+        print(tidy)
 
 
 def pick_row(rows, task, job=None):
@@ -1312,6 +1315,28 @@ def remove_worktree(path, facts):
     if code:
         raise pa.Problem("git would not remove it: {}".format(err or out))
     return "Removed the worktree {}. Branch {} is kept.".format(path, facts["branch"])
+
+
+def remove_container(given):
+    """After a worktree was removed: removes the folder that held it when that is a container,
+    <...>/worktrees/<container>/<repo>, now empty. given: the worktree's path as recorded (so a symlinked container is
+    seen). Never the `worktrees` folder, a project or workspace, a symlink, a non-empty folder or anything else;
+    a workspace's worktree (<ws>/worktrees/<name>) has no container. One os.rmdir, no recursion; never raises.
+    Returns what it did, or None when there is no container to look at."""
+    try:
+        parent = os.path.dirname(os.path.abspath(os.path.expanduser(given)))
+        holder = os.path.dirname(parent)
+        if (os.path.basename(holder) != "worktrees" or os.path.basename(parent) == "worktrees" or os.path.islink(parent)
+                or not os.path.isdir(parent) or os.path.basename(os.path.realpath(holder)) != "worktrees"
+                or os.path.dirname(os.path.realpath(parent)) != os.path.realpath(holder)):
+            return None
+        names = sorted(os.listdir(parent))
+        if names:
+            return "kept {}: not empty ({}{})".format(parent, ", ".join(clean(n) for n in names[:3]), ", …" if len(names) > 3 else "")
+        os.rmdir(parent)
+        return "Removed the empty folder {}.".format(parent)
+    except OSError as e:
+        return "could not remove the empty folder {}: {}".format(os.path.dirname(os.path.abspath(str(given))), clean(e))
 
 
 def by_an_agent():
@@ -2042,6 +2067,9 @@ def cmd_worker(args):
         else:
             did.append(remove_worktree(tree["path"], row["facts"]))
             tree["removed"] = True
+            tidy = remove_container(row["given"])
+            if tidy:
+                did.append(tidy)
     if facts.get("task"):
         with open(os.path.join(directory, ".ledger.lock"), "a") as lock:
             import fcntl
