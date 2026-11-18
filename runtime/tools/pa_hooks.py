@@ -1243,7 +1243,14 @@ def cmd_worktree(args):
         append_journal(directory, {"by": "agent" if by_an_agent() else "person", "trigger": "worktree", "task": task,
                                    "why": "withdrew card {}: {}".format(card["id"], why)})
         raise pa.Problem(changed + "; the card is withdrawn and the next `pa-worktree check --open-cards` asks again. Nothing was removed")
-    print(remove_worktree(row["path"], facts) + " (card {})".format(card["id"]))
+    try:
+        done = remove_worktree(row["path"], facts)
+    except pa.Problem:
+        if not os.path.lexists(row["path"]):  # it failed, but the folder is gone: the ledger must not name it
+            mark_removed_everywhere(directory, row, "the worktree {} is gone after a failed removal (card {})".format(row["path"], card["id"]))
+        raise
+    mark_removed_everywhere(directory, row, "removed the worktree {} (card {})".format(row["path"], card["id"]))
+    print(done + " (card {})".format(card["id"]))
     tidy = remove_container(row["given"])
     if tidy:
         print(tidy)
@@ -1269,9 +1276,28 @@ def pick_row(rows, task, job=None):
     return mine[0]
 
 
+def state_word(state):
+    """A task's state as said on a line: `no state` when the ledger gives none (it counts as unfinished)."""
+    return clean(state) if state not in (None, "") else "no state"
+
+
 def tasks_still(row):
     """'t-003 in-progress, t-004 review' for the tasks using a worktree that are not done or parked."""
-    return ", ".join("{} {}".format(clean(i), clean(s)) for i, s in row["states"].items() if s not in ("done", "parked"))
+    return ", ".join("{} {}".format(clean(i), state_word(s)) for i, s in row["states"].items() if s not in ("done", "parked"))
+
+
+def mark_removed_everywhere(directory, row, why):
+    """After a worktree was removed (or is gone after a failed removal): every task that records it gets it marked
+    removed (mark_removed), under the ledger lock, and the journal says so. No entry is left naming the folder."""
+    with ledger_lock(directory):
+        ledger = read_ledger(directory)
+        for t in ledger.get("tasks", []):
+            if t.get("id") in row["tasks"]:
+                mark_removed(t, row["path"], pa.now())
+                t["updated"] = pa.now()
+        if ledger:
+            pa.write_json(os.path.join(directory, "ledger.json"), ledger)
+    append_journal(directory, {"by": "agent" if by_an_agent() else "person", "trigger": "worktree", "task": row["tasks"][0], "why": why})
 
 
 def changed_since_card(snapshot):
@@ -1362,17 +1388,14 @@ def worker_facts(directory, agent, profile, address):
     if row and task["id"] not in row["tasks"]:  # never another task's worktree (worker_tree gives only its own; a second guard)
         row = None
     if row and row["facts"] and not row["facts"].get("main") and not row["facts"].get("unreadable"):
-        # Another task that records this worktree and is not done or parked keeps it. Old shape (every task has it as its
-        # main `worktree`, the worker has no `worktree` field): as before J1, the other tasks are not looked at.
-        field = entry.get("worktree")
-        legacy = (field is None or (isinstance(field, str) and not field.strip())) and all(row["mains"].get(t) for t in row["tasks"])
-        held = [] if legacy else [t for t in row["tasks"] if t != task["id"] and row["states"].get(t) not in ("done", "parked")]
+        # Another task that records this worktree and is not done or parked keeps it (rule (a), every ledger shape: card d-094).
+        held = [t for t in row["tasks"] if t != task["id"] and row["states"].get(t) not in ("done", "parked")]
         others = [w["address"] for w in row["workers"] if w["fate"] == "live" and w["address"] != address] + row["others"]
-        others += ["task {} ({})".format(clean(t), clean(row["states"].get(t))) for t in held]
+        others += ["task {} ({})".format(clean(t), state_word(row["states"].get(t))) for t in held]
         out["worktree"] = {"path": row["path"], "kind": row["facts"].get("kind", "worktree"), "uncommitted": row["facts"]["uncommitted"],
                            "unpushed": row["facts"]["unpushed"], "removesBranches": bool(row["facts"].get("removesBranches")),
                            "branch": row["facts"]["branch"], "sharedWith": others, "keep": row["keep"], "heldBy": held,
-                           "tasks": [task["id"]] if legacy else list(row["tasks"])}  # whose ledger entries a removal marks
+                           "tasks": list(row["tasks"])}  # whose ledger entries a removal marks
     return out, row
 
 
@@ -2049,7 +2072,7 @@ def cmd_worker(args):
         raise pa.Problem("pa-worker delete is the person's command. To remove a worker or a worktree, ask the person.")
     if facts["address"] == agent.get("terminal"):
         raise pa.Problem("that is the Project Agent itself; it ends when its space is closed")
-    did = []
+    did, failed = [], None
     if facts["state"] == "live":
         pa.call(["hc", "kill", facts["address"]], check=False)
     if facts["state"] != "gone":
@@ -2065,11 +2088,16 @@ def cmd_worker(args):
             did.append("Kept the worktree: it has {} uncommitted file(s) and {} unpushed commit(s); delete again with --discard to lose them.".format(
                 tree["uncommitted"], tree["unpushed"]))
         else:
-            did.append(remove_worktree(tree["path"], row["facts"]))
-            tree["removed"] = True
-            tidy = remove_container(row["given"])
-            if tidy:
-                did.append(tidy)
+            try:
+                did.append(remove_worktree(tree["path"], row["facts"]))
+                tree["removed"] = True
+                tidy = remove_container(row["given"])
+                if tidy:
+                    did.append(tidy)
+            except pa.Problem as e:  # the worker is ended already: the ledger is still written, the failure said
+                failed = "Could not remove the worktree {}: {}".format(tree["path"], e)
+                did.append(failed)
+                tree["removed"] = not os.path.lexists(tree["path"])  # gone anyway: marked, so no entry names it
     if facts.get("task"):
         with open(os.path.join(directory, ".ledger.lock"), "a") as lock:
             import fcntl
@@ -2080,7 +2108,7 @@ def cmd_worker(args):
                 if t.get("id") == facts["task"]:
                     t["workers"] = [w for w in t.get("workers") or [] if w.get("address") != facts["address"]]
                     t["updated"] = pa.now()
-                if tree and tree.get("removed") and t.get("id") in tree["tasks"]:  # every task that recorded it (old shape: its own)
+                if tree and tree.get("removed") and t.get("id") in tree["tasks"]:  # every task that recorded it
                     mark_removed(t, tree["path"], pa.now())
                     t["updated"] = pa.now()
             if ledger:
@@ -2099,6 +2127,8 @@ def cmd_worker(args):
                      "unless they ask.".format(facts["address"], facts["task"], " ".join(did[1:]))], check=False)
         else:
             print("(The Project Agent is not running; it reads the ledger when it starts.)")
+    if failed:
+        raise pa.Problem("the worktree was not removed ({}); the worker is ended and the ledger updated".format(tree["path"]))
 
 
 # ---- pa-trust: Claude Code's folder trust prompt (t-035) ---------------------------------------------------
