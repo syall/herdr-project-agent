@@ -912,11 +912,37 @@ def tree_hash(folder, top_py_only=False):
             names.append(os.path.relpath(os.path.join(here, name), folder).replace(os.sep, "/"))
     h = hashlib.sha256()
     for rel in sorted(names):
-        with open(os.path.join(folder, rel), "rb") as f:
-            data = f.read()
-        h.update("{}\0{}\0".format(rel, len(data)).encode())
-        h.update(data)
+        hash_file(h, os.path.join(folder, rel), rel)
     return h.hexdigest()
+
+
+HASH_CHUNK = 1024 * 1024
+
+
+def hash_file(h, path, rel):
+    """Adds one file to h as `rel\0length\0bytes` (J1's form). Follows a symlink (a linked context.md counts by
+    content). A FIFO, socket or device is never opened: it is added as `rel\0special\0` (t-037 J2, REVIEW L4).
+    Read in chunks, so a large file is never held whole. Raises OSError when it cannot be read."""
+    import stat
+    if not stat.S_ISREG(os.stat(path).st_mode):
+        h.update("{}\0special\0".format(rel).encode())
+        return
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))  # a FIFO swapped in after the stat: no hang
+    with os.fdopen(fd, "rb") as f:
+        st = os.fstat(f.fileno())
+        if not stat.S_ISREG(st.st_mode):
+            h.update("{}\0special\0".format(rel).encode())
+            return
+        h.update("{}\0{}\0".format(rel, st.st_size).encode())
+        seen = 0
+        while True:
+            chunk = f.read(HASH_CHUNK)
+            if not chunk:
+                break
+            seen += len(chunk)
+            h.update(chunk)
+    if seen != st.st_size:
+        raise OSError("{} changed while it was hashed".format(path))
 
 
 def hash_or_none(folder, top_py_only=False):
@@ -967,20 +993,54 @@ def write_launcher(directory, record):
     write_json(os.path.join(directory, "launcher.json"), record)
 
 
+def as_dict(value):
+    """value when it is a dict, else {}: a stamp or record with a wrong shape is read as empty (REVIEW L3)."""
+    return value if isinstance(value, dict) else {}
+
+
+def as_text(value):
+    return value if isinstance(value, str) else None
+
+
+LAUNCHER_VERSION = 2  # version 2: the launcher takes requests (accepts); a version-1 record is from J1 code
+ACCEPTS = ["restart"]  # t-041 J4 adds "context"
+
+
+def restart_capable(record):
+    """True when launcher.json was written by a launcher that takes a restart request (spec S4)."""
+    record = as_dict(record)
+    version, accepts = record.get("version"), record.get("accepts")
+    return (isinstance(version, int) and not isinstance(version, bool) and version >= 2
+            and isinstance(accepts, list) and "restart" in accepts)
+
+
+def launcher_update(ctx, directory, change):
+    """The one writer of launcher.json (REVIEW L2): change(record) and the write happen under one lock, so the main
+    thread (session, profile) and the watcher (restart outcomes) never lose each other's fields. False when this
+    launcher has no record (run_agent called alone)."""
+    record = ctx.get("launcher")
+    if not record:
+        return False
+    with ctx.setdefault("launcherLock", threading.Lock()):
+        change(record)
+        write_launcher(directory, record)
+    return True
+
+
 def launcher_start(ctx, address, space, directory, p):
     """launcher.json for this launcher, written after claim (R2). Never stops the launch (AC2.2)."""
     try:
-        import uuid as _uuid
-        instance = ctx.setdefault("instance", str(_uuid.uuid4()))  # one per process start; a retry keeps it
+        instance = ctx.setdefault("instance", str(uuid.uuid4()))  # one per process start; a retry keeps it
+        ctx.setdefault("launcherLock", threading.Lock())
         me = os.path.realpath(__file__)
         tools = hash_or_none(os.path.dirname(me), top_py_only=True)
-        installed = installed_stamp() or {}
-        commit = ((installed.get("source") or {}).get("commit")
+        installed = as_dict(installed_stamp())
+        commit = (as_text(as_dict(installed.get("source")).get("commit"))
                   if tools is not None and installed.get("tools") == tools else None)
         folder = p.get("_folder") or os.path.join(ROOT, "profiles", p["name"])
-        record = {"version": 1, "instance": instance, "pid": os.getpid(), "terminal": address, "space": space,
+        record = {"version": LAUNCHER_VERSION, "accepts": list(ACCEPTS), "instance": instance, "pid": os.getpid(), "terminal": address, "space": space,
                   "started": ctx.get("startedAt") or ctx.setdefault("startedAt", now()),
-                  "code": {"tools": tools, "file": me, "installed": installed.get("tools"), "commit": commit},
+                  "code": {"tools": tools, "file": me, "installed": as_text(installed.get("tools")), "commit": commit},
                   "profile": {"name": p["name"], "readAt": now(), "mtime": mtime_or_none(os.path.join(folder, "profile.json")),
                               "hash": hash_or_none(folder)},
                   "session": None, "restart": None, "restartedFrom": None}
@@ -988,7 +1048,7 @@ def launcher_start(ctx, address, space, directory, p):
         session_log(directory, "launcher instance={} tools={} core={} profile={}@{}".format(
             instance, (tools or "none")[:12], (hash_or_none(os.path.join(ROOT, "core")) or "none")[:12], p["name"],
             record["profile"]["mtime"]))
-        write_launcher(directory, record)
+        launcher_update(ctx, directory, lambda r: None)
     except Exception as e:  # noqa: BLE001 - never stops the Project Agent
         print("[Project Agent] launcher.json not written: {}".format(e), flush=True)
         try:
@@ -1003,25 +1063,25 @@ def launcher_session(ctx, directory, agent, resume):
     if not record:
         return
     try:
-        folder = os.path.join(ROOT, "profiles", (record.get("profile") or {}).get("name") or "")
-        record["session"] = {"id": agent.get("sessionId"), "resume": bool(resume), "at": now(),
-                             "core": hash_or_none(os.path.join(ROOT, "core")),
-                             "context": mtime_or_none(os.path.join(folder, "context.md"))}
-        write_launcher(directory, record)
+        folder = os.path.join(ROOT, "profiles", as_text(as_dict(record.get("profile")).get("name")) or "")
+        session = {"id": agent.get("sessionId"), "resume": bool(resume), "at": now(),
+                   "core": hash_or_none(os.path.join(ROOT, "core")),
+                   "context": mtime_or_none(os.path.join(folder, "context.md"))}
+        launcher_update(ctx, directory, lambda r: r.__setitem__("session", session))
     except Exception as e:  # noqa: BLE001 - never stops the Project Agent
         print("[Project Agent] launcher.json not written: {}".format(e), flush=True)
 
 
 def code_state(launcher, installed, terminal):
     """(word, detail) for R3: current | older (tools) | older (core) | older (tools, core) | unknown."""
-    if not isinstance(installed, dict) or not installed.get("tools"):
+    if not isinstance(installed, dict) or not as_text(installed.get("tools")):
         return "unknown", "no installed.json on this machine (run install.sh or pa-sync)"
     if not isinstance(launcher, dict):
         return "unknown", "started before restart support (no launcher.json)"
     if terminal and launcher.get("terminal") != terminal:
         return "unknown", "launcher.json is from another terminal ({})".format(launcher.get("terminal"))
-    tools = (launcher.get("code") or {}).get("tools")
-    core = (launcher.get("session") or {}).get("core")
+    tools = as_text(as_dict(launcher.get("code")).get("tools"))
+    core = as_text(as_dict(launcher.get("session")).get("core"))
     if not tools or not core:
         return "unknown", "launcher.json has no {} hash".format("tools" if not tools else "core")
     older = [n for n, a in (("tools", tools), ("core", core)) if a != installed.get(n)]
@@ -1157,9 +1217,73 @@ def launch_command(p, agent, resume, directory):
     return argv, model
 
 
+# ---- the launcher's own Claude child (t-037 J2, R6/R9; the hooks t-041 J4 uses) -------------------------------
+# run_child starts Claude with a Popen handle kept in ctx["child"]; end_child ends that child, and only it, by the
+# handle (never a pid looked up). ctx["ended"] tells the loop the exit was ours, not a crash; ctx["after"] is what
+# the loop does once that child has exited ({"kind": "exec", ...} for a restart; t-041 adds "fresh").
+
+END_GRACE = 20  # seconds between SIGTERM and SIGKILL to the launcher's own Claude child
+
+
+def spawn(argv, cwd):
+    return subprocess.Popen(argv, cwd=cwd)
+
+
+def run_child(ctx, argv, cwd):
+    """subprocess.call(argv, cwd=cwd), keeping the handle in ctx["child"] while it runs (same exceptions at start)."""
+    child = spawn(argv, cwd)
+    ctx["child"] = child
+    try:
+        return child.wait()
+    except BaseException:  # as subprocess.call: the child does not outlive an error here
+        child.kill()
+        child.wait()
+        raise
+    finally:
+        ctx["child"] = None
+
+
+def mark_started(ctx):
+    """agent.json sessionStarted, before the launcher ends its child, when the session ran >= RAN s or its
+    transcript exists: the next start resumes it."""
+    running, directory = ctx.get("running") or {}, ctx.get("directory")
+    if not running.get("since") or not directory:
+        return
+    if time.time() - running["since"] < RAN and transcript_state(ctx.get("project"), running.get("session")) is not True:
+        return
+    path = os.path.join(directory, "agent.json")
+    current = read_json(path, {}) or {}
+    if current.get("sessionId") == running.get("session") and not current.get("sessionStarted"):
+        current["sessionStarted"] = True
+        write_json(path, current)
+    running["marked"] = True
+
+
+def end_child(ctx, why, grace=None):
+    """Ends the launcher's own Claude child by its handle: SIGTERM, then SIGKILL to the same handle after `grace`
+    seconds. Returns its exit code, or None when no child runs. The only code in pa.py that signals a process."""
+    child = ctx.get("child")
+    if child is None:
+        return None
+    ctx["ended"] = why
+    try:
+        mark_started(ctx)
+    except (OSError, ValueError):
+        pass
+    try:
+        child.send_signal(signal.SIGTERM)
+    except OSError:
+        pass
+    try:
+        return child.wait(timeout=END_GRACE if grace is None else grace)
+    except subprocess.TimeoutExpired:
+        child.kill()
+        return child.wait()
+
+
 def run_agent(args, address, project, p, directory, agent, ctx, started):
     running = ctx.setdefault("running", {"since": None, "session": None, "marked": False})
-    ctx["directory"] = directory
+    ctx["directory"], ctx["project"] = directory, project
 
     def beat():
         # The tab bar reads this: a live terminal whose heartbeat stopped has lost its launcher.
@@ -1228,7 +1352,7 @@ def run_agent(args, address, project, p, directory, agent, ctx, started):
             return began
         began = starting(model)
         try:
-            code = subprocess.call(argv, cwd=project)
+            code = run_child(ctx, argv, project)
         except (OSError, ValueError, TypeError) as e:
             # t-033 round 4: a changed profile whose program the exec could not start (a raise, not an exit code:
             # a lone surrogate, a folder or non-program as claude, an argument list too long, ...) does not stop
@@ -1241,10 +1365,14 @@ def run_agent(args, address, project, p, directory, agent, ctx, started):
             p = held
             argv, model = launch_command(p, agent, resume, directory)
             began = starting(model)
-            code = subprocess.call(argv, cwd=project)
+            code = run_child(ctx, argv, project)
         running["since"] = None
         lasted = time.time() - began
-        session_log(directory, "exit code={} after={:.0f}s".format(code, lasted))
+        ended = ctx.pop("ended", None)  # the launcher ended it (end_child): not a crash, not a quick exit
+        session_log(directory, "exit code={} after={:.0f}s{}".format(code, lasted, " ended=" + ended if ended else ""))
+        if ended:
+            print("\n[Project Agent] The agent was ended by its launcher ({}).".format(ended), flush=True)
+            continue
         if lasted >= RAN:
             quick, quick_resume_fails = 0, 0
         else:
@@ -2002,10 +2130,10 @@ def decide_card(directory, path, args):
 def stamp_script():
     """The command pa-sync runs on the other machine to write its installed.json."""
     import socket
-    source = (installed_stamp() or {}).get("source") or {}
+    source = as_dict(as_dict(installed_stamp()).get("source"))
     argv = ["--synced-from", socket.gethostname().split(".")[0] or "unknown"]
-    if source.get("commit"):
-        argv += ["--commit", str(source["commit"])] + (["--dirty"] if source.get("dirty") else [])
+    if as_text(source.get("commit")):
+        argv += ["--commit", source["commit"]] + (["--dirty"] if source.get("dirty") is True else [])
     return '"$HOME/.config/herdr-pa/tools/pa.py" stamp ' + " ".join(shlex.quote(a) for a in argv)
 
 

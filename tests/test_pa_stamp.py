@@ -303,7 +303,7 @@ class R2_Launcher(Base):
         seen = self.launch()
         rec = seen[0]
         self.assertIsNotNone(rec, "launcher.json is written before Claude starts")
-        self.assertEqual(rec["version"], 1)
+        self.assertEqual(rec["version"], 2)  # t-037 J2, spec S4 (card d-108): version 2 takes restart requests
         self.assertEqual(rec["pid"], os.getpid())
         self.assertEqual(rec["terminal"], "t1")
         self.assertEqual(rec["space"], "sp1")

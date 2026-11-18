@@ -26,6 +26,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 TOOLS = os.path.join(HERE, "..", "runtime", "tools")
 sys.path.insert(0, HERE)
 import costs_fixtures as fx  # noqa: E402
+import child_fakes  # noqa: E402
 
 TMP = tempfile.mkdtemp(prefix="t009-unit-")
 _HOMES = {"HERDR_PA_HOME": os.path.join(TMP, "pa"), "CLAUDE_CONFIG_DIR": os.path.join(TMP, "claude"),
@@ -731,6 +732,7 @@ class L_LaunchRecords(Base):
             raise StopLaunch()
         saved = pa.subprocess
         pa.subprocess = types.SimpleNamespace(call=fake_call, run=saved.run, PIPE=saved.PIPE, DEVNULL=saved.DEVNULL)
+        undo_child = child_fakes.patch(pa, fake_call)  # t-037 J2: the launcher starts Claude with pa.spawn
         try:
             for fresh in (True, False):
                 agent = load(os.path.join(directory, "agent.json"))
@@ -741,6 +743,7 @@ class L_LaunchRecords(Base):
                     pa.run_agent(ap.Namespace(fresh=fresh), "t0", self.project, p, directory, agent, {"beat": True, "previous": None}, time.time())
         finally:
             pa.subprocess = saved
+            undo_child()
         recs = self.records()
         self.assertEqual([(r["kind"], r["resumed"]) for r in recs], [("pa", False), ("pa", True)])
         sid = load(os.path.join(directory, "agent.json"))["sessionId"]
@@ -3271,6 +3274,7 @@ class CC_Launch(Base):
             raise StopLaunch()
         saved = pa.subprocess
         pa.subprocess = types.SimpleNamespace(call=fake_call, run=saved.run, PIPE=saved.PIPE, DEVNULL=saved.DEVNULL)
+        undo_child = child_fakes.patch(pa, fake_call)  # t-037 J2: the launcher starts Claude with pa.spawn
         try:
             for fresh in (True, False, True):
                 if len(calls) == 2:
@@ -3283,6 +3287,7 @@ class CC_Launch(Base):
                     pa.run_agent(ap.Namespace(fresh=fresh), "t0", self.project, p, directory, agent, {"beat": True, "previous": None}, time.time())
         finally:
             pa.subprocess = saved
+            undo_child()
         self.assertIn("--session-id", calls[0])
         self.assertIn("--resume", calls[1])
         for argv in calls[:2]:
