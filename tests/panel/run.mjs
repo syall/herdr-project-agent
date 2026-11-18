@@ -4609,6 +4609,25 @@ cases["P61-open-last-fallback"] = async () => { // R1, R2, R3: another machine, 
   check61(v);
 };
 
+// ---- t-054: the archive, on request ----------------------------------------------------------------------------
+cases["P54-archive-on-request"] = async () => { // R5: reloads never read decisions-archive/; the Archive line reads it once per click
+  world(); localCards(3, { open: 1 });
+  g.__files[`:${DIR}/decisions-archive/d-000.json`] = JSON.stringify({ id: "d-000", status: "answered", answer: "Yes", question: "An archived question?", options: [{ label: "Yes" }], created: "2026-01-01T10:00:00Z" });
+  g.__ls[`:${DIR}/decisions-archive`] = ["d-000.json"];
+  const v = await mount(); await settle();
+  const archiveCalls = () => g.__issued.filter((x) => JSON.stringify(x).includes("decisions-archive")).length;
+  advance(60000); await settle();
+  check(archiveCalls() === 0, `no load reads the archive (got ${archiveCalls()})`);
+  check(!/An archived question/.test(look(v).text), "not shown before it is asked for");
+  await click(v, "pa-older");
+  check(/Archive/.test(look(v).text) && archiveCalls() === 0, "the Archive line, still unread");
+  await click(v, "pa-archive"); await settle();
+  check(archiveCalls() === 1, `one read on the click (got ${archiveCalls()})`);
+  check(/An archived question\?/.test(look(v).text), "the archived card is shown");
+  await click(v, "pa-archive"); await settle();
+  check(!/An archived question/.test(look(v).text) && archiveCalls() === 1, "folded: hidden, nothing read");
+};
+
 cases["P53-hidden-batchonly-local"] = async () => { // AC3.3: hidden, a local batch that fails: no card read
   world(); localCards(5, { open: 2 }); g.__batchFail = { "": { code: 1 } }; g.__layout = panelLayout("changes");
   await mount(); await settle();

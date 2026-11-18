@@ -570,6 +570,21 @@ cases["S61-fallback-known-closed-last"] = async () => { // R1: on the fallback, 
   check(order.slice(0, 5).every((n) => n.startsWith("z-")), `the open (not known answered) ones read first (got ${order.slice(0, 7)})`);
 };
 
+// ---- t-054 -----------------------------------------------------------------------------------------------------
+cases["S54-archive-folder"] = async () => { // R5: the archive is read with the same batch from decisions-archive/, only when asked
+  world(); cards({ "d-1.json": card("d-1") });
+  for (const space of [remote, local]) {
+    g.__ls[keyOf(space, "/decisions-archive")] = ["d-0.json"];
+    g.__files[keyOf(space, "/decisions-archive/d-0.json")] = card("d-0", { status: "answered", answer: "A" });
+  }
+  const list = await store.loadDecisions(remote, { cx });
+  check(list.length === 1 && list[0].id === "d-1", `a load reads decisions/ only (got ${list.map((c) => c.id)})`);
+  check(!g.__issued.some((x) => JSON.stringify(x).includes("decisions-archive")), "no call names the archive");
+  const arch = await store.loadDecisions(remote, { cx, batchOnly: true, folder: "decisions-archive" });
+  check(arch?.length === 1 && arch[0].id === "d-0" && arch[0].path === `${rdir}/decisions-archive/d-0.json`, `the archive's cards (got ${JSON.stringify(arch?.map((c) => c.path))})`);
+  check(remoteCalls("batch").length === 2, "one batch each");
+};
+
 const hostMod = fs.existsSync(path.join(dst, "host.js")) ? await import(path.join(dst, "host.js")) : null;
 cases["S53-host-busy"] = async () => { // R2: a key still pending answers BUSY and starts nothing, given up or not; settling frees it
   world();
