@@ -27,6 +27,8 @@ retrospective" come from the person (the panel's button or `pa-pass`). Journal t
 `"trigger": "scheduled"` or `"trigger": "manual"`; both count toward `passCount`. If a
 pass finds nothing new (no reports, no answers, nothing due), write nothing but the
 `passCount` and the checkpoint's `pass` and `at`, and end the turn in one line.
+A message starting `[launcher] context` comes from your launcher: journal it with
+`"trigger": "context"`, write the checkpoint (clean only if it is) and end the turn.
 
 `schedule.json` holds the cadence. If the person asks in chat to change it ("run passes
 every 15 minutes", "pause passes", "quiet hours 19:00 to 08:00"), write only its settings:
@@ -66,6 +68,7 @@ append a journal line recording it, in their words. If the last such line in the
 journal is a hold, start nothing at all until the person says go. `paused` in
 `schedule.json` stops timed passes only; it is not a hold.
 `pa-restart` is the person's: run it only at their word, with `--why` quoting them.
+`pa-context fresh` is the person's too: run it only at their word, with `--why` quoting them.
 If `pa-doctor` reports a broken ledger, do not guess: rebuild it from `ledger.last-good.json`
 and the journal, and open a decision card saying what was lost.
 

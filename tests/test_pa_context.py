@@ -1541,12 +1541,14 @@ class J4Request(J4Base):  # R6, AC6.1
         self.once(ctx)
         self.assertIsNone(ctx.get("after"))
         self.terms["t0"]["status"] = {"state": "idle"}
-        self.once(ctx)
+        self.once(ctx)  # idle from now on: 20 s to wait
+        self.assertIsNone(ctx.get("after"))
+        self.once(ctx, self.now + 25)
         self.assertEqual((ctx["after"]["reason"], ctx["after"]["request"], ctx["after"]["ctx"]), ("person", "req-1", 90000))
 
     def test_q3_expired(self):
         self.request(at=pa.iso_time(time.time() - 8000), expires=pa.iso_time(time.time() - 800))
-        ctx = self.ctx()
+        ctx = self.ctx(launcher={"version": 2, "accepts": ["restart", "context"], "instance": "i1"})
         self.once(ctx)
         self.assertIsNone(self.req_file())
         self.assertIn("context request req-1 expired", self.log())

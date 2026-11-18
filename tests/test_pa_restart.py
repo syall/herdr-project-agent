@@ -143,7 +143,7 @@ class L1_RestartCapable(Base):
         ctx = self.record()
         rec = load(os.path.join(self.dir, "launcher.json"))
         self.assertEqual(rec["version"], 2)
-        self.assertEqual(rec["accepts"], ["restart"])
+        self.assertEqual(rec["accepts"], ["restart", "context"])  # t-041 J4 adds "context" (ACCEPTS)
         self.assertTrue(pa.restart_capable(rec))
         self.assertIs(ctx["launcher"]["accepts"], ctx["launcher"]["accepts"])
 

@@ -23,6 +23,8 @@ One file, selected by the name it is invoked as (symlinks in ~/.local/bin):
                                                  restart the space's Project Agent in place (terminal, workers stay)
   pa-context set [--mode fresh|off] [--net N] ...   the Project Agent's context settings (t-041; the person's)
   pa-context compact-instructions|start-pack|compacted   the Project Agent's compaction hooks (Claude Code runs them)
+  pa-context fresh [--why TEXT] [--withdraw] [--dry-run]   a fresh context at its next clean point (t-041 J4)
+  pa-context followup [--since T]   the fresh reset's follow-up report (t-041 R17; read-only)
   pa-restart --space ID --end-terminal [--anyway] [--dry-run]
                                                  for a launcher from before restart support only: end its terminal
                                                  (and its workers), after a typed yes; the keeper or pa-start reopens it
@@ -1096,7 +1098,11 @@ def hook_directory(space):
 
 def cmd_context(args):
     if args.action == "set":
-        return context_set(args)
+        return context_relay(args) if getattr(args, "on", None) else context_set(args)
+    if args.action == "fresh":
+        return context_fresh(args)
+    if args.action == "followup":
+        return context_followup(args)
     # The hooks: Claude Code runs them in the Project Agent's session. Each exits 0 whatever happens (PreCompact must
     # never block a compaction: exit 2 would postpone it to the 967k default).
     try:
@@ -1140,9 +1146,11 @@ def context_set(args):
             changes[key] = parse_amount(getattr(args, flag))
     if not changes:
         print(context_summary(current, had))
+        if getattr(args, "json", False):
+            print(json.dumps({k: current.get(k) for k in ("v", "mode", "taskCap", "passCap", "net", "enabledAt", "by")}))
         return
     new = dict(current, **changes)
-    new["v"], new["by"] = 1, "person"
+    new["v"], new["by"] = 1, "panel" if getattr(args, "by", None) == "panel" else "person"
     if new["mode"] == "fresh" and (not had or current.get("mode") == "off"):
         new["enabledAt"] = now()
     problems = context_problems(new)
@@ -1150,13 +1158,683 @@ def context_set(args):
         raise Problem("; ".join(problems))
     write_json(path, {k: new.get(k) for k in ("v", "mode", "taskCap", "passCap", "net", "enabledAt", "by")})
     print(context_summary(new, True))
-    print("This applies at the Project Agent's next start (a restart in place loads it).")
+    print("The net applies at the Project Agent's next start (a restart in place loads it); the caps and the mode's "
+          "resets at its launcher's next check.")
+    if getattr(args, "json", False):
+        print(json.dumps({k: new.get(k) for k in ("v", "mode", "taskCap", "passCap", "net", "enabledAt", "by")}))
 
 
 def context_summary(settings, saved):
     return "mode {}  taskCap {:,}  passCap {:,}  net {:,}  enabledAt {}  by {}{}".format(
         settings["mode"], settings["taskCap"], settings["passCap"], settings["net"], settings.get("enabledAt") or "-",
         settings.get("by") or "-", "" if saved else "  (the defaults: no context.json)")
+
+
+# ---- the fresh reset (t-041 J4, R1-R4, R6, R10, R16) ----------------------------------------------------------
+# The watcher thread looks every CONTEXT_EVERY s: the context size from the transcript's tail (R1); when a cap is
+# crossed or the person asked (R3, R6) and the PA is at a clean point (R2), it ends its own Claude child by its
+# handle (end_child) and leaves ctx["after"] of kind "fresh"; the loop then starts Claude in a new session with the
+# start prompt (R4, R10). The terminal, its address, its labels and its workers stay.
+
+CONTEXT_REQUEST = "context-request.json"
+CONTEXT_REQUEST_LIFE = 7200  # a context request expires 2 h after it was written (R6)
+CONTEXT_REQUEST_BY = ("person", "panel", "orchestrator")
+TAIL_MAX = 1 << 20  # bytes of the transcript one check reads (R1)
+JOURNAL_TAIL = 256 * 1024  # bytes of journal.jsonl the clean-point check reads
+IDLE_MIN = 20  # seconds the PA must have been idle (R2 a)
+RESET_GAP = 600  # seconds between two resets (R2 f)
+NUDGE_GAP = 3600  # seconds between two of the launcher's lines (R2)
+CONTEXT_EVERY = 10  # seconds between two context checks of the watcher
+PREVIOUS_MAX = 20  # agent.json previousSessions
+CONTEXT_COPIES_MAX = 200  # costs/context/<session>.txt copies kept (R16)
+NUDGE_CAP = ("[launcher] context at {}k, over the cap: if this is a clean point, write the ledger's context "
+             "checkpoint and end your turn")
+NUDGE_ASKED = ("[launcher] context: a fresh context was asked for: if this is a clean point, write the ledger's "
+               "context checkpoint and end your turn")
+STAMP = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(\.\d+)?Z$")
+SESSION_ID = re.compile(r"^[A-Za-z0-9-]{8,80}$")
+
+
+def parse_stamp(text):
+    """Epoch seconds of a UTC time with or without fractions (transcripts have them), else None."""
+    m = STAMP.match(text) if isinstance(text, str) else None
+    base = parse_time(m.group(1) + "Z") if m else None
+    return None if base is None else base + (float(m.group(2)) if m.group(2) else 0.0)
+
+
+def transcript_path(project, sid):
+    """Where Claude keeps this session's transcript (as transcript_state looks), or None."""
+    if not project or not isinstance(sid, str) or not SESSION_ID.match(sid):
+        return None
+    return os.path.join(CLAUDE_HOME, "projects", claude_slug(project), sid + ".jsonl")
+
+
+def read_tail(path, limit):
+    """At most `limit` bytes from the end of the file, starting at a line (a cut first line is dropped)."""
+    with open(path, "rb") as f:
+        f.seek(0, 2)
+        size = f.tell()
+        start = max(0, size - limit)
+        f.seek(start)
+        data = f.read(limit)
+    if start:
+        cut = data.find(b"\n")
+        data = data[cut + 1:] if cut >= 0 else b""
+    return data
+
+
+def token_count(value):
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+
+
+def is_message(obj):
+    """A user entry that is a message (the person's or a pasted line), not a tool result or a meta entry."""
+    if obj.get("isMeta") or "toolUseResult" in obj:
+        return False
+    content = as_dict(obj.get("message")).get("content")
+    return isinstance(content, str) or (isinstance(content, list) and bool(content) and isinstance(content[0], dict)
+                                        and content[0].get("type") == "text")
+
+
+def context_size(project, sid, cache=None):
+    """The Project Agent's context from its transcript's tail (R1): {ctx, source, lastAssistant, turnStart,
+    userAfter, midTool, key}, or None (no transcript, no usage in the tail, a compaction after the last answer).
+    Main conversation only (sidechain entries skipped). cache (a dict): the tail is read again only when the file
+    changed. Never raises."""
+    try:
+        path = transcript_path(project, sid)
+        if not path or not os.path.isfile(path):
+            return None
+        st = os.stat(path)
+        if cache is not None and cache.get("of") == (path, st.st_size, st.st_mtime):
+            return cache.get("size")
+        size = transcript_size(path, st)
+        if cache is not None:
+            cache.update({"of": (path, st.st_size, st.st_mtime), "size": size})
+        return size
+    except Exception:  # noqa: BLE001 - unknown: no reset
+        return None
+
+
+def transcript_size(path, st):
+    try:
+        last, turn, after, boundary = None, None, False, False
+        for line in read_tail(path, TAIL_MAX).splitlines():
+            try:
+                obj = json.loads(line.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                continue
+            if not isinstance(obj, dict) or obj.get("isSidechain"):
+                continue
+            kind, message = obj.get("type"), as_dict(obj.get("message"))
+            if kind == "assistant" and isinstance(message.get("usage"), dict):
+                last, after, boundary = obj, False, False
+            elif kind == "user":
+                after = after or last is not None
+                if is_message(obj):
+                    turn = parse_stamp(obj.get("timestamp"))
+            elif kind == "system" and obj.get("subtype") == "compact_boundary":
+                boundary = True
+        if last is None or boundary:
+            return None
+        message = last["message"]
+        usage = message["usage"]
+        ctx = sum(token_count(usage.get(k)) for k in ("input_tokens", "cache_creation_input_tokens",
+                                                       "cache_read_input_tokens"))
+        return {"ctx": ctx, "source": "transcript", "lastAssistant": parse_stamp(last.get("timestamp")),
+                "turnStart": turn, "userAfter": after, "midTool": message.get("stop_reason") == "tool_use",
+                "key": (st.st_size, st.st_mtime)}
+    except Exception:  # noqa: BLE001 - unknown: no reset
+        return None
+
+
+def statusline_ctx(directory, sid):
+    """The recording status line's ctx for this session (J1), the second source: no turn facts, so never a reset."""
+    try:
+        if not isinstance(sid, str) or not SESSION_ID.match(sid):
+            return None
+        record = as_dict(read_json_safe(os.path.join(directory, "costs", "cc", sid + ".json")))
+        n = record.get("ctx")
+        if record.get("session") != sid or isinstance(n, bool) or not isinstance(n, (int, float)) or n < 0:
+            return None
+        return {"ctx": int(n), "source": "statusline", "lastAssistant": None, "turnStart": None, "userAfter": False,
+                "midTool": False, "key": None}
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def current_size(directory, project, sid, cache=None):
+    return context_size(project, sid, cache) or statusline_ctx(directory, sid)
+
+
+def read_context_request(directory):
+    """(request, None) for a well-formed context-request.json; (None, why) for one that is not; (None, None) for
+    none. Every field is checked before use (as read_request checks a restart's)."""
+    path = os.path.join(directory, CONTEXT_REQUEST)
+    try:
+        text = read_text(path)
+    except OSError as e:
+        return None, "unreadable: {}".format(e)
+    if not text and not os.path.exists(path):
+        return None, None
+    try:
+        req = json.loads(text)
+    except ValueError:
+        return None, "not JSON"
+    if not isinstance(req, dict):
+        return None, "not an object"
+    if req.get("v") != 1 or isinstance(req.get("v"), bool):
+        return None, "v is not 1"
+    for key in ("id", "space", "by", "at", "expires"):
+        if not isinstance(req.get(key), str) or not req[key]:
+            return None, "field {!r} missing or not text".format(key)
+    for key in ("id", "space"):
+        if not REQUEST_ID.match(req[key]):
+            return None, "bad {}".format(key)
+    if req["by"] not in CONTEXT_REQUEST_BY:
+        return None, "field 'by' is not one of {}".format(", ".join(CONTEXT_REQUEST_BY))
+    why = req.get("why")
+    if why is not None and (not isinstance(why, str) or len(why) > 2000
+                            or any((ord(c) < 32 and c not in "\t\n") or ord(c) == 127 for c in why)):
+        return None, "field 'why' is not text of at most 2000 characters without control characters"
+    at, expires = parse_time(req["at"]), parse_time(req["expires"])
+    if at is None or expires is None:
+        return None, "at/expires are not times"
+    if expires - at > CONTEXT_REQUEST_LIFE:
+        return None, "it expires more than 2 h after it was written"
+    req["_at"], req["_expires"] = at, expires
+    return req, None
+
+
+def remove_context_request(directory, rid=None, text=None):
+    """Deletes context-request.json while it is still the one meant (same id, or same text)."""
+    path = os.path.join(directory, CONTEXT_REQUEST)
+    try:
+        current = read_text(path)
+        if rid is not None:
+            try:
+                if as_dict(json.loads(current)).get("id") != rid:
+                    return False
+            except ValueError:
+                return False
+        elif text is not None and current != text:
+            return False
+        os.remove(path)
+        return True
+    except OSError:
+        return False
+
+
+def journal_tail(directory):
+    try:
+        return read_tail(os.path.join(directory, "journal.jsonl"), JOURNAL_TAIL).decode("utf-8", "replace").splitlines()
+    except OSError:
+        return []
+
+
+def answered_unacted(directory, lines):
+    """Ids of cards in decisions/ answered with no later journal line naming them (R2 c): an answer being acted on."""
+    folder, out = os.path.join(directory, "decisions"), []
+    names = sorted(os.listdir(folder)) if os.path.isdir(folder) else []
+    stamped = []
+    for line in lines:
+        try:
+            at = parse_stamp(as_dict(json.loads(line)).get("at"))
+        except ValueError:
+            at = None
+        if at is not None:
+            stamped.append((at, line))
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        card = as_dict(read_json_safe(os.path.join(folder, name)))
+        cid = card.get("id") if isinstance(card.get("id"), str) else name[:-len(".json")]
+        answered = parse_stamp(card.get("answered"))
+        if card.get("status") != "answered" or answered is None or not cid:
+            continue
+        named = re.compile(r"(?<![A-Za-z0-9_])" + re.escape(cid) + r"(?![A-Za-z0-9_])")
+        if not any(at >= int(answered) and named.search(line) for at, line in stamped):
+            out.append(cid)
+    return out
+
+
+def worker_handoffs_missing(directory, ledger, live):
+    """(task, address, job) of each ledger worker not finished, live, and without its handoff file (R2 d, R8). A
+    worker whose name names no job has no handoff path to find: it counts as missing (plan Q4)."""
+    out = []
+    tasks = as_dict(ledger).get("tasks")
+    for t in tasks if isinstance(tasks, list) else []:
+        for w in as_dict(t).get("workers") or []:
+            w = as_dict(w)
+            if w.get("finished") or w.get("address") not in live:
+                continue
+            found, expected = handoff_file(directory, as_dict(t).get("id"), w)
+            if not found:
+                job = os.path.basename(expected)[len("handoff-"):-len(".md")] if expected else "no job in its name"
+                out.append((as_dict(t).get("id"), w.get("address"), job))
+    return out
+
+
+def clean_point(ctx, directory, agent, size, at, address):
+    """(ok, reasons) for R2: reasons [(letter, text)], letters a-f as the spec lists them; ok when there is none."""
+    reasons = []
+    turn = agent_turn(address)
+    if turn != "idle":
+        reasons.append(("a", "turn " + turn))
+    since = ctx.get("idleSince")
+    if since is None or at - since < IDLE_MIN:
+        reasons.append(("a", "idle {}s < {}s".format(int(round(at - since)) if since is not None else 0, IDLE_MIN)))
+    if not size or size.get("source") != "transcript":
+        reasons.append(("a", "no transcript to read the turn from"))
+    elif size.get("userAfter") or size.get("midTool"):
+        reasons.append(("a", "message waiting"))
+    ledger = as_dict(read_json_safe(os.path.join(directory, "ledger.json")))
+    check = ledger.get("context")
+    sid = as_dict(agent).get("sessionId")
+    if check is None:
+        reasons.append(("b", "checkpoint none"))
+    elif checkpoint_problems(check):
+        reasons.append(("b", "checkpoint malformed: " + checkpoint_problems(check)[0]))
+    elif not check["clean"]:
+        reasons.append(("b", "checkpoint not clean ({})".format(check["why"][:80])))
+    else:
+        written = parse_time(check["at"])
+        turn_start = (size or {}).get("turnStart")
+        began = as_dict(ctx.get("running")).get("since")
+        if check.get("session") is not None and check["session"] != sid:
+            reasons.append(("b", "checkpoint of another session"))
+        elif check.get("session") is None and (began is None or written < int(began)):
+            reasons.append(("b", "checkpoint older than this session"))
+        elif turn_start is None or written < int(turn_start):
+            reasons.append(("b", "checkpoint older than the turn"))
+    for cid in answered_unacted(directory, journal_tail(directory)):
+        reasons.append(("c", "card {} answered, not acted on".format(cid)))
+    live = set((live_terminals() or {}).keys())
+    for task, worker, job in worker_handoffs_missing(directory, ledger, live):
+        reasons.append(("d", "worker {} ({} {}) has no handoff file".format(worker, task, job)))
+    _text, _sections, problems, _warnings = read_standing(directory)
+    for problem in problems[:2]:
+        reasons.append(("e", "standing.md " + problem))
+    if os.path.exists(os.path.join(directory, REQUEST)):
+        reasons.append(("f", "restart request pending"))
+    last = ctx.get("lastResetAt")
+    if last is not None and at - last < RESET_GAP:
+        reasons.append(("f", "reset {}s ago".format(int(round(at - last)))))
+    return not reasons, reasons
+
+
+def reset_reason(size, checkpoint, settings, request):
+    """R3: task-cap | pass-cap | person | orchestrator, or None. A request needs no size; mode off: never."""
+    if as_dict(settings).get("mode") != "fresh":
+        return None
+    if request:
+        return "orchestrator" if request.get("by") == "orchestrator" else "person"
+    if not size:
+        return None
+    n, boundary = size.get("ctx") or 0, as_dict(checkpoint).get("boundary")
+    if n >= settings["taskCap"] and boundary == "task":
+        return "task-cap"
+    if n >= settings["passCap"]:
+        return "pass-cap"
+    return None
+
+
+def fresh_prompt(directory, n, reason, previous):
+    """R10: the fresh session's first prompt, at most START_PACK_MAX characters."""
+    head = ("Fresh context (reset {} today, reason {}; previous session {}). Your conversation was reset on "
+            "purpose.".format(n, reason, previous or "none"))
+    return start_pack(directory, head)
+
+
+def resets_today(directory, at=None):
+    day = time.strftime("%Y-%m-%d", time.gmtime(time.time() if at is None else at))
+    count = 0
+    try:
+        lines = read_text(os.path.join(directory, "session.log")).splitlines()
+    except (OSError, ValueError):
+        return 0
+    for line in lines:
+        words = line.split()
+        if len(words) >= 2 and words[0].startswith(day) and words[1] == "fresh":
+            count += 1
+    return count
+
+
+def context_capable(record):
+    record = as_dict(record)
+    version, accepts = record.get("version"), record.get("accepts")
+    return (isinstance(version, int) and not isinstance(version, bool) and version >= 2
+            and isinstance(accepts, list) and "context" in accepts)
+
+
+def context_outcome(ctx, directory, rid, outcome, why):
+    entry = {"request": rid, "outcome": outcome, "why": why, "at": now()}
+    try:
+        launcher_update(ctx, directory, lambda r: r.__setitem__("context", entry))
+    except Exception:  # noqa: BLE001 - never stops the Project Agent
+        pass
+
+
+def nudge(ctx, directory, address, text, at, size, reason):
+    """The launcher's one line to its own PA (R2), at most once per NUDGE_GAP."""
+    if ctx.get("nudgedAt") is not None and at - ctx["nudgedAt"] < NUDGE_GAP:
+        return False
+    ctx["nudgedAt"] = at
+    call(["hc", "send", address, text], check=False)
+    session_log(directory, "context nudge ctx={} reason={}".format((size or {}).get("ctx"), reason))
+    return True
+
+
+def context_once(ctx, directory, address, space, at=None):
+    """One context check of the watcher (R2-R4, R6). A restart taken or waiting outranks it (R2 f)."""
+    at = time.time() if at is None else at
+    if (ctx.get("restarting") or ctx.get("after") or ctx.get("waitingFor") or ctx.get("child") is None
+            or os.path.exists(os.path.join(directory, REQUEST))):
+        return
+    settings, _problem = read_context(directory)
+    if settings["mode"] != "fresh":
+        return
+    req, why = read_context_request(directory)
+    if why:
+        session_log(directory, "context request refused: " + why)
+        try:
+            remove_context_request(directory, text=read_text(os.path.join(directory, CONTEXT_REQUEST)))
+        except (OSError, ValueError):
+            pass
+        context_outcome(ctx, directory, None, "refused", why)
+    elif req and req["space"] != space:
+        session_log(directory, "context request {} refused: for space {}, not {}".format(req["id"], req["space"], space))
+        remove_context_request(directory, req["id"])
+        context_outcome(ctx, directory, req["id"], "refused", "for another space")
+        req = None
+    elif req and at > req["_expires"]:
+        session_log(directory, "context request {} expired".format(req["id"]))
+        remove_context_request(directory, req["id"])
+        context_outcome(ctx, directory, req["id"], "expired", "no clean point within 2 h")
+        req = None
+    agent = as_dict(read_json_safe(os.path.join(directory, "agent.json")))
+    sid = agent.get("sessionId")
+    size = current_size(directory, ctx.get("project") or agent.get("project"), sid, ctx.setdefault("sizeCache", {}))
+    turn = agent_turn(address)
+    key = (size or {}).get("key")
+    if turn != "idle":
+        ctx["idleSince"] = None
+    elif ctx.get("idleSince") is None or key != ctx.get("idleKey"):
+        ctx["idleSince"] = at
+    ctx["idleKey"] = key
+    ledger = as_dict(read_json_safe(os.path.join(directory, "ledger.json")))
+    reason = reset_reason(size, ledger.get("context"), settings, req)
+    if not reason:
+        return
+    ok, reasons = clean_point(ctx, directory, agent, size, at, address)
+    if ok:
+        begin_fresh(ctx, directory, address, {
+            "reason": reason, "ctx": (size or {}).get("ctx"), "pass": as_dict(ledger.get("context")).get("pass"),
+            "from": sid, "request": req["id"] if req else None, "by": req["by"] if req else None})
+        return
+    letters = {letter for letter, _text in reasons}
+    if "a" in letters:
+        return  # mid-turn or not idle long enough: wait, say nothing
+    if letters == {"b"}:
+        nudge(ctx, directory, address, NUDGE_ASKED if req else NUDGE_CAP.format(int((size or {}).get("ctx", 0) // 1000)),
+              at, size, reason)
+    said = (ctx.get("idleSince"), reason)
+    if ctx.get("contextSaid4") != said:
+        ctx["contextSaid4"] = said
+        session_log(directory, "context not reset (ctx={} reason={}): {}".format(
+            (size or {}).get("ctx"), reason, "; ".join(text for _letter, text in reasons)))
+
+
+def begin_fresh(ctx, directory, address, plan):
+    """Takes the reset: ctx["after"] of kind fresh, then ends this launcher's own Claude child by its handle."""
+    with child_lock(ctx):
+        if ctx.get("after") or ctx.get("restarting"):
+            return False
+        ctx["after"] = dict(plan, kind="fresh")
+    print("\n[Project Agent] Context reset ({}k): continuing from the state folder. Previous session: {}".format(
+        int((plan.get("ctx") or 0) // 1000), plan.get("from")), flush=True)
+    session_log(directory, "context reset taken ctx={} reason={}{}".format(
+        plan.get("ctx"), plan.get("reason"), " request=" + plan["request"] if plan.get("request") else ""))
+    end_child(ctx, "fresh")  # no child running: the loop takes ctx["after"] next
+    return True
+
+
+def fresh_records(ctx, directory, address, after, new_sid, prompt):
+    """The reset's records (R4, R16): the session.log line, the reset record, the prompt's copy, launcher.json;
+    a request taken is removed. Each in its own try: none stops the launch."""
+    old, reason, n = after.get("from"), after.get("reason"), resets_today(directory) + 1
+    steps = []
+    steps.append(lambda: session_log(directory, "fresh from={} to={} ctx={} reason={} checkpoint={} by={} n={}".format(
+        old, new_sid, after.get("ctx"), reason, after.get("pass"), after.get("by") or "-", n)))
+
+    def record():
+        costs = costs_module()
+        if costs:
+            costs.append_session(directory, {"v": 1, "ev": "reset", "at": now(), "from": old, "to": new_sid,
+                                             "ctx": after.get("ctx"), "reason": reason, "pass": after.get("pass"),
+                                             "terminal": address})
+
+    def copy():
+        folder = os.path.join(directory, "costs", "context")
+        os.makedirs(folder, exist_ok=True)
+        write_text(os.path.join(folder, new_sid + ".txt"), prompt or "")
+        names = [os.path.join(folder, x) for x in os.listdir(folder) if x.endswith(".txt")]
+        names.sort(key=lambda x: (os.path.getmtime(x), x))
+        for x in names[:max(0, len(names) - CONTEXT_COPIES_MAX)]:
+            os.remove(x)
+
+    def launcher():
+        last = {"at": now(), "from": old, "to": new_sid, "reason": reason, "ctx": after.get("ctx")}
+        launcher_update(ctx, directory, lambda r: r.__setitem__("lastReset", last))
+        if after.get("request"):
+            remove_context_request(directory, after["request"])
+            context_outcome(ctx, directory, after["request"], "ok", None)
+    steps += [record, copy, launcher]
+    for step in steps:
+        try:
+            step()
+        except Exception:  # noqa: BLE001 - never stops the Project Agent
+            pass
+    ctx["lastResetAt"] = time.time()
+
+
+# ---- pa-context fresh and followup: the person's commands (R6, R17) --------------------------------------------
+
+def context_flags(args):
+    flags = ["--space", args.space]
+    for name in ("why", "mode", "task_cap", "pass_cap", "net", "by", "since", "until"):
+        if getattr(args, name, None) is not None:
+            flags += ["--" + name.replace("_", "-"), getattr(args, name)]
+    for name in ("dry_run", "withdraw", "json"):
+        if getattr(args, name, False):
+            flags.append("--" + name.replace("_", "-"))
+    return flags
+
+
+def context_relay(args):
+    """pa-context <action> --on M: the same command on the space's machine (as pa-restart --on)."""
+    if not args.space:
+        raise Problem("--on needs --space <id> (the space's id on that machine)")
+    script = ('"$HOME/.config/herdr-pa/tools/pa.py" context ' + args.action + " "
+              + " ".join(shlex.quote(a) for a in context_flags(args)))
+    if args.action == "fresh" and os.environ.get("CLAUDECODE") not in (None, "", "0") and args.why:
+        journal_caller({"by": "orchestrator", "trigger": "conversation", "why": "fresh context: " + args.why,
+                        "on": args.on, "space": args.space})
+    code = relay(["hc", "exec", "--on", args.on, "--timeout", "60", "--", "sh", "-c", script])
+    if code == 127:
+        print("pa-context is not installed on {}: run pa-sync --on {} first".format(args.on, args.on), file=sys.stderr)
+    if code:
+        sys.exit(code)
+
+
+def context_report(directory, agent):
+    """What a fresh context request would meet now (the dry run): size, due reason and clean-point reasons."""
+    settings, _problem = read_context(directory)
+    req, _why = read_context_request(directory)
+    sid = agent.get("sessionId")
+    size = current_size(directory, agent.get("project"), sid)
+    turn = agent_turn(agent.get("terminal"))
+    ctx = {"idleSince": (size or {}).get("lastAssistant") if turn == "idle" else None,
+           "running": {"since": parse_time(last_start(directory) or "")}}
+    ledger = as_dict(read_json_safe(os.path.join(directory, "ledger.json")))
+    due = reset_reason(size, ledger.get("context"), settings, req)
+    _ok, reasons = clean_point(ctx, directory, agent, size, time.time(), agent.get("terminal"))
+    return settings, size, due, reasons, req
+
+
+def context_fresh(args):
+    """pa-context fresh: asks the launcher for a fresh context at its next clean point (R6); --withdraw, --dry-run."""
+    if args.on:
+        return context_relay(args)
+    in_claude = os.environ.get("CLAUDECODE") not in (None, "", "0")
+    if args.by == "panel" and any(os.environ.get(k) for k in AGENT_VARS):
+        raise Problem("--by panel is the panel's own flag; it is refused inside Claude")
+    if in_claude and not args.dry_run and not (args.why or "").strip():
+        raise Problem("inside Claude, pa-context fresh needs --why quoting the person's own words")
+    directory, agent = space_for_command(args.space)
+    if args.dry_run:
+        settings, size, due, reasons, req = context_report(directory, agent)
+        print("mode {}  taskCap {:,}  passCap {:,}".format(settings["mode"], settings["taskCap"], settings["passCap"]))
+        print("context: {}".format("{}k ({})".format(size["ctx"] // 1000, size["source"]) if size else "unknown"))
+        print("request: {}".format(req["id"] if req else "none"))
+        print("reset due: {}".format(due or "no"))
+        print("clean point: " + ("yes" if not reasons else "no: " + "; ".join(t for _l, t in reasons)))
+        print("Dry run: nothing written.")
+        if args.json:
+            print(json.dumps({"outcome": "dry-run", "ctx": size["ctx"] if size else None,
+                              "source": size["source"] if size else None, "due": due,
+                              "request": req["id"] if req else None, "expires": req["expires"] if req else None,
+                              "reasons": [t for _l, t in reasons]}))
+        return
+    if args.withdraw:
+        req, _why = read_context_request(directory)
+        removed = bool(req) and remove_context_request(directory, req["id"])
+        print("Withdrawn ({}).".format(req["id"]) if removed else "No request was pending.")
+        if args.json:
+            print(json.dumps({"outcome": "withdrawn" if removed else "none", "request": req["id"] if removed else None}))
+        return
+    settings, _problem = read_context(directory)
+    if settings["mode"] != "fresh":
+        raise Problem("the context mode is off (context.json), so no fresh context is taken: pa-restart --fresh gives a "
+                      "new conversation now, or set the mode to fresh first")
+    if not context_capable(read_json_safe(os.path.join(directory, "launcher.json"))):
+        raise Problem("its launcher is older and takes no context request: restart it once with pa-restart")
+    by = "panel" if args.by == "panel" else ("orchestrator" if in_claude else "person")
+    pending, _why = read_context_request(directory)
+    at, rid = time.time(), str(uuid.uuid4())
+    req = {"v": 1, "id": rid, "space": agent.get("space") or os.path.basename(directory), "by": by, "why": args.why,
+           "at": iso_time(at), "expires": iso_time(at + CONTEXT_REQUEST_LIFE)}
+    if by == "orchestrator":
+        with open(os.path.join(directory, "journal.jsonl"), "a") as journal:
+            journal.write(json.dumps({"at": now(), "by": "orchestrator", "trigger": "conversation",
+                                      "why": "fresh context: " + args.why, "request": rid}) + "\n")
+    write_json(os.path.join(directory, CONTEXT_REQUEST), req)
+    if pending:
+        print("It replaces the pending request {}.".format(pending["id"]))
+    print("Requested ({}): a fresh context at the Project Agent's next clean point (it waits up to 2 h; a pass is "
+          "never cut short).".format(rid))
+    if args.json:
+        print(json.dumps({"outcome": "requested", "request": rid, "expires": req["expires"]}))
+
+
+def followup_report(directory, since, until=None):
+    """R17's numbers and markers for the follow-up worker (read-only). The verdict is keep or tune by the rule;
+    back out is never decided here: its candidates are listed under judgement."""
+    lo, hi = parse_stamp(since), parse_stamp(until) if until else None
+    inside = (lambda t: t is not None and t >= lo and (hi is None or t <= hi))
+    day_lo, day_hi = since[:10], until[:10] if until else None
+    days = [d for d in as_dict(read_json_safe(os.path.join(directory, "costs", "summary.json"))).get("paContext") or []
+            if isinstance(d, dict) and isinstance(d.get("day"), str)]
+
+    def per_pass(rows):
+        money = sum(r["money"] for r in rows if isinstance(r.get("money"), (int, float)) and r.get("passes"))
+        passes = sum(r["passes"] for r in rows if isinstance(r.get("money"), (int, float)) and r.get("passes"))
+        return {"days": len(rows), "money": round(money, 6), "passes": passes,
+                "perPass": round(money / passes, 6) if passes else None}
+    before = per_pass([d for d in days if d["day"] < day_lo])
+    after = per_pass([d for d in days if d["day"] >= day_lo and (day_hi is None or d["day"] <= day_hi)])
+    fell = (round((before["perPass"] - after["perPass"]) / before["perPass"], 6)
+            if before["perPass"] and after["perPass"] is not None else None)
+    records = []
+    for line in read_text(os.path.join(directory, "costs", "sessions.jsonl")).splitlines():
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(r, dict) and r.get("ev") in ("reset", "compact") and inside(parse_stamp(r.get("at"))):
+            records.append(r)
+    resets = sorted((parse_stamp(r["at"]), r) for r in records if r["ev"] == "reset")
+    by_reason = {}
+    for _t, r in resets:
+        key = r.get("reason") if isinstance(r.get("reason"), str) else "(none)"
+        by_reason[key] = by_reason.get(key, 0) + 1
+    most = max([sum(1 for u, _r in resets if t <= u < t + 3600) for t, _r in resets] or [0])
+    journal, markers, standing = [], [], []
+    for line in read_text(os.path.join(directory, "journal.jsonl")).splitlines():
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        t = parse_stamp(as_dict(e).get("at"))
+        if not inside(t):
+            continue
+        journal.append((t, e))
+        for kind in ("repeat", "reask", "redo"):
+            if isinstance(e.get(kind), str):
+                markers.append({"at": e["at"], "kind": kind, "text": e[kind][:300], "pass": e.get("pass")})
+        if e.get("standing") in ("added", "removed"):
+            standing.append({"at": e["at"], "standing": e["standing"], "entry": str(e.get("entry") or "")[:80]})
+    judgement = []
+    for t, r in resets:
+        for m in markers:
+            mt = parse_stamp(m["at"])
+            if m["kind"] in ("repeat", "reask") and mt > t:
+                passes = {e.get("pass") for u, e in journal if t < u <= mt and e.get("pass") is not None}
+                if len(passes) <= 2:
+                    judgement.append("reset at {} then {} at {}: {}".format(r["at"], m["kind"], m["at"], m["text"][:120]))
+        for folder in ("decisions", ARCHIVE):
+            path = os.path.join(directory, folder)
+            for name in sorted(os.listdir(path)) if os.path.isdir(path) else []:
+                card = as_dict(read_json_safe(os.path.join(path, name)))
+                answered = parse_stamp(card.get("answered"))
+                if card.get("status") == "answered" and answered is not None and t - 1800 <= answered <= t:
+                    judgement.append("reset at {} within 30 min of card {} answered at {}".format(
+                        r["at"], card.get("id") or name[:-5], card["answered"]))
+    if any(m["kind"] in ("repeat", "reask") for m in markers) or most > 1:
+        verdict = "tune"
+    elif fell is not None and fell >= 0.25:
+        verdict = "keep"
+    else:
+        verdict = "needs judgement"
+    return {"since": since, "until": until, "days": days, "before": before, "after": after, "fell": fell,
+            "resets": {"total": len(resets), "byReason": by_reason, "maxPerHour": most},
+            "compact": sum(1 for r in records if r["ev"] == "compact"), "markers": markers, "standing": standing,
+            "judgement": judgement, "verdict": verdict}
+
+
+def context_followup(args):
+    directory, _agent = space_for_command(args.space)
+    since = args.since or read_context(directory)[0].get("enabledAt")
+    if not since or parse_stamp(since) is None:
+        raise Problem("--since <UTC time> is needed (context.json has no enabledAt)")
+    if args.until and parse_stamp(args.until) is None:
+        raise Problem("--until is not a UTC time")
+    r = followup_report(directory, since, args.until)
+    if args.json:
+        print(json.dumps(r))
+        return
+    print("Since {}{}".format(since, " until " + args.until if args.until else ""))
+    for name in ("before", "after"):
+        b = r[name]
+        print("  {:6}  days {}  USD {}  passes {}  USD/pass {}".format(name, b["days"], b["money"], b["passes"], b["perPass"]))
+    print("  USD/pass fell: {}".format("{:.1%}".format(r["fell"]) if r["fell"] is not None else "unknown"))
+    print("  resets {} (by reason {}; most in one hour {}); compactions {}".format(
+        r["resets"]["total"], r["resets"]["byReason"], r["resets"]["maxPerHour"], r["compact"]))
+    for m in r["markers"]:
+        print("  marker {} at {}: {}".format(m["kind"], m["at"], m["text"]))
+    for line in r["judgement"]:
+        print("  needs judgement: " + line)
+    print("verdict: {} (back out is the follow-up worker's call, from the lines above)".format(r["verdict"]))
 
 
 def exec_plain(p, extra=()):
@@ -1443,7 +2121,7 @@ def as_text(value):
 
 
 LAUNCHER_VERSION = 2  # version 2: the launcher takes requests (accepts); a version-1 record is from J1 code
-ACCEPTS = ["restart"]  # t-041 J4 adds "context"
+ACCEPTS = ["restart", "context"]  # t-041 J4: a context request (context-request.json)
 
 
 def restart_capable(record):
@@ -1488,7 +2166,7 @@ def launcher_start(ctx, address, space, directory, p):
                   "started": ctx.get("startedAt") or ctx.setdefault("startedAt", now()),
                   "code": {"tools": tools, "file": me, "installed": as_text(installed.get("tools")), "commit": commit},
                   "profile": profile_record(p),
-                  "session": None, "restart": None, "restartedFrom": None}
+                  "session": None, "restart": None, "restartedFrom": None, "context": None, "lastReset": None}
         restarted = ctx.get("restarted")
         if restarted:  # this process was exec'd by a restart (R6): what it came from
             record["restartedFrom"] = restarted.get("from")
@@ -1676,10 +2354,11 @@ def reload_profile(p):
         return p
 
 
-def launch_command(p, agent, resume, directory, snapshot=False, version=None):
+def launch_command(p, agent, resume, directory, snapshot=False, version=None, prompt=None):
     """(argv, model) for one launch of the Project Agent from profile p; raises when p cannot give one (also when
     the exec would refuse the argv: an element not a str, or with a NUL byte). version: the claude command's Claude
-    Code version (cc_version), which gates --autocompact and idleCompaction (t-041 J3); None leaves both out."""
+    Code version (cc_version), which gates --autocompact and idleCompaction (t-041 J3); None leaves both out.
+    prompt: a new session's first prompt (t-041 J4, the fresh context's start prompt); a resume keeps its own."""
     argv = list(p["claude"])
     model = (agent.get("models") or {}).get("orchestrator") or (p.get("models") or {}).get("orchestrator")
     if model:
@@ -1701,6 +2380,10 @@ def launch_command(p, agent, resume, directory, snapshot=False, version=None):
                  "the person, no worker for a task with an open card. If the last hold or resume line in the "
                  "journal is a hold, start nothing at all until the person says go. `paused` in "
                  "`schedule.json` stops timed passes only; it is not a hold."]
+    elif prompt:  # t-041 J4: the fresh context's start prompt, where the resume prompt sits
+        if not isinstance(prompt, str) or prompt.startswith("-"):
+            raise Problem("a start prompt must be text that does not start with '-'")
+        argv += [prompt]
     argv += pa_settings_args(p, agent.get("space") or os.path.basename(directory), directory, version)  # last (t-029 R4, t-040, t-041)
     argv = resolve(argv, p)
     # The exec refuses anything else (TypeError / ValueError); refuse it here, so run_agent's trial build of a
@@ -2080,11 +2763,18 @@ def begin_restart(ctx, directory, address, req, pre):
 
 
 def watcher(ctx, directory, address, space):
+    looked = 0.0
     while True:
         try:
             watch_once(ctx, directory, address, space)
         except Exception:  # noqa: BLE001 - the watcher never stops the launcher
             pass
+        if time.time() - looked >= CONTEXT_EVERY:  # t-041 J4: the fresh reset's check, after the restart's
+            looked = time.time()
+            try:
+                context_once(ctx, directory, address, space)
+            except Exception:  # noqa: BLE001
+                pass
         time.sleep(WATCH_EVERY)
 
 
@@ -2146,6 +2836,8 @@ def take_after(ctx, project, directory, address):
     after = ctx.pop("after", None)
     if after and after.get("kind") == "exec":
         exec_restart(ctx, after, project, directory, address)
+    elif after and after.get("kind") == "fresh":  # t-041 J4: the loop starts a new session with the start prompt
+        ctx["freshNext"] = after
 
 
 def reload_after_exit(ctx, project, directory, address, space):
@@ -2218,13 +2910,20 @@ def run_agent(args, address, project, p, directory, agent, ctx, started):
     quick, quick_resume_fails = 0, 0
     while True:
         take_after(ctx, project, directory, address)  # a restart taken while no Claude ran (returns if it failed)
+        fresh_next = ctx.pop("freshNext", None)  # t-041 J4: a fresh context was taken
         fresh = reload_profile(p)
         agent = read_json(os.path.join(directory, "agent.json"), agent)
         resume, why = should_resume(agent, directory, project, before=started, heartbeat=ctx.get("previous"))
-        if args.fresh:
-            resume, why = False, "fresh"
+        if args.fresh or fresh_next:
+            resume, why = False, "fresh" if args.fresh else "context"
         if not resume:
+            old = agent.get("sessionId")
+            if why in ("fresh", "context") and isinstance(old, str) and old:  # the person can /resume it
+                previous = [s for s in agent.get("previousSessions") or [] if isinstance(s, str) and s != old]
+                agent["previousSessions"] = ([old] + previous)[:PREVIOUS_MAX]
             agent["sessionId"], agent["sessionStarted"] = str(uuid.uuid4()), False
+        prompt = (fresh_prompt(directory, resets_today(directory) + 1, fresh_next.get("reason"), fresh_next.get("from"))
+                  if fresh_next else None)
         args.fresh = False
         agent["updated"] = now()
         write_json(os.path.join(directory, "agent.json"), agent)
@@ -2234,13 +2933,13 @@ def run_agent(args, address, project, p, directory, agent, ctx, started):
             # loads but has a wrong shape in a key read here (models a list, path a number, ...) keeps the old one.
             try:
                 snap, ver = snapshot_flag(fresh, ctx), cc_version(fresh, ctx)  # t-041 J3: the version gates the net
-                argv, model = launch_command(fresh, agent, resume, directory, snapshot=snap, version=ver)
+                argv, model = launch_command(fresh, agent, resume, directory, snapshot=snap, version=ver, prompt=prompt)
                 p, adopted = fresh, fresh != held
             except Exception:  # noqa: BLE001 - a restart never fails because of the reload
                 fresh = p
         if fresh is p:
             snap, ver = snapshot_flag(p, ctx), cc_version(p, ctx)  # t-041 J3: the version gates the net
-            argv, model = launch_command(p, agent, resume, directory, snapshot=snap, version=ver)
+            argv, model = launch_command(p, agent, resume, directory, snapshot=snap, version=ver, prompt=prompt)
 
         def starting(model):  # what is written as a launch starts; returns its start time
             ttl, by = cache_in_effect(p, os.environ)  # t-040: the cache lifetime this start asks for
@@ -2250,6 +2949,9 @@ def run_agent(args, address, project, p, directory, agent, ctx, started):
                 if note not in said:
                     said.add(note)
                     session_log(directory, note)
+            if fresh_next and not fresh_next.get("recorded"):  # t-041 J4: before the start line (it stays last)
+                fresh_next["recorded"] = True
+                fresh_records(ctx, directory, address, fresh_next, agent["sessionId"], prompt)
             session_log(directory, "start resume={} session={} reason={} cache={} cacheBy={} net={} idle={}".format(
                 resume, agent["sessionId"], why, ttl, by, plan["net"] or ("off" if plan["mode"] == "off" else "none"),
                 "off" if plan["idle"] else "kept"))
@@ -2283,7 +2985,7 @@ def run_agent(args, address, project, p, directory, agent, ctx, started):
                         .format(ascii(e)[:200]))
             p, adopted = held, False
             snap, ver = snapshot_flag(p, ctx), cc_version(p, ctx)  # t-041 J3: the version gates the net
-            argv, model = launch_command(p, agent, resume, directory, snapshot=snap, version=ver)
+            argv, model = launch_command(p, agent, resume, directory, snapshot=snap, version=ver, prompt=prompt)
             began = starting(model)
             code = run_child(ctx, argv, project)
         running["since"] = None
@@ -3971,13 +4673,22 @@ def main():
         return cmd_restart(parser.parse_args())
     if kind == "pa-context":
         parser.description = ("set: the Project Agent's context settings (context.json; the person's command, applied at "
-                              "its next start). compact-instructions, start-pack, compacted: its compaction hooks (t-041).")
-        parser.add_argument("action", choices=("set", "compact-instructions", "start-pack", "compacted"))
+                              "its next start). compact-instructions, start-pack, compacted: its compaction hooks (t-041). fresh: a "
+                              "fresh context at its next clean point; followup: the reset's follow-up report (t-041 J4).")
+        parser.add_argument("action", choices=("set", "compact-instructions", "start-pack", "compacted", "fresh", "followup"))
         parser.add_argument("--space", help="a space id (default: this terminal's)")
         parser.add_argument("--mode", choices=CONTEXT_MODES, help="fresh: the net and the hooks; off: none of them")
         parser.add_argument("--task-cap", help="tokens, like 150k (read by the fresh reset, t-041 J4)")
         parser.add_argument("--pass-cap", help="tokens, like 250k (read by the fresh reset, t-041 J4)")
         parser.add_argument("--net", help="tokens, like 400k: Claude Code's auto-compact window for the Project Agent")
+        parser.add_argument("--why", help="fresh: why (inside Claude: the person's own words)")
+        parser.add_argument("--on", help="set, fresh: run it on that machine (hc exec)")
+        parser.add_argument("--dry-run", action="store_true", help="fresh: show the size and what a reset meets now")
+        parser.add_argument("--withdraw", action="store_true", help="fresh: withdraw the pending request")
+        parser.add_argument("--json", action="store_true", help="set, fresh, followup: one JSON line")
+        parser.add_argument("--since", help="followup: from (default: context.json enabledAt)")
+        parser.add_argument("--until", help="followup: until")
+        parser.add_argument("--by", choices=("panel",), help=argparse.SUPPRESS)  # the panel's own flag (t-041 J5)
         return cmd_context(parser.parse_args())
     if kind == "pa-stamp":
         parser.add_argument("--commit", help="the repo commit installed from")

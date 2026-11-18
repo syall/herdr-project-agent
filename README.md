@@ -511,9 +511,36 @@ pa-context set --mode off         # the back-out: no net, no hooks, idle compact
 pa-context set --mode fresh       # back on (the default)
 ```
 
-`--task-cap` and `--pass-cap` (defaults 150k and 250k) are kept for the fresh-context reset that comes
-later (t-041 J4); they must stay below the net. A change applies at the Project Agent's next start, or a
-restart in place.
+`--task-cap` and `--pass-cap` (defaults 150k and 250k) are the fresh context's caps; they must stay below
+the net. The net applies at the Project Agent's next start, or a restart in place; the caps and `--mode`
+apply to resets at the launcher's next check.
+
+### Fresh context
+
+Before the net is reached, the launcher starts the Project Agent in a fresh session, in the same terminal:
+same address, same labels, its workers keep running. It does so only at a clean point: Claude idle for 20
+seconds with nothing waiting, the ledger's checkpoint written clean by this session in its last turn, no
+answered card it is still acting on, a handoff file for every live worker, a valid `standing.md`, no
+restart request, and no other reset in the last 10 minutes. Then it resets when the context (read from the
+session's transcript) is at `taskCap` at a task boundary, or at `passCap` at any clean point. When only the
+checkpoint is missing it types one line into the tab (`[launcher] context ...`, at most once an hour).
+
+The new session starts with the usual system prompt (so the current core text) and a start prompt with
+`standing.md` inlined; it reads the ledger, the journal and the open cards as after a restart. The tab
+prints `[Project Agent] Context reset (<N>k) ... Previous session: <id>`; `agent.json` keeps the last 20
+session ids in `previousSessions`, so `/resume` still finds the old conversation. `session.log` gets a
+`fresh from=... to=... reason=...` line and `costs/sessions.jsonl` a `reset` record (`pa-costs report`
+counts them).
+
+```sh
+pa-context fresh                  # a fresh context at the next clean point (waits up to 2 h)
+pa-context fresh --dry-run        # the context size now, and what a reset would meet
+pa-context fresh --withdraw       # take a pending request back
+pa-context followup               # the follow-up report since the mode was turned on (read-only)
+```
+
+`--on <machine>` runs `fresh` or `set` on the space's machine. With `--mode off` there are no resets and
+no request is taken (`pa-restart --fresh` still gives a new conversation at once).
 
 ## Checks
 
