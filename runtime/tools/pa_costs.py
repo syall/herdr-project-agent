@@ -149,6 +149,10 @@ def load_prices(profile):
         has_default = "defaultScope" in raw
         if has_default:
             default = _scope(raw["defaultScope"], "defaultScope")
+            extra = sorted(k for k in raw["defaultScope"] if k not in SCOPE_FIELDS)
+            if extra:
+                warnings.append("prices.json of profile {}: defaultScope has keys this tool does not know ({}): ignored".format(
+                    profile.get("name"), ", ".join(str(k)[:40] for k in extra[:5])))
         elif raw.get("defaultProvider") is not None:
             if fact_label("provider", raw["defaultProvider"]) is None:
                 raise ValueError("defaultProvider must be a label")
@@ -160,9 +164,15 @@ def load_prices(profile):
                             "the file's is used".format(profile.get("name"), default[0], prof_default))
         if not isinstance(raw.get("scoped") or [], list):
             raise ValueError("scoped must be a list")
-        scoped, seen = [], {default}
+        scoped, seen, skipped = [], {default}, []
         for i, e in enumerate(raw.get("scoped") or []):
             where = "scoped[{}]".format(i)
+            extra = sorted(k for k in e if k not in SCOPE_FIELDS + ("models",)) if isinstance(e, dict) else []
+            if extra:  # d-117 limit 4: an unknown key may narrow the scope; ignoring it would widen it, so skip the entry
+                skipped.append(i)
+                warnings.append("prices.json of profile {}: {} has keys this tool does not know ({}): the entry is skipped".format(
+                    profile.get("name"), where, ", ".join(str(k)[:40] for k in extra[:5])))
+                continue
             scope = _scope(e, where)
             if all(v is None for v in scope):
                 raise ValueError("{}: at least one of provider, endpoint, region, account".format(where))
@@ -195,7 +205,7 @@ def load_prices(profile):
     return {"currency": raw["currency"], "unit": raw.get("unit"), "source": raw.get("source"), "asOf": raw.get("asOf"),
             "note": raw.get("note"), "profile": profile.get("name"), "models": models, "aliases": aliases,
             "warnings": warnings, "defaultScope": default, "fileDefault": has_default, "scoped": scoped,
-            "scopedAliases": scoped_aliases, "endpointPriceAs": price_as}, None
+            "scopedAliases": scoped_aliases, "endpointPriceAs": price_as, "skippedScoped": skipped}, None
 
 
 def model_key(table, model):
@@ -209,6 +219,17 @@ def model_key(table, model):
             return model
     for pattern, key in list(table["aliases"]) + list(table.get("scopedAliases") or []):
         if pattern.search(model):
+            return key
+    return None
+
+
+def scope_key(table, models, model):
+    """The key of model in one scope's models (d-117 limit 1): its exact key there, else the first alias (aliases, then
+    scopedAliases) that matches and whose target that scope has. Aliases apply to every scope (A-P1)."""
+    if model in models:
+        return model
+    for pattern, key in list(table["aliases"]) + list(table.get("scopedAliases") or []):
+        if key in models and pattern.search(model):
             return key
     return None
 
@@ -233,8 +254,7 @@ def lookup(table, model, when, facts=None):
     A-P2: the scopes that match (null = any; unknown provider and endpoint take the default scope's), most specific first
     (account, then region, then endpoint, then provider); in each the latest validFrom on or before the day; none: (None,
     None). pricedAs = {"scope": [p, n, g, a] with null as "*", "validFrom"}. No facts: the default scope alone."""
-    key = model_key(table, model)
-    if key is None:
+    if not table or not model or model_key(table, model) is None:
         return None, None
     day = (when or "")[:10]
     default = table.get("defaultScope") or (None, None, None, None)
@@ -250,7 +270,8 @@ def lookup(table, model, when, facts=None):
         candidates.sort(key=lambda x: (x[0][3] is not None, x[0][2] is not None, x[0][1] is not None, x[0][0] is not None), reverse=True)
     for scope, models in candidates:
         found = None
-        for entry in models.get(key) or []:
+        key = scope_key(table, models, model)
+        for entry in models.get(key) or [] if key is not None else []:
             if entry["validFrom"] <= day:
                 found = entry
         if found is not None:
