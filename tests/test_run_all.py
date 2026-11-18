@@ -104,7 +104,7 @@ class RunAll(unittest.TestCase):
         self.repo = os.path.join(self.tmp, "repo")
         os.makedirs(os.path.join(self.repo, "tests"))
         shutil.copy(os.path.join(HERE, "run-all.sh"), os.path.join(self.repo, "tests", "run-all.sh"))
-        for name in ("pa", "pa_hooks", "pa_guard", "pa_costs", "pa_push"):
+        for name in ("pa", "pa_hooks", "pa_guard", "pa_costs", "pa_push", "pa_queue"):
             write(os.path.join(self.repo, "runtime", "tools", name + ".py"), "x = 1\n")
         write(os.path.join(self.repo, "stub.sh"), STUB)
         write(os.path.join(self.repo, "tests", "test_stub.py"), UNITS)
