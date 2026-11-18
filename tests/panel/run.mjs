@@ -1390,8 +1390,10 @@ async function press(v, id) {
     if (h && h[0] === "left") h[1]({}, ecx);
     if (stopped) break;
   }
-  const target = route[route.length - 1];
-  if (id !== null && target.click) target.click({}, cx);
+  // gpui draws the view again between the mouse-down and the click (t-028 A3): the click is that of the element
+  // with this id in the tree drawn after the mouse-down (none: it is gone, nothing is clicked).
+  const again = id === null ? null : pathTo(v.render(cx), id), target = again?.[again.length - 1];
+  if (target?.click) target.click({}, cx);
   await flush();
 }
 const ARMED = "Delete the task, its evidence and its cards?";
@@ -3454,6 +3456,70 @@ cases["T26-sel-every-view"] = async () => { // no TextView under a click anywher
   const v = await copyCardWorld(openCopyCard);
   for (const view of ["decisions", "tasks", "rules", "costs"]) { await click(v, `view-${view}`); await settle(); safeViews(v.render(cx), view); }
   safeViews(v.render(cx), "root");
+};
+
+// ---- t-028 group A: the armed Delete (t-018 items 1-4) ----
+cases["A8-live-arm"] = async () => { // A1: a click on a Delete drawn armed after its arm ran out (no tick, no redraw) only arms again
+  const v = await armWorld();
+  await press(v, "delete-t-1");
+  check(armedText(v), "task Delete armed");
+  let { clicks } = look(v); // the tree on screen, drawn armed
+  advance(10500); // past ARM_WAIT; no 1 s tick, no render
+  clicks["delete-t-1"]({}, cx); await flush();
+  check(deletes().length === 0, `task: nothing deleted (got ${JSON.stringify(deletes())})`);
+  check(armedText(v), "task: the click arms it again");
+  const r = await ruleWorld();
+  await press(r, "rule-delete-r-one");
+  check(ruleArmed(r), "rule Delete armed");
+  ({ clicks } = look(r));
+  advance(10500);
+  clicks["rule-delete-r-one"]({}, cx); await settle();
+  check(ruleIds() === "r-one,r-two", `rule: nothing deleted (got ${ruleIds()})`);
+  check(ruleArmed(r), "rule: the click arms it again");
+};
+cases["A9-field-focus-disarms"] = async () => { // A2: focus in a panel text field disarms (whether or not the Input stops the press)
+  const v = await armWorld();
+  look(v).clicks["sched-summary"]({}, cx); await flush(); // the schedule opens (its click alone)
+  for (const k of ["quietFrom", "quietTo", "custom"]) {
+    await press(v, "delete-t-1");
+    check(armedText(v), `armed before ${k}`);
+    const f = v.schedule[k];
+    check(f && f.handlers("focus") > 0, `${k} has a focus handler`);
+    f.fire("focus"); await flush();
+    check(!armedText(v), `focus in ${k} disarms the task Delete`);
+  }
+  check(deletes().length === 0, "nothing deleted");
+  const r = await ruleWorld();
+  look(r).clicks["rule-import"]({}, cx); await flush(); // the import path field
+  await press(r, "rule-delete-r-one");
+  check(ruleArmed(r), "rule Delete armed");
+  r.rules.importPath.fire("focus"); await flush();
+  check(!ruleArmed(r), "focus in the import path disarms the rule Delete");
+  r.rules.edit(null);
+  for (const [k, f] of Object.entries(r.rules.form.inputs)) {
+    await press(r, "rule-delete-r-one");
+    check(ruleArmed(r), `armed before the form's ${k}`);
+    f.fire("focus"); await flush();
+    check(!ruleArmed(r), `focus in the form's ${k} disarms`);
+  }
+  await settle();
+  check(ruleIds() === "r-one,r-two", `no rule deleted (got ${ruleIds()})`);
+  const w = await cardsWorld({}, ["d-x"]); await settle();
+  const note = noteOf(w, "d-x");
+  check(note && note.handlers("focus") > 0, "a card's note field has a focus handler");
+};
+cases["A11-redraw-at-10s"] = async () => { // A4: the 1 s tick asks for a redraw when an arm runs out (and not before)
+  const v = await armWorld();
+  await press(v, "delete-t-1");
+  let n0 = g.__notifies ?? 0;
+  advance(9000); await fire(1000);
+  check((g.__notifies ?? 0) === n0, `no redraw at 9 s (got ${(g.__notifies ?? 0) - n0})`);
+  advance(1500); n0 = g.__notifies ?? 0; await fire(1000);
+  check((g.__notifies ?? 0) - n0 === 1, `one redraw at 10.5 s (got ${(g.__notifies ?? 0) - n0})`);
+  const r = await ruleWorld();
+  await press(r, "rule-delete-r-one");
+  advance(10500); n0 = g.__notifies ?? 0; await fire(1000);
+  check((g.__notifies ?? 0) - n0 === 1, `rule: one redraw at 10.5 s (got ${(g.__notifies ?? 0) - n0})`);
 };
 
 // Which cases run (t-031): every case, or the named ones; --shard=<k>/<n> keeps every n-th case by definition
