@@ -2774,28 +2774,79 @@ def trust_project(project, home, pa_home=None):
         spaces = os.path.join(pa_home, "spaces")
         try:
             names = os.listdir(spaces)
-        except OSError:
+        except FileNotFoundError:
             names = []
+        except OSError as e:
+            return None, TrustUncertain("the Project Agent's spaces folder could not be read ({}): whether a space "
+                                        "folder lands in the project folder is not known".format(e))
         if any(trust_inside(os.path.join(spaces, n), real) for n in names):
             return None, "the project folder holds a space folder of the Project Agent's home (through a symlink): " \
                          "its state would be inside it"
+        unread = None
         for n in names:
-            link = trust_link_into(os.path.join(spaces, n), real)
+            link, why = trust_link_into(os.path.join(spaces, n), real)
             if link:
                 return None, "a symlink in a space folder of the Project Agent's home ({}) lands in the project " \
                              "folder: its state would be inside it".format(link)
+            unread = unread or why
+        if unread:
+            return None, TrustUncertain("a part of a space folder of the Project Agent's home could not be read "
+                                        "({}): whether it lands in the project folder is not known".format(unread))
     return real, None
 
 
+class TrustUncertain(str):
+    """A why from trust_project that means uncertain (not known), not refused; no key either way."""
+
+
+TRUST_WALK_DEPTH = 64  # folders deep, links followed
+TRUST_WALK_ENTRIES = 200000
+
+
 def trust_link_into(folder, base):
-    """The first symlink found under folder's real path (walked without following links) whose real path is base
-    or inside it, else None (t-047 W1: a space folder's evidence/, ledger.json or any deeper entry linked into P)."""
-    for top, dirs, files in os.walk(os.path.realpath(folder)):
-        for name in dirs + files:
+    """(the first entry under folder whose real path is base or inside it, None), else (None, what could not be
+    read, or None). Links are followed to their final real path, through folders anywhere (a chain: evidence ->
+    /X, /X/t-1 -> P/...); each folder is entered once by its real path (the cycle guard), up to TRUST_WALK_DEPTH
+    folders deep and TRUST_WALK_ENTRIES entries. A dangling link counts by where it points. An entry that cannot be
+    read (an unreadable folder, a link loop) or a bound reached is returned as the second value; the walk goes on,
+    since a link into base found later still refuses (t-047 W1 and round 2: Verify L1, Review L-R1, N-R1)."""
+    if trust_inside(folder, base):
+        return folder, None
+    seen, unread, count = set(), None, 0
+    stack = [(folder, 0)]
+    while stack:
+        top, depth = stack.pop()
+        real = os.path.realpath(top)
+        if real in seen:
+            continue
+        seen.add(real)
+        if depth >= TRUST_WALK_DEPTH:
+            unread = unread or "{}: more than {} folders deep".format(top, TRUST_WALK_DEPTH)
+            continue
+        try:
+            names = sorted(os.listdir(real))
+        except OSError as e:
+            unread = unread or "{}: {}".format(top, e.strerror or e)
+            continue
+        for name in names:
+            count += 1
+            if count > TRUST_WALK_ENTRIES:
+                return None, unread or "{}: more than {} entries".format(folder, TRUST_WALK_ENTRIES)
             path = os.path.join(top, name)
-            if os.path.islink(path) and trust_inside(path, base):
-                return path
-    return None
+            if trust_inside(path, base):
+                return path, None
+            try:
+                os.stat(path)
+            except FileNotFoundError:
+                if not os.path.islink(path):
+                    unread = unread or "{}: gone while read".format(path)
+                continue  # a dangling link: where it points was checked above
+            except OSError as e:
+                unread = unread or "{}: {}".format(path, e.strerror or e)
+                continue
+            if os.path.isdir(path):
+                stack.append((path, depth + 1))
+    return None, unread
 
 
 def trust_inside(folder, base):
@@ -2993,7 +3044,7 @@ def cmd_trust(args):
 
     project, why = trust_project(agent.get("project"), home, pa.ROOT)
     if why:
-        done("refused", why)
+        done("uncertain" if isinstance(why, TrustUncertain) else "refused", why)
     out["project"] = project
     if address == agent.get("terminal") or address in (agent.get("terminals") or []):
         done("refused", "that is the Project Agent's own terminal: its trust prompt is the person's")
