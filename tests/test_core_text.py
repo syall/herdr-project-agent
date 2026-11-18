@@ -148,7 +148,7 @@ class Orchestrator(unittest.TestCase):
         self.assertIn("When it is answered Close all listed, run `pa-worker close --card d-leftovers`", self.text)
         self.assertIn("Answered Close none: leave them", self.text)
         # review round 3: R1 (one card at a time, the rest on the next) and R2 (any note closes nothing)
-        self.assertIn("If the person wrote a note, nothing is closed", self.text)
+        self.assertIn("If the person wrote a note or answered Other, nothing is closed", self.text)  # t-046 T6
         self.assertIn("then run `pa-worker close --leftovers` again: it opens the next card", self.text)
         self.assertNotIn("may name workers to keep in its note", self.text)
         self.assertNotIn("journal its list, then run `pa-worker close --leftovers` in the same pass", self.text)
@@ -549,8 +549,9 @@ PUSH_PARAGRAPH = ("Push cards. No agent moves a main branch on its remote. " + P
                   "branch moves on its remote in one way only: the person answers Push on a push card in the panel, and "
                   "the panel runs `pa-push-main run`. " + PUSH_ORDER + " " + PUSH_NOT_INSTEAD + " When the panel tells "
                   "you the answer, read the card: "
-                  "pushed, move the task on; refused, follow its message (a stale card needs a new one) or leave it to "
-                  "the person.")
+                  "pushed, move the task on; answered Other, nothing was pushed: act on their words (a push still "
+                  "needs Push on a push card); refused, follow its message (a stale card needs a new one) or leave "
+                  "it to the person.")  # t-046 T4
 README_PUSH_CARD = ("**The push card.** Once a task for a listed repository has passed its gate, you have approved the "
                     "card that asks to publish or merge it (the one that lists every Recorded limit), and nothing was "
                     "committed after the gate, the Project Agent may open a push card with `pa-push-main plan "
@@ -878,6 +879,80 @@ class T037Restart(unittest.TestCase):  # t-037 R16: pa-restart is the person's
         text = flat(section(read("runtime", "core", "orchestrator.md"), "## After a restart or a compaction"))
         text = text[:text.index("## Files")]
         self.assertIn("`pa-restart` is the person's: run it only at their word, with `--why` quoting them.", text)
+
+
+def part(raw, start, end):
+    return flat(raw[raw.index(start):raw.index(end)])
+
+
+T046_T1 = ("Every card also takes an answer in the person's own words: the panel offers **Other** under the options, "
+           "and the card is written `\"answer\": \"Other\", \"other\": true` with their words in `\"note\"`. "
+           "Never give a card an option labelled Other. An Other answer is the person's own instruction for that "
+           "question: act on it as written, and on nothing it does not say. Never read it as one of the listed "
+           "options, even when it sounds like one. Read the words on the card; the panel's notice may cut them. When "
+           "they are unclear, ask in chat or open a new card. When they ask for something the card did not ask (a "
+           "push, a publish, a merge, a delete), that needs its own card. No tool acts on an Other answer: a rule "
+           "change, `pa-worktree remove`, `pa-worker close --card` and `pa-push-main run` act only on their own "
+           "option, and say so.")
+T046_T2 = ("The label must be one of the card's options, or `Other` when their words answer the question but pick none "
+           "of them (`pa-decide <card-id> --answer Other --quote \"<their words>\"`), and the quote must be what they "
+           "actually wrote. If their words do not clearly pick an option, ask; do not round a comment up to a "
+           "decision.")
+T046_T3 = ("Say in your reply which cards you closed this way. It also withdraws a card answered Other once their words "
+           "ask for the question again, so the tool that owns it asks again; never any other answered card.")
+T046_T4 = ("When the panel tells you the answer, read the card: pushed, move the task on; answered Other, nothing was "
+           "pushed: act on their words (a push still needs Push on a push card); refused, follow its message (a stale "
+           "card needs a new one) or leave it to the person.")
+T046_T5 = ("Answering the card changes the rule's status for you. Answered Other, the rule stays proposed: act on their "
+           "words; to change what it says, propose a new rule on a new card.")
+T046_T6_LEFTOVERS = ("If the person wrote a note or answered Other, nothing is closed and the card is withdrawn: ask them "
+                     "to say \"keep tNN\" for the ones to keep.")
+T046_T6_WORKTREE = ("Answered Keep: leave it, it is not asked again. Answered Other: nothing is removed; act on their "
+                    "words, and if they ask for it to go, withdraw the card (`pa-decide <card-id> --withdraw`) so the "
+                    "next check asks again.")
+
+
+class T046OtherAnswer(unittest.TestCase):  # t-046 R11 AC1, AC2 (spec section 4, T1-T6; W3)
+    def setUp(self):
+        self.raw = read("runtime", "core", "orchestrator.md")
+        self.cards = part(self.raw, "## Decision cards", "## Rules")
+        self.rules = part(self.raw, "## Rules", "## Workers")
+        self.workers = part(self.raw, "## Workers", "## Phases and gates")
+
+    def test_t1_decision_cards_paragraph(self):
+        self.assertIn("An answer covers exactly the question asked, once. " + T046_T1 + " The person may decide in "
+                      "conversation instead of in the panel.", self.cards)
+
+    def test_t2_pa_decide_other(self):
+        self.assertIn("records their answer. " + T046_T2, self.cards)
+        self.assertNotIn("The label must be one of the card's options and the quote must be what they actually wrote.",
+                         flat(self.raw))
+
+    def test_t3_withdraw_other(self):
+        self.assertIn("`pa-decide <card-id> --withdraw --why \"<reason>\"` closes a card the conversation made moot",
+                      self.cards)
+        self.assertIn(T046_T3, self.cards)
+
+    def test_t4_push_cards(self):
+        self.assertTrue(self.cards.rstrip().endswith(T046_T4), "T4 closes the push paragraph and Decision cards")
+        self.assertNotIn("pushed, move the task on; refused,", flat(self.raw))
+
+    def test_t5_rules(self):
+        self.assertIn(T046_T5, self.rules)
+
+    def test_t6_workers(self):
+        self.assertIn(T046_T6_LEFTOVERS, self.workers)
+        self.assertNotIn("If the person wrote a note, nothing is closed", flat(self.raw))
+        self.assertIn(T046_T6_WORKTREE, self.workers)
+
+    def test_safety_unchanged(self):
+        self.assertEqual(section(self.raw, "## Safety"), ORCHESTRATOR_SAFETY)
+
+    def test_worker_and_sdlc_unchanged(self):  # R11 AC2
+        for name in ("worker.md", "sdlc.md"):
+            text = flat(read("runtime", "core", name))
+            for words in ("answered Other", "--answer Other", "an Other answer", "**Other**"):
+                self.assertNotIn(words, text, name)
 
 
 if __name__ == "__main__":
