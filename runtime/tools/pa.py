@@ -2859,6 +2859,11 @@ def identify_old_launcher(directory, agent):
     argv = term.get("argv")
     if not pa_session_argv(argv, space):
         shown = " ".join(a for a in argv[:4] if isinstance(a, str)) if isinstance(argv, list) else ""
+        if (isinstance(argv, list) and argv and isinstance(argv[0], str) and os.path.basename(argv[0]) == "pa-session"
+                and "--ask" in argv):  # card d-161 'B: keep strict': refused, said plainly
+            raise Problem("cannot end it: its terminal is a space's first tab, started with {!r} (no --space), so it "
+                          "cannot be proven to be this space's launcher; close it by hand if it is the Project Agent "
+                          "(the keeper or the panel's Open then starts a restart-capable one)".format(shown))
         raise Problem("cannot end it: its terminal's program is {!r}, not this space's pa-session; close it by hand "
                       "if it is the Project Agent".format(shown or "unknown"))
     record = read_json_safe(os.path.join(directory, "launcher.json"))
