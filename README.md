@@ -210,11 +210,13 @@ ships none, so without one the figures are tokens only).
   that is its UTC day, marked "(UTC)" beside its date.
 - `pa-costs report [--by KEY] [--json] [--billed] [--utc]` prints the same figures as the Costs view, by
   this terminal's local days (`--since`/`--until` too), or UTC days with `--utc`;
-  `pa-costs report --account-wide` prints the estimates of every space on the machine with the
-  same account label.
+  `--by provider|endpoint|region|account|scope` groups by what each cost was priced under (`--by scope`
+  also says which price scope priced it). `pa-costs report --account-wide [--account LABEL]` prints the
+  estimates of that account label (default: this machine's) from every space on the machine.
 - `pa-costs reconstruct [--dry-run]` finds the space's sessions from before launch records existed,
   best effort, marked `reconstructed` (◌ in the view). The view's `Reconstruct from session files` runs it.
-- `pa-costs prices` shows the table in use and the models seen without a price.
+- `pa-costs prices` shows the table in use, each price scope as a heading, each row's `source`, and the
+  models seen without a price (per provider · endpoint · region · account when there are scopes).
 
 A price table, in the profile:
 ```json
@@ -223,6 +225,49 @@ A price table, in the profile:
 ```
 A model with no price is shown as tokens with `no price`, never as 0.00; a total that leaves part of
 the use unpriced says `+ unpriced`.
+
+**Price scopes** (optional keys, same `v: 1`; older `pa-costs` ignore them and price everything from
+`models`): the same model can cost differently by provider, endpoint kind (`global`, `geo`,
+`regional`, or a profile's own), source region and billable account.
+```json
+{"defaultScope": {"provider": "provider-a", "endpoint": "global", "region": null, "account": null},
+ "models": {"model-a": [{"validFrom": "2026-11-01", "in": 1.0, "out": 5.0, "cw5m": 1.25, "cw1h": 2.0, "cr": 0.1}]},
+ "scoped": [{"provider": "provider-a", "endpoint": "regional", "region": "region-a", "account": null,
+             "models": {"model-a": [{"validFrom": "2026-11-01", "in": 1.1, "out": 5.5, "cw5m": 1.4, "cw1h": 2.2, "cr": 0.11}]}}],
+ "scopedAliases": [{"match": "^model-c-", "model": "model-c"}]}
+```
+`defaultScope` is the scope of the top-level `models` (an older `"defaultProvider": "P"` means provider P,
+any endpoint, region and account; without either, the profile's `pricing.defaultProvider`). A `scoped`
+entry names at least one of the four (null = any); `scopedAliases` point at keys that exist only in
+scoped tables. A cost is priced by the most specific scope that matches its facts (one that names the
+account wins, then the region, then the endpoint, then the provider), from that scope's latest row on or
+before the day; a scope without such a row passes to the next. An unknown provider or endpoint takes the
+default scope's; an unknown region matches only scopes without a region. A cost is never priced from
+another provider's or another endpoint's rows: with no matching row it shows `no price`. The summary,
+`report --json` and the view say for each cost what it was priced under (`pricedAs`).
+
+**What each session records for its price** (labels only, in its launch record and its ledger rows):
+- provider and endpoint from the profile's `pricing.providers` (`{"program", "model": "<regex>",
+  "provider"}`, first match) and `pricing.endpoints` (`{"model": "<regex>", "endpoint"}` on the
+  requested `--model`, or `{"env": "<NAME>", "match", "endpoint"}`); `pricing.endpointPriceAs`
+  (`{"geo": "regional"}`) prices one kind as another;
+- the region from `PA_COST_REGION`, else the first variable named in the profile's `pricing.region`
+  (`{"env": [...], "match": "<regex>"}`) that is set, stored only if it matches, else the machine
+  config's `costs.region`, else unknown;
+- the account from `PA_COST_ACCOUNT`, else the machine config's `costs.accountRules`
+  (`[{"env": "<NAME>", "match": "<regex>", "account": "<label>"}]`: the variable is tested and only the
+  label is stored), else the space's `agent.json` `costs.account`, the machine's `costs.account`, the
+  profile's `billing.account`, `default`.
+A variable's value is never stored unless it is the accepted region label; names that look like
+credentials (`KEY`, `SECRET`, `TOKEN`, `PASSWORD`, `CREDENTIAL`, `SESSION`) are refused and not read,
+and so is any label with 12 digits. `pa-doctor` notes refused rules and values (names only). Sessions
+recorded before this get their provider and endpoint from the same model rules, region unknown, and the
+account from that chain.
+
+The account label of estimates and of billed rows is the same chain: on a machine without
+`costs.account`, a profile's `billing.account` now labels the estimates too (they said `default`
+before), so `billed compare` sets this space's estimates beside the bill of that account, and
+`--account-wide` finds them under that label. Set `costs.account` in the machine config to choose it.
 
 **The Costs view** (Project panel, fourth tab) reads only `costs/summary.json` on the space's machine,
 only while it is shown, at most every 10 s. It shows Total, Today and Last 7 days, then the spend by

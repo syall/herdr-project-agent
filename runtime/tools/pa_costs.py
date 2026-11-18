@@ -115,6 +115,11 @@ def scope_text(scope):
     return " · ".join("*" if v is None else v for v in scope)
 
 
+def facts_text(facts):
+    """'provider · endpoint · region · account' of a row's facts, unknown as '?'."""
+    return " · ".join("?" if v is None else v for v in facts)
+
+
 def load_prices(profile):
     """(table, problem). (None, None) when the profile has no prices.json; (None, why) when it is unusable,
     and then everything is shown as tokens only. Scopes (t-032 A-P1): `defaultScope` (or the older `defaultProvider`,
@@ -1707,6 +1712,15 @@ def account_chain(directory=None):
     return "default", "default"
 
 
+def space_rules(directory):
+    """(rules, problems) of the space's profile's pricing block (t-032); ({}, []) without a profile."""
+    agent = pa.read_json(os.path.join(directory, "agent.json"), {}) or {}
+    try:
+        return pricing_rules(pa.load_profile(agent.get("profile")))
+    except pa.Problem:
+        return None, []
+
+
 def costs_account(directory=None):
     return account_chain(directory)[0]
 
@@ -1848,13 +1862,19 @@ def cc_join(cc, records, sessions, sess_b, since=None, until=None, zone=None):
 
 
 def summarize(directory, rows, records, table, price_problem, profile_name, now, problems=(), cc=None, since=None, until=None,
-              zone=None):
+              zone=None, rules=None):
     """The summary.json object (spec 2.3) for the given ledger rows. cc: Claude Code's figure records (default: read
     costs/cc/); they add cc fields beside est., never to it (t-029 R5). zone: byDay's days (t-036; default UTC); a row
     counts on the day of its start. byDayModel keeps UTC days (the billed rows' days)."""
     zone = zone or UTC_ZONE
     problems = list(problems)
     chain = account_chain(directory)
+    if rules is None:
+        try:
+            rules, rule_problems = pricing_rules(pa.load_profile(profile_name) if profile_name else {})
+        except pa.Problem:
+            rules, rule_problems = None, []
+        problems.extend(p for p in rule_problems if p not in problems)
     if cc is None:
         cc, cc_problems = read_cc(directory)
         problems.extend(cc_problems)
@@ -1874,11 +1894,24 @@ def summarize(directory, rows, records, table, price_problem, profile_name, now,
     cut_utc = set()  # byDay's days holding a row from before the zone table's start (cut in UTC, marked)
     day_act_b = {}  # day -> activity -> Bucket: the day drill's activities with their unpriced part (t-028)
     sess_tasks, sess_split = {}, set()  # the tasks of each session's rows; sessions with a split row
+    fact_b = {f: {} for f in SCOPE_FIELDS}  # t-032: by provider, endpoint, region, account
+    scope_b, scope_info, day_model_as = {}, {}, {}
     hour_floor = iso(now - HOURS * 3600)[:13]
     for r in rows:
         tokens = {k: num(r["tokens"].get(k)) for k in KINDS}
         t = total_tokens(tokens)
-        m = row_money(r, table)
+        sess = sessions.get(r["session"]) or {}
+        rf = row_facts(r, sess, rules, chain)
+        facts = tuple(rf[f] for f in SCOPE_FIELDS)
+        entry, priced_as = (None, None)
+        if table:
+            # a provider or endpoint by default is left to the price file's default scope
+            entry, priced_as = lookup(table, r.get("model"), r.get("from"),
+                                      (None if rf["providerBy"] == "default" else facts[0],
+                                       None if rf["endpointBy"] == "default" else facts[1], facts[2], facts[3]))
+            if rf["providerBy"] == "default" and facts[0] is None:
+                facts = ((table.get("defaultScope") or (None,))[0],) + facts[1:]
+        m = money(r["tokens"] or {}, r.get("long") or {}, entry)
         rec = r.get("source") == "reconstructed"
         calls = num(r.get("calls"))
         if m is None and t:
@@ -1895,8 +1928,7 @@ def summarize(directory, rows, records, table, price_problem, profile_name, now,
         rb_t = rb_tokens["cw5m"] + rb_tokens["cw1h"]
         rb_m = None
         if rb_t:
-            price = price_for(table, r.get("model"), r.get("from"), facts_of(r))
-            rb_m = money(rb_tokens, zero(), price) if m is not None else None
+            rb_m = money(rb_tokens, zero(), entry) if m is not None else None
             group(acts, "cache-rebuild").add(rb_t, rb_m, 0, rec)
         act = r.get("activity") or "unattributed"
         group(acts, act).add(t - rb_t, None if m is None else m - (rb_m or 0), calls, rec)
@@ -1924,7 +1956,16 @@ def summarize(directory, rows, records, table, price_problem, profile_name, now,
             if short(r["session"]) not in task_sessions[key]:
                 task_sessions[key].append(short(r["session"]))
         group(phases, r.get("phase") or "(none)").add(t, m, calls, rec)
-        sess = sessions.get(r["session"]) or {}
+        for f, v in zip(SCOPE_FIELDS, facts):
+            group(fact_b[f], "?" if v is None else v).add(t, m, calls, rec)
+        skey = facts_text(facts)
+        group(scope_b, skey).add(t, m, calls, rec)
+        si = scope_info.setdefault(skey, {"scope": list(facts), "pricedAs": [], "by": {k: rf[k] for k in ("providerBy", "endpointBy", "regionBy", "accountBy")}})
+        if priced_as is not None and priced_as not in si["pricedAs"] and len(si["pricedAs"]) < 4:
+            si["pricedAs"].append(priced_as)
+        for k in list(si["by"]):
+            if si["by"][k] != rf[k]:
+                si["by"][k] = "mixed"
         for dim, value in (("kind", r.get("kind")), ("role", r.get("role")), ("program", r.get("program")),
                            ("model", r.get("model")), ("machine", sess.get("host"))):
             group(dims[dim], value or ("unknown" if dim == "machine" else "(none)")).add(t, m, calls, rec)
@@ -1944,7 +1985,10 @@ def summarize(directory, rows, records, table, price_problem, profile_name, now,
         group(dab, act).add(t - rb_t, None if m is None else m - (rb_m or 0), calls, rec)
         if rb_t:
             group(dab, "cache-rebuild").add(rb_t, rb_m, 0, rec)
-        group(day_model, (utc_day, r.get("model") or "(unknown model)")).add(t, m, calls, rec, tokens)
+        dm_key = (utc_day, r.get("model") or "(unknown model)") + tuple("" if v is None else v for v in facts)
+        group(day_model, dm_key).add(t, m, calls, rec, tokens)
+        if dm_key not in day_model_as or day_model_as[dm_key][1] is None:
+            day_model_as[dm_key] = (facts, priced_as, rf["accountBy"])
         hour = (r.get("from") or "")[:13]
         if hour >= hour_floor:
             group(hours, hour).add(t, m, calls, rec)
@@ -1966,6 +2010,7 @@ def summarize(directory, rows, records, table, price_problem, profile_name, now,
         info["tasks"][r.get("task")] = info["tasks"].get(r.get("task"), 0) + t
         info["role"] = r.get("role") or info["role"]
         info["row"] = r
+        info["facts"], info["pricedAs"] = facts, priced_as
     cc_parts, um_n, um_money = cc_join(cc, records, sessions, sess_b, since, until, zone) if cc else ({}, 0, 0.0)
     cc_money, task_cc = {}, {}
     for sid, parts in cc_parts.items():
@@ -2010,9 +2055,10 @@ def summarize(directory, rows, records, table, price_problem, profile_name, now,
     if day_list[DAYS:]:
         by_day.append(older.out("older", days=len(day_list) - DAYS))
     kept_days = set(sorted(utc_days, reverse=True)[:DAYS])
-    by_day_model = [dict(day=d, model=mod, tokens=b.kinds or zero(), money=round(b.money, 6) if b.priced else None,
-                         **({"unpricedTokens": b.partial()} if b.partial() else {}))
-                    for (d, mod), b in sorted(day_model.items(), reverse=True) if d in kept_days]
+    by_day_model = [dict(day=k[0], model=k[1], tokens=b.kinds or zero(), money=round(b.money, 6) if b.priced else None,
+                         **({"unpricedTokens": b.partial()} if b.partial() else {}),
+                         **dict(zip(SCOPE_FIELDS, day_model_as[k][0])), accountBy=day_model_as[k][2], pricedAs=day_model_as[k][1])
+                    for k, b in sorted(day_model.items(), reverse=True) if k[0] in kept_days]
     sess_list = []
     for sid, b in sess_b.items():
         info, sess = sess_info[sid], sessions.get(sid) or {}
@@ -2021,7 +2067,8 @@ def summarize(directory, rows, records, table, price_problem, profile_name, now,
         entry = b.out(short(sid), kind=r.get("kind"), role=info["role"], program=r.get("program"),
                       task=max(info["tasks"], key=lambda k: info["tasks"][k]),
                       model=max(info["models"], key=lambda k: info["models"][k]), **{"from": info["from"]},
-                      to=info["to"], state=state, source=r.get("source"), match=r.get("match"))
+                      to=info["to"], state=state, source=r.get("source"), match=r.get("match"),
+                      **dict(zip(SCOPE_FIELDS, info["facts"])), pricedAs=info["pricedAs"])
         if sid in cc_money:
             parts = [(rec, cleared) for rec, cleared in cc_parts[sid] if cc_figure(rec) is not None]
             entry["cc"], entry["ccAt"] = round(cc_money[sid], 6), max(rec["at"] for rec, _c in parts)
@@ -2061,6 +2108,9 @@ def summarize(directory, rows, records, table, price_problem, profile_name, now,
         "byDay": by_day,
         "days": dict({"zone": zone["zone"], "offsets": zone["offsets"]}, **({"from": zone["from"]} if zone.get("from") else {})),
         "byDayModel": by_day_model,
+        "byProvider": by_money(fact_b["provider"]), "byEndpoint": by_money(fact_b["endpoint"]),
+        "byRegion": by_money(fact_b["region"]), "byAccount": by_money(fact_b["account"]),
+        "byScope": by_money(scope_b, **scope_info), "scopes": len(scope_b),
         "passes": sorted(({**{k: v for k, v in p.items() if k != "unpricedTokens"},
                            "money": None if p["money"] is None else round(p["money"], 6),
                            **({"unpricedTokens": p["unpricedTokens"]} if p["money"] is not None and p["unpricedTokens"] else {})}
@@ -2177,7 +2227,8 @@ def fmt_tokens(n):
     return str(int(n))
 
 
-REPORT_BY = ("activity", "task", "phase", "kind", "role", "program", "model", "machine", "day", "pass", "session")
+REPORT_BY = ("activity", "task", "phase", "kind", "role", "program", "model", "machine", "day", "pass", "session",
+             "provider", "endpoint", "region", "account", "scope")
 
 
 def report_lines(s, by=None):
@@ -2233,13 +2284,22 @@ def report_lines(s, by=None):
                  ("pass", "Costliest passes", [dict(p, key="pass {} ({})".format(p["pass"], p.get("trigger") or "?") + (" rebuild" if p.get("rebuild") else ""))
                                                for p in s["passes"]], None),
                  ("session", "Sessions", s["sessions"], lambda e: "{} {} {}".format(e["key"], e.get("role") or e.get("kind"), e.get("task") or ""))]
+    sections += [(f, "By " + f, s.get("by" + f.capitalize()) or [], None) for f in SCOPE_FIELDS]
+    sections += [("scope", "By scope (provider · endpoint · region · account)", s.get("byScope") or [], None)]
     for key, title, entries, label in sections:
-        if by is None and key in ("phase", "session", "pass", "program", "machine"):
+        if by is None and key in ("phase", "session", "pass", "program", "machine") + SCOPE_FIELDS:
+            continue
+        if by is None and key == "scope" and len(entries) < 2:
             continue
         if by is not None and key != by:
             continue
         with_cc = bool(cc) and key in ("session", "task")
         table(title, entries, label or (lambda e: str(e["key"])), with_cc, with_cc and key == "session" and p.get("currency") == "USD")
+        if key == "scope":
+            for e in entries:
+                said = ", ".join("{} (from {})".format(scope_text(tuple(None if x == "*" else x for x in a["scope"])), a["validFrom"])
+                                 for a in e.get("pricedAs") or []) or "no price"
+                out.append("  {}: priced as {}".format(e["key"], said))
     if by is None:
         out.append("No price: {}".format(", ".join(p.get("missing") or []) or "(none)"))
         if s.get("unmatched", {}).get("sessions"):
@@ -2252,19 +2312,28 @@ def report_lines(s, by=None):
     return out
 
 
+def entry_account(entry, otherwise):
+    """The account of a byDayModel entry: its own when its launch recorded one (accountBy env or rule), else
+    `otherwise` (the summary's label: an entry labelled by the space's chain follows the space)."""
+    if entry.get("accountBy") in ("env", "rule") and fact_label("account", entry.get("account")):
+        return entry["account"]
+    return otherwise
+
+
 def account_wide_summary(account, now):
     """byDayModel summed over every space on this machine with the same account label (read-only)."""
     root = os.path.join(pa.ROOT, "spaces")
     spaces, merged, unpriced = [], {}, {}
     for name in sorted(os.listdir(root)) if os.path.isdir(root) else []:
         s = pa.read_json(os.path.join(root, name, "costs", "summary.json"), None) if pa.ID.match(name) else None
-        try:
-            if not isinstance(s, dict) or (s.get("account") or "default") != account:
-                continue
-        except ValueError:
+        if not isinstance(s, dict):
+            continue
+        # per entry (t-032 R-A3): the account a launch recorded for it, else the summary's
+        mine = [e for e in s.get("byDayModel") or [] if isinstance(e, dict) and entry_account(e, s.get("account") or "default") == account]
+        if not mine and (s.get("account") or "default") != account:
             continue
         spaces.append(name)
-        for e in s.get("byDayModel") or []:
+        for e in mine:
             m = merged.setdefault((e.get("day"), e.get("model")), {"day": e.get("day"), "model": e.get("model"), "tokens": zero(), "money": None})
             for k in KINDS:
                 m["tokens"][k] += num((e.get("tokens") or {}).get(k))
@@ -2281,11 +2350,14 @@ def account_wide_summary(account, now):
             "byDayModel": [merged[k] for k in sorted(merged, key=lambda k: (k[0] or "", k[1] or ""), reverse=True)]}
 
 
-def report(directory, by=None, since=None, until=None, as_json=False, account_wide=False, billed=False, now=None, utc=False):
+def report(directory, by=None, since=None, until=None, as_json=False, account_wide=False, billed=False, now=None, utc=False,
+           account=None):
     """The space's costs; days are the terminal's local days (t-036), or UTC days with utc."""
     now = time.time() if now is None else now
     if account_wide:
-        print(json.dumps(account_wide_summary(costs_account(), now), indent=2))
+        if account is not None and fact_label("account", account) is None:
+            raise pa.Problem("--account is a label (letters, digits, . _ -), never an account number")
+        print(json.dumps(account_wide_summary(account or costs_account(), now), indent=2))
         return 0
     for d in (since, until):
         if d is not None and not DATE.match(d):
@@ -2811,6 +2883,8 @@ def billing_comparison(billed, space, here, table):
         out, unpriced = {}, set()
         for e in summary.get("byDayModel") or []:
             if e.get("day") not in covered:
+                continue
+            if entry_account(e, account) != account:  # R-A5: never another account's estimate
                 continue
             key = model_key(table, e.get("model")) or e.get("model")
             if e.get("money") is not None:
@@ -3670,22 +3744,61 @@ def space_directory(explicit):
 
 def cmd_prices(directory):
     table, problem, name = space_prices(directory)
+    rules, rule_problems = space_rules(directory)
     if problem:
         print(problem)
-    for warning in (table or {}).get("warnings") or []:
+    for warning in ((table or {}).get("warnings") or []) + rule_problems:
         print(warning)
+
+    def rows_of(models):
+        for model, entries in sorted(models.items()):
+            for e in entries:
+                fetched = e.get("fetched") if isinstance(e.get("fetched"), dict) else {}
+                prov = "  source {}".format(str(e["source"])[:120]) if isinstance(e.get("source"), str) else ""
+                if fetched.get("publicationDate"):
+                    prov += "  published {}".format(str(fetched["publicationDate"])[:40])
+                print("  {:<24} from {}  ".format(model, e["validFrom"]) + "  ".join(
+                    "{} {}".format(k, "—" if e.get(k) is None else e.get(k, 0)) for k in KINDS) + ("  (long above {})".format(
+                        e["long"].get("above")) if e.get("long") else "") + prov)
+
+    def heading(scope):
+        return "provider {} · endpoint {} · region {} · account {}".format(*("*" if v is None else v for v in scope))
     if not table:
         print("No price table in profile {}: tokens only.".format(name))
     else:
         print("Profile {}: {} per 1M tokens, source {}, as of {}".format(name, table["currency"], table.get("source"), table.get("asOf")))
-        for model, entries in sorted(table["models"].items()):
-            for e in entries:
-                print("  {:<24} from {}  ".format(model, e["validFrom"]) + "  ".join(
-                    "{} {}".format(k, "—" if e.get(k) is None else e.get(k, 0)) for k in KINDS) + ("  (long above {})".format(
-                        e["long"].get("above")) if e.get("long") else ""))
-    seen = sorted({r.get("model") for r in ledger_rows(directory) if r.get("model")})
-    unpriced = [m for m in seen if model_key(table, m) is None]
-    print("Models seen without a price: {}".format(", ".join(unpriced) or "(none)"))
+        d = table.get("defaultScope") or (None, None, None, None)
+        if table.get("fileDefault"):
+            print("default scope: " + heading(d))
+        else:
+            print("default scope: provider {} · any endpoint, any region, any account (the file has no defaultScope)".format(d[0] or "?"))
+        rows_of(table["models"])
+        for e in table.get("scoped") or []:
+            print(heading(e["scope"]))
+            rows_of(e["models"])
+        if table.get("scoped"):
+            print("Note: scoped prices are ignored by pa-costs from before t-032 (it prices everything from the default scope).")
+        if rules and rules.get("providers") and not rules.get("defaultProvider") and not (table.get("defaultScope") or (None,))[0]:
+            print("Note: the profile has provider rules but no pricing.defaultProvider: rows with a provider are priced only by scopes that name it.")
+    records, _bad = read_lines(os.path.join(costs_dir(directory), "sessions.jsonl"))
+    sessions, chain = sessions_of(records), account_chain(directory)
+    unpriced, by_facts = set(), {}
+    for r in ledger_rows(directory):
+        if not r.get("model"):
+            continue
+        rf = row_facts(r, sessions.get(r.get("session")) or {}, rules, chain)
+        facts = tuple(rf[f] for f in SCOPE_FIELDS)
+        entry = None
+        if table:
+            entry = lookup(table, r["model"], r.get("from"), (None if rf["providerBy"] == "default" else facts[0],
+                                                              None if rf["endpointBy"] == "default" else facts[1], facts[2], facts[3]))[0]
+        if entry is None:
+            unpriced.add(r["model"])
+            by_facts.setdefault(facts_text(facts), set()).add(r["model"])
+    print("Models seen without a price: {}".format(", ".join(sorted(unpriced)) or "(none)"))
+    if table and (table.get("scoped") or len(by_facts) > 1):
+        for key in sorted(by_facts):
+            print("  under {}: {}".format(key, ", ".join(sorted(by_facts[key]))))
     return 0
 
 
@@ -3708,6 +3821,7 @@ def main(argv=None):
     r.add_argument("--billed", action="store_true", help="add the comparison with billed amounts")
     r.add_argument("--account-wide", action="store_true", help="byDayModel of every space here with the same account")
     r.add_argument("--utc", action="store_true", help="UTC days (default: this terminal's local days)")
+    r.add_argument("--account", help="with --account-wide: this account label (default: this machine's)")
     x = sub.add_parser("reconstruct", help="find and bind the space's sessions from before launch records")
     x.add_argument("--space")
     x.add_argument("--dry-run", action="store_true")
@@ -3730,7 +3844,7 @@ def main(argv=None):
         return 0
     if args.cmd == "report":
         if args.account_wide:
-            return report(None, account_wide=True)
+            return report(None, account_wide=True, account=args.account)
         return report(space_directory(args.space), by=args.by, since=args.since, until=args.until, as_json=args.json, billed=args.billed,
                       utc=args.utc)
     if args.cmd == "reconstruct":
