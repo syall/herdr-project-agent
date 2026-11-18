@@ -1141,7 +1141,8 @@ def open_worktree_card(directory, row, facts, profile, owner, rule, gone, desc=N
         pass
     squash = (" " + SQUASH if any(c["merged"] is False for r in desc["repos"] for c in r["commits"]) else "")
     titles = ", ".join('{} "{}"'.format(clean(t), cut(clean(row["titles"].get(t, "")), 60)) for t in row.get("counted") or row["tasks"])
-    pa.write_json(card_path(directory, task, job, main), {
+    path = card_path(directory, task, job, main)
+    pa.write_json(path, dict(carried(pa.read_json(path)), **{
         "id": cid, "task": task, "worktree": row["path"], "job": job, "main": main, "rule": rule, "tasks": row_tasks(row),
         "question": "Delete the worktree for {}{}?".format(titles, ", job {}".format(clean(job)) if named else ""),
         "context": card_context(desc, row, facts, gone, extra, md_file),
@@ -1157,8 +1158,19 @@ def open_worktree_card(directory, row, facts, profile, owner, rule, gone, desc=N
                      "heads": {r["path"]: r["head"] for r in desc["repos"] if r.get("head")},
                      "uncommittedFiles": {r["path"]: [u["path"] for u in r["uncommitted"]] for r in desc["repos"]
                                           if r.get("head") and r["uncommittedTotal"] == len(r["uncommitted"])}},
-        "created": pa.now(), "answered": None})
+        "created": pa.now(), "answered": None}))
     print("{}: opened card {} (recommends {})".format(task, cid, "Keep" if dirty else "Delete"))
+
+
+CARRIED = ("previousAnswer", "previousNote", "previousAnswered")
+
+
+def carried(old):
+    """What a card asked again keeps of the withdrawn card it replaces: the answer, the person's words and when they
+    were given, so the person and the Project Agent see what was said (t-046 J1b). Nothing from any other card."""
+    if not isinstance(old, dict) or old.get("status") != "withdrawn" or old.get("previousAnswer") is None:
+        return {}
+    return {k: old[k] for k in CARRIED if old.get(k) is not None}
 
 
 def remove_command(task, job, main):
@@ -2029,7 +2041,8 @@ def close_leftovers(directory, agent, profile, dry_run):
         ledger = read_ledger(directory)
         opened = bool(on_card) and not os.path.exists(path)
         if opened:
-            pa.write_json(path, {
+            before = carried(pa.read_json(os.path.join(directory, "decisions", last_id + ".json")) if policy and last_id else None)
+            pa.write_json(path, dict(dict(before, previousCard=last_id) if before else {}, **{
                 "id": card_id, "kind": "leftovers", "task": None,
                 "question": "Close the {} worker(s) left from before one-worker-per-job that are listed here?".format(len(on_card)),
                 "context": context,
@@ -2039,7 +2052,7 @@ def close_leftovers(directory, agent, profile, dry_run):
                              "Worktrees, branches, tasks and evidence stay.".format(card_id)},
                             {"label": CLOSE_NONE, "detail": "Leave them. The agent closes each later, once it has read its report."}],
                 "evidence": [], "recommendation": None, "status": "open", "answer": None, "note": None,
-                "workers": on_card, "more": len(listed) - len(on_card), "notListed": held, "created": pa.now(), "answered": None})
+                "workers": on_card, "more": len(listed) - len(on_card), "notListed": held, "created": pa.now(), "answered": None}))
         ledger["workerPolicy"] = dict(policy or {"style": "per-job", "since": pa.now()},
                                       card=card_id if opened else (policy or {}).get("card"), cards=cards + ([card_id] if opened else []))
         pa.write_json(os.path.join(directory, "ledger.json"), ledger)
@@ -2075,8 +2088,8 @@ def leftovers_card(directory, card_id):
     if pa.is_other(card):
         # The person's own words are never parsed, as a note: close nothing, withdraw, and the next sweep asks again.
         words = cut(clean(card.get("note")), 200)
-        card.update(status="withdrawn", previousAnswer=pa.OTHER, previousNote=card.get("note"), answer=None,
-                    answeredBy="pa-worker close: withdrawn", withdrawnAt=pa.now())
+        card.update(status="withdrawn", previousAnswer=pa.OTHER, previousNote=card.get("note"), previousAnswered=card.get("answered"),
+                    answer=None, answeredBy="pa-worker close: withdrawn", withdrawnAt=pa.now())
         card.pop("other", None)
         pa.write_json(os.path.join(directory, "decisions", card_id + ".json"), card)
         append_journal(directory, {"by": "agent" if by_an_agent() else "person", "trigger": "leftovers",

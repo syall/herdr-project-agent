@@ -1879,6 +1879,12 @@ def is_other(card):
     return isinstance(card, dict) and (card.get("other") is True or str(card.get("answer") or "").strip().lower() == "other")
 
 
+def words_cut(text, limit=200):
+    """The person's words on one line, cut at `limit` characters for a journal line; the card keeps them whole."""
+    text = " ".join(str(text or "").split())
+    return text if len(text) <= limit else text[:limit - 1] + "… (the rest is on the card)"
+
+
 def push_card_lock(directory):
     """The space's push lock (<space>/.push.lock, as pa_push.push_lock takes it): every write of a push card holds
     it, so pa-decide never writes one while pa-push-main runs. Returns the open file; close it to unlock."""
@@ -1928,7 +1934,7 @@ def decide_card(directory, path, args):
             raise Problem("--withdraw needs --why \"<reason>\"")
         if withdraw_other:
             # Their words asked for the question again: the tool that owns the card asks again; the words are kept.
-            card.update(previousAnswer=OTHER, previousNote=card.get("note"))
+            card.update(previousAnswer=OTHER, previousNote=card.get("note"), previousAnswered=card.get("answered"))
             card.pop("other", None)
         card.update(status="withdrawn", answer=None, note=args.why.strip(), answered=stamp, answeredBy="orchestrator: withdrawn")
         what = "withdrawn"
@@ -1973,7 +1979,8 @@ def decide_card(directory, path, args):
     write_json(path, card)
     with open(os.path.join(directory, "journal.jsonl"), "a") as journal:
         journal.write(json.dumps({"at": stamp, "by": "orchestrator", "trigger": "conversation", "task": card.get("task"), "decision": args.card,
-                                  "why": "{}: {}".format(what, card["note"])}) + "\n")
+                                  "why": "{}{}: {}".format(what, ' (was Other: "{}")'.format(words_cut(card["previousNote"])) if withdraw_other else "",
+                                                           card["note"])}) + "\n")
     print("{} {} ({}).".format(args.card, what, card["answeredBy"]))
     if after:
         print(after)
