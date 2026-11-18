@@ -142,6 +142,54 @@ class Orchestrator(unittest.TestCase):
         self.assertIn("the full list is in `WORKTREE.md` in the task's evidence folder", self.text)
         self.assertNotIn("Worktrees outlive idle and finished workers", self.text)
 
+    def test_t020_worktrees_ledger_and_record_at_creation(self):  # t-020 R8 AC8.1, AC8.2 (plan J5)
+        self.assertIn('"worktree": "<path or null>",\n'
+                      '    "worktrees": [ { "path": "<path>", "job": "main", "created": "<UTC time>" } ],\n'
+                      '    "evidence": "evidence/t-003",\n', self.raw)
+        self.assertIn("`evidence` is relative to the state folder (the folder can move when a space is reopened). "
+                      "`worktrees` lists every worktree the task uses, each with the job it was made for (a short slug, "
+                      "unique in the task); `worktree` is the first of them. Mark an entry `\"removed\": \"<UTC time>\"` "
+                      "once its worktree is removed, and `\"keep\": true` to keep that one whatever happens. A worker's "
+                      "`worktree` is the folder it was started in.", self.text)
+        self.assertIn("- One git worktree per job. Record it in the task's `worktrees` with its job in the same ledger "
+                      "write as creating it, before starting a worker in it, and record the worker's `worktree` (its "
+                      "`--cwd`) in its entry. A task's `extraWorktrees` list is the old form: rewrite it as `worktrees` "
+                      "entries the next time you write that task. Parallel workers only when they touch different files.",
+                      self.text)
+        self.assertNotIn("One git worktree per code task", self.text)
+
+    def test_t020_two_offer_rules(self):  # t-020 R8 AC8.3 (R2, R3, R6), plan J5
+        workers = part(self.raw, "## Workers", "## Phases and gates")
+        self.assertIn(
+            "- Worktrees outlive their workers: a task's worktrees stay while its workers come and go. Each pass, run "
+            "`pa-worktree check --open-cards`. It opens a Delete/Keep card for each recorded worktree whose job is over: "
+            "`d-wt-<task>` for the task's main worktree, `d-wt-<task>-<job>` for any other. Only when every task using a "
+            "worktree is done or parked, and no worker or other terminal is working in it, is it offered whatever its "
+            "commits are. While a task is still in progress, a worktree of it is offered only when every repository in "
+            "it has commits, all of them merged into the main branch, nothing is uncommitted and no terminal is working "
+            "in it; a new commit, file or terminal withdraws that card. Each card says what is in it (tasks, job, branch, "
+            "commits and whether they are merged or pushed, files changed, anything uncommitted) and what deleting would "
+            "cost; the full list is in `WORKTREE.md` in the task's evidence folder (`WORKTREE-<job>.md` for a job's "
+            "card). When that card is answered Delete, run `pa-worktree remove <task-id>` (add `--job <job>` for a job's "
+            "card); it also removes the empty folder the worktree leaves. Then mark that entry `removed`, set the task's "
+            "`worktree` to null if it was that one, and journal it. " + T046_T6_WORKTREE + " If the person says to keep a "
+            "worktree whatever happens, set `\"keep\": true` on its entry, or `\"keepWorktree\": true` on the task for "
+            "all of them. Never remove a worktree or delete a branch any other way; the tool refuses without the card. "
+            "- Worktrees no task records:", workers)
+        self.assertNotIn("does the person get asked", workers)
+        self.assertNotIn("then set the task's `worktree` to null and journal it", workers)
+
+    def test_t020_unrecorded_card(self):  # t-020 R8 AC8.3 (R4, R5), plan J5; J4 review RL-R4
+        workers = part(self.raw, "## Workers", "## Phases and gates")
+        self.assertIn(
+            "- Worktrees no task records: `pa-worktree check --open-cards` lists them on one card, "
+            "`d-wt-unrecorded-<n>`, with the task each seems to belong to. It is answered by recording or by leaving "
+            "them alone, never by deleting: for each one the person records, add a `worktrees` entry to that task with "
+            "the job they gave or the guessed one, and nothing else; the ones they leave are not listed again. A "
+            "worktree whose name starts with no task id is the person's: it is only counted, never on a card, never "
+            "touched.", workers)
+        self.assertTrue(workers.rstrip().endswith("never on a card, never touched."), "the unrecorded bullet ends Workers")
+
     def test_r5_first_pass_leftovers(self):  # AC5.4, as changed by the person on card d-031
         self.assertIn("on the first pass where the ledger has no `workerPolicy`, run `pa-worker close --leftovers`. It closes nothing", self.text)
         self.assertIn("puts that list on one decision card (`d-leftovers`", self.text)
