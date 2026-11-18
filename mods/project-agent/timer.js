@@ -82,7 +82,7 @@ export async function patchJson(path, machine, change, fallback, timerCx = null)
   if (gaveUp(text)) throw new Error(`${path.split("/").pop()} did not answer`);
   const value = text === null ? fallback : parse(text);
   if (!value) throw new Error(`${path.split("/").pop()} is not valid JSON; fix it by hand.`);
-  await replaceFile(path, `${JSON.stringify(change({ ...value }), null, 2)}\n`, text, machine);
+  await replaceFile(path, `${JSON.stringify(change({ ...value }), null, 2)}\n`, text, machine, timerCx); // keyed and capped with the timer's cx (round 2)
 }
 
 // A notification for each decision card that is new and open, for every Project Agent (not only
@@ -109,9 +109,12 @@ async function announceCards(agent, timerCx) {
   setShared("project-agent.cards", all);
 }
 
+const STAMPED = ["pass-request.json", "schedule.json"];
 async function tickOne(agent, now, timerCx) {
   await announceCards(agent, timerCx).catch(() => {});
   if (!agent.alive) return; // no launcher known to run there: nothing is typed into that terminal
+  // A stamp write of this agent given up and still pending (round 2): it may still land, so no pass until it settles.
+  if (timerCx?.host && STAMPED.some((f) => timerCx.host.busy(`${timerCx.origin}:write:${agent.machine ?? ""}:${agent.dir}/${f}`))) return;
   const busy = agent.status === "working" || agent.status === "blocked";
   const texts = await Promise.all(["schedule.json", "ledger.json", "pass-request.json"].map((f) => capped(timerCx, () => read(`${agent.dir}/${f}`, { on: agent.machine }), { key: `read:${agent.machine ?? ""}:${agent.dir}/${f}`, what: `the ${f} read` })));
   if (texts.some(gaveUp)) return; // did not answer: the next tick tries again

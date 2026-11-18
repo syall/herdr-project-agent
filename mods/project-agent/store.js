@@ -368,13 +368,19 @@ os.replace(tmp, path)
 `;
 
 // Replaces a file only if it still reads `expected` (null: it must not exist yet, here only).
-export async function replaceFile(path, text, expected, on) {
+// cx (t-053 round 2, the timer's): the write is keyed `write:<machine>:<path>` and given up after WRITE_LIMIT, never
+// skipped (a write is not a background read); a give-up throws. Without cx: as before (clicks, the keeper).
+export const WRITE_LIMIT = 20000 + GRACE;
+export async function replaceFile(path, text, expected, on, cx = null) {
+  const name = path.split("/").pop();
+  const opts = { key: `write:${on ?? ""}:${path}`, limit: WRITE_LIMIT, what: `the ${name} write` }, wcx = cx ? { ...cx, background: false, wait: false } : null;
+  const given = (v) => { if (gaveUp(v)) throw new Error(v.busy ? `an earlier ${name} write is still waiting` : v.refused ? `the ${name} write was refused (too many calls waiting)` : `the ${name} write did not answer`); return v; };
   if (!on) {
-    try { await write(path, text, expected); }
+    try { given(await capped(wcx, () => write(path, text, expected), opts)); }
     catch (e) { throw new Error(/stale|match|changed/i.test(String(e.message ?? e)) ? "The file changed on disk while you were editing; reloaded, try again." : String(e.message ?? e)); }
     return;
   }
-  const r = await run("python3", ["-c", REMOTE_WRITE, path, expected ?? "", text], { on, timeout: 20000 });
+  const r = given(await capped(wcx, () => run("python3", ["-c", REMOTE_WRITE, path, expected ?? "", text], { on, timeout: 20000 }), opts));
   if (r.code !== 0) throw new Error(r.code === 3 ? "The file changed on disk while you were editing; reloaded, try again." : r.stderr || "Could not write the file.");
 }
 

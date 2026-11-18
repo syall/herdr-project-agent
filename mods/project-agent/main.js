@@ -367,7 +367,7 @@ export default class ProjectAgent extends View {
       // Given up with its card fallback skipped (no result), or a newer load of this space has committed.
       if (!((cards === null && !wasCurrent) || token < (this.committed[space.id] ?? 0))) this.commit(space, token, data, cards, rules, cx, missed, Boolean(cardsOut.busy));
       if (wasCurrent && this.again[space.id]) { delete this.again[space.id]; if (shown()) this.reload(cx); }
-    }, { what: "the panel's load" });
+    }, { what: "the panel's load", background });
     if (!started) { if (current()) delete this.loads[space.id]; this.showRefusal(space, cx); }
   }
 
