@@ -684,6 +684,44 @@ class ProfileReload(Base):
                 self.assertIsNotNone(self.ours(first))
                 self.assertEqual(self.masked(first), self.masked(second))
 
+    def test_r2_value_the_exec_refuses_keeps_the_one_in_hand(self):
+        # Round 3 (check round 2 M1): the command line builds, but an element is not a str or holds a NUL byte, so
+        # the exec would raise TypeError / ValueError. Each shape on the restart and on the resume path.
+        def set_model(value):
+            return lambda v: v["models"].update(orchestrator=value)
+        cases = {"models.orchestrator a number": set_model(5),
+                 "models.orchestrator a list": set_model(["m"]),
+                 "models.orchestrator an object": set_model({"a": 1}),
+                 "models.orchestrator a bool": set_model(True),
+                 "models.orchestrator with NUL": set_model("a\0b"),
+                 "claude argument with NUL": lambda v: v.update(claude=["true", "a\0b"]),
+                 "changeRequest.name with NUL": lambda v: v.update(changeRequest={"name": "a\0"}),
+                 "ci with NUL": lambda v: v.update(ci=["a\0"])}
+        def launches(path, change):
+            self.fresh_agent()
+            dump(self.good_profile(), os.path.join(self.prof, "profile.json"))
+
+            def between():
+                v = self.good_profile()
+                change(v)
+                dump(v, os.path.join(self.prof, "profile.json"))
+                if path == "resume":
+                    agent = load(os.path.join(self.dir, "agent.json"))
+                    agent["sessionStarted"] = True
+                    dump(agent, os.path.join(self.dir, "agent.json"))
+            return self.two_launches(between)
+        for path in ("restart", "resume"):
+            # The first profile's command on this path: the second launch when the profile is left unchanged.
+            expected = self.masked(launches(path, lambda v: None)[1])
+            self.assertEqual("--resume" in expected, path == "resume")
+            for name, change in cases.items():
+                with self.subTest(name, path=path):
+                    first, second = launches(path, change)
+                    self.assertIn("model-a", first)
+                    bad = [a for a in second if not isinstance(a, str) or "\0" in a]
+                    self.assertEqual(bad, [], "the exec would refuse the second launch")
+                    self.assertEqual(self.masked(second), expected)
+
     def test_r1_model_change_between_launches_is_picked_up(self):
         dump(self.good_profile(), os.path.join(self.prof, "profile.json"))
 
