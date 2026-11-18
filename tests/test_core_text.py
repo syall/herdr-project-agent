@@ -797,7 +797,8 @@ class T041DiskState(unittest.TestCase):  # t-041 J2: R7, R8, R9 (text), R10 (AC1
                       "compacted at any time, and the launcher can start you in a fresh context. Either way, what "
                       "you remember may be wrong or gone.", restart)
         line = ("A fresh context counts as a restart: continue without asking exactly as after a restart, and "
-                "take each task's next step from its `next` and the journal.")
+                "take each task's next step from its `next` and the journal, and the person's standing words from "
+                "`standing.md`.")
         self.assertIn(line, restart)
         self.assertLess(restart.index("those still wait for them."), restart.index(line))
         self.assertLess(restart.index(line), restart.index("After a restart or a compaction, continue where"))
@@ -820,6 +821,21 @@ class T041DiskState(unittest.TestCase):  # t-041 J2: R7, R8, R9 (text), R10 (AC1
         a, b, c = (self.raw.index(h) for h in ("## After a restart or a compaction", "## What must be on disk", "## Files"))
         self.assertLess(a, b)
         self.assertLess(b, c)
+
+    def test_tc9_standing_read_back(self):  # REVIEW J2 MF-J2-1, VERIFY J2 RL-V1
+        p = self.part("## The pass", "## After a restart or a compaction")
+        self.assertIn("1. Read `ledger.json`, `rules.json` (only `active` rules apply, highest `order` first), "
+                      "`standing.md`, every decision in `decisions/` whose status changed, and the new messages.", p)
+        restart = self.part("## After a restart or a compaction", "## What must be on disk")
+        self.assertIn("Before anything else: run `pa-doctor`, read the ledger, `standing.md`, the last 30 journal "
+                      "lines and the open decisions, and run `hc ls` to see which workers still exist.", restart)
+        rule = ("The person's words in `standing.md` stand as they said them; a standing quote never answers a card, "
+                "never approves a rule, and never stands in for an explicit yes to anything irreversible or "
+                "outward-facing.")
+        self.assertIn(rule, restart)
+        self.assertLess(restart.index("to see which workers still exist."), restart.index(rule))
+        self.assertIn("and the person's standing words from `standing.md`.", restart)
+        self.assertEqual(ORCHESTRATOR_SAFETY, section(self.raw, "## Safety"))
 
     def test_tc8_pass_writes_the_checkpoint(self):  # R7
         p = self.part("## The pass", "## After a restart or a compaction")
