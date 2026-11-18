@@ -5,10 +5,12 @@ Run: python3 -m unittest -v tests/test_pa_queue.py
 Every case runs in scratch repositories under a mkdtemp folder and a fake space (tests/queue_fixtures.py).
 """
 import fcntl
+import importlib.util
 import json
 import os
 import subprocess
 import sys
+import types
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -775,20 +777,98 @@ class Q22Install(unittest.TestCase):
         self.assertIn("runtime/tools/pa_queue.py", line)
 
 
+def load_pa_suite():
+    """runtime/tools/pa_suite.py as pa-full-suite loads it (pa_hooks.cmd_full_suite): its own module, given pa."""
+    spec = importlib.util.spec_from_file_location("pa_suite", os.path.join(TOOLS, "pa_suite.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    module.pa = pa
+    return module
+
+
+pa_suite = load_pa_suite()
+
+
+def t056_suite(test, tid, code, moved=False, untracked=None):
+    """One suites.jsonl line as t-056's pa-full-suite writes it (pa_suite.full_suite): pins taken by pa_suite.pins,
+    the extra keys run/start/end/waited/load/parts, `moved: true` when the worktree changed during the run, written by
+    pa_hooks.suite_record. untracked overrides the count pins found (the files themselves are not made)."""
+    h = types.SimpleNamespace(**vars(pa_hooks))
+    found = pa_suite.pins(h, test.trees[tid])
+    if untracked is not None:
+        found = [dict(p, untracked=untracked) for p in found]
+    extra = {"run": "r" * 12, "start": "2026-11-18T10:00:00Z", "end": "2026-11-18T10:00:10Z", "waited": 0.0,
+             "load": None, "parts": pa_suite.parse_parts("  unit: ok (10s)\n")}
+    if moved:
+        extra["moved"] = True
+    pa_hooks.suite_record(test.dir, {"task": tid, "root": test.trees[tid]}, "full", code, 10.0, found, extra)
+
+
 class V8SuiteRuns(QBase):
     def test_suite_runs_reads_both_shapes(self):
+        """J1's line and t-056's real line (pa_suite.full_suite's keys: start/end, parts {name, ok, seconds},
+        untracked, moved) come out in one shape; the t-056 times are its own start and end."""
+        self.task("t-A", [("fa.txt", "a\n")])
         os.makedirs(os.path.join(self.dir, "content"), exist_ok=True)
         j1 = {"at": "2026-11-18T10:00:10Z", "task": "t-A", "worker": "t1", "repo": "/r", "commit": "c", "tree": "t",
               "uncommitted": 0, "exit": 0, "seconds": 10.0, "command": "x"}
-        t056 = dict(j1, kind="suite", started="2026-11-18T10:00:00Z", ended="2026-11-18T10:00:10Z",
-                    parts=[{"name": "unit", "started": "2026-11-18T10:00:00Z", "ended": "2026-11-18T10:00:10Z", "seconds": 10.0, "exit": 0}])
-        write(os.path.join(self.dir, "content", "suites.jsonl"), json.dumps(j1) + "\n" + json.dumps(t056) + "\nnot json\n")
+        write(os.path.join(self.dir, "content", "suites.jsonl"), json.dumps(j1) + "\nnot json\n")
+        t056_suite(self, "t-A", 0)
+        t056_suite(self, "t-A", 0, moved=True)
+        t056_suite(self, "t-A", 0, untracked=2)
+        lines = [json.loads(l) for l in read(os.path.join(self.dir, "content", "suites.jsonl")).splitlines()[2:]]
+        self.assertIn("start", lines[0])
+        self.assertNotIn("started", lines[0])
         runs = pa_hooks.suite_runs(self.dir)
-        self.assertEqual(len(runs), 2)
-        keys = ("kind", "task", "tree", "exit", "uncommitted", "started", "ended", "seconds")
-        self.assertEqual([runs[0][k] for k in keys], [runs[1][k] for k in keys])
+        self.assertEqual(len(runs), 4)
+        self.assertEqual([r["started"] for r in runs], ["2026-11-18T10:00:00Z"] * 4)
+        self.assertEqual([r["ended"] for r in runs], ["2026-11-18T10:00:10Z"] * 4)
+        self.assertEqual([r["seconds"] for r in runs], [10.0] * 4)
         self.assertIsNone(runs[0]["parts"])
-        self.assertEqual(len(runs[1]["parts"]), 1)
+        self.assertEqual(runs[1]["parts"], [{"name": "unit", "ok": True, "seconds": 10}])
+        self.assertEqual([r["moved"] for r in runs], [False, False, True, False])
+        self.assertEqual([r["untracked"] for r in runs], [None, 0, 0, 2])
+        self.assertEqual([r["reusable"] for r in runs], [True, True, False, False])
+
+
+class Q24NonReusableSuite(QBase):
+    """Short review J2 MF-1: a t-056 run marked moved (or with untracked files) is never a pass for its tree."""
+
+    def setUp(self):
+        super().setUp()
+        self.task("t-A", [("fa.txt", "a\n")])
+        self.add("t-A")
+
+    def refresh(self):
+        code, out, err = self.queue("refresh", "--repo", self.proj)
+        self.assertEqual(code, 0, out + err)
+        return self.queue("show", "--repo", self.proj)[1]
+
+    def test_q24a_moved_run_is_not_the_trees_pass(self):
+        t056_suite(self, "t-A", 0, moved=True)
+        out = self.refresh()
+        self.assertEqual(self.entry("t-A")["state"], "checking")
+        self.assertNotIn("mergeable: t-A\n", out)
+        t056_suite(self, "t-A", 0)
+        out = self.refresh()
+        self.assertEqual(self.entry("t-A")["state"], "passed")
+        self.assertIn("mergeable: t-A\n", out)
+
+    def test_q24b_run_with_untracked_files_is_not_the_trees_pass(self):
+        t056_suite(self, "t-A", 0, untracked=2)
+        self.refresh()
+        self.assertEqual(self.entry("t-A")["state"], "checking")
+
+    def test_q24c_moved_failing_run_does_not_fail_the_entry(self):
+        """A moved run did not run on this tree throughout: its exit says nothing about the tree either way."""
+        t056_suite(self, "t-A", 3, moved=True)
+        self.refresh()
+        self.assertEqual(self.entry("t-A")["state"], "checking")
+
+    def test_q24d_clean_t056_run_passes(self):
+        t056_suite(self, "t-A", 0)
+        self.refresh()
+        self.assertEqual(self.entry("t-A")["state"], "passed")
 
 
 if __name__ == "__main__":
