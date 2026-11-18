@@ -165,6 +165,13 @@ class Base(unittest.TestCase):
             return [json.loads(l) for l in f if l.strip()]
 
 
+class W0Parse(unittest.TestCase):
+    def test_w0_pa_suite_parses_as_python_37(self):  # run-all.sh's parse part lists its files by name (other tests pin it)
+        import ast
+        with open(os.path.join(TOOLS, "pa_suite.py")) as f:
+            ast.parse(f.read(), feature_version=(3, 7))
+
+
 class W1Record(Base):
     def test_w1a_parts_parse_from_the_summary_list(self):
         self.assertEqual(pa_suite.parse_parts(SUMMARY), [
