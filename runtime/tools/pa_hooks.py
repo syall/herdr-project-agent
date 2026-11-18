@@ -1797,6 +1797,255 @@ def remove_command(task, job, main):
     return "pa-worktree remove {}{}".format(task, "" if main else " --job " + job)
 
 
+# ---- worktrees no task records (t-020 J4, spec R4, R5) ---------------------------------------------
+# Found only under the scanned `worktrees` folders, listed once on a card d-wt-unrecorded-<n>, never deleted.
+
+UNRECORDED_CAP = 20  # worktrees described and listed on one card; the rest go on the next one
+UNRECORDED = "d-wt-unrecorded-"
+
+
+def scan_folders(agent, rows):
+    """The folders pa-worktree check looks in for worktrees no task records: <project>/worktrees (project from
+    agent.json), and each folder named `worktrees` that is the parent or grandparent of a recorded worktree (how a
+    workspace's own worktrees folder comes in). Realpaths of existing folders, the project's first, no repeats."""
+    found = []
+    project = agent.get("project") if isinstance(agent.get("project"), str) and agent.get("project").strip() else None
+    if project:
+        found.append(os.path.join(os.path.expanduser(project), "worktrees"))
+    for row in sorted(rows.values(), key=lambda r: r["path"]):
+        for path in (row.get("given") or row["path"], row["path"]):
+            parent = os.path.dirname(os.path.normpath(os.path.expanduser(str(path))))
+            for folder in (parent, os.path.dirname(parent)):
+                if os.path.basename(folder) == "worktrees":
+                    found.append(folder)
+                    break
+    out = []
+    for folder in found:
+        real = os.path.realpath(folder)
+        if os.path.isdir(real) and real not in out:
+            out.append(real)
+    return out
+
+
+def recorded_paths(directory, agent):
+    """(paths, unreadable): every worktree path any task records (removed entries too) in this space and in every space
+    under pa.ROOT/spaces whose agent.json names the same project folder; unreadable: [(space, why)] for a same-project
+    space whose ledger cannot be read (D5: then nothing is listed as unrecorded)."""
+    project = agent.get("project") if isinstance(agent.get("project"), str) and agent.get("project").strip() else None
+    project = os.path.realpath(os.path.expanduser(project)) if project else None
+    folders = [directory]
+    root = os.path.join(pa.ROOT, "spaces")
+    if project:
+        for name in sorted(os.listdir(root)) if os.path.isdir(root) else []:
+            folder = os.path.join(root, name)
+            if os.path.realpath(folder) == os.path.realpath(directory):
+                continue
+            try:
+                other = pa.read_json(os.path.join(folder, "agent.json"))
+            except (OSError, ValueError):
+                continue
+            theirs = other.get("project") if isinstance(other, dict) else None
+            if isinstance(theirs, str) and theirs.strip() and os.path.realpath(os.path.expanduser(theirs)) == project:
+                folders.append(folder)
+    paths, unreadable = set(), []
+    for folder in folders:
+        try:
+            ledger = pa.read_json(os.path.join(folder, "ledger.json"), {}) or {}
+            tasks = ledger.get("tasks") or [] if isinstance(ledger, dict) else None
+            if not isinstance(tasks, list):
+                raise ValueError("no task list")
+        except (OSError, ValueError) as e:
+            unreadable.append((os.path.basename(folder), clean(e)[:200]))
+            continue
+        for task in tasks:
+            if not isinstance(task, dict):
+                continue
+            paths.update(t["path"] for t in pa.task_worktrees(task))
+            entries = task.get("worktrees") if isinstance(task.get("worktrees"), list) else []
+            paths.update(os.path.realpath(os.path.expanduser(e["path"])) for e in entries
+                         if isinstance(e, dict) and isinstance(e.get("path"), str) and e["path"].strip())
+    return sorted(paths), unreadable
+
+
+def guess_task(name, ids):
+    """The task a worktree's folder name seems to belong to: its leading t-<digits><letter> if that is a task id of
+    this ledger, else its leading t-<digits> if that is one, else None (then it is taken as the person's, R5)."""
+    for pattern in (r"t-\d+[a-z]?", r"t-\d+"):
+        m = re.match(pattern, name)
+        if m and m.group() in ids:
+            return m.group()
+    return None
+
+
+def unrecorded_cards(directory):
+    """{card id: card} of every d-wt-unrecorded-<n> card, in decisions/ and in decisions-archive/ (t-054)."""
+    cards = {}
+    for sub in (pa.ARCHIVE, "decisions"):  # decisions/ last: it wins over an archived copy
+        folder = os.path.join(directory, sub)
+        for name in os.listdir(folder) if os.path.isdir(folder) else []:
+            if re.fullmatch(re.escape(UNRECORDED) + r"[0-9]+\.json", name):
+                card = pa.read_json_safe(os.path.join(folder, name))
+                if isinstance(card, dict):
+                    cards[name[:-len(".json")]] = card
+    return cards
+
+
+def scan_unrecorded(directory, agent, profile, ledger, rows):
+    """What is under the scanned folders that no task records. {"items": [...], "more": [...], "empty": {folder: n},
+    "persons": {folder: n}, "unreadable": [(space, why)], "folders": [...]}. A folder's child counts when it is a worktree
+    (worktree_facts: a linked git worktree or the profile's kind; never a main checkout), or for a container, each
+    direct child that is one; an empty child folder is counted in "empty"; anything else (and every symlink) is passed
+    over. Recorded: a recorded path equals it, lies inside it or holds it. Paths on an answered d-wt-unrecorded card
+    are left out. The first UNRECORDED_CAP are described ("items"); the rest are named only ("more")."""
+    folders = scan_folders(agent, rows)
+    recorded, unreadable = recorded_paths(directory, agent)
+    ids = {t.get("id") for t in ledger.get("tasks") or [] if isinstance(t, dict) and isinstance(t.get("id"), str)}
+    answered = set()
+    for card in unrecorded_cards(directory).values():
+        if card.get("status") == "answered":
+            answered.update(os.path.realpath(p) for p in card.get("paths") or [] if isinstance(p, str))
+    live = pa.live_terminals() or {}
+    out = {"items": [], "more": [], "empty": {}, "persons": {}, "unreadable": unreadable, "folders": folders}
+    found = []
+    for folder in folders:
+        for name in sorted(os.listdir(folder)):
+            child = os.path.join(folder, name)
+            if os.path.islink(child) or not os.path.isdir(child):
+                continue
+            facts = worktree_facts(child, profile)
+            if facts is not None:
+                trees = [] if facts.get("main") else [(child, facts)]
+            else:
+                trees = []
+                try:
+                    inner = sorted(os.listdir(child))
+                except OSError:
+                    continue
+                if not inner:
+                    out["empty"][folder] = out["empty"].get(folder, 0) + 1
+                    continue
+                for sub in inner:
+                    path = os.path.join(child, sub)
+                    if os.path.islink(path) or not os.path.isdir(path):
+                        continue
+                    sub_facts = worktree_facts(path, profile)
+                    if sub_facts is not None and not sub_facts.get("main"):
+                        trees.append((path, sub_facts))
+            for path, facts_ in trees:
+                real = os.path.realpath(path)
+                if any(inside(r, real) or inside(real, r) for r in recorded) or real in answered:
+                    continue
+                guess = guess_task(name, ids)
+                if guess is None:
+                    out["persons"][folder] = out["persons"].get(folder, 0) + 1
+                    continue
+                found.append({"folder": folder, "name": name, "path": real, "facts": facts_, "guess": guess,
+                              "job": pa.legacy_job(guess, path)})
+    if unreadable:
+        return out  # D5: another space's work is never listed as unrecorded
+    for i, f in enumerate(found):
+        if i >= UNRECORDED_CAP:
+            out["more"].append({k: f[k] for k in ("folder", "name", "path", "guess", "job")})
+            continue
+        facts_ = f["facts"]
+        try:
+            desc = describe_worktree({"path": f["path"], "tasks": [], "titles": {}, "states": {}}, facts_, profile)
+        except Exception as e:  # noqa: BLE001 - describing never stops the scan
+            desc = {"repos": [], "kind": facts_.get("kind") or "git worktree", "error": clean(e)[:200]}
+        repos = desc.get("repos") or []
+        out["items"].append({
+            "folder": f["folder"], "name": f["name"], "path": f["path"], "kind": clean(desc.get("kind") or facts_.get("kind") or "git worktree"),
+            "branch": clean(facts_.get("branch") or (repos[0]["branch"] if repos else None) or "?"),
+            "commits": sum(r["commitsTotal"] for r in repos), "merged": sum(r["merged"] for r in repos),
+            "pushed": sum(r["pushed"] for r in repos), "uncommitted": facts_.get("uncommitted"),
+            "terminals": sorted(a for a, info in live.items() if a != agent.get("terminal") and (
+                inside(info.get("cwd"), f["path"]) or inside((info.get("foreground") or {}).get("cwd"), f["path"]))),
+            "guess": f["guess"], "job": f["job"]})
+    return out
+
+
+def unrecorded_card(card_id, scan, old=None):
+    """The card that lists the worktrees no task records: Record as guessed or Leave them alone; no Delete option and no
+    `worktree` field, so neither pa-worktree remove nor the panel's worktree path can take it (AC4.2)."""
+    items = scan["items"]
+    lines = []
+    for folder in dict.fromkeys(i["folder"] for i in items):
+        lines.append("Worktrees under {} that no task records. Nothing on this card deletes anything.".format(clean(folder)))
+        for i in (i for i in items if i["folder"] == folder):
+            lines.append("{} ({}): branch {}, {} commits ({} merged, {} pushed), {} uncommitted; terminals in it: {}; guess: {}, job {}".format(
+                clean(i["path"]), i["kind"], i["branch"], i["commits"], i["merged"], i["pushed"],
+                "unknown" if i["uncommitted"] is None else i["uncommitted"], ", ".join(clean(t) for t in i["terminals"]) or "none",
+                clean(i["guess"]), clean(i["job"])))
+    if scan["more"]:
+        lines.append("… and {} more (more than {}; listed on the next card)".format(len(scan["more"]), UNRECORDED_CAP))
+    first = clean(items[0]["name"])
+    lines.append('In the note you can say per folder: "{0}: {1}" or "{0}: leave".'.format(first, clean(items[0]["guess"])))
+    card = {"id": card_id, "task": None, "kind": "unrecorded-worktrees", "paths": [i["path"] for i in items],
+            "items": [{k: i[k] for k in ("path", "kind", "branch", "commits", "merged", "pushed", "uncommitted", "terminals", "guess", "job")}
+                      for i in items],
+            "question": "Record these worktrees no task records under the tasks they seem to belong to?",
+            "context": "\n".join(lines),
+            "options": [{"label": "Record as guessed", "detail": "Add each to its guessed task's worktrees with that job; it then gets its own "
+                                                                 "Delete/Keep card when its job is over."},
+                        {"label": "Leave them alone", "detail": "Record nothing; these are not listed again."}],
+            "recommendation": "Record as guessed", "status": "open", "answer": None, "note": None,
+            "created": (old or {}).get("created") or pa.now(), "answered": None}
+    if old:
+        card["updated"] = pa.now()
+    return card
+
+
+def check_unrecorded(directory, agent, profile, rows, open_cards):
+    """pa-worktree check's part for worktrees no task records (R4, R5): lines always; the card only with --open-cards.
+    At most one open card: updated in place when the set changes, withdrawn when nothing is left."""
+    ledger = pa.read_json(os.path.join(directory, "ledger.json"), {}) or {}
+    scan = scan_unrecorded(directory, agent, profile, ledger, rows)
+    for space, why in scan["unreadable"]:
+        print("could not read the ledger of space {} ({}); no worktree is listed as unrecorded until it can be read".format(clean(space), why))
+    for folder in scan["folders"]:
+        if scan["empty"].get(folder):
+            print("{} empty folders under {} (left by earlier removals)".format(scan["empty"][folder], clean(folder)))
+        if scan["persons"].get(folder):
+            print("{} worktrees under {} not named after a task of this ledger: left alone, not listed".format(scan["persons"][folder], clean(folder)))
+    if scan["unreadable"]:
+        return
+    cards = unrecorded_cards(directory)
+    number = lambda cid: int(cid[len(UNRECORDED):])
+    is_open = sorted((cid for cid, c in cards.items() if c.get("status") == "open"), key=number)
+    cid = is_open[0] if is_open else None
+    old = cards.get(cid) if cid else None
+    listed = scan["items"] + scan["more"]
+    if not open_cards:
+        on_card = set((old or {}).get("paths") or [])
+        for i in listed:
+            print("unrecorded: {} (guess {}, job {}); {}".format(clean(i["path"]), clean(i["guess"]), clean(i["job"]),
+                  "on card " + cid if i["path"] in on_card else "--open-cards lists it on a card"))
+        if old and sorted(old.get("paths") or []) != sorted(i["path"] for i in scan["items"]):
+            print("card {} is open, but the worktrees no task records changed; --open-cards {}".format(
+                cid, "updates it" if scan["items"] else "withdraws it"))
+        return
+    if not scan["items"]:
+        if old:
+            path = pa.card_file(directory, cid)
+            why = "no unrecorded worktree is left"
+            old.update(status="withdrawn", answer=None, note="Withdrawn by pa-worktree check: " + why, answered=pa.now(),
+                       answeredBy="pa-worktree check: withdrawn")
+            pa.write_card(directory, path, old)
+            append_journal(directory, {"by": "agent" if by_an_agent() else "person", "trigger": "worktree", "task": None,
+                                       "why": "withdrew card {}: {}".format(cid, why)})
+            print("withdrew card {}: {}".format(cid, why))
+        return
+    n = len(scan["items"])
+    count = "{} worktree{} no task records".format(n, "" if n == 1 else "s")
+    if old and sorted(old.get("paths") or []) == sorted(i["path"] for i in scan["items"]):
+        print("card {} is open ({})".format(cid, count))
+        return
+    if not old:
+        cid = UNRECORDED + str(1 + max([number(c) for c in cards] or [0]))
+    pa.write_card(directory, pa.card_file(directory, cid), unrecorded_card(cid, scan, old))
+    print("{} card {} ({})".format("updated" if old else "opened", cid, count))
+
+
 def cmd_worktree(args):
     record = find_task(os.getcwd())
     space = pa.local_id(args.space or (record or {}).get("space") or space_from_terminal() or "")
@@ -1886,6 +2135,7 @@ def cmd_worktree(args):
                 open_worktree_card(directory, row, facts, profile, owner, "a", gone)
         if not rows:
             print("No task in the ledger has a worktree.")
+        check_unrecorded(directory, agent, profile, rows, args.open_cards)
         return
     # remove: only what an answered card allows, re-checked now.
     row = pick_row(rows, args.task, args.job)
