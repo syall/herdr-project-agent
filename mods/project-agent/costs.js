@@ -388,11 +388,11 @@ export class CostsPane {
       .bg(st.dim === d ? t.selected : t.chrome).text_color(st.dim === d ? t.foreground : t.muted).cursor_pointer().on_click((_e, cx) => { st.dim = d; st.open.kind = null; cx.notify(); }).child(d))));
     const dimRows = st.dim === "machine" ? [this.machineRow(s, space)] : list(s.byKind?.[st.dim]);
     dimRows.forEach((x, i) => out.child(row("kind", i, x, str(x.key), null, () => sessionsOf((ss) => st.dim === "machine" || str(ss[st.dim] ?? "(none)") === str(x.key)))));
-    // By day: newest first; Show more reveals up to 92.
+    // By day: newest first; Show more reveals up to 92. A day pa-costs cut in UTC (older than the zone table) says (UTC).
     const days = list(s.byDay);
     const z = summaryZone(s, Date.now());
     out.child(titled("day", z.local ? "By day" : `By day (${z.label})`));
-    days.slice(0, st.moreDays ? DAYS_MORE : DAYS_SHOWN).forEach((d, i) => out.child(row("day", i, d, d.key === "older" ? `older (${num(d.days)} days)` : str(d.key), null,
+    days.slice(0, st.moreDays ? DAYS_MORE : DAYS_SHOWN).forEach((d, i) => out.child(row("day", i, d, d.key === "older" ? `older (${num(d.days)} days)` : `${str(d.key)}${d.utc ? " (UTC)" : ""}`, null,
       // Each activity with its tokens and est., marked as the rows are (t-028; activities from pa-costs of t-028 on);
       // an older summary's byActivity (priced money only) as before.
       () => (Array.isArray(d.activities) ? list(d.activities).map((a) => sub(`${ACTIVITY[a.key] ?? str(a.key)} · ${tokens(a.tokens)} tokens · ${est(a, cur)}${priceTag(a) ? ` · ${priceTag(a)}` : ""}`))

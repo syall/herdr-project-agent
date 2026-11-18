@@ -206,6 +206,8 @@ ships none, so without one the figures are tokens only).
   Last 7 days and By day are the person's own days, cut at their local midnight, daylight saving
   included, wherever the space runs. Everything stored stays UTC; prices are looked up by a row's UTC
   day; a summary in another zone (or from an older pa-costs) is drawn with that zone named, e.g. "(UTC)".
+  The timezone table covers the last 10 years (`--zone-from` says where it starts); a day older than
+  that is its UTC day, marked "(UTC)" beside its date.
 - `pa-costs report [--by KEY] [--json] [--billed] [--utc]` prints the same figures as the Costs view, by
   this terminal's local days (`--since`/`--until` too), or UTC days with `--utc`;
   `pa-costs report --account-wide` prints the estimates of every space on the machine with the

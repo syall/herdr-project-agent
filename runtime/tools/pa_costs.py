@@ -1399,9 +1399,10 @@ DAYS, SESSIONS, PASSES, HOURS = 92, 200, 20, 48
 
 # ---- days in a timezone (t-036): on disk everything stays UTC; only the day buckets are cut in a zone ----------------
 # A zone is {"zone": name, "offsets": [[epoch, minutes east of UTC in force from it on], ...]}, the first from 0. The
-# panel passes its own (its machine's getTimezoneOffset over now - 100 d .. now + 35 d, so daylight saving is in it and
-# no zone database is needed here); costs/zone.json keeps it for the collects that pass none. The report uses the
-# terminal's (time.localtime, which honours TZ), or UTC with --utc.
+# panel passes its own (its machine's getTimezoneOffset over the last 10 years .. now + 35 d, so daylight saving is in
+# it and no zone database is needed here); costs/zone.json keeps it for the collects that pass none. The report uses
+# the terminal's (time.localtime, which honours TZ) back to its oldest row, or UTC with --utc. "from" (absent: 0): where
+# the table starts; a row before it is put under its UTC day, and that day is marked utc (never a guessed midnight).
 UTC_ZONE = {"zone": "UTC", "offsets": [[0, 0]]}
 ZONE_BACK, ZONE_AHEAD, ZONE_MAX = (DAYS + 8) * 86400, 35 * 86400, 64
 ZONE_NAME = re.compile(r"^[A-Za-z0-9_+\-/:.]{1,64}$")
@@ -1417,23 +1418,30 @@ def offset_at(offsets, epoch):
     return minutes
 
 
+def before_table(zone, epoch):
+    """Whether `epoch` is before where the zone's table starts (its day is then the UTC day)."""
+    return epoch < zone.get("from", 0)
+
+
 def day_in(zone, text):
-    """The day (YYYY-MM-DD) of an ISO UTC time in `zone`; None when it is not one."""
+    """The day (YYYY-MM-DD) of an ISO UTC time in `zone` (its UTC day before the table's start); None when not one."""
     epoch = parse_ts(text or "")
     if epoch is None:
         return None
-    return iso(epoch + offset_at(zone["offsets"], epoch) * 60)[:10]
+    return iso(epoch + (0 if before_table(zone, epoch) else offset_at(zone["offsets"], epoch) * 60))[:10]
 
 
 def offset_name(minutes):
     return "UTC{}{:02d}:{:02d}".format("-" if minutes < 0 else "+", abs(minutes) // 60, abs(minutes) % 60)
 
 
-def machine_zone(now):
-    """This machine's zone (the terminal's: TZ is honoured) as a table over now - ZONE_BACK .. now + ZONE_AHEAD."""
+def machine_zone(now, oldest=None):
+    """This machine's zone (the terminal's: TZ is honoured) as a table over now - ZONE_BACK (or a day before `oldest`,
+    when earlier) .. now + ZONE_AHEAD. Over ZONE_MAX entries: the newest, with "from" where they start."""
     def off(t):
         return int(time.localtime(t).tm_gmtoff // 60)
-    t, end, step = int(now) - ZONE_BACK, int(now) + ZONE_AHEAD, 6 * 3600  # changes are months apart
+    t = int(now) - ZONE_BACK if oldest is None else min(int(now) - ZONE_BACK, int(oldest) - 86400)
+    end, step = int(now) + ZONE_AHEAD, 6 * 3600  # changes are months apart
     offsets = [[0, off(t)]]
     while t < end:
         nxt = t + step
@@ -1447,11 +1455,16 @@ def machine_zone(now):
     if offsets == [[0, 0]]:
         return dict(UTC_ZONE)
     name = time.strftime("%Z", time.localtime(now))
-    return {"zone": name if ZONE_NAME.match(name or "") else offset_name(off(int(now))), "offsets": offsets}
+    zone = {"zone": name if ZONE_NAME.match(name or "") else offset_name(off(int(now))), "offsets": offsets}
+    if len(offsets) > ZONE_MAX:
+        kept = offsets[-ZONE_MAX:]
+        zone.update(offsets=[[0, kept[0][1]]] + kept[1:], **{"from": kept[0][0]})
+    return zone
 
 
-def parse_zone(offsets_text, name=None):
-    """The panel's --zone-offsets "0:<min>,<epoch>:<min>,..." and --zone-name, checked; pa.Problem when not one."""
+def parse_zone(offsets_text, name=None, known_from=None):
+    """The panel's --zone-offsets "0:<min>,<epoch>:<min>,...", --zone-name and --zone-from (where its table starts),
+    checked; pa.Problem when not one."""
     offsets = []
     for part in (offsets_text or "").split(","):
         m = re.match(r"^(\d{1,12}):(-?\d{1,4})$", part.strip())
@@ -1464,31 +1477,41 @@ def parse_zone(offsets_text, name=None):
         raise pa.Problem("--zone-offsets: epochs ascending, offsets within ±15 h")
     if name is not None and not ZONE_NAME.match(name):
         raise pa.Problem("--zone-name is letters, digits and _+-/:. only")
-    return {"zone": name or offset_name(offsets[-1][1]), "offsets": offsets}
+    if known_from is not None and not re.match(r"^\d{1,12}$", str(known_from)):
+        raise pa.Problem("--zone-from is an epoch in seconds")
+    zone = {"zone": name or offset_name(offsets[-1][1]), "offsets": offsets}
+    if known_from is not None and int(known_from):
+        zone["from"] = int(known_from)
+    return zone
 
 
 def load_zone(directory):
     """The zone the panel last passed (costs/zone.json), else UTC."""
     z = pa.read_json(os.path.join(costs_dir(directory), "zone.json"), None)
     try:
-        return parse_zone(",".join("{}:{}".format(e, m) for e, m in z["offsets"]), z["zone"])
+        return parse_zone(",".join("{}:{}".format(e, m) for e, m in z["offsets"]), z["zone"], z.get("from"))
     except (TypeError, KeyError, ValueError, pa.Problem):
         return dict(UTC_ZONE)
 
 
 def save_zone(directory, zone):
-    """Keeps the panel's zone for the collects that pass none; True when it changed."""
-    if load_zone(directory) == zone and os.path.exists(os.path.join(costs_dir(directory), "zone.json")):
+    """Keeps the panel's zone for the collects that pass none; True when it changed. Its start ("from") moves on each
+    day the panel runs: kept, but not a change (the summary is not rewritten for it alone)."""
+    def table(z):
+        return {k: v for k, v in z.items() if k != "from"}
+    path = os.path.join(costs_dir(directory), "zone.json")
+    old = load_zone(directory) if os.path.exists(path) else None
+    if old == zone:
         return False
-    pa.write_text(os.path.join(costs_dir(directory), "zone.json"), compact(zone))
-    return True
+    pa.write_text(path, compact(zone))
+    return old is None or table(old) != table(zone)
 
 
 def zone_of(s):
     """A summary's zone (an older summary's: UTC)."""
     z = s.get("days") if isinstance(s.get("days"), dict) else None
     try:
-        return parse_zone(",".join("{}:{}".format(e, m) for e, m in z["offsets"]), z["zone"])
+        return parse_zone(",".join("{}:{}".format(e, m) for e, m in z["offsets"]), z["zone"], z.get("from"))
     except (TypeError, KeyError, ValueError, pa.Problem):
         return dict(UTC_ZONE)
 
@@ -1692,6 +1715,7 @@ def summarize(directory, rows, records, table, price_problem, profile_name, now,
     dims = {d: {} for d in ("kind", "role", "program", "model", "machine")}
     days, day_acts, day_model, hours, passes, sess_b, sess_info = {}, {}, {}, {}, {}, {}, {}
     utc_days = set()  # byDayModel's own days (UTC)
+    cut_utc = set()  # byDay's days holding a row from before the zone table's start (cut in UTC, marked)
     day_act_b = {}  # day -> activity -> Bucket: the day drill's activities with their unpriced part (t-028)
     sess_tasks, sess_split = {}, set()  # the tasks of each session's rows; sessions with a split row
     hour_floor = iso(now - HOURS * 3600)[:13]
@@ -1751,6 +1775,9 @@ def summarize(directory, rows, records, table, price_problem, profile_name, now,
         utc_day = r.get("day") or (r.get("from") or "")[:10]
         utc_days.add(utc_day)
         day = day_in(zone, r.get("from")) or utc_day
+        start = parse_ts(r.get("from") or "")
+        if start is not None and before_table(zone, start) and zone["offsets"] != [[0, 0]]:
+            cut_utc.add(day)
         group(days, day).add(t, m, calls, rec)
         da = day_acts.setdefault(day, {})
         if m is not None:
@@ -1822,7 +1849,8 @@ def summarize(directory, rows, records, table, price_problem, profile_name, now,
     # byActivity: the priced money of each activity (as before); activities: every activity with its tokens, money
     # (None: no price) and unpricedTokens, for the day drill's marks (t-028).
     by_day = [days[d].out(d, byActivity={k: round(v, 6) for k, v in sorted(day_acts.get(d, {}).items())},
-                          activities=drill(day_act_b.get(d, {}), keep=20)) for d in day_list[:DAYS]]
+                          activities=drill(day_act_b.get(d, {}), keep=20), **({"utc": True} if d in cut_utc else {}))
+              for d in day_list[:DAYS]]
     if day_list[DAYS:]:
         by_day.append(older.out("older", days=len(day_list) - DAYS))
     kept_days = set(sorted(utc_days, reverse=True)[:DAYS])
@@ -1875,7 +1903,7 @@ def summarize(directory, rows, records, table, price_problem, profile_name, now,
         "byPhase": by_money(phases),
         "byKind": {d: by_money(v) for d, v in dims.items()},
         "byDay": by_day,
-        "days": {"zone": zone["zone"], "offsets": zone["offsets"]},
+        "days": dict({"zone": zone["zone"], "offsets": zone["offsets"]}, **({"from": zone["from"]} if zone.get("from") else {})),
         "byDayModel": by_day_model,
         "passes": sorted(({**{k: v for k, v in p.items() if k != "unpricedTokens"},
                            "money": None if p["money"] is None else round(p["money"], 6),
@@ -2045,7 +2073,7 @@ def report_lines(s, by=None):
     sections = [("activity", "By activity", s["byActivity"], None), ("task", "By task", s["byTask"], None),
                 ("phase", "By phase", s["byPhase"], None)]
     sections += [(d, "By " + d, s["byKind"].get(d, []), None) for d in ("kind", "role", "program", "model", "machine")]
-    sections += [("day", "By day ({})".format(zone["zone"]), s["byDay"], None),
+    sections += [("day", "By day ({})".format(zone["zone"]), s["byDay"], lambda e: str(e["key"]) + (" (UTC)" if e.get("utc") else "")),
                  ("pass", "Costliest passes", [dict(p, key="pass {} ({})".format(p["pass"], p.get("trigger") or "?") + (" rebuild" if p.get("rebuild") else ""))
                                                for p in s["passes"]], None),
                  ("session", "Sessions", s["sessions"], lambda e: "{} {} {}".format(e["key"], e.get("role") or e.get("kind"), e.get("task") or ""))]
@@ -2109,9 +2137,11 @@ def report(directory, by=None, since=None, until=None, as_json=False, account_wi
     if by is not None and by not in REPORT_BY:
         raise pa.Problem("--by is one of " + ", ".join(REPORT_BY))
     folder = costs_dir(directory)
-    zone = dict(UTC_ZONE) if utc else machine_zone(now)
+    every = ledger_rows(directory)
+    starts = [e for e in (parse_ts(r.get("from") or "") for r in every) if e is not None]
+    zone = dict(UTC_ZONE) if utc else machine_zone(now, min(starts) if starts else None)  # its table reaches every row
     day = lambda r: day_in(zone, r.get("from")) or r.get("day", "")  # noqa: E731
-    rows = [r for r in ledger_rows(directory) if (not since or day(r) >= since) and (not until or day(r) <= until)]
+    rows = [r for r in every if (not since or day(r) >= since) and (not until or day(r) <= until)]
     records, _bad = read_lines(os.path.join(folder, "sessions.jsonl"))
     table, problem, name = space_prices(directory)
     state = pa.read_json(os.path.join(folder, "state.json"), {}) or {}
@@ -3284,6 +3314,7 @@ def main(argv=None):
     c.add_argument("--resummarize", action="store_true", help="only rewrite summary.json (after a price table change)")
     c.add_argument("--zone-offsets", help="the panel's timezone: <epoch>:<minutes east of UTC>[,...], the first from 0")
     c.add_argument("--zone-name", help="its name (shown beside the days)")
+    c.add_argument("--zone-from", help="where its table starts (epoch seconds); a row before it is put under its UTC day")
     r = sub.add_parser("report", help="the space's costs as text, or --json")
     r.add_argument("--space")
     r.add_argument("--by", choices=REPORT_BY)
@@ -3301,7 +3332,8 @@ def main(argv=None):
     add_billed_parser(sub)
     args = parser.parse_args(argv)
     if args.cmd == "collect":
-        zone = parse_zone(args.zone_offsets, args.zone_name) if args.zone_offsets is not None or args.zone_name is not None else None
+        zone = (parse_zone(args.zone_offsets, args.zone_name, args.zone_from)
+                if args.zone_offsets is not None or args.zone_name is not None or args.zone_from is not None else None)
         directory = space_directory(args.space)
         try:
             collect(directory, quiet=args.quiet, resummarize=args.resummarize, zone=zone)
