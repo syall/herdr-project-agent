@@ -654,6 +654,49 @@ class ProfileReload(Base):
         self.assertIsNotNone(self.ours(first))
         self.assertEqual(self.masked(first), self.masked(second))
 
+    def good_profile(self):
+        return {"name": "test", "claude": ["true"], "codex": ["true"], "models": {"orchestrator": "model-a"},
+                "statusLine": {"command": ["true", "statusline"], "refreshInterval": 30}}
+
+    def fresh_agent(self):
+        dump({"version": 1, "space": "sp1", "project": self.project, "profile": "test", "name": "proj",
+              "terminal": "t1"}, os.path.join(self.dir, "agent.json"))
+
+    def test_r2_wrong_shape_in_a_key_the_loop_reads_keeps_the_one_in_hand(self):
+        # Round 2 (check M1): the file loads as JSON, but a key the loop reads has a shape the launch cannot use.
+        def without_claude(v):
+            del v["claude"]
+        cases = {"models a list": lambda v: v.update(models=["m"]),
+                 "path a number": lambda v: v.update(path=5),
+                 "claude a string": lambda v: v.update(claude="true"),
+                 "claude missing": without_claude}
+        for name, change in cases.items():
+            with self.subTest(name):
+                self.fresh_agent()
+                dump(self.good_profile(), os.path.join(self.prof, "profile.json"))
+
+                def between():
+                    v = self.good_profile()
+                    change(v)
+                    dump(v, os.path.join(self.prof, "profile.json"))
+                first, second = self.two_launches(between)
+                self.assertIn("model-a", first)
+                self.assertIsNotNone(self.ours(first))
+                self.assertEqual(self.masked(first), self.masked(second))
+
+    def test_r1_model_change_between_launches_is_picked_up(self):
+        dump(self.good_profile(), os.path.join(self.prof, "profile.json"))
+
+        def between():
+            v = self.good_profile()
+            v["models"]["orchestrator"] = "model-b"
+            dump(v, os.path.join(self.prof, "profile.json"))
+        first, second = self.two_launches(between)
+        self.assertEqual(first[first.index("--model") + 1], "model-a")
+        self.assertEqual(second[second.index("--model") + 1], "model-b")
+        expected = [a.replace("model-a", "model-b") for a in self.masked(first)]  # the steering names the model too
+        self.assertEqual(self.masked(second), expected)
+
 
 def tearDownModule():
     shutil.rmtree(TMP, ignore_errors=True)
