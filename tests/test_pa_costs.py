@@ -4705,6 +4705,77 @@ class J1C_AccountScope(Collecting):
         self.assertIn("Models seen without a price: (none)", out)
 
 
+class J1R3_StartInEffect(Collecting):
+    """Fix round 3 (verify Must fix 1, review RL-6): a row takes the facts of the start record in effect when it
+    happened: the session's latest start record at or before the row's time, the first one when the row is earlier
+    than all of them."""
+
+    FACTS_A = {"provider": "provider-a", "providerBy": "launch", "endpoint": "global", "endpointBy": "rule", "region": None,
+               "regionBy": "unknown", "account": "acct-a", "accountBy": "env"}
+    FACTS_R = {"provider": "provider-a", "providerBy": "launch", "endpoint": "regional", "endpointBy": "rule",
+               "region": "region-a", "regionBy": "machine", "account": "acct-c", "accountBy": "env"}
+
+    def test_j1r1_fallback_rows_take_the_start_that_ran(self):
+        # t-033's fallback: the refused attempt's record, then the record of the profile that started, same second
+        self.prices(scoped_fixture())
+        self.record(session=SID, model="model-a", **dict(self.FACTS_A, provider="provider-new", account="acct-new"))
+        self.record(session=SID, model="model-a", **self.FACTS_A)
+        self.add(self.prompt(T0 + 10), self.call(T0 + 12, "f1", lines=1, out=1000000))
+        self.collect(T0 + 5000)
+        rows = self.rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual({k: rows[0].get(k) for k in FACT_KEYS}, self.FACTS_A)
+        s = load(self.costs("summary.json"))
+        self.assertAlmostEqual(s["totals"]["money"], 10.0, places=4)  # priced, under provider-a's global scope
+        self.assertEqual([e["key"] for e in s["byProvider"]], ["provider-a"])
+        self.assertEqual([e["key"] for e in s["byAccount"]], ["acct-a"])
+        self.assertEqual([e["key"] for e in s["byScope"]], ["provider-a · global · ? · acct-a"])
+
+    def test_j1r2_resume_after_a_profile_edit(self):
+        # rows before the resume under the first facts, rows after under the new; a resumed session's past (before
+        # its first record) under the first
+        self.prices(scoped_fixture())
+        self.record(session=SID, at=iso(T0 + 100), model="model-a", resumed=True, **self.FACTS_A)
+        self.add(self.prompt(T0 + 10), self.call(T0 + 12, "p1", lines=1, out=1000000))
+        self.add(self.prompt(T0 + 200), self.call(T0 + 202, "a1", lines=1, out=1000000))
+        self.record(session=SID, at=iso(T0 + 1000), model="model-a", resumed=True, **self.FACTS_R)
+        self.add(self.prompt(T0 + 1010), self.call(T0 + 1012, "b1", lines=1, out=1000000))
+        self.collect(T0 + 5000)
+        rows = sorted(self.rows(), key=lambda r: r["from"])
+        self.assertEqual(len(rows), 3)
+        self.assertEqual([r["source"] for r in rows], ["reconstructed", "recorded", "recorded"])
+        self.assertEqual([{k: r.get(k) for k in FACT_KEYS} for r in rows], [self.FACTS_A, self.FACTS_A, self.FACTS_R])
+        s = load(self.costs("summary.json"))
+        self.assertAlmostEqual(s["totals"]["money"], 10.0 + 10.0 + 11.0, places=4)
+        scopes = {e["key"]: e["money"] for e in s["byScope"]}
+        self.assertAlmostEqual(scopes["provider-a · global · ? · acct-a"], 20.0, places=4)
+        self.assertAlmostEqual(scopes["provider-a · regional · region-a · acct-c"], 11.0, places=4)
+
+    def test_j1r3_make_row_picks_the_start_in_effect(self):
+        a = dict(self.FACTS_A, ev="start", session=SID, at=iso(T0 + 5))
+        b = dict(self.FACTS_R, ev="start", session=SID, at=iso(T0 + 50))
+        c = dict(self.FACTS_A, ev="start", session=SID, at=iso(T0 + 50), account="acct-b")  # same second, later line
+        sess = pa_costs.sessions_of([a, b, c])[SID]
+        def facts(t):
+            seg = pa_costs.new_segment(isoms(t), isoms(t), "model-a")
+            row = pa_costs.make_row(sess, seg)
+            return {k: row.get(k) for k in FACT_KEYS}
+        self.assertEqual(facts(T0 + 1), self.FACTS_A)  # earlier than all: the first
+        self.assertEqual(facts(T0 + 5), self.FACTS_A)  # at the record's second (a call's time has milliseconds)
+        self.assertEqual(facts(T0 + 49.9), self.FACTS_A)
+        self.assertEqual(facts(T0 + 50.2), dict(self.FACTS_A, account="acct-b"))  # the later of two in one second
+        self.assertEqual(facts(T0 + 9000), dict(self.FACTS_A, account="acct-b"))
+        one = pa_costs.sessions_of([b])[SID]  # old data with one start record: its facts for every row
+        for t in (T0, T0 + 60, T0 + 9000):
+            row = pa_costs.make_row(one, pa_costs.new_segment(isoms(t), isoms(t), "model-a"))
+            self.assertEqual({k: row.get(k) for k in FACT_KEYS}, self.FACTS_R)
+        bare = pa_costs.sessions_of([{"ev": "start", "session": SID, "at": iso(T0)},
+                                     dict(self.FACTS_R, ev="start", session=SID, at=iso(T0 + 50))])[SID]
+        row = pa_costs.make_row(bare, pa_costs.new_segment(isoms(T0 + 10), isoms(T0 + 10), "model-a"))
+        for k in FACT_KEYS:  # a start record without facts gives a row without fact keys, as before
+            self.assertNotIn(k, row)
+
+
 class J1C_Docs(unittest.TestCase):
     def test_j1c11_readme_names_the_scope_format_and_facts(self):
         with open(os.path.join(HERE, "..", "README.md")) as f:
