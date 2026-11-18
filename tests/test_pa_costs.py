@@ -5168,15 +5168,43 @@ class PX_PaContext(Collecting):
         s = self.summary()
         self.assertEqual(json.loads(pa_costs.compact(s))["paContext"], s["paContext"])
         self.assertEqual(load(self.costs("summary.json"))["paContext"], s["paContext"])
-        big = {"sessions": [], "byTask": [], "passes": [], "byDayModel": [],
-               "paContext": [{"day": "d{:05d}".format(9999 - i), "calls": 1, "mean": 1, "peak": 1, "peakExact": True,
-                              "resets": {"fresh": 0, "compact": 0}, "firstCall": None, "firstCalls": 0, "money": None,
-                              "passes": 0, "perPass": None, "pad": "x" * 200} for i in range(2000)]}
-        newest = big["paContext"][0]
-        text = pa_costs.compact(big)
-        while len(text.encode()) > pa_costs.SUMMARY_MAX and pa_costs.shrink(big):
-            text = pa_costs.compact(big)
+
+    @staticmethod
+    def pc_days(n, pad):
+        return [{"day": "d{:05d}".format(9999 - i), "calls": 1, "mean": 1, "peak": 1, "peakExact": True,
+                 "resets": {"fresh": 0, "compact": 0}, "firstCall": None, "firstCalls": 0, "money": None,
+                 "passes": 0, "perPass": None, "pad": "x" * pad} for i in range(n)]
+
+    def test_px10b_summary_keeps_14_days_cut_before_any_other_list(self):
+        """t-041 J1 round 2 (REVIEW MF-2): summary.json keeps at most 14 days of paContext, cut before shrink touches
+        the Sessions list, the per-task sessions, the passes, byTask or byDayModel."""
+        self.assertEqual(pa_costs.PA_CONTEXT_SUMMARY_DAYS, 14)
+        sessions = [{"session": "s{:04d}".format(i), "pad": "y" * 150} for i in range(150)]
+        passes = [{"pass": i, "pad": "z" * 150} for i in range(20)]
+        by_task = [{"key": "t-{:03d}".format(i), "tokens": 1, "money": None, "calls": 1, "sessions": [{"session": "s"}]}
+                   for i in range(5)]
+        big = {"sessions": list(sessions), "byTask": json.loads(json.dumps(by_task)), "passes": list(passes),
+               "byDayModel": [{"day": "d", "pad": "w" * 100}], "paContext": self.pc_days(92, 300)}
+        self.assertGreater(len(pa_costs.compact(big).encode()), pa_costs.SUMMARY_MAX)  # over the cap with 92 days
+        newest = big["paContext"][:14]
+        text = pa_costs.fit_summary(big)
         self.assertLessEqual(len(text.encode()), pa_costs.SUMMARY_MAX)
+        self.assertEqual(json.loads(text), big)
+        self.assertEqual(big["paContext"], newest)
+        self.assertEqual((big["sessions"], big["passes"], big["byTask"]), (sessions, passes, by_task))
+        self.assertNotIn("truncated", big)  # the 14-day cut is the summary's form, not a truncation
+        small = {"sessions": [], "byTask": [], "passes": [], "byDayModel": [], "paContext": self.pc_days(30, 10)}
+        pa_costs.fit_summary(small)
+        self.assertEqual(len(small["paContext"]), 14)  # under the cap too: summary.json keeps at most 14 days
+
+    def test_px10c_pa_context_cut_further_as_the_last_resort(self):
+        big = {"sessions": [{"session": "s", "pad": "y" * 100}], "byTask": [], "passes": [{"pass": 1}], "byDayModel": [],
+               "paContext": self.pc_days(14, 6000)}
+        newest = big["paContext"][0]
+        text = pa_costs.fit_summary(big)
+        self.assertLessEqual(len(text.encode()), pa_costs.SUMMARY_MAX)
+        self.assertEqual((big["sessions"], big["passes"]), ([], []))  # the existing steps ran first
+        self.assertLess(len(big["paContext"]), 14)
         self.assertEqual(big["paContext"][0], newest)
         self.assertTrue(big["truncated"])
 
@@ -5187,8 +5215,56 @@ class PX_PaContext(Collecting):
             rows.append({"day": d, "from": d + "T01:00:00Z", "to": d + "T01:01:00Z", "tokens": toks(cr=1000), "peak": 1000})
         self.put_rows(*rows)
         pc = self.summary()["paContext"]
-        self.assertEqual(len(pc), pa_costs.DAYS)
+        self.assertEqual(len(pc), pa_costs.PA_CONTEXT_SUMMARY_DAYS)  # summary.json: 14 days (round 2, MF-2)
         self.assertEqual(pc[0]["day"], D1)  # newest first
+        self.assertEqual(load(self.costs("summary.json"))["paContext"], pc)
+        _r, out, _e = self.run_cmd(pa_costs.report, self.dir, as_json=True, now=T0 + 5000)
+        pc = json.loads(out)["paContext"]
+        self.assertEqual(len(pc), pa_costs.DAYS)  # report summarizes without the summary's cut
+        self.assertEqual(pc[0]["day"], D1)
+
+    def test_px14_first_call_is_the_sessions_first_row_of_all(self):
+        """t-041 J1 round 2 (REVIEW MF-1, review_j1_probe P1): a fresh session that starts before --since has its
+        first row cut; its first row inside the window is a mid-session prompt and is not its first call."""
+        self.put_record(fx.reset_record(D0 + "T23:50:00Z", SID, SID3))
+        self.put_record(fx.reset_record(D1 + "T05:00:00Z", SID3, SID4))
+        self.put_rows({"session": SID3, "calls": 2, "tokens": toks(cr=160000), "peak": 80000, "first": 80000, "day": D0,
+                       "from": D0 + "T23:51:00Z", "to": D0 + "T23:59:00Z"},
+                      {"session": SID3, "calls": 3, "tokens": toks(cr=900000), "peak": 310000, "first": 290000,
+                       "from": D1 + "T00:00:10Z", "to": D1 + "T00:30:00Z"},
+                      {"session": SID4, "calls": 1, "tokens": toks(cr=70000), "peak": 70000, "first": 70000,
+                       "from": D1 + "T05:01:00Z", "to": D1 + "T05:02:00Z"})
+        s = self.summary()
+        self.assertEqual((self.day(s, D0)["firstCall"], self.day(s, D0)["firstCalls"]), (80000, 1))
+        self.assertEqual((self.day(s)["firstCall"], self.day(s)["firstCalls"]), (70000, 1))
+        for kw in ({"since": D1}, {"since": D1, "until": D1}):
+            _r, out, _e = self.run_cmd(pa_costs.report, self.dir, as_json=True, now=T0 + 5000, **kw)
+            pc = json.loads(out)["paContext"]
+            self.assertEqual([(e["day"], e["firstCall"], e["firstCalls"]) for e in pc], [(D1, 70000, 1)], kw)
+        _r, out, _e = self.run_cmd(pa_costs.report, self.dir, until=D0, as_json=True, now=T0 + 5000)
+        pc = json.loads(out)["paContext"]
+        self.assertEqual([(e["day"], e["firstCall"], e["firstCalls"]) for e in pc], [(D0, 80000, 1)])
+        _r, out, _e = self.run_cmd(pa_costs.report, self.dir, by="context", since=D1, now=T0 + 5000)
+        self.assertNotIn("290k", out)
+
+    def test_px15_a_record_with_a_non_string_field_is_skipped(self):
+        """t-041 J1 round 2 (VERIFY recorded limit 1): a reset or compact record whose session, at, to or from is not a
+        string is skipped, like one with a bad at; the summary is still written."""
+        self.put_rows({"calls": 1, "tokens": toks(cr=100000), "peak": 100000})
+        good = [fx.reset_record(D1 + "T02:00:00Z", SID, SID3), fx.compact_record(D1 + "T04:00:00Z", SID3)]
+        bad = [fx.compact_record(D1 + "T04:00:00Z", ["a", "b"]), fx.compact_record(D1 + "T04:00:00Z", {"x": 1}),
+               fx.compact_record(D1 + "T04:00:00Z", 7), fx.compact_record(12345, SID3),
+               fx.reset_record(D1 + "T02:00:00Z", SID, ["l"]), fx.reset_record(D1 + "T02:00:00Z", {"o": 1}, SID4),
+               fx.reset_record(D1 + "T02:00:00Z", 3, SID4), fx.reset_record(["t"], SID, SID4),
+               dict(fx.reset_record(D1 + "T02:00:00Z", SID, SID4), session=["s"])]
+        for rec in bad + good:
+            self.put_record(rec)
+        s = self.summary()
+        e = self.day(s)
+        self.assertEqual(e["resets"], {"fresh": 1, "compact": 1})
+        self.assertEqual(load(self.costs("summary.json"))["paContext"], s["paContext"])
+        _r, out, _e = self.run_cmd(pa_costs.report, self.dir, by="context", now=T0 + 5000)
+        self.assertIn(D1, out)
 
     def test_px12_old_open_segment_without_peak(self):
         seg = pa_costs.new_segment(D1 + "T01:00:00Z", D1 + "T01:00:00Z", "model-a")
