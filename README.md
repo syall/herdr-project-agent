@@ -477,7 +477,10 @@ simulate a slow or hung remote machine), and a `pa-session` check
 against a private hc core); `--affected` runs only the
 fast set. The parts run at the same time (each unit test module is its own part), and each part's whole
 output is kept in a run folder that the last line names, after a summary of every part and failing test;
-`PA_SERIAL=1` runs the parts one after another, each streamed as it runs. After updating, run `pa-sync --on <machine>` before installing the mod, so remote launchers
+`PA_SERIAL=1` runs the parts one after another, each streamed as it runs. Every run that has parts to
+run, full or `--affected`, first takes the same machine slot as `pa-full-suite` (at most `PA_SUITE_CAP`, default
+1, at once per user), waiting its turn and saying for whom; its summary says how long it waited. A single test
+module run on its own (`python3 -m unittest tests.test_x`) takes no slot. After updating, run `pa-sync --on <machine>` before installing the mod, so remote launchers
 get the new `pa-session` (see the install order above).
 
 ## Licence

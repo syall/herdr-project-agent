@@ -7,23 +7,37 @@ folder; the pa_hooks module is passed in (`h`) for its helpers, so nothing here 
   pa-full-suite --last [--commit C|--tree T]       the last recorded run (default: this worktree's HEAD tree)
   pa-full-suite --report                           the suite's parts by time, slowest median first
 
-The machine cap: at most CAP full suites at once per user (slots under HERDR_PA_HOME, i.e. ~/.config/herdr-pa,
+The machine cap: at most CAP suite runs at once per user (slots under HERDR_PA_HOME, i.e. ~/.config/herdr-pa,
 never a space). A slot is an flock on suite-slots/slot-<i>, so the kernel frees it when its holder dies.
+
+Run as a script (t-072), it is how tests/run-all.sh takes the same slot, full or --affected:
+  python3 pa_suite.py slot --for <what> [--worker W] [--dir D] -- <command...>
+waits for a slot (saying for whom), runs the command under it and exits with its code (124: no slot came free).
+A caller that holds a slot already (pa-full-suite) names it in PA_SUITE_SLOT; it is trusted only when that slot
+is locked and its recorded holder is an ancestor of this process, so the run under it does not wait for itself.
+The command gets PA_SUITE_SLOT, PA_SUITE_SLOT_PID (this process) and PA_SUITE_HOLD (the seconds waited, or held
+by the caller). Script mode never loads pa.py (run-all.sh's test fixture stubs it): HERDR_PA_HOME and a UTC clock.
 """
+import argparse
+import datetime
 import fcntl
 import json
 import os
 import re
+import signal
 import statistics
 import subprocess
 import sys
 import time
 import uuid
 
-try:
-    import pa
-except ImportError:  # loaded from a module that dropped it: pa_hooks sets it after loading
-    pa = None
+if __name__ == "__main__":
+    pa = None  # the slot entry point: see the top
+else:
+    try:
+        import pa
+    except ImportError:  # loaded from a module that dropped it: pa_hooks sets it after loading
+        pa = None
 
 CAP = 1  # one at a time: two overlapping took 8-10 min each, two in a row ~4 min together (plan.md, rule r-worker-mix)
 POLL = 2
@@ -41,8 +55,20 @@ def cap():
     return int(value) if value.isdigit() and int(value) > 0 else CAP
 
 
+def home():
+    if pa is not None and getattr(pa, "ROOT", None):
+        return pa.ROOT
+    return os.environ.get("HERDR_PA_HOME") or os.path.join(os.path.expanduser("~"), ".config", "herdr-pa")
+
+
+def stamp():
+    if pa is not None and getattr(pa, "now", None):
+        return pa.now()
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def slot_dir():
-    return os.path.join(pa.ROOT, "suite-slots")
+    return os.path.join(home(), "suite-slots")
 
 
 def parse_parts(text):
@@ -60,11 +86,13 @@ def holder_of(path):
 
 
 def describe(holders):
-    return "; ".join("task {} (worker {}, pid {}, since {})".format(h.get("task"), h.get("worker"), h.get("pid"), h.get("start"))
-                     for h in holders) or "unknown"
+    return "; ".join("task {} (worker {}, pid {}, since {}{})".format(
+        h.get("task"), h.get("worker"), h.get("pid"), h.get("start"),
+        ", {}{}".format(h["what"], " in " + h["dir"] if h.get("dir") else "") if h.get("what") else "")
+        for h in holders) or "unknown"
 
 
-def acquire(limit_slots, info, poll=POLL, limit=WAIT_LIMIT, say=print):
+def acquire(limit_slots, info, poll=POLL, limit=WAIT_LIMIT, say=print, who="pa-full-suite"):
     """Takes a free slot (an open file holding an flock) out of limit_slots, waiting for one. Says once that it
     waits and for whom, and again when the holders change. Raises Waited after `limit` seconds."""
     folder = slot_dir()
@@ -83,15 +111,15 @@ def acquire(limit_slots, info, poll=POLL, limit=WAIT_LIMIT, say=print):
                 continue
             f.seek(0)
             f.truncate()
-            f.write(json.dumps(dict(info, pid=os.getpid(), start=pa.now())))
+            f.write(json.dumps(dict(info, pid=os.getpid(), start=stamp())))
             f.flush()
             return f
         text = describe(holders)
         if text != shown:
-            say("pa-full-suite: waiting for a free slot (cap {}): running: {}".format(limit_slots, text))
+            say("{}: waiting for the suite slot (cap {}): running: {}".format(who, limit_slots, text))
             shown = text
         if time.time() - began >= limit:
-            raise Waited("pa-full-suite: no slot came free in {:.0f} s (running: {})".format(time.time() - began, text))
+            raise Waited("{}: no slot came free in {:.0f} s (running: {})".format(who, time.time() - began, text))
         time.sleep(poll)
 
 
@@ -102,6 +130,111 @@ def release(f):
         fcntl.flock(f, fcntl.LOCK_UN)
     finally:
         f.close()
+
+
+def ancestors():
+    """This process's parent, its parent, and so on (ps), nearest first."""
+    found, pid = [], os.getppid()
+    while pid > 1 and pid not in found and len(found) < 64:
+        found.append(pid)
+        try:
+            out = subprocess.run(["ps", "-o", "ppid=", "-p", str(pid)], stdout=subprocess.PIPE,
+                                 stderr=subprocess.DEVNULL, universal_newlines=True, timeout=10).stdout
+            pid = int(out.strip())
+        except (OSError, ValueError, subprocess.SubprocessError):
+            break
+    return found
+
+
+def held_by_caller(path):
+    """The holder line of the slot at path when a caller of this process holds it (the path is one of this home's
+    slots, it is locked, and its recorded pid is an ancestor), else None: a stale or leaked marker is not trusted."""
+    if not path or not os.path.basename(path).startswith("slot-"):
+        return None
+    if os.path.dirname(os.path.realpath(path)) != os.path.realpath(slot_dir()) or not os.path.isfile(path):
+        return None
+    try:
+        f = open(path, "a+")
+    except OSError:
+        return None
+    try:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            pass  # locked: by whom is in its holder line
+        else:
+            fcntl.flock(f, fcntl.LOCK_UN)
+            return None
+    finally:
+        f.close()
+    holder = holder_of(path)
+    pid = holder.get("pid")
+    return holder if isinstance(pid, int) and pid in ancestors() else None
+
+
+def task_of(start):
+    """The task id of the worktree around start (pa-hooks install marks it in .claude/pa-task.json), else None."""
+    folder = os.path.realpath(start)
+    while True:
+        try:
+            with open(os.path.join(folder, ".claude", "pa-task.json")) as f:
+                record = json.load(f)
+            if isinstance(record, dict) and record.get("task"):
+                return record["task"]
+        except (OSError, ValueError):
+            pass
+        parent = os.path.dirname(folder)
+        if parent == folder:
+            return None
+        folder = parent
+
+
+def run_under_slot(argv):
+    """The script entry point (see the top): a slot, the command under it, its exit code."""
+    parser = argparse.ArgumentParser(prog="pa_suite.py slot")
+    parser.add_argument("--for", dest="what", default="a test run")
+    parser.add_argument("--worker", default="")
+    parser.add_argument("--dir", default=os.getcwd())
+    parser.add_argument("command", nargs=argparse.REMAINDER)
+    args = parser.parse_args(argv)
+    command = args.command[1:] if args.command[:1] == ["--"] else args.command
+    if not command:
+        parser.error("no command after --")
+    value = os.environ.get("PA_SUITE_WAIT_LIMIT", "")
+    limit = int(value) if value.isdigit() else WAIT_LIMIT
+    who = args.what.split()[0] if args.what.split() else "pa_suite.py"
+    marker = os.environ.get("PA_SUITE_SLOT", "")
+    caller, slot = held_by_caller(marker), None
+    if caller:
+        path = marker
+        hold = "held by the caller (task {}, pid {}, {})".format(caller.get("task"), caller.get("pid"), os.path.basename(path))
+    else:
+        queued = time.time()
+        info = {"task": task_of(args.dir), "worker": args.worker or None, "what": args.what, "dir": args.dir}
+        try:
+            slot = acquire(cap(), info, limit=limit, say=lambda m: print(m, flush=True), who=who)
+        except Waited as e:
+            print(e, flush=True)
+            return 124
+        except KeyboardInterrupt:
+            return 130
+        path = slot.name
+        hold = "waited {:.1f}s for {} (cap {})".format(time.time() - queued, os.path.basename(path), cap())
+    env = dict(os.environ, PA_SUITE_SLOT=path, PA_SUITE_SLOT_PID=str(os.getpid()), PA_SUITE_HOLD=hold)
+    child = None
+
+    def forward(sig, frame):  # TERM, INT or HUP to this process goes to the run, which stops its parts
+        if child is not None and child.poll() is None:
+            child.send_signal(sig)
+    try:
+        for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            signal.signal(sig, forward)
+        child = subprocess.Popen(command, env=env)
+        code = child.wait()
+    finally:
+        if slot is not None:
+            release(slot)
+    return 128 - code if code < 0 else code
 
 
 def untracked(h, repo):
@@ -290,6 +423,8 @@ def full_suite(h, args):
     except Waited as e:
         print(e)
         return sys.exit(124)
+    marker = os.environ.get("PA_SUITE_SLOT")
+    os.environ["PA_SUITE_SLOT"] = slot.name  # tests/run-all.sh under this run sees its caller holds the slot (t-072)
     try:
         waited = round(time.time() - queued, 1)
         found = pins(h, record["root"])  # MF-1: what runs is the tree at this point, not the one before the wait
@@ -300,6 +435,10 @@ def full_suite(h, args):
         seconds, end = round(time.time() - began, 1), pa.now()
         change = moved(found, pins(h, record["root"]))
     finally:
+        if marker is None:
+            os.environ.pop("PA_SUITE_SLOT", None)
+        else:
+            os.environ["PA_SUITE_SLOT"] = marker
         release(slot)
     with open(build_log, "a") as f:
         f.write("=== {} full suite: `{}` in {} -> exit {} after {:.0f}s ===\n{}\n".format(end, command, record["root"], code, seconds, h.tail(out, 200)))
@@ -317,3 +456,10 @@ def full_suite(h, args):
               "on with moved: true and is never reused; run pa-full-suite again for the new tree".format(change))
     print("full suite exit {} (appended to {}; {})".format(code, build_log, recorded))
     return sys.exit(code)
+
+
+if __name__ == "__main__":
+    if sys.argv[1:2] == ["slot"]:
+        sys.exit(run_under_slot(sys.argv[2:]))
+    print("usage: python3 pa_suite.py slot --for <what> [--worker W] [--dir D] -- <command...>", file=sys.stderr)
+    sys.exit(2)

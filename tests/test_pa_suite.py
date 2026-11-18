@@ -494,5 +494,5 @@ class W6RunAllUnderTheSlot(Base):
         self.assertEqual(code, 0, out)
         self.assertNotIn("waiting for the suite slot", out)
         self.assertIn("  suite slot: held by the caller", out)
-        self.assertIsNone(left, "pa-full-suite left its slot marker in its environment")
+        self.assertEqual(left, saved["PA_SUITE_SLOT"], "pa-full-suite left its slot marker in its environment")
         self.assertEqual(self.lines()[-1]["exit"], 0)

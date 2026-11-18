@@ -13,9 +13,16 @@
 # failing tests (lines starting FAIL or ERROR), else its last 40 lines. The last line names the folder.
 # Each part's TMPDIR is its own folder in there (<n>.tmp), so no part sees another's temp files, nor another
 # suite's running beside it.
-# Exit: 0 all passed, 1 a part failed, 2 a usage error or no temp folder, 130/143/129 interrupt, terminate, hangup.
+# The suite slot (t-072): a run with parts to run takes pa-full-suite's slot first (runtime/tools/pa_suite.py: an
+# flock under HERDR_PA_HOME/suite-slots, at most PA_SUITE_CAP runs at once), waiting its turn and saying for whom;
+# a dead holder never blocks, and a run whose caller holds the slot (pa-full-suite) does not wait for itself. The
+# summary's first line and the run folder's file `slot` say how long it waited. A run that selects no part takes
+# no slot; nor does one test module run on its own (python3 -m unittest tests.test_x).
+# Exit: 0 all passed, 1 a part failed, 2 a usage error or no temp folder, 124 no slot came free,
+# 130/143/129 interrupt, terminate, hangup.
 # Node: $NODE, else `node` on PATH, else the newest mise install.
 set -u
+worker=${HC_TERMINAL_ID:-}  # named to a run waiting for the slot (read before it is dropped below)
 # Never reach the person's hc core from a test: drop every variable that names it.
 unset HC_TERMINAL_ID HC_SOCKET HC_TERMINAL_SOCKET HC_SCOPE CLAUDECODE
 here=$(cd "$(dirname "$0")" && pwd)
@@ -86,8 +93,21 @@ fi
 [ "$want_store" = 1 ] && add store "store harness"
 [ "$affected" = 0 ] && add integration "pa-session integration (private hc core)"
 
+# Take the slot: pa_suite.py runs this script again under it, with PA_SUITE_SLOT_PID set to its own pid (this
+# script's parent then) and PA_SUITE_HOLD saying how it got the slot.
+helper=$repo/runtime/tools/pa_suite.py
+if [ "${PA_SUITE_SLOT_PID:-}" != "$PPID" ]; then
+  if [ -n "$PY" ] && [ -f "$helper" ]; then
+    exec "$PY" "$helper" slot --for "tests/run-all.sh${1:+ $1}" --worker "$worker" --dir "$repo" -- \
+      sh "$here/$(basename "$0")" "$@"
+  fi
+  PA_SUITE_HOLD="none (no $helper: this run took no slot)"
+fi
+hold=${PA_SUITE_HOLD:-unknown}
+
 tmp=${TMPDIR:-/tmp}
 out=$(mktemp -d "${tmp%/}/run-all.XXXXXX") || { echo "run-all.sh: cannot make a temp folder under $tmp" >&2; exit 2; }
+printf '%s\n' "$hold" > "$out/slot"
 log() { eval "echo \"\$out/\$1-\$part_$1\${arg_$1:+-\$arg_$1}.log\""; }
 # Print a file whole, ending in a newline.
 show() { cat "$1"; [ -s "$1" ] && [ -n "$(tail -c 1 "$1")" ] && echo; return 0; }
@@ -161,6 +181,7 @@ pids=
 
 # The summary: always the last lines (pa-full-suite keeps the tail of this output).
 echo "=== summary (each part's whole output: $out)"
+echo "  suite slot: $hold"
 failed=0 names= i=1
 while [ "$i" -le "$count" ]; do
   eval "name=\$name_$i; code=\$code_$i"
