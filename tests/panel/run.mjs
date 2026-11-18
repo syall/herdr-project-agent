@@ -2173,7 +2173,9 @@ cases["P-push-rules-invalid"] = async () => { // AC3.2: an invalid file says why
 
 // ---- t-009 Costs view (step 9c): R9, R11, R12, R14; every pa-costs call is answered by costsTool (an unanswered one is recorded) ----
 const isoAt = (ms) => new Date(ms).toISOString().replace(/\.\d+Z$/, "Z");
-const UTC_ARGS = ["--zone-offsets", "0:0", "--zone-name", "UTC"]; // the zone every world's collect passes (t-036)
+// Where the panel's zone table starts (t-036 round 2): 3653 days (10 years) before now, at that day's UTC midnight.
+const FROM0 = Math.floor((T0 - 3653 * 86400000) / 86400000) * 86400;
+const UTC_ARGS = ["--zone-offsets", "0:0", "--zone-name", "UTC", "--zone-from", String(FROM0)]; // the zone every world's collect passes (t-036)
 const CUR = "XTS"; // the ISO code kept for tests: generic code and tests name no real currency
 function costsSummary(over = {}) {
   const from = isoAt(T0 - 7200000), to = isoAt(T0 - 3600000);
@@ -2619,7 +2621,7 @@ cases["P-costs-actions"] = async () => { // R12: across every click the only pa-
   check(!(g.__writes ?? []).length && !g.__execs.some(([c, a]) => c === "python3" && a[0] === "-c"), `nothing written (got ${JSON.stringify(g.__writes)})`);
   check(!g.__costsUnexpected.length, `no unanswered pa-costs call (got ${JSON.stringify(g.__costsUnexpected)})`);
   // The collect's zone (t-036) is the one value besides them: a checked offset table and zone name.
-  const zoneValue = (a, i) => (a[i - 1] === "--zone-offsets" && /^\d+:-?\d+(,\d+:-?\d+)*$/.test(a[i])) || (a[i - 1] === "--zone-name" && /^[A-Za-z0-9_+\-/:.]{1,64}$/.test(a[i]));
+  const zoneValue = (a, i) => (a[i - 1] === "--zone-offsets" && /^\d+:-?\d+(,\d+:-?\d+)*$/.test(a[i])) || (a[i - 1] === "--zone-name" && /^[A-Za-z0-9_+\-/:.]{1,64}$/.test(a[i])) || (a[i - 1] === "--zone-from" && /^\d{1,12}$/.test(a[i]));
   for (const [, a] of costsExecs()) a.forEach((x, i) => check(typeof x === "string" && (x.startsWith("{") || /^[a-z-]+$|^sp1$/.test(x) || zoneValue(a, i)), `fixed argv words only (got ${x.slice(0, 80)})`));
 };
 
@@ -3765,7 +3767,7 @@ cases["D1-send-timeout"] = async () => { // a hung hc send is given up after 90 
 // A fake America/Los_Angeles (the panel machine's zone in these cases): minutes east of UTC from each change on.
 const LA_CHANGES = [[1772964000, -420], [1793523600, -480], [1805018400, -420], [1825578000, -480]];
 const laOffset = (ms) => { let m = -480; for (const [e, o] of LA_CHANGES) if (ms >= e * 1000) m = o; return m; };
-const LA_TABLE = [[0, -420], [1793523600, -480]]; // at T0 (2027-01-15T08:00Z = 00:00 PST): now - 100 d .. now + 35 d
+const LA_TABLE = [[0, -480], [1772964000, -420], [1793523600, -480]]; // at T0 (2027-01-15T08:00Z = 00:00 PST): now - 10 years .. now + 35 d
 const LA_DAYS = { zone: "America/Los_Angeles", offsets: LA_TABLE };
 const H20 = 20 * 3600000; // T0 + 20 h = 2027-01-16T04:00Z = 2027-01-15 20:00 PST: the local and the UTC day differ
 function zoneDays(days) {
@@ -3780,8 +3782,8 @@ cases["Z1-zone-table"] = async () => { // W2: the panel's zone as a table of off
   const { zone, zoneTable, zoneArgs, localDate, daysBefore, summaryZone, oldTool } = zoneMod;
   setZone(laOffset, "America/Los_Angeles");
   check(JSON.stringify(zoneTable(T0)) === JSON.stringify(LA_TABLE), `the LA table at T0 (got ${JSON.stringify(zoneTable(T0))})`);
-  check(JSON.stringify(zoneTable(T0 + 60 * 86400000)) === JSON.stringify([[0, -480], [1805018400, -420]]), `the spring change once it is within 35 days (got ${JSON.stringify(zoneTable(T0 + 60 * 86400000))})`);
-  check(JSON.stringify(zoneArgs(T0)) === JSON.stringify(["--zone-offsets", "0:-420,1793523600:-480", "--zone-name", "America/Los_Angeles"]), `the args (got ${JSON.stringify(zoneArgs(T0))})`);
+  check(JSON.stringify(zoneTable(T0 + 60 * 86400000)) === JSON.stringify([...LA_TABLE, [1805018400, -420]]), `the spring change once it is within 35 days (got ${JSON.stringify(zoneTable(T0 + 60 * 86400000))})`);
+  check(JSON.stringify(zoneArgs(T0)) === JSON.stringify(["--zone-offsets", "0:-480,1772964000:-420,1793523600:-480", "--zone-name", "America/Los_Angeles", "--zone-from", String(FROM0)]), `the args (got ${JSON.stringify(zoneArgs(T0))})`);
   zone.name = () => null;
   check(zoneArgs(T0)[3] === "UTC-08:00", `no zone name: the offset now (got ${zoneArgs(T0)[3]})`);
   setZone(() => 330, null);
@@ -3825,7 +3827,7 @@ cases["Z3-other-zone-labelled"] = async () => { // W2: days of another zone, or 
 };
 
 cases["Z4-collect-zone"] = async () => { // W2: the timer's and Refresh's collect pass the panel's zone
-  const la = ["--zone-offsets", "0:-420,1793523600:-480", "--zone-name", "America/Los_Angeles"];
+  const la = ["--zone-offsets", "0:-480,1772964000:-420,1793523600:-480", "--zone-name", "America/Los_Angeles", "--zone-from", String(FROM0)];
   timerWorld({ machine: M });
   setZone(laOffset, "America/Los_Angeles");
   const { tick } = await timerMod();
@@ -3858,6 +3860,29 @@ cases["Z5-cc-date-and-billed-days"] = async () => { // W1: the CC cover date is 
   const text = costsView(v).text;
   check(text.includes("Claude Code's figure covers sessions started from 2027-01-13;"), `the local date (got ${text.slice(0, 3000)})`);
   check(/Covered 2027-01-10 – 2027-01-14 \(5 of 6 days; not billed: 2027-01-15\) · source query:q1, fetched [^|]* \(billing days are UTC days\)/.test(text), `billed days labelled (got ${text.slice(text.indexOf("Covered"), text.indexOf("Covered") + 300)})`);
+};
+
+cases["Z6-old-days"] = async () => { // round 2 (REVIEW MF1): a day older than a table is never drawn as a local day unlabelled
+  const { zoneArgs, summaryZone } = zoneMod;
+  setZone(laOffset, "America/Los_Angeles");
+  // A summary cut by a table that reaches back 100 days only, with a local day from before it: not this panel's days.
+  const short = { zone: "America/Los_Angeles", offsets: [[0, -420], [1793523600, -480]] };
+  const old = summaryZone({ days: short, byDay: [{ key: "2027-01-15" }, { key: "2026-02-09" }] }, T0);
+  check(old.local === false && old.label === "America/Los_Angeles", `an old local day from a short table: labelled (got ${JSON.stringify(old)})`);
+  check(summaryZone({ days: LA_DAYS, byDay: [{ key: "2027-01-15" }, { key: "2026-02-09" }] }, T0).local === true, "the same old day from a table like this panel's: local");
+  // The day pa-costs cut in UTC (before the table's start) says so beside its date; the others are local days.
+  const s = zoneDays({ ...LA_DAYS, from: FROM0 });
+  s.byDay.push({ key: "2016-12-01", tokens: 5, money: 1, calls: 1, byActivity: {}, utc: true });
+  const { v } = await costsWorld({ summary: s, open: false });
+  setZone(laOffset, "America/Los_Angeles");
+  await click(v, "view-costs"); await settle();
+  const text = costsView(v).text;
+  check(/By day \|/.test(text) && text.includes("2016-12-01 (UTC)") && !text.includes("2027-01-15 (UTC)"), `the UTC day labelled, the local ones not (got ${text.slice(0, 3000)})`);
+  // A zone with more changes than pa-costs takes (64): the newest kept, the table starts at the first kept one.
+  setZone((ms) => (Math.floor(ms / (20 * 86400000)) % 2 ? 60 : 0), "Test/Flip");
+  const a = zoneArgs(T0), parts = a[1].split(","), from = Number(a[5]);
+  check(a[4] === "--zone-from" && parts.length === 64 && parts[0].startsWith("0:") && from === Number(parts[1].split(":")[0]) - 20 * 86400 && from > FROM0,
+    `capped at 64 (got ${parts.length} parts, from ${a[5]}, second ${parts[1]})`);
 };
 
 // Which cases run (t-031): every case, or the named ones; --shard=<k>/<n> keeps every n-th case by definition

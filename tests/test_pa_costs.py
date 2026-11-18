@@ -3938,6 +3938,75 @@ class T36_LocalDays(Collecting):
             self.assertEqual(pa_costs.machine_zone(T0), {"zone": "UTC", "offsets": [[0, 0]]})
 
 
+    # ---- round 2 (REVIEW MF1): every day cut locally falls inside the zone table; before it, UTC days, labelled ----
+    def test_mf1_a_row_before_the_panels_table_is_a_utc_day_labelled(self):
+        # The reviewer's repro: the LA table a panel passed on 2026-11-17 that reaches back 100 days only.
+        old = pa_costs.parse_ts("2026-02-10T07:30:00Z")  # 23:30 PST on 2026-02-09
+        rows = [self.row(old, 1), self.row(T0 - 1800, 2)]  # and 2026-11-16 15:30 PST
+        short = pa_costs.parse_zone("0:-420,1793523600:-480", "America/Los_Angeles", known_from=T0 - 100 * 86400)
+        s = self.summ(rows, short, now=T0)
+        self.assertEqual(self.keys(s), ["2026-11-16", "2026-02-10"])  # 02-10: its UTC day, never a guessed local one
+        by = {d["key"]: d for d in s["byDay"]}
+        self.assertIs(by["2026-02-10"].get("utc"), True)
+        self.assertNotIn("utc", by["2026-11-16"])
+        self.assertEqual(s["days"], {"zone": "America/Los_Angeles", "offsets": [[0, -420], [1793523600, -480]], "from": T0 - 100 * 86400})
+        # A table that reaches back to it: the local day, not labelled.
+        full = pa_costs.parse_zone(LA_ARG, "America/Los_Angeles", known_from=T0 - 3653 * 86400)
+        s = self.summ(rows, full, now=T0)
+        self.assertEqual(self.keys(s), ["2026-11-16", "2026-02-09"])
+        self.assertFalse([d for d in s["byDay"] if "utc" in d])
+
+    def test_mf1_the_cli_takes_where_the_panels_table_starts(self):
+        os.makedirs(os.path.join(self.dir, "costs"), exist_ok=True)
+        self.record(session=SID, task="t-001", terminal="t5")
+        args = ["collect", "--space", "sp1", "--quiet", "--zone-offsets", LA_ARG, "--zone-name", "America/Los_Angeles"]
+        r, _out, _err = self.run_cmd(pa_costs.main, args + ["--zone-from", "1478000000"])
+        self.assertEqual(r, 0)
+        self.assertEqual(load(self.costs("zone.json")), dict(LA_ZONE, **{"from": 1478000000}))
+        for bad in ("x", "1.5", "1234567890123"):
+            with self.assertRaises(pa.Problem, msg=bad):
+                pa_costs.main(args + ["--zone-from", bad])
+        # The start moves on every day the panel runs: kept, but not a new zone (no rewrite of the summary for it).
+        self.assertFalse(pa_costs.save_zone(self.dir, dict(LA_ZONE, **{"from": 1478086400})))
+        self.assertEqual(pa_costs.load_zone(self.dir)["from"], 1478086400)
+        self.assertTrue(pa_costs.save_zone(self.dir, {"zone": "UTC", "offsets": [[0, 0]], "from": 1478086400}))
+
+    def test_mf1_report_since_and_until_before_100_days_are_local_days(self):
+        old = pa_costs.parse_ts("2026-02-10T07:30:00Z")  # 23:30 PST on 2026-02-09
+        self.prices()
+        self.record(session=SID, task="t-001", terminal="t5")
+        self.add(self.prompt(old - 1), self.call(old, "m1", lines=1, out=10))
+        self.collect(old + 2000)
+        self.add(self.prompt(T0 - 1800), self.call(T0 - 1799, "m2", lines=1, out=10))
+        self.collect(T0 - 1000)
+        with tz("America/Los_Angeles"):
+            _r, out, _e = self.run_cmd(pa_costs.report, self.dir, by="day", since="2026-02-09", until="2026-02-09", now=T0)
+            self.assertIn("  2026-02-09", out)
+            self.assertNotIn("  2026-02-10", out)
+            self.assertNotIn("  2026-11-16", out)
+            _r, out, _e = self.run_cmd(pa_costs.report, self.dir, by="day", until="2026-02-09", now=T0)
+            self.assertIn("  2026-02-09", out)
+            _r, out, _e = self.run_cmd(pa_costs.report, self.dir, by="day", now=T0)
+            self.assertIn("  2026-02-09", out)
+            self.assertIn("  2026-11-16", out)
+            self.assertNotIn("(UTC)", out)
+
+    def test_mf1_machine_zone_reaches_back_to_the_oldest_row(self):
+        old = pa_costs.parse_ts("2026-02-10T07:30:00Z")
+        with tz("America/Los_Angeles"):
+            z = pa_costs.machine_zone(T0, oldest=old)
+            self.assertEqual(z, {"zone": "PST", "offsets": [[0, -480], [1772964000, -420], [1793523600, -480]]})
+            # Further back than ZONE_MAX entries hold: the newest kept, "from" where they start; before it UTC days.
+            z = pa_costs.machine_zone(T0, oldest=T0 - 40 * 365 * 86400)
+            self.assertLessEqual(len(z["offsets"]), pa_costs.ZONE_MAX)
+            self.assertEqual(z["offsets"][0][0], 0)
+            self.assertEqual(z["offsets"][-1], [1793523600, -480])
+            self.assertGreater(z["from"], T0 - 40 * 365 * 86400)
+            before = z["from"] - z["from"] % 86400 - 86400 + 3600  # 01:00Z before it: the day before in LA
+            self.assertEqual(pa_costs.day_in(z, pa_costs.iso(before)), pa_costs.iso(before)[:10])
+            self.assertEqual(pa_costs.zone_of({"days": z}), z)  # it round-trips through the summary
+
+
 class ZZ_V1_Privacy(unittest.TestCase):
     """Run last: the canary of every fixture reached no file under costs/ or billing/ and no captured output."""
 
