@@ -1,8 +1,9 @@
 #!/bin/sh
 # All of this repo's tests. Exits non-zero if any part fails.
 #   tests/run-all.sh             full suite: Python 3.7 parse check, unit tests (each tests/test_*.py its own part),
-#                                keeper harness, panel harness, store harness, and the pa-session integration check
-#                                against a private hc core
+#                                keeper harness, panel harness (four parts: run.mjs --shard=1/4 .. 4/4, each case in
+#                                exactly one), store harness, and the pa-session integration check against a
+#                                private hc core
 #   tests/run-all.sh --affected  the fast set only (no integration check). With PA_CHANGED_FILES
 #                                (paths separated by spaces or newlines), parts whose files did not
 #                                change are skipped; without it, the whole fast set runs.
@@ -51,7 +52,10 @@ parse37() { "$PY" -c "import ast,sys
 for f in sys.argv[1:]: ast.parse(open(f).read(), feature_version=(3,7)); print(f, 'parses as Python 3.7')" runtime/tools/pa.py runtime/tools/pa_hooks.py runtime/tools/pa_guard.py runtime/tools/pa_costs.py runtime/tools/pa_push.py; }
 units() { "$PY" -m unittest discover -s tests -p "$1.py" -v; }  # one module: the same loader and top folder
 keeper() { [ -n "$NODE" ] || { echo "no node found (set NODE)"; return 1; }; "$NODE" tests/keeper/run.mjs; }
-panel() { [ -n "$NODE" ] || { echo "no node found (set NODE)"; return 1; }; "$NODE" tests/panel/run.mjs; }
+# The panel harness is one part per shard (t-031): its time is nearly all short real timers, not CPU, so its
+# shards running at once divide its wall time. $1 is the shard, 1..panel_parts.
+panel_parts=4
+panel() { [ -n "$NODE" ] || { echo "no node found (set NODE)"; return 1; }; "$NODE" tests/panel/run.mjs "--shard=$1/$panel_parts"; }
 store() { [ -n "$NODE" ] || { echo "no node found (set NODE)"; return 1; }; "$NODE" tests/store/run.mjs; }
 integration() {
   S=$(mktemp -d /tmp/t001.XXXXXX) || return 1
@@ -75,7 +79,10 @@ if [ "$want_py" = 1 ]; then
   done
 fi
 [ "$want_keeper" = 1 ] && add keeper "keeper harness"
-[ "$want_panel" = 1 ] && add panel "panel harness"
+if [ "$want_panel" = 1 ]; then
+  k=1
+  while [ "$k" -le "$panel_parts" ]; do add panel "panel harness $k/$panel_parts" "$k"; k=$((k + 1)); done
+fi
 [ "$want_store" = 1 ] && add store "store harness"
 [ "$affected" = 0 ] && add integration "pa-session integration (private hc core)"
 
