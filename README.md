@@ -118,7 +118,8 @@ A push card's entry lasts while its push run is in flight (its `ttl`, at most 72
 run ends answered (an answered result, not an unknown one); a refused run removes it. An unknown push
 result (`unknown: true`) never expires: every copy keeps the card locked, with only Check again, until a
 check from any panel copy, asked at or after the result, reads the card open; that removes the one shared
-entry, so every copy unlocks. A copy's load that reads the card file and finds it no longer open also
+entry, so every other copy unlocks. The copy that ran the push stays locked until a check of its own
+reads the card open. A copy's load that reads the card file and finds it no longer open also
 removes the entry (stale entries are cleaned up by `resolveMarks`), and the card is then drawn from the
 file. Writing any entry also drops entries that have expired. The copy that submitted
 draws the card answered from the click until a read of the card file shows the answer (or a change made
