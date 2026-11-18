@@ -414,5 +414,56 @@ class W4RunAllTimes(unittest.TestCase):
         self.assertTrue(all(p["ok"] for n, p in by.items() if n != "store harness"), by)
 
 
+class W5Pins(Base):
+    """MF-1: the record names the tree that ran. A commit made while the run waits for a slot is what runs and
+    what is recorded; a change during the run itself leaves a record that is never reused."""
+    holder = W3Cap.holder
+
+    def commit(self, message):
+        sh(self.wt, "git", "add", "-A")
+        sh(self.wt, "git", "commit", "-q", "-m", message)
+        return sh(self.wt, "git", "rev-parse", "HEAD"), sh(self.wt, "git", "rev-parse", "HEAD^{tree}")
+
+    def test_w5a_a_commit_made_while_waiting_is_what_is_recorded(self):
+        write(os.path.join(self.wt, "bad.txt"), "x\n")
+        commit_x, tree_x = self.commit("x")
+        self.set_command(self.counting("test ! -f bad.txt"))  # fails on tree X, passes on tree Y
+        p = self.holder(0)
+        got = {}
+        t = threading.Thread(target=lambda: got.update(r=self.main()))
+        t.start()
+        time.sleep(1)
+        self.assertTrue(t.is_alive(), got)  # it waits for slot 0
+        os.remove(os.path.join(self.wt, "bad.txt"))
+        commit_y, tree_y = self.commit("y")
+        p.kill()
+        p.wait()
+        t.join(30)
+        self.assertFalse(t.is_alive())
+        self.assertEqual(got["r"][0], 0, got["r"][1])
+        line = self.lines()[-1]
+        self.assertEqual((line["tree"], line["commit"]), (tree_y, commit_y), "the record names the tree it tested")
+        sh(self.wt, "git", "revert", "--no-edit", "-q", "HEAD")  # tree X again, clean
+        self.assertEqual(sh(self.wt, "git", "rev-parse", "HEAD^{tree}"), tree_x)
+        code, out = self.main()
+        self.assertNotIn("already passed", out)
+        self.assertEqual((code != 0, self.runs()), (True, 2), out)
+
+    def test_w5b_a_change_during_the_run_is_never_reused(self):
+        write(os.path.join(self.wt, "moveme.txt"), "m\n")
+        commit_x, tree_x = self.commit("x")
+        self.set_command(self.counting("if [ -f moveme.txt ]; then git rm -q moveme.txt && git commit -q -m m; fi"))
+        code, out = self.main()
+        self.assertEqual(code, 0, out)
+        self.assertIn("changed during the run", out)
+        line = self.lines()[-1]
+        self.assertEqual((line["commit"], line["tree"], line.get("moved")), (commit_x, tree_x, True))
+        sh(self.wt, "git", "revert", "--no-edit", "-q", "HEAD")  # tree X again, clean
+        self.assertEqual(sh(self.wt, "git", "rev-parse", "HEAD^{tree}"), tree_x)
+        code, out = self.main()
+        self.assertNotIn("already passed", out)
+        self.assertEqual(self.runs(), 2, out)
+
+
 if __name__ == "__main__":
     unittest.main()
