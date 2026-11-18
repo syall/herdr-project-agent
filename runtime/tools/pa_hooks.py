@@ -1338,7 +1338,8 @@ def cmd_worktree(args):
 
 def withdraw_answered(directory, path, card, task, why):
     """pa-worktree remove withdraws an answered card that no longer stands; the next check asks again."""
-    card.update(status="withdrawn", previousAnswer=card.get("answer"), answer=None, answered=pa.now(),
+    pa.keep_previous(card, card.get("answer"))
+    card.update(status="withdrawn", answer=None, answered=pa.now(),
                 answeredBy="pa-worktree remove: withdrawn", note="Withdrawn by pa-worktree remove: " + why)
     pa.write_json(path, card)
     append_journal(directory, {"by": "agent" if by_an_agent() else "person", "trigger": "worktree", "task": task,
@@ -2088,8 +2089,8 @@ def leftovers_card(directory, card_id):
     if pa.is_other(card):
         # The person's own words are never parsed, as a note: close nothing, withdraw, and the next sweep asks again.
         words = cut(clean(card.get("note")), 200)
-        card.update(status="withdrawn", previousAnswer=pa.OTHER, previousNote=card.get("note"), previousAnswered=card.get("answered"),
-                    answer=None, answeredBy="pa-worker close: withdrawn", withdrawnAt=pa.now())
+        pa.keep_previous(card, pa.OTHER)
+        card.update(status="withdrawn", answer=None, answeredBy="pa-worker close: withdrawn", withdrawnAt=pa.now())
         card.pop("other", None)
         pa.write_json(os.path.join(directory, "decisions", card_id + ".json"), card)
         append_journal(directory, {"by": "agent" if by_an_agent() else "person", "trigger": "leftovers",
@@ -2101,8 +2102,8 @@ def leftovers_card(directory, card_id):
         raise pa.Problem("card {} was answered {!r}; nothing was closed".format(card_id, card.get("answer")))
     if str(card.get("note") or "").strip():
         # A note is never parsed: it could name a worker to keep in any words. Close nothing and ask again.
-        card.update(status="withdrawn", previousAnswer=card.get("answer"), answer=None, answeredBy="pa-worker close: withdrawn",
-                    withdrawnAt=pa.now())
+        pa.keep_previous(card, card.get("answer"))
+        card.update(status="withdrawn", answer=None, answeredBy="pa-worker close: withdrawn", withdrawnAt=pa.now())
         pa.write_json(os.path.join(directory, "decisions", card_id + ".json"), card)
         append_journal(directory, {"by": "agent" if by_an_agent() else "person", "trigger": "leftovers",
                                    "why": "withdrew card {}: it was answered with a note ({}); nothing was closed".format(card_id, cut(clean(card["note"]), 200))})

@@ -1885,6 +1885,19 @@ def words_cut(text, limit=200):
     return text if len(text) <= limit else text[:limit - 1] + "… (the rest is on the card)"
 
 
+def keep_previous(card, answer):
+    """A withdraw keeps what the card being withdrawn was answered: `answer`, its words and when, written together so
+    the three always describe the same answer (t-046 J1b round 2). Absent words leave no previousNote key; an older
+    carried value of any of the three is replaced or dropped. Call it before the withdraw changes note or answered."""
+    note, answered = card.get("note"), card.get("answered")
+    for key, value in (("previousAnswer", answer), ("previousNote", note if str(note or "").strip() else None),
+                       ("previousAnswered", answered)):
+        if value is None:
+            card.pop(key, None)
+        else:
+            card[key] = value
+
+
 def push_card_lock(directory):
     """The space's push lock (<space>/.push.lock, as pa_push.push_lock takes it): every write of a push card holds
     it, so pa-decide never writes one while pa-push-main runs. Returns the open file; close it to unlock."""
@@ -1934,7 +1947,7 @@ def decide_card(directory, path, args):
             raise Problem("--withdraw needs --why \"<reason>\"")
         if withdraw_other:
             # Their words asked for the question again: the tool that owns the card asks again; the words are kept.
-            card.update(previousAnswer=OTHER, previousNote=card.get("note"), previousAnswered=card.get("answered"))
+            keep_previous(card, OTHER)
             card.pop("other", None)
         card.update(status="withdrawn", answer=None, note=args.why.strip(), answered=stamp, answeredBy="orchestrator: withdrawn")
         what = "withdrawn"
@@ -1979,7 +1992,7 @@ def decide_card(directory, path, args):
     write_json(path, card)
     with open(os.path.join(directory, "journal.jsonl"), "a") as journal:
         journal.write(json.dumps({"at": stamp, "by": "orchestrator", "trigger": "conversation", "task": card.get("task"), "decision": args.card,
-                                  "why": "{}{}: {}".format(what, ' (was Other: "{}")'.format(words_cut(card["previousNote"])) if withdraw_other else "",
+                                  "why": "{}{}: {}".format(what, ' (was Other: "{}")'.format(words_cut(card.get("previousNote"))) if withdraw_other else "",
                                                            card["note"])}) + "\n")
     print("{} {} ({}).".format(args.card, what, card["answeredBy"]))
     if after:
