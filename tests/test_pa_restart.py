@@ -1056,7 +1056,8 @@ class Command(Base):
                       "w3": {"address": "w3", "state": "live", "parent": "t9", "name": "other-space"}}
         pa.hc_get = lambda address: dict(self.terms.get(address) or {})
         pa.live_terminals = lambda: {k: dict(v) for k, v in self.terms.items()}
-        self.saved_env = {k: os.environ.get(k) for k in ("CLAUDECODE", "HC_TERMINAL_ID")}
+        self.saved_env = {k: os.environ.get(k) for k in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CODEX_SANDBOX",
+                                                         "HC_TERMINAL_ID")}
         for k in self.saved_env:
             os.environ.pop(k, None)
         self.saved_poll, self.saved_relay = pa.RESTART_POLL, pa.relay
@@ -1994,7 +1995,8 @@ class EndTerminal(Command):
         super().tearDown()
 
     def run_end(self, **over):
-        args = dict(end_terminal=True, anyway=False, confirmed_terminal=None, confirmed_workers=None)
+        args = dict(end_terminal=True, anyway=False, confirmed_terminal=None, confirmed_workers=None,
+                    relay_issue=False, relay_token=None)
         args.update(over)
         return self.run_cmd(**args)
 
@@ -2303,7 +2305,8 @@ class AC10_1_After(EndTerminal):
 
 class AC10_1_On(EndTerminal):
     def dry(self, workers):
-        return (0, "Ends: terminal t1 ...\n" + json.dumps({"outcome": "dry-run", "terminal": "t1", "workers": workers}) + "\n")
+        return (0, "Ends: terminal t1 ...\n" + json.dumps({"outcome": "dry-run", "terminal": "t1", "workers": workers,
+                                                            "token": "tok123"}) + "\n")
 
     def test_on_asks_here_then_relays_bound_to_what_was_confirmed(self):
         self.relay_answer = self.dry(["w4", "w1"])
@@ -2322,9 +2325,10 @@ class AC10_1_On(EndTerminal):
         self.assertEqual(first[:5], ["hc", "exec", "--on", "m2", "--timeout"])
         w1 = shlex.split(first[-1])
         self.assertEqual(w1[:3], ["$HOME/.config/herdr-pa/tools/pa.py", "restart", "--space"])
-        for part in ("--end-terminal", "--dry-run", "--json", "--anyway"):
+        for part in ("--end-terminal", "--dry-run", "--json", "--anyway", "--relay-issue"):
             self.assertIn(part, w1)
         w2 = shlex.split(second[-1])
+        self.assertEqual(w2[w2.index("--relay-token") + 1], "tok123")
         self.assertNotIn("--dry-run", w2)
         self.assertEqual(w2[w2.index("--confirmed-terminal") + 1], "t1")
         self.assertEqual(w2[w2.index("--confirmed-workers") + 1], "w1,w4")
@@ -2364,23 +2368,239 @@ class AC10_1_On(EndTerminal):
             raise AssertionError("the bound form never asks")
 
         self.answer = never
-        c, out, err = self.run_end(anyway=True, confirmed_terminal="t1", confirmed_workers="w1")
+        c, out, err = self.run_end(anyway=True, confirmed_terminal="t1", confirmed_workers="w1",
+                                   relay_token=self.issue(anyway=True))
         self.assertEqual(c, 1, out + err)
         self.assertIn("changed since you answered", err)
         self.assertEqual(self.kills(), [])
-        c, out, err = self.run_end(anyway=True, confirmed_terminal="t2", confirmed_workers="w1,w4")
+        c, out, err = self.run_end(anyway=True, confirmed_terminal="t2", confirmed_workers="w1,w4",
+                                   relay_token=self.issue(anyway=True))
         self.assertEqual(c, 1, out + err)
         self.assertEqual(self.kills(), [])
-        c, out, err = self.run_end(anyway=True, confirmed_terminal="t1", confirmed_workers="w1,w4")
+        c, out, err = self.run_end(anyway=True, confirmed_terminal="t1", confirmed_workers="w1,w4",
+                                   relay_token=self.issue(anyway=True))
         self.assertEqual(c, 0, out + err)
         self.assertEqual(self.kills(), [["hc", "kill", "t1"]])
+
+    def issue(self, **over):
+        """The remote side's dry run as the relay asks for it: the one-time token it hands back (round 2)."""
+        saved, pa.interactive = pa.interactive, lambda: False
+        try:
+            c, out, err = self.run_end(dry_run=True, json=True, relay_issue=True, **over)
+        finally:
+            pa.interactive = saved
+        self.assertEqual(c, 0, out + err)
+        return json.loads(out.strip().splitlines()[-1])["token"]
 
     def test_remote_side_bound_no_workers(self):
         self.no_workers()
         pa.interactive = lambda: False
-        c, out, err = self.run_end(confirmed_terminal="t1", confirmed_workers="-")
+        c, out, err = self.run_end(confirmed_terminal="t1", confirmed_workers="-", relay_token=self.issue())
         self.assertEqual(c, 0, out + err)
         self.assertEqual(self.kills(), [["hc", "kill", "t1"]])
+
+
+
+class J3R2_KillUnknown(EndTerminal):
+    """Round 2, REVIEW J3 M1 (plan J3.2 step 7, V6): when hc kill failed, the terminal counts as ended only when hc
+    says its state is finished; an hc get that does not answer is not ended, and nothing new starts."""
+
+    def setUp(self):
+        super().setUp()
+        self.no_workers()
+
+    def kill_fails_then(self, answer):
+        def call(argv, check=True):
+            self.calls.append(list(argv))
+            if argv[:2] == ["hc", "kill"]:
+                pa.hc_get = lambda a: dict(answer)
+                raise pa.Problem("hc kill failed: connection refused")
+            return ""
+
+        pa.call = call
+
+    def test_kill_error_and_hc_get_silent_is_not_ended(self):
+        self.kill_fails_then({})
+        c, out, err = self.run_end(json=True)
+        self.assertEqual(c, 1, out + err)
+        self.assertNotIn("Terminal t1 ended", out)
+        self.assertIn("nothing new was started", err)
+        self.assertIn("connection refused", err)
+        self.assertEqual(self.started, [])
+        self.assertEqual(json.loads(out.strip().splitlines()[-1])["outcome"], "not-ended")
+        with open(os.path.join(self.dir, "session.log")) as f:
+            self.assertIn("end-terminal not-ended terminal=t1", f.read())
+
+    def test_kill_error_and_no_state_is_not_ended(self):
+        self.kill_fails_then({"address": "t1", "state": ""})
+        c, out, err = self.run_end()
+        self.assertEqual(c, 1, out + err)
+        self.assertEqual(self.started, [])
+
+    def test_kill_error_and_finished_is_ended(self):
+        self.kill_fails_then({"address": "t1", "state": "finished"})
+        c, out, err = self.run_end()
+        self.assertEqual(c, 0, out + err)
+        self.assertIn("Terminal t1 ended", out)
+        self.assertEqual(len(self.started), 1)
+
+
+class J3R2_AgentsRefused(EndTerminal):
+    """Round 2, REVIEW J3 RL-J3-2: every agent marker the repo knows refuses --end-terminal (as pa-task does), also
+    with --on (no relay) and with the bound form."""
+
+    def test_each_agent_marker_refused(self):
+        for k in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CODEX_SANDBOX"):
+            os.environ[k] = "seatbelt" if k == "CODEX_SANDBOX" else "1"
+            try:
+                for over in ({}, {"dry_run": True}, {"on": "m2"},
+                             {"anyway": True, "confirmed_terminal": "t1", "confirmed_workers": "w1,w4",
+                              "relay_token": "x"}):
+                    c, out, err = self.run_end(**over)
+                    self.assertEqual(c, 2, (k, over, out + err))
+                    self.assertIn("person's command", err, k)
+            finally:
+                os.environ.pop(k, None)
+        self.assertEqual(self.relayed, [])
+        self.assertEqual(self.kills(), [])
+        self.assertEqual(self.asked, [])
+        self.nothing_written()
+
+
+class J3R2_RelayBound(EndTerminal):
+    """Round 2, REVIEW J3 RL-J3-2: --confirmed-terminal/--confirmed-workers are the --on relay's remote side only. They
+    need a one-time token that the relay's own dry run (--relay-issue) wrote in the space's folder, and a run with no
+    terminal (hc exec: no tty, no HC_TERMINAL_ID). A direct local run never skips the typed yes."""
+
+    TOKEN = "end-terminal-token.json"
+
+    def setUp(self):
+        super().setUp()
+        pa.interactive = lambda: False
+
+        def never(*a):
+            raise AssertionError("the bound form never asks")
+
+        self.answer = never
+
+    def issue(self, **over):
+        c, out, err = self.run_end(dry_run=True, json=True, relay_issue=True, **over)
+        self.assertEqual(c, 0, out + err)
+        return json.loads(out.strip().splitlines()[-1])["token"]
+
+    def bound(self, token, **over):
+        args = dict(anyway=True, confirmed_terminal="t1", confirmed_workers="w1,w4", relay_token=token)
+        args.update(over)
+        return self.run_end(**args)
+
+    def test_confirmed_flags_without_a_token_refused(self):
+        c, out, err = self.bound(None)
+        self.assertNotEqual(c, 0, out + err)
+        self.assertIn("relay", err)
+        self.assertEqual(self.kills(), [])
+        self.nothing_written()
+
+    def test_confirmed_flags_with_a_made_up_token_refused(self):
+        c, out, err = self.bound("tok123")
+        self.assertNotEqual(c, 0, out + err)
+        self.assertEqual(self.kills(), [])
+        self.nothing_written()
+
+    def test_relay_issue_writes_a_private_token_and_answers_it(self):
+        token = self.issue(anyway=True)
+        self.assertTrue(isinstance(token, str) and len(token) >= 32)
+        path = os.path.join(self.dir, self.TOKEN)
+        self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+        rec = load(path)
+        self.assertEqual((rec["terminal"], rec["workers"]), ("t1", ["w1", "w4"]))
+        self.assertEqual(self.kills(), [])
+
+    def test_the_relays_cycle_ends_once_and_the_token_is_used_up(self):
+        token = self.issue(anyway=True)
+        c, out, err = self.bound(token)
+        self.assertEqual(c, 0, out + err)
+        self.assertEqual(self.kills(), [["hc", "kill", "t1"]])
+        self.assertFalse(os.path.exists(os.path.join(self.dir, self.TOKEN)))
+
+    def test_a_wrong_token_uses_it_up(self):
+        token = self.issue(anyway=True)
+        c, out, err = self.bound(token[::-1])
+        self.assertNotEqual(c, 0, out + err)
+        self.assertFalse(os.path.exists(os.path.join(self.dir, self.TOKEN)))
+        c, out, err = self.bound(token)
+        self.assertNotEqual(c, 0, out + err)
+        self.assertEqual(self.kills(), [])
+
+    def test_an_expired_token_refused(self):
+        token = self.issue(anyway=True)
+        path = os.path.join(self.dir, self.TOKEN)
+        rec = load(path)
+        rec["expires"] = time.time() - 1
+        dump(rec, path)
+        c, out, err = self.bound(token)
+        self.assertNotEqual(c, 0, out + err)
+        self.assertEqual(self.kills(), [])
+
+    def test_from_a_terminal_refused_even_with_the_token(self):
+        token = self.issue(anyway=True)
+        pa.interactive = lambda: True
+        c, out, err = self.bound(token)
+        self.assertNotEqual(c, 0, out + err)
+        self.assertEqual(self.kills(), [])
+        pa.interactive = lambda: False
+        token = self.issue(anyway=True)
+        os.environ["HC_TERMINAL_ID"] = "t5"
+        try:
+            c, out, err = self.bound(token)
+        finally:
+            os.environ.pop("HC_TERMINAL_ID", None)
+        self.assertNotEqual(c, 0, out + err)
+        self.assertEqual(self.kills(), [])
+
+    def test_relay_issue_from_a_terminal_refused(self):
+        pa.interactive = lambda: True
+        c, out, err = self.run_end(dry_run=True, json=True, relay_issue=True, anyway=True)
+        self.assertNotEqual(c, 0, out + err)
+        self.assertFalse(os.path.exists(os.path.join(self.dir, self.TOKEN)))
+        pa.interactive = lambda: False
+        os.environ["HC_TERMINAL_ID"] = "t5"
+        try:
+            c, out, err = self.run_end(dry_run=True, json=True, relay_issue=True, anyway=True)
+        finally:
+            os.environ.pop("HC_TERMINAL_ID", None)
+        self.assertNotEqual(c, 0, out + err)
+        self.assertFalse(os.path.exists(os.path.join(self.dir, self.TOKEN)))
+
+    def test_relay_issue_needs_a_dry_run(self):
+        c, out, err = self.run_end(relay_issue=True, anyway=True)
+        self.assertNotEqual(c, 0, out + err)
+        self.assertEqual(self.kills(), [])
+
+    def test_on_side_needs_the_token_from_the_dry_run(self):
+        pa.interactive = lambda: True
+        self.answer = "yes"
+        self.relay_answer = (0, json.dumps({"outcome": "dry-run", "terminal": "t1", "workers": []}) + "\n")
+        c, out, err = self.run_end(on="m2")
+        self.assertNotEqual(c, 0, out + err)
+        self.assertEqual(len(self.relayed), 1)
+        self.assertEqual(self.asked, [])
+
+
+class J3R2_Main(Base):
+    def test_main_knows_the_relay_flags(self):
+        seen = {}
+        saved = (sys.argv, pa.cmd_restart)
+        sys.argv = ["pa-restart", "--space", SP, "--end-terminal", "--dry-run", "--relay-issue"]
+        pa.cmd_restart = lambda args: seen.update(vars(args))
+        try:
+            pa.main()
+            self.assertEqual((seen["relay_issue"], seen["relay_token"]), (True, None))
+            sys.argv = ["pa-restart", "--space", SP, "--end-terminal", "--relay-token", "abc",
+                        "--confirmed-terminal", "t1", "--confirmed-workers", "-"]
+            pa.main()
+            self.assertEqual((seen["relay_issue"], seen["relay_token"]), (False, "abc"))
+        finally:
+            sys.argv, pa.cmd_restart = saved
 
 
 class J3Main(Base):
