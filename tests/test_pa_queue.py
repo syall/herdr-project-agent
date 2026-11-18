@@ -871,5 +871,174 @@ class Q24NonReusableSuite(QBase):
         self.assertEqual(self.entry("t-A")["state"], "passed")
 
 
+# ---- t-052 J3a: the J2 limits assigned to J3 (plan.md 'J3-J5', JJ.2) ----------------------------------------------
+
+class A1OntoAhead(QBase):
+    """RL-J2-1: an entry's onto counts for the gate only when it is main or the branch of the entry directly ahead."""
+
+    def test_a1_gate_after_out_is_against_main_until_restack(self):
+        self.task("t-A", [("fa.txt", "a\n")])
+        self.add("t-A")
+        self.task("t-B", [("fb.txt", "b\n")])
+        self.add("t-B")
+        self.gate("t-B")
+        self.task("t-C", [("fc.txt", "c\n")])
+        self.add("t-C")
+        self.assertEqual(self.gate("t-C")[0], 0)
+        code, out, err = self.queue("out", "t-B", "--repo", self.proj, "--why", "held")
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(self.entry("t-C")["onto"], "t-B-x")  # restack has not run yet
+        code, out, _ = self.gate("t-C")
+        self.assertEqual(code, 1, out)
+        self.assertIn("fb.txt", out)
+        code, out, err = self.queue("restack", "--repo", self.proj)
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(self.entry("t-C")["onto"], "t-A-x")
+        code, out, _ = self.gate("t-C")
+        self.assertEqual(code, 0, out)
+
+    def test_a1b_onto_for_the_first_entry_is_main_only(self):
+        self.task("t-A", [("fa.txt", "a\n")])
+        self.add("t-A")
+        common = self.qrepo()["common"]
+        self.assertEqual(pa_hooks.content_onto(self.dir, "t-A", common, "t-A-x"), "main")
+        self.set_entries(lambda r: r["entries"][0].update(onto="t-gone-x"))
+        self.assertIsNone(pa_hooks.content_onto(self.dir, "t-A", common, "t-A-x"))
+
+
+class A2DependentUpstream(QBase):
+    """RL-J2-3: a task started on its parent's branch, whose parent was restacked before it joined, replays only its
+    own commits (the upstream is the parent's recorded old tip, not the merge-base)."""
+
+    def test_a2_dependent_replays_only_its_own_commits(self):
+        self.task("t-A", [("a.txt", (30, "x")), ("a.txt", (30, "z"))])
+        self.add("t-A")
+        old = self.tip("t-A")
+        code, out, err = self.queue("plan", "t-B", "--repo", self.proj, "--files", "a.txt", "fb.txt")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("start from t-A-x", out)
+        self.task("t-B", [("fb.txt", "b\n")], start="t-A-x")
+        self.on_main("b.txt", "b two\n")
+        code, out, err = self.queue("restack", "--repo", self.proj)
+        self.assertEqual(code, 0, out + err)
+        self.assertNotEqual(self.ref("t-A-x"), old)
+        code, out, err = self.add("t-B")
+        e = self.entry("t-B")
+        self.assertEqual(e["rebases"][-1]["result"], "clean", out + err)
+        line = self.journal("rebase")[-1]
+        self.assertEqual((line["task"], line["base"]), ("t-B", old))
+        self.assertEqual(sh(self.proj, "git", "rev-list", "--count", "t-A-x..t-B-x"), "1")
+        self.assertEqual(self.base_of("t-B", "t-A-x"), self.ref("t-A-x"))
+
+
+class A3ReviewMatch(QBase):
+    """RL-J2-V1, Nit-J2-1: derive takes a short review record only for the entry's task, job, repository, tip and tree."""
+
+    def setUp(self):
+        super().setUp()
+        self.task("t-A", [("a.txt", (30, "thirty"))])
+        self.add("t-A")
+        self.task("t-B", [("a.txt", (100, "hundred"))])
+        self.add("t-B")
+        need = self.entry("t-B")["needs"]["shortReview"]
+        self.add_worker("t-B", "t-Bs", "reviewer")
+        write(os.path.join(self.evidence("t-B"), need["file"]), review_text(self.tip("t-B"), "t-Bs"))
+        self.suite("t-B", 0)
+        code, out, err = self.queue("refresh", "--repo", self.proj)
+        self.assertEqual(code, 0, out + err)
+        self.path = os.path.join(self.dir, "content", "reviews.jsonl")
+        self.good = json.loads(read(self.path).splitlines()[0])
+
+    def review_now(self):
+        code, out, err = self.queue("show", "--repo", self.proj, "--json")
+        self.assertEqual(code, 0, out + err)
+        return next(e for e in json.loads(out)["entries"] if e["task"] == "t-B")["now"]["review"]
+
+    def test_a3_the_matching_record_is_taken(self):
+        self.assertEqual(self.review_now()["tip"], self.tip("t-B"))
+
+    def test_a3_other_tree_job_or_repository_is_not_taken(self):
+        for what, change in (("another tree", {"tree": "0" * 40}), ("another job", {"job": "j9"}),
+                             ("another repository", {"common": "/elsewhere/.git"})):
+            with self.subTest(what):
+                write(self.path, json.dumps(dict(self.good, **change)) + "\n")
+                self.assertIsNone(self.review_now(), what)
+
+
+class A4OutDependents(QBase):
+    """D-J2-7 (Q-J3-8): out takes the entries built on the one taken out, as a failure does."""
+
+    def test_a4_out_takes_dependents(self):
+        self.task("t-A", [("fa.txt", "a\n")])
+        self.add("t-A")
+        self.queue("plan", "t-B", "--repo", self.proj, "--files", "fb.txt")
+        self.queue("plan", "t-C", "--repo", self.proj, "--files", "fb.txt")
+        self.task("t-B", [("fb.txt", "b\n")])
+        self.add("t-B")
+        self.gate("t-B")
+        self.task("t-C", [("fb.txt", "b c\n")], start="t-B-x")
+        self.add("t-C")
+        self.task("t-D", [("fd.txt", "d\n")])
+        self.add("t-D")
+        code, out, err = self.queue("out", "t-B", "--repo", self.proj, "--why", "held")
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual([e["task"] for e in self.entries()], ["t-A", "t-D"])
+        left = self.qrepo()["left"]
+        self.assertEqual([l["task"] for l in left], ["t-B", "t-C"])
+        self.assertIn("t-B", left[1]["why"])
+        self.assertEqual(self.entry("t-D")["state"], "invalidated")
+        self.assertEqual(self.entry("t-A")["state"], "checking")
+
+
+class A5JobWorktree(QBase):
+    """Job entries: a job whose worktree is not the ledger's task.worktree is refused at add, with the reason; an
+    entry_below of a sibling job is not skipped (Nit-J2-R2-1)."""
+
+    def job_tree(self):
+        self.task("t-J", [("fa.txt", "a\n")])
+        wt2 = os.path.join(self.tmp, "wt-t-J-2")
+        sh(self.proj, "git", "worktree", "add", "-q", "-b", "t-J-y", wt2, "main")
+        write(os.path.join(wt2, "fj.txt"), "j\n")
+        sh(wt2, "git", "add", "fj.txt")
+        sh(wt2, "git", "commit", "-q", "-m", "job two")
+        led = self.ledger()
+        t = next(t for t in led["tasks"] if t["id"] == "t-J")
+        t["worktrees"] = [{"path": self.trees["t-J"], "job": "j1"}, {"path": wt2, "job": "j2"}]
+        self.set_ledger(led)
+        return wt2
+
+    def test_a5_job_outside_the_task_worktree_is_refused(self):
+        self.job_tree()
+        before = snapshot(self.qfile())
+        code, out, err = self.queue("add", "t-J", "--job", "j2", "--repo", self.proj)
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("the gate reads", err)
+        self.assertIn("worktree", err)
+        self.assertEqual(snapshot(self.qfile()), before)
+
+    def test_a5_job_that_is_the_task_worktree_joins(self):
+        wt2 = self.job_tree()
+        led = self.ledger()
+        next(t for t in led["tasks"] if t["id"] == "t-J")["worktree"] = wt2
+        self.set_ledger(led)
+        self.trees["t-J"] = wt2
+        self.checked("t-J")
+        self.assertEqual(self.gate("t-J")[0], 0)
+        code, out, err = self.queue("add", "t-J", "--job", "j2", "--repo", self.proj)
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual((self.entries()[0]["task"], self.entries()[0]["job"]), ("t-J", "j2"))
+
+    def test_a5b_entry_below_skips_only_the_same_job(self):
+        self.task("t-A", [("fa.txt", "a\n")])
+        self.change("t-A", "fb.txt", "b\n")
+        commit = self.tip("t-A")
+        below = sh(self.proj, "git", "rev-parse", commit + "^")
+        sh(self.proj, "git", "branch", "t-A-j1", below)
+        rec = {"main": "main"}
+        entries = [{"task": "t-A", "job": "j1", "branch": "t-A-j1"}]
+        self.assertEqual(pa_hooks.entry_below(pa_hooks.git, self.proj, rec, entries, "t-A", commit, job="j2"), "t-A-j1")
+        self.assertIsNone(pa_hooks.entry_below(pa_hooks.git, self.proj, rec, entries, "t-A", commit, job="j1"))
+
+
 if __name__ == "__main__":
     unittest.main()
