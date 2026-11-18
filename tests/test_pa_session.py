@@ -621,7 +621,7 @@ class ProfileReload(Base):
             return None
         self.assertEqual(n, 1)
         self.assertEqual(argv[-2], "--settings")
-        return json.loads(argv[-1])["statusLine"]
+        return json.loads(argv[-1]).get("statusLine")  # t-040: the same --settings also holds promptCacheTtl
 
     def masked(self, argv):
         out = list(argv)
@@ -879,6 +879,160 @@ hooks_spec = importlib.util.spec_from_file_location("pa_hooks", os.path.join(HER
 sys.modules["pa"] = pa  # pa_hooks imports pa: the copy loaded above, with the temp homes
 pa_hooks = importlib.util.module_from_spec(hooks_spec)
 hooks_spec.loader.exec_module(pa_hooks)
+
+
+class PromptCache(Base):
+    """t-040: the Project Agent's own session gets promptCacheTtl in its one --settings (default 1h); workers get
+    nothing of it; the profile key orchestratorPromptCacheTtl turns it off; session.log and pa-doctor show it."""
+
+    ENV = ("FORCE_PROMPT_CACHING_5M", "CLAUDE_CODE_PROMPT_CACHE_TTL", "ENABLE_PROMPT_CACHING_1H", "PA_NO_CC_STATUSLINE")
+
+    def setUp(self):
+        super().setUp()
+        self.prof = os.path.join(pa.ROOT, "profiles", "test")
+        os.makedirs(self.prof, exist_ok=True)
+        self.agent = {"version": 1, "space": "sp1", "project": self.project, "profile": "test", "name": "proj",
+                      "terminal": "t1", "sessionId": SID}
+        dump(self.agent, os.path.join(self.dir, "agent.json"))
+        self.env = {k: os.environ.pop(k) for k in self.ENV if k in os.environ}
+
+    def tearDown(self):
+        for k in self.ENV:
+            os.environ.pop(k, None)
+        os.environ.update(self.env)
+        super().tearDown()
+
+    def profile(self, status_line=False, **keys):
+        value = {"name": "test", "claude": ["true"], "codex": ["true"]}
+        if status_line:
+            value["statusLine"] = {"command": ["true", "statusline"], "refreshInterval": 30}
+        value.update(keys)
+        dump(value, os.path.join(self.prof, "profile.json"))
+        return pa.load_profile("test")
+
+    def settings(self, argv):
+        """The one --settings JSON of a launch (asserted last and alone), or None when there is none."""
+        n = sum(1 for a in argv if a == "--settings" or a.startswith("--settings="))
+        if not n:
+            return None
+        self.assertEqual(n, 1, argv)
+        self.assertEqual(argv[-2], "--settings")
+        return json.loads(argv[-1])
+
+    def launch(self, p, resume=False):
+        argv, _model = pa.launch_command(p, dict(self.agent), resume, self.dir)
+        return argv
+
+    def test_c1_default_is_one_hour_on_start_and_resume(self):
+        for status_line in (False, True):
+            p = self.profile(status_line)
+            for resume in (False, True):
+                js = self.settings(self.launch(p, resume))
+                self.assertIsNotNone(js, (status_line, resume))
+                self.assertEqual(js.get("promptCacheTtl"), "1h", (status_line, resume))
+                self.assertEqual(sorted(js), sorted(["promptCacheTtl"] + (["statusLine"] if status_line else [])))
+        for k in self.ENV[:3]:
+            self.assertNotIn(k, os.environ)  # set in --settings, never in the environment workers inherit
+
+    def test_c2_the_profile_key_chooses_or_turns_it_off(self):
+        self.assertEqual(self.settings(self.launch(self.profile(orchestratorPromptCacheTtl="1h")))["promptCacheTtl"], "1h")
+        self.assertEqual(self.settings(self.launch(self.profile(orchestratorPromptCacheTtl="5m")))["promptCacheTtl"], "5m")
+        self.assertIsNone(self.settings(self.launch(self.profile(orchestratorPromptCacheTtl="default"))))
+        js = self.settings(self.launch(self.profile(True, orchestratorPromptCacheTtl="default")))
+        self.assertEqual(sorted(js), ["statusLine"])
+        for bad in ("2h", "1H", "", 1, None, True, ["1h"], {"ttl": "1h"}):
+            self.assertIsNone(self.settings(self.launch(self.profile(orchestratorPromptCacheTtl=bad))), bad)
+            ttl, why = pa.pa_cache_ttl(self.profile(orchestratorPromptCacheTtl=bad))
+            self.assertIsNone(ttl, bad)
+            self.assertIn("orchestratorPromptCacheTtl", why)
+        self.assertEqual(pa.pa_cache_ttl(self.profile()), ("1h", None))
+        self.assertEqual(pa.pa_cache_ttl(self.profile(orchestratorPromptCacheTtl="default")), (None, None))
+
+    def test_c3_status_line_off_switch_keeps_the_cache(self):
+        os.environ["PA_NO_CC_STATUSLINE"] = "1"
+        self.assertEqual(self.settings(self.launch(self.profile(True))), {"promptCacheTtl": "1h"})
+
+    def test_c4_a_broken_status_line_build_still_gives_the_cache(self):
+        saved = pa.cc_statusline
+
+        def broken(p):
+            raise RuntimeError("broken on purpose")
+        pa.cc_statusline = broken
+        try:
+            js = self.settings(self.launch(self.profile(True)))
+        finally:
+            pa.cc_statusline = saved
+        self.assertEqual(js, {"promptCacheTtl": "1h"})
+
+    def test_c5_cache_in_effect_follows_claude_codes_order(self):
+        p1, p5, pd = self.profile(), self.profile(orchestratorPromptCacheTtl="5m"), self.profile(orchestratorPromptCacheTtl="default")
+        self.assertEqual(pa.cache_in_effect(p1, {}), ("1h", "pa"))
+        self.assertEqual(pa.cache_in_effect(p5, {}), ("5m", "profile"))
+        self.assertEqual(pa.cache_in_effect(self.profile(orchestratorPromptCacheTtl="1h"), {}), ("1h", "profile"))
+        self.assertEqual(pa.cache_in_effect(pd, {}), ("default", "claude-code"))
+        self.assertEqual(pa.cache_in_effect(self.profile(orchestratorPromptCacheTtl="2h"), {}), ("default", "claude-code"))
+        self.assertEqual(pa.cache_in_effect(p1, {"FORCE_PROMPT_CACHING_5M": "1", "CLAUDE_CODE_PROMPT_CACHE_TTL": "1h"}),
+                         ("5m", "FORCE_PROMPT_CACHING_5M"))
+        self.assertEqual(pa.cache_in_effect(p1, {"FORCE_PROMPT_CACHING_5M": "0"}), ("1h", "pa"))
+        self.assertEqual(pa.cache_in_effect(p1, {"CLAUDE_CODE_PROMPT_CACHE_TTL": "5m"}), ("5m", "CLAUDE_CODE_PROMPT_CACHE_TTL"))
+        self.assertEqual(pa.cache_in_effect(p1, {"CLAUDE_CODE_PROMPT_CACHE_TTL": "10m"}), ("1h", "pa"))  # ignored value
+        self.assertEqual(pa.cache_in_effect(p5, {"ENABLE_PROMPT_CACHING_1H": "1"}), ("5m", "profile"))
+        self.assertEqual(pa.cache_in_effect(pd, {"ENABLE_PROMPT_CACHING_1H": "1"}), ("1h", "ENABLE_PROMPT_CACHING_1H"))
+
+    def test_c6_session_log_start_line_records_it_and_still_parses(self):
+        p = self.profile()
+        calls = []
+
+        class Stop(Exception):
+            pass
+
+        def fake_call(argv, cwd=None):
+            calls.append(list(argv))
+            raise Stop()
+        saved = (pa.subprocess.call, pa.time.sleep)
+        pa.subprocess.call, pa.time.sleep = fake_call, (lambda s: None)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(Stop):
+                pa.run_agent(types.SimpleNamespace(fresh=True), "t1", self.project, p, self.dir,
+                             load(os.path.join(self.dir, "agent.json")), {"beat": True, "previous": None}, time.time())
+        finally:
+            pa.subprocess.call, pa.time.sleep = saved
+        with open(os.path.join(self.dir, "session.log")) as f:
+            line = [l for l in f.read().splitlines() if " start " in l][-1]
+        words = line.split()
+        self.assertIn("cache=1h", words)
+        self.assertIn("cacheBy=pa", words)
+        sid = [w for w in words if w.startswith("session=")][0][len("session="):]
+        with open(os.path.join(self.dir, "session.log"), "a") as f:
+            f.write("{} exit code=0 after=25s\n".format(iso(time.time())))
+        self.assertTrue(pa.session_ran(self.dir, sid))
+        self.assertEqual(self.settings(calls[0])["promptCacheTtl"], "1h")
+
+    def test_c7_doctor_shows_the_lifetime_and_notes_a_malformed_key(self):
+        import argparse
+        saved = (pa.hc_get, pa.call)
+        pa.hc_get, pa.call = (lambda a: {}), (lambda *a, **k: "")
+        try:
+            self.profile()
+            self.log("{} start resume=False session={} reason=new cache=1h cacheBy=pa".format(iso(T), SID))
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                pa.cmd_doctor(argparse.Namespace(space="sp1"))
+            lines = [l for l in out.getvalue().splitlines() if "prompt cache" in l]
+            self.assertEqual(len(lines), 1, out.getvalue())
+            self.assertIn("1h", lines[0])
+            self.assertIn("last start: cache=1h cacheBy=pa", lines[0])
+            self.assertNotIn("PROBLEM", lines[0])
+            self.profile(orchestratorPromptCacheTtl="2h")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                pa.cmd_doctor(argparse.Namespace(space="sp1"))
+            lines = [l for l in out.getvalue().splitlines() if "orchestratorPromptCacheTtl" in l]
+            self.assertEqual(len(lines), 1, out.getvalue())
+            self.assertIn("malformed", lines[0])
+            self.assertNotIn("PROBLEM", lines[0])
+        finally:
+            pa.hc_get, pa.call = saved
 
 
 class LiveLauncherOnly(Base):

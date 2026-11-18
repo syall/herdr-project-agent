@@ -3172,10 +3172,10 @@ class CC_Launch(Base):
     def settings_count(self, cmd):
         return sum(1 for a in cmd if a == "--settings" or a.startswith("--settings="))
 
-    def ours(self, cmd):
+    def ours(self, cmd, extra=()):
         self.assertEqual(cmd[-2], "--settings")
         js = json.loads(cmd[-1])
-        self.assertEqual(sorted(js), ["statusLine"])
+        self.assertEqual(sorted(js), sorted(["statusLine"] + list(extra)))  # t-040: a Project Agent's adds promptCacheTtl
         sl = js["statusLine"]
         self.assertEqual(sorted(sl), ["command", "refreshInterval", "type"])
         self.assertEqual(sl["type"], "command")
@@ -3285,10 +3285,24 @@ class CC_Launch(Base):
         self.assertIn("--session-id", calls[0])
         self.assertIn("--resume", calls[1])
         for argv in calls[:2]:
-            sl = self.ours(argv)
+            sl = self.ours(argv, extra=("promptCacheTtl",))
             self.assertEqual(shlex.split(sl["command"])[2:6], ["statusline", "--space", "sp1", "--then"])
             self.assertEqual(self.settings_count(argv), 1)
-        self.assertEqual(self.settings_count(calls[2]), 0)
+        # t-040: PA_NO_CC_STATUSLINE drops the status line only; the Project Agent keeps its cache setting
+        self.assertEqual(self.settings_count(calls[2]), 1)
+        self.assertEqual(json.loads(calls[2][-1]), {"promptCacheTtl": "1h"})
+
+    def test_cl10_a_worker_gets_no_cache_setting(self):
+        # t-040 W2: the profile key is for the Project Agent's own session; a worker's command is as without it
+        base = self.launch("claude", "job")
+        for value in ("1h", "5m", "default"):
+            p = load(os.path.join(self.profile_dir, "profile.json"))
+            p["orchestratorPromptCacheTtl"] = value
+            dump(p, os.path.join(self.profile_dir, "profile.json"))
+            cmd = self.launch("claude", "job")
+            self.ours(cmd)
+            self.assertNotIn("promptCacheTtl", " ".join(cmd))
+            self.assertEqual(self.mask(cmd), self.mask(base), value)
 
     def test_cl9_exec_plain_adds_nothing(self):
         seen = []
