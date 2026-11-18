@@ -3043,9 +3043,44 @@ class CC_Script(CCBase):
         self.assertEqual(self.script(["--space", "sp1", "--then"], cc_bytes())[0], b"")
 
     def test_cs4_overhead_is_at_most_150_ms(self):
+        # t-063: a wall-clock bound alone failed under machine load (0.18 s at load 13 on 14 cores). Load barely moves
+        # the child's CPU time, so that is the main bound; wall time is bounded as overhead over a bare python3 that
+        # runs the same inner command in the same rounds.
+        import resource
         noop = shutil.which("true")
-        best = min(self.script(["--space", "sp1", "--then", noop], cc_bytes())[1] for _ in range(5))
-        self.assertLessEqual(best, 0.15)
+        env = dict(os.environ)
+        env.update(_HOMES)
+        env["HC_TERMINAL_ID"] = "t5"
+        statusline = [sys.executable, os.path.join(TOOLS, "pa_costs.py"), "statusline", "--space", "sp1", "--then", noop]
+        baseline = [sys.executable, "-c", "import subprocess, sys; sys.stdin.buffer.read(); subprocess.run([sys.argv[1]])",
+                    noop]
+
+        def timed(cmd):
+            before = resource.getrusage(resource.RUSAGE_CHILDREN)
+            began = time.monotonic()
+            p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+            self.addCleanup(lambda: p.poll() is None and p.kill())
+            _out, err = p.communicate(cc_bytes(), timeout=30)
+            took = time.monotonic() - began
+            after = resource.getrusage(resource.RUSAGE_CHILDREN)  # reaped by communicate: now counted
+            self.assertEqual((p.returncode, err), (0, b""), cmd)
+            return took, (after.ru_utime + after.ru_stime) - (before.ru_utime + before.ru_stime)
+
+        # A best time only falls toward the unloaded cost, never below it, so more rounds cannot hide a real slowdown
+        # (a sleep or a lock wait is in every round); a busy machine only needs more rounds to see one quiet moment.
+        rounds = []
+        for _batch in range(3):
+            for _ in range(7):
+                base_took, _c = timed(baseline)
+                took, cpu_took = timed(statusline)
+                rounds.append((base_took, took, cpu_took))
+            cpu = min(c for _b, _t, c in rounds)
+            overhead = min(t for _b, t, _c in rounds) - min(b for b, _t, _c in rounds)
+            if cpu <= 0.15 and overhead <= 0.15:
+                break
+        self.assertEqual(self.cc_record()["cost"], 1.25)  # the timed runs did the real work
+        self.assertLessEqual(cpu, 0.15, "CPU seconds of the statusline process and its inner command")
+        self.assertLessEqual(overhead, 0.15, "wall seconds over a bare python3 running the same inner command")
 
 
 HANG_SCRIPT = "#!/bin/sh\ncat > /dev/null\nsleep 30 &\necho $$ $! > \"$1.part\"\nmv \"$1.part\" \"$1\"\nwait\n"
