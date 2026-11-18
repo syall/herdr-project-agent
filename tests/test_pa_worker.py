@@ -2616,6 +2616,205 @@ class JobCards(Base):
         self.assertEqual(self.card()["status"], "withdrawn")
         self.assertNotIn(["git", "worktree", "remove"], [c[:3] for c in self.calls])
 
+    # ---- round 3: which tasks a worktree belongs to (REVIEW M2, VERIFY M2) ----
+    def forge_card(self, path, name, job="main", main=True, rule="b", status="answered", answer="Delete", tasks=None):
+        """A card as if check had opened it (and the person answered it); `tasks` None: a card from before round 3."""
+        card = {"id": name, "task": "t-003", "worktree": os.path.realpath(path), "job": job, "main": main, "rule": rule,
+                "status": status, "answer": answer, "snapshot": {}}
+        if tasks is not None:
+            card["tasks"] = tasks
+        dump(card, os.path.join(self.dir, "decisions", name + ".json"))
+
+    def reset(self):
+        self.ledger({"version": 1, "tasks": []})
+        shutil.rmtree(os.path.join(self.dir, "decisions"), ignore_errors=True)
+        os.makedirs(os.path.join(self.dir, "decisions"))
+
+    def assert_refused(self, still, path, name, job=None):
+        """check offers no card; remove refuses a forged rule-(b) card and writes nothing."""
+        code, out, err = self.check("--open-cards")
+        self.assertEqual(code, 0, err)
+        self.assertIn("t-003: tasks still {}; asked once every task using it is done or parked; rule (b) is only for a worktree "
+                      "one task records".format(still), out)
+        self.assertIsNone(self.card(name), "not offered while a task that records a path in it or around it is unfinished")
+        self.forge_card(path, name, *((job, False) if job else ()))
+        before = self.snapshot()
+        code, _, err = self.remove("t-003", *(("--job", job) if job else ()))
+        self.assertEqual(code, 2, err)
+        self.assertIn("tasks still {}; a worktree is removed only once every task using it is done or parked. Nothing was removed"
+                      .format(still), err)
+        self.assertTrue(os.path.isdir(path))
+        self.assertEqual(self.snapshot(), before, "no task's entry is marked removed")
+        self.assertNotIn(["git", "worktree", "remove"], [c[:3] for c in self.calls])
+
+    @staticmethod
+    def still_of(*pairs):
+        return ", ".join("{} {}".format(t, pa_hooks.state_word(s)) for t, s in pairs if s not in ("done", "parked"))
+
+    def test_b16_a_task_that_records_a_package_inside_the_worktree_counts_on_it(self):
+        # the reviewer's P1: a profile-kind worktree K (a workspace) is t-003's main; t-009 records K/src/A (where its worker starts)
+        kind = self.kind_profile(["A"], unpushed=0)
+        rm = os.path.join(self.tmp, "rm.sh")
+        write(rm, '#!/bin/sh\nrm -rf "$1"\n')
+        os.chmod(rm, 0o755)
+        prof = os.path.join(pa.ROOT, "profiles", "test2", "profile.json")
+        p = load(prof)
+        p["worktree"]["remove"] = rm
+        dump(p, prof)
+        pkg = self.package(kind, "A", 1, merged=True)
+        for mine, other in (("in-progress", "in-progress"), ("done", "in-progress"), ("in-progress", None), ("done", "review")):
+            with self.subTest(t003=mine, t009=other):
+                self.reset()
+                self.add_task("t-003", mine, kind, [])
+                self.add_task("t-009", other, None, [], worktrees=[{"path": pkg, "job": "pkg"}])
+                self.assert_refused(self.still_of(("t-003", mine), ("t-009", other)), kind, "d-wt-t-003")
+                self.assertTrue(os.path.isdir(pkg))
+        # both done: one rule-(a) card for both tasks; the removal marks t-009's package entry too
+        self.reset()
+        self.add_task("t-003", "done", kind, [])
+        self.add_task("t-009", "done", None, [], worktrees=[{"path": pkg, "job": "pkg"}])
+        self.assertIn("t-003: opened card d-wt-t-003", self.check("--open-cards")[1])
+        card = self.card("d-wt-t-003")
+        self.assertEqual((card["rule"], card["tasks"]), ("a", ["t-003", "t-009"]))
+        self.assertEqual(card["question"], 'Delete the worktree for t-003 "Title of t-003", t-009 "Title of t-009"?')
+        self.answer("d-wt-t-003")
+        code, out, err = self.remove("t-003")
+        self.assertEqual(code, 0, err)
+        self.assertFalse(os.path.exists(kind))
+        t9 = next(t for t in self.ledger()["tasks"] if t["id"] == "t-009")
+        self.assertTrue(t9["worktrees"][0].get("removed"), "t-009's entry no longer names a folder that is gone")
+        self.assertEqual(pa.task_worktrees(t9), [])
+
+    def test_b17_a_task_that_records_the_container_counts_on_the_worktree(self):
+        # the reviewer's P3: t-009 records the container <tmp>/worktrees/t-003-billing that holds t-003's billing worktree
+        container = os.path.dirname(self.bill)
+        for mine, other in (("in-progress", "in-progress"), ("done", "in-progress"), ("in-progress", "parked"), ("done", None)):
+            with self.subTest(t003=mine, t009=other):
+                self.reset()
+                self.billing_task(mine)
+                self.add_task("t-009", other, None, [], worktrees=[{"path": container, "job": "c"}])
+                self.merged_commit(self.bill)
+                if other == "parked":  # t-009 is parked: the row's one unfinished task is t-003, but two tasks count on it
+                    self.assert_refused("t-003 in-progress", self.bill, "d-wt-t-003-billing", job="billing")
+                else:
+                    self.assert_refused(self.still_of(("t-003", mine), ("t-009", other)), self.bill, "d-wt-t-003-billing", job="billing")
+                self.assertTrue(os.path.isdir(container))
+        self.reset()
+        self.billing_task("done")
+        self.add_task("t-009", "done", None, [], worktrees=[{"path": container, "job": "c"}])
+        self.check("--open-cards")
+        card = self.card()
+        self.assertEqual((card["rule"], card["tasks"]), ("a", ["t-003", "t-009"]))
+        self.answer()
+        code, out, err = self.remove("t-003", "--job", "billing")
+        self.assertEqual(code, 0, err)
+        self.assertIn("Removed the empty folder {}.".format(container), out)
+        self.assertFalse(os.path.exists(container))
+        t9 = next(t for t in self.ledger()["tasks"] if t["id"] == "t-009")
+        self.assertTrue(t9["worktrees"][0].get("removed"), "the container is gone: t-009's entry is marked removed")
+
+    def test_b17b_a_container_that_stays_is_not_marked(self):
+        container = os.path.dirname(self.bill)
+        write(os.path.join(container, "notes.txt"), "kept\n")
+        self.billing_task("done")
+        self.add_task("t-009", "done", None, [], worktrees=[{"path": container, "job": "c"}])
+        self.check("--open-cards")
+        self.answer()
+        code, out, err = self.remove("t-003", "--job", "billing")
+        self.assertEqual(code, 0, err)
+        self.assertFalse(os.path.exists(self.bill))
+        self.assertTrue(os.path.isdir(container))
+        t9 = next(t for t in self.ledger()["tasks"] if t["id"] == "t-009")
+        self.assertFalse(t9["worktrees"][0].get("removed"), "the container is still there: t-009's entry still names it")
+        t3 = next(t for t in self.ledger()["tasks"] if t["id"] == "t-003")
+        self.assertTrue(t3["worktrees"][0].get("removed"))
+
+    def test_b18_an_answered_card_is_for_the_tasks_it_asked_about(self):
+        # the verifier's probe2: a real rule-(b) card for t-003 alone, answered Delete; then t-004 records the path; both finish
+        self.billing_task()
+        self.merged_commit(self.bill)
+        self.check("--open-cards")
+        self.assertEqual((self.card()["rule"], self.card()["tasks"]), ("b", ["t-003"]))
+        self.answer()
+        self.add_task("t-004", "review", None, [], worktrees=[{"path": self.bill, "job": "shared"}])
+        led = self.ledger()
+        led["tasks"][0]["state"], led["tasks"][1]["state"] = "done", "parked"
+        self.ledger(led)
+        why = "the card was asked for t-003; the worktree is recorded by t-003, t-004 now"
+        self.assertIn("t-003: card d-wt-t-003-billing answered 'Delete', but {}; pa-worktree remove refuses it and withdraws it, "
+                      "and the next --open-cards asks again".format(why), self.check()[1])
+        code, _, err = self.remove("t-003", "--job", "billing")
+        self.assertEqual(code, 2, err)
+        self.assertIn(why + "; the card is withdrawn and the next `pa-worktree check --open-cards` asks again. Nothing was removed", err)
+        self.assertTrue(os.path.isdir(self.bill))
+        self.assertEqual((self.card()["status"], self.card()["previousAnswer"]), ("withdrawn", "Delete"))
+        self.assertNotIn(["git", "worktree", "remove"], [c[:3] for c in self.calls])
+        # asked again, for both tasks, under rule (a)
+        self.assertIn("t-003: opened card d-wt-t-003-billing", self.check("--open-cards")[1])
+        card = self.card()
+        self.assertEqual((card["rule"], card["tasks"], card["status"]), ("a", ["t-003", "t-004"], "open"))
+        self.answer()
+        code, out, err = self.remove("t-003", "--job", "billing")
+        self.assertEqual(code, 0, err)
+        self.assertFalse(os.path.exists(self.bill))
+        # the rule-(a) form (RL-V3): t-003 done with main W, answered; then t-009 (done) records W
+        self.reset()
+        self.add_task("t-003", "done", self.wt, [])
+        self.check("--open-cards")
+        self.assertEqual(self.card("d-wt-t-003")["tasks"], ["t-003"])
+        self.answer("d-wt-t-003")
+        self.add_task("t-009", "done", self.wt, [])
+        code, _, err = self.remove("t-003")
+        self.assertEqual(code, 2, err)
+        self.assertIn("the card was asked for t-003; the worktree is recorded by t-003, t-009 now; the card is withdrawn", err)
+        self.assertTrue(os.path.isdir(self.wt))
+
+    def test_b19_an_open_card_whose_tasks_or_rule_no_longer_match_is_withdrawn(self):
+        self.billing_task()
+        self.merged_commit(self.bill)
+        self.check("--open-cards")
+        self.assertEqual((self.card()["rule"], self.card()["status"]), ("b", "open"))
+        led = self.ledger()
+        led["tasks"][0]["state"] = "done"
+        self.ledger(led)
+        why = ("the card was asked under rule (b), and every task using the worktree is done or parked now; it is asked again "
+               "under rule (a)")
+        self.assertIn("t-003: card d-wt-t-003-billing is open, but {}; --open-cards withdraws it".format(why), self.check()[1])
+        self.assertIn("t-003: withdrew card d-wt-t-003-billing: " + why, self.check("--open-cards")[1])
+        self.assertEqual(self.card()["status"], "withdrawn")
+        self.assertIn("t-003: opened card d-wt-t-003-billing", self.check("--open-cards")[1])
+        self.assertEqual((self.card()["rule"], self.card()["tasks"]), ("a", ["t-003"]))
+        # an open rule-(a) card, then a second (done) task records the path
+        self.add_task("t-009", "done", None, [], worktrees=[{"path": self.bill, "job": "shared"}])
+        why = "the card was asked for t-003; the worktree is recorded by t-003, t-009 now"
+        self.assertIn("t-003: card d-wt-t-003-billing is open, but {}; --open-cards withdraws it".format(why), self.check()[1])
+        self.assertIn("t-003: withdrew card d-wt-t-003-billing: " + why, self.check("--open-cards")[1])
+        self.assertIn("t-003: opened card d-wt-t-003-billing", self.check("--open-cards")[1])
+        self.assertEqual(self.card()["tasks"], ["t-003", "t-009"])
+
+    def test_b20_a_card_from_before_round_3(self):
+        # no task list on it: accepted for a worktree one task records ...
+        self.billing_task("done")
+        self.merged_commit(self.bill)
+        self.forge_card(self.bill, "d-wt-t-003-billing", "billing", False, rule="a")
+        code, out, err = self.remove("t-003", "--job", "billing")
+        self.assertEqual(code, 0, err)
+        self.assertFalse(os.path.exists(self.bill))
+        # ... and treated as asked for other tasks when two or more record it
+        self.reset()
+        old = self.job_tree("t-003-old")
+        self.add_task("t-003", "done", None, [], worktrees=[{"path": old, "job": "old"}])
+        self.add_task("t-009", "done", None, [], worktrees=[{"path": old, "job": "shared"}])
+        self.forge_card(old, "d-wt-t-003-old", "old", False, rule="a")
+        why = "the card does not record which tasks it was asked for, and t-003, t-009 record the worktree now"
+        self.assertIn("t-003: card d-wt-t-003-old answered 'Delete', but {}; pa-worktree remove refuses it".format(why), self.check()[1])
+        code, _, err = self.remove("t-003", "--job", "old")
+        self.assertEqual(code, 2, err)
+        self.assertIn(why + "; the card is withdrawn", err)
+        self.assertTrue(os.path.isdir(old))
+        self.forge_card(old, "d-wt-t-003-old", "old", False, rule="a", status="open", answer=None)
+        self.assertIn("t-003: withdrew card d-wt-t-003-old: " + why, self.check("--open-cards")[1])
+
     def kind_profile(self, repos, uncommitted=0, unpushed=1):
         kind = os.path.join(self.tmp, "Ws", "worktrees", "t-003-pkg")
         write(os.path.join(kind, "marker.txt"), "")
