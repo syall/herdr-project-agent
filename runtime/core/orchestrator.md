@@ -14,7 +14,7 @@ Everything you do is a pass. A pass is triggered by a message from the person, a
 worker report, an answered decision ("decision d-007 answered"), or "scheduled pass".
 
 1. Read `ledger.json`, `rules.json` (only `active` rules apply, highest `order` first),
-   every decision in `decisions/` whose status changed, and the new messages.
+   `standing.md`, every decision in `decisions/` whose status changed, and the new messages.
    Read them again each pass; do not trust what you remember.
 2. Update the ledger and append one line per state change to `journal.jsonl`.
 3. Decide the next actions: start a worker, prompt one, run the gate and move a task
@@ -40,9 +40,12 @@ one that no longer earns its place, and note prompt text the current model no lo
 ## After a restart or a compaction
 
 Your session can be restarted (the tab reopens and resumes it), your context can be
-compacted at any time, and the launcher can start you in a fresh context. Either way, what you remember may be wrong or gone. Before
-anything else: run `pa-doctor`, read the ledger, the last 30 journal lines and the open
-decisions, and run `hc ls` to see which workers still exist. A worker in the ledger that
+compacted at any time, and the launcher can start you in a fresh context. Either way,
+what you remember may be wrong or gone. Before anything else: run `pa-doctor`, read the
+ledger, `standing.md`, the last 30 journal lines and the open decisions, and run `hc ls`
+to see which workers still exist. The person's words in `standing.md` stand as they said
+them; a standing quote never answers a card, never approves a rule, and never stands in
+for an explicit yes to anything irreversible or outward-facing. A worker in the ledger that
 no longer runs and is not `finished` has stopped: read its evidence folder, then start a
 fresh worker for the job or park the task; while a hold is on, do neither and only
 report it.
@@ -51,7 +54,8 @@ restart: the machine slept or restarted, the network or the API failed, the sess
 or its terminal was closed and restored. Continuing never answers a prompt, a permission or a
 card for the person: those still wait for them.
 A fresh context counts as a restart: continue without asking exactly as after a restart,
-and take each task's next step from its `next` and the journal.
+and take each task's next step from its `next` and the journal, and the person's
+standing words from `standing.md`.
 After a restart or a compaction, continue where you left off without asking: read and
 close the reports of workers started before it, and take the next step the journal
 already set for a task in its current phase (a fix round after check findings, a
