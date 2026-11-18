@@ -2323,25 +2323,34 @@ def fold_tasks(entries, keep):
 
 def fit_summary(s):
     """summary.json's form of a summary, as compact text ≤ SUMMARY_MAX: paContext cut to its newest
-    PA_CONTEXT_SUMMARY_DAYS days first; if still over the cap, to its newest day (neither is a truncation); only then
-    shrink until it fits; that last day goes only as the final resort, so the other lists stay as before J1."""
+    PA_CONTEXT_SUMMARY_DAYS days. If they do not fit, paContext is set aside, the rest is shrunk as without it (as at
+    cf0de90), and as many of the newest days as fit in the room left go back in its place (none if none fits; the key
+    is left out if not even [] fits). paContext never causes a shrink step or truncated (t-041 REVIEW RL-4)."""
     if "paContext" in s:
         s["paContext"] = s["paContext"][:PA_CONTEXT_SUMMARY_DAYS]
     text = compact(s)
-    if len(text.encode()) > SUMMARY_MAX and len(s.get("paContext") or []) > 1:
-        s["paContext"] = s["paContext"][:1]
-        text = compact(s)
+    if len(text.encode()) <= SUMMARY_MAX or "paContext" not in s:
+        while len(text.encode()) > SUMMARY_MAX and shrink(s):
+            text = compact(s)
+        return text
+    order, days = list(s), s.pop("paContext")
+    text = compact(s)
     while len(text.encode()) > SUMMARY_MAX and shrink(s):
         text = compact(s)
-    if len(text.encode()) > SUMMARY_MAX and s.get("paContext"):
-        s["paContext"] = []
-        text = compact(s)
+    rest = dict(s)
+    for n in range(len(days), -1, -1):
+        s.clear()
+        s.update((k, days[:n] if k == "paContext" else rest[k]) for k in order + [k for k in rest if k not in order])
+        with_days = compact(s)
+        if len(with_days.encode()) <= SUMMARY_MAX:
+            return with_days
+    del s["paContext"]
     return text
 
 
 def shrink(s):
-    """One step towards SUMMARY_MAX: fewer sessions, then shorter session lists per task, then fewer tasks; paContext
-    (already cut to PA_CONTEXT_SUMMARY_DAYS by fit_summary) is halved only as the last resort."""
+    """One step towards SUMMARY_MAX: fewer sessions, then shorter session lists per task, then fewer tasks (paContext
+    is never shrunk: fit_summary sets it aside first)."""
     if s["sessions"]:
         s["sessions"] = s["sessions"][:len(s["sessions"]) * 3 // 4]
     elif any(t["sessions"] for t in s["byTask"]):
@@ -2353,8 +2362,6 @@ def shrink(s):
         s["byTask"] = fold_tasks(s["byTask"], len(s["byTask"]) * 3 // 4)
     elif s["byDayModel"]:
         s["byDayModel"] = s["byDayModel"][:len(s["byDayModel"]) * 3 // 4]
-    elif len(s.get("paContext") or []) > 1:  # the last resort; the newest days are kept
-        s["paContext"] = s["paContext"][:len(s["paContext"]) // 2]
     else:
         return False
     s["truncated"] = True
