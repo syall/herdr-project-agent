@@ -339,6 +339,8 @@ class Doctor(Base):
     def setUp(self):
         super().setUp()
         write(os.path.join(self.dir, "standing.md"), SEED)
+        dump({"version": 1, "rules": []}, os.path.join(self.dir, "rules.json"))
+        dump({"everyMinutes": 5}, os.path.join(self.dir, "schedule.json"))
 
     def test_d1_clean_checkpoint(self):
         self.ledger(dict(self.ledger(), context=CHECKPOINT))

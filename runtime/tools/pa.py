@@ -445,6 +445,171 @@ def seed_rules(p):
     return {"version": 1, "rules": rules}
 
 
+# ---- what must be on disk before a context is dropped (t-041 J2: R7, R8, R9) ----------------------------------
+
+STANDING_FILE = "standing.md"
+STANDING_HEADINGS = ("# Standing words", "# Open asks", "# Hold", "# Working notes")
+STANDING_CAP = 6000  # characters (about 1.5k tokens)
+WORKING_NOTES_MAX = 10
+STANDING_ENTRY = re.compile(r"^- \d{4}-\d\d-\d\d")
+
+
+def standing_seed():
+    """standing.md as init_state writes it: the four headings, nothing under them."""
+    return "\n\n".join(STANDING_HEADINGS) + "\n"
+
+
+def parse_standing(text):
+    """(sections, problems, warnings) of standing.md's text. sections: heading -> its non-blank lines. problems (a
+    reset is refused on any, t-041 R2 (e)): over STANDING_CAP characters, one of the four headings missing or twice,
+    another level-1 heading. warnings (pa-doctor notes only): an entry not starting `- YYYY-MM-DD`, text before the
+    first heading, more than WORKING_NOTES_MAX working notes. The headings' order is free; `##` sub-headings and
+    indented continuation lines are allowed."""
+    sections, problems, warnings, current, seen = {}, [], [], None, []
+    if len(text) > STANDING_CAP:
+        problems.append("over the cap: {:,} of {:,} characters".format(len(text), STANDING_CAP))
+    for line in text.splitlines():
+        if line.startswith("# "):
+            heading = line.rstrip()
+            if heading not in STANDING_HEADINGS:
+                problems.append("unknown heading {!r}".format(heading[:60]))
+                current = None
+            elif heading in seen:
+                problems.append("heading {!r} twice".format(heading))
+                current = heading
+            else:
+                seen.append(heading)
+                sections[heading] = []
+                current = heading
+            continue
+        if not line.strip():
+            continue
+        if current is None:
+            if not seen and "text before the first heading" not in warnings:
+                warnings.append("text before the first heading")
+            continue
+        sections[current].append(line)
+        if line.startswith("- ") and not STANDING_ENTRY.match(line):
+            warnings.append("entry without a date under {}: {!r}".format(current, line[:60]))
+    for heading in STANDING_HEADINGS:
+        if heading not in seen:
+            problems.append("heading {!r} missing".format(heading))
+    notes = [l for l in sections.get("# Working notes", []) if l.startswith("- ")]
+    if len(notes) > WORKING_NOTES_MAX:
+        warnings.append("{} working notes (at most {})".format(len(notes), WORKING_NOTES_MAX))
+    return sections, problems, warnings
+
+
+def read_standing(directory):
+    """(text, sections, problems, warnings) of the space's standing.md; text None when it cannot be used whole.
+    A file over 4 x the cap in bytes is not read. Never raises."""
+    path = os.path.join(directory, STANDING_FILE)
+    try:
+        if not os.path.isfile(path):
+            return None, {}, ["missing (the launcher creates it at its next start)"], []
+        size = os.path.getsize(path)
+        if size > 4 * STANDING_CAP:
+            return None, {}, ["over the cap: {:,} bytes, the cap is {:,} characters".format(size, STANDING_CAP)], []
+        with open(path, "rb") as f:
+            text = f.read().decode("utf-8")
+    except (OSError, UnicodeDecodeError) as e:
+        return None, {}, ["unreadable ({})".format(type(e).__name__)], []
+    sections, problems, warnings = parse_standing(text)
+    return text, sections, problems, warnings
+
+
+def checkpoint_problems(ctx):
+    """What is wrong with the ledger's `context` checkpoint (t-041 R7), [] when it is well formed."""
+    if not isinstance(ctx, dict):
+        return ["not an object"]
+    out = []
+    n = ctx.get("pass")
+    if isinstance(n, bool) or not isinstance(n, int) or n < 0:
+        out.append("pass must be a whole number")
+    if not isinstance(ctx.get("at"), str) or parse_time(ctx["at"]) is None:
+        out.append("at must be a UTC time")
+    if ctx.get("session") is not None and not isinstance(ctx.get("session"), str):
+        out.append("session must be a string or null")
+    clean = ctx.get("clean")
+    if not isinstance(clean, bool):
+        out.append("clean must be true or false")
+    if ctx.get("boundary") not in ("task", "pass", None):
+        out.append("boundary must be task, pass or null")
+    elif clean is True and ctx.get("boundary") is None:
+        out.append("a clean checkpoint needs boundary task or pass")
+    if clean is False and not (isinstance(ctx.get("why"), str) and ctx["why"].strip()):
+        out.append("a checkpoint that is not clean needs why")
+    return out
+
+
+def handoff_file(directory, task_id, worker):
+    """(found, expected) paths of a worker's handoff file evidence/<task>/handoff-<job>.md (t-041 R8), job = its
+    name without "<task>-"; a second try "<job>-N" may use its job's file. (None, None) when the name says no job."""
+    name = worker.get("name") if isinstance(worker, dict) else None
+    prefix = "{}-".format(task_id)
+    if not isinstance(name, str) or not task_id or not name.startswith(prefix) or name == prefix:
+        return None, None
+    job = job_slug(name[len(prefix):])
+    folder = os.path.join(directory, "evidence", str(task_id))
+    expected = os.path.join(folder, "handoff-{}.md".format(job))
+    tries = [expected]
+    base = re.sub(r"-\d+$", "", job)
+    if base != job:
+        tries.append(os.path.join(folder, "handoff-{}.md".format(base)))
+    return next((p for p in tries if os.path.isfile(p)), None), expected
+
+
+def context_notes(directory, ledger, environ=None):
+    """pa-doctor's notes on what must be on disk (t-041 J2): this session's id, the checkpoint, standing.md, tasks whose
+    `due` passed, and workers not finished without a handoff file. Notes only, never problems. Never raises."""
+    notes = []
+    try:
+        environ = os.environ if environ is None else environ
+        sid = environ.get("CLAUDE_CODE_SESSION_ID") or ""
+        if re.match(r"^[A-Za-z0-9-]{8,64}$", sid):
+            notes.append("this session: {}".format(sid))
+        ledger = ledger if isinstance(ledger, dict) else {}
+        ctx = ledger.get("context")
+        if ctx is None:
+            notes.append("checkpoint: none yet")
+        elif checkpoint_problems(ctx):
+            notes.append("checkpoint malformed: {}".format(checkpoint_problems(ctx)[0]))
+        elif ctx["clean"]:
+            notes.append("checkpoint: pass {} at {}, clean, boundary {}{}".format(
+                ctx["pass"], ctx["at"], ctx["boundary"], ", session " + ctx["session"][:8] if ctx.get("session") else ""))
+        else:
+            notes.append("checkpoint: pass {} at {}, not clean ({})".format(ctx["pass"], ctx["at"], ctx["why"][:80]))
+        text, _sections, problems, warnings = read_standing(directory)
+        if not problems and text is not None:
+            notes.append("standing.md: {:,} of {:,} characters".format(len(text), STANDING_CAP))
+        notes.extend("standing.md: {}".format(p) for p in problems[:5])
+        notes.extend("standing.md: {}".format(w) for w in warnings[:3])
+        tasks = [t for t in ledger.get("tasks") or [] if isinstance(t, dict)] if isinstance(ledger.get("tasks"), list) else []
+        due, handoffs, stamp = [], [], time.time()
+        for t in tasks:
+            if t.get("due") is not None and t.get("state") not in ("done", "parked"):
+                at = parse_time(t["due"]) if isinstance(t["due"], str) else None
+                if at is None:
+                    due.append("{} due {!r} is not a UTC time".format(t.get("id"), t["due"]))
+                elif at <= stamp:
+                    due.append("{} due {} (passed): {}".format(t.get("id"), t["due"], str(t.get("next") or "")[:80]))
+            for w in t.get("workers") or []:
+                if not isinstance(w, dict) or w.get("finished"):
+                    continue
+                found, expected = handoff_file(directory, t.get("id"), w)
+                if expected and not found:
+                    handoffs.append("worker {} ({} {}) has no handoff file {}".format(
+                        w.get("address"), t.get("id"), os.path.basename(expected)[len("handoff-"):-len(".md")],
+                        os.path.relpath(expected, directory)))
+        for group in (due, handoffs):
+            notes.extend(group[:5])
+            if len(group) > 5:
+                notes.append("and {} more".format(len(group) - 5))
+    except Exception:  # noqa: BLE001 - notes only
+        pass
+    return notes
+
+
 def init_state(space, project, p, name=None, terminal=None, tab=None, adopt=True, terms=None):
     """Create (or adopt, or update) spaces/<space>/ and register the agent. Returns (dir, agent)."""
     space = ident(local_id(space), "space id")
@@ -483,6 +648,7 @@ def init_state(space, project, p, name=None, terminal=None, tab=None, adopt=True
     seeds = {
         "ledger.json": lambda: json.dumps({"version": 1, "passCount": 0, "tasks": [], "updated": now()}, indent=2) + "\n",
         "journal.jsonl": lambda: "",
+        STANDING_FILE: standing_seed,
         "rules.json": lambda: json.dumps(seed_rules(p), indent=2) + "\n",
         "schedule.json": lambda: json.dumps({"everyMinutes": 5, "paused": False, "onlyWhileActive": True,
                                              "quietHours": None, "lastPass": None, "nextPass": None}, indent=2) + "\n",
@@ -1497,6 +1663,7 @@ def cmd_doctor(args):
     if why:  # a note only: the launches go on without the recording status line
         notes.append("profile statusLine is malformed ({}): Claude Code's own cost figure is not recorded".format(why))
     notes.extend(cache_notes(directory, agent))
+    notes.extend(context_notes(directory, ledger))
     term = hc_get(agent.get("terminal"))
     running = term.get("state") == "live" and (term.get("labels") or {}).get("herdr.pa") == agent.get("space")
     notes.append("agent {} in terminal {}".format("running" if running else "NOT running", agent.get("terminal")))
