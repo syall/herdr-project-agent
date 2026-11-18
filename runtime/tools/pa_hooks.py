@@ -1002,18 +1002,25 @@ def read_lines(path):
 
 def suite_runs(directory):
     """Every full suite run of content/suites.jsonl, in file order, in one shape (t-052 J2): {kind, task, worker, repo,
-    commit, tree, uncommitted, exit, started, ended, seconds, parts}. J1's lines have `at` (the end) and `seconds`;
-    t-056's standard record adds `started`, `ended` and `parts`. This is the one reader of both shapes."""
+    commit, tree, uncommitted, untracked, moved, reusable, exit, started, ended, seconds, parts}. J1's lines have `at`
+    (written at the end) and `seconds`; t-056's (pa_suite.full_suite) add `start`, `end`, `parts` ({name, ok, seconds}),
+    `untracked`, and `moved: true` when the worktree changed during the run. reusable is False for a moved run or one
+    with untracked files (t-056 never reuses those: pa_suite.clean): such a run is no pass or failure for its tree.
+    A J1 line has no untracked count (None) and stays reusable, as before t-056. This is the one reader of both shapes."""
     runs = []
     for l in read_lines(os.path.join(content_dir(directory), "suites.jsonl")):
         seconds = l.get("seconds") if isinstance(l.get("seconds"), (int, float)) else None
-        ended = l.get("ended") if isinstance(l.get("ended"), str) else l.get("at")
-        started = l.get("started") if isinstance(l.get("started"), str) else None
+        ended = l.get("end") if isinstance(l.get("end"), str) else l.get("at")
+        started = l.get("start") if isinstance(l.get("start"), str) else None
         end_ts = pa.parse_time(ended) if isinstance(ended, str) else None
         if started is None and end_ts is not None and seconds is not None:
             started = iso_at(end_ts - seconds)
+        untracked = l.get("untracked") if isinstance(l.get("untracked"), int) else None
+        moved = bool(l.get("moved"))
         runs.append({"kind": l.get("kind") or "suite", "task": l.get("task"), "worker": l.get("worker"), "repo": l.get("repo"),
-                     "commit": l.get("commit"), "tree": l.get("tree"), "uncommitted": l.get("uncommitted"), "exit": l.get("exit"),
+                     "commit": l.get("commit"), "tree": l.get("tree"), "uncommitted": l.get("uncommitted"),
+                     "untracked": untracked, "moved": moved,
+                     "reusable": not moved and ("untracked" not in l or untracked == 0), "exit": l.get("exit"),
                      "started": started, "ended": ended, "seconds": seconds,
                      "parts": l.get("parts") if isinstance(l.get("parts"), list) else None})
     return runs

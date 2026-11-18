@@ -480,7 +480,7 @@ def derive(ctx, rec):
                 n.update(state="changed", why="content changed: {}".format(d["why"] or ", ".join(d["files"])))
             else:
                 tree = ctx.tree(n["tip"])
-                s = latest(suites, lambda r: r.get("tree") == tree and tree and r.get("uncommitted") == 0)
+                s = latest(suites, lambda r: r.get("tree") == tree and tree and r.get("uncommitted") == 0 and r.get("reusable"))
                 n["suite"] = s
                 r = None
                 if d["result"] == "moved":
