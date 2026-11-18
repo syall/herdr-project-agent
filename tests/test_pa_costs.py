@@ -4146,6 +4146,20 @@ class J1A_Scopes(CostsBase):
         legacy["models"]["model-a"][0]["provider"] = "provider-q"  # files without defaultScope are not checked
         self.assertEqual(self.table(legacy)["warnings"], [])
 
+    def test_j1a12_endpoint_beats_provider(self):
+        # A-P2 step 2 (fix round 2): a provider-null scope with an endpoint beside a provider-only scope; a row both match
+        f = scoped_fixture()
+        f["scoped"] += [
+            {"provider": None, "endpoint": "edge", "region": None, "account": None,
+             "models": {"model-a": [{"validFrom": "2026-01-01", "in": 4.0, "out": 40.0, "cw5m": 8.0, "cw1h": 16.0, "cr": 2.0}]}},
+            {"provider": "provider-a", "endpoint": None, "region": None, "account": None,
+             "models": {"model-a": [{"validFrom": "2026-01-01", "in": 6.0, "out": 60.0, "cw5m": 12.0, "cw1h": 24.0, "cr": 3.0}]}}]
+        t = self.table(f)
+        self.assertEqual(self.look(t, "model-a", ("provider-a", "edge", None, None)), (4.0, ["*", "edge", "*", "*"]))
+        self.assertEqual(self.look(t, "model-a", ("provider-a", "edge", "region-c", None)), (4.0, ["*", "edge", "*", "*"]))
+        # the provider-only scope still prices what the endpoint scope does not match
+        self.assertEqual(self.look(t, "model-a", ("provider-a", "other", None, None)), (6.0, ["provider-a", "*", "*", "*"]))
+
 
 class J1A_Parity(CostsBase):
     """R-P1/A-P1: the 99e7d8b code (tests/samples/old_pricing.py) reads the scoped file as its top-level models,
@@ -4654,6 +4668,40 @@ class J1C_Prices(Collecting):
         _r, out, _e = self.run_cmd(pa_costs.cmd_prices, self.dir)
         self.assertIn("default scope: provider ? · any endpoint, any region, any account (the file has no defaultScope)", out)
         self.assertNotIn("t-032", out)
+        self.assertIn("Models seen without a price: (none)", out)
+
+
+class J1C_AccountScope(Collecting):
+    """R-A4 at the summary and in pa-costs prices (fix round 2): a session on acct-b after the account scope's validFrom
+    is priced at the account's rate, not the general one."""
+
+    def acct_b(self, fixture=None, model="model-a", out=1000000):
+        self.prices(scoped_fixture() if fixture is None else fixture)
+        self.record(session=SID, model=model, provider="provider-a", providerBy="launch", endpoint="global",
+                    endpointBy="rule", region=None, regionBy="unknown", account="acct-b", accountBy="env")
+        self.add(self.prompt(T0 + 10), self.call(T0 + 12, "b1", lines=1, out=out, model=model))
+        self.collect(T0 + 5000)
+        return load(self.costs("summary.json"))
+
+    def test_j1c12_summary_prices_an_account_scope(self):
+        s = self.acct_b()
+        self.assertAlmostEqual(s["totals"]["money"], 5.0, places=4)  # the account's 5.0 per 1M out, not the default's 10.0
+        e = {x["key"]: x for x in s["byScope"]}["provider-a · global · ? · acct-b"]
+        self.assertAlmostEqual(e["money"], 5.0, places=4)
+        self.assertEqual(e["pricedAs"], [{"scope": ["provider-a", "*", "*", "acct-b"], "validFrom": "2026-06-01"}])
+        self.assertEqual(s["byDayModel"][0]["pricedAs"]["scope"], ["provider-a", "*", "*", "acct-b"])
+        self.assertEqual({x["key"]: x for x in s["sessions"]}[SID[:8]]["pricedAs"]["scope"], ["provider-a", "*", "*", "acct-b"])
+        self.assertAlmostEqual({x["key"]: x["money"] for x in s["byAccount"]}["acct-b"], 5.0, places=4)
+
+    def test_j1c13_prices_finds_a_model_priced_only_in_an_account_scope(self):
+        f = scoped_fixture()
+        for e in f["scoped"]:
+            if e.get("account") == "acct-b":
+                e["models"]["model-d"] = [{"validFrom": "2026-06-01", "in": 0.5, "out": 5.0, "cw5m": 1.0, "cw1h": 2.0, "cr": 0.25}]
+        s = self.acct_b(f, model="model-d")
+        self.assertAlmostEqual(s["totals"]["money"], 5.0, places=4)
+        self.assertEqual([r["model"] for r in self.rows()], ["model-d"])
+        _r, out, _e = self.run_cmd(pa_costs.cmd_prices, self.dir)
         self.assertIn("Models seen without a price: (none)", out)
 
 
