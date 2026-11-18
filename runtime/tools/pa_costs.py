@@ -1564,6 +1564,7 @@ def reconstruct(directory, dry_run=False, now=None, quiet=False):
 
 SUMMARY_MAX = 65536
 DAYS, SESSIONS, PASSES, HOURS = 92, 200, 20, 48
+PA_CONTEXT_SUMMARY_DAYS = 14  # summary.json's paContext days (t-041 REVIEW MF-2); `report` keeps DAYS
 
 
 # ---- days in a timezone (t-036): on disk everything stays UTC; only the day buckets are cut in a zone ----------------
@@ -2185,9 +2186,20 @@ def pa_context(rows, records, sessions, table, since=None, until=None):
     def inside(day):
         return day is not None and (not since or day >= since) and (not until or day <= until)
 
-    fresh = {r.get("to") for r in records if r.get("ev") == "reset" and isinstance(r.get("to"), str)}
-    fresh.update(r.get("session") for r in records if r.get("ev") == "start" and r.get("kind") == "pa"
-                 and r.get("resumed") is False and isinstance(r.get("session"), str))
+    def bad(rec):  # a reset or compact record with a field that is not a string: skipped (one line never stops a summary)
+        return any(k in rec and not isinstance(rec[k], str) for k in ("session", "at", "to", "from"))
+
+    records = [r for r in records if isinstance(r, dict) and not (r.get("ev") in ("reset", "compact") and bad(r))]
+    began = {}  # fresh session -> the UTC day it began (its reset or start record), None when that day is not known
+    for r in records:
+        sid = r.get("to") if r.get("ev") == "reset" else r.get("session")
+        if not isinstance(sid, str) or not (r.get("ev") == "reset" or (r.get("ev") == "start" and r.get("kind") == "pa"
+                                                                         and r.get("resumed") is False)):
+            continue
+        day = context_day(r.get("at"))
+        if sid not in began or (day and (began[sid] is None or day < began[sid])):
+            began[sid] = day
+    fresh = set(began)
     earliest = {}  # fresh session -> its earliest row
     for r in rows:
         calls = num(r.get("calls"))
@@ -2232,7 +2244,11 @@ def pa_context(rows, records, sessions, table, since=None, until=None):
             reason = rec.get("reason") if isinstance(rec.get("reason"), str) else "(none)"
             e["reasons"][reason] = e["reasons"].get(reason, 0) + 1
     firsts = {}
-    for r in earliest.values():
+    for sid, r in earliest.items():
+        # A session's first call is its first row of all. Rows reach here cut to [since, until] (report): when the
+        # session began before `since`, or its start day is not known, its first row may be cut, so it counts no first call.
+        if since and not (began.get(sid) and began[sid] >= since):
+            continue
         day = r.get("day") or context_day(r.get("from"))
         if isinstance(r.get("first"), (int, float)) and not isinstance(r.get("first"), bool):
             firsts.setdefault(day, []).append(r["first"])
@@ -2305,8 +2321,20 @@ def fold_tasks(entries, keep):
     return entries[:keep] + [other]
 
 
+def fit_summary(s):
+    """summary.json's form of a summary, as compact text ≤ SUMMARY_MAX: paContext cut to its newest
+    PA_CONTEXT_SUMMARY_DAYS days first (not a truncation), then shrink until it fits."""
+    if "paContext" in s:
+        s["paContext"] = s["paContext"][:PA_CONTEXT_SUMMARY_DAYS]
+    text = compact(s)
+    while len(text.encode()) > SUMMARY_MAX and shrink(s):
+        text = compact(s)
+    return text
+
+
 def shrink(s):
-    """One step towards SUMMARY_MAX: fewer sessions, then shorter session lists per task, then fewer tasks."""
+    """One step towards SUMMARY_MAX: fewer sessions, then shorter session lists per task, then fewer tasks; paContext
+    (already cut to PA_CONTEXT_SUMMARY_DAYS by fit_summary) is halved only as the last resort."""
     if s["sessions"]:
         s["sessions"] = s["sessions"][:len(s["sessions"]) * 3 // 4]
     elif any(t["sessions"] for t in s["byTask"]):
@@ -2318,7 +2346,7 @@ def shrink(s):
         s["byTask"] = fold_tasks(s["byTask"], len(s["byTask"]) * 3 // 4)
     elif s["byDayModel"]:
         s["byDayModel"] = s["byDayModel"][:len(s["byDayModel"]) * 3 // 4]
-    elif len(s.get("paContext") or []) > 1:  # the newest days are kept
+    elif len(s.get("paContext") or []) > 1:  # the last resort; the newest days are kept
         s["paContext"] = s["paContext"][:len(s["paContext"]) // 2]
     else:
         return False
@@ -2340,9 +2368,7 @@ def write_summary(directory, state=None, now=None, records=None):
     if bad:
         problems.append("{} lines of sessions.jsonl are not JSON".format(bad))
     s = summarize(directory, ledger_rows(directory), records, table, problem, name, now, problems, zone=load_zone(directory))
-    text = compact(s)
-    while len(text.encode()) > SUMMARY_MAX and shrink(s):
-        text = compact(s)
+    text = fit_summary(s)
     pa.write_text(os.path.join(folder, "summary.json"), text)
     return s
 
