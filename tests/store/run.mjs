@@ -622,6 +622,83 @@ cases["S53-host-refused"] = async () => { // R6: the runtime's RangeError (throw
   check(/^Too many calls waiting \(\d+\): the ledger\.json read was skipped; showing what was read at \d\d:\d\d$/.test(hostMod.refusalLine({ n: 3, what: "the ledger.json read" }, T0)), "the plain line");
 };
 
+// ---- t-046 J3: an answer in the person's own words (Other) ----
+const s46 = (space, extra = {}) => {
+  world();
+  const k = keyOf(space, "/decisions/d-1.json"), path = `${space.machine ? rdir : ldir}/decisions/d-1.json`;
+  g.__files[k] = card("d-1", { options: [{ label: "A" }, { label: "B" }], ...extra });
+  return { k, path, entry: { id: "d-1", path } };
+};
+const refusedWith = async (fn) => { try { await fn(); return null; } catch (e) { return String(e?.message ?? e); } };
+
+cases["S46-other-answer"] = async () => { // R2 AC1: answer Other, other: true, the words trimmed in note
+  for (const space of [local, remote]) {
+    const { k, entry } = s46(space);
+    const before = g.__files[k];
+    const r = await store.answerDecision(space, entry, "Other", "  do X first, then ask me \n");
+    const c = JSON.parse(g.__files[k]);
+    check(c.status === "answered" && c.answer === "Other" && c.other === true && c.note === "do X first, then ask me" && /Z$/.test(c.answered),
+      `${space.machine ?? "local"}: written (got ${g.__files[k]})`);
+    check(r.before === before && r.after === g.__files[k] && r.card.other === true, `${space.machine ?? "local"}: returns before/after`);
+  }
+  check(store.OTHER === "Other" && store.OTHER_MAX === 2000, "OTHER and OTHER_MAX exported");
+};
+
+cases["S46-other-empty"] = async () => { // R2 AC2: no words: refused, nothing written
+  for (const words of ["", "   \n ", null]) {
+    const { k, entry } = s46(local);
+    const before = g.__files[k];
+    const why = await refusedWith(() => store.answerDecision(local, entry, "Other", words));
+    check(why === "An Other answer needs your own words.", `refused (got ${why})`);
+    check(g.__files[k] === before && !(g.__writes ?? []).length, "the file is unchanged, nothing written");
+  }
+};
+
+cases["S46-other-long"] = async () => { // R2 AC2: over 2000 characters refused; 2000 accepted
+  const { k, entry } = s46(local);
+  const before = g.__files[k];
+  const why = await refusedWith(() => store.answerDecision(local, entry, "Other", "x".repeat(2001)));
+  check(why === "Your answer is longer than 2000 characters; shorten it, or write it in a file and give the path.", `refused (got ${why})`);
+  check(g.__files[k] === before, "unchanged");
+  await store.answerDecision(local, entry, "Other", "y".repeat(2000));
+  check(JSON.parse(g.__files[k]).note.length === 2000, "2000 characters accepted");
+};
+
+cases["S46-listed-no-other-key"] = async () => { // R2 AC3: a listed answer has no other field at all
+  const { k, entry } = s46(local);
+  await store.answerDecision(local, entry, "A", "a note");
+  const c = JSON.parse(g.__files[k]);
+  check(c.answer === "A" && !("other" in c) && c.note === "a note", `no other key (got ${g.__files[k]})`);
+};
+
+cases["S46-other-not-open"] = async () => { // R2 AC1: the existing refusals come first
+  let { k, entry } = s46(local, { status: "answered", answer: "A" });
+  let before = g.__files[k];
+  check(await refusedWith(() => store.answerDecision(local, entry, "Other", "words")) === "This card was already answered.", "answered: refused");
+  check(g.__files[k] === before, "unchanged");
+  ({ k, entry } = s46(local, { kind: "push", push: { task: "t-1" } }));
+  before = g.__files[k];
+  check(/A push card is answered with its own Submit/.test(await refusedWith(() => store.answerDecision(local, entry, "Other", "words"))), "push card: refused");
+  check(g.__files[k] === before, "unchanged");
+};
+
+cases["S46-isOther"] = async () => { // R2 AC6 as J1 decided (pa.is_other): the marker, or the label in any case
+  const yes = [{ other: true }, { answer: "Other" }, { answer: " other " }, { answer: "OTHER", options: [{ label: "Other" }] }, { other: true, answer: "A" }];
+  const no = [{ answer: "Others" }, { answer: "A" }, { answer: null }, { other: false, answer: "A" }, {}, null, "Other"];
+  for (const c of yes) check(store.isOther(c) === true, `isOther(${JSON.stringify(c)}) is true`);
+  for (const c of no) check(store.isOther(c) === false, `isOther(${JSON.stringify(c)}) is false`);
+};
+
+cases["S46-oneLine"] = async () => { // R4 AC3: one line, cut at 400 with the tail
+  check(store.oneLine("a\nb\t c  \r\n d ") === "a b c d", `flattened (got ${store.oneLine("a\nb\t c  \r\n d ")})`);
+  const s400 = "x".repeat(400);
+  check(store.oneLine(s400) === s400, "400 kept whole");
+  const cut = store.oneLine("z".repeat(600));
+  check(cut === `${"z".repeat(399)}… (the rest is on the card)`, `600 cut to 399 + the tail (got ${cut.length})`);
+  check(store.oneLine('say "hi"') === 'say "hi"', "quotes kept");
+  check(store.oneLine("abcdef", 4) === "abc… (the rest is on the card)", "max is a parameter");
+};
+
 const pick = process.argv.slice(2);
 let failed = 0;
 for (const [name, fn] of Object.entries(cases)) {

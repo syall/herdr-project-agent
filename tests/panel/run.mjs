@@ -4424,6 +4424,250 @@ cases["P45-push-unknown-owner-gone"] = async () => { // the same with the owner 
   check(!g.__shared["project-agent.answering"]?.[`${S}\0${PID}`], "the shared mark is gone");
 };
 
+// ---- t-046 J3: every card takes an answer in the person's own words (Other) ----
+const OTHER_DETAIL = "Your own answer, in your words. The Project Agent acts on it as written; no tool's action runs on it.";
+const NEEDS_WORDS = "Write your answer above to submit Other.", AS_WORDS = "Write your answer above; it is sent as your own words.";
+const cardFile = (id) => `:${DIR}/decisions/${id}.json`;
+// Local cards from { id: card object }: each gets status open, a question and A/B unless given.
+async function otherWorld(cards, opts = {}) {
+  world(opts);
+  for (const [id, c] of Object.entries(cards)) g.__files[cardFile(id)] = JSON.stringify({ id, status: "open", question: `Q ${id}?`, options: [{ label: "A" }, { label: "B" }], created: "2026-11-16T10:00:00Z", ...c });
+  g.__ls[`:${DIR}/decisions`] = Object.keys(cards).map((id) => `${id}.json`);
+  const v = await mount(); await settle();
+  return v;
+}
+// Types into a card's field as the person would: the value, then the field's change event.
+const fieldOf = (v, id) => Object.entries(v.notes).find(([k]) => k.endsWith(`\0${id}`))?.[1] ?? null;
+const typeInto = (v, id, words) => { const f = fieldOf(v, id); check(Boolean(f), `a field for ${id}`); f.set(words); f.fire("change"); };
+// The text of the selectable row with this id (copy.js sel), or null.
+const selText = (tree, id) => { let found = null; const walk = (x) => { if (!x || typeof x !== "object" || found !== null) return; if (x.kind === "textview" && x.key === id) found = x.text; for (const k of x.kids ?? []) walk(k); }; walk(tree); return found; };
+async function answerOther(v, id, words) { await click(v, `opt-${id}-other`); typeInto(v, id, words); await click(v, `submit-${id}`); await settle(); }
+const queued = (v) => v.unsent.map((x) => x.message);
+
+cases["P46-other-row"] = async () => { // R1 AC1-AC2: every kind of card draws the Other row after its options
+  const v = await otherWorld({ "d-x": { recommendation: "Other" }, "d-r": { rule: "r-p", options: [{ label: "Approve" }, { label: "Decline" }] },
+    "d-wt-t-1": { options: [{ label: "Delete" }, { label: "Keep" }] }, "d-leftovers": { kind: "leftovers", options: [{ label: "Close all listed" }, { label: "Keep them" }] } });
+  for (const id of ["d-x", "d-r", "d-wt-t-1", "d-leftovers"]) {
+    const { clicks } = look(v);
+    check(Boolean(clicks[`opt-${id}-other`]) && Boolean(clicks[`opt-${id}-0`]) && Boolean(clicks[`opt-${id}-1`]), `${id}: its two options and Other (got ${optClicks(clicks, id)})`);
+    const rowText = inspect(pathTo(v.render(cx), `opt-${id}-other`)?.at(-1) ?? null).text;
+    check(rowText.startsWith("Other | "), `${id}: the Other row is labelled Other (got ${rowText})`);
+    check(rowText.includes(OTHER_DETAIL) && !rowText.includes("recommended"), `${id}: its detail, never recommended (got ${rowText})`);
+  }
+  const ids = Object.keys(look(v).clicks).filter((k) => k.startsWith("opt-d-x-"));
+  check(ids.indexOf("opt-d-x-other") === ids.length - 1, `Other is the last row (got ${ids})`);
+  await click(v, "opt-d-x-other");
+  check(v.choice["d-x"] === "Other", "picking Other selects it");
+  await click(v, "opt-d-x-other");
+  check(!v.choice["d-x"], "picking it again unselects it");
+  const { v: p } = await pushWorld();
+  const checks = pushExecs("check").length;
+  check(Boolean(look(p).clicks[`opt-${PID}-other`]), `a push card has Other (got ${optClicks(look(p).clicks, PID)})`);
+  await click(p, `opt-${PID}-other`); await settle();
+  check(pushExecs("check").length === checks && pushExecs("run").length === 0, "picking Other on a push card checks nothing, runs nothing");
+};
+
+cases["P46-other-needs-words"] = async () => { // R1 AC3-AC4: Submit for Other only with words
+  const v = await otherWorld({ "d-x": {} });
+  await click(v, "opt-d-x-other");
+  let { text, clicks } = look(v);
+  check(!clicks["submit-d-x"] && text.includes("Submit answer: Other") && text.includes(NEEDS_WORDS), `empty: no Submit, the hint (got ${text.slice(0, 900)})`);
+  typeInto(v, "d-x", "   \n ");
+  ({ text, clicks } = look(v));
+  check(!clicks["submit-d-x"] && text.includes(NEEDS_WORDS), "spaces only: still no Submit");
+  typeInto(v, "d-x", "do X first");
+  ({ text, clicks } = look(v));
+  check(Boolean(clicks["submit-d-x"]) && text.includes(AS_WORDS) && !text.includes(NEEDS_WORDS), `with words: Submit, the other hint (got ${text.slice(0, 900)})`);
+  check(fieldOf(v, "d-x").handlers("change") === 1, "the field has a change handler (Submit follows the typing)");
+  typeInto(v, "d-x", "x".repeat(2001));
+  check(!look(v).clicks["submit-d-x"], "over 2000 characters: no Submit");
+  await click(v, "opt-d-x-0");
+  ({ text } = look(v));
+  check(text.includes("Submit answer: A") && text.includes("Add a note above if you want; it is sent with the answer."), "a listed option: today's texts");
+};
+
+cases["P46-other-written"] = async () => { // R2 AC1, AC3: the file
+  const v = await otherWorld({ "d-x": {}, "d-y": {} });
+  await answerOther(v, "d-x", "  do X first  ");
+  const c = JSON.parse(g.__files[cardFile("d-x")]);
+  check(c.status === "answered" && c.answer === "Other" && c.other === true && c.note === "do X first", `written Other (got ${g.__files[cardFile("d-x")]})`);
+  await click(v, "opt-d-y-0"); await click(v, "submit-d-y"); await settle();
+  const d = JSON.parse(g.__files[cardFile("d-y")]);
+  check(d.answer === "A" && !("other" in d), `a listed answer has no other key (got ${g.__files[cardFile("d-y")]})`);
+  check(JSON.stringify(queued(v)) === JSON.stringify(['decision d-x answered Other, in the person\'s own words: "do X first"', "decision d-y answered"]), `the notices (got ${JSON.stringify(queued(v))})`);
+};
+
+cases["P46-other-notice"] = async () => { // R4 AC1, AC3: one line, cut at 400; the card keeps every word
+  const v = await otherWorld({ "d-x": {}, "d-y": {} });
+  await answerOther(v, "d-x", 'first line\nsecond "line"');
+  const long = "w".repeat(600);
+  await answerOther(v, "d-y", long);
+  const q = queued(v);
+  check(q[0] === 'decision d-x answered Other, in the person\'s own words: "first line second "line""', `one line (got ${q[0]})`);
+  check(q[1] === `decision d-y answered Other, in the person's own words: "${"w".repeat(399)}… (the rest is on the card)"`, `cut (got ${q[1]?.length})`);
+  check(JSON.parse(g.__files[cardFile("d-y")]).note === long, "the card keeps all 600");
+  g.__shared["project-agent.tabs"] = alive("t4w"); v.resend(cx); await settle();
+  const s = sends();
+  check(s.length === 2 && s[0][1] === "t4w" && s[0][2] === q[0] && s.every((a) => a.length === 3), `sent as hc's message argument (got ${JSON.stringify(s)})`);
+};
+
+cases["P46-other-locked"] = async () => { // R1 AC6 (t-045): from the click the card is answered, never answerable again
+  const v = await remoteCardWorld();
+  const w = await mount();
+  const release = holdWrite();
+  await click(v, "opt-d-01-other"); typeInto(v, "d-01", "neither; ask me tomorrow"); await click(v, "submit-d-01"); await settle();
+  let t = locked(v, "d-01", "Other", "write in flight");
+  check(t.includes("Saving…") && t.includes("Your answer: “neither; ask me tomorrow”"), `Saving… and the words (got ${t.slice(0, 800)})`);
+  const tw = locked(w, "d-01", "Other", "the other window");
+  check(tw.includes("Answered in another panel window.") && tw.includes("Your answer: “neither; ask me tomorrow”"), `the other window says where, with the words (got ${tw.slice(0, 800)})`);
+  g.__remoteDelay = 1e9;
+  release(); await settle(); await settle();
+  check(JSON.parse(g.__files[R1]).answer === "Other", "written Other");
+  t = locked(v, "d-01", "Other", "written, reload slow");
+  check(!t.includes("Saving…"), "no Saving… once written");
+  // A write that really failed reopens the card, the words still in the field.
+  const v2 = await remoteCardWorld();
+  const text0 = g.__files[R1];
+  const release2 = holdWrite({ reply: { code: 3, stdout: "", stderr: "" } });
+  await click(v2, "opt-d-01-other"); typeInto(v2, "d-01", "my words"); await click(v2, "submit-d-01"); await settle();
+  locked(v2, "d-01", "Other", "in flight");
+  release2(); await settle(); await settle();
+  const after = look(v2);
+  check(g.__files[R1] === text0 && /Not saved: /.test(after.text) && Boolean(after.clicks["opt-d-01-other"]), `Not saved, open again (got ${after.text.slice(0, 800)})`);
+  check(fieldOf(v2, "d-01")?.value() === "my words", "the words are still in the field");
+};
+
+cases["P46-other-shown"] = async () => { // R3 AC1-AC3: answered on file, from the panel and from conversation; Copy
+  const v = await otherWorld({ "d-x": { status: "answered", answer: "Other", other: true, note: "do X first", answered: "2026-11-16T11:00:00Z" },
+    "d-y": { status: "answered", answer: "Other", other: true, note: "use the second one", answered: "2026-11-16T11:00:00Z", answeredBy: "person, in conversation" } });
+  v.older = true;
+  const { text, clicks } = look(v);
+  check(text.includes("answered: Other") && text.includes("Your answer: “do X first”"), `from the panel (got ${text.slice(0, 1200)})`);
+  check(text.includes("You said: “use the second one”"), `from conversation (got ${text.slice(0, 1200)})`);
+  check(!clicks["opt-d-x-other"] && !text.includes(OTHER_DETAIL), "no Other row on an answered card");
+  check(selText(v.render(cx), "sel-note-d-x") === "Your answer: “do X first”", "selectable as the note line");
+  clipReset(); await click(v, "copy-d-x");
+  check(lastClip().includes("Answer: Other (the person's own words)") && lastClip().includes("Your answer: “do X first”"), `Copy (got ${JSON.stringify(lastClip())})`);
+};
+
+cases["P46-other-withdrawn"] = async () => { // R3 AC5: withdrawn after an Other answer: the earlier answer
+  const v = await otherWorld({ "d-x": { status: "withdrawn", answer: null, previousAnswer: "Other", previousNote: "keep it for now", note: "asked again", answeredBy: "orchestrator: withdrawn", answered: "2026-11-16T11:00:00Z" } });
+  v.older = true;
+  const { text } = look(v);
+  check(text.includes("withdrawn") && text.includes("Earlier answer: Other: “keep it for now”"), `the earlier answer (got ${text.slice(0, 1200)})`);
+  clipReset(); await click(v, "copy-d-x");
+  check(lastClip().includes("Earlier answer: Other: “keep it for now”"), `Copy (got ${JSON.stringify(lastClip())})`);
+};
+
+cases["P46-asked-again"] = async () => { // Q1 (card d-155): an open card asked again shows the earlier answer
+  const v = await otherWorld({ "d-wt-t-1": { options: [{ label: "Delete" }, { label: "Keep" }], previousAnswer: "Other", previousNote: "delete it after the demo", previousAnswered: "2026-11-15T09:00:00Z" },
+    "d-leftovers-2": { kind: "leftovers", options: [{ label: "Close all listed" }], previousAnswer: "Other", previousNote: "close all but t32", previousCard: "d-leftovers" },
+    "d-new": {} });
+  const { text, clicks } = look(v);
+  check(text.includes("Asked again. Your earlier answer: Other: “delete it after the demo”"), `worktree card (got ${text.slice(0, 1500)})`);
+  check(text.includes("Asked again (after d-leftovers). Your earlier answer: Other: “close all but t32”"), `leftovers card names the earlier card (got ${text.slice(0, 1500)})`);
+  check((text.match(/Asked again/g) ?? []).length === 2, "a fresh card says nothing");
+  check(Boolean(clicks["opt-d-wt-t-1-0"]) && Boolean(clicks["opt-d-wt-t-1-other"]), "still open and answerable");
+  clipReset(); await click(v, "copy-d-wt-t-1");
+  check(lastClip().includes("Asked again. Your earlier answer: Other: “delete it after the demo”"), `Copy (got ${JSON.stringify(lastClip())})`);
+};
+
+cases["P46-other-rule"] = async () => { // R6 AC1, AC3; R12 AC1: Other on a rule card changes no rule
+  world();
+  const rulesText = JSON.stringify({ rules: [{ ...rule("r-p", "Proposed"), status: "proposed", source: "agent" }] });
+  g.__files[RULES] = rulesText;
+  g.__files[cardFile("d-r")] = JSON.stringify({ id: "d-r", status: "open", rule: "r-p", question: "Adopt rule r-p?", options: [{ label: "Approve" }, { label: "Decline" }], created: "2026-11-16T10:00:00Z" });
+  g.__ls[`:${DIR}/decisions`] = ["d-r.json"];
+  const v = await mount(); await settle();
+  g.__delay = { [`:${DIR}/agent.json`]: 5000 };
+  await answerOther(v, "d-r", "Approve, but only for tests");
+  const c = JSON.parse(g.__files[cardFile("d-r")]);
+  check(c.answer === "Other" && c.other === true && c.note === "Approve, but only for tests", "answered Other");
+  check(g.__files[RULES] === rulesText && !(g.__writes ?? []).some((k) => k.endsWith("/rules.json")), "rules.json unchanged, never written");
+  const t = locked(v, "d-r", "Other", "rule card");
+  check(t.includes("The rule stays proposed: Other is not Approve or Decline."), `the line (got ${t.slice(0, 900)})`);
+  g.__delay = {}; await step(5000); await settle(); v.older = true;
+  check(look(v).text.includes("The rule stays proposed: Other is not Approve or Decline."), "the line from the file too");
+};
+
+cases["P46-rules-view-unchanged"] = async () => { // R1 AC7: the Rules view has no Other; Approve there answers Approve
+  world(live4w());
+  g.__files[RULES] = JSON.stringify({ rules: [{ ...rule("r-p", "Proposed"), status: "proposed", source: "agent" }] });
+  g.__files[`:${DIR}/schedule.json`] = JSON.stringify({ everyMinutes: 15 });
+  g.__files[cardFile("d-r")] = JSON.stringify({ id: "d-r", status: "open", rule: "r-p", question: "Adopt rule r-p?", options: [{ label: "Approve" }, { label: "Decline" }], created: "2026-11-16T10:00:00Z" });
+  g.__ls[`:${DIR}/decisions`] = ["d-r.json"];
+  const v = await mount(); await settle();
+  await staleClick(v, "view-rules");
+  await staleClick(v, "rule-head-r-p");
+  check(!Object.keys(look(v).clicks).some((k) => /other/i.test(k)) && !look(v).text.includes(OTHER_DETAIL), "no Other in the Rules view");
+  await staleClick(v, "rule-approve-r-p");
+  const c = JSON.parse(g.__files[cardFile("d-r")]);
+  check(c.answer === "Approve" && !("other" in c), `answered Approve, no other key (got ${g.__files[cardFile("d-r")]})`);
+};
+
+const pushOtherReply = { ok: true, done: false, answer: "Other", refusal: null, result: null, message: `${PID} answered Other; nothing was pushed.` };
+const pushOtherCard = (words) => { const base = JSON.parse(pushCardText()); return JSON.stringify({ ...base, status: "answered", answer: "Other", other: true, note: words, answered: "2026-11-16T10:01:00Z", answeredBy: "person, in the panel" }); };
+
+cases["P46-other-push"] = async () => { // R7 AC5-AC6, R4 AC2, R12 AC1/AC3: Other on a push card runs the tool with --answer Other, never --seen
+  let file;
+  const { v, file: f } = await pushWorld({ tool: { run: () => { g.__files[file] = pushOtherCard("do X first"); return json(0, pushOtherReply); } } });
+  file = f;
+  await click(v, `opt-${PID}-0`); await settle(); // a passing check: a seen token is there
+  check(v.push.canSubmit(S, PID), "a check passed");
+  await click(v, `opt-${PID}-other`); typeInto(v, PID, "do X first");
+  await click(v, `submit-${PID}`); await settle(); await settle();
+  const runs = pushExecs("run");
+  check(runs.length === 1, `one run (got ${runs.length})`);
+  check(JSON.stringify(runs[0][1]) === JSON.stringify(["run", PID, "--answer", "Other", "--space", S, "--json", "--note", "do X first"]), `its argv (got ${JSON.stringify(runs[0][1])})`);
+  check(!runs[0][1].includes("--seen"), "never --seen");
+  const { text } = look(v);
+  check(text.includes("answered: Other") && text.includes("Answered Other: nothing was pushed."), `shown (got ${text.slice(0, 1500)})`);
+  check(!text.includes("Answered Not now"), "not called Not now");
+  check(JSON.stringify(queued(v)) === JSON.stringify([`decision ${PID} answered Other (nothing was pushed), in the person's own words: "do X first"`]), `the notice (got ${JSON.stringify(queued(v))})`);
+  check(!g.__execs.some(([c, a]) => c === "sh" && (a ?? []).some((x) => String(x).includes("do X first"))), "the words never reach a shell");
+  // The tool says it was pushed already: shown and told as Push (t-045 R9).
+  let file2;
+  const { v: v2, file: f2 } = await pushWorld({ tool: { run: () => { g.__files[file2] = answeredByTool(); return json(0, { ...toolPushed, message: `${PID} was already pushed; nothing to do.` }); } } });
+  file2 = f2;
+  await click(v2, `opt-${PID}-other`); typeInto(v2, PID, "do X first"); await click(v2, `submit-${PID}`); await settle(); await settle();
+  check(look(v2).text.includes(`Pushed ${PURL} main aa22000..cc11000`) && queued(v2)[0].startsWith(`decision ${PID} was already answered Push; `), `already pushed: shown as Push (got ${JSON.stringify(queued(v2))})`);
+  // A refusal (C5): not saved, the card open.
+  const { v: v3 } = await pushWorld({ tool: { run: () => json(2, { ok: false, answer: null, refusal: { check: "C5", message: "an Other answer needs --note with the person's own words" }, message: "refused" }) } });
+  await click(v3, `opt-${PID}-other`); typeInto(v3, PID, "x"); await click(v3, `submit-${PID}`); await settle(); await settle();
+  const t3 = look(v3);
+  check(t3.text.includes("Not saved: an Other answer needs --note") && Boolean(t3.clicks[`opt-${PID}-other`]), `refused: Not saved, open (got ${t3.text.slice(0, 1500)})`);
+  check(queued(v3)[0] === `decision ${PID} answered Other; refused: an Other answer needs --note with the person's own words (the card stays open)`, `its notice (got ${queued(v3)[0]})`);
+  // Other while a check runs: not run, said.
+  const gate = deferred();
+  let checking = false;
+  const { v: v4 } = await pushWorld({ tool: { check: () => (checking ? gate.promise : json(0, checkReply())) } });
+  await click(v4, `opt-${PID}-other`); typeInto(v4, PID, "later");
+  checking = true; await click(v4, `push-check-${PID}`); await settle();
+  v4.answerPush(g.__spaces[0], v4.cards.find((c) => c.id === PID), "Other", cx); await settle();
+  check(pushExecs("run").length === 0 && look(v4).text.includes("Other was not saved: a check was running. Submit it again."), `not run while checking (got ${look(v4).text.slice(0, 1500)})`);
+  gate.resolve(json(0, checkReply())); await settle();
+};
+
+cases["P46-push-other-closed"] = async () => { // R3 AC4: a push card answered Other on file
+  const { v } = await pushWorld({ card: pushOtherCard("not this week") });
+  v.older = true;
+  const { text } = look(v);
+  check(text.includes("Answered Other: nothing was pushed.") && text.includes("Your answer: “not this week”"), `shown (got ${text.slice(0, 1500)})`);
+  check(!text.includes("Nothing was pushed from this card."), "not the plain line");
+};
+
+cases["P46-own-other-option"] = async () => { // R1 AC5, R12 AC2: a card's own Other option becomes the panel's Other row
+  const v = await otherWorld({ "d-x": { options: [{ label: "A" }, { label: "other", detail: "something else" }, { label: "B" }] } });
+  const { clicks } = look(v);
+  check(Boolean(clicks["opt-d-x-0"]) && !clicks["opt-d-x-1"] && Boolean(clicks["opt-d-x-2"]) && Boolean(clicks["opt-d-x-other"]), `A, B keep their ids; one Other row (got ${optClicks(clicks, "d-x")})`);
+  const rowText = inspect(pathTo(v.render(cx), "opt-d-x-other")?.at(-1) ?? null).text;
+  check(rowText === "Other | something else", "the card's own detail under it");
+  check(!look(v).text.includes("| other |"), "the card's own row is not drawn");
+  await answerOther(v, "d-x", "neither of these");
+  const c = JSON.parse(g.__files[cardFile("d-x")]);
+  check(c.answer === "Other" && c.other === true && c.note === "neither of these", `written as Other (got ${g.__files[cardFile("d-x")]})`);
+};
+
 // ---- t-053: the panel far below the runtime's host-task limit (spec R1-R8) ------------------------------------
 // tests/panel/stubs.mjs keeps the pool (__pool): a slot per pending spawn, sleep, timer, read, exec, hc and watch, the
 // runtime's RangeError past the limit. The long cases (R7) drive every copy's timers on the clock and assert the pool
