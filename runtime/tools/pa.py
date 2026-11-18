@@ -885,7 +885,8 @@ def claim(args, address, labels, space, project, p, existing, directory):
 def reload_profile(p):
     """The profile as it is now, by the same name, so a restart in run_agent's loop sees an edit made since the
     launcher began (t-033); the one in hand when it cannot be read now (missing, malformed, refused by load_profile).
-    run_agent also keeps the one in hand when no launch can be built from the new one (round 2)."""
+    run_agent also keeps the one in hand when no launch can be built from the new one (round 2), and launches with
+    it when the new one's program cannot be started (round 4)."""
     try:
         return load_profile(p["name"])
     except Exception:  # noqa: BLE001 - a restart never fails because of it
@@ -965,27 +966,46 @@ def run_agent(args, address, project, p, directory, agent, ctx, started):
         args.fresh = False
         agent["updated"] = now()
         write_json(os.path.join(directory, "agent.json"), agent)
+        held, adopted = p, False
         if fresh is not p:
             # The re-read profile is used only when a launch can be built from it (t-033 round 2): a file that
             # loads but has a wrong shape in a key read here (models a list, path a number, ...) keeps the old one.
             try:
                 argv, model = launch_command(fresh, agent, resume, directory)
-                p = fresh
+                p, adopted = fresh, fresh != held
             except Exception:  # noqa: BLE001 - a restart never fails because of the reload
                 fresh = p
         if fresh is p:
             argv, model = launch_command(p, agent, resume, directory)
-        session_log(directory, "start resume={} session={} reason={}".format(resume, agent["sessionId"], why))
-        began = time.time()
-        running.update(since=began, session=agent["sessionId"], marked=False)
-        launcher_session(ctx, directory, agent, resume)
-        costs = costs_module()
-        if costs:
-            try:
-                costs.record_agent_start(directory, agent, address, project, model, resume)
-            except Exception:  # noqa: BLE001 - never stops the Project Agent
-                pass
-        code = subprocess.call(argv, cwd=project)
+
+        def starting(model):  # what is written as a launch starts; returns its start time
+            session_log(directory, "start resume={} session={} reason={}".format(resume, agent["sessionId"], why))
+            began = time.time()
+            running.update(since=began, session=agent["sessionId"], marked=False)
+            launcher_session(ctx, directory, agent, resume)
+            costs = costs_module()
+            if costs:
+                try:
+                    costs.record_agent_start(directory, agent, address, project, model, resume)
+                except Exception:  # noqa: BLE001 - never stops the Project Agent
+                    pass
+            return began
+        began = starting(model)
+        try:
+            code = subprocess.call(argv, cwd=project)
+        except (OSError, ValueError, TypeError) as e:
+            # t-033 round 4: a changed profile whose program the exec could not start (a raise, not an exit code:
+            # a lone surrogate, a folder or non-program as claude, an argument list too long, ...) does not stop
+            # the launcher: this launch uses the profile in hand. Its own build and start are not guarded, so a
+            # failure there is raised as before.
+            if not adopted:
+                raise
+            session_log(directory, "the re-read profile did not start ({}); launching with the profile in hand"
+                        .format(ascii(e)[:200]))
+            p = held
+            argv, model = launch_command(p, agent, resume, directory)
+            began = starting(model)
+            code = subprocess.call(argv, cwd=project)
         running["since"] = None
         lasted = time.time() - began
         session_log(directory, "exit code={} after={:.0f}s".format(code, lasted))
