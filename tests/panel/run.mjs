@@ -1,6 +1,7 @@
 // Panel harness (t-003): renders mods/project-agent/main.js against stubbed Herdr data and
-// clicks its controls. Usage: node tests/panel/run.mjs [case ...]
-// Prints one line per case; exits non-zero when any case fails.
+// clicks its controls. Usage: node tests/panel/run.mjs [--list] [--shard=<k>/<n>] [case ...]
+// Prints one line per case; exits non-zero when any case fails (2: a bad argument). No case names: every case.
+// --shard=<k>/<n>: every n-th case from the k-th (tests/run-all.sh runs four shards at once); --list: the names only.
 import fs from "fs";
 import os from "os";
 import path from "path";
@@ -3455,10 +3456,26 @@ cases["T26-sel-every-view"] = async () => { // no TextView under a click anywher
   safeViews(v.render(cx), "root");
 };
 
-const pick = process.argv.slice(2);
+// Which cases run (t-031): every case, or the named ones; --shard=<k>/<n> keeps every n-th case by definition
+// order (index mod n == k - 1), so n shards together run each case once, and a case added later lands in one.
+// --list prints the names that would run and runs none. An unknown name or option exits 2.
+const refuse = (why) => { fs.rmSync(dst, { recursive: true, force: true }); console.error(`run.mjs: ${why}`); process.exit(2); };
+const pick = [];
+let list = false, shard = null;
+for (const arg of process.argv.slice(2)) {
+  if (arg === "--list") list = true;
+  else if (arg.startsWith("--shard=")) {
+    const m = /^--shard=([0-9]+)\/([0-9]+)$/.exec(arg), k = Number(m?.[1]), n = Number(m?.[2]);
+    if (!m || n < 1 || k < 1 || k > n) refuse(`bad ${arg} (want --shard=<k>/<n>, 1 <= k <= n)`);
+    shard = { k, n };
+  } else if (arg.startsWith("-")) refuse(`unknown option ${arg} (usage: run.mjs [--list] [--shard=<k>/<n>] [case ...])`);
+  else if (!Object.hasOwn(cases, arg)) refuse(`no case named ${arg}`);
+  else pick.push(arg);
+}
+const chosen = Object.entries(cases).filter(([name], i) => (!pick.length || pick.includes(name)) && (!shard || i % shard.n === shard.k - 1));
+if (list) { for (const [name] of chosen) console.log(name); fs.rmSync(dst, { recursive: true, force: true }); process.exit(0); }
 let failed = 0;
-for (const [name, fn] of Object.entries(cases)) {
-  if (pick.length && !pick.includes(name)) continue;
+for (const [name, fn] of chosen) {
   g.__rejected = [];
   let why = null;
   try { await fn(); } catch (e) { why = e instanceof Failed ? e.message : e.stack; }
