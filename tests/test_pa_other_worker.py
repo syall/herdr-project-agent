@@ -127,7 +127,24 @@ class Decide(Cards):
             self.assertEqual((c["status"], c["answer"], c["previousAnswer"], c["previousNote"], c["note"], c["answeredBy"]),
                              ("withdrawn", None, "Other", "ask me again tomorrow", "the person asked for the question again",
                               "orchestrator: withdrawn"))
-            self.assertEqual(self.journal()[-1]["why"], "withdrawn: the person asked for the question again")
+            self.assertEqual(self.journal()[-1]["why"],
+                             'withdrawn (was Other: "ask me again tomorrow"): the person asked for the question again')
+
+    def test_d12_withdraw_keeps_when_and_cuts_the_journal_words(self):
+        """J1b: the withdraw keeps when the Other answer was given, and its journal line keeps the words (cut, said so)."""
+        self.put("d-1", status="answered", answer="Other", other=True, note="w" * 150 + "\n" + "v" * 150,
+                 answered="2026-11-01T10:00:00Z", answeredBy="person, in the panel")
+        code, _o, err = self.decide("d-1", withdraw=True, why="asked again")
+        self.assertEqual(code, 0, err)
+        c = self.read("d-1")
+        self.assertEqual((c["previousAnswered"], c["previousNote"]), ("2026-11-01T10:00:00Z", "w" * 150 + "\n" + "v" * 150))
+        self.assertNotEqual(c["answered"], "2026-11-01T10:00:00Z")
+        words = ("w" * 150 + " " + "v" * 150)[:199]
+        self.assertEqual(self.journal()[-1]["why"], 'withdrawn (was Other: "{}… (the rest is on the card)"): asked again'.format(words))
+        self.put("d-2")  # an open card: as before
+        self.assertEqual(self.decide("d-2", withdraw=True, why="moot")[0], 0)
+        self.assertEqual(self.journal()[-1]["why"], "withdrawn: moot")
+        self.assertNotIn("previousAnswered", self.read("d-2"))
 
     def test_d09_withdraw_any_other_answered_card_is_refused(self):
         self.put("d-1", status="answered", answer="B", note="B it is")
@@ -239,6 +256,22 @@ class Worktree(Cards):
         c = self.read("d-wt-t-003")
         self.assertEqual((c["status"], c["answer"]), ("open", None))
 
+    def test_w06_the_card_asked_again_carries_the_words(self):
+        """J1b: the new card over the same file keeps what the person said on the withdrawn one."""
+        self.answered_other(answered="2026-11-01T10:00:00Z")
+        self.assertEqual(self.decide("d-wt-t-003", withdraw=True, why="the person now wants it deleted")[0], 0)
+        self.assertIn("opened card d-wt-t-003", self.check()[1])
+        c = self.read("d-wt-t-003")
+        self.assertEqual((c["status"], c["answer"], c["note"], c["answered"]), ("open", None, None, None))
+        self.assertEqual((c["previousAnswer"], c["previousNote"], c["previousAnswered"]), ("Other", WORDS, "2026-11-01T10:00:00Z"))
+        self.assertNotIn("other", c)
+
+    def test_w07_a_first_card_carries_nothing(self):
+        self.assertIn("opened card d-wt-t-003", self.check()[1])
+        c = self.read("d-wt-t-003")
+        for key in ("previousAnswer", "previousNote", "previousAnswered", "previousCard"):
+            self.assertNotIn(key, c)
+
 
 class Leftovers(Cards):
     """R9: pa-worker close --card closes nothing on an Other answer, withdraws the card and quotes the words."""
@@ -297,6 +330,21 @@ class Leftovers(Cards):
         self.assertNotIn("answered 'other'", err)
         self.assertEqual(self.ended(), [])
         self.assertEqual(self.card()["status"], "withdrawn")
+
+    def test_l04_the_next_card_carries_the_words(self):
+        """J1b: the next leftovers card (another id) names the withdrawn card and what the person said on it."""
+        self.ready()
+        self.answer("Other", note="close all but t32")
+        answered = self.card()["answered"]
+        self.worker("close", "--card", "d-leftovers")
+        self.assertEqual(self.card()["previousAnswered"], answered)
+        code, out, err = self.sweep()
+        self.assertEqual(code, 0, err)
+        self.assertIn("opened card d-leftovers-2", out)
+        c = pa.read_json(self.card_path("d-leftovers-2"))
+        self.assertEqual((c["status"], c["answer"], c["note"]), ("open", None, None))
+        self.assertEqual((c["previousCard"], c["previousAnswer"], c["previousNote"], c["previousAnswered"]),
+                         ("d-leftovers", "Other", "close all but t32", answered))
 
 
 if __name__ == "__main__":
