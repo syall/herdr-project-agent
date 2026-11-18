@@ -5892,6 +5892,8 @@ class J2S_Net(J2Base):
 
     def test_j2n2_the_real_opener_has_only_the_handlers_it_needs(self):
         import urllib.request
+        os.environ["HTTPS_PROXY"] = "https://proxy.example.test"  # ProxyHandler registers only when a proxy is set (Q5)
+        self.addCleanup(os.environ.pop, "HTTPS_PROXY", None)
         opener = pa_costs.http_opener()
         names = sorted(type(h).__name__ for h in opener.handlers)
         self.assertIn("HTTPSHandler", names)
@@ -6206,7 +6208,7 @@ class J2C_Rules(J2Base):
         code, out, _err = self.fetch(source="src-a", yes=True)
         self.assertEqual(code, 0)
         self.assertEqual(len(self.written()["models"]["model-a"]), 1)
-        self.assertIn("model-a / cw1h: kept 4.0 (source has no price: no cw1h row in the list)", out)
+        self.assertIn("model-a / cw1h: kept 4.0 (source has no price: no row)", out)  # the stub's default why
 
     def test_j2c7_a_null_beside_a_change_carries_the_files_number(self):
         self.change_a_global({"cw1h": None, "in": 1.5})
@@ -6304,7 +6306,7 @@ class J2C_Rules(J2Base):
         after = self.written()
         self.assertNotIn("model-b", after["models"])
         self.assertIsNone((self.scoped(after, ("provider-a", "global", "region-b", None)) or {}).get("model-c"))
-        self.assertIn("excluded by the profile: model-b, model-c", out)
+        self.assertIn("excluded by the profile (left as they are): model-b, model-c", out)
         self.assertEqual(self.scoped(after, ("provider-a", "regional", "region-a", None))["model-a"][0]["in"], 1.1)
 
     def test_j2c17_the_first_fetch_writes_the_declared_default_scope(self):
