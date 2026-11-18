@@ -51,6 +51,7 @@ function world({ agent = true, agentTerminal = "t30", records = {}, extraPanes =
   g.__shared = { "project-agent.tabs": records, "project-agent.timer": { id: "K", at: T0 }, "project-agent.keeper": { id: "K", at: T0 } };
   g.__files = {}; g.__fail = []; g.__hang = [];
   g.__remoteDelay = 0; g.__execHang = []; g.__batchFail = {}; g.__issued = []; g.__timers = []; g.__layout = {}; g.__execs = []; g.__execOut = {}; g.__sleepHang = false; g.__execFail = []; g.__execFn = null;
+  g.__pool = null; g.__watchers = null; g.__hangOn = []; g.__delayOn = {}; g.__als = null; g.__cardReads = { live: 0, peak: 0 }; // t-053: off unless a case sets them
   if (agent) {
     const dir = machine ? `${machine}:.config/herdr-pa/spaces/${S}` : `:${DIR}`, home = machine ? `${machine}:.config/herdr-pa` : ":/home/u/.config/herdr-pa";
     g.__files[`${dir}/agent.json`] = JSON.stringify({ space: S, project: "/proj", profile: "test", name: "proj", terminal: agentTerminal });
@@ -864,8 +865,10 @@ cases["P-given-up-commits"] = async () => { // AC5.3a: a given-up load (a read t
   v.reload(cx); await settle();
   await step(6000); v.reload(cx); await settle();
   check(reads("agent.json").length === 2, `6 s: no second load yet (agent.json reads ${reads("agent.json").length})`);
-  await step(6000); v.reload(cx); await settle(); // 12 s, no progress: load 1 is given up; load 2's agent.json also takes 20 s
-  check(reads("agent.json").length === 3, `12 s: load 1 given up, load 2 started (agent.json reads ${reads("agent.json").length})`);
+  const load1 = v.loads[RS]?.token;
+  await step(6000); v.reload(cx); await settle(); // 12 s, no progress: load 1 is given up; load 2 starts
+  // t-053 (R2): load 2 starts no second agent.json read while load 1's is pending; it waits for it, then reads again.
+  check(v.loads[RS]?.token > load1 && reads("agent.json").length === 2, `12 s: load 1 given up, load 2 started, no second read yet (agent.json reads ${reads("agent.json").length})`);
   for (let t = 0; t < 9; t++) await step(1000); // 21 s: load 1 has ended, load 2 has not
   check(/Decisions · 4/.test(look(v).text), `load 1 committed: no newer load had (got ${look(v).text.slice(0, 300)})`);
   // The other order: the newer load commits first; the older one, ending later, commits nothing.
@@ -873,15 +876,16 @@ cases["P-given-up-commits"] = async () => { // AC5.3a: a given-up load (a read t
   g.__files[`${M}:${RDIR}/ledger.json`] = ledgerOf(2);
   remoteCards(3);
   v = await mount(); await settle();
-  g.__sleepHang = true; g.__delay[AJ] = 30000;
-  v.reload(cx); await settle(); // load A: agent.json answers at 30 s
-  await step(12000); delete g.__delay[AJ];
-  v.reload(cx); await settle(); // load B: given A up, ends at once
-  check(/Decisions · 3/.test(look(v).text) && v.cache.get(RS)?.cards?.length === 3, "load B committed");
-  await step(8000); addCard("d-04"); // A will see it when it ends
-  for (let t = 0; t < 12; t++) await step(1000); // 32 s: A has ended
-  check(reads("agent.json").length === 3, `no other load ran (agent.json reads ${reads("agent.json").length})`);
-  check(/Decisions · 3/.test(look(v).text) && v.cache.get(RS)?.cards?.length === 3, `A committed nothing after B (got ${look(v).text.slice(0, 300)})`);
+  // t-053 (R2): a newer load never re-reads what an older one still waits on, so the older one ending last is one whose
+  // slow call the newer load skipped: here its evidence listing (the newer load shows the last known evidence).
+  g.__sleepHang = true; g.__execHang = [`${M}:evidence`];
+  v.reload(cx); await settle(); // load A: its evidence listing hangs
+  await step(12000); addCard("d-04");
+  await fire(10000); // load B (background): given A up; the evidence listing still pending is skipped; it ends at once
+  check(/Decisions · 4/.test(look(v).text) && v.cache.get(RS)?.cards?.length === 4, `load B committed (got ${look(v).text.slice(0, 300)})`);
+  g.__execHang = []; await settle(); // A ends now, with the 3 cards it read at 0 s
+  for (let t = 0; t < 3; t++) await step(1000);
+  check(/Decisions · 4/.test(look(v).text) && v.cache.get(RS)?.cards?.length === 4, `A committed nothing after B (got ${look(v).text.slice(0, 300)})`);
 };
 
 cases["P-late-first-paint"] = async () => { // AC4.1 (verifier N1): B's first paint after the switch back to A changes nothing shown
@@ -1025,11 +1029,12 @@ cases["P-hidden-overlap"] = async () => { // AC8.2 (review P-M3): of two overlap
   await step(10000); await fire(10000); // read A at 10 s, answers at 40 s
   g.__remoteDelay = 0;
   for (const c of ["d-01", "d-02"]) g.__files[`${M}:${RDIR}/decisions/${c}.json`] = openCard(c, { status: "answered", answer: "Yes" });
-  await step(12000); await fire(10000); // 22 s: A has been busy for 12 s: read B, answers at once
-  check((g.__shared["project-agent.open"] ?? {})[RS] === 1, `read B: 1 open (got ${JSON.stringify(g.__shared["project-agent.open"])})`);
-  g.__batchFail = { [M]: { code: 0, stdout: ["d-01", "d-02", "d-03"].map((c) => `${c}.json\0${openCard(c)}\0`).join("") } }; // what A saw when it was issued
-  await step(20000);
-  check((g.__shared["project-agent.open"] ?? {})[RS] === 1, `A, ending after B, wrote nothing (got ${JSON.stringify(g.__shared["project-agent.open"])})`);
+  const batches = () => remoteCalls("batch").length, before = batches();
+  await step(12000); await fire(10000); // 22 s: A has been busy for 12 s: read B
+  // t-053 (R2): B starts no second card read while A's is pending (BUSY): nothing is written.
+  check(batches() === before && (g.__shared["project-agent.open"] ?? {})[RS] === 3, `read B: no second card read, nothing written (batches ${batches() - before}, ${JSON.stringify(g.__shared["project-agent.open"])})`);
+  await step(20000); // A answers at 40 s, the newest read: it writes
+  check((g.__shared["project-agent.open"] ?? {})[RS] === 1, `A, the newest read, wrote (got ${JSON.stringify(g.__shared["project-agent.open"])})`);
   void v;
 };
 
@@ -2085,7 +2090,7 @@ cases["P-push-exec-timeout"] = async () => { // D8: a run that never settles: "r
 
 cases["P-push-lastknown"] = async () => { // D7: a card shown from its last known copy still checks and runs on a click; reloads run nothing
   const { v } = await pushWorld();
-  g.__execFail = [":ls"]; // the card listing stops answering: the last known card stays shown
+  g.__execFail = [":batch", ":ls"]; // the card listing stops answering: the last known card stays shown (t-053: the batch runs here too)
   for (let i = 0; i < 3; i++) { advance(10000); await fire(10000); }
   check(look(v).text.includes("the last known are shown"), `shown from the last known copy (got ${look(v).text.slice(0, 600)})`);
   check(pushExecs("run").length === 0, "reloads ran no run");
@@ -3642,8 +3647,10 @@ cases["C3-turnoff-race"] = async () => { // item 3: a compare from before Turn o
   advance(61000); v.reload(cx); await settle(); // a later read: its compare (the 2nd) is held
   check(n === 2, `the 2nd compare is in flight (got ${n})`);
   await click(v, "costs-billing-off"); await settle();
-  check(costsView(v).text.includes("The billing query is off"), `off after Turn off (got ${costsView(v).text.slice(-400)})`);
+  // t-053 (R2): the compare after Turn off waits for the one in flight (the same call), then asks again.
+  check(n === 2, `the compare after Turn off waits for the 2nd (got ${n})`);
   h.release(); await settle(); await settle();
+  check(n === 3 && costsView(v).text.includes("The billing query is off"), `off after Turn off (got ${n}, ${costsView(v).text.slice(-400)})`);
   const text = costsView(v).text;
   check(text.includes("The billing query is off") && !text.includes("Billing query: on"), `the older compare does not bring "on" back (got ${text.slice(-400)})`);
 };
@@ -4415,6 +4422,280 @@ cases["P45-push-unknown-owner-gone"] = async () => { // the same with the owner 
   mode.now = "open"; await click(w, `push-check-${PID}`); await settle(); await settle();
   check(W3(w).includes(`opt-${PID}-1`), `w's check read it open: unlocked (got ${W3(w)})`);
   check(!g.__shared["project-agent.answering"]?.[`${S}\0${PID}`], "the shared mark is gone");
+};
+
+// ---- t-053: the panel far below the runtime's host-task limit (spec R1-R8) ------------------------------------
+// tests/panel/stubs.mjs keeps the pool (__pool): a slot per pending spawn, sleep, timer, read, exec, hc and watch, the
+// runtime's RangeError past the limit. The long cases (R7) drive every copy's timers on the clock and assert the pool
+// never holds more than POOL_MAX.
+const { AsyncLocalStorage } = await import("async_hooks");
+const POOL_MAX = 128;
+const turn = async (n = 4) => { for (let i = 0; i < n; i++) await new Promise((r) => setTimeout(r, 1)); };
+const pool = () => g.__pool;
+// n cards in the local space's decisions/ (answered: the old ones a long project keeps; the first `open` are open).
+function localCards(n, { open = 0, dir = DIR, on = "" } = {}) {
+  const names = [];
+  for (let i = 1; i <= n; i++) {
+    const id = `d-${String(i).padStart(3, "0")}`; names.push(`${id}.json`);
+    g.__files[`${on}:${dir}/decisions/${id}.json`] = JSON.stringify({ id, status: i <= open ? "open" : "answered", answer: i <= open ? undefined : "Yes", question: `Q ${id}?`, options: [{ label: "Yes" }, { label: "No" }], created: `2026-11-${String(1 + (i % 28)).padStart(2, "0")}T10:00:00Z` });
+  }
+  g.__ls[`${on}:${dir}/decisions`] = names;
+}
+// Runs every registered timer when it is due (once per step at most), each in its own copy's props (__als); each(t)
+// runs per step (t: ms since the start). Stops early once the pool holds more than POOL_MAX (the case then fails).
+async function drive(ms, { stepMs = 1000, each = null, lease = true, settleTurns = 4 } = {}) {
+  const next = new Map(), errors = [];
+  for (let t = stepMs; t <= ms; t += stepMs) {
+    if (lease) advance(stepMs); else g.__now += stepMs;
+    for (const tm of [...g.__timers]) {
+      if (!next.has(tm)) next.set(tm, g.__now - stepMs + tm.ms);
+      if (g.__now < next.get(tm)) continue;
+      next.set(tm, g.__now + tm.ms);
+      const callIt = () => tm.fn(cx);
+      try { if (tm.store && g.__als) g.__als.run(tm.store, callIt); else callIt(); } catch (e) { errors.push(String(e?.message ?? e)); }
+    }
+    if (each) await each(t);
+    await turn(settleTurns);
+    if ((pool()?.live ?? 0) > POOL_MAX) return { stopped: t, errors };
+  }
+  return { stopped: null, errors };
+}
+const poolSaid = () => JSON.stringify({ live: pool()?.live, peak: pool()?.peak, kinds: pool()?.kinds, refused: pool()?.refused ?? 0 });
+const localIssued = (kind) => g.__issued.filter((x) => x.on === null && (!kind || x.kind === kind));
+const loadsLocal = () => localIssued("read").filter((x) => x.path === `${DIR}/agent.json`).length; // a full load reads agent.json first
+const liveIdle = (address, space = S) => ({ address, state: "live", argv: ["pa-session"], labels: { "herdr.pa": localId53(space) }, status: "idle", program: claude });
+const localId53 = (id) => String(id).split("/").pop();
+// A copy mounted in its own props (several copies in one case: the shown panel, a hidden one, the timer copy).
+async function mountAs(copyProps) { return g.__als.run({ props: copyProps }, async () => { const v = new ProjectAgent(); v.init({}, cx); await flush(); return v; }); }
+const layout53 = () => ({ type: "row", id: "root", children: [
+  { type: "block", id: "main", content: { tab: "active" } },
+  { type: "column", id: "panel", children: [{ type: "block", id: "project-agent", content: { mod: "project-agent" } }] },
+  { type: "column", id: "side", hidden: true, children: [{ type: "block", id: "pa-side", content: { mod: "project-agent", props: { side: 1 } } }] },
+  { type: "block", id: "pa-timer", content: { mod: "project-agent", props: { timer: true } } }] });
+
+cases["P53-long-a-local"] = async () => { // R7 (a), AC1.1: local, 200 cards, 10 watch batches per 10 s, 30 min: never over POOL_MAX
+  world({ records: alive(), extraTabs: [paTab], extraPanes: [paPane()], extraTerms: [paTerm()], agents: [{ address: "t4w", status: "working" }] });
+  localCards(200, { open: 2 });
+  g.__files[`:${DIR}/schedule.json`] = JSON.stringify({ everyMinutes: 30 });
+  g.__pool = { limit: 1024 }; g.__watchers = [];
+  const v = await mount(); await settle();
+  const paths = [`${DIR}/heartbeat`, `${DIR}/evidence/t-1/build.log`, `${DIR}/keeper.lock`, `${DIR}/decisions/d-001.json`, `${DIR}/session.log`, `${DIR}/ledger.json`, `/home/u/.config/herdr-pa/spaces/sp9/heartbeat`];
+  let k = 0;
+  const r = await drive(30 * 60000, { each: () => { const w = g.__watchers.shift(); if (w) w.resolve([paths[k++ % paths.length]]); } });
+  console.log(`  P53-long-a-local: peak ${pool().peak} in flight, refused ${pool().refused ?? 0}, ${poolSaid()}`);
+  check(r.stopped === null && pool().peak <= POOL_MAX && !pool().refused, `in flight stays <= ${POOL_MAX} (stopped at ${r.stopped} ms; ${poolSaid()})`);
+  check(/PA: proj/.test(look(v).text) && v.cards.length === 200, `the panel still shows its data (cards ${v.cards.length})`);
+  check(loadsLocal() > 30, `loads still happen (got ${loadsLocal()})`);
+};
+
+cases["P53-long-b-three-spaces"] = async () => { // R7 (b), AC2.1: a hung remote, a slow remote (5 s), a local space; shown, hidden and timer copies in one pool; 2 h
+  world({ extraTabs: [paTab], extraPanes: [paPane()], extraTerms: [liveIdle("t4w")] });
+  localCards(20, { open: 1 });
+  g.__files[`:${DIR}/schedule.json`] = JSON.stringify({ everyMinutes: 30 });
+  g.__machines.push({ name: "m1", layout: "ready" }, { name: "m2", layout: "ready" });
+  const recs = { tb1: { space: S, project: "/proj", profile: "test", name: "proj", terminal: "t4w", alive: true } };
+  for (const [m, id, name] of [["m1", "spH", "hung"], ["m2", "spS", "slow"]]) {
+    const dir = `.config/herdr-pa/spaces/${id}`;
+    g.__spaces.push({ id: `${m}/${id}`, name, machine: m, folder: `/${name}`, active: false, tabs: [{ id: `${m}/tb-${id}`, index: 1, name: `PA: ${name}`, named: true }] });
+    g.__files[`${m}:${dir}/agent.json`] = JSON.stringify({ space: id, project: `/${name}`, profile: "test", name });
+    g.__files[`${m}:${dir}/ledger.json`] = ledgerOf(2);
+    g.__files[`${m}:${dir}/schedule.json`] = JSON.stringify({ everyMinutes: 30 });
+    g.__files[`${m}:.config/herdr-pa/profiles/test/profile.json`] = JSON.stringify({ name: "test" });
+    g.__files[`${m}:${dir}/heartbeat`] = "1 t\n";
+    localCards(20, { open: 1, dir, on: m });
+    g.__panes.push({ pane: `${m}/p-${id}`, terminal: `${m}/t-${id}`, tab: `${m}/tb-${id}`, title: `PA: ${name}`, cwd: `/${name}`, status: "idle", program: claude });
+    g.__terminals.push(liveIdle(`${m}/t-${id}`, id));
+    recs[`${m}/tb-${id}`] = { space: `${m}/${id}`, project: `/${name}`, profile: "test", name, terminal: `${m}/t-${id}`, alive: true };
+  }
+  g.__shared["project-agent.tabs"] = recs;
+  delete g.__shared["project-agent.timer"]; delete g.__shared["project-agent.keeper"]; // one of these copies keeps time
+  g.__layout = layout53(); g.__als = new AsyncLocalStorage();
+  g.__pool = { limit: 1024 }; g.__hangOn = ["m1"]; g.__delayOn = { m2: 5000 }; g.__hcHang = ["m1/t-spH"];
+  const shownCopy = await mountAs({}); await mountAs({ side: 1 }); await mountAs({ timer: true }); await settle();
+  const order = ["m1/spH", "m2/spS", S];
+  let slowSeen = false;
+  const r = await drive(2 * 3600000, { stepMs: 5000, lease: false, settleTurns: 3, each: (t) => {
+    show(order[Math.floor(t / 1200000) % 3]);
+    if (shownCopy.space === "m2/spS" && shownCopy.data?.agent?.name === "slow") slowSeen = true;
+  } });
+  console.log(`  P53-long-b-three-spaces: peak ${pool().peak} in flight, refused ${pool().refused ?? 0}, ${poolSaid()}`);
+  check(r.stopped === null && pool().peak <= POOL_MAX && !pool().refused, `in flight stays <= ${POOL_MAX} in one pool (stopped at ${r.stopped} ms; ${poolSaid()}; ${r.errors.slice(0, 2)})`);
+  check(slowSeen, "the slow remote space still loads while the other one hangs");
+};
+
+cases["P53-long-c-costs"] = async () => { // R7 (c): the Costs view shown, a collect every 120 s and its writes seen by the watch; 30 min
+  world({ records: alive(), extraTabs: [paTab], extraPanes: [paPane()], extraTerms: [liveIdle("t4w")] });
+  localCards(200, { open: 1 });
+  costsFiles(costsSummary()); costsTool({});
+  delete g.__shared["project-agent.timer"]; delete g.__shared["project-agent.keeper"]; // this copy keeps time and collects
+  g.__pool = { limit: 1024 }; g.__watchers = [];
+  const v = await mount(); await settle(); await click(v, "view-costs"); await settle();
+  let collects = 0;
+  const r = await drive(30 * 60000, { lease: false, each: () => {
+    const n = g.__issued.filter((x) => x.kind === "pa-costs").length;
+    if (n > collects) { collects = n; const w = g.__watchers.shift(); if (w) w.resolve([`${DIR}/costs/sessions.jsonl`, `${DIR}/costs/summary.json`]); }
+  } });
+  console.log(`  P53-long-c-costs: peak ${pool().peak} in flight, refused ${pool().refused ?? 0}, ${poolSaid()}`);
+  check(r.stopped === null && pool().peak <= POOL_MAX && !pool().refused, `in flight stays <= ${POOL_MAX} (stopped at ${r.stopped} ms; ${poolSaid()})`);
+  check(collects >= 10, `collects every 120 s while shown (got ${collects} pa-costs calls)`);
+};
+
+cases["P53-local-200-no-sleeps"] = async () => { // AC1.1: a local load of 200 cards leaves at most the clock's sleep, none a second later
+  world(); localCards(200, { open: 3 }); g.__pool = { limit: 1024 };
+  const v = await mount(); await settle();
+  check(v.cards.length === 200 && !v.loads[S], `the load committed (cards ${v.cards.length})`);
+  check((pool().kinds.sleep ?? 0) <= 1, `at most one pending sleep at commit (${poolSaid()})`);
+  advance(1000); await settle();
+  check((pool().kinds.sleep ?? 0) === 0, `none a second later (${poolSaid()})`);
+};
+
+cases["P53-local-batch-one-exec"] = async () => { // AC3.1: the local cards are one exec, no readTextFile of a card
+  world(); localCards(200, { open: 3 });
+  const v = await mount(); await settle();
+  const cardReads = localIssued("read").filter((x) => x.path.includes("/decisions/"));
+  check(v.cards.length === 200 && localIssued("batch").length === 1 && cardReads.length === 0, `1 batch exec, 0 card reads (batch ${localIssued("batch").length}, reads ${cardReads.length})`);
+};
+
+cases["P53-fallback-peak-8"] = async () => { // AC3.2, AC1.2: the batch fails: at most 8 card reads pending; a hung fallback gives up at 10 s
+  world({ machine: M }); localCards(40, { open: 40, dir: RDIR, on: M }); g.__batchFail = { [M]: { code: 1 } }; g.__pool = { limit: 1024 };
+  for (let i = 1; i <= 40; i++) g.__delay[`${M}:${RDIR}/decisions/d-${String(i).padStart(3, "0")}.json`] = 500;
+  g.__cardReads = { live: 0, peak: 0 };
+  const v = await mount();
+  for (let s = 0; s < 8; s++) await step(500);
+  check(g.__cardReads.peak <= 8 && g.__cardReads.peak > 0, `at most 8 card reads at a time (peak ${g.__cardReads.peak})`);
+  check(v.cards.length === 40, `every card read (got ${v.cards.length})`);
+  world({ machine: M }); localCards(40, { open: 40, dir: RDIR, on: M }); g.__batchFail = { [M]: { code: 1 } }; g.__pool = { limit: 1024 };
+  g.__hang = Array.from({ length: 40 }, (_, i) => `${M}:${RDIR}/decisions/d-${String(i + 1).padStart(3, "0")}.json`);
+  g.__cardReads = { live: 0, peak: 0 };
+  const w = await mount();
+  await step(9000);
+  check(Boolean(w.loads[RS]), "still reading at 9 s");
+  await step(2000);
+  check(!w.loads[RS] && g.__cardReads.peak <= 8 && (pool().kinds.sleep ?? 0) <= 1, `given up by 11 s, <= 8 card reads, <= 1 sleep (peak ${g.__cardReads.peak}; ${poolSaid()})`);
+};
+
+cases["P53-hidden-batchonly-local"] = async () => { // AC3.3: hidden, a local batch that fails: no card read
+  world(); localCards(5, { open: 2 }); g.__batchFail = { "": { code: 1 } }; g.__layout = panelLayout("changes");
+  await mount(); await settle();
+  await drive(30000);
+  const cardReads = localIssued("read").filter((x) => x.path.includes("/decisions/"));
+  check(cardReads.length === 0 && localIssued("ls").length === 0, `no fallback while hidden (reads ${cardReads.length}, ls ${localIssued("ls").length})`);
+};
+
+cases["P53-watch-filter"] = async () => { // AC4.1: watch batches the panel does not show reload nothing; shown ones at most one load per 2 s
+  world(); localCards(3, { open: 1 }); g.__watchers = [];
+  await mount(); await settle();
+  const fireOnly1s = () => { for (const tm of g.__timers.filter((x) => x.ms === 1000)) tm.fn(cx); };
+  const batches = async (paths) => { for (let s = 0; s < 10; s++) { advance(1000); for (let i = 0; i < 10; i++) { const w = g.__watchers.shift(); if (w) w.resolve(paths); await turn(2); } fireOnly1s(); await settle(); } };
+  const before = loadsLocal();
+  await batches([`${DIR}/heartbeat`, `${DIR}/evidence/t-1/build.log`, `${DIR}/keeper.lock`, `${DIR}/session.log`, `${DIR}/costs/sessions.jsonl`, `/home/u/.config/herdr-pa/spaces/sp9/agent.json`]);
+  check(loadsLocal() === before, `heartbeat and log batches start no load (got ${loadsLocal() - before})`);
+  const mid = loadsLocal();
+  await batches([`${DIR}/decisions/d-1.json`]);
+  advance(3000); fireOnly1s(); await settle();
+  check(loadsLocal() - mid >= 1 && loadsLocal() - mid <= 6, `100 card batches in 10 s: 1 to 6 loads (got ${loadsLocal() - mid})`);
+  const end = loadsLocal();
+  g.__watchers.shift()?.resolve([`/home/u/.config/herdr-pa/spaces`]); await turn(2); advance(3000); fireOnly1s(); await settle();
+  check(loadsLocal() > end, "a batch naming the watched root reloads");
+};
+
+cases["P53-hung-recovers"] = async () => { // AC2.1, AC2.2: a hung machine: no new call of a pending kind; when it answers, the next round reads normally
+  world({ machine: M }); g.__files[`${M}:${RDIR}/ledger.json`] = ledgerOf(2); remoteCards(3);
+  const v = await mount(); await settle();
+  g.__hangOn = [M];
+  await drive(60000);
+  const at = g.__issued.length;
+  await drive(120000);
+  const more = g.__issued.slice(at).filter((x) => x.on === M);
+  check(more.length <= 2, `no new call while the old ones hang (got ${more.length}: ${JSON.stringify(more.slice(0, 6).map((x) => x.kind + (x.path ? ` ${x.path.split("/").pop()}` : "")))})`);
+  g.__files[`${M}:${RDIR}/ledger.json`] = ledgerOf(3); g.__hangOn = [];
+  await drive(25000);
+  check(/Tasks · 3/.test(look(v).text), `read normally once it answers (got ${look(v).text.slice(0, 200)})`);
+};
+
+cases["P53-busy-quiet"] = async () => { // D4 (card t-053 approval): a call still pending answers BUSY: skipped quietly; a click waits for it and reads again
+  world({ machine: M }); g.__files[`${M}:${RDIR}/ledger.json`] = ledgerOf(2); remoteCards(1);
+  const v = await mount(); await settle();
+  const L = `${M}:${RDIR}/ledger.json`;
+  g.__delay[L] = 15000; advance(3000);
+  await fire(10000); // a background load: its ledger read takes 15 s
+  await step(10000); await step(1000); // timed out at 10 s: the last known tasks
+  check(/ledger\.json: timed out/.test(look(v).text), `a real time-out is said (got ${look(v).text.slice(0, 300)})`);
+  const reads0 = reads("ledger.json").length;
+  await fire(10000); await step(500); // another background load: the ledger read still pending
+  check(reads("ledger.json").length === reads0, "no second ledger read while the first is pending");
+  const { text } = look(v);
+  check(/Tasks · 2/.test(text) && !/ledger\.json: timed out/.test(text) && !/still waiting|busy/i.test(text), `BUSY shows nothing (got ${text.slice(0, 300)})`);
+  g.__files[L] = ledgerOf(4);
+  v.reload(cx); await settle(); // a click's reload: waits for the read in flight
+  delete g.__delay[L];
+  await step(2000); await step(2000); await step(1000);
+  check(/Tasks · 4/.test(look(v).text) && !/timed out/.test(look(v).text), `the click read again after the old read settled (got ${look(v).text.slice(0, 300)})`);
+};
+
+cases["P53-tick-single-flight"] = async () => { // AC5.1: a hung machine for 1 h: tick and readBeats hold no more each round; the healthy space's passes go out
+  world({ extraTabs: [paTab], extraPanes: [paPane()], extraTerms: [liveIdle("t4w")] });
+  g.__machines.push({ name: "m1", layout: "ready" });
+  const hdir = ".config/herdr-pa/spaces/spH";
+  g.__spaces.push({ id: "m1/spH", name: "hung", machine: "m1", folder: "/hung", active: false, tabs: [{ id: "m1/tb-spH", index: 1, name: "PA: hung", named: true }] });
+  g.__files[`m1:${hdir}/agent.json`] = JSON.stringify({ space: "spH", project: "/hung", profile: "test", name: "hung" });
+  g.__panes.push({ pane: "m1/p-spH", terminal: "m1/t-spH", tab: "m1/tb-spH", title: "PA: hung", cwd: "/hung", status: "idle", program: claude });
+  g.__terminals.push(liveIdle("m1/t-spH", "spH"));
+  g.__shared["project-agent.tabs"] = { "m1/tb-spH": { space: "m1/spH", project: "/hung", profile: "test", name: "hung", terminal: "m1/t-spH", alive: true },
+    tb1: { space: S, project: "/proj", profile: "test", name: "proj", terminal: "t4w", alive: true } };
+  delete g.__shared["project-agent.timer"]; delete g.__shared["project-agent.keeper"];
+  g.__files[`:${DIR}/schedule.json`] = JSON.stringify({ everyMinutes: 0 });
+  g.__props = { timer: true }; g.__pool = { limit: 1024 }; g.__hangOn = ["m1"];
+  await mount(); await settle();
+  const passes = () => sends().filter((a) => a[1] === "t4w" && /manual pass/.test(a[2])).length;
+  let asked = 0, live30 = null;
+  const r = await drive(3600000, { stepMs: 5000, lease: false, each: (t) => {
+    g.__files[`:${DIR}/heartbeat`] = `${Math.floor(g.__now / 1000)} t4w\n`; // the local launcher runs
+    if (t % 600000 === 0) { g.__files[`:${DIR}/pass-request.json`] = JSON.stringify({ pending: true, at: "x", by: "panel" }); asked += 1; }
+    if (t === 1800000) live30 = pool().live;
+  } });
+  check(r.stopped === null && pool().live <= (live30 ?? 0) + 2, `the pool does not grow while m1 hangs (30 min ${live30}, 60 min ${pool().live}; ${poolSaid()})`);
+  check(passes() >= asked - 1 && asked >= 5, `the local space's passes still go out (${passes()} of ${asked})`);
+};
+
+cases["P53-hc-hung-one-slot"] = async () => { // AC5.2: a hung hc send: one call; the notice stays queued; no second send to that address
+  const v = await cardsWorld({ records: alive("t4w"), extraTabs: [paTab], extraPanes: [paPane()], extraTerms: [paTerm()], agents: [{ address: "t4w", status: "idle" }] }, ["d-x"]);
+  g.__hcHang = ["t4w"];
+  await answerCard(v, "d-x"); await settle();
+  await drive(600000, { stepMs: 2000 });
+  check(sends().length === 1, `one send in 10 min (got ${sends().length})`);
+  check(v.unsent.length === 1 && /hasn't been told yet/.test(look(v).text), `the notice stays queued and says so (got ${look(v).text.slice(0, 300)})`);
+};
+
+cases["P53-pool-full"] = async () => { // AC6.1: the runtime refuses: one plain line, the last data kept, no call for a second; gone once it drains
+  world(); localCards(3, { open: 1 }); g.__pool = { limit: 1024 };
+  const v = await mount(); await settle();
+  check(/PA: proj/.test(look(v).text), "loaded");
+  pool().full = true;
+  advance(10000);
+  for (const t of g.__timers.filter((x) => x.ms === 10000)) { try { t.fn(cx); } catch (e) { (g.__thrown ??= []).push(String(e)); } }
+  await settle();
+  let { text } = look(v);
+  check(/Too many calls waiting \(\d+\): .+ was skipped; showing what was read at \d\d:\d\d/.test(text) && !/host task limit/.test(text) && /PA: proj/.test(text) && !(g.__thrown ?? []).length,
+    `the plain line with the last data (got ${text.slice(0, 400)}; thrown ${g.__thrown})`);
+  const issued = g.__issued.length, refused = pool().refused;
+  advance(500); for (const t of g.__timers.filter((x) => x.ms === 1000)) { try { t.fn(cx); } catch {} } v.reload(cx, { background: true }); await settle();
+  check(g.__issued.length === issued && pool().refused === refused, `no call in the next second (issued ${g.__issued.length - issued}, refused ${pool().refused - refused})`);
+  pool().full = false;
+  advance(10000); await fire(10000); await settle();
+  ({ text } = look(v));
+  check(!/Too many calls waiting/.test(text) && /PA: proj/.test(text), `the line goes at the next load (got ${text.slice(0, 300)})`);
+};
+
+cases["P53-grep-host-calls"] = async () => { // AC1.3, AC6.2: no cx.sleep outside host.js; every host call goes through host.js
+  const files = fs.readdirSync(src).filter((n) => n.endsWith(".js") && n !== "host.js");
+  const code = (f) => fs.readFileSync(path.join(src, f), "utf8").split("\n").filter((l) => !/^\s*\/\//.test(l)).join("\n");
+  const sleeps = files.filter((f) => /cx\.sleep\(/.test(code(f)));
+  check(!sleeps.length, `no cx.sleep( outside host.js (got ${sleeps})`);
+  const calls = files.flatMap((f) => [...code(f).matchAll(/(?<![.\w])(readTextFile|writeTextFile|exec|hc|watchFolder)\(/g)].map((m) => `${f}: ${m[1]}`));
+  check(!calls.length, `no host call outside host.js (got ${calls.slice(0, 8)})`);
+  const imports = files.filter((f) => /import\s*\{[^}]*\b(readTextFile|writeTextFile|exec|hc|watchFolder)\b[^}]*\}\s*from\s*"herdr"/.test(code(f)));
+  check(!imports.length && fs.existsSync(path.join(src, "host.js")), `only host.js imports them (got ${imports})`);
 };
 
 // Which cases run (t-031): every case, or the named ones; --shard=<k>/<n> keeps every n-th case by definition

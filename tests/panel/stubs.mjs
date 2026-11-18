@@ -7,7 +7,7 @@
 //   __layout      layout()            (default {}: the panel is not in it, so it counts as shown)
 // A slow remote (t-012), on the same __now clock as __delay:
 //   __remoteDelay  ms                every readTextFile and exec on another machine settles once __now has moved on by ms
-//   __execHang     ["<machine>:<kind>"]  exec of that kind never settles (kind: batch, evidence, stale, ls, or the command)
+//   __execHang     ["<machine>:<kind>"]  exec of that kind settles only once it leaves the list (kind: batch, evidence, stale, ls, or the command)
 //   __batchFail    { "<machine>": { code, stdout } }  what the batched card read returns instead
 //   __issued       [{ at, on, kind, path? }]  every readTextFile and exec, when it was called
 //   __execOut      { "<machine>:<kind>": { code?, stdout } }  what an exec of that kind (evidence, stale) prints
@@ -20,6 +20,17 @@
 // cx / makeCx(): the keeper stubs' spawn (flush() awaits it) plus sleep(ms) on the __now clock and a timer that
 // records every(ms, fn) in __timers ([{ ms, fn }]) and after(ms, fn) in __afters, so a case can fire them;
 // write_to_clipboard(text) appends text to __clipboard (t-026); notify() counts into __notifies (t-028).
+// t-053 (each opt-in; unset, the stubs behave as before):
+//   __pool     { limit?: 1024, full?: bool }  the runtime's host-task pool: a slot per pending spawn, sleep, after, live
+//              every, readTextFile, exec, hc and watchFolder; past `limit` (or while `full`) the call throws the runtime's
+//              RangeError synchronously. The stubs fill in live, peak, kinds { kind: live }, refused, refusedKinds.
+//   __watchers []                      each watchFolder call pushes { path, resolve }; resolve(paths) ends it (a batch);
+//              its cancel() resolves []. Unset: a watch never ends (as before).
+//   __hangOn   ["<machine>"]           every readTextFile and exec there waits until the machine leaves the list, then
+//              answers as usual (a hung machine that comes back)
+//   __delayOn  { "<machine>": ms }    every readTextFile and exec there settles once __now has moved on by ms
+//   __als      an AsyncLocalStorage   props() answers its store's `props` (several copies, each its own props)
+//   __cardReads { live, peak }         pending readTextFile calls under decisions/ (always kept)
 export * from "./keeper-stubs.mjs";
 import { readTextFile as baseRead, exec as baseExec, cx as baseCx, hc as baseHc } from "./keeper-stubs.mjs";
 const g = globalThis;
@@ -35,19 +46,64 @@ export const execKind = (command, args = []) => {
 };
 // __draining: set between cases; every call fails at once, so work left over from a case ends there.
 const drained = () => { if (g.__draining) throw new Error("an old world"); };
-export const readTextFile = async (path, options = {}) => {
-  drained();
-  const on = options?.on ?? null;
-  (g.__issued ??= []).push({ at: g.__now, on, kind: "read", path });
-  if (on && g.__remoteDelay && !(g.__offline ?? []).includes(on)) await waitFor(g.__remoteDelay);
-  return baseRead(path, options);
+// t-053: the pool. hold(kind) takes a slot (or throws the runtime's RangeError) and returns its release.
+const LIMIT_TEXT = (kind) => (["read", "exec", "hc", "watch"].includes(kind) ? "a HostModule's async function exceeded the per-runtime outstanding host task limit of 1024"
+  : `cx.${kind === "spawn" ? "spawn(fn)" : kind === "sleep" ? "sleep(ms)" : `timer.${kind}(ms, fn)`} exceeded the per-runtime outstanding host task limit of 1024`);
+export function hold(kind) {
+  const P = g.__pool;
+  if (!P) return () => {};
+  P.live ??= 0; P.peak ??= 0; P.kinds ??= {};
+  if (P.full || P.live >= (P.limit ?? 1024)) {
+    P.refused = (P.refused ?? 0) + 1; (P.refusedKinds ??= {})[kind] = (P.refusedKinds[kind] ?? 0) + 1;
+    throw new RangeError(LIMIT_TEXT(kind));
+  }
+  P.live += 1; P.kinds[kind] = (P.kinds[kind] ?? 0) + 1; P.peak = Math.max(P.peak, P.live);
+  let done = false;
+  return () => { if (!done) { done = true; P.live -= 1; P.kinds[kind] -= 1; } };
+}
+const pooled = (kind, f) => (...a) => {
+  const end = hold(kind);
+  let p;
+  try { p = f(...a); } catch (e) { end(); throw e; }
+  Promise.resolve(p).then(end, end);
+  return p;
 };
-export const exec = async (command, args = [], options = {}) => {
+// A machine in __hangOn: wait until it leaves the list (an old world: fail). One in __delayOn: its delay.
+const waits = (on) => Boolean(on && ((g.__hangOn ?? []).includes(on) || (g.__delayOn ?? {})[on]));
+async function machineWait(on) {
+  const gen = g.__gen;
+  while ((g.__hangOn ?? []).includes(on)) { if (g.__gen !== gen) throw new Error("an old world"); await new Promise((r) => setTimeout(r, 1)); }
+  const ms = (g.__delayOn ?? {})[on];
+  if (ms) await waitFor(ms);
+}
+export const readTextFile = pooled("read", async (path, options = {}) => {
+  drained();
+  const on = options?.on ?? null, card = String(path).includes("/decisions/");
+  (g.__issued ??= []).push({ at: g.__now, on, kind: "read", path });
+  const C = (g.__cardReads ??= { live: 0, peak: 0 });
+  if (!card) {
+    if (waits(on)) await machineWait(on);
+    if (on && g.__remoteDelay && !(g.__offline ?? []).includes(on)) await waitFor(g.__remoteDelay);
+    return baseRead(path, options);
+  }
+  C.live += 1; C.peak = Math.max(C.peak, C.live);
+  try {
+    if (waits(on)) await machineWait(on);
+    if (on && g.__remoteDelay && !(g.__offline ?? []).includes(on)) await waitFor(g.__remoteDelay);
+    return await baseRead(path, options);
+  } finally { C.live -= 1; }
+});
+export const exec = pooled("exec", async (command, args = [], options = {}) => {
   drained();
   const on = options?.on ?? null, kind = execKind(command, args);
   if (!(command === "python3" && args[0] === "-c")) (g.__issued ??= []).push({ at: g.__now, on, kind });
+  if (waits(on)) await machineWait(on);
   if ((g.__execFail ?? []).includes(`${on ?? ""}:${kind}`)) throw new Error("exec failed");
-  if ((g.__execHang ?? []).includes(`${on ?? ""}:${kind}`)) { (g.__execs ??= []).push([command, args, on]); return new Promise(() => {}); }
+  if ((g.__execHang ?? []).includes(`${on ?? ""}:${kind}`)) { // settles only once the case takes it off the list (t-053), then as usual
+    (g.__execs ??= []).push([command, args, on]);
+    const gen = g.__gen;
+    while ((g.__execHang ?? []).includes(`${on ?? ""}:${kind}`)) { if (g.__gen !== gen) throw new Error("an old world"); await new Promise((r) => setTimeout(r, 1)); }
+  }
   if (on && g.__remoteDelay && !(g.__offline ?? []).includes(on)) await waitFor(g.__remoteDelay);
   const own = g.__execFn ? g.__execFn(command, args, on, options) : undefined;
   if (own !== undefined) { (g.__execs ??= []).push([command, args, on, options]); return own; }
@@ -67,15 +123,23 @@ export const exec = async (command, args = [], options = {}) => {
     out += `${n}\0${text}\0`;
   }
   return { code: 0, stdout: out, stderr: "" };
-};
+});
 // makeCx(): a cx for one world. Its spawns run only while that world lasts (__gen unchanged), so a
 // view mounted by an earlier case cannot start work in a later one.
 export function makeCx(extra = {}) {
   const gen = g.__gen;
   const c = {
-    spawn(f) { if (gen !== undefined && g.__gen !== gen) return Promise.resolve(); return baseCx.spawn(() => f(c)); },
-    sleep: (ms) => (g.__sleepHang ? new Promise(() => {}) : waitFor(ms ?? 0)),
-    timer: { every(ms, fn) { if (gen === undefined || g.__gen === gen) (g.__timers ??= []).push({ ms, fn }); }, after(ms, fn) { if (gen === undefined || g.__gen === gen) (g.__afters ??= []).push({ ms, fn }); } },
+    spawn(f) {
+      if (gen !== undefined && g.__gen !== gen) return Promise.resolve();
+      const end = hold("spawn"), p = baseCx.spawn(() => f(c));
+      Promise.resolve(p).then(end, end);
+      return p;
+    },
+    sleep: (ms) => { const end = hold("sleep"); if (g.__sleepHang) return new Promise(() => {}); const p = waitFor(ms ?? 0); p.then(end, end); return p; },
+    timer: {
+      every(ms, fn) { if (gen === undefined || g.__gen === gen) { hold("every"); (g.__timers ??= []).push({ ms, fn, store: g.__als?.getStore() }); } },
+      after(ms, fn) { if (gen === undefined || g.__gen === gen) { const end = hold("after"); (g.__afters ??= []).push({ ms, fn, end, store: g.__als?.getStore() }); } },
+    },
     notify() { g.__notifies = (g.__notifies ?? 0) + 1; }, // counted (t-028 A4): a redraw asked for
     write_to_clipboard(text) { (g.__clipboard ??= []).push(text); },
     ...extra,
@@ -85,19 +149,32 @@ export function makeCx(extra = {}) {
 export const cx = makeCx();
 
 export const agents = () => g.__agents ?? [];
-export const props = () => g.__props ?? {};
+export const props = () => g.__als?.getStore()?.props ?? g.__props ?? {};
 export const theme = () => new Proxy({}, { get: () => "#808080" });
 export const window = () => ({ platform: "macos" });
 export const layout = () => g.__layout ?? {};
-export const watchFolder = () => new Promise(() => {}); // never changes
+// Never changes, unless a case keeps __watchers (t-053): then each call waits for a batch the case gives it.
+export const watchFolder = (path) => {
+  const end = hold("watch");
+  let resolve;
+  const p = new Promise((r) => { resolve = r; });
+  p.cancel = () => resolve([]);
+  p.then(end, end);
+  if (g.__watchers) g.__watchers.push({ path, resolve });
+  return p;
+};
 export const closeOverlay = (o) => { (g.__closed ??= []).push(o); return null; };
 export const pickFolder = async () => null;
 
-// __hcHang ["<address>"]: an hc send to these is recorded and never settles (t-028 D1: a hung send).
-export const hc = (args = []) => {
-  if (args[0] === "send" && (g.__hcHang ?? []).includes(args[1])) { (g.__hcs ??= []).push(args); return new Promise(() => {}); }
+// __hcHang ["<address>"]: an hc send to these is recorded and settles (code 0) only once the address leaves the list (t-028 D1: a hung send).
+export const hc = pooled("hc", (args = []) => {
+  if (args[0] === "send" && (g.__hcHang ?? []).includes(args[1])) { // answers 0 only once the case takes the address off the list (t-053)
+    (g.__hcs ??= []).push(args);
+    const gen = g.__gen;
+    return (async () => { while ((g.__hcHang ?? []).includes(args[1])) { if (g.__gen !== gen) throw new Error("an old world"); await new Promise((r) => setTimeout(r, 1)); } return { code: 0, stdout: "", stderr: "" }; })();
+  }
   return baseHc(args);
-};
+});
 
 // ---- gpui-kit / gpui-base ----
 class El {

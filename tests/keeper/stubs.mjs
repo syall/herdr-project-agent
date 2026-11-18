@@ -6,7 +6,7 @@
 //   __files   { "<machine or ''>:<path>": text }            files readTextFile sees (null/absent: none)
 //   __offline [machine names]                               readTextFile/exec on them throw
 //   __fail    ["<machine>:<path>"]                          readTextFile of these throws (a failed read)
-//   __hang    ["<machine>:<path>"]                          readTextFile of these never settles
+//   __hang    ["<machine>:<path>"]                          readTextFile of these settles only once the path leaves the list
 //   __delay   { "<machine>:<path>": ms }                    readTextFile of these settles once __now has moved on by ms
 //   __gen                                                   bumped by each new world: a delayed read of an old world fails
 //   __runs    [[name, args]]                                every run() call
@@ -42,7 +42,10 @@ export const readTextFile = async (path, options = {}) => {
   (g.__reads ??= []).push(key(path, on));
   if (offline(on)) throw new Error(`machine ${on} is unreachable`);
   if ((g.__fail ?? []).includes(key(path, on))) throw new Error("read failed");
-  if ((g.__hang ?? []).includes(key(path, on))) return new Promise(() => {});
+  if ((g.__hang ?? []).includes(key(path, on))) { // hangs until the case takes it off the list (t-053: a hung read that ends), or the world ends
+    const gen = g.__gen;
+    while ((g.__hang ?? []).includes(key(path, on))) { if (g.__gen !== gen) throw new Error("an old world"); await new Promise((r) => setTimeout(r, 1)); }
+  }
   const wait = (g.__delay ?? {})[key(path, on)];
   if (wait) {
     const until = g.__now + wait, gen = g.__gen;
@@ -75,6 +78,8 @@ export const exec = async (command, args = [], options = {}) => {
   if (command === "ls" && args[0] === "-1") { const names = (g.__ls ?? {})[key(args[1], on)]; return names ? { code: 0, stdout: names.join("\n") + "\n", stderr: "" } : { code: 1, stdout: "", stderr: "no such folder" }; }
   return { code: 0, stdout: "", stderr: "" };
 };
+// host.js (t-053) imports it; the keeper never watches a folder.
+export const watchFolder = () => { const p = new Promise(() => {}); p.cancel = () => {}; return p; };
 export const hc = async (args = []) => {
   (g.__hcs ??= []).push(args);
   await Promise.resolve();

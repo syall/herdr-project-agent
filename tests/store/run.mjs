@@ -309,7 +309,7 @@ cases["S-cards-unknown"] = async () => { // I1: a listing that never answered is
     ["batch and ls hung", () => { cards(m); g.__execHang = [`${M}:batch`, `${M}:ls`]; }, remote, null],
     ["batch failed, ls threw", () => { cards(m); g.__batchFail = { [M]: { code: 1 } }; g.__execFail = [`${M}:ls`]; }, remote, null],
     ["batch and ls threw", () => { cards(m); g.__execFail = [`${M}:batch`, `${M}:ls`]; }, remote, null],
-    ["local ls threw", () => { cards(m); g.__execFail = [":ls"]; }, local, null],
+    ["local batch and ls threw", () => { cards(m); g.__execFail = [":batch", ":ls"]; }, local, null], // t-053: the batch runs here too
     ["batch failed, no folder (ls exit 1)", () => { g.__batchFail = { [M]: { code: 1 } }; }, remote, []],
     ["no folder (batch exit 3)", () => {}, remote, []],
   ];
@@ -504,6 +504,54 @@ cases["S45-fallback-marked"] = async () => { // t-045 round 2: a card whose own 
   world(); cards({ "d-1.json": card("d-1") });
   const b = await store.loadDecisions(remote, { cx });
   check(b.length === 1 && !b[0].fallback && !(b.unread?.size), "a batch read: no fallback, nothing unread");
+};
+
+// ---- t-053 -----------------------------------------------------------------------------------------------------
+cases["S53-batch-local"] = async () => { // R3: on this computer the cards are one batch exec too: the same cards and order as on another machine
+  world();
+  const m = {}; for (let i = 1; i <= 30; i++) m[`d-${String(i).padStart(3, "0")}.json`] = card(`d-${String(i).padStart(3, "0")}`, { status: i % 3 ? "answered" : "open" });
+  m["bad name!.json"] = card("x"); m["d-broken.json"] = "{"; cards(m);
+  const here = await store.loadDecisions(local, { cx }), there = await store.loadDecisions(remote, { cx });
+  const localCalls = g.__issued.filter((x) => x.on === null);
+  check(localCalls.length === 1 && localCalls[0].kind === "batch", `one local call, the batch (got ${JSON.stringify(localCalls.map((x) => x.kind))})`);
+  check(norm(here) === norm(there), "the same list as the remote batch");
+};
+
+const hostMod = fs.existsSync(path.join(dst, "host.js")) ? await import(path.join(dst, "host.js")) : null;
+cases["S53-host-busy"] = async () => { // R2: a key still pending answers BUSY and starts nothing, given up or not; settling frees it
+  world();
+  check(hostMod, "host.js exists");
+  const h = new hostMod.Host(); let started = 0, release;
+  const start = () => { started += 1; return new Promise((r) => { release = r; }); };
+  const first = h.call(cx, "k", start, { limit: 10000 });
+  const r1 = await within(first, 11000, 11);
+  check(r1.done && r1.value === hostMod.TIMED_OUT, `given up at its limit (got ${JSON.stringify(r1.value)})`);
+  const second = await h.call(cx, "k", start, { limit: 10000 });
+  check(second === hostMod.BUSY && hostMod.gaveUp(second) && started === 1, `BUSY, nothing started (started ${started})`);
+  release("late"); await settle();
+  const third = h.call(cx, "k", () => Promise.resolve("now"), { limit: 10000 });
+  check((await third) === "now", "the key is free once the late call settled");
+  const waited = h.call(cx, "w", () => new Promise((r) => { release = r; }), { limit: 10000 });
+  const click = h.call(cx, "w", () => Promise.resolve("fresh"), { limit: 10000, wait: true });
+  release("old"); await settle();
+  check((await waited) === "old" && (await click) === "fresh", "a click waits for the call in flight, then reads again");
+};
+
+cases["S53-host-refused"] = async () => { // R6: the runtime's RangeError (thrown or a rejection) answers REFUSED, recorded once; quiet for a second
+  world();
+  check(hostMod, "host.js exists");
+  const h = new hostMod.Host();
+  const r1 = await h.call(cx, "a", () => { throw new RangeError("a HostModule's async function exceeded the per-runtime outstanding host task limit of 1024"); }, { what: "the ledger.json read" });
+  check(r1 === hostMod.REFUSED && h.refusalSince(T0)?.what === "the ledger.json read", `refused, recorded (got ${JSON.stringify(r1)}, ${JSON.stringify(h.refusal)})`);
+  let started = 0;
+  const r2 = await h.call(cx, "b", () => { started += 1; return Promise.resolve(1); });
+  check(r2 === hostMod.SKIPPED && started === 0, "a background call within the quiet second starts nothing");
+  g.__now += 1001;
+  const r3 = await h.call(cx, "c", () => Promise.reject(new RangeError("cx.sleep(ms) exceeded the per-runtime outstanding host task limit of 1024")));
+  check(r3 === hostMod.REFUSED, "a rejection with the limit's text is REFUSED too");
+  g.__now += 1001;
+  check((await h.call(cx, "d", () => Promise.resolve(2), { background: false })) === 2, "a click runs");
+  check(/^Too many calls waiting \(\d+\): the ledger\.json read was skipped; showing what was read at \d\d:\d\d$/.test(hostMod.refusalLine({ n: 3, what: "the ledger.json read" }, T0)), "the plain line");
 };
 
 const pick = process.argv.slice(2);

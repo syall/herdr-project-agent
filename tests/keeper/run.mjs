@@ -9,7 +9,7 @@ const here = path.dirname(new URL(import.meta.url).pathname);
 const src = path.join(here, "..", "..", "mods", "project-agent");
 const dst = fs.mkdtempSync(path.join(os.tmpdir(), "t001-keeper-"));
 fs.copyFileSync(path.join(here, "stubs.mjs"), path.join(dst, "stubs.mjs"));
-for (const f of ["keeper.js", "store.js", "timer.js", "zone.js"]) fs.writeFileSync(path.join(dst, f), fs.readFileSync(path.join(src, f), "utf8").replace(/from "herdr"/g, 'from "./stubs.mjs"'));
+for (const f of ["keeper.js", "store.js", "timer.js", "zone.js", "host.js"].filter((n) => fs.existsSync(path.join(src, n)))) fs.writeFileSync(path.join(dst, f), fs.readFileSync(path.join(src, f), "utf8").replace(/from "herdr"/g, 'from "./stubs.mjs"'));
 const stubs = await import(path.join(dst, "stubs.mjs"));
 const { Keeper } = await import(path.join(dst, "keeper.js"));
 const timer = await import(path.join(dst, "timer.js"));
@@ -977,6 +977,16 @@ async function staleLabelOpen(labels, what) { // a launcher killed while startin
 }
 cases["K-stale-starting"] = () => staleLabelOpen({ "herdr.pa.starting": S }, "stale herdr.pa.starting on an idle shell");
 cases["K-stale-error"] = () => staleLabelOpen({ "herdr.pa.error": "profile test is missing" }, "stale herdr.pa.error on an idle shell");
+
+// ---- t-053 ----
+cases["K53-beats-single-flight"] = async () => { // R5: a heartbeat read that hangs: readBeats starts no second read of it
+  const { f } = world({ machine: "m1" });
+  g.__hang = [f("heartbeat")];
+  const k = new Keeper("me");
+  for (let i = 0; i < 50; i++) { g.__now += 15000; k.readBeats(cx); await flush(); }
+  const beats = g.__reads.filter((r) => r === f("heartbeat")).length;
+  check(beats === 1, `one heartbeat read in flight (got ${beats})`);
+};
 
 const pick = process.argv.slice(2);
 let failed = 0;
