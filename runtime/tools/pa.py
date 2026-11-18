@@ -8,7 +8,7 @@ One file, selected by the name it is invoked as (symlinks in ~/.local/bin):
   pa-claude [args]                               the profile's Claude command (workers, plain tabs)
   pa-codex [args]                                the profile's Codex command
   pa-profile [show|apply|set NAME]               show / apply to Herdr's programs file / set default
-  pa-peers [--json] [--all]                      list Project Agents on this machine
+  pa-peers [--json] [--all] [--older]            list Project Agents on this machine (and who runs older code)
   pa-pass [--retro] [--space ID]                 run a pass now (queued if the agent is mid-turn)
   pa-pass --pause | --resume                     pause or resume scheduled passes for the space
   pa-cleanup [--kill] [--dry-run] [--space ID]   remove finished workers whose evidence is recorded
@@ -18,6 +18,7 @@ One file, selected by the name it is invoked as (symlinks in ~/.local/bin):
   pa-decide <card> --withdraw --why TEXT         close a card the conversation made moot
   pa-sync --on MACHINE [--dry-run]               copy core/, tools/ and profiles/ to another Herdr machine
   pa-core-check                                  fail if the generic core names a profile's tools
+  pa-stamp [--commit C] [--dirty]                write installed.json: hashes of the installed tools, core, mods
 
 In pa_costs.py (see its docstring), linked as pa-costs: cost tracking per space (collect, report,
 reconstruct, prices, billed ...). Tokens are measured; money is an estimate from the profile's price table.
@@ -655,6 +656,153 @@ def cmd_session(args):
         call(["hc", "label", address, "herdr.pa.error=", "herdr.pa.starting="], check=False)
 
 
+# ---- the stamp: what is installed (installed.json) and what a launcher loaded (launcher.json), t-037 J1 ----------
+
+def tree_hash(folder, top_py_only=False):
+    """sha256 over the sorted relative paths and bytes of the files under folder, skipping what pa-sync skips
+    (names with .bak-, .pyc, dotfiles) and __pycache__. top_py_only: only the *.py files directly in folder (tools/).
+    Raises OSError when the folder is missing or a file cannot be read."""
+    import hashlib
+    if not os.path.isdir(folder):
+        raise FileNotFoundError("no folder " + folder)
+    def fail(error):  # an unreadable folder is an error, not an empty one
+        raise error
+    names = []
+    for here, dirs, files in os.walk(folder, onerror=fail):
+        dirs[:] = sorted(d for d in dirs if d != "__pycache__" and not d.startswith(".") and not top_py_only)
+        for name in files:
+            if ".bak-" in name or name.endswith(".pyc") or name.startswith("."):
+                continue
+            if top_py_only and not name.endswith(".py"):
+                continue
+            names.append(os.path.relpath(os.path.join(here, name), folder).replace(os.sep, "/"))
+    h = hashlib.sha256()
+    for rel in sorted(names):
+        with open(os.path.join(folder, rel), "rb") as f:
+            data = f.read()
+        h.update("{}\0{}\0".format(rel, len(data)).encode())
+        h.update(data)
+    return h.hexdigest()
+
+
+def hash_or_none(folder, top_py_only=False):
+    try:
+        return tree_hash(folder, top_py_only)
+    except OSError:
+        return None
+
+
+def mtime_or_none(path):
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return None
+
+
+def installed_stamp():
+    s = read_json_safe(os.path.join(ROOT, "installed.json"))
+    return s if isinstance(s, dict) else None
+
+
+def read_json_safe(path):
+    try:
+        return read_json(path)
+    except (OSError, ValueError):
+        return None
+
+
+def cmd_stamp(args):
+    """Writes ~/.config/herdr-pa/installed.json: the hashes of what is installed now (R1). Every hash is computed
+    before anything is written, so a folder that cannot be read leaves the previous stamp in place."""
+    try:
+        tools = tree_hash(os.path.join(ROOT, "tools"), top_py_only=True)
+        core = tree_hash(os.path.join(ROOT, "core"))
+        mods_dir = os.path.join(APP, "mods", "project-agent")
+        mods = tree_hash(mods_dir) if os.path.isdir(mods_dir) else None
+    except OSError as e:
+        raise Problem("cannot stamp the install (previous installed.json kept): {}".format(e))
+    stamp = {"version": 1, "at": now(), "by": "pa-sync" if args.synced_from else "install.sh",
+             "source": {"commit": args.commit, "dirty": bool(args.dirty)} if args.commit else None,
+             "tools": tools, "core": core, "mods": mods, "syncedFrom": args.synced_from or None}
+    write_json(os.path.join(ROOT, "installed.json"), stamp)
+    print("stamped {}: tools {} core {}{}".format(os.path.join(ROOT, "installed.json"), tools[:12], core[:12],
+                                                   " ({}{})".format(args.commit[:12], ", dirty" if args.dirty else "") if args.commit else ""))
+
+
+def write_launcher(directory, record):
+    write_json(os.path.join(directory, "launcher.json"), record)
+
+
+def launcher_start(ctx, address, space, directory, p):
+    """launcher.json for this launcher, written after claim (R2). Never stops the launch (AC2.2)."""
+    try:
+        import uuid as _uuid
+        instance = ctx.setdefault("instance", str(_uuid.uuid4()))  # one per process start; a retry keeps it
+        me = os.path.realpath(__file__)
+        tools = hash_or_none(os.path.dirname(me), top_py_only=True)
+        installed = installed_stamp() or {}
+        commit = ((installed.get("source") or {}).get("commit")
+                  if tools is not None and installed.get("tools") == tools else None)
+        folder = p.get("_folder") or os.path.join(ROOT, "profiles", p["name"])
+        record = {"version": 1, "instance": instance, "pid": os.getpid(), "terminal": address, "space": space,
+                  "started": ctx.get("startedAt") or ctx.setdefault("startedAt", now()),
+                  "code": {"tools": tools, "file": me, "installed": installed.get("tools"), "commit": commit},
+                  "profile": {"name": p["name"], "readAt": now(), "mtime": mtime_or_none(os.path.join(folder, "profile.json")),
+                              "hash": hash_or_none(folder)},
+                  "session": None, "restart": None, "restartedFrom": None}
+        ctx["launcher"] = record
+        session_log(directory, "launcher instance={} tools={} core={} profile={}@{}".format(
+            instance, (tools or "none")[:12], (hash_or_none(os.path.join(ROOT, "core")) or "none")[:12], p["name"],
+            record["profile"]["mtime"]))
+        write_launcher(directory, record)
+    except Exception as e:  # noqa: BLE001 - never stops the Project Agent
+        print("[Project Agent] launcher.json not written: {}".format(e), flush=True)
+        try:
+            session_log(directory, "launcher.json not written: {}".format(e))
+        except OSError:
+            pass
+
+
+def launcher_session(ctx, directory, agent, resume):
+    """Rewrites launcher.json's session at each Claude start: core text and context are read then (R2)."""
+    record = ctx.get("launcher")
+    if not record:
+        return
+    try:
+        folder = os.path.join(ROOT, "profiles", (record.get("profile") or {}).get("name") or "")
+        record["session"] = {"id": agent.get("sessionId"), "resume": bool(resume), "at": now(),
+                             "core": hash_or_none(os.path.join(ROOT, "core")),
+                             "context": mtime_or_none(os.path.join(folder, "context.md"))}
+        write_launcher(directory, record)
+    except Exception as e:  # noqa: BLE001 - never stops the Project Agent
+        print("[Project Agent] launcher.json not written: {}".format(e), flush=True)
+
+
+def code_state(launcher, installed, terminal):
+    """(word, detail) for R3: current | older (tools) | older (core) | older (tools, core) | unknown."""
+    if not isinstance(installed, dict) or not installed.get("tools"):
+        return "unknown", "no installed.json on this machine (run install.sh or pa-sync)"
+    if not isinstance(launcher, dict):
+        return "unknown", "started before restart support (no launcher.json)"
+    if terminal and launcher.get("terminal") != terminal:
+        return "unknown", "launcher.json is from another terminal ({})".format(launcher.get("terminal"))
+    tools = (launcher.get("code") or {}).get("tools")
+    core = (launcher.get("session") or {}).get("core")
+    if not tools or not core:
+        return "unknown", "launcher.json has no {} hash".format("tools" if not tools else "core")
+    older = [n for n, a in (("tools", tools), ("core", core)) if a != installed.get(n)]
+    if older:
+        return "older ({})".format(", ".join(older)), "runs tools {} core {}; installed tools {} core {}".format(
+            tools[:12], core[:12], (installed.get("tools") or "")[:12], (installed.get("core") or "")[:12])
+    return "current", "tools {} core {}".format(tools[:12], core[:12])
+
+
+def space_code_state(space, terminal):
+    directory = os.path.join(ROOT, "spaces", space) if space and ID.match(space) else None
+    launcher = read_json_safe(os.path.join(directory, "launcher.json")) if directory else None
+    return code_state(launcher, installed_stamp(), terminal)
+
+
 def launch_lock(space, wait=60):
     """An exclusive lock, per space, around "is another launcher alive?" up to "this one is labelled
     and has beaten once", so two launchers started at the same moment cannot both pass the check.
@@ -704,6 +852,7 @@ def run_session(args, address, labels, space, project, ctx):
     lock = launch_lock(space)
     try:
         directory, agent, previous = claim(args, address, labels, space, project, p, existing, directory)
+        launcher_start(ctx, address, space, directory, p)  # t-037 R2: what this launcher loaded
     finally:
         lock.close()  # releases the lock
     # The heartbeat the previous launcher left: the only sign that a killed session ran. Kept from
@@ -796,6 +945,7 @@ def run_agent(args, address, project, p, directory, agent, ctx, started):
         session_log(directory, "start resume={} session={} reason={}".format(resume, agent["sessionId"], why))
         began = time.time()
         running.update(since=began, session=agent["sessionId"], marked=False)
+        launcher_session(ctx, directory, agent, resume)
         costs = costs_module()
         if costs:
             try:
@@ -981,15 +1131,20 @@ def cmd_peers(args):
     for a in agents:
         t = terms.get(a.get("terminal"))
         a = dict(a, live=bool(t and (t.get("labels") or {}).get("herdr.pa") == a.get("space")))
-        if a["live"] or args.all:
+        a["code"], a["codeNote"] = space_code_state(a.get("space"), a.get("terminal"))  # t-037 R3
+        if (a["live"] or args.all) and not (getattr(args, "older", False) and a["code"] == "current"):
             rows.append(a)
     if args.json:
         print(json.dumps(rows, indent=2))
     elif not rows:
-        print("No Project Agents running on this machine." + ("" if args.all else " (--all lists stopped ones)"))
+        if getattr(args, "older", False):
+            print("No Project Agent on this machine runs older code." + ("" if args.all else " (--all also checks stopped ones)"))
+        else:
+            print("No Project Agents running on this machine." + ("" if args.all else " (--all lists stopped ones)"))
     else:
         for a in rows:
-            print("{}\t{}\t{}\t{}\t{}{}".format(a.get("address"), a.get("name"), a.get("project"), a.get("profile"), a.get("space"), "" if a["live"] else "\t(stopped)"))
+            code = a["code"] if a["code"] != "unknown" else "unknown: " + a["codeNote"]
+            print("{}\t{}\t{}\t{}\t{}\t{}{}".format(a.get("address"), a.get("name"), a.get("project"), a.get("profile"), a.get("space"), code, "" if a["live"] else "\t(stopped)"))
 
 
 def cmd_pass(args):
@@ -1165,6 +1320,10 @@ def cmd_doctor(args):
     term = hc_get(agent.get("terminal"))
     running = term.get("state") == "live" and (term.get("labels") or {}).get("herdr.pa") == agent.get("space")
     notes.append("agent {} in terminal {}".format("running" if running else "NOT running", agent.get("terminal")))
+    word, detail = space_code_state(agent.get("space"), agent.get("terminal"))  # t-037 R3
+    if word == "unknown" and running and not os.path.exists(os.path.join(directory, "launcher.json")):
+        detail += "; or launcher.json could not be written (see session.log)"
+    notes.append("code: {} ({})".format(word, detail))
     print("{} ({})".format(agent.get("name"), directory))
     for n in notes:
         print("  " + n)
@@ -1412,6 +1571,16 @@ def cmd_decide(args):
     print("{} {} ({}).".format(args.card, what, card["answeredBy"]))
 
 
+def stamp_script():
+    """The command pa-sync runs on the other machine to write its installed.json."""
+    import socket
+    source = (installed_stamp() or {}).get("source") or {}
+    argv = ["--synced-from", socket.gethostname().split(".")[0] or "unknown"]
+    if source.get("commit"):
+        argv += ["--commit", str(source["commit"])] + (["--dirty"] if source.get("dirty") else [])
+    return '"$HOME/.config/herdr-pa/tools/pa.py" stamp ' + " ".join(shlex.quote(a) for a in argv)
+
+
 def cmd_sync(args):
     """Each machine has its own copy of ~/.config/herdr-pa. This copies the shared parts (not
     config.json, the registry or any space's state) to another machine known to hc."""
@@ -1432,6 +1601,7 @@ def cmd_sync(args):
         if r.returncode:
             raise Problem("copying {} failed: {}".format(rel, r.stderr.decode(errors="replace").strip()))
     if args.dry_run:
+        print("would stamp installed.json there: " + stamp_script())
         return
     # Scripts must be runnable there, and every command linked where that machine's core looks.
     here = sorted(n for n in os.listdir(os.path.join(HOME, ".local", "bin")) if n.startswith("pa-")
@@ -1441,6 +1611,8 @@ def cmd_sync(args):
     script = ("cd \"$HOME/.config/herdr-pa\" && find core tools profiles -type f \\( -name '*.sh' -o -name '*.py' \\) -exec chmod +x {} + ; "
               "mkdir -p \"$HOME/.local/bin\" spaces; " + links + " [ -f config.json ] || echo '{\"version\": 1, \"defaultProfile\": \"" + ident(config().get("defaultProfile"), "profile name") + "\"}' > config.json")
     call(["hc", "exec", "--on", args.on, "--", "sh", "-c", script])
+    # Its own stamp, recomputed there over what was just copied (t-037 R1); the commit is this machine's.
+    call(["hc", "exec", "--on", args.on, "--", "sh", "-c", stamp_script()])
     print("Copied {} files to {} and linked {} commands. Running agents there pick up prompt changes when their session restarts.".format(
         len(files), args.on, len(here)))
 
@@ -1513,6 +1685,7 @@ def main():
     if kind == "pa-peers":
         parser.add_argument("--json", action="store_true")
         parser.add_argument("--all", action="store_true")
+        parser.add_argument("--older", action="store_true", help="only the ones not running the installed code")
         return cmd_peers(parser.parse_args())
     if kind == "pa-pass":
         parser.add_argument("--retro", action="store_true", help="also review the rules")
@@ -1553,7 +1726,12 @@ def main():
         return cmd_sync(parser.parse_args())
     if kind == "pa-core-check":
         return cmd_core_check(parser.parse_args())
-    raise Problem("invoke as pa-start, pa-session, pa-claude, pa-codex, pa-profile, pa-peers, pa-pass, pa-cleanup, pa-doctor, pa-task, pa-decide, pa-sync or pa-core-check")
+    if kind == "pa-stamp":
+        parser.add_argument("--commit", help="the repo commit installed from")
+        parser.add_argument("--dirty", action="store_true", help="the checkout had uncommitted changes")
+        parser.add_argument("--synced-from", help="the machine pa-sync copied from")
+        return cmd_stamp(parser.parse_args())
+    raise Problem("invoke as pa-start, pa-session, pa-claude, pa-codex, pa-profile, pa-peers, pa-pass, pa-cleanup, pa-doctor, pa-task, pa-decide, pa-sync, pa-core-check or pa-stamp")
 
 
 if __name__ == "__main__":

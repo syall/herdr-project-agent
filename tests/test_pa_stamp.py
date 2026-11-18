@@ -54,6 +54,9 @@ def quiet(fn, *a):
             fn(*a)
         except SystemExit as e:
             code = e.code or 0
+        except pa.Problem as e:  # what main() turns into exit 2
+            print(e, file=sys.stderr)
+            code = 2
     return code, out.getvalue(), err.getvalue()
 
 
@@ -161,6 +164,7 @@ class R1_Stamp(Base):
 class R1_Sync(Base):
     def test_sync_stamps_the_other_machine(self):
         self.stamp(("commit", "c0ffee"))
+        write(os.path.join(pa.ROOT, "config.json"), json.dumps({"version": 1, "defaultProfile": "test"}))
         bin_ = os.path.join(pa.HOME, ".local", "bin")
         calls = []
         pa.call = lambda argv, check=True: calls.append(argv) or ""
