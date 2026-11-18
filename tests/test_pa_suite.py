@@ -6,11 +6,13 @@ only: no real space, no real ~/.config/herdr-pa, and the slot folder is under th
      untracked files, or another command are never reused
   w3 the cap: a run past the cap waits, says for whom, and starts when the slot frees; a dead holder never blocks
   w4 part times: run-all.sh prints each part's seconds; --report lists parts by median, slowest first
+  w6 (t-072) pa-full-suite running run-all.sh, which now takes the slot itself, does not wait for itself
 """
 import contextlib
 import fcntl
 import importlib.util
 import io
+import shlex
 import json
 import os
 import shutil
@@ -19,6 +21,7 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -401,6 +404,7 @@ class W4RunAllTimes(unittest.TestCase):
     setUp = tra.RunAll.setUp
     tearDown = tra.RunAll.tearDown
     run_all = tra.RunAll.run_all
+    env_for = tra.RunAll.env_for
     summary = tra.RunAll.summary
 
     def test_w4b_each_part_has_its_seconds(self):
@@ -467,3 +471,28 @@ class W5Pins(Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class W6RunAllUnderTheSlot(Base):
+    def test_w6a_pa_full_suite_running_run_all_does_not_wait_for_itself(self):
+        fx = types.SimpleNamespace()
+        tra.RunAll.setUp(fx)
+        self.addCleanup(tra.RunAll.tearDown, fx)
+        env = {"NODE": fx.node, "STUB_DIR": fx.tmp, "TMPDIR": fx.tmp, "PA_SUITE_WAIT_LIMIT": "5"}
+        saved = {k: os.environ.get(k) for k in list(env) + ["PA_SUITE_SLOT"]}
+        os.environ.update(env)
+        try:
+            self.set_command("sh {} --affected".format(shlex.quote(os.path.join(fx.repo, "tests", "run-all.sh"))))
+            code, out = self.main()
+            left = os.environ.get("PA_SUITE_SLOT")
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("waiting for the suite slot", out)
+        self.assertIn("  suite slot: held by the caller", out)
+        self.assertIsNone(left, "pa-full-suite left its slot marker in its environment")
+        self.assertEqual(self.lines()[-1]["exit"], 0)

@@ -1,12 +1,15 @@
 """tests/run-all.sh itself (t-017 J6, R7): parts in parallel, output in a fixed order, a summary that names
 every part and every failure, PA_SERIAL=1, --affected; J9: TERM, INT and HUP stop every part and its children,
 and each unit test module (tests/test_*.py) is its own part; t-031: the panel harness runs as four parts, one per
-shard (run.mjs --shard=<k>/4), each named in the summary. The real script runs in a temp copy of the repo whose
+shard (run.mjs --shard=<k>/4), each named in the summary; t-072: every run takes pa-full-suite's slot (s1-s7). The real script runs in a temp copy of the repo whose
 parts are stubs (stub.sh, chosen per part by STUB_<part>), so no real suite runs here."""
+import fcntl
 import os
+import re
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -35,6 +38,13 @@ case "$m" in
   sleep:*) sleep "${m#sleep:}" ;;
   child) sleep 300 & c=$!
     echo "$$ $c" > "$STUB_DIR/$k.pids.new"; mv "$STUB_DIR/$k.pids.new" "$STUB_DIR/$k.pids"; wait ;;
+  probe) "$PY_PROBE" -c "import fcntl, sys
+f = open(sys.argv[1], 'a+')
+try:
+    fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except OSError:
+    sys.exit(0)
+print('FAIL slot: free during the run'); sys.exit(1)" "$HERDR_PA_HOME/suite-slots/slot-0" || exit 1 ;;
   wait:*) other=${m#wait:}; n=0
     until grep -q "start $other" "$STUB_DIR/events"; do
       n=$((n + 1)); [ $n -gt 200 ] && { echo "FAIL barrier: $other never started"; exit 1; }; sleep 0.1
@@ -81,6 +91,25 @@ class T(unittest.TestCase):
 '''
 
 
+# Holds slot-0 of the suite slots (an flock, its holder line as pa_suite writes it), then touches the ready file.
+# With a command after them, runs it as its child with PA_SUITE_SLOT naming the slot (as pa-full-suite does) and
+# exits with its code; else sleeps until killed.
+HOLDER = r'''import fcntl, json, os, subprocess, sys, time
+path, ready = sys.argv[1], sys.argv[2]
+os.makedirs(os.path.dirname(path), exist_ok=True)
+f = open(path, "a+")
+fcntl.flock(f, fcntl.LOCK_EX)
+f.seek(0)
+f.truncate()
+f.write(json.dumps({"task": "t-holder", "worker": "w-holder", "pid": os.getpid(), "start": "then"}))
+f.flush()
+open(ready, "w").close()
+if len(sys.argv) > 3:
+    sys.exit(subprocess.run(sys.argv[3:], env=dict(os.environ, PA_SUITE_SLOT=path)).returncode)
+time.sleep(600)
+'''
+
+
 def write(path, text, mode=0o644):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as f:
@@ -106,6 +135,9 @@ class RunAll(unittest.TestCase):
         shutil.copy(os.path.join(HERE, "run-all.sh"), os.path.join(self.repo, "tests", "run-all.sh"))
         for name in ("pa", "pa_hooks", "pa_guard", "pa_costs", "pa_push", "pa_queue"):
             write(os.path.join(self.repo, "runtime", "tools", name + ".py"), "x = 1\n")
+        shutil.copy(os.path.join(HERE, "..", "runtime", "tools", "pa_suite.py"), os.path.join(self.repo, "runtime", "tools"))
+        self.home = os.path.join(self.tmp, "pa")  # HERDR_PA_HOME: the slots are under it, never the real one
+        self.slot = os.path.join(self.home, "suite-slots", "slot-0")
         write(os.path.join(self.repo, "stub.sh"), STUB)
         write(os.path.join(self.repo, "tests", "test_stub.py"), UNITS)
         for part in ("keeper", "store"):
@@ -121,12 +153,18 @@ class RunAll(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def run_all(self, *args, **stubs):
-        env = {k: v for k, v in os.environ.items() if not k.startswith(("STUB_", "PA_SERIAL", "PA_CHANGED"))}
-        env.update({"NODE": self.node, "STUB_DIR": self.tmp, "TMPDIR": self.tmp})
+    def env_for(self, **stubs):
+        # PA_SUITE_*: a marker or cap inherited from the suite running this test is not this run's.
+        env = {k: v for k, v in os.environ.items() if not k.startswith(("STUB_", "PA_SERIAL", "PA_CHANGED", "PA_SUITE_"))}
+        env.update({"NODE": self.node, "STUB_DIR": self.tmp, "TMPDIR": self.tmp, "HERDR_PA_HOME": self.home,
+                    "PY_PROBE": sys.executable})
         env.update({k if k.startswith("PA_") else "STUB_" + k: v for k, v in stubs.items()})
-        r = subprocess.run(["sh", os.path.join(self.repo, "tests", "run-all.sh")] + list(args), cwd=self.tmp, env=env,
-                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, timeout=120)
+        return env
+
+    def run_all(self, *args, **stubs):
+        r = subprocess.run(["sh", os.path.join(self.repo, "tests", "run-all.sh")] + list(args), cwd=self.tmp,
+                           env=self.env_for(**stubs), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           universal_newlines=True, timeout=120)
         return r.returncode, r.stdout
 
     def outputs(self, out):
@@ -299,9 +337,7 @@ class RunAll(unittest.TestCase):
         for k in hung:
             if os.path.exists(os.path.join(self.tmp, k + ".pids")):
                 os.remove(os.path.join(self.tmp, k + ".pids"))
-        env = {k: v for k, v in os.environ.items() if not k.startswith(("STUB_", "PA_SERIAL", "PA_CHANGED"))}
-        env.update({"NODE": self.node, "STUB_DIR": self.tmp, "TMPDIR": self.tmp, "PA_SERIAL": serial})
-        env.update({"STUB_" + k: "child" for k in hung})
+        env = self.env_for(PA_SERIAL=serial, **{k: "child" for k in hung})
         log = os.path.join(self.tmp, "stop.out")
         with open(log, "w") as out:
             proc = subprocess.Popen(["sh", os.path.join(self.repo, "tests", "run-all.sh")], cwd=self.tmp, env=env,
@@ -330,6 +366,7 @@ class RunAll(unittest.TestCase):
             self.assertEqual(code, want, text)
             self.assertIn("=== interrupted (outputs so far: ", text)
             self.assertEqual(left, [], "part processes still running after the script ended: " + text)
+            self.assertTrue(self.slot_free(), "the suite slot is still held after the script ended: " + text)
         finally:
             for p in pids + [proc.pid]:
                 try:
@@ -371,6 +408,128 @@ class RunAll(unittest.TestCase):
     def test_r7_usage(self):
         code, out = self.run_all("--nope")
         self.assertEqual(code, 2, out)
+
+    # ---- t-072: the suite slot (pa_suite.py's flock slots under HERDR_PA_HOME/suite-slots) ----
+
+    def holder(self, *command, **stubs):
+        """A process holding slot-0 (running command under it when given), once it holds it."""
+        script = os.path.join(self.tmp, "holder.py")
+        write(script, HOLDER)
+        ready = os.path.join(self.tmp, "ready")
+        if os.path.exists(ready):
+            os.remove(ready)
+        p = subprocess.Popen([sys.executable, script, self.slot, ready] + list(command), cwd=self.tmp,
+                             env=self.env_for(**stubs), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             universal_newlines=True)
+        self.addCleanup(lambda: (p.poll() is None and p.kill(), p.wait(), p.stdout.close()))
+        end = time.time() + 20
+        while not os.path.exists(ready) and time.time() < end:
+            time.sleep(0.05)
+        self.assertTrue(os.path.exists(ready), "the holder never took the slot")
+        return p
+
+    def slot_free(self):
+        os.makedirs(os.path.dirname(self.slot), exist_ok=True)
+        with open(self.slot, "a+") as f:
+            try:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                return False
+            fcntl.flock(f, fcntl.LOCK_UN)
+        return True
+
+    def waited(self, out):
+        m = re.search(r"^  suite slot: waited ([0-9.]+)s ", self.summary(out), re.M)
+        self.assertTrue(m, out)
+        return float(m.group(1))
+
+    def test_s1_a_run_waits_for_the_holder_says_for_whom_and_records_the_wait(self):
+        # Full and --affected alike: the run waits while another holds the slot, says so naming the holder, and
+        # starts once it frees; the summary and the run folder carry the seconds waited.
+        for args in ((), ("--affected",)):
+            with self.subTest(args=args):
+                p = self.holder()
+                log = os.path.join(self.tmp, "s1.out")
+                with open(log, "w") as f:
+                    run = subprocess.Popen(["sh", os.path.join(self.repo, "tests", "run-all.sh")] + list(args),
+                                           cwd=self.tmp, env=self.env_for(), stdin=subprocess.DEVNULL, stdout=f,
+                                           stderr=subprocess.STDOUT)
+                try:
+                    time.sleep(1.5)
+                    self.assertIsNone(run.poll(), pa_text(log))
+                    with open(self.events) as f:
+                        self.assertEqual(f.read(), "", "a part started while the slot was held")
+                    text = pa_text(log)
+                    self.assertIn("waiting for the suite slot", text)
+                    self.assertIn("t-holder", text)
+                    self.assertIn(str(p.pid), text)
+                    p.kill()
+                    p.wait()
+                    code = run.wait(timeout=60)
+                finally:
+                    if run.poll() is None:
+                        run.kill()
+                        run.wait()
+                out = pa_text(log)
+                self.assertEqual(code, 0, out)
+                self.assertGreaterEqual(self.waited(out), 1.0, out)
+                with open(os.path.join(self.outputs(out), "slot")) as f:
+                    self.assertIn("waited", f.read())
+                self.assertTrue(self.slot_free())
+                write(self.events, "")
+
+    def test_s2_a_dead_holder_never_blocks(self):
+        p = self.holder()
+        p.kill()
+        p.wait()
+        code, out = self.run_all("--affected")
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("waiting for the suite slot", out)
+        self.assertLess(self.waited(out), 1.0, out)
+
+    def test_s3_a_run_that_selects_no_part_takes_no_slot(self):
+        self.holder()
+        began = time.time()
+        code, out = self.run_all("--affected", PA_CHANGED_FILES="README.md", PA_SUITE_WAIT_LIMIT="5")
+        self.assertEqual((code, out.strip()), (0, "no tested files changed: nothing to run"))
+        self.assertLess(time.time() - began, 4)
+
+    def test_s4_a_run_under_the_slot_holder_does_not_wait_for_itself(self):
+        # pa-full-suite holds the slot and runs run-all.sh: the run sees its caller holds it and goes on.
+        p = self.holder("sh", os.path.join(self.repo, "tests", "run-all.sh"), "--affected", PA_SUITE_WAIT_LIMIT="5")
+        out, _ = p.communicate(timeout=60)
+        self.assertEqual(p.returncode, 0, out)
+        self.assertNotIn("waiting for the suite slot", out)
+        self.assertIn("  suite slot: held by the caller", self.summary(out))
+
+    def test_s5_a_stale_marker_does_not_skip_the_slot(self):
+        # A PA_SUITE_SLOT that is not this run's caller's (the holder is no ancestor) is not trusted.
+        self.holder()
+        code, out = self.run_all("--affected", PA_SUITE_SLOT=self.slot, PA_SUITE_SLOT_PID="1", PA_SUITE_WAIT_LIMIT="1")
+        self.assertEqual(code, 124, out)
+        self.assertIn("waiting for the suite slot", out)
+        self.assertIn("no slot came free", out)
+        with open(self.events) as f:
+            self.assertEqual(f.read(), "")
+
+    def test_s6_the_slot_is_held_while_the_parts_run_and_freed_after(self):
+        for serial in ("", "1"):
+            with self.subTest(serial=serial):
+                code, out = self.run_all("--affected", keeper="probe", PA_SERIAL=serial)
+                self.assertEqual(code, 0, out)
+                self.assertIn("  keeper harness: ok", self.summary(out))
+                self.assertTrue(self.slot_free())
+
+    def test_s7_without_pa_suite_the_run_goes_on_and_says_so(self):
+        os.remove(os.path.join(self.repo, "runtime", "tools", "pa_suite.py"))
+        code, out = self.run_all("--affected")
+        self.assertEqual(code, 0, out)
+        self.assertIn("  suite slot: none", self.summary(out))
+
+
+def pa_text(path):
+    with open(path) as f:
+        return f.read()
 
 
 if __name__ == "__main__":
