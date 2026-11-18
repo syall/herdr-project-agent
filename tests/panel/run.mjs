@@ -3926,7 +3926,7 @@ cases["P-costs-j1d-old"] = async () => { // V-J1d-1: a summary without the J1 ke
   const { v } = await costsWorld({ summary: s });
   const got = await j1dStates(v, s);
   for (const [k, want] of Object.entries(J1D_OLD)) check(got[k] === want, `${k}: the same text as before J1d (got ${got[k]}\nwant ${want})`);
-  for (const [k, text] of Object.entries(got)) check(!/By scope|Accounts|priced as|· account /.test(text), `${k}: nothing of J1d (got ${text})`);
+  for (const [k, text] of Object.entries(got)) check(!/By scope|Accounts|priced as|priced from the price file|· account /.test(text), `${k}: nothing of J1d (got ${text})`);
 };
 
 // A J1 summary: three scopes (global with the region unknown, priced from the default scope; regional priced as its own
@@ -3966,7 +3966,7 @@ cases["P-costs-j1d-one"] = async () => { // R-A3: one account: its label beside 
   await click(v, "costs-task-0"); await settle();
   const text = costsView(v).text;
   check(/1k tokens · 94% cache read · account acct1 \|/.test(text), `the account beside Total (got ${text.slice(0, 900)})`);
-  check(!/By scope|\| Accounts|priced as|provider-a/.test(text), `one scope, one account: no section, no tag (got ${text})`);
+  check(!/By scope|\| Accounts|priced as|priced from the price file|provider-a/.test(text), `one scope, one account: no section, no tag (got ${text})`);
   const copied = await j1dCopy(v, "costs-copy-totals");
   check(/Total: [^\n]* · account acct1/.test(copied), `the totals Copy says it (got ${copied})`);
 };
@@ -3981,10 +3981,11 @@ cases["P-costs-j1d-one-note"] = async () => { // A-V3 "always a priced as note":
   const { v } = await costsWorld({ summary: s });
   await click(v, "costs-task-0"); await settle();
   const text = costsView(v).text;
-  check(/\| All costs: provider-a · global · \? \(unknown\) · acct1 · priced as \* · \* · \* · \* \(from 2026-01-01\) \|/.test(text), `the one scope's note (got ${text.slice(0, 1200)})`);
-  check((text.match(/priced as/g) ?? []).length === 1 && !/By scope/.test(text), `said once, no section, no session tags (got ${text})`);
+  const note = "All costs priced from the price file's default prices valid from 2026-01-01 (no region recorded) · provider provider-a, endpoint global, account acct1"; // t-050: plain words
+  check(text.includes(`| ${note} |`), `the one scope's note (got ${text.slice(0, 1200)})`);
+  check((text.match(/priced from/g) ?? []).length === 1 && !/By scope|priced as/.test(text), `said once, no section, no session tags (got ${text})`);
   const copied = await j1dCopy(v, "costs-copy-totals");
-  check(copied.includes("All costs: provider-a · global · ? (unknown) · acct1 · priced as * · * · * · * (from 2026-01-01)"), `in the totals Copy (got ${copied})`);
+  check(copied.includes(note), `in the totals Copy (got ${copied})`);
 };
 
 cases["P-costs-j1d-scopes"] = async () => { // A-V3 AC: two or more scopes: By scope, rows summing to the total; ? with its …By; the priced-as note; tags on session lines
@@ -3993,29 +3994,30 @@ cases["P-costs-j1d-scopes"] = async () => { // A-V3 AC: two or more scopes: By s
   let text = costsView(v).text;
   const sc = section(text, "| By scope (provider · endpoint · region · account) | Copy", ["| By day"]);
   check(sc, `a By scope section with Copy (got ${text})`);
-  check(sc.includes("provider-a · global · ? (unknown) · acct1"), `the unknown region as ? with its regionBy (got ${sc})`);
-  check(sc.includes("provider-b · global · ? (refused) · acct1"), `a refused region (got ${sc})`);
-  check(/provider-a · global · \? \(unknown\) · acct1 \| priced as provider-a · global · \* · \* \(from 2026-01-01\) \|/.test(sc), `the default scope's row says priced as (got ${sc})`);
-  check(/provider-a · regional · region-a · acct1 \| 300 tokens/.test(sc), `a row priced as its own facts: no note (got ${sc})`);
-  check(/provider-b · global · \? \(refused\) · acct1 \| no price \| 100 tokens \| — est\./.test(sc), `no price (got ${sc})`);
+  check(sc.includes("| provider provider-a, endpoint global, account acct1, no region recorded |"), `the unknown region in words (got ${sc})`);
+  check(sc.includes("| provider provider-b, endpoint global, account acct1, region value refused |"), `a refused region in words (got ${sc})`);
+  check(sc.includes("provider provider-a, endpoint global, account acct1, no region recorded | priced from the price file's prices for provider provider-a, endpoint global valid from 2026-01-01 |"), `the default scope's row says how it was priced (got ${sc})`);
+  check(sc.includes("provider provider-a, endpoint regional, region region-a, account acct1 | 300 tokens"), `a row priced as its own facts: no note (got ${sc})`);
+  check(/provider provider-b, endpoint global, account acct1, region value refused \| no price \| 100 tokens \| — est\./.test(sc), `no price (got ${sc})`);
+  check(!/\?|\*|\(default\)|priced as/.test(sc), `no ?, *, (default) or priced as in By scope (got ${sc})`);
   const money = [...sc.matchAll(/(\d+\.\d\d) est\./g)].map((m) => Number(m[1])), toks = [...sc.matchAll(/\| (\d+) tokens/g)].map((m) => Number(m[1]));
   check(Math.abs(money.reduce((a, b) => a + b, 0) - 12.5) < 1e-9 && toks.reduce((a, b) => a + b, 0) === 1000, `the rows sum to the Total (got ${money}, ${toks})`);
   check(!/\| Accounts \|/.test(text) && /account acct1 \|/.test(text), `one account: beside Total, no Accounts (got ${text.slice(0, 900)})`);
   // the drill: models of the scope (from byDayModel), then its sessions
   await click(v, "costs-scope-0"); await settle(); text = costsView(v).text;
   const d = section(text, "| By scope (provider · endpoint · region · account) | Copy", ["| By day"]);
-  check(/Models \(from \d{4}-\d{2}-\d{2}\): \| model-a · 600 tokens · [^|]*7\.50[^|]* est\. · priced as provider-a · global · \* · \* \|/.test(d), `the scope's models (got ${d})`);
+  check(/Models \(from \d{4}-\d{2}-\d{2}\): \| model-a · 600 tokens · [^|]*7\.50[^|]* est\. · priced from the price file's prices for provider provider-a, endpoint global \|/.test(d), `the scope's models (got ${d})`);
   check(/Sessions: \| ◌ aaaa1111 /.test(d) && !d.includes("bbbb2222"), `the scope's sessions (got ${d})`);
   const copied = await j1dCopy(v, "costs-copy-scope");
-  check(/^By scope[^\n]*\nprovider-a · global · \? \(unknown\) · acct1 · priced as/.test(copied), `the section's Copy (got ${copied})`);
+  check(copied.startsWith("By scope (provider · endpoint · region · account)\nprovider provider-a, endpoint global, account acct1, no region recorded · priced from the price file's prices"), `the section's Copy (got ${copied})`);
   // session lines are tagged, with the note where it applies
   await click(v, "costs-task-0"); await settle(); text = costsView(v).text;
-  check(/aaaa1111 · worker · build · claude · model-a \(provider-a · global · \? · acct1\) · [^|]* est\. · priced as provider-a · global · \* · \* · closed/.test(text), `a tagged session line with its note (got ${text})`);
-  check(/bbbb2222 · worker · build · claude · model-a \(provider-a · regional · region-a · acct1\) · [^|]* est\. · gone/.test(text), `no note where priced as its facts (got ${text})`);
+  check(/aaaa1111 · worker · build · claude · model-a \(provider provider-a, endpoint global, account acct1, no region recorded\) · [^|]* est\. · priced from the price file's prices for provider provider-a, endpoint global · closed/.test(text), `a tagged session line with its note (got ${text})`);
+  check(/bbbb2222 · worker · build · claude · model-a \(provider provider-a, endpoint regional, region region-a, account acct1\) · [^|]* est\. · gone/.test(text), `no note where priced as its facts (got ${text})`);
   // a model row's drill starts with its scopes
   await click(v, "costs-task-0"); await click(v, "costs-dim-model"); await click(v, "costs-kind-0"); await settle(); text = costsView(v).text;
   const m = section(text, "| By session type", ["| By day"]);
-  check(/Scopes \(from \d{4}-\d{2}-\d{2}\): \| model-a \(provider-a · global · \? · acct1\) · 600 tokens · [^|]* est\. · priced as provider-a · global · \* · \* \| model-a \(provider-a · regional · region-a · acct1\) · 300 tokens · [^|]* est\. \| model-a \(provider-b · global · \? · acct1\) · 100 tokens · — est\. · no price \|/.test(m), `the model's scopes (got ${m})`);
+  check(/Scopes \(from \d{4}-\d{2}-\d{2}\): \| model-a \(provider provider-a, endpoint global, account acct1, no region recorded\) · 600 tokens · [^|]* est\. · priced from the price file's prices for provider provider-a, endpoint global \| model-a \(provider provider-a, endpoint regional, region region-a, account acct1\) · 300 tokens · [^|]* est\. \| model-a \(provider provider-b, endpoint global, account acct1, no region recorded\) · 100 tokens · — est\. · no price \|/.test(m), `the model's scopes (got ${m})`);
   check(moneyLabelled(v).length === 0, `labelled (${JSON.stringify(moneyLabelled(v))})`);
 };
 
@@ -4051,7 +4053,28 @@ cases["P-costs-j1d-reads"] = async () => { // V-J1d-4: the same reads and execs 
   const { v } = await costsWorld({ summary: bad });
   await click(v, "costs-task-0"); await click(v, "costs-dim-model"); await click(v, "costs-kind-0"); await settle();
   const text = costsView(v).text;
-  check(!/By scope|\| Accounts|priced as|\[object|rows in|· account /.test(text), `malformed keys draw nothing (got ${text})`);
+  check(!/By scope|\| Accounts|priced as|priced from the price file|\[object|rows in|· account /.test(text), `malformed keys draw nothing (got ${text})`);
+};
+
+cases["P-costs-t050-words"] = async () => { // t-050: the one-scope note in plain words: all facts unknown (the person's line, two price dates); every fact known, priced from a wider row
+  const none = [null, null, null, "work"], all = ["*", "*", "*", "*"];
+  const s = j1dSummary({ byScope: [{ key: j1dKey(none), scope: none, tokens: 1000, money: 12.5, calls: 7, pricedAs: [{ scope: all, validFrom: "2026-09-01" }, { scope: all, validFrom: "2026-11-01" }],
+    by: { providerBy: "default", endpointBy: "default", regionBy: "unknown", accountBy: "rule" } }],
+    scopes: 1, account: "work", byAccount: [{ key: "work", tokens: 1000, money: 12.5, calls: 7 }], totals: costsSummary().totals,
+    sessions: costsSummary().sessions.map((x) => ({ ...x, ...j1dFacts(none), pricedAs: { scope: all, validFrom: "2026-09-01" } })) });
+  const { v } = await costsWorld({ summary: s });
+  await click(v, "costs-task-0"); await settle();
+  const text = costsView(v).text;
+  const note = "All costs priced from the price file's default prices valid from 2026-09-01 and 2026-11-01 (no provider, endpoint or region recorded) · account work";
+  check(text.includes(`| ${note} |`), `all unknown: the note in words (got ${text.slice(0, 1200)})`);
+  check(!/\? \(|\* ·|· \*|\(default\)|priced as/.test(text), `no ?, *, (default) or priced as anywhere (got ${text})`);
+  check((await j1dCopy(v, "costs-copy-totals")).includes(note), "in the totals Copy");
+  const known = ["provider-a", "regional", "region-a", "acct1"];
+  const s2 = j1dSummary({ byScope: [{ key: j1dKey(known), scope: known, tokens: 1000, money: 12.5, calls: 7, pricedAs: [{ scope: ["provider-a", "*", "*", "*"], validFrom: "2026-01-01" }], by: {} }],
+    scopes: 1, byAccount: [{ key: "acct1", tokens: 1000, money: 12.5, calls: 7 }], totals: costsSummary().totals });
+  const w2 = await costsWorld({ summary: s2 });
+  const t2 = costsView(w2.v).text;
+  check(t2.includes("| All costs priced from the price file's prices for provider provider-a valid from 2026-01-01 · provider provider-a, endpoint regional, region region-a, account acct1 |"), `every fact known: named, no parentheses (got ${t2.slice(0, 1200)})`);
 };
 
 // Which cases run (t-031): every case, or the named ones; --shard=<k>/<n> keeps every n-th case by definition
