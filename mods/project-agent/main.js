@@ -12,7 +12,7 @@ import { View, div } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, ScrollHandle } from "gpui-base";
 import { spaces, panes, agents, terminals, machines, theme, run, exec, props, home, watchFolder, notify, shared, setShared, closeOverlay, openOverlay, window, layout } from "herdr";
 import { loadSpace, loadLedger, loadProfile, loadDecisions, loadRules, withTimeout, TIMED_OUT, READ_LIMIT, answerDecision, notifyOrchestrator, changeRules, touched, localId, paHome, stateDir, taskActions, taskLinks, evidenceTasks, cardEvidence, staleInstructions, liveTarget, lookAlike, OPEN_REQUESTS, keeperJudging, startingLabels } from "./store.js";
-import { RulesPane, arm, armHolds } from "./rules.js"; // arm, armHolds: the two-click Delete (ARM_WAIT, 10 s)
+import { RulesPane, arm, armHolds, fieldState } from "./rules.js"; // arm, armHolds: the two-click Delete (ARM_WAIT, 10 s)
 import { SetupPane } from "./setup.js";
 import { Keeper, idleShell } from "./keeper.js";
 import { WorkerPane } from "./worker.js";
@@ -90,7 +90,7 @@ export default class ProjectAgent extends View {
     this.asleep = false; // not on screen: only the open-card count is read
     this.view = null; // "decisions" | "tasks" | "rules" | "costs"; null: decisions when any is open
     this.viewShown = null; // the view the last render drew (this.view, or the one picked for null)
-    this.rules = new RulesPane();
+    this.rules = new RulesPane((options) => this.field(options));
     this.copier = new Copier(); // the Copy controls of cards and tasks (copy.js, t-026)
     this.push = new PushCards(); // push cards: the last pa-push-main check and run of each (push.js)
     // The Costs view: each space's last summary and billed comparison (costs.js); it reads and runs only while
@@ -161,7 +161,7 @@ export default class ProjectAgent extends View {
   syncNotes(space, cards, release) {
     const open = new Set((cards ?? []).filter((c) => c.card?.status === "open").map((c) => noteKey(space.id, c.id)));
     if (release) for (const k of Object.keys(this.notes)) if (k.startsWith(noteKey(space.id, "")) && !open.has(k)) { this.notes[k].release?.(); delete this.notes[k]; }
-    for (const k of open) this.notes[k] ??= InputState.new({ placeholder: NOTE });
+    for (const k of open) this.notes[k] ??= this.field({ placeholder: NOTE });
     return open.size;
   }
 
@@ -537,9 +537,9 @@ export default class ProjectAgent extends View {
           .on_click((_e, cx) => {
             st.open = !st.open;
             if (st.open && !st.custom) {
-              st.custom = InputState.new({ placeholder: "min", value: PRESETS.includes(every) || !every ? "" : String(every) });
-              st.quietFrom = InputState.new({ placeholder: QUIET.from, value: s.quietHours?.from ?? "" });
-              st.quietTo = InputState.new({ placeholder: QUIET.to, value: s.quietHours?.to ?? "" });
+              st.custom = this.field({ placeholder: "min", value: PRESETS.includes(every) || !every ? "" : String(every) });
+              st.quietFrom = this.field({ placeholder: QUIET.from, value: s.quietHours?.from ?? "" });
+              st.quietTo = this.field({ placeholder: QUIET.to, value: s.quietHours?.to ?? "" });
             }
             cx.notify();
           }).child(`${st.open ? "▾" : "▸"} ${summary}`))
@@ -602,6 +602,8 @@ export default class ProjectAgent extends View {
 
   // Drops every armed Delete: the task's and the Rules view's.
   disarm() { this.armed = null; this.rules.armed = null; }
+  // A panel text field (t-028): focus in it drops an armed Delete, whether or not the Input stops the press.
+  field(options) { return fieldState(options, (_e, cx) => { if (this.armed || this.rules.armed) { this.disarm(); cx.notify(); } }); }
 
   // Opens a link on this computer (wherever the space lives).
   openLink(url, cx) {
@@ -724,7 +726,8 @@ export default class ProjectAgent extends View {
           // Two clicks on the same button: the first arms it (ARM_WAIT; Cancel, a press elsewhere, collapsing, another view or space disarm).
           .child(keep(div().id(`delete-${task.id}`)).flex_none().px(8).h(24).flex().items_center().rounded(6).border(1).border_color(armed ? t.blocked : t.border)
             .text_size(11.5).text_color(armed ? t.blocked : t.muted).cursor_pointer().hover((s) => s.bg(t.hover))
-            .on_click((_e, cx) => { cx.stop_propagation(); if (armed) this.changeTask(space, task, "delete", cx); else { this.armed = arm(task.id, space.id); cx.notify(); } })
+            // The arm is asked again at the click (t-028): one that ran out since this was drawn only arms again.
+            .on_click((_e, cx) => { cx.stop_propagation(); if (this.armedTask(space.id) === task.id) this.changeTask(space, task, "delete", cx); else { this.armed = arm(task.id, space.id); cx.notify(); } })
             .child(armed ? "Delete the task, its evidence and its cards?" : "Delete…"))
           .when(armed, (e) => e.child(keep(this.button(t, `delete-cancel-${task.id}`, "Cancel", (_e, cx) => { cx.stop_propagation(); this.disarm(); cx.notify(); })))))
         .when(Boolean(this.taskError[task.id]), (e) => e.child(div().text_size(11.5).text_color(t.blocked).child(this.taskError[task.id])))));

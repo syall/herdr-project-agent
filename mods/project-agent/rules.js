@@ -20,11 +20,14 @@ export const ALLOW_EVERY = 30000; // the push allowlist is read at most this oft
 export const ARM_WAIT = 10000;
 export const arm = (id, spaceId) => ({ id, space: spaceId, at: Date.now() });
 export const armHolds = (a, spaceId, shown) => Boolean(a && a.space === spaceId && shown && Date.now() - a.at < ARM_WAIT);
+// A text field whose focus calls onFocus(event, cx) (t-028: focus in a panel field drops an armed Delete).
+export function fieldState(options, onFocus) { const s = InputState.new(options); s.on?.("focus", onFocus); return s; }
 
 const FIELDS = [["title", "Title"], ["text", "The rule, in plain language"], ["why", "Why (so later edits keep the intent)"], ["appliesTo", "Applies to: all, a phase, a task type or a worker role"]];
 
 export class RulesPane {
-  constructor() {
+  constructor(field = (options) => InputState.new(options)) {
+    this.field = field; // makes the view's text fields (main.js: focus in one drops an armed Delete)
     this.data = null; // loadRules() result
     this.open = new Set(); // expanded rule ids
     this.form = null; // { id | null, approve, inputs: { title, text, why, appliesTo } }
@@ -99,7 +102,7 @@ export class RulesPane {
   edit(rule, approve) {
     for (const s of Object.values(this.form?.inputs ?? {})) s.release?.();
     const inputs = {};
-    for (const [key, placeholder] of FIELDS) inputs[key] = InputState.new({ placeholder, value: String(rule?.[key] ?? (key === "appliesTo" ? "all" : "")) });
+    for (const [key, placeholder] of FIELDS) inputs[key] = this.field({ placeholder, value: String(rule?.[key] ?? (key === "appliesTo" ? "all" : "")) });
     this.form = { id: rule?.id ?? null, approve: Boolean(approve), inputs };
   }
 
@@ -200,7 +203,8 @@ export class RulesPane {
           .when(!proposed, (e) => e.child(this.button(t, `rule-edit-${rule.id}`, "Edit", (_e, cx) => { this.edit(rule, false); cx.notify(); })))
           // Two clicks on the same button (ARM_WAIT; Cancel, a press elsewhere, another view or space disarm).
           .child(this.button(t, `rule-delete-${rule.id}`, armed ? "Delete for good?" : "Delete", (_e, cx) => {
-            if (!armed) { this.armed = arm(rule.id, space.id); cx.notify(); return; }
+            // The arm is asked again at the click (t-028): one that ran out since this was drawn only arms again.
+            if (this.armedRule(space.id) !== rule.id) { this.armed = arm(rule.id, space.id); cx.notify(); return; }
             this.armed = null;
             this.save(space, cx, (rules) => rules.filter((r) => r.id !== rule.id));
           }, armed ? t.blocked : t.muted, true))
@@ -227,7 +231,7 @@ export class RulesPane {
             cx.notify();
           }), t.muted))
           .child(this.button(t, "rule-import", this.importPath ? "Import this file" : "Import…", (_e, cx) => {
-            if (!this.importPath) { this.importPath = InputState.new({ placeholder: "Path to an exported rules file" }); cx.notify(); return; }
+            if (!this.importPath) { this.importPath = this.field({ placeholder: "Path to an exported rules file" }); cx.notify(); return; }
             const path = this.importPath.value().trim();
             if (!path) { this.importPath.release?.(); this.importPath = null; cx.notify(); return; }
             cx.spawn(async (cx) => {
