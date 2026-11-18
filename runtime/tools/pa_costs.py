@@ -523,6 +523,13 @@ class Reader:
             for item in self.f.get("tail", []):
                 item[2] = True  # a later line of these calls is a late growth
 
+    def new_start(self, seg, ts):
+        """A later start record of the session took effect between the open segment's start and this call (t-032 J1d,
+        d-117 limit 8): the segment settles there, so each row lies under one record and takes its facts."""
+        if len(self.sess.get("starts") or ()) < 2:
+            return False
+        return start_in_effect(self.sess, seg.get("from")) is not start_in_effect(self.sess, ts)
+
     def add_call(self, ts, ident, model, tokens):
         f = self.f
         epoch = parse_ts(ts)
@@ -551,7 +558,8 @@ class Reader:
         model = model or f.get("model")
         pre = self.before is not None and epoch < self.before
         if seg and (seg["day"] != ts[:10] or seg["model"] != model or bool(seg.get("pre")) != pre
-                    or (self.sess.get("program") == "codex" and last is not None and epoch - last > IDLE)):
+                    or (self.sess.get("program") == "codex" and last is not None and epoch - last > IDLE)
+                    or self.new_start(seg, ts)):
             self.settle()
             seg = None
         if not seg:
@@ -2029,7 +2037,10 @@ def summarize(directory, rows, records, table, price_problem, profile_name, now,
         info["tasks"][r.get("task")] = info["tasks"].get(r.get("task"), 0) + t
         info["role"] = r.get("role") or info["role"]
         info["row"] = r
-        info["facts"], info["pricedAs"] = facts, priced_as
+        sc = info.setdefault("scopes", {}).setdefault(skey, [0, facts, None])  # J1d (d-117 limit 9): tokens per scope
+        sc[0] += t
+        if sc[2] is None:
+            sc[2] = priced_as
     cc_parts, um_n, um_money = cc_join(cc, records, sessions, sess_b, since, until, zone) if cc else ({}, 0, 0.0)
     cc_money, task_cc = {}, {}
     for sid, parts in cc_parts.items():
@@ -2082,12 +2093,14 @@ def summarize(directory, rows, records, table, price_problem, profile_name, now,
     for sid, b in sess_b.items():
         info, sess = sess_info[sid], sessions.get(sid) or {}
         r = info["row"]
+        top = max(info["scopes"].values(), key=lambda v: v[0])  # its largest scope by tokens; ties: the first seen
         state = "gone" if sess.get("gone") else ("closed" if sess.get("closed") else "open")
         entry = b.out(short(sid), kind=r.get("kind"), role=info["role"], program=r.get("program"),
                       task=max(info["tasks"], key=lambda k: info["tasks"][k]),
                       model=max(info["models"], key=lambda k: info["models"][k]), **{"from": info["from"]},
                       to=info["to"], state=state, source=r.get("source"), match=r.get("match"),
-                      **dict(zip(SCOPE_FIELDS, info["facts"])), pricedAs=info["pricedAs"])
+                      **dict(zip(SCOPE_FIELDS, top[1])), pricedAs=top[2],
+                      **({"scopes": len(info["scopes"])} if len(info["scopes"]) > 1 else {}))
         if sid in cc_money:
             parts = [(rec, cleared) for rec, cleared in cc_parts[sid] if cc_figure(rec) is not None]
             entry["cc"], entry["ccAt"] = round(cc_money[sid], 6), max(rec["at"] for rec, _c in parts)
@@ -3428,25 +3441,29 @@ def launch_facts(profile, program, model, directory=None, env=None):
 def row_facts(row, sess, rules, chain):
     """The facts a ledger row is priced and shown under (t-032): its own where it has them (from its launch record);
     else, at summarize time, provider and endpoint from the profile's model rules over its record's program and model
-    (providerBy/endpointBy "rule"), else the default ("default"); region unknown; account from the chain (C7, C15)."""
+    (providerBy/endpointBy "rule"), else the default ("default"); region unknown; account from the chain (C7, C15).
+    The rules read the program and model of the start record in effect at the row's time (t-032 J1d, d-117 limit 7).
+    A stored account counts only when the launch recorded it (accountBy env or rule); one the launch took from the
+    chain follows today's chain, as entry_account does (J1d, d-117 limit 2: one label per row)."""
     sess = sess or {}
+    rec = start_in_effect(sess, row.get("from")) if sess else {}
     out = {}
     if row.get("provider"):
         out["provider"], out["providerBy"] = row["provider"], row.get("providerBy") or "launch"
     else:
-        p = provider_rule(rules, row.get("program") or sess.get("program"), sess.get("model"))
+        p = provider_rule(rules, row.get("program") or rec.get("program") or sess.get("program"), rec.get("model"))
         out["provider"], out["providerBy"] = (p, "rule") if p else ((rules or {}).get("defaultProvider"), "default")
     if row.get("endpoint"):
         out["endpoint"], out["endpointBy"] = row["endpoint"], row.get("endpointBy") or "rule"
     else:
-        n = endpoint_rule(rules, sess.get("model"))
+        n = endpoint_rule(rules, rec.get("model"))
         out["endpoint"], out["endpointBy"] = (n, "rule") if n else (None, "default")
     if row.get("region"):
         out["region"], out["regionBy"] = row["region"], row.get("regionBy") or "unknown"
     else:
         out["region"], out["regionBy"] = None, row.get("regionBy") if row.get("regionBy") in ("refused",) else "unknown"
-    if row.get("account"):
-        out["account"], out["accountBy"] = row["account"], row.get("accountBy") or "default"
+    if row.get("account") and row.get("accountBy") in ("env", "rule"):
+        out["account"], out["accountBy"] = row["account"], row["accountBy"]
     else:
         out["account"], out["accountBy"] = chain
     return out

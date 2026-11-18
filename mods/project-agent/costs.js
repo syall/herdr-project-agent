@@ -13,6 +13,10 @@
 //           the view was left starts nothing; the space is marked stale and read at once when shown.
 //   days:   Today, Last 7 days and By day are this machine's local days when the summary's days are in its zone (t-036:
 //           the collect passes it, zone.js); else they are the summary's days, named ("(UTC)" for an older summary).
+//   scopes: (t-032 J1d) where the summary has them (pa-costs of t-032 on): the account beside Total, or an Accounts section
+//           with two or more; with two or more scopes a By scope section, each scope's "priced as" where it was priced from
+//           another (wider) scope, the scopes of a model in its drill and the scope of each session line. An older summary
+//           has none of these keys and draws as before; nothing more is read.
 //   runs:   on a click only: Refresh (`pa-costs collect`, with this panel's zone), Reconstruct (`pa-costs reconstruct`) on the
 //           space's machine, Turn off (`pa-costs billed disable`, here). Nothing else writes (R12).
 
@@ -84,6 +88,27 @@ const ccNum = (v) => (typeof v === "number" && Number.isFinite(v) ? v : null);
 const ccMoney = (v) => `${money(v, null)} USD`;
 // A summary's own entry list (a key that is not one is an empty list).
 const list = (v) => (Array.isArray(v) ? v.filter((e) => e && typeof e === "object") : []);
+
+// t-032 J1d: the facts a cost was priced under (provider · endpoint · region · account). A fact that is not a label is
+// "?", with its …By where the entry says how it was found ("? (unknown)", "? (refused)", "? (mixed)").
+const BY = ["providerBy", "endpointBy", "regionBy", "accountBy"];
+const label = (v) => (typeof v === "string" && v ? v : null);
+const factsOf = (e) => (Array.isArray(e?.scope) && e.scope.length === 4 ? e.scope : [e?.provider, e?.endpoint, e?.region, e?.account]);
+const factsText = (facts, by = null) => facts.map((v, i) => label(v) ?? (by && typeof by === "object" && label(by[BY[i]]) ? `? (${by[BY[i]]})` : "?")).join(" · ");
+// "priced as <scope>" for each pricedAs (one, or a list) whose scope is not the facts themselves (a fact "?" priced from
+// "*" counts as another scope); "" when every one is. from: with the date its row holds from.
+function pricedNote(facts, pricedAs, from = false) {
+  const plain = factsText(facts);
+  const as = (Array.isArray(pricedAs) ? pricedAs : [pricedAs]).filter((x) => x && typeof x === "object" && Array.isArray(x.scope) && x.scope.length === 4);
+  return [...new Set(as.map((x) => {
+    const text = x.scope.map((v) => label(v) ?? "*").join(" · ");
+    return text === plain ? null : `priced as ${text}${from && label(x.validFrom) ? ` (from ${x.validFrom})` : ""}`;
+  }).filter(Boolean))].join("; ");
+}
+// The summary has two or more scopes (then lines say theirs); its one account label (null: none, or two or more).
+const tagged = (s) => num(s?.scopes) > 1 || list(s?.byScope).length > 1;
+const accountsOf = (s) => list(s?.byAccount).filter((e) => label(e.key));
+const oneAccount = (s) => { const a = accountsOf(s); return a.length === 1 ? a[0].key : null; };
 
 // The figure on the tab, from the last summary read (none: no figure).
 function tabFigure(s) {
@@ -310,10 +335,11 @@ export class CostsPane {
     // Claude Code's figure in the Total tile (AC7.1): under est.; where there is no est., the tile's money, never "est.".
     const cc = ccOf(s), ccM = ccNum(cc?.money), count = cc ? `${num(cc.sessions)} of ${num(cc.claudeSessions)} Claude sessions` : "";
     const noEst = tot.money === null || tot.money === undefined;
+    const acct = oneAccount(s); // R-A3 (t-032 J1d): one account: its label beside Total; two or more: the Accounts section
     const ccAlt = cc && ccM !== null && noEst ? `Claude Code: ${ccMoney(ccM)} (list price)` : null;
     const ccLine = !cc ? null : ccM === null ? `Claude Code: no figure · ${count}` : noEst ? `Claude Code's figure: ${count}` : `Claude Code: ${ccMoney(ccM)} (list price) · ${count}`;
     return h_flex().gap(6)
-      .child(tile("Total", { money: tot.money, unpricedTokens: tot.unpricedTokens, tokens: all }, `${tokens(all)} tokens${all ? ` · ${Math.round((cr / all) * 100)}% cache read` : ""}`, ccAlt, ccLine))
+      .child(tile("Total", { money: tot.money, unpricedTokens: tot.unpricedTokens, tokens: all }, `${tokens(all)} tokens${all ? ` · ${Math.round((cr / all) * 100)}% cache read` : ""}${acct ? ` · account ${acct}` : ""}`, ccAlt, ccLine))
       .child(tile("Today", sum(mine), `${tokens(sum(mine).tokens)} tokens`))
       .child(tile(z.local ? "Last 7 days" : `Last 7 days (${z.label})`, week, `${tokens(week.tokens)} tokens`));
   }
@@ -364,7 +390,36 @@ export class CostsPane {
         .when(Boolean(ccCell), (x) => x.child(div().flex_none().text_size(11).text_color(t.muted).child(ccCell))));
       return open && drill ? el.children(drill()) : el;
     };
-    const sessionsOf = (pred) => list(s.sessions).filter(pred).map((x) => sub(`${x.source === "reconstructed" ? "◌ " : ""}${str(x.key)} · ${[x.kind, x.role, x.program, x.model].filter(Boolean).map(str).join(" · ")} · ${clock(x.from)} – ${clock(x.to)} · ${est(x, cur)}${ccOn && ccNum(x.cc) !== null ? ` · CC ${money(x.cc, null)}` : ""} · ${str(x.state)}${x.source ? ` · ${str(x.source)}` : ""}`));
+    // With two or more scopes (t-032 J1d) a session line says its scope after the model, and how it was priced where that
+    // is another scope (or not at all); a session whose rows span scopes shows its largest and says so.
+    const tags = tagged(s);
+    const scopeOf = (x) => (tags ? ` (${factsText(factsOf(x))})` : "");
+    const noteOf = (x) => {
+      if (!tags) return "";
+      const n = [pricedNote(factsOf(x), x.pricedAs) || priceTag(x), num(x.scopes) > 1 ? `rows in ${num(x.scopes)} scopes (the largest shown)` : ""].filter(Boolean).join(" · ");
+      return n ? ` · ${n}` : "";
+    };
+    const sessionsOf = (pred) => list(s.sessions).filter(pred).map((x) => sub(`${x.source === "reconstructed" ? "◌ " : ""}${str(x.key)} · ${[x.kind, x.role, x.program, x.model].filter(Boolean).map(str).join(" · ")}${scopeOf(x)} · ${clock(x.from)} – ${clock(x.to)} · ${est(x, cur)}${ccOn && ccNum(x.cc) !== null ? ` · CC ${money(x.cc, null)}` : ""}${noteOf(x)} · ${str(x.state)}${x.source ? ` · ${str(x.source)}` : ""}`));
+    // The model lines of a scope or of a model (t-032 J1d): byDayModel (UTC days, from its oldest) summed per model and scope.
+    const dayModel = list(s.byDayModel);
+    const dmDays = dayModel.map((e) => str(e.day)).filter((d) => /^\d{4}-\d{2}-\d{2}$/.test(d)).sort();
+    const dmFrom = dmDays.length ? ` (from ${dmDays[0]})` : "";
+    const modelLines = (pred, withScope) => {
+      const groups = new Map();
+      for (const e of dayModel.filter(pred)) {
+        const f = factsOf(e), key = `${str(e.model)}\0${factsText(f)}`;
+        const g = groups.get(key) ?? { model: str(e.model), facts: f, tokens: 0, money: null, unpricedTokens: 0, pricedAs: [] };
+        const tk = e.tokens && typeof e.tokens === "object" ? Object.values(e.tokens).reduce((a, x) => a + num(x), 0) : 0;
+        g.tokens += tk;
+        if (e.money === null || e.money === undefined) g.unpricedTokens += tk; else { g.money = (g.money ?? 0) + num(e.money); g.unpricedTokens += num(e.unpricedTokens); }
+        if (e.pricedAs) g.pricedAs.push(e.pricedAs);
+        groups.set(key, g);
+      }
+      return [...groups.values()].map((g) => {
+        const e = { money: g.money, unpricedTokens: g.money === null ? 0 : g.unpricedTokens, tokens: g.tokens };
+        return sub([`${g.model}${withScope ? ` (${factsText(g.facts)})` : ""}`, `${tokens(g.tokens)} tokens`, est(e, cur), pricedNote(g.facts, g.pricedAs), priceTag(e)].filter(Boolean).join(" · "));
+      });
+    };
     const entries = (items) => items.map((e) => sub(`${str(e.key)} · ${tokens(e.tokens)} tokens · ${est(e, cur)}${priceTag(e) ? ` · ${priceTag(e)}` : ""}`));
     // By activity: tasks of an activity; unattributed: its reasons; cache rebuild: the passes with a rebuild and its tasks.
     const acts = list(s.byActivity);
@@ -387,7 +442,24 @@ export class CostsPane {
     out.child(h_flex().gap(4).items_center().child(head("By session type")).child(copy("kind")).children(DIMS.map((d) => div().id(`costs-dim-${d}`).px(6).h(20).flex().items_center().rounded(5).text_size(11)
       .bg(st.dim === d ? t.selected : t.chrome).text_color(st.dim === d ? t.foreground : t.muted).cursor_pointer().on_click((_e, cx) => { st.dim = d; st.open.kind = null; cx.notify(); }).child(d))));
     const dimRows = st.dim === "machine" ? [this.machineRow(s, space)] : list(s.byKind?.[st.dim]);
-    dimRows.forEach((x, i) => out.child(row("kind", i, x, str(x.key), null, () => sessionsOf((ss) => st.dim === "machine" || str(ss[st.dim] ?? "(none)") === str(x.key)))));
+    dimRows.forEach((x, i) => out.child(row("kind", i, x, str(x.key), null, () => [
+      ...(tags && st.dim === "model" ? [sub(`Scopes${dmFrom}:`, t.dim), ...modelLines((e) => str(e.model) === str(x.key), true)] : []),
+      ...sessionsOf((ss) => st.dim === "machine" || str(ss[st.dim] ?? "(none)") === str(x.key))])));
+    // Accounts (R-A3, t-032 J1d): two or more account labels; each with its sessions.
+    const accts = accountsOf(s);
+    if (accts.length > 1) {
+      out.child(titled("account", "Accounts"));
+      accts.forEach((x, i) => out.child(row("account", i, x, str(x.key), null, () => [sub("Sessions:", t.dim), ...sessionsOf((ss) => str(ss.account) === str(x.key))])));
+    }
+    // By scope (A-V3): two or more scopes; each says how it was priced where that is another scope; its models and sessions.
+    if (tags) {
+      out.child(titled("scope", "By scope (provider · endpoint · region · account)"));
+      list(s.byScope).forEach((x, i) => {
+        const f = factsOf(x), same = (e) => factsText(factsOf(e)) === factsText(f);
+        out.child(row("scope", i, x, factsText(f, x.by), pricedNote(f, x.pricedAs, true) || null, () => [
+          sub(`Models${dmFrom}:`, t.dim), ...modelLines(same, false), sub("Sessions:", t.dim), ...sessionsOf(same)]));
+      });
+    }
     // By day: newest first; Show more reveals up to 92. A day pa-costs cut in UTC (older than the zone table) says (UTC).
     const days = list(s.byDay);
     const z = summaryZone(s, Date.now());

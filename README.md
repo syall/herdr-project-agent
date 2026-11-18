@@ -273,6 +273,13 @@ before), so `billed compare` sets this space's estimates beside the bill of that
 only while it is shown, at most every 10 s. It shows Total, Today and Last 7 days, then the spend by
 activity, task, session type and day, each with its drill-down, and `Refresh` (runs `pa-costs
 collect`). Nothing in it writes anything except those two buttons and `Turn off` below.
+It says which account and scope each cost belongs to, from the same summary: with one account label,
+the label beside Total (`account <label>`); with two or more, an **Accounts** section (each with its
+sessions). With two or more scopes, a **By scope** section, one row per `provider · endpoint · region ·
+account` (an unknown fact is `?` with how it was found, e.g. `? (unknown)`), with `priced as <scope>
+(from <date>)` where its price came from another, wider scope and `no price` where none applies; each
+session line then names its scope (and `rows in N scopes` when it spans several: the largest is shown),
+and a model's drill lists its scopes. A summary from before these labels draws as before.
 
 **Billed amounts** (optional): rows in a neutral shape in `<HERDR_PA_HOME>/billing/billed.jsonl` on
 the panel's machine (`{account, from, to, label, model, kind, quantity, unit, amount, currency, final,
