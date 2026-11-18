@@ -679,7 +679,7 @@ class RunAll(unittest.TestCase):
                 if os.path.exists(pids):
                     os.remove(pids)
                 began = time.time()
-                code, out = self.run_all(keeper="child", PA_PART_LIMIT="2", PA_SERIAL=serial)
+                code, out = self.run_all(keeper="child", PA_PART_LIMIT="4", PA_SERIAL=serial)
                 self.assertLess(time.time() - began, 60, out)
                 self.assertEqual(code, 1, out)
                 tail = self.summary(out)

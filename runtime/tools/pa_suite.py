@@ -6,6 +6,17 @@ folder; the pa_hooks module is passed in (`h`) for its helpers, so nothing here 
                                                    unless --again
   pa-full-suite --last [--commit C|--tree T]       the last recorded run (default: this worktree's HEAD tree)
   pa-full-suite --report                           the suite's parts by time, slowest median first
+  pa-full-suite --module test_x                    one unit module: tests/run-all.sh --module test_x as the command
+                                                   (the same slot, part limit, progress file and record)
+  pa-full-suite --status [--commit C]              this worktree's latest run (or C's; outside a worktree, every run
+                                                   not done): waiting, running (parts done, the parts running now) or done
+  pa-full-suite --wait [--commit C] [--timeout S]  waits for that run (a heartbeat line every minute) and exits with its
+                                                   code; 75 when it still runs after S (default 540) s: --wait again
+
+A run (t-076) names its output file first (evidence/<task>/full-suite-<run>.out, the whole output) and keeps a
+progress file, HERDR_PA_HOME/suite-runs/<run>.json, which its tests/run-all.sh fills in with its parts; every
+run-all.sh run with parts has one (pa_suite.py slot writes it). The slot holder also stops a part that runs past
+max(PA_PART_LIMIT or PART_FLOOR, 3x its median in the suite record) and marks it hung.
 
 The machine cap: at most CAP suite runs at once per user (slots under HERDR_PA_HOME, i.e. ~/.config/herdr-pa,
 never a space). A slot is an flock on suite-slots/slot-<i>, so the kernel frees it when its holder dies.
@@ -21,8 +32,10 @@ The command gets PA_SUITE_SLOT, PA_SUITE_SLOT_PID (this process) and PA_SUITE_HO
 by the caller). Script mode never loads pa.py (run-all.sh's test fixture stubs it): HERDR_PA_HOME and a UTC clock.
 """
 import argparse
+import calendar
 import datetime
 import fcntl
+import glob
 import json
 import os
 import re
@@ -30,6 +43,7 @@ import signal
 import statistics
 import subprocess
 import sys
+import threading
 import time
 import uuid
 
@@ -45,7 +59,14 @@ CAP = 1  # one at a time: two overlapping took 8-10 min each, two in a row ~4 mi
 POLL = 2
 WAIT_LIMIT = 7200  # longer than a run's own 3600 s timeout
 SLOT_WAIT_LIMIT = 840  # script mode (run-all.sh): under its shortest caller's timeout, the affected-tests hook's 900 s
-PART = re.compile(r"^  (.+): (ok|FAILED) \((\d+)s\)$")
+PART = re.compile(r"^  (.+): (ok|FAILED|HUNG) \((\d+)s\)$")
+PART_FLOOR = 900  # a part's limit is at least this (PA_PART_LIMIT), else 3x its recorded median
+STOP_GRACE = 10  # seconds from TERM to KILL for a hung part
+HEARTBEAT = 60  # a status line this often while a run or a --wait goes on (PA_SUITE_HEARTBEAT)
+WAIT_CALL = 540  # --wait's default: under a 600 s tool-call limit, so a worker's call ends and says so
+STILL_RUNNING = 75  # --wait's exit when the run goes on past its timeout
+KEEP_DONE = 7 * 86400  # progress files of runs that ended are pruned after this
+MODULE = re.compile(r"^test_[A-Za-z0-9_]+$")
 
 
 class Waited(Exception):
@@ -76,8 +97,14 @@ def slot_dir():
 
 def parse_parts(text):
     """run-all.sh's summary list: `  <name>: ok (<n>s)` or `  <name>: FAILED (<n>s)`, in order."""
-    return [{"name": m.group(1), "ok": m.group(2) == "ok", "seconds": int(m.group(3))}
-            for m in (PART.match(l) for l in text.splitlines()) if m]
+    parts = []
+    for m in (PART.match(l) for l in text.splitlines()):
+        if m:
+            part = {"name": m.group(1), "ok": m.group(2) == "ok", "seconds": int(m.group(3))}
+            if m.group(2) == "HUNG":
+                part["hung"] = True
+            parts.append(part)
+    return parts
 
 
 def holder_of(path):
@@ -95,10 +122,10 @@ def describe(holders):
         for h in holders) or "unknown"
 
 
-def acquire(limit_slots, info, poll=POLL, limit=WAIT_LIMIT, say=print, who="pa-full-suite", gone=None):
+def acquire(limit_slots, info, poll=POLL, limit=WAIT_LIMIT, say=print, who="pa-full-suite", gone=None, beat=None):
     """Takes a free slot (an open file holding an flock) out of limit_slots, waiting for one. Says once that it
     waits and for whom, and again when the holders change. Raises Waited after `limit` seconds, or as soon as
-    gone() (when given) says the caller it waits for has gone."""
+    gone() (when given) says the caller it waits for has gone. beat(holders text), when given, on every poll."""
     folder = slot_dir()
     os.makedirs(folder, exist_ok=True)
     began, shown = time.time(), None
@@ -124,6 +151,8 @@ def acquire(limit_slots, info, poll=POLL, limit=WAIT_LIMIT, say=print, who="pa-f
             shown = text
         if time.time() - began >= limit:
             raise Waited("{}: no slot came free in {:.0f} s (running: {})".format(who, time.time() - began, text))
+        if beat:
+            beat(text)
         reason = gone() if gone else None
         if reason:
             raise Waited("{}: stopped waiting for the suite slot after {:.0f} s: {}".format(who, time.time() - began, reason))
@@ -200,21 +229,265 @@ def caller_slot(marker):
     return None, None
 
 
-def task_of(start):
-    """The task id of the worktree around start (pa-hooks install marks it in .claude/pa-task.json), else None."""
+def task_record(start):
+    """The task record of the worktree around start (pa-hooks install marks it in .claude/pa-task.json), else {}."""
     folder = os.path.realpath(start)
     while True:
         try:
             with open(os.path.join(folder, ".claude", "pa-task.json")) as f:
                 record = json.load(f)
             if isinstance(record, dict) and record.get("task"):
-                return record["task"]
+                return record
         except (OSError, ValueError):
             pass
         parent = os.path.dirname(folder)
         if parent == folder:
-            return None
+            return {}
         folder = parent
+
+
+def task_of(start):
+    """The task id of the worktree around start, else None."""
+    return task_record(start).get("task")
+
+
+# ---- progress files (t-076): HERDR_PA_HOME/suite-runs/<run>.json, one per run, written whole ----
+
+def runs_dir():
+    return os.path.join(home(), "suite-runs")
+
+
+def alive(pid):
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def read_progress(path):
+    try:
+        with open(path) as f:
+            row = json.load(f)
+        return row if isinstance(row, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def write_progress(path, row):
+    tmp = "{}.tmp-{}-{}".format(path, os.getpid(), threading.get_ident())
+    with open(tmp, "w") as f:
+        json.dump(row, f)
+    os.replace(tmp, path)
+
+
+_progress_lock = threading.Lock()
+
+
+def update_progress(path, **fields):
+    """Adds fields to the progress file at path (read, merged, written whole). Never raises: progress is a view."""
+    if not path:
+        return
+    with _progress_lock:
+        try:
+            row = read_progress(path)
+            row.update(fields, updated=stamp())
+            write_progress(path, row)
+        except OSError:
+            pass
+
+
+def prune():
+    """Removes progress files of runs that ended (or whose owner is gone) more than KEEP_DONE ago."""
+    for path in glob.glob(os.path.join(runs_dir(), "*.json")):
+        try:
+            old = time.time() - os.path.getmtime(path) > KEEP_DONE
+        except OSError:
+            continue
+        if old:
+            row = read_progress(path)
+            if row.get("state") == "done" or not alive(row.get("pid")):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+
+
+def new_progress(row):
+    """A progress file for a new run (its id in row["run"]); its path, or None when it cannot be written."""
+    try:
+        os.makedirs(runs_dir(), exist_ok=True)
+        prune()
+        path = os.path.join(runs_dir(), row["run"] + ".json")
+        write_progress(path, dict(row, t=time.time(), updated=stamp()))
+        return path
+    except OSError:
+        return None
+
+
+def all_progress():
+    rows = []
+    for path in glob.glob(os.path.join(runs_dir(), "*.json")):
+        row = read_progress(path)
+        if row.get("run"):
+            rows.append(row)
+    return sorted(rows, key=lambda r: (r.get("t") or epoch(r.get("queued")) or 0, r.get("run")))
+
+
+def epoch(value):
+    """Seconds since the epoch of a stamp() string (or a number), else None."""
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return float(calendar.timegm(time.strptime(value, "%Y-%m-%dT%H:%M:%SZ")))
+    except (TypeError, ValueError):
+        return None
+
+
+def head_commit(folder):
+    try:
+        r = subprocess.run(["git", "-C", folder, "rev-parse", "--verify", "-q", "HEAD"], stdout=subprocess.PIPE,
+                           stderr=subprocess.DEVNULL, universal_newlines=True, timeout=10)
+        return r.stdout.strip() or None if not r.returncode else None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+# ---- the per-part limit: from the suite record's medians ----
+
+def floor_limit():
+    value = os.environ.get("PA_PART_LIMIT", "")
+    return int(value) if value.isdigit() and int(value) > 0 else PART_FLOOR
+
+
+def part_limit(median, floor):
+    """A part's limit: 3x its median, at least floor (no median: the floor)."""
+    return max(floor, 3 * median) if median else floor
+
+
+def record_rows(start):
+    """The suite record (suites.jsonl) of the space of the task around start, else every space's."""
+    space = task_record(start).get("space") or ""
+    space = space.split("/")[-1]
+    paths = []
+    if re.match(r"^[A-Za-z0-9_.-]+$", space) and space not in (".", ".."):
+        paths = [os.path.join(home(), "spaces", space, "content", "suites.jsonl")]
+    rows = [r for p in paths for r in read_lines(p)]
+    if not rows:
+        rows = [r for p in sorted(glob.glob(os.path.join(home(), "spaces", "*", "content", "suites.jsonl")))
+                for r in read_lines(p)]
+    return rows
+
+
+def median_total(rows, command=None, full=False):
+    """The median seconds of the recorded runs (each run once): those of command, or (full) every run with parts
+    that ran no single module. (median, runs), or (None, 0)."""
+    seen, times = set(), []
+    for i, r in enumerate(rows):
+        key = r.get("run") or i
+        if key in seen or not isinstance(r.get("seconds"), (int, float)):
+            continue
+        if (command is not None and r.get("command") == command) or (full and r.get("parts") and not r.get("module")):
+            seen.add(key)
+            times.append(r["seconds"])
+    return (statistics.median(times), len(times)) if times else (None, 0)
+
+
+class Watcher(threading.Thread):
+    """Follows a tests/run-all.sh run folder (named in the watch file once run-all.sh made it): writes its parts
+    into the progress file and stops a part past its limit (TERM to its process group, KILL after STOP_GRACE)."""
+
+    def __init__(self, progress, watch, medians, floor, poll=1.0):
+        threading.Thread.__init__(self, daemon=True)
+        self.progress, self.watch, self.medians, self.floor, self.poll = progress, watch, medians, floor, poll
+        self.folder, self.stopped, self.done = None, {}, threading.Event()
+
+    def run(self):
+        while not self.done.wait(self.poll):
+            try:
+                self.tick()
+            except Exception:  # a view: never stop the run for it
+                pass
+
+    def stop(self):
+        self.done.set()
+        self.join(10)
+        try:
+            self.tick()
+        except Exception:
+            pass
+
+    def read(self, name):
+        try:
+            with open(os.path.join(self.folder, name)) as f:
+                return f.read().strip()
+        except OSError:
+            return None
+
+    def tick(self):
+        if not self.folder:
+            try:
+                with open(self.watch) as f:
+                    self.folder = f.read().strip() or None
+            except OSError:
+                return
+            if not self.folder:
+                return
+        parts = []
+        for line in (self.read("parts") or "").splitlines():
+            bits = line.split("\t")
+            if len(bits) == 3:
+                parts.append(bits)
+        now, running, done, failed, hung = time.time(), [], 0, [], []
+        for i, name, log in parts:
+            start = self.read(i + ".start")
+            if self.read(i + ".end") is not None:
+                done += 1
+                code = self.read(i + ".code")
+                if os.path.exists(os.path.join(self.folder, i + ".hung")):
+                    hung.append(name)
+                elif code not in (None, "", "0"):
+                    failed.append(name)
+                continue
+            if not start or not start.isdigit():
+                continue
+            began, median = int(start), self.medians.get(name)
+            limit = part_limit(median, self.floor)
+            try:
+                last = os.path.getmtime(log)
+            except OSError:
+                last = began
+            running.append({"name": name, "since": began, "last_output": last, "limit": limit, "median": median})
+            if now - began > limit:
+                self.halt(i, now - began, limit, median)
+        update_progress(self.progress, folder=self.folder,
+                        parts={"total": len(parts), "done": done, "running": running, "failed": failed, "hung": hung})
+
+    def halt(self, i, seconds, limit, median):
+        pid = self.read(i + ".pid")
+        if not pid or not pid.isdigit():
+            return
+        pid = int(pid)
+        first = i not in self.stopped
+        if not first and (self.stopped[i] is None or time.time() - self.stopped[i] < STOP_GRACE):
+            return  # TERM sent and waiting out the grace, or KILL sent already
+        if first:
+            why = "3x its median {:g}s, at least {}s".format(median, self.floor) if median else "no recorded median: {}s".format(self.floor)
+            with open(os.path.join(self.folder, i + ".hung"), "w") as f:
+                f.write("stopped after {:.0f}s (limit {:g}s: {})\n".format(seconds, limit, why))
+        self.stopped[i] = time.time() if first else None
+        sig = signal.SIGTERM if first else signal.SIGKILL
+        try:
+            if os.getpgid(pid) == pid:  # its own group (run-all.sh's set -m): the part and its children
+                os.killpg(pid, sig)
+            else:
+                os.kill(pid, sig)
+        except OSError:
+            pass
 
 
 def run_under_slot(argv):
@@ -233,23 +506,54 @@ def run_under_slot(argv):
     who = args.what.split()[0] if args.what.split() else "pa_suite.py"
     path, caller = caller_slot(os.environ.get("PA_SUITE_SLOT", ""))
     slot, parent = None, os.getppid()
+    # The progress file (t-076): the caller's (a pa-full-suite holding the slot) gets this run's parts; else its own.
+    progress = os.environ.get("PA_SUITE_PROGRESS", "") if caller else ""
+    if not (progress and os.path.dirname(os.path.realpath(progress)) == os.path.realpath(runs_dir())
+            and os.path.isfile(progress)):
+        progress = None
+    own = progress is None
+    run = uuid.uuid4().hex[:12]
+    if own:
+        rows = record_rows(args.dir)
+        total, runs = median_total(rows, full=True) if args.what == "tests/run-all.sh" else (None, 0)
+        progress = new_progress({"run": run, "kind": "run-all.sh", "what": args.what, "task": task_of(args.dir),
+                                 "worker": args.worker or None, "dir": os.path.realpath(args.dir),
+                                 "commit": head_commit(args.dir), "pid": os.getpid(), "state": "waiting",
+                                 "queued": stamp(), "median_total": total, "median_runs": runs})
     if caller:
         hold = "held by the caller (task {}, pid {}, {})".format(caller.get("task"), caller.get("pid"), os.path.basename(path))
     else:
         queued = time.time()
         info = {"task": task_of(args.dir), "worker": args.worker or None, "what": args.what, "dir": args.dir}
+        shown = {}
+
+        def beat(text):
+            if shown.get("text") != text:
+                shown["text"] = text
+                update_progress(progress, waiting_for=text)
         try:
-            slot = acquire(cap(), info, limit=limit, say=lambda m: print(m, flush=True), who=who,
+            slot = acquire(cap(), info, limit=limit, say=lambda m: print(m, flush=True), who=who, beat=beat,
                            gone=lambda: os.getppid() != parent and "its caller is gone (pid {})".format(parent))
         except Waited as e:
             print(e, flush=True)
+            update_progress(progress, state="done", exit=124, end=stamp(), note=str(e))
             return 124
         except KeyboardInterrupt:
+            update_progress(progress, state="done", exit=130, end=stamp())
             return 130
         path = slot.name
         hold = "waited {:.1f}s for {} (cap {})".format(time.time() - queued, os.path.basename(path), cap())
-    env = dict(os.environ, PA_SUITE_SLOT=path, PA_SUITE_SLOT_PID=str(os.getpid()), PA_SUITE_HOLD=hold)
-    child = None
+    if own:
+        update_progress(progress, state="running", start=stamp(), hold=hold)
+    watch = os.path.join(runs_dir(), "{}.watch-{}".format(run, os.getpid()))
+    env = dict(os.environ, PA_SUITE_SLOT=path, PA_SUITE_SLOT_PID=str(os.getpid()), PA_SUITE_HOLD=hold,
+               PA_SUITE_WATCH=watch)
+    env.pop("PA_SUITE_PROGRESS", None)
+    medians = {p["name"]: p["median"] for p in report(record_rows(args.dir))}
+    watcher = Watcher(progress, watch, medians, floor_limit()) if progress else None
+    if watcher:
+        watcher.start()
+    child, code = None, 1
 
     def forward(sig, frame):  # TERM, INT or HUP to this process goes to the run, which stops its parts
         if child is not None and child.poll() is None:
@@ -260,9 +564,18 @@ def run_under_slot(argv):
         child = subprocess.Popen(command, env=env)
         code = child.wait()
     finally:
+        if watcher:
+            watcher.stop()
         if slot is not None:
             release(slot)
-    return 128 - code if code < 0 else code
+        try:
+            os.remove(watch)
+        except OSError:
+            pass
+    code = 128 - code if code < 0 else code
+    if own:
+        update_progress(progress, state="done", exit=code, end=stamp())
+    return code
 
 
 def untracked(h, repo):
@@ -410,16 +723,184 @@ def cmd_report(h, args):
     return 0
 
 
+def heartbeat():
+    try:
+        value = float(os.environ.get("PA_SUITE_HEARTBEAT", ""))
+    except ValueError:
+        value = 0
+    return value if value > 0 else HEARTBEAT
+
+
+def gone(row):
+    return row.get("state") in ("waiting", "running") and not alive(row.get("pid"))
+
+
+def status_line(row, rows=None, now=None):
+    """One line on a run, from its progress file: waiting, running or done (or gone without a result)."""
+    now = time.time() if now is None else now
+    who = "[run {}: {}, task {}, {}]".format(row.get("run"), row.get("kind") or "run", row.get("task"), row.get("dir"))
+    state = row.get("state")
+    if gone(row):
+        return "pa-full-suite: ended without a result (pid {} gone; it was {} since {}) {}".format(
+            row.get("pid"), state, row.get("start") or row.get("queued"), who)
+    if state == "waiting":
+        queued = epoch(row.get("queued"))
+        line = [r for r in (rows if rows is not None else all_progress()) if r.get("state") == "waiting" and not gone(r)]
+        place = [r.get("run") for r in line].index(row.get("run")) + 1 if row.get("run") in [r.get("run") for r in line] else len(line) + 1
+        return "pa-full-suite: waiting for the suite slot since {} ({}s), place {} of {} waiting; running: {} {}".format(
+            row.get("queued"), int(now - queued) if queued else "?", place, max(len(line), place),
+            row.get("waiting_for") or "unknown", who)
+    if state == "running":
+        start = epoch(row.get("start"))
+        text = "pa-full-suite: running since {} ({}s".format(row.get("start"), int(now - start) if start else "?")
+        if row.get("median_total") is not None:
+            text += "; median total {:g}s over {} runs".format(row["median_total"], row.get("median_runs"))
+        text += ")"
+        parts = row.get("parts") or {}
+        if parts.get("total"):
+            text += ": parts {} of {} done".format(parts.get("done", 0), parts["total"])
+            now_parts = ["{} ({}s, limit {:g}s; last output {}s ago)".format(
+                p.get("name"), int(now - (epoch(p.get("since")) or now)), p.get("limit") or 0,
+                int(now - (epoch(p.get("last_output")) or now))) for p in parts.get("running") or []]
+            if now_parts:
+                text += "; now: " + ", ".join(now_parts)
+            for key in ("failed", "hung"):
+                if parts.get(key):
+                    text += "; {}: {}".format(key, ", ".join(parts[key]))
+        return text + " " + who
+    start, end = epoch(row.get("start")), epoch(row.get("end"))
+    text = "pa-full-suite: done: exit {} at {} (started {}, {}s)".format(
+        row.get("exit"), row.get("end"), row.get("start") or row.get("queued"),
+        int(end - start) if start and end else "?")
+    parts = row.get("parts") or {}
+    for key in ("failed", "hung"):
+        if parts.get(key):
+            text += "; {}: {}".format(key, ", ".join(parts[key]))
+    if row.get("note"):
+        text += "; " + row["note"]
+    if row.get("output") or row.get("folder"):
+        text += "; output {}".format(row.get("output") or row.get("folder"))
+    if row.get("record"):
+        text += "; record {}".format(row["record"])
+    return text + " " + who
+
+
+def under(path, root):
+    path, root = os.path.realpath(path or "/nonexistent"), os.path.realpath(root)
+    return path == root or path.startswith(root.rstrip(os.sep) + os.sep)
+
+
+def pick_runs(h, args):
+    """The runs --status shows and --wait follows: in a worktree its latest (one not done first), with --commit the
+    latest for that commit; outside a worktree without --commit every run not done. (rows, where it looked)."""
+    rows = all_progress()
+    record = h.find_task(os.getcwd())
+    found = rows
+    if args.commit:
+        found = [r for r in found if str(r.get("commit") or "").startswith(args.commit)]
+    if record and not args.commit:
+        found = [r for r in found if under(r.get("dir"), record["root"])]
+    if record or args.commit:
+        active = [r for r in found if r.get("state") != "done" and not gone(r)]
+        found = (active or found)[-1:]
+    else:
+        found = [r for r in found if r.get("state") != "done" and not gone(r)]
+    where = ("commit " + args.commit) if args.commit else ("this worktree" if record else "any worktree (none not done)")
+    return found, rows, where
+
+
+def cmd_status(h, args):
+    found, rows, where = pick_runs(h, args)
+    if not found:
+        print("pa-full-suite: no run for {} in {}".format(where, runs_dir()))
+        return 1
+    for row in found:
+        print(status_line(row, rows))
+    return 0
+
+
+def cmd_wait(h, args):
+    found, rows, where = pick_runs(h, args)
+    if not found:
+        print("pa-full-suite: no run for {} in {}".format(where, runs_dir()))
+        return 1
+    run = found[-1]["run"]
+    path = os.path.join(runs_dir(), run + ".json")
+    limit = args.timeout if getattr(args, "timeout", None) is not None else WAIT_CALL
+    began = beat = time.time()
+    while True:
+        row = read_progress(path) or found[-1]
+        if row.get("state") == "done":
+            print(status_line(row), flush=True)
+            code = row.get("exit")
+            return code if isinstance(code, int) else 1
+        if gone(row):
+            print(status_line(row), flush=True)
+            return 1
+        if time.time() - began >= limit:
+            print(status_line(row), flush=True)
+            print("pa-full-suite: still running after {:.0f}s of waiting; run pa-full-suite --wait again".format(
+                time.time() - began), flush=True)
+            return STILL_RUNNING
+        if time.time() - beat >= heartbeat():
+            print(status_line(row), flush=True)
+            beat = time.time()
+        time.sleep(min(1.0, heartbeat(), max(0.05, limit - (time.time() - began))))
+
+
+def run_to_file(command, cwd, output, timeout, env, beat):
+    """Runs command (sh -c) with its whole output into the file output; beat() every second. (exit, output text)."""
+    with open(output, "w") as out:
+        child = subprocess.Popen(["sh", "-c", command.replace("{files}", "").replace("{file}", "")], cwd=cwd, env=env,
+                                 stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT)
+        began = time.time()
+        try:
+            while True:
+                try:
+                    code = child.wait(timeout=1)
+                    break
+                except subprocess.TimeoutExpired:
+                    if time.time() - began > timeout:
+                        child.kill()
+                        child.wait()
+                        out.write("\n(timed out after {} s)\n".format(timeout))
+                        code = 124
+                        break
+                    beat()
+        except BaseException:
+            if child.poll() is None:
+                child.kill()
+                child.wait()
+            raise
+    try:
+        with open(output) as f:
+            return code, f.read()
+    except OSError:
+        return code, ""
+
+
 def full_suite(h, args):
     if getattr(args, "last", False):
         return sys.exit(cmd_last(h, args))
     if getattr(args, "report", False):
         return sys.exit(cmd_report(h, args))
+    if getattr(args, "status", False):
+        return sys.exit(cmd_status(h, args))
+    if getattr(args, "wait", False):
+        return sys.exit(cmd_wait(h, args))
     record = h.find_task(os.getcwd())
     if not record:
         raise pa.Problem("run pa-full-suite inside a task's worktree (pa-hooks install marks it)")
     directory, agent, profile = h.load_context(record["space"])
-    command = h.command_for("full", agent, profile)
+    module = getattr(args, "module", None)
+    if module:
+        if not MODULE.match(module):
+            raise pa.Problem("--module takes a unit test module's name, test_<name> (tests/test_<name>.py)")
+        if not os.path.isfile(os.path.join(record["root"], "tests", "run-all.sh")):
+            raise pa.Problem("--module runs tests/run-all.sh --module; this worktree has no tests/run-all.sh")
+        command = "sh tests/run-all.sh --module " + module
+    else:
+        command = h.command_for("full", agent, profile)
     if not command:
         raise pa.Problem("no full-suite command: set tests.full in the profile, or commands.full in the space's agent.json")
     evidence = os.path.join(directory, "evidence", record["task"])
@@ -444,12 +925,37 @@ def full_suite(h, args):
 
     if reuse():
         return sys.exit(0)
+    # t-076: the output file, named first, and the progress file that --status and --wait read.
+    run = uuid.uuid4().hex[:12]
+    output = os.path.join(evidence, "full-suite-{}.out".format(run))
+    print("pa-full-suite: run {}: output in {} (pa-full-suite --status shows it; pa-full-suite --wait waits for it)".format(
+        run, output), flush=True)
+    rows = read_lines(where)
+    total, runs = median_total(rows, command=command)
+    progress = new_progress({"run": run, "kind": "pa-full-suite", "what": command, "task": record.get("task"),
+                             "worker": os.environ.get("HC_TERMINAL_ID") or None, "dir": os.path.realpath(record["root"]),
+                             "commit": found[0].get("commit") if found else None, "tree": found[0].get("tree") if found else None,
+                             "pid": os.getpid(), "state": "waiting", "queued": pa.now(), "output": output, "record": where,
+                             "median_total": total, "median_runs": runs, "module": module})
+    beaten = {"at": time.time()}
+
+    def pulse(text=None):  # the heartbeat: the status line every HEARTBEAT seconds, the holders when they change
+        if text is not None and beaten.get("text") != text:
+            beaten["text"] = text
+            update_progress(progress, waiting_for=text)
+        if time.time() - beaten["at"] >= heartbeat():
+            beaten["at"] = time.time()
+            row = read_progress(progress) if progress else {}
+            if row:
+                print(status_line(row), flush=True)
     queued = time.time()
     try:
         slot = acquire(cap(), {"task": record.get("task"), "worker": os.environ.get("HC_TERMINAL_ID") or None,
-                               "tree": found[0].get("tree") if found else None})
+                               "tree": found[0].get("tree") if found else None},
+                       say=lambda m: print(m, flush=True), beat=pulse)
     except Waited as e:
         print(e)
+        update_progress(progress, state="done", exit=124, end=pa.now(), note=str(e))
         return sys.exit(124)
     marker = os.environ.get("PA_SUITE_SLOT")
     os.environ["PA_SUITE_SLOT"] = slot.name  # tests/run-all.sh under this run sees its caller holds the slot (t-072)
@@ -457,9 +963,13 @@ def full_suite(h, args):
         waited = round(time.time() - queued, 1)
         found = pins(h, record["root"])  # MF-1: what runs is the tree at this point, not the one before the wait
         if reuse():  # a run of the same tree may have passed while this one waited
+            update_progress(progress, state="done", exit=0, end=pa.now(), note="not run: this tree passed while it waited")
             return sys.exit(0)
         start, load, began = pa.now(), load_now(), time.time()
-        code, out = h.run_shell(command, record["root"], [], 3600)
+        update_progress(progress, state="running", start=start, commit=found[0].get("commit") if found else None,
+                        tree=found[0].get("tree") if found else None)
+        env = dict(os.environ, PA_CHANGED_FILES="", PA_SUITE_PROGRESS=progress or "")
+        code, out = run_to_file(command, record["root"], output, 3600, env, pulse)
         seconds, end = round(time.time() - began, 1), pa.now()
         change = moved(found, pins(h, record["root"]))
     finally:
@@ -468,9 +978,13 @@ def full_suite(h, args):
         else:
             os.environ["PA_SUITE_SLOT"] = marker
         release(slot)
+    update_progress(progress, state="done", exit=code, end=end)
     with open(build_log, "a") as f:
         f.write("=== {} full suite: `{}` in {} -> exit {} after {:.0f}s ===\n{}\n".format(end, command, record["root"], code, seconds, h.tail(out, 200)))
-    extra = {"run": uuid.uuid4().hex[:12], "start": start, "end": end, "waited": waited, "load": load, "parts": parse_parts(out)}
+    extra = {"run": run, "start": start, "end": end, "waited": waited, "load": load, "parts": parse_parts(out),
+             "output": output}
+    if module:
+        extra["module"] = module
     if change:  # recorded under the tree the run started on, marked so it is never reused
         extra["moved"] = True
     try:

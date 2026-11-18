@@ -89,7 +89,10 @@ folder and the address to report to.
   suite-wide run at that commit (not `--affected`, not the suite's own script); re-run
   single tests only (a failing-first check, a mutation). Builders: high tier, run it at
   the end of the Test phase, before the commit; low and normal tier, the affected tests
-  are enough, the verifier's run is the round's.
+  are enough, the verifier's run is the round's. Start it as `pa-full-suite` (in the
+  foreground, or your tool's own background run; never `&`, `nohup` or a wrapper), see it
+  with `pa-full-suite --status`, wait for it with `pa-full-suite --wait` (again while it
+  says still running), and run one long test module with `pa-full-suite --module test_x`.
 - For a bug fix, commit a failing test first. Do not edit test files while fixing.
 - Paste real tool output into `build.log`; never summarize a build you did not run.
 - A hook that exits with code 2 means fix it and try again. Do not work around a hook.

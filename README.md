@@ -556,8 +556,16 @@ output is kept in a run folder that the last line names, after a summary of ever
 `PA_SERIAL=1` runs the parts one after another, each streamed as it runs. Every run that has parts to
 run, full or `--affected`, first takes the same machine slot as `pa-full-suite` (at most `PA_SUITE_CAP`, default
 1, at once per user), waiting its turn and saying for whom; its summary says how long it waited. It waits at most 840 s (`PA_SUITE_WAIT_LIMIT`), and stops waiting if its caller
-is gone. A single test
-module run on its own (`python3 -m unittest tests.test_x`) takes no slot. After updating, run `pa-sync --on <machine>` before installing the mod, so remote launchers
+is gone. Each part has a time limit, 3 times its median in the suite record or 900 s
+(`PA_PART_LIMIT`), whichever is longer: a part past it is stopped and named HUNG, the other parts
+finish, and the run exits 1. Every run keeps a progress file under `~/.config/herdr-pa/suite-runs`
+(waiting for whom, or the parts done of the total, the parts running now and their last output).
+One way to run the full suite, see it and wait for it: `pa-full-suite` (it names its output file in the
+task's evidence folder first, and prints a heartbeat line every minute), `pa-full-suite --status
+[--commit C]` (any run of this worktree, `run-all.sh` ones too) and `pa-full-suite --wait` (up to
+540 s a call, `--timeout`; exit 75 while it still runs). `pa-full-suite --module test_x` runs one unit
+test module (`tests/run-all.sh --module test_x`) with the same slot, limit and record. A few tests run
+on their own (`python3 -m unittest tests.test_x.T.test_y`) take no slot. After updating, run `pa-sync --on <machine>` before installing the mod, so remote launchers
 get the new `pa-session` (see the install order above).
 
 ## Licence

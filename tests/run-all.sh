@@ -8,6 +8,8 @@
 #   tests/run-all.sh --affected  the fast set only (no integration check). With PA_CHANGED_FILES
 #                                (paths separated by spaces or newlines), parts whose files did not
 #                                change are skipped; without it, the whole fast set runs.
+#   tests/run-all.sh --module test_x  one unit test module (tests/test_x.py) as one part: the same slot, limit,
+#                                progress file and summary as in a full run (pa-full-suite --module runs it)
 # The parts run at the same time (they share no temp folder, home, port or hc core); PA_SERIAL=1 runs them
 # one after another, each streamed as it runs. Each part's whole output is kept in its own file in one temp
 # folder and printed in the order above, then a summary: every part with ok or FAILED and its seconds, for a failed part its
@@ -18,7 +20,11 @@
 # flock under HERDR_PA_HOME/suite-slots, at most PA_SUITE_CAP runs at once), waiting its turn and saying for whom;
 # a dead holder never blocks, and a run whose caller holds the slot (pa-full-suite) does not wait for itself. The
 # summary's first line and the run folder's file `slot` say how long it waited. A run that selects no part takes
-# no slot; nor does one test module run on its own (python3 -m unittest tests.test_x).
+# no slot; nor do a few tests run on their own (python3 -m unittest tests.test_x.T.test_y).
+# Progress and the part limit (t-076): pa_suite.py, holding the slot, watches the run folder (the files `parts`,
+# <i>.pid, <i>.start, <i>.end, <i>.code): it keeps the run's progress file under HERDR_PA_HOME/suite-runs
+# (pa-full-suite --status reads it) and stops a part past max(PA_PART_LIMIT or 900 s, 3x its recorded median),
+# writing <i>.hung; the summary names it HUNG, the other parts finish, and the run exits 1.
 # Exit: 0 all passed, 1 a part failed, 2 a usage error or no temp folder, 124 no slot came free,
 # 130/143/129 interrupt, terminate, hangup.
 # Node: $NODE, else `node` on PATH, else the newest mise install.
@@ -30,8 +36,15 @@ unset PA_UNIT_SHARD  # set below for one shard part only (t-078), never inherite
 here=$(cd "$(dirname "$0")" && pwd)
 repo=$(cd "$here/.." && pwd)
 cd "$repo" || exit 2
-affected=0
-case "${1:-}" in --affected) affected=1 ;; "") ;; *) echo "usage: tests/run-all.sh [--affected]" >&2; exit 2 ;; esac
+affected=0 module=
+usage() { echo "usage: tests/run-all.sh [--affected | --module test_x]" >&2; exit 2; }
+case "${1:-}" in
+  --affected) [ $# = 1 ] || usage; affected=1 ;;
+  --module) [ $# = 2 ] || usage; module=$2
+    case "$module" in test_*/*|test_*.*) usage ;; test_?*) [ -f "tests/$module.py" ] || usage ;; *) usage ;; esac ;;
+  "") ;;
+  *) usage ;;
+esac
 
 NODE=${NODE:-$(command -v node 2>/dev/null || ls -d "$HOME"/.local/share/mise/installs/node/*/bin/node 2>/dev/null | sort -V | tail -n 1)}
 PY=$(command -v python3)
@@ -86,6 +99,10 @@ integration() {
 # unit_shards is one part per shard.
 count=0
 add() { count=$((count + 1)); eval "part_$count=\$1; name_$count=\$2; arg_$count=\${3:-}"; }
+if [ -n "$module" ]; then
+  want_py=0 want_keeper=0 want_panel=0 want_store=0 affected=1
+  add units "unit tests: $module" "$module"
+fi
 if [ "$want_py" = 1 ]; then
   add parse37 "python 3.7 parse"
   for f in tests/test_*.py; do
@@ -110,7 +127,7 @@ fi
 helper=$repo/runtime/tools/pa_suite.py
 if [ "${PA_SUITE_SLOT_PID:-}" != "$PPID" ]; then
   if [ -n "$PY" ] && [ -f "$helper" ]; then
-    exec "$PY" "$helper" slot --for "tests/run-all.sh${1:+ $1}" --worker "$worker" --dir "$repo" -- \
+    exec "$PY" "$helper" slot --for "tests/run-all.sh${*:+ $*}" --worker "$worker" --dir "$repo" -- \
       sh "$here/$(basename "$0")" "$@"
   fi
   PA_SUITE_HOLD="none (no $helper: this run took no slot)"
@@ -121,6 +138,14 @@ tmp=${TMPDIR:-/tmp}
 out=$(mktemp -d "${tmp%/}/run-all.XXXXXX") || { echo "run-all.sh: cannot make a temp folder under $tmp" >&2; exit 2; }
 printf '%s\n' "$hold" > "$out/slot"
 log() { eval "echo \"\$out/\$1-\$part_$1\${arg_$1:+-\$arg_$1}.log\""; }
+# The parts for pa_suite.py's watcher (t-076): one line each, <i> TAB <name> TAB <log>; then the run folder is
+# named in the file PA_SUITE_WATCH (made whole, then moved), and the watcher's variables are not the parts'.
+i=1
+while [ "$i" -le "$count" ]; do eval "printf '%s\t%s\t%s\n' \"\$i\" \"\$name_$i\" \"\$(log \$i)\""; i=$((i + 1)); done > "$out/parts"
+if [ -n "${PA_SUITE_WATCH:-}" ]; then
+  printf '%s\n' "$out" > "$PA_SUITE_WATCH.new" && mv "$PA_SUITE_WATCH.new" "$PA_SUITE_WATCH"
+fi
+unset PA_SUITE_WATCH PA_SUITE_PROGRESS
 # Print a file whole, ending in a newline.
 show() { cat "$1"; [ -s "$1" ] && [ -n "$(tail -c 1 "$1")" ] && echo; return 0; }
 # Run part $1 (function $2) with its own TMPDIR in the run folder: a test that looks for its own leftovers in
@@ -159,11 +184,15 @@ if [ "${PA_SERIAL:-}" = 1 ]; then
     set -m 2>/dev/null
     ( { (inpart "$i" "$p" "$a") 2>&1; echo $? > "$out/$i.code"; } </dev/null | tee "$(log "$i")" ) &
     pids=$!
+    echo "$pids" > "$out/$i.pid"
     set +m 2>/dev/null
     wait "$pids"
     pids=
     code=$(cat "$out/$i.code" 2>/dev/null) || code=1
-    eval "code_$i=\${code:-1}"
+    code=${code:-1}
+    [ -f "$out/$i.end" ] || date +%s > "$out/$i.end"  # a part stopped as hung wrote none
+    echo "$code" > "$out/$i.code"
+    eval "code_$i=\$code"
     [ "$code" = 0 ] && echo "--- $name: ok" || echo "--- $name: FAILED"
     i=$((i + 1))
   done
@@ -173,6 +202,7 @@ else
     eval "p=\$part_$i; a=\$arg_$i"
     inpart "$i" "$p" "$a" </dev/null >"$(log "$i")" 2>&1 &
     eval "pid_$i=\$!"
+    echo "$!" > "$out/$i.pid"
     pids="$pids $!"
     i=$((i + 1))
   done
@@ -182,6 +212,8 @@ else
     eval "pid=\$pid_$i; name=\$name_$i"
     wait "$pid"
     code=$?
+    [ -f "$out/$i.end" ] || date +%s > "$out/$i.end"
+    echo "$code" > "$out/$i.code"
     eval "code_$i=\$code"
     echo "=== $name"
     show "$(log "$i")"
@@ -198,7 +230,12 @@ failed=0 names= i=1
 while [ "$i" -le "$count" ]; do
   eval "name=\$name_$i; code=\$code_$i"
   f=$(log "$i")
-  if [ "$code" != 0 ]; then
+  if [ "$code" != 0 ] && [ -f "$out/$i.hung" ]; then
+    failed=$((failed + 1))
+    names="${names:+$names, }$name (hung)"
+    echo "--- $name: HUNG: $(head -n 1 "$out/$i.hung") (its last 40 lines:)"
+    tail -n 40 "$f" | sed 's/^/  /'
+  elif [ "$code" != 0 ]; then
     failed=$((failed + 1))
     names="${names:+$names, }$name"
     hits=$(grep -E '^(FAIL|ERROR)(:| )' "$f" | cut -c1-200)
@@ -217,7 +254,9 @@ done
 i=1
 while [ "$i" -le "$count" ]; do
   eval "name=\$name_$i; code=\$code_$i"
-  [ "$code" = 0 ] && echo "  $name: ok ($(took "$i")s)" || echo "  $name: FAILED ($(took "$i")s)"
+  if [ "$code" = 0 ]; then echo "  $name: ok ($(took "$i")s)"
+  elif [ -f "$out/$i.hung" ]; then echo "  $name: HUNG ($(took "$i")s)"
+  else echo "  $name: FAILED ($(took "$i")s)"; fi
   i=$((i + 1))
 done
 [ "$failed" = 0 ] && echo "=== all passed (outputs: $out)" || echo "=== $failed part(s) failed: $names (outputs: $out)"
