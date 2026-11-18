@@ -75,6 +75,14 @@ export class PushCards {
 
   of(spaceId, id) { return (this.cards[`${spaceId}\0${id}`] ??= { check: null, at: 0, asked: 0, busy: false, running: null, result: null, error: null, unknown: null, stale: false }); }
   running(spaceId, id) { return this.cards[`${spaceId}\0${id}`]?.running ?? null; }
+  // The answer a run from this copy ended with (t-045), or null.
+  answeredHere(spaceId, id) { return this.cards[`${spaceId}\0${id}`]?.result?.label ?? null; }
+  // Whether this copy may not answer the card again (t-045): a run is in flight, a run from here ended answered, or its
+  // result is unknown and no check since found the card open. The card then has no option or Submit to click.
+  locked(spaceId, id) {
+    const st = this.cards[`${spaceId}\0${id}`];
+    return Boolean(st && (st.running || st.result || (st.unknown && !(st.check?.ok === true && !st.busy))));
+  }
   // A card pushed from this copy stays in the Decisions list, answered, with its result (spec §8.2),
   // until the person leaves it: another view (main.js) or its Done link.
   kept(spaceId, id) { return Boolean(this.cards[`${spaceId}\0${id}`]?.kept); }
@@ -121,7 +129,7 @@ export class PushCards {
     if (shownOnly(entry)) return false;
     // Not now while a check runs: not run, and said (t-028); not queued: a run starts only from a Submit click.
     if (label === NOT_NOW && st.busy && !st.running) { st.notNowWait = true; cx.notify(); return false; }
-    if (st.running || st.busy || (label !== PUSH && label !== NOT_NOW)) return false;
+    if (this.locked(space.id, entry.id) || st.busy || (label !== PUSH && label !== NOT_NOW)) return false; // never a second run from here
     if (label === PUSH && !this.canSubmit(space.id, entry.id)) { st.stale = true; cx.notify(); return false; }
     const args = ["run", entry.id, "--answer", label, "--space", localId(space.id), ...(label === PUSH ? ["--seen", st.check.seen] : []), "--json", ...(note ? ["--note", note] : [])];
     st.running = label; st.result = null; st.error = null; st.errorFor = label; st.unknown = null; st.stale = false; st.notNowWait = false;
@@ -130,19 +138,23 @@ export class PushCards {
       st.running = null;
       let notice;
       const out = error ? null : printed(r);
+      // The answer the card has, as the tool says (t-045): a card answered before this run (Push, say, when Not now
+      // was asked) is shown and told as that answer, never as the label asked.
+      const answer = r?.code === 0 && [PUSH, NOT_NOW].includes(out?.answer) ? out.answer : label;
       // Exit 0 of a Push is done only when the tool's JSON says so (ok, done, and its result).
       const pushedSaid = out?.ok === true && out.done === true && out.result !== null && typeof out.result === "object";
-      if (error || ![0, 1, 2].includes(r?.code) || (r.code !== 0 && out?.ok !== false) || (r.code === 0 && label === PUSH && !pushedSaid)) {
+      if (error || ![0, 1, 2].includes(r?.code) || (r.code !== 0 && out?.ok !== false) || (r.code === 0 && answer === PUSH && !pushedSaid)) {
         st.unknown = error ?? `pa-push-main run exited with ${r?.code}${r?.code === 0 ? " without a result that says it pushed" : ""}${said(r) ? `: ${said(r)}` : ""}`;
         st.check = null;
         st.kept = true; // the tool may have saved the card answered before it failed: keep it shown with the check's verdict
         notice = `decision ${entry.id} answered ${label}; result unknown (${st.unknown}); the panel checks the card again`;
       } else {
         if (r.code === 0) {
-          st.result = { label, ...(out ?? {}) }; st.kept = label === PUSH;
+          st.result = { ...(out ?? {}), label: answer }; st.kept = answer === PUSH;
           let what = String(out?.message || resultLine(out?.result) || "pushed");
           if (what.startsWith(`${entry.id}: `)) what = what.slice(entry.id.length + 2); // the tool's message starts with the card id
-          notice = label === PUSH ? `decision ${entry.id} answered Push; result: ${what}` : `decision ${entry.id} answered Not now`;
+          notice = answer !== label ? `decision ${entry.id} was already answered ${answer}; ${what}`
+            : label === PUSH ? `decision ${entry.id} answered Push; result: ${what}` : `decision ${entry.id} answered Not now`;
         } else {
           st.error = text(out?.refusal?.message || out?.message) || said(r) || `pa-push-main run exited with ${r.code}`;
           st.check = null;

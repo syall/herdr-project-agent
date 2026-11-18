@@ -110,6 +110,13 @@ Agent but does not run under its launcher (tab name or pane title `PA: <name>`, 
 project, or the space's label) gets a confirm in the panel first.
 (`project-agent.open` is something else: the number of open decision cards per space.)
 
+Shared `project-agent.answering` = `{ "<space id>\u0000<card id>": { "label", "note", "at": <ms>, "by": "<panel copy>" } }`.
+A panel copy writes an entry when the person submits a decision card there; every other copy draws that
+card answered ("Answered in another panel window.") and offers no option or Submit, for at most 120 s
+from `at`. The copy that submitted draws the card answered from the click until a read of the card file
+shows the answer (or a change made after it); only a write that really failed (the file still open)
+unlocks the card, with "Not saved: …".
+
 ## Messages go only to a live launcher
 
 The panel's "decision … answered" and "rule …" notices are sent to the record whose `alive` is true,

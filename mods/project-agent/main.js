@@ -10,7 +10,7 @@
 
 import { View, div } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, ScrollHandle } from "gpui-base";
-import { spaces, panes, agents, terminals, machines, theme, run, exec, props, home, watchFolder, notify, shared, setShared, closeOverlay, openOverlay, window, layout } from "herdr";
+import { spaces, panes, agents, terminals, machines, theme, run, exec, props, home, watchFolder, notify, shared, setShared, closeOverlay, openOverlay, window, layout, readTextFile } from "herdr";
 import { loadSpace, loadLedger, loadProfile, loadDecisions, loadRules, withTimeout, TIMED_OUT, READ_LIMIT, answerDecision, notifyOrchestrator, changeRules, touched, localId, paHome, stateDir, taskActions, taskLinks, evidenceTasks, cardEvidence, staleInstructions, liveTarget, lookAlike, OPEN_REQUESTS, keeperJudging, startingLabels } from "./store.js";
 import { RulesPane, arm, armHolds, fieldState } from "./rules.js"; // arm, armHolds: the two-click Delete (ARM_WAIT, 10 s)
 import { SetupPane } from "./setup.js";
@@ -39,6 +39,10 @@ const QUIET = { from: "19:00", to: "08:00" }; // what the quiet-hours fields sho
 // A quiet-hours field's time as HH:MM (24-hour; "7:30" is 07:30), or null when it is not one.
 const hhmm = (v) => { const m = /^(\d{1,2}):(\d{2})$/.exec(v); return m && Number(m[1]) <= 23 && Number(m[2]) <= 59 ? `${m[1].padStart(2, "0")}:${m[2]}` : null; };
 const noteKey = (spaceId, cardId) => `${spaceId}\0${cardId}`; // note fields are per space: two spaces can have the same card id
+// t-045: a card answered from a panel copy is marked there (this.sent, the same key as noteKey) and, for the other
+// copies, in shared ANSWERING { key: { label, note, at, by } }, no longer than ANSWERING_TTL.
+const ANSWERING = "project-agent.answering", ANSWERING_TTL = 120000;
+const isoAt = (ms) => new Date(ms).toISOString().replace(/\.\d+Z$/, "Z");
 
 // Whether this panel is on screen: a block showing it in the shown layout with no hidden node above
 // it, and the selected child of each stack above it (how the tabs mod reads the side panel; the
@@ -108,6 +112,11 @@ export default class ProjectAgent extends View {
     this.cardScroll = ScrollHandle.new(); // the Decisions list, to bring one card into view
     this.spotlight = null; // card id reached from its task: drawn with an accent border
     this.busy = {}; // card id -> answering now
+    // t-045: noteKey -> { label, note, at, state, before, after, why, seq }: a card answered from this copy, drawn
+    // answered and never answerable again while the mark lasts. state: saving (the write in flight), saved, unsure
+    // (the write threw and a re-read could not tell); seq: this.seq when the write ended (a load with a newer token
+    // read after it). Dropped by resolveMarks (commit) once a read shows the answer or a later change, or on a failure.
+    this.sent = {};
     this.failed = {}; // card id -> why the answer wasn't written
     this.unsent = []; // [{ spaceId, message, why? }] notices the orchestrator hasn't had yet (its terminal is looked up when sending)
     this.opening = {}; // space id -> { at, before }: when this copy asked the keeper to open its Project Agent, and the record terminals then
@@ -345,6 +354,7 @@ export default class ProjectAgent extends View {
       data.errors = [...(data.errors ?? []), src ? "decision cards: did not answer; the last known are shown" : "decision cards: did not answer"];
     }
     this.committed[space.id] = token;
+    if (listed) this.resolveMarks(space, token, cards); // t-045
     // The kept entry takes only what answered: a missed part keeps the kept entry's value, else is unknown there.
     const keptKnows = (part) => Boolean(kept?.data?.agent && !(kept.data.unknown ?? []).includes(part));
     const keptData = { ...data, unknown: [...(data.unknown ?? []), ...missed.filter((p) => !keptKnows(p) && !(data.unknown ?? []).includes(p))] };
@@ -445,24 +455,98 @@ export default class ProjectAgent extends View {
 
   answer(space, entry, label, cx) {
     if (isPush(entry.card)) { this.answerPush(space, entry, label, cx); return; } // never answerDecision
-    if (this.busy[entry.id] || !label) return;
+    if (this.busy[entry.id] || !label || this.mark(space, entry)) return; // answered here or in another copy: never again
     delete this.choice[entry.id];
-    this.busy[entry.id] = true; delete this.failed[entry.id];
+    delete this.failed[entry.id];
     const note = (this.notes[noteKey(space.id, entry.id)]?.value() ?? "").trim();
+    const m = this.markSaving(space, entry, label, note);
+    this.busy[entry.id] = true;
     cx.notify();
     cx.spawn(async (cx) => {
-      try {
-        await answerDecision(space, entry, label, note);
-        // A card for a rule proposal ("rule": "<id>", options Approve / Decline) decides that rule too.
+      let saved = null;
+      try { saved = await answerDecision(space, entry, label, note); }
+      catch (e) { await this.notSaved(space, entry, m, String(e.message ?? e), cx); }
+      if (saved) {
+        Object.assign(m, { state: "saved", before: saved.before, after: saved.after, seq: this.seq });
+        // A card for a rule proposal ("rule": "<id>", options Approve / Decline) decides that rule too. Its failure is
+        // its own message: the answer is saved and stays.
         const decided = entry.card?.rule && (/^approve/i.test(label) ? "active" : /^decline/i.test(label) ? "declined" : null);
-        if (decided) await changeRules(space, (rules) => rules.map((r) => (r.id === entry.card.rule && r.status === "proposed" ? touched({ ...r, status: decided }, decided === "active" ? "approved" : "declined") : r)));
+        if (decided) {
+          try { await changeRules(space, (rules) => rules.map((r) => (r.id === entry.card.rule && r.status === "proposed" ? touched({ ...r, status: decided }, decided === "active" ? "approved" : "declined") : r))); }
+          catch (e) { this.failed[entry.id] = `The answer was saved; the rule was not changed: ${String(e.message ?? e)}`; }
+        }
         this.unsent.push({ spaceId: space.id, message: `decision ${entry.id} answered` });
         this.resend(cx);
-      } catch (e) { this.failed[entry.id] = String(e.message ?? e); }
+      }
       delete this.busy[entry.id];
       this.reload(cx);
       cx.notify();
     });
+  }
+
+  // t-045. The mark that locks a card for this copy: its own (saving, saved, unsure), else another copy's shared one
+  // under ANSWERING_TTL old (state "elsewhere"); null when the card may be answered.
+  mark(space, entry) {
+    const k = noteKey(space.id, entry.id), own = this.sent[k];
+    if (own) return own;
+    const o = (shared(ANSWERING) ?? {})[k];
+    if (o && o.by !== this.me && typeof o.at === "number" && Date.now() - o.at < ANSWERING_TTL) return { label: String(o.label ?? ""), note: o.note ?? null, at: o.at, state: "elsewhere" };
+    return null;
+  }
+
+  // Marks the card saving, here and in the shared key (expired entries pruned).
+  markSaving(space, entry, label, note) {
+    const k = noteKey(space.id, entry.id), at = Date.now();
+    const m = { label, note: note || null, at, state: "saving", before: null, after: null, why: null, seq: this.seq };
+    this.sent[k] = m;
+    this.shareMark(k, { label, note: note || null, at, by: this.me });
+    return m;
+  }
+
+  shareMark(k, value) {
+    const now = Date.now(), all = {};
+    for (const [key, x] of Object.entries(shared(ANSWERING) ?? {})) if (key !== k && typeof x?.at === "number" && now - x.at < ANSWERING_TTL) all[key] = x;
+    if (value) all[k] = value;
+    setShared(ANSWERING, all);
+  }
+
+  // The card's write threw: read the file once to tell. Answered (here, or before by another route): it stays answered.
+  // Open: the write really failed; the mark goes and the card says so (W3). Unreadable: unsure, locked until a load
+  // newer than now reads it (resolveMarks).
+  async notSaved(space, entry, m, why, cx) {
+    const k = noteKey(space.id, entry.id);
+    let text;
+    try { text = await withTimeout({ sleep: (ms) => cx.sleep(ms) }, readTextFile(entry.path, { on: space.machine ?? null })); } catch { text = TIMED_OUT; }
+    let card = null;
+    if (typeof text === "string") { try { card = JSON.parse(text); } catch { card = null; } }
+    Object.assign(m, { why, seq: this.seq });
+    if (text === null || (card && card.status === "open")) {
+      delete this.sent[k]; this.shareMark(k, null);
+      this.failed[entry.id] = `Not saved: ${why.replace(/\.?\s*$/, ".")} Pick an option and submit again.`;
+    } else if (card && typeof card === "object") {
+      Object.assign(m, { state: "saved", label: String(card.answer ?? card.status ?? m.label), note: card.note ?? null }); // what the file has
+      this.shareMark(k, { label: m.label, note: m.note, at: m.at, by: this.me });
+      if (/already answered/.test(why)) this.failed[entry.id] = why; // today's words: "This card was already answered."
+    } else m.state = "unsure";
+  }
+
+  // From commit() of a load of `space` that listed its cards (token: the load's): each of this copy's marks there.
+  resolveMarks(space, token, cards) {
+    for (const [k, m] of Object.entries(this.sent)) {
+      if (!k.startsWith(noteKey(space.id, ""))) continue;
+      if (m.state === "saving") continue; // the write is in flight
+      const entry = cards.find((c) => noteKey(space.id, c.id) === k);
+      // Gone, not a card, read answered, or the text written: the file shows it now.
+      if (!entry?.card || entry.card.status !== "open" || (m.after && entry.text === m.after)) { delete this.sent[k]; continue; }
+      if (token <= m.seq) continue; // a read that started before the write ended: the old copy
+      if (m.state === "unsure") { // a fresh read finds it open: the write did not happen
+        delete this.sent[k]; this.shareMark(k, null);
+        this.failed[entry.id] = `Not saved: ${String(m.why ?? "the write failed").replace(/\.?\s*$/, ".")} Pick an option and submit again.`;
+        continue;
+      }
+      if (m.before !== null && entry.text === m.before) continue; // the copy from before the write (a read's fallback)
+      delete this.sent[k]; // open with other text, read after the write: the card changed since; show the file
+    }
   }
 
   // A push card's Submit: pa-push-main run (push.js) records the answer and pushes; the panel shows
@@ -511,9 +595,14 @@ export default class ProjectAgent extends View {
 
   // A proposal approved or declined in the Rules view: answer its card too, and tell the orchestrator.
   async ruleDecided(space, id, what, cx) {
-    const entry = this.cards.find((c) => c.card?.status === "open" && c.card.rule === id);
+    const entry = this.cards.find((c) => c.card?.status === "open" && c.card.rule === id && !this.mark(space, c));
     const label = entry?.card.options?.find((o) => (what === "declined" ? /^decline/i : /^approve/i).test(o.label))?.label;
-    if (label) await answerDecision(space, entry, label, what === "edited and approved" ? "Edited before approving; read rules.json." : "");
+    if (label) { // marked as from the Decisions view (t-045): drawn answered from now, never answered twice
+      const note = what === "edited and approved" ? "Edited before approving; read rules.json." : "";
+      const m = this.markSaving(space, entry, label, note);
+      try { const saved = await answerDecision(space, entry, label, note); Object.assign(m, { state: "saved", before: saved.before, after: saved.after, seq: this.seq }); }
+      catch (e) { await this.notSaved(space, entry, m, String(e.message ?? e), cx); throw e; }
+    }
     this.unsent.push({ spaceId: space.id, message: label ? `decision ${entry.id} answered` : `rule ${id} ${what}` });
     this.resend(cx);
     this.reload(cx);
@@ -776,15 +865,21 @@ export default class ProjectAgent extends View {
   }
 
   card(t, entry, space) {
-    const c = entry.card;
+    let c = entry.card;
     if (!c) {
       return v_flex().id(`card-${entry.id}`).flex_none().p(10).gap(4).rounded(7).border(1).border_color(t.blocked).bg(t.surface)
         .child(div().text_size(12).text_color(t.foreground).child(`${entry.id}: can't read this card`))
         .child(div().text_size(11.5).text_color(t.blocked).child(entry.error ?? ""))
         .child(div().text_size(11).text_color(t.dim).truncate().child(entry.path.replace(home(), "~")));
     }
-    const push = isPush(c), running = push ? this.push.running(space.id, entry.id) : null;
-    const open = c.status === "open", busy = Boolean(this.busy[entry.id]) || Boolean(running);
+    const push = isPush(entry.card), running = push ? this.push.running(space.id, entry.id) : null;
+    // t-045: a card answered from here (or another copy) is drawn answered while the file read still says open.
+    const m = !push && c.status === "open" ? this.mark(space, entry) : null;
+    if (m) c = { ...c, status: "answered", answer: m.label, note: m.note, answered: isoAt(m.at) };
+    const markLine = m?.state === "saving" ? "Saving…" : m?.state === "unsure" ? "Could not tell whether the answer was saved; reading the card again."
+      : m?.state === "elsewhere" ? "Answered in another panel window." : null;
+    const pushAnswered = push && c.status === "open" ? this.push.answeredHere(space.id, entry.id) : null; // a run from here ended answered
+    const open = c.status === "open", busy = Boolean(this.busy[entry.id]) || Boolean(running) || (push && this.push.locked(space.id, entry.id));
     const task = c.task && (this.data?.ledger?.tasks ?? []).find((x) => x.id === c.task);
     const picked = open ? this.choice[entry.id] ?? null : null;
     const ready = Boolean(picked) && !busy && !(push && shownOnly(entry)) && (!push || picked !== PUSH || this.push.canSubmit(space.id, entry.id)); // Push: a fresh check that passed; a shown-only card: never
@@ -798,7 +893,7 @@ export default class ProjectAgent extends View {
         .when(Boolean(c.task) && !this.data?.evidence?.has(c.task), (el) => el.child(div().flex_none().text_size(11.5).text_color(t.dim).child(c.task)))
         .child(div().flex_1())
         .child(div().flex_none().text_size(10.5).text_color(t.dim).child(when(open ? c.created : c.answered)))
-        .child(this.chip(t, open ? "open" : c.status === "withdrawn" ? "withdrawn" : `answered: ${c.answer}`, open ? t.blocked : t.dim))
+        .child(this.chip(t, pushAnswered ? `answered: ${pushAnswered}` : open ? "open" : c.status === "withdrawn" ? "withdrawn" : `answered: ${c.answer}`, open && !pushAnswered ? t.blocked : t.dim))
         .child(this.copier.button(t, `copy-${entry.id}`, () => this.cardText(c, entry, evidence, pushLines))))
       .child(div().text_size(13).font_semibold().text_color(t.foreground).child(sel(`sel-q-${entry.id}`, String(c.question))))
       // A push card: the facts pa-push-main check read now, never the card file's context (push.js).
@@ -825,7 +920,7 @@ export default class ProjectAgent extends View {
           .child(div().flex_1().min_w(0).text_size(12).text_color(t.muted).child(String(o.detail ?? "")))
           .when(recommended, (el) => el.child(div().flex_none().text_size(10.5).text_color(t.dim).child("recommended")));
       }))
-      .when(open && Boolean(this.notes[noteKey(space.id, entry.id)]), (el) => el.child(Input.new(this.notes[noteKey(space.id, entry.id)]).h(30).px(8).rounded(6).border_1().border_color(t.input).bg(t.background).text_size(12).text_color(t.foreground))
+      .when(open && !pushAnswered && Boolean(this.notes[noteKey(space.id, entry.id)]), (el) => el.child(Input.new(this.notes[noteKey(space.id, entry.id)]).h(30).px(8).rounded(6).border_1().border_color(t.input).bg(t.background).text_size(12).text_color(t.foreground))
         .child(h_flex().gap(8).items_center()
           .child(div().id(`submit-${entry.id}`).flex_none().px(12).h(28).flex().items_center().rounded(7).text_size(12.5).font_semibold()
             .bg(ready ? t.solid : t.raised).text_color(ready ? t.solid_foreground : t.dim)
@@ -836,6 +931,7 @@ export default class ProjectAgent extends View {
       // Closed from the conversation: say so, with the words that decided it (or why it was withdrawn).
       .when(!open && Boolean(c.answeredBy), (el) => el.child(div().text_size(11).text_color(t.dim).child(sel(`sel-by-${entry.id}`, c.status === "withdrawn" ? "Closed by the Project Agent as no longer needed" : `Answered by the ${c.answeredBy}`))))
       .when(!open && Boolean(c.note), (el) => el.child(div().text_size(12).text_color(t.muted).child(sel(`sel-note-${entry.id}`, c.status === "withdrawn" ? `Why: ${c.note}` : c.answeredBy ? `You said: “${c.note}”` : `Note: ${c.note}`))))
+      .when(Boolean(markLine), (el) => el.child(div().text_size(11.5).text_color(m?.state === "unsure" ? t.blocked : t.dim).child(markLine)))
       .when(Boolean(this.failed[entry.id]), (el) => el.child(div().text_size(11.5).text_color(t.blocked).child(this.failed[entry.id])));
   }
 
@@ -909,7 +1005,7 @@ export default class ProjectAgent extends View {
     const sections = [...ORDER, ...new Set(tasks.map((x) => x.state).filter((s) => !ORDER.includes(s)))]
       .map((state) => ({ state, tasks: tasks.filter((x) => x.state === state) })).filter((s) => s.tasks.length);
     const active = tasks.filter((x) => ACTIVE.includes(x.state)).length;
-    const openCards = this.cards.filter((c) => !c.card || c.card.status === "open");
+    const openCards = this.cards.filter((c) => !c.card || (c.card.status === "open" && !this.mark(space, c))); // one answered here is not counted (t-045)
     // A push card pushed from here stays with the open ones, answered, until the person leaves it (push.js kept).
     const kept = (c) => Boolean(c.card) && c.card.status !== "open" && this.push.kept(space.id, c.id);
     const listed = this.cards.filter((c) => !c.card || c.card.status === "open" || kept(c));

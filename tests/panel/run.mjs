@@ -4211,6 +4211,7 @@ cases["P45-write-failed"] = async () => { // W3: only a write that really failed
   const release2 = holdWrite({ reply: { code: 1, stdout: "", stderr: "disk full" }, after: () => { g.__fail = [R1]; } });
   await click(v2, "opt-d-01-0"); await click(v2, "submit-d-01"); await settle();
   g.__remoteDelay = 1e9; release2(); await settle(); await settle();
+  await step(10000); // the re-read on the slow machine reaches its 10 s cap: the panel cannot tell
   const t2 = locked(v2, "d-01", "Yes", "unsure");
   check(t2.includes("Could not tell whether the answer was saved; reading the card again."), `says it could not tell (got ${t2.slice(0, 800)})`);
   g.__fail = []; g.__remoteDelay = 0; await step(1e9); await settle(); await settle();

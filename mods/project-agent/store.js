@@ -324,10 +324,20 @@ export async function loadDecisions(space, { cx, batchOnly = false, live, known 
   return parseCards(picked.map((name, i) => ({ name, path: `${dir}/${name}`, text: texts[i] })));
 }
 
-// Compare-and-write on the space's machine: the file must be unchanged since it was read.
-const REMOTE_WRITE = `
+// Compare-and-write on the space's machine: the file must be unchanged since it was read. Under an exclusive flock
+// on the file (t-045), the compare reads the path after the lock: a second writer waits for the first, then finds
+// its answer and exits 3. Where no lock can be taken, the compare alone, as before.
+export const REMOTE_WRITE = `
 import json, os, sys, tempfile
 path, expected, text = sys.argv[1], sys.argv[2], sys.argv[3]
+lock = None
+try:
+    import fcntl
+    if os.path.exists(path):
+        lock = open(path, "rb")
+        fcntl.flock(lock, fcntl.LOCK_EX)
+except Exception:
+    lock = None
 if (open(path).read() if os.path.exists(path) else "") != expected: sys.exit(3)
 fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path))
 with os.fdopen(fd, "w") as f: f.write(text)
@@ -350,7 +360,9 @@ export async function replaceFile(path, text, expected, on) {
 export const isPush = (card) => Boolean(card && typeof card === "object" && ((card.push && typeof card.push === "object") || card.kind === "push"));
 
 // Writes the person's answer into the card file. The only fields this mod ever changes. A push card (as
-// read from disk now) is refused: only pa-push-main run, from its own Submit, answers it.
+// read from disk now) is refused: only pa-push-main run, from its own Submit, answers it. A card that is not open
+// (as read now) is refused, and the write is a compare-and-write against that open copy: an answer already written
+// is never changed. Returns { card, before, after }: the answered card, the file text it replaced, the text written.
 export async function answerDecision(space, entry, label, note) {
   const on = space.machine ?? null;
   const now = await readTextFile(entry.path, { on });
@@ -361,8 +373,9 @@ export async function answerDecision(space, entry, label, note) {
   if (card.status !== "open") throw new Error("This card was already answered.");
   if (!(card.options ?? []).some((o) => o.label === label)) throw new Error("That option is no longer on the card.");
   const next = { ...card, status: "answered", answer: label, note: note || null, answered: new Date().toISOString().replace(/\.\d+Z$/, "Z") };
-  await replaceFile(entry.path, `${JSON.stringify(next, null, 2)}\n`, now, on);
-  return next;
+  const after = `${JSON.stringify(next, null, 2)}\n`;
+  await replaceFile(entry.path, after, now, on);
+  return { card: next, before: now, after };
 }
 
 // An exec's rejection that says `program` is not there (t-028): a not-found text that names the program and is not
