@@ -14,7 +14,9 @@ Run as a script (t-072), it is how tests/run-all.sh takes the same slot, full or
   python3 pa_suite.py slot --for <what> [--worker W] [--dir D] -- <command...>
 waits for a slot (saying for whom), runs the command under it and exits with its code (124: no slot came free).
 A caller that holds a slot already (pa-full-suite) names it in PA_SUITE_SLOT; it is trusted only when that slot
-is locked and its recorded holder is an ancestor of this process, so the run under it does not wait for itself.
+is locked and its recorded holder is an ancestor of this process, so the run under it does not wait for itself. With
+no trusted marker, any locked slot of this home whose holder is an ancestor counts too (an older pa-full-suite sets
+none). A wait ends after SLOT_WAIT_LIMIT s (PA_SUITE_WAIT_LIMIT) or once this process's caller is gone, never later.
 The command gets PA_SUITE_SLOT, PA_SUITE_SLOT_PID (this process) and PA_SUITE_HOLD (the seconds waited, or held
 by the caller). Script mode never loads pa.py (run-all.sh's test fixture stubs it): HERDR_PA_HOME and a UTC clock.
 """
@@ -42,6 +44,7 @@ else:
 CAP = 1  # one at a time: two overlapping took 8-10 min each, two in a row ~4 min together (plan.md, rule r-worker-mix)
 POLL = 2
 WAIT_LIMIT = 7200  # longer than a run's own 3600 s timeout
+SLOT_WAIT_LIMIT = 840  # script mode (run-all.sh): under its shortest caller's timeout, the affected-tests hook's 900 s
 PART = re.compile(r"^  (.+): (ok|FAILED) \((\d+)s\)$")
 
 
@@ -92,9 +95,10 @@ def describe(holders):
         for h in holders) or "unknown"
 
 
-def acquire(limit_slots, info, poll=POLL, limit=WAIT_LIMIT, say=print, who="pa-full-suite"):
+def acquire(limit_slots, info, poll=POLL, limit=WAIT_LIMIT, say=print, who="pa-full-suite", gone=None):
     """Takes a free slot (an open file holding an flock) out of limit_slots, waiting for one. Says once that it
-    waits and for whom, and again when the holders change. Raises Waited after `limit` seconds."""
+    waits and for whom, and again when the holders change. Raises Waited after `limit` seconds, or as soon as
+    gone() (when given) says the caller it waits for has gone."""
     folder = slot_dir()
     os.makedirs(folder, exist_ok=True)
     began, shown = time.time(), None
@@ -120,6 +124,9 @@ def acquire(limit_slots, info, poll=POLL, limit=WAIT_LIMIT, say=print, who="pa-f
             shown = text
         if time.time() - began >= limit:
             raise Waited("{}: no slot came free in {:.0f} s (running: {})".format(who, time.time() - began, text))
+        reason = gone() if gone else None
+        if reason:
+            raise Waited("{}: stopped waiting for the suite slot after {:.0f} s: {}".format(who, time.time() - began, reason))
         time.sleep(poll)
 
 
@@ -146,9 +153,10 @@ def ancestors():
     return found
 
 
-def held_by_caller(path):
+def held_by_caller(path, chain=None):
     """The holder line of the slot at path when a caller of this process holds it (the path is one of this home's
-    slots, it is locked, and its recorded pid is an ancestor), else None: a stale or leaked marker is not trusted."""
+    slots, it is locked, and its recorded pid is an ancestor), else None: a stale or leaked marker is not trusted.
+    chain: ancestors(), when the caller has it already."""
     if not path or not os.path.basename(path).startswith("slot-"):
         return None
     if os.path.dirname(os.path.realpath(path)) != os.path.realpath(slot_dir()) or not os.path.isfile(path):
@@ -169,7 +177,27 @@ def held_by_caller(path):
         f.close()
     holder = holder_of(path)
     pid = holder.get("pid")
-    return holder if isinstance(pid, int) and pid in ancestors() else None
+    return holder if isinstance(pid, int) and pid in (ancestors() if chain is None else chain) else None
+
+
+def caller_slot(marker):
+    """(path, holder line) of the slot a caller of this process holds, else (None, None). The slot PA_SUITE_SLOT
+    names is looked at first; else every slot of this home, since a pa-full-suite from before t-072 holds one (its
+    pid in the holder line) and names none (round 2, MF-1). Either way only a locked slot held by an ancestor counts."""
+    chain = ancestors()
+    holder = held_by_caller(marker, chain)
+    if holder:
+        return marker, holder
+    try:
+        names = sorted(n for n in os.listdir(slot_dir()) if n.startswith("slot-"))
+    except OSError:
+        names = []
+    for name in names:
+        path = os.path.join(slot_dir(), name)
+        holder = held_by_caller(path, chain)
+        if holder:
+            return path, holder
+    return None, None
 
 
 def task_of(start):
@@ -201,18 +229,18 @@ def run_under_slot(argv):
     if not command:
         parser.error("no command after --")
     value = os.environ.get("PA_SUITE_WAIT_LIMIT", "")
-    limit = int(value) if value.isdigit() else WAIT_LIMIT
+    limit = int(value) if value.isdigit() else SLOT_WAIT_LIMIT
     who = args.what.split()[0] if args.what.split() else "pa_suite.py"
-    marker = os.environ.get("PA_SUITE_SLOT", "")
-    caller, slot = held_by_caller(marker), None
+    path, caller = caller_slot(os.environ.get("PA_SUITE_SLOT", ""))
+    slot, parent = None, os.getppid()
     if caller:
-        path = marker
         hold = "held by the caller (task {}, pid {}, {})".format(caller.get("task"), caller.get("pid"), os.path.basename(path))
     else:
         queued = time.time()
         info = {"task": task_of(args.dir), "worker": args.worker or None, "what": args.what, "dir": args.dir}
         try:
-            slot = acquire(cap(), info, limit=limit, say=lambda m: print(m, flush=True), who=who)
+            slot = acquire(cap(), info, limit=limit, say=lambda m: print(m, flush=True), who=who,
+                           gone=lambda: os.getppid() != parent and "its caller is gone (pid {})".format(parent))
         except Waited as e:
             print(e, flush=True)
             return 124

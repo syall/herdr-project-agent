@@ -479,7 +479,8 @@ fast set. The parts run at the same time (each unit test module is its own part)
 output is kept in a run folder that the last line names, after a summary of every part and failing test;
 `PA_SERIAL=1` runs the parts one after another, each streamed as it runs. Every run that has parts to
 run, full or `--affected`, first takes the same machine slot as `pa-full-suite` (at most `PA_SUITE_CAP`, default
-1, at once per user), waiting its turn and saying for whom; its summary says how long it waited. A single test
+1, at once per user), waiting its turn and saying for whom; its summary says how long it waited. It waits at most 840 s (`PA_SUITE_WAIT_LIMIT`), and stops waiting if its caller
+is gone. A single test
 module run on its own (`python3 -m unittest tests.test_x`) takes no slot. After updating, run `pa-sync --on <machine>` before installing the mod, so remote launchers
 get the new `pa-session` (see the install order above).
 
