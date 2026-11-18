@@ -68,8 +68,10 @@ _module_pa = []
 
 
 def setUpModule():
-    for k in list(_HOMES) + list(DROP_ENV):
+    for k in list(_HOMES) + list(DROP_ENV) + ["TZ"]:
         _module_env[k] = os.environ.get(k)
+    os.environ["TZ"] = "UTC"  # the report's days are the terminal's (t-036): every test sets its own zone, never the machine's
+    time.tzset()
     for k in DROP_ENV:
         os.environ.pop(k, None)
     os.environ.update(_HOMES)
@@ -83,6 +85,7 @@ def tearDownModule():
             os.environ.pop(k, None)
         else:
             os.environ[k] = v
+    time.tzset()
     if _module_pa and _module_pa[0] is not None:
         sys.modules["pa"] = _module_pa[0]
     else:
@@ -3748,6 +3751,174 @@ class T28_DayActivities(Collecting):
             self.assertGreater(a["tokens"], 0, a)
         self.assertEqual(sum(a["tokens"] for a in acts.values()), day["tokens"])
         self.assertEqual(day["byActivity"], {})  # the old field leaves it out (no price)
+
+
+# ---- t-036: days in the person's own timezone ----------------------------------------------------------------------
+
+# America/Los_Angeles from 2026 on: minutes east of UTC in force from each epoch on (the panel's --zone-offsets form).
+LA = [[0, -480], [1772964000, -420], [1793523600, -480], [1805018400, -420]]
+LA_ZONE = {"zone": "America/Los_Angeles", "offsets": LA}
+LA_ARG = ",".join("{}:{}".format(e, m) for e, m in LA)
+
+
+@contextlib.contextmanager
+def tz(name):
+    """The process's own timezone (the report's terminal), set by the test and put back after it."""
+    old = os.environ.get("TZ")
+    os.environ["TZ"] = name
+    time.tzset()
+    try:
+        yield
+    finally:
+        os.environ["TZ"] = old if old is not None else "UTC"
+        time.tzset()
+
+
+class T36_LocalDays(Collecting):
+    """The summary's days cut at the person's local midnight (W1, W2), on disk UTC (W3), the report local (W4)."""
+
+    def row(self, at, seq, tokens=100, activity="build"):
+        return {"seq": seq, "session": SID, "from": iso(at), "to": iso(at + 60), "day": iso(at)[:10], "calls": 1,
+                "tokens": toks(**{"in": tokens}), "long": dict(ZERO), "model": "model-a", "activity": activity,
+                "kind": "worker"}
+
+    def summ(self, rows, zone=None, now=T0 + 86400):
+        return pa_costs.summarize(self.dir, rows, [], None, None, "test", now, cc=[], zone=zone)
+
+    def keys(self, s):
+        return [d["key"] for d in s["byDay"]]
+
+    def test_w1_a_row_before_local_midnight_is_the_local_day_before(self):
+        at = T0 + 6 * 3600 + 1800  # 2026-11-17T06:30Z = 2026-11-16 22:30 PST
+        rows = [self.row(at, 1, 100, "build"), self.row(T0 + 9 * 3600, 2, 50, "review")]  # 09:00Z = 01:00 PST on the 17th
+        s = self.summ(rows, LA_ZONE)
+        self.assertEqual(self.keys(s), ["2026-11-17", "2026-11-16"])
+        by = {d["key"]: d for d in s["byDay"]}
+        self.assertEqual([a["key"] for a in by["2026-11-16"]["activities"]], ["build"])
+        self.assertEqual([a["key"] for a in by["2026-11-17"]["activities"]], ["review"])
+        self.assertEqual(s["days"], {"zone": "America/Los_Angeles", "offsets": LA})
+        # W3: what is not a day bucket stays UTC
+        self.assertEqual([e["day"] for e in s["byDayModel"]], ["2026-11-17"])
+        self.assertEqual([h[0] for h in s["hours"]], ["2026-11-17T06", "2026-11-17T09"])
+        self.assertTrue(s["updated"].endswith("Z"))
+
+    def test_w1_no_zone_is_utc_days_named_utc(self):
+        s = self.summ([self.row(T0 + 6 * 3600 + 1800, 1)])
+        self.assertEqual(self.keys(s), ["2026-11-17"])
+        self.assertEqual(s["days"], {"zone": "UTC", "offsets": [[0, 0]]})
+
+    def test_w2_daylight_saving_changes_where_local_midnight_falls(self):
+        before = 1772964000 - 3600 * 2 - 1800  # 2026-03-08T07:30Z, PST: 23:30 on 03-07
+        after = 1772964000 + 3600 * 21 + 1800  # 2026-03-09T07:30Z, PDT: 00:30 on 03-09 (PST would be 23:30 on 03-08)
+        s = self.summ([self.row(before, 1), self.row(after, 2)], LA_ZONE, now=after + 3600)
+        self.assertEqual(self.keys(s), ["2026-03-09", "2026-03-07"])
+        nov = 1793523600 + 3600 * 15 + 1800  # 2026-11-02T00:30Z, PST again: 16:30 on 11-01
+        self.assertEqual(self.keys(self.summ([self.row(nov, 1)], LA_ZONE, now=nov + 60)), ["2026-11-01"])
+
+    def test_w2_a_half_hour_zone_cuts_at_its_own_midnight(self):
+        india = {"zone": "Asia/Kolkata", "offsets": [[0, 330]]}
+        s = self.summ([self.row(T0 + 18 * 3600 + 900, 1), self.row(T0 + 18 * 3600 + 2700, 2)], india)  # 18:15Z, 18:45Z
+        self.assertEqual(self.keys(s), ["2026-11-18", "2026-11-17"])  # 23:45 and 00:15 local
+
+    def test_w2_collect_keeps_the_panels_zone_and_rewrites_on_a_change(self):
+        at = T0 + 6 * 3600 + 1800
+        self.record(session=SID, task="t-001", terminal="t5")
+        self.add(self.prompt(at), self.call(at + 1, "m1", lines=1, out=10))
+        self.collect(at + 2000, zone=LA_ZONE)
+        self.assertEqual(load(self.costs("zone.json")), LA_ZONE)
+        s = load(self.costs("summary.json"))
+        self.assertEqual(self.keys(s), ["2026-11-16"])
+        self.assertEqual(s["days"]["zone"], "America/Los_Angeles")
+        self.collect(at + 2100)  # no zone given (the Project Agent's own collect): the saved one
+        self.assertEqual(self.keys(load(self.costs("summary.json"))), ["2026-11-16"])
+        self.collect(at + 2200, zone={"zone": "UTC", "offsets": [[0, 0]]})  # no new rows, another zone: rewritten
+        s = load(self.costs("summary.json"))
+        self.assertEqual(self.keys(s), ["2026-11-17"])
+        self.assertEqual(s["days"]["zone"], "UTC")
+        # W3: the ledger's rows keep their UTC day and time
+        self.assertEqual([(r["day"], r["from"]) for r in self.rows()], [("2026-11-17", iso(at + 1))])
+
+    def test_w2_no_saved_zone_is_utc_days(self):
+        at = T0 + 6 * 3600 + 1800
+        self.record(session=SID, task="t-001", terminal="t5")
+        self.add(self.prompt(at), self.call(at + 1, "m1", lines=1, out=10))
+        with tz("America/Los_Angeles"):  # the space's machine's own zone is not the person's: not used
+            self.collect(at + 2000)
+        s = load(self.costs("summary.json"))
+        self.assertEqual(self.keys(s), ["2026-11-17"])
+        self.assertEqual(s["days"]["zone"], "UTC")
+        self.assertFalse(os.path.exists(self.costs("zone.json")))
+
+    def test_w2_the_cli_takes_the_panels_zone_and_refuses_a_bad_one(self):
+        os.makedirs(os.path.join(self.dir, "costs"), exist_ok=True)
+        self.record(session=SID, task="t-001", terminal="t5")
+        r, _out, _err = self.run_cmd(pa_costs.main, ["collect", "--space", "sp1", "--quiet", "--zone-offsets", LA_ARG,
+                                                     "--zone-name", "America/Los_Angeles"])
+        self.assertEqual(r, 0)
+        self.assertEqual(load(self.costs("zone.json")), LA_ZONE)
+        for bad in ("x", "0:-480,5:-420,3:-480", "0:9999", "", ",".join("{}:0".format(i * 100) for i in range(70))):
+            with self.assertRaises(pa.Problem, msg=bad):
+                pa_costs.main(["collect", "--space", "sp1", "--quiet", "--zone-offsets", bad])
+        with self.assertRaises(pa.Problem):
+            pa_costs.main(["collect", "--space", "sp1", "--quiet", "--zone-offsets", "0:60", "--zone-name", "a b;c"])
+        self.assertEqual(load(self.costs("zone.json")), LA_ZONE)  # a refused zone changes nothing
+
+    def report_world(self):
+        at = T0 + 6 * 3600 + 1800  # 2026-11-16 22:30 PST
+        self.prices()
+        self.record(session=SID, task="t-001", terminal="t5")
+        self.add(self.prompt(at), self.call(at + 1, "m1", lines=1, out=10))
+        self.collect(at + 2000, zone=LA_ZONE)
+        return at + 2000  # 2026-11-17T07:03:20Z = 2026-11-16 23:03 PST
+
+    def test_w4_report_days_are_the_terminals_local_days(self):
+        now = self.report_world()
+        with tz("America/Los_Angeles"):
+            _r, out, _e = self.run_cmd(pa_costs.report, self.dir, by="day", now=now)
+            self.assertIn("By day (PST)", out)
+            self.assertIn("2026-11-16", out)
+            self.assertNotIn("2026-11-17", out)
+            _r, out, _e = self.run_cmd(pa_costs.report, self.dir, now=now)
+            self.assertIn("updated 2026-11-16 23:03 PST", out)
+            self.assertRegex(out, r"Today     \d+\.\d\d est\. \(local day, PST\)")
+            _r, out, _e = self.run_cmd(pa_costs.report, self.dir, by="day", since="2026-11-17", now=now)
+            self.assertNotIn("2026-11-16", out)
+            _r, out, _e = self.run_cmd(pa_costs.report, self.dir, by="day", until="2026-11-16", now=now)
+            self.assertIn("2026-11-16", out)
+        with tz("UTC"):  # the saved zone is the panel's, not the terminal's
+            _r, out, _e = self.run_cmd(pa_costs.report, self.dir, by="day", now=now)
+            self.assertIn("2026-11-17", out)
+            self.assertNotIn("2026-11-16", out)
+
+    def test_w4_report_utc_asks_for_utc_days(self):
+        now = self.report_world()
+        with tz("America/Los_Angeles"):
+            _r, out, _e = self.run_cmd(pa_costs.report, self.dir, by="day", now=now, utc=True)
+            self.assertIn("By day (UTC)", out)
+            self.assertIn("2026-11-17", out)
+            self.assertNotIn("2026-11-16", out)
+            _r, out, _e = self.run_cmd(pa_costs.report, self.dir, now=now, utc=True)
+            self.assertIn("updated 2026-11-17 07:03 UTC", out)
+            self.assertRegex(out, r"Today     \d+\.\d\d est\. \(UTC day\)")
+            _r, out, _e = self.run_cmd(pa_costs.report, self.dir, by="day", since="2026-11-17", now=now, utc=True)
+            self.assertIn("2026-11-17", out)
+            r, out, _e = self.run_cmd(pa_costs.main, ["report", "--space", "sp1", "--by", "day", "--utc"])
+            self.assertEqual(r, 0)
+            self.assertIn("By day (UTC)", out)
+            _r, out, _e = self.run_cmd(pa_costs.report, self.dir, as_json=True, now=now)
+            self.assertEqual(json.loads(out)["days"]["offsets"][0][1], -420)  # Aug 2026 (now - 100 days): PDT
+
+    def test_w4_machine_zone_finds_the_daylight_saving_changes(self):
+        with tz("America/Los_Angeles"):
+            z = pa_costs.machine_zone(T0)
+            self.assertEqual(z, {"zone": "PST", "offsets": [[0, -420], [1793523600, -480]]})
+            z = pa_costs.machine_zone(T0 + 120 * 86400)  # 2027-03-17: back to 2026-12-07, ahead to 2027-04-21
+            self.assertEqual(z["offsets"], [[0, -480], [1805018400, -420]])
+            self.assertEqual(z["zone"], "PDT")
+        with tz("Asia/Kolkata"):
+            self.assertEqual(pa_costs.machine_zone(T0)["offsets"], [[0, 330]])
+        with tz("UTC"):
+            self.assertEqual(pa_costs.machine_zone(T0), {"zone": "UTC", "offsets": [[0, 0]]})
 
 
 class ZZ_V1_Privacy(unittest.TestCase):

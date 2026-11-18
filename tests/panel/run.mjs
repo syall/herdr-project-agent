@@ -17,6 +17,9 @@ for (const f of fs.readdirSync(src).filter((n) => n.endsWith(".js"))) {
 const stubs = await import(path.join(dst, "stubs.mjs"));
 const { default: ProjectAgent } = await import(path.join(dst, "main.js"));
 const { cx: baseCx, flush, inspect } = stubs;
+// The person's timezone (t-036): zone.js's offsetAt/name, UTC in every world unless a case sets its own (never the machine's).
+const zoneMod = await import(path.join(dst, "zone.js")).catch(() => null);
+const setZone = (offsetAt, name) => { if (zoneMod) { zoneMod.zone.offsetAt = offsetAt; zoneMod.zone.name = () => name; } };
 let cx = { ...baseCx, stop_propagation() {} }; // a new one per world (world())
 const g = globalThis;
 g.__rejected = []; // what tasks threw and nobody caught (the runner fails the case)
@@ -35,6 +38,7 @@ const check = (ok, what) => { if (!ok) throw new Failed(what); };
 // field names `agentTerminal`); records: project-agent.tabs; extra: more panes/terminals.
 function world({ agent = true, agentTerminal = "t30", records = {}, extraPanes = [], extraTerms = [], extraTabs = [], agents = [], machine = null } = {}) {
   g.__now = T0; g.__gen = (g.__gen ?? 0) + 1; g.__delay = {};
+  setZone(() => 0, "UTC");
   cx = stubs.makeCx({ stop_propagation() {} }); g.__draining = false;
   g.__runs = []; g.__notes = []; g.__reads = []; g.__writes = []; g.__overlays = []; g.__offline = []; g.__hcs = []; g.__hcFail = []; g.__hcHang = []; g.__ls = {};
   g.__machines = [{ name: null, layout: "ready" }, ...(machine ? [{ name: machine, layout: "ready" }] : [])];
@@ -2169,6 +2173,7 @@ cases["P-push-rules-invalid"] = async () => { // AC3.2: an invalid file says why
 
 // ---- t-009 Costs view (step 9c): R9, R11, R12, R14; every pa-costs call is answered by costsTool (an unanswered one is recorded) ----
 const isoAt = (ms) => new Date(ms).toISOString().replace(/\.\d+Z$/, "Z");
+const UTC_ARGS = ["--zone-offsets", "0:0", "--zone-name", "UTC"]; // the zone every world's collect passes (t-036)
 const CUR = "XTS"; // the ISO code kept for tests: generic code and tests name no real currency
 function costsSummary(over = {}) {
   const from = isoAt(T0 - 7200000), to = isoAt(T0 - 3600000);
@@ -2454,7 +2459,7 @@ cases["P-costs-remote"] = async () => { // R6, AC6.2, AC9.4: reads and execs on 
     const sub = a[0] === "billed" ? `billed ${a[1]}` : a[0];
     check(sub === "billed compare" ? on === null : on === M, `${sub} on ${on}`);
   }
-  check(costsExecs("collect").some(([, a]) => JSON.stringify(a) === JSON.stringify(["collect", "--space", S])), `collect --space sp1 (got ${JSON.stringify(costsExecs("collect"))})`);
+  check(costsExecs("collect").some(([, a]) => JSON.stringify(a) === JSON.stringify(["collect", "--space", S, ...UTC_ARGS])), `collect --space sp1 (got ${JSON.stringify(costsExecs("collect"))})`);
 };
 
 cases["P-costs-refresh"] = async () => { // R12: Refresh runs collect on the space's machine, one at a time, Refreshing…, then one reread
@@ -2466,7 +2471,7 @@ cases["P-costs-refresh"] = async () => { // R12: Refresh runs collect on the spa
   await click(v, "costs-refresh"); await settle();
   check(costsExecs("collect").length === 1, `one at a time (got ${costsExecs("collect").length})`);
   const [, args, on, opts] = costsExecs("collect")[0];
-  check(JSON.stringify(args) === JSON.stringify(["collect", "--space", S]) && on === M && opts?.timeout >= 30000, `its argv and machine (got ${JSON.stringify(costsExecs("collect")[0])})`);
+  check(JSON.stringify(args) === JSON.stringify(["collect", "--space", S, ...UTC_ARGS]) && on === M && opts?.timeout >= 30000, `its argv and machine (got ${JSON.stringify(costsExecs("collect")[0])})`);
   release(); await settle();
   check(costsReads().length === n + 1 && !costsView(v).text.includes("Refreshing…"), `one reread (got ${costsReads().length - n})`);
 };
@@ -2940,7 +2945,7 @@ cases["K-costs-collect"] = async () => { // R11, D6: one collect --quiet per spa
   const { tick } = await timerMod();
   await tickAt(tick, T0);
   const c = collects();
-  check(c.length === 1 && JSON.stringify(c[0][1]) === JSON.stringify(["collect", "--space", S, "--quiet"]) && c[0][2] === null, `one collect for the not-alive record (got ${JSON.stringify(c)})`);
+  check(c.length === 1 && JSON.stringify(c[0][1]) === JSON.stringify(["collect", "--space", S, "--quiet", ...UTC_ARGS]) && c[0][2] === null, `one collect for the not-alive record (got ${JSON.stringify(c)})`);
   for (let t = 15000; t < 1800000; t += 15000) await tickAt(tick, T0 + t);
   check(collects().length === 1, `none again within COLLECT_SLOW (got ${collects().length})`);
   await tickAt(tick, T0 + 1800000);
@@ -2989,7 +2994,7 @@ cases["K-costs-remote"] = async () => { // R6, AC6.1: a remote space's collect r
   const { tick } = await timerMod();
   await tickAt(tick, T0);
   const c = collects();
-  check(c.length === 1 && c[0][2] === M && JSON.stringify(c[0][1]) === JSON.stringify(["collect", "--space", S, "--quiet"]), `on m1, --space sp1 (got ${JSON.stringify(c)})`);
+  check(c.length === 1 && c[0][2] === M && JSON.stringify(c[0][1]) === JSON.stringify(["collect", "--space", S, "--quiet", ...UTC_ARGS]), `on m1, --space sp1 (got ${JSON.stringify(c)})`);
   const f = costsExecs("billed fetch");
   check(f.length === 1 && f[0][2] === null, `the billing query only here (got ${JSON.stringify(f)})`);
 };
@@ -3752,6 +3757,105 @@ cases["D1-send-timeout"] = async () => { // a hung hc send is given up after 90 
   await answerCard(v, "d-y"); await settle();
   check(JSON.stringify(sends().map((x) => x[2])) === JSON.stringify(["decision d-x answered", "decision d-y answered"]), `sent again, then the next one, in order (got ${JSON.stringify(sends())})`);
   check(v.sending === false && !/hasn't been told yet/.test(look(v).text), "the line is gone");
+};
+
+// ---- t-036: days and times in the person's own timezone ----------------------------------------------------------
+// A fake America/Los_Angeles (the panel machine's zone in these cases): minutes east of UTC from each change on.
+const LA_CHANGES = [[1772964000, -420], [1793523600, -480], [1805018400, -420], [1825578000, -480]];
+const laOffset = (ms) => { let m = -480; for (const [e, o] of LA_CHANGES) if (ms >= e * 1000) m = o; return m; };
+const LA_TABLE = [[0, -420], [1793523600, -480]]; // at T0 (2027-01-15T08:00Z = 00:00 PST): now - 100 d .. now + 35 d
+const LA_DAYS = { zone: "America/Los_Angeles", offsets: LA_TABLE };
+const H20 = 20 * 3600000; // T0 + 20 h = 2027-01-16T04:00Z = 2027-01-15 20:00 PST: the local and the UTC day differ
+function zoneDays(days) {
+  return costsSummary({ days,
+    hours: [[isoAt(T0 - 3600000).slice(0, 13), { tokens: 1000, money: 50 }], [isoAt(T0 + 12 * 3600000).slice(0, 13), { tokens: 7, money: 0.7 }]],
+    byDay: [{ key: "2027-01-15", tokens: 100, money: 3, calls: 1, byActivity: {} }, { key: "2027-01-09", tokens: 10, money: 2, calls: 1, byActivity: {} },
+      { key: "2027-01-08", tokens: 10, money: 100, calls: 1, byActivity: {} }] });
+}
+
+cases["Z1-zone-table"] = async () => { // W2: the panel's zone as a table of offset changes (DST included), its collect args, local dates
+  check(zoneMod, "mods/project-agent/zone.js exists");
+  const { zone, zoneTable, zoneArgs, localDate, daysBefore, summaryZone, oldTool } = zoneMod;
+  setZone(laOffset, "America/Los_Angeles");
+  check(JSON.stringify(zoneTable(T0)) === JSON.stringify(LA_TABLE), `the LA table at T0 (got ${JSON.stringify(zoneTable(T0))})`);
+  check(JSON.stringify(zoneTable(T0 + 60 * 86400000)) === JSON.stringify([[0, -480], [1805018400, -420]]), `the spring change once it is within 35 days (got ${JSON.stringify(zoneTable(T0 + 60 * 86400000))})`);
+  check(JSON.stringify(zoneArgs(T0)) === JSON.stringify(["--zone-offsets", "0:-420,1793523600:-480", "--zone-name", "America/Los_Angeles"]), `the args (got ${JSON.stringify(zoneArgs(T0))})`);
+  zone.name = () => null;
+  check(zoneArgs(T0)[3] === "UTC-08:00", `no zone name: the offset now (got ${zoneArgs(T0)[3]})`);
+  setZone(() => 330, null);
+  check(zoneArgs(T0)[3] === "UTC+05:30" && zoneArgs(T0)[1] === "0:330", `a half-hour zone (got ${JSON.stringify(zoneArgs(T0))})`);
+  setZone(laOffset, "America/Los_Angeles");
+  check(localDate(T0) === "2027-01-15" && localDate(T0 - 1) === "2027-01-14" && localDate(T0 + H20) === "2027-01-15", "local dates cut at local midnight");
+  check(daysBefore("2027-01-15", 6) === "2027-01-09" && daysBefore("2027-03-01", 1) === "2027-02-28", "days before");
+  const same = summaryZone({ days: LA_DAYS }, T0), other = summaryZone({ days: { zone: "UTC", offsets: [[0, 0]] } }, T0), none = summaryZone({}, T0);
+  const stale = summaryZone({ days: { zone: "America/Los_Angeles", offsets: [[0, -480]] } }, T0); // no Nov 1 change: other days before it
+  check(same.local === true && other.local === false && other.label === "UTC" && none.local === false && none.label === "UTC" && stale.local === false && stale.label === "America/Los_Angeles",
+    `same / other / none / stale (got ${JSON.stringify([same, other, none, stale])})`);
+  check(summaryZone({ days: { zone: "x", offsets: "bad" } }, T0).local === false, "a bad table is not the panel's");
+  setZone(() => 0, "UTC");
+  check(summaryZone({ days: { zone: "UTC", offsets: [[0, 0]] } }, T0).local === true, "UTC days on a UTC panel are local");
+  const refused = { code: 2, stdout: "", stderr: "usage: pa-costs [-h] ...\npa-costs: error: unrecognized arguments: --zone-offsets 0:0 --zone-name UTC\n" };
+  check(oldTool(refused) && !oldTool({ code: 2, stdout: "", stderr: "pa-costs: no Project Agent state" }) && !oldTool({ code: 0, stdout: "", stderr: "" }), "an old pa-costs is told apart");
+};
+
+cases["Z2-local-days"] = async () => { // W1, W2: a summary in the panel's zone: Today, Last 7 days and By day are local days, no "(UTC)"
+  const { v } = await costsWorld({ summary: zoneDays(LA_DAYS), open: false });
+  setZone(laOffset, "America/Los_Angeles");
+  await click(v, "view-costs"); await settle();
+  g.__now = T0 + H20;
+  const text = costsView(v).text;
+  check(/Today \| [^|]*3\.00[^|]* est\. \| 100 tokens/.test(text), `Today: the local day's byDay entry (got ${text.slice(0, 1500)})`);
+  check(/Last 7 days \| [^|]*5\.00[^|]* est\. \| 110 tokens/.test(text), `Last 7 days: local 01-09 .. 01-15 (got ${text.slice(0, 1500)})`);
+  check(!/\(UTC\)/.test(text) && /By day \|/.test(text), `no UTC label (got ${text.slice(0, 2500)})`);
+};
+
+cases["Z3-other-zone-labelled"] = async () => { // W2: days of another zone, or an older summary without days: labelled, Today from the hours
+  for (const [days, label] of [[{ zone: "UTC", offsets: [[0, 0]] }, "UTC"], [undefined, "UTC"], [{ zone: "Europe/Paris", offsets: [[0, 60]] }, "Europe/Paris"]]) {
+    const s = zoneDays(days); if (days === undefined) delete s.days;
+    const { v } = await costsWorld({ summary: s, open: false });
+    setZone(laOffset, "America/Los_Angeles");
+    await click(v, "view-costs"); await settle();
+    g.__now = T0 + H20;
+    const text = costsView(v).text;
+    check(text.includes(`Last 7 days (${label}) |`) && text.includes(`By day (${label})`), `labelled ${label} (got ${text.slice(0, 2500)})`);
+    check(/Today \| [^|]*0\.70[^|]* est\. \| 7 tokens/.test(text), `Today: the local day of the hours (got ${text.slice(0, 1500)})`);
+  }
+};
+
+cases["Z4-collect-zone"] = async () => { // W2: the timer's and Refresh's collect pass the panel's zone
+  const la = ["--zone-offsets", "0:-420,1793523600:-480", "--zone-name", "America/Los_Angeles"];
+  timerWorld({ machine: M });
+  setZone(laOffset, "America/Los_Angeles");
+  const { tick } = await timerMod();
+  await tickAt(tick, T0);
+  check(JSON.stringify(collects().map((c) => c[1])) === JSON.stringify([["collect", "--space", S, "--quiet", ...la]]), `the timer's collect (got ${JSON.stringify(collects())})`);
+  const { v } = await costsWorld({ machine: M });
+  setZone(laOffset, "America/Los_Angeles");
+  await click(v, "costs-refresh"); await settle();
+  check(JSON.stringify(collects().map((c) => c[1])) === JSON.stringify([["collect", "--space", S, ...la]]), `Refresh's collect (got ${JSON.stringify(collects())})`);
+};
+
+cases["Z4-old-pa-costs"] = async () => { // an old pa-costs on the space's machine refuses the zone: the collect runs again without it
+  const old = (args) => (args.includes("--zone-offsets") ? { code: 2, stdout: "", stderr: "usage: pa-costs [-h] {collect,report} ...\npa-costs: error: unrecognized arguments: --zone-offsets 0:0 --zone-name UTC\n" } : { code: 0, stdout: "", stderr: "" });
+  timerWorld({ machine: M, tool: { collect: old } });
+  const { tick } = await timerMod();
+  await tickAt(tick, T0);
+  check(JSON.stringify(collects().map((c) => c[1])) === JSON.stringify([["collect", "--space", S, "--quiet", ...UTC_ARGS], ["collect", "--space", S, "--quiet"]]), `again without the zone (got ${JSON.stringify(collects())})`);
+  check(g.__shared["project-agent.costs"]?.[`${M}/${S}`]?.ok === true || g.__shared["project-agent.costs"]?.[S]?.ok === true, `the collect counts as done (got ${JSON.stringify(g.__shared["project-agent.costs"])})`);
+  const { v } = await costsWorld({ machine: M, tool: { collect: old } });
+  await click(v, "costs-refresh"); await settle();
+  check(JSON.stringify(collects().map((c) => c[1])) === JSON.stringify([["collect", "--space", S, ...UTC_ARGS], ["collect", "--space", S]]), `Refresh: again without the zone (got ${JSON.stringify(collects())})`);
+  check(!/Refresh failed/.test(costsView(v).text), "no failure shown");
+};
+
+cases["Z5-cc-date-and-billed-days"] = async () => { // W1: the CC cover date is the local date; the billed days say they are UTC days
+  const s = ccSummary(); s.sessions[0].ccAt = "2027-01-14T03:00:00Z"; // 2027-01-13 19:00 PST
+  const { v } = await costsWorld({ summary: s, open: false, tool: { "billed compare": () => json0(withRows()) } });
+  setZone(laOffset, "America/Los_Angeles");
+  await click(v, "view-costs"); await settle();
+  const text = costsView(v).text;
+  check(text.includes("Claude Code's figure covers sessions started from 2027-01-13;"), `the local date (got ${text.slice(0, 3000)})`);
+  check(/Covered 2027-01-10 – 2027-01-14 \(5 of 6 days; not billed: 2027-01-15\) · source query:q1, fetched [^|]* \(billing days are UTC days\)/.test(text), `billed days labelled (got ${text.slice(text.indexOf("Covered"), text.indexOf("Covered") + 300)})`);
 };
 
 // Which cases run (t-031): every case, or the named ones; --shard=<k>/<n> keeps every n-th case by definition
