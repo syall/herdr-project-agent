@@ -2137,7 +2137,15 @@ def unrecorded(address):
     return pa.Problem("{} is not a recorded worker of this space; nothing was closed (if it is yours, close it in Herdr)".format(address))
 
 
-def close_worker(directory, agent, profile, address, evidence, card_id=None):
+class Refused(pa.Problem):
+    """A close refused on the terminal's identity or status; `kind` is the refusal's first word (t-042)."""
+
+    def __init__(self, kind, text):
+        super().__init__(text)
+        self.kind = kind
+
+
+def close_worker(directory, agent, profile, address, evidence, card_id=None, trigger="close"):
     """pa-worker close <address> --evidence F (spec 3.2 and 3.3), or --card <id>: the person's answer on a
     leftovers card stands in for the evidence file (card d-031). Returns the lines to print."""
     if "/" in address:
@@ -2152,7 +2160,7 @@ def close_worker(directory, agent, profile, address, evidence, card_id=None):
         raise pa.Problem("cannot read {}'s state from hc ({}); nothing was closed".format(address, why))
     refusal = identity_refusal(address, task, entry, info)
     if refusal:
-        raise pa.Problem(refusal[1])
+        raise Refused(*refusal)
     if entry.get("finished") and not info:
         return ["{} is already closed.".format(address)]
     card = leftovers_card(directory, card_id) if card_id else None
@@ -2165,7 +2173,7 @@ def close_worker(directory, agent, profile, address, evidence, card_id=None):
         report = report_path(directory, task["id"], address, evidence, worker_start(entry, info))
     refusal = status_refusal(address, entry, info)
     if refusal:
-        raise pa.Problem(refusal[1])
+        raise Refused(*refusal)
     refusal, checked, unseen = worktree_refusal(task, profile, info, entry)
     if refusal:
         raise pa.Problem(refusal[1])
@@ -2180,7 +2188,7 @@ def close_worker(directory, agent, profile, address, evidence, card_id=None):
             raise pa.Problem("cannot read {}'s state from hc ({}); nothing was closed".format(address, why))
         refusal = identity_refusal(address, task, entry, info) or status_refusal(address, entry, info)
         if refusal:
-            raise pa.Problem(refusal[1])
+            raise Refused(*refusal)
         if card:
             problem = card_refusal(card, address, task, entry, info)
             if problem:
@@ -2191,8 +2199,70 @@ def close_worker(directory, agent, profile, address, evidence, card_id=None):
             line = end_worker(directory, ledger, task, entry, address, info, report, by, "leftovers",
                               why="closed worker {} ({}) on the person's answer to card {}".format(address, entry.get("name") or "unnamed", card_id))
         else:
-            line = end_worker(directory, ledger, task, entry, address, info, report, by, "close")
+            line = end_worker(directory, ledger, task, entry, address, info, report, by, trigger)
     return [line, checked_note(checked, unseen)]
+
+
+# ---- pa-worker close --when-idle (t-042) ------------------------------------------------------
+# A worker that reported is often still finishing its turn when the agent closes it. With --when-idle
+# that refusal (and only that one) leaves one detached waiter: the same command with --idle-waiter,
+# which runs close_worker again, every guard included, until the worker is idle or the limit is reached.
+# It journals what happened and sends no hc message, so it starts no Project Agent pass. A worker that
+# becomes blocked is never closed: it is left for the person.
+
+WHEN_IDLE_LIMIT = 600  # seconds the waiter waits, at most
+WHEN_IDLE_POLL = 5  # seconds between its checks
+
+
+def spawn_idle_closer(directory, space, address, report):
+    """Starts the waiter in its own session, detached from the caller, with no terminal input or output."""
+    argv = [sys.executable, os.path.abspath(sys.argv[0]), "close", address, "--evidence", report, "--space", space, "--idle-waiter"]
+    subprocess.Popen(argv, cwd=directory, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     start_new_session=True, close_fds=True)
+
+
+def close_when_idle(directory, agent, profile, space, address, evidence):
+    """pa-worker close <address> --evidence F --when-idle: close now, or leave a waiter if it is only working."""
+    try:
+        return close_worker(directory, agent, profile, address, evidence)
+    except Refused as e:
+        if e.kind != "working":
+            raise
+    task, entry = recorded(read_ledger(directory), address)
+    spawn_idle_closer(directory, space, address, report_path(directory, task["id"], address, evidence))
+    return ["{} is working; it will be closed once it is idle (checked every {} s, for up to {} min), under the same checks, "
+            "and the result journaled (trigger close-when-idle). Nothing more to do for it.".format(
+                worker_label(address, entry, None), WHEN_IDLE_POLL, int(WHEN_IDLE_LIMIT // 60))]
+
+
+def wait_idle(directory, agent, profile, address, evidence):
+    """The waiter: one per worker (a lock in the space folder; a second one leaves at once). Every refusal
+    but `working` ends it, and so does the limit; the close journals itself, anything else is journaled here."""
+    import fcntl
+    with open(os.path.join(directory, ".close-when-idle-{}.lock".format(re.sub(r"[^A-Za-z0-9_-]", "_", address))), "a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return
+        deadline = time.monotonic() + WHEN_IDLE_LIMIT
+        while True:
+            try:
+                close_worker(directory, agent, profile, address, evidence, trigger="close-when-idle")
+                return
+            except Refused as e:
+                if e.kind == "working" and time.monotonic() < deadline:
+                    time.sleep(WHEN_IDLE_POLL)
+                    continue
+                kind, text = e.kind, str(e)
+            except Exception as e:  # noqa: BLE001 (detached: nobody sees a traceback, so it is journaled)
+                kind, text = "error", str(e) or type(e).__name__
+            break
+    if kind == "working":
+        text = "{} still working after {} s".format(address, WHEN_IDLE_LIMIT)
+    what = "left for the person; not closed" if kind == "blocked" else "not closed"
+    task, _entry = recorded(read_ledger(directory), address)
+    append_journal(directory, {"by": "agent" if by_an_agent() else "person", "trigger": "close-when-idle",
+                               "task": (task or {}).get("id"), "why": "{}: {} (pa-worker close --when-idle)".format(text, what)})
 
 
 def keep_worker(directory, agent, address, quote, off):
@@ -2538,7 +2608,11 @@ def cmd_worker(args):
             return close_leftovers(directory, agent, profile, args.dry_run)
         if args.card and not args.address:
             return close_by_card(directory, agent, profile, args.card)
-        for line in close_worker(directory, agent, profile, args.address, args.evidence, args.card):
+        if args.idle_waiter:
+            return wait_idle(directory, agent, profile, args.address, args.evidence)
+        lines = (close_when_idle(directory, agent, profile, space, args.address, args.evidence) if args.when_idle
+                 else close_worker(directory, agent, profile, args.address, args.evidence, args.card))
+        for line in lines:
             print(line)
         return
     if args.action == "keep":
@@ -3213,6 +3287,8 @@ def main():
         parser.add_argument("--leftovers", action="store_true", help="close: list the workers from before one-worker-per-job on one decision card (closes nothing)")
         parser.add_argument("--card", help="close: an answered leftovers card, in place of --evidence (without an address: every worker on it)")
         parser.add_argument("--dry-run", action="store_true", help="close --leftovers: only list what it would do")
+        parser.add_argument("--when-idle", action="store_true", help="close: if it is still working, close it once idle (in the background, up to 10 min)")
+        parser.add_argument("--idle-waiter", action="store_true", help=argparse.SUPPRESS)  # the --when-idle waiter itself
         parser.add_argument("--quote", help="keep: the person's own words")
         parser.add_argument("--off", action="store_true", help="keep: the person says it may be closed again")
         parser.add_argument("--space")
@@ -3221,6 +3297,8 @@ def main():
             raise pa.Problem("pa-worker close takes --evidence or --card, not both")
         if args.action == "close" and (sum(map(bool, (args.address, args.leftovers))) != 1 if not args.card else bool(args.leftovers)):
             raise pa.Problem("pa-worker close needs an address and --evidence, or --leftovers, or --card <id>")
+        if (args.when_idle or args.idle_waiter) and (args.action != "close" or not args.address or not args.evidence or args.card):
+            raise pa.Problem("pa-worker close --when-idle needs an address and --evidence")
         if args.action != "close" and not args.address:
             raise pa.Problem("pa-worker {} needs an address".format(args.action))
         return cmd_worker(args)

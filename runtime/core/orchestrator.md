@@ -344,13 +344,17 @@ Run `hc --skill` once to learn `hc`. Start workers with the profile's commands (
   permission or card: a `blocked` worker still goes to the person.
 - Close each worker once its job is over: in the pass where you read its report, after
   you have read the files it names and recorded the result in the ledger and the
-  journal, run `pa-worker close <t> --evidence <file>` (the file in its task's evidence
-  folder that holds its report: a file that worker wrote after it started). Keep a
+  journal, run `pa-worker close <t> --evidence <file> --when-idle` (the file in its task's
+  evidence folder that holds its report: a file that worker wrote after it started). Keep a
   worker open only while a follow-up for its own job is still expected. The command
-  refuses a worker that is working or blocked, is not recorded in this space, has no
-  evidence, has uncommitted files in its worktree, or that the person marked to keep; it
-  then closes nothing, so read why and act on it (ask the worker to commit or report
-  what it left, or leave it for a later pass). Committed work that is not pushed or
+  refuses a worker that is blocked, is not recorded in this space, has no evidence, has
+  uncommitted files in its worktree, or that the person marked to keep; it then closes
+  nothing, so read why and act on it (ask the worker to commit or report what it left, or
+  leave it for a later pass). A worker still finishing its turn is not refused:
+  `--when-idle` closes it by itself once it is idle (within 10 minutes), under the same
+  checks, and journals the result without a message to you; do not start a pass only to
+  close it. A `close-when-idle` journal line saying it was not closed is for your next
+  pass. Committed work that is not pushed or
   merged does not stop a close: the worktree and its branch stay. Never end a worker
   with `hc kill` or `hc rm` yourself, and never run `pa-cleanup` unless the person asks.
   When the person asks you to close a worker, use `pa-worker close` too; if it refuses,
