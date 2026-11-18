@@ -3862,9 +3862,12 @@ def record_cc(directory, fields, now):
                 rec["heldCost"], rec["heldMs"] = old["cost"], old["durationMs"]
             elif "heldCost" in old:
                 if (fields["cost"] is not None and fields["durationMs"] is not None and old["durationMs"] is not None
-                        and fields["durationMs"] >= old["heldMs"] and fields["cost"] >= old["heldCost"] - CC_DROP
-                        and fields["durationMs"] - old["durationMs"] > (now - then + CC_RESTORE_SLACK) * 1000):
-                    # wall time grew faster than the clock: Claude Code restored the totals, which hold the old segment
+                        and old["durationMs"] < old["heldMs"] <= fields["durationMs"] and fields["cost"] >= old["heldCost"] - CC_DROP
+                        and now >= then and fields["durationMs"] - old["durationMs"] > (now - then + CC_RESTORE_SLACK) * 1000):
+                    # wall time grew faster than the clock: Claude Code restored the totals, which hold the old segment.
+                    # t-051 (t-043 REVIEW RL-A): a restore jumps across heldMs in one reading, so a real restart that has
+                    # crossed it already is never undone, whatever the clock does later; and with the clock behind the
+                    # last reading the time between them is unknown, so the drop stays counted (over, never under)
                     rec["base"] = max(0, rec["base"] - old["heldCost"])
                     rec["segments"] = max(1, rec["segments"] - 1)
                 else:
