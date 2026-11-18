@@ -179,6 +179,7 @@ class Base(unittest.TestCase):
         write(os.path.join(self.space, "journal.jsonl"), "")
         self.hc = os.path.join(self.root, "hcdata")
         os.makedirs(self.hc)
+        self.first_on_path = []  # folders put before the fake hc's on pa-trust's PATH (a fake git)
 
     def agent(self, value):
         dump(value, os.path.join(self.space, "agent.json"))
@@ -208,7 +209,7 @@ class Base(unittest.TestCase):
         env = {k: v for k, v in os.environ.items() if k not in DROP_ENV}
         env.update(GIT_ENV, HOME=self.home, HERDR_PA_HOME=self.pa_home, CLAUDE_CONFIG_DIR=os.path.join(self.root, "claude"),
                    HERDR_APP_HOME=os.path.join(self.root, "app"), FAKE_HC=self.hc,
-                   PATH=os.path.join(TMP, "bin") + os.pathsep + env.get("PATH", ""))
+                   PATH=os.pathsep.join(self.first_on_path + [os.path.join(TMP, "bin"), env.get("PATH", "")]))
         r = subprocess.run([sys.executable, os.path.join(TMP, "bin", "pa-trust"), address, "--space", "sp1"] + list(extra),
                            env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=60)
         self.assertEqual(before, snapshot(self.space), "pa-trust must write nothing in the state folder (AC8.2)")
@@ -625,7 +626,7 @@ class R3cTrustKey(Base):
         self.agent({"space": "sp1", "terminal": "t0", "profile": "test", "project": project})
         return project
 
-    def test_state_folder_refused_when_the_project_folder_holds_it(self):
+    def test_state_folder_refused_when_the_project_folder_holds_it(self):  # round 3: P itself is refused now
         self.project_parent_of_state()
         decisions = os.path.join(self.space, "decisions")
         os.makedirs(decisions)
@@ -635,16 +636,33 @@ class R3cTrustKey(Base):
                 shutil.rmtree(self.hc)
                 os.makedirs(self.hc)
                 self.run_on(shown, shown)
-                self.expect("outside")
+                self.expect("refused", "Project Agent's home")
 
-    def test_project_folder_holding_the_state_folder_still_allowed(self):  # t124: only the state folder is refused
+    def test_project_folder_overlapping_the_pa_home_refused(self):  # Review F1-R2 = Verify F2 (round 3)
+        """P = <pa home>/spaces (it reverses round 2's 'stays allowed'): this space's state folder, another
+        space's state folder and its evidence/t-1, and P itself: all refused, no key sent."""
         project = self.project_parent_of_state()
-        self.assertIsNone(pa_hooks.trust_project(project, self.home, self.pa_home)[1])
-        other = os.path.join(project, "notes")
-        os.makedirs(other)
-        self.accepts(other, cwd=other)
-        shutil.rmtree(self.hc)
-        os.makedirs(self.hc)
+        other = os.path.join(project, "sp2")
+        dump({"version": 1, "tasks": []}, os.path.join(other, "ledger.json"))
+        os.makedirs(os.path.join(other, "evidence", "t-1"))
+        for shown in (self.space, other, os.path.join(other, "evidence", "t-1"), project):
+            with self.subTest(shown):
+                shutil.rmtree(self.hc)
+                os.makedirs(self.hc)
+                self.run_on(shown, shown)
+                self.expect("refused", "Project Agent's home")
+        for p in (project, other, self.space, os.path.join(self.pa_home, "profiles"), self.pa_home):
+            self.assertIsNotNone(pa_hooks.trust_project(p, self.home, self.pa_home)[1], p)
+
+    def test_project_folder_reaching_the_spaces_through_a_symlink_refused(self):  # round 3: on real paths
+        real_spaces = os.path.join(self.P, "kept-spaces")
+        shutil.move(os.path.join(self.pa_home, "spaces"), real_spaces)
+        os.symlink(real_spaces, os.path.join(self.pa_home, "spaces"))
+        self.assertIsNotNone(pa_hooks.trust_project(self.P, self.home, self.pa_home)[1])
+        self.run_on(os.path.join(real_spaces, "sp1"), os.path.join(real_spaces, "sp1"))
+        self.expect("refused", "Project Agent's home")
+
+    def test_own_evidence_folder_still_accepted(self):  # the one place inside the PA home, by the evidence rule
         folder = os.path.join(self.space, "evidence", "t-1")
         os.makedirs(folder)
         out = self.accepts(folder, cwd=folder)
@@ -670,6 +688,71 @@ class R3cTrustKey(Base):
         other_home = os.path.join(self.root, "elsewhere-home")
         self.assertIsNotNone(pa_hooks.trust_project(self.pa_home, other_home, self.pa_home)[1])
         self.assertIsNone(pa_hooks.trust_project(self.P, self.home, self.pa_home)[1])
+
+FAKE_GIT = r"""#!/bin/sh
+# Fake git for t-035 round 3: `rev-parse --show-toplevel` fails as FAKE_GIT_MODE says; everything else is real git.
+case " $* " in
+*" rev-parse --show-toplevel "*)
+    case "$FAKE_GIT_MODE" in
+    timeout) exec sleep 40 ;;
+    dubious) echo "fatal: detected dubious ownership in repository at '$2'" >&2; exit 128 ;;
+    other) echo "error: something else went wrong" >&2; exit 1 ;;
+    esac ;;
+esac
+exec {git} "$@"
+"""
+
+
+class R3dGitFailures(Base):
+    """Review L-R2a (round 3, t124: Must fix): only git's 'not a git repository' (exit 128) reads as outside git;
+    a timeout, 'detected dubious ownership' or any other failure gives uncertain, no key sent, the reason said."""
+
+    def fake_git(self, mode):
+        folder = os.path.join(self.root, "fakegit")
+        write(os.path.join(folder, "git"), FAKE_GIT.replace("{git}", shutil.which("git")))
+        os.chmod(os.path.join(folder, "git"), 0o755)
+        self.first_on_path = [folder]
+        os.environ["FAKE_GIT_MODE"] = mode
+        self.addCleanup(os.environ.pop, "FAKE_GIT_MODE", None)
+        return folder
+
+    def refused(self, mode, why):
+        self.fake_git(mode)
+        self.terminal(self.tree)
+        self.screens(fx.new_screen(self.tree), fx.new_screen(self.tree))
+        out = self.expect("uncertain", why)
+        self.assertIn("git", out["why"])
+
+    def test_dubious_ownership_is_uncertain(self):
+        self.refused("dubious", "dubious ownership")
+
+    def test_timeout_is_uncertain(self):
+        self.refused("timeout", "timed out")
+
+    def test_other_git_error_is_uncertain(self):
+        self.refused("other", "something else went wrong")
+
+    def test_outside_git_still_accepted_with_the_fake(self):  # the fake passes 'not a git repository' through
+        self.fake_git("none")
+        notes = os.path.join(self.P, "notes")
+        os.makedirs(notes)
+        self.accepts(notes, cwd=notes)
+
+    def test_unit_git_area(self):
+        notes = os.path.join(self.P, "notes")
+        os.makedirs(notes)
+        self.assertEqual((os.path.realpath(notes), None), pa_hooks.trust_key_why(notes))
+        self.assertEqual((os.path.realpath(self.repo), None), pa_hooks.trust_key_why(self.tree))
+        folder = self.fake_git("dubious")
+        saved = os.environ["PATH"]
+        os.environ["PATH"] = folder + os.pathsep + saved
+        try:
+            key, why = pa_hooks.trust_key_why(self.tree)
+        finally:
+            os.environ["PATH"] = saved
+        self.assertIsNone(key)
+        self.assertIn("dubious ownership", why)
+
 
 # ---- R5 no grants of its own --------------------------------------------------------------------------------
 
