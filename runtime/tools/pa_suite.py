@@ -140,7 +140,22 @@ def read_lines(path):
 
 
 def clean(row):
-    return bool(row.get("commit") and row.get("tree")) and row.get("uncommitted") == 0 and row.get("untracked") == 0
+    return (bool(row.get("commit") and row.get("tree")) and row.get("uncommitted") == 0 and row.get("untracked") == 0
+            and not row.get("moved"))
+
+
+def moved(before, after):
+    """The repos whose commit, tree or uncommitted count differ between two pins() lists, as text; '' when none."""
+    key = lambda p: (p.get("commit"), p.get("tree"), p.get("uncommitted"))
+    was = {p["repo"]: p for p in before}
+    now = {p["repo"]: p for p in after}
+    changed = []
+    for repo in sorted(set(was) | set(now)):
+        a, b = was.get(repo, {}), now.get(repo, {})
+        if key(a) != key(b):
+            changed.append("{}: commit {} tree {} uncommitted {} -> commit {} tree {} uncommitted {}".format(
+                repo, a.get("commit"), a.get("tree"), a.get("uncommitted"), b.get("commit"), b.get("tree"), b.get("uncommitted")))
+    return "; ".join(changed)
 
 
 def reusable(rows, found, command):
@@ -250,7 +265,7 @@ def full_suite(h, args):
     os.makedirs(evidence, exist_ok=True)
     build_log = os.path.join(evidence, "build.log")
     where = suites_path(h, directory)
-    found = pins(h, record["root"])
+    found = pins(h, record["root"])  # for the check before queueing only: pinned again once the slot is taken
 
     def reuse():
         if getattr(args, "again", False):
@@ -277,21 +292,28 @@ def full_suite(h, args):
         return sys.exit(124)
     try:
         waited = round(time.time() - queued, 1)
+        found = pins(h, record["root"])  # MF-1: what runs is the tree at this point, not the one before the wait
         if reuse():  # a run of the same tree may have passed while this one waited
             return sys.exit(0)
         start, load, began = pa.now(), load_now(), time.time()
         code, out = h.run_shell(command, record["root"], [], 3600)
         seconds, end = round(time.time() - began, 1), pa.now()
+        change = moved(found, pins(h, record["root"]))
     finally:
         release(slot)
     with open(build_log, "a") as f:
         f.write("=== {} full suite: `{}` in {} -> exit {} after {:.0f}s ===\n{}\n".format(end, command, record["root"], code, seconds, h.tail(out, 200)))
     extra = {"run": uuid.uuid4().hex[:12], "start": start, "end": end, "waited": waited, "load": load, "parts": parse_parts(out)}
+    if change:  # recorded under the tree the run started on, marked so it is never reused
+        extra["moved"] = True
     try:
         h.suite_record(directory, record, command, code, seconds, found, extra)
         recorded = "recorded in " + where
     except OSError as e:
         recorded = "could not record the run in {} ({})".format(where, e)
     print(h.tail(out, 40))
+    if change:
+        print("pa-full-suite: the worktree changed during the run ({}); the run is recorded under the tree it started "
+              "on with moved: true and is never reused; run pa-full-suite again for the new tree".format(change))
     print("full suite exit {} (appended to {}; {})".format(code, build_log, recorded))
     return sys.exit(code)
