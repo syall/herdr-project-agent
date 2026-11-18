@@ -5683,6 +5683,807 @@ class J2A_Keys(CostsBase):
         self.assertEqual(self.look(t, "model-a", None)[0], 1.0)
 
 
+# ---- t-032 J2b: pa-costs prices fetch (R-F1-F4, R-S1-S5, R-T1, A-F1-F4, A-S); no network: an injected opener --------
+
+FETCH_SAMPLES = os.path.join(SAMPLES, "prices-fetch")
+URL_A = "https://prices.example.test/list/region-a/index.json"
+URL_B = "https://prices.example.test/list/region-b/index.json"
+FETCH_NOW = T0  # 2026-11-17 (UTC)
+
+
+def fetch_sample(name):
+    return load(os.path.join(FETCH_SAMPLES, name))
+
+
+def source_decl(**over):
+    decl = {"label": "Neutral list", "providers": ["provider-a"],
+            "defaultScope": {"provider": "provider-a", "endpoint": "global", "region": None, "account": None},
+            "urls": {"region-a": {"url": URL_A, "region": "region-a", "maxBytes": 100000},
+                     "region-b": {"url": URL_B, "region": "region-b", "maxBytes": 100000}},
+            "defaultRegion": "region-a", "regionFree": ["global"],
+            "read": ["prices/reader_stub.py", "--file", "{file}", "--region", "{region}"], "currency": "USD"}
+    decl.update(over)
+    return decl
+
+
+class FakeResponse:
+    def __init__(self, status, headers, body, chunks=None, on_read=None):
+        self.status, self.headers, self.body, self.pos = status, headers, body, 0
+        self.chunks, self.on_read, self.closed = chunks, on_read, False
+
+    def getcode(self):
+        return self.status
+
+    def read(self, n=-1):
+        if self.on_read:
+            self.on_read()
+        size = self.chunks or n
+        if n is not None and n >= 0:
+            size = min(size, n)
+        part = self.body[self.pos:self.pos + size] if size and size > 0 else self.body[self.pos:]
+        self.pos += len(part)
+        return part
+
+    def close(self):
+        self.closed = True
+
+
+class FakeHeaders(dict):
+    def get(self, key, default=None):
+        for k, v in self.items():
+            if k.lower() == key.lower():
+                return v
+        return default
+
+
+class J2Base(CostsBase):
+    """A profile `test` declaring source src-a (two neutral regions), the installed-shape price file, the stub reader
+    copied into the profile folder, an opener serving tests/samples/prices-fetch/, and no socket anywhere."""
+
+    def setUp(self):
+        super().setUp()
+        for target in ("socket.socket", "socket.create_connection", "urllib.request.urlopen"):
+            p = mock.patch(target, side_effect=AssertionError("no network in tests: " + target))
+            p.start()
+            self.addCleanup(p.stop)
+        os.makedirs(os.path.join(self.profile_dir, "prices"), exist_ok=True)
+        stub = os.path.join(self.profile_dir, "prices", "reader_stub.py")
+        shutil.copy(os.path.join(FETCH_SAMPLES, "reader_stub.py"), stub)
+        os.chmod(stub, 0o755)
+        self.declare(source_decl())
+        self.prices(fetch_sample("prices-before.json"))
+        self.served = {URL_A: fetch_sample("list-region-a.json"), URL_B: fetch_sample("list-region-b.json")}
+        self.requests, self.responses = [], {}
+        saved_tty = pa_costs.stdin_is_tty
+        pa_costs.stdin_is_tty = lambda: True
+        self.addCleanup(setattr, pa_costs, "stdin_is_tty", saved_tty)
+        self.tmp_before = set(os.listdir(tempfile.gettempdir()))
+
+    def declare(self, *decls, **named):
+        prof = load(os.path.join(self.profile_dir, "profile.json"))
+        sources = dict(named)
+        if decls:
+            sources["src-a"] = decls[0]
+        prof["prices"] = {"sources": sources}
+        dump(prof, os.path.join(self.profile_dir, "profile.json"))
+
+    def target(self):
+        return os.path.join(self.profile_dir, "prices.json")
+
+    def opener(self, request, timeout):
+        self.requests.append((request, timeout))
+        url = request.get_full_url()
+        if url in self.responses:
+            r = self.responses[url]
+            return r() if callable(r) else r
+        value = self.served[url]
+        body = value if isinstance(value, bytes) else json.dumps(value).encode()
+        return FakeResponse(200, FakeHeaders({"Content-Length": str(len(body))}), body)
+
+    def fetch(self, answer="y", **kw):
+        kw.setdefault("opener", self.opener)
+        kw.setdefault("now", FETCH_NOW)
+        asked = []
+
+        def ask(prompt):
+            asked.append(prompt)
+            return answer
+        kw.setdefault("ask", ask)
+        code, out, err = self.run_cmd(pa_costs.prices_fetch, **kw)
+        self.asked = asked
+        return code, out, err
+
+    def snapshot(self):
+        path = self.target()
+        folder = os.path.dirname(path)
+        return raw(path), os.stat(path).st_mtime_ns, sorted(os.listdir(folder))
+
+    def assert_untouched(self, before):
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual([x for x in os.listdir(os.path.dirname(self.target())) if x.endswith(".bak")], [])
+        self.assert_no_temp_left()
+
+    def assert_no_temp_left(self):
+        left = [x for x in set(os.listdir(tempfile.gettempdir())) - self.tmp_before if x.startswith("pa-prices-")]
+        self.assertEqual(left, [])
+
+    def written(self):
+        return load(self.target())
+
+    def scoped(self, value, scope):
+        for e in value.get("scoped") or []:
+            if tuple(e.get(f) for f in pa_costs.SCOPE_FIELDS) == scope:
+                return e["models"]
+        return None
+
+
+class J2S_Decl(J2Base):
+    def test_j2d1_a_good_declaration(self):
+        sources, problems = pa_costs.price_sources(pa.load_profile("test"))
+        self.assertEqual(problems, [])
+        self.assertEqual(sorted(sources), ["src-a"])
+        self.assertEqual(sources["src-a"]["defaultRegion"], "region-a")
+
+    def test_j2d2_each_bad_declaration_is_refused_and_nothing_is_downloaded(self):
+        url = lambda u: {"region-a": {"url": u, "region": "region-a", "maxBytes": 1000}}  # noqa: E731
+        bad = {"unknown key": {"color": "x"}, "http": {"urls": url("http://prices.example.test/a.json"), "defaultRegion": "region-a"},
+               "ip": {"urls": url("https://192.0.2.1/a.json"), "defaultRegion": "region-a"},
+               "ipv6": {"urls": url("https://[2001:db8::1]/a.json"), "defaultRegion": "region-a"},
+               "localhost": {"urls": url("https://localhost/a.json"), "defaultRegion": "region-a"},
+               "port": {"urls": url("https://prices.example.test:8443/a.json"), "defaultRegion": "region-a"},
+               "userinfo": {"urls": url("https://u:p@prices.example.test/a.json"), "defaultRegion": "region-a"},
+               "query": {"urls": url("https://prices.example.test/a.json?x=1"), "defaultRegion": "region-a"},
+               "no dot": {"urls": url("https://prices/a.json"), "defaultRegion": "region-a"},
+               "too big": {"urls": {"region-a": {"url": URL_A, "region": "region-a", "maxBytes": 60 * 1024 * 1024}}, "defaultRegion": "region-a"},
+               "no maxBytes": {"urls": {"region-a": {"url": URL_A, "region": "region-a"}}, "defaultRegion": "region-a"},
+               "read outside": {"read": ["../outside.py", "--file", "{file}"]},
+               "read empty": {"read": []},
+               "defaultRegion": {"defaultRegion": "region-z"},
+               "bad provider": {"providers": ["Bad Label!"]}, "no providers": {"providers": []},
+               "twelve": {"label": "acct " + "12345" + "6789012"},
+               "bad regex": {"models": {"include": ["("]}},
+               "bad currency": {"currency": "usd"}}
+        for why, over in sorted(bad.items()):
+            with self.subTest(why=why):
+                self.declare(source_decl(**over))
+                sources, problems = pa_costs.price_sources(pa.load_profile("test"))
+                self.assertEqual(sources, {}, why)
+                self.assertTrue(problems and "src-a" in problems[0], (why, problems))
+                before = self.snapshot()
+                code, _out, err = self.fetch(source="src-a")
+                self.assertIn(code, (1, 3), (why, err))
+                self.assertEqual(self.requests, [], why)
+                self.assert_untouched(before)
+
+    def test_j2d3_prices_lists_the_declared_sources(self):
+        _code, out, _err = self.run_cmd(pa_costs.cmd_prices, self.dir)
+        self.assertIn("Sources:", out)
+        self.assertIn("src-a (Neutral list): 2 files", out)
+        self.declare(source_decl(color="x"))
+        _code, out, _err = self.run_cmd(pa_costs.cmd_prices, self.dir)
+        self.assertIn("src-a", out)
+        self.assertIn("color", out)
+
+    def test_j2d4_check_url_table(self):
+        self.assertIsNone(pa_costs.check_url(URL_A))
+        for u in ("http://a.example.test/x", "https://a.example.test:443/x", "https://127.0.0.1/x", "https://a.localhost/x",
+                  "https://a.example.test/x#f", "ftp://a.example.test/x", "file:///etc/passwd", "https://a_b.example.test/x",
+                  "https://a.example.test/" + "12345" + "6789012", "https://a.example.test/" + "x" * 3000, ""):
+            self.assertIsNotNone(pa_costs.check_url(u), u)
+
+
+class J2S_Net(J2Base):
+    def test_j2n1_a_redirect_is_a_failure_naming_its_target(self):
+        for status in (301, 302, 307, 308):
+            self.responses[URL_A] = FakeResponse(status, FakeHeaders({"Location": "https://elsewhere.example.test/x"}), b"")
+            before = self.snapshot()
+            code, _out, err = self.fetch(source="src-a")
+            self.assertEqual(code, 1, err)
+            self.assertIn("elsewhere.example.test", err)
+            self.assertIn("redirect", err)
+            self.assert_untouched(before)
+        handler = pa_costs.NoRedirect()
+        import urllib.request
+        req = urllib.request.Request(URL_A)
+        with self.assertRaises(pa_costs.FetchFailed) as e:
+            handler.redirect_request(req, None, 302, "Found", {"Location": "https://elsewhere.example.test/y"},
+                                     "https://elsewhere.example.test/y")
+        self.assertIn("elsewhere.example.test/y", str(e.exception))
+
+    def test_j2n2_the_real_opener_has_only_the_handlers_it_needs(self):
+        import urllib.request
+        opener = pa_costs.http_opener()
+        names = sorted(type(h).__name__ for h in opener.handlers)
+        self.assertIn("HTTPSHandler", names)
+        self.assertIn("NoRedirect", names)
+        self.assertIn("ProxyHandler", names)
+        for forbidden in ("HTTPHandler", "FileHandler", "FTPHandler", "DataHandler", "HTTPCookieProcessor", "HTTPRedirectHandler",
+                          "HTTPBasicAuthHandler", "ProxyBasicAuthHandler", "HTTPDigestAuthHandler", "UnknownHandler"):
+            self.assertNotIn(forbidden, names)
+        https = [h for h in opener.handlers if isinstance(h, urllib.request.HTTPSHandler)][0]
+        ctx = getattr(https, "_context", None)
+        if ctx is not None:
+            import ssl
+            self.assertEqual(ctx.verify_mode, ssl.CERT_REQUIRED)
+            self.assertTrue(ctx.check_hostname)
+
+    def test_j2n4_the_request_carries_no_credentials(self):
+        self.fetch(source="src-a", dry_run=True)
+        self.assertEqual(len(self.requests), 2)
+        for request, timeout in self.requests:
+            headers = {k.lower(): v for k, v in request.header_items()}
+            self.assertEqual(headers, {"user-agent": "herdr-pa-costs", "accept-encoding": "identity"})
+            self.assertLessEqual(timeout, 20)
+            self.assertIsNone(request.data)
+            self.assertEqual(request.get_method(), "GET")
+
+    def test_j2n5_a_compressed_response_is_refused(self):
+        body = json.dumps(self.served[URL_A]).encode()
+        self.responses[URL_A] = FakeResponse(200, FakeHeaders({"Content-Encoding": "gzip"}), body)
+        before = self.snapshot()
+        code, _out, err = self.fetch(source="src-a")
+        self.assertEqual(code, 1, err)
+        self.assertIn("gzip", err)
+        self.assert_untouched(before)
+
+    def test_j2n6_the_reader_gets_a_minimal_environment(self):
+        os.environ["PA_TEST_READER_CANARY"] = "x"
+        self.addCleanup(os.environ.pop, "PA_TEST_READER_CANARY", None)
+        code, out, err = self.fetch(source="src-a", dry_run=True)
+        self.assertEqual(code, 0, err)
+        env_lines = [x for x in (out + err).splitlines() if "env: " in x]
+        self.assertTrue(env_lines, out + err)
+        for line in env_lines:
+            keys = set(line.split("env: ", 1)[1].split(","))
+            self.assertNotIn("PA_TEST_READER_CANARY", keys)
+            self.assertNotIn("HERDR_PA_HOME", keys)
+            self.assertTrue(keys <= {"PATH", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "HOME", "SYSTEMROOT", "__CF_USER_TEXT_ENCODING"}, keys)
+
+    def test_j2n7_content_length_over_max_is_refused_before_reading(self):
+        read = []
+        self.responses[URL_A] = FakeResponse(200, FakeHeaders({"Content-Length": "100001"}), b"x" * 10, on_read=lambda: read.append(1))
+        before = self.snapshot()
+        code, _out, err = self.fetch(source="src-a")
+        self.assertEqual(code, 1, err)
+        self.assertIn("100000", err)
+        self.assertEqual(read, [])
+        self.assert_untouched(before)
+
+    def test_j2n8_a_stream_over_max_is_refused_at_the_chunk_that_passes_it(self):
+        resp = FakeResponse(200, FakeHeaders({}), b"x" * 300000, chunks=65536)
+        self.responses[URL_A] = resp
+        before = self.snapshot()
+        code, _out, err = self.fetch(source="src-a")
+        self.assertEqual(code, 1, err)
+        self.assertIn("more than", err)
+        self.assertLessEqual(resp.pos, 100000 + 65536)
+        self.assert_untouched(before)
+
+    def test_j2n9_past_the_whole_fetch_budget_is_refused(self):
+        ticks = {"t": 0.0}
+
+        def clock():
+            return ticks["t"]
+
+        def slow():
+            ticks["t"] += 50.0
+        body = json.dumps(self.served[URL_A]).encode()
+        self.responses[URL_A] = lambda: FakeResponse(200, FakeHeaders({}), body, chunks=512, on_read=slow)
+        before = self.snapshot()
+        code, _out, err = self.fetch(source="src-a", clock=clock)
+        self.assertEqual(code, 3, err)
+        self.assertIn("120", err)
+        self.assert_untouched(before)
+
+    def test_j2n10_the_temp_folder_is_gone_after_success_and_failure(self):
+        self.assertEqual(self.fetch(source="src-a", yes=True)[0], 0)
+        self.assert_no_temp_left()
+        self.served[URL_B] = {"raw": "not json\n", "exit": 0}
+        self.assertEqual(self.fetch(source="src-a", yes=True)[0], 4)
+        self.assert_no_temp_left()
+
+    def test_j2n11_a_status_other_than_200_fails(self):
+        self.responses[URL_B] = FakeResponse(404, FakeHeaders({}), b"no")
+        before = self.snapshot()
+        code, _out, err = self.fetch(source="src-a")
+        self.assertEqual(code, 1, err)
+        self.assertIn("404", err)
+        self.assert_untouched(before)
+
+    def test_j2n12_no_socket_is_opened(self):
+        import socket
+        with self.assertRaises(AssertionError):
+            socket.socket()
+        self.assertEqual(self.fetch(source="src-a", yes=True)[0], 0)
+
+
+class J2S_Person(J2Base):
+    def test_j2p1_refused_inside_an_agent_before_anything(self):
+        for marker in pa_costs.AGENT_MARKERS:
+            for dry in (False, True):
+                os.environ[marker] = "1"
+                try:
+                    before = self.snapshot()
+                    code, _out, err = self.fetch(source="src-a", dry_run=dry)
+                finally:
+                    os.environ.pop(marker)
+                self.assertEqual(code, 3, (marker, err))
+                self.assertIn("person", err)
+                self.assertEqual(self.requests, [])
+                self.assert_untouched(before)
+
+    def test_j2p2_refused_in_a_worker_terminal(self):
+        self.hc.terminals["w9"] = {"address": "w9", "labels": {"herdr.pa": "sp1"}}
+        os.environ["HC_TERMINAL_ID"] = "w9"
+        self.addCleanup(os.environ.pop, "HC_TERMINAL_ID", None)
+        before = self.snapshot()
+        code, _out, err = self.fetch(source="src-a", dry_run=True)
+        self.assertEqual(code, 3, err)
+        self.assertEqual(self.requests, [])
+        self.assert_untouched(before)
+
+    def guard(self, command):
+        return W_CloseAndGuard.guard(self, command)
+
+    def test_j2p3_the_guard_refuses_the_fetch_and_allows_the_listing(self):
+        tool = "pa-" + "costs"
+        for command in (tool + " prices fetch", tool + " prices fetch --dry-run", tool + " prices --space sp1 fetch --dry-run",
+                        tool + " 'prices' fetch", tool + ' prices "fetch" --yes', "cd /tmp && " + tool + " prices\\ fetch",
+                        "~/.local/bin/" + tool + " prices fetch --source s --into /x/prices.json"):
+            code, err = self.guard(command)
+            self.assertEqual(code, 2, command)
+            self.assertIn("price fetch", err, command)
+        for command in (tool + " prices", tool + " prices --space sp1", tool + " report", tool + " collect --space sp1 --quiet"):
+            self.assertEqual(self.guard(command)[0], 0, command)
+
+
+def reader_lines(*lines, done=True, url=URL_A):
+    out = "".join(json.dumps(x) + "\n" for x in lines)
+    if done:
+        out += json.dumps({"done": True, "source": {"url": url, "version": "v1", "publicationDate": "2026-11-01T12:00:00Z"}}) + "\n"
+    return out
+
+
+def rline(**over):
+    line = {"provider": "provider-a", "account": None, "endpoint": "global", "region": None, "model": "model-a", "kind": "in",
+            "price": 1.5, "effectiveDate": "2026-11-01", "ref": {"sku": "S1", "usagetype": "u", "rateCode": "r", "raw": "1.5"}}
+    line.update(over)
+    return line
+
+
+class J2R_Reader(J2Base):
+    def run_raw(self, text, code=0):
+        self.served[URL_A] = {"raw": text, "exit": code}
+        before = self.snapshot()
+        result = self.fetch(source="src-a", yes=True)
+        return result, before
+
+    def test_j2r1_a_good_batch_is_read(self):
+        code, out, err = self.fetch(source="src-a", dry_run=True)
+        self.assertEqual(code, 0, err)
+        self.assertIn(URL_A, out)
+        self.assertIn("v-2026-11-01", out)
+
+    def test_j2r2_each_breach_refuses_the_whole_batch(self):
+        no_kind = rline()
+        del no_kind["kind"]
+        null_no_why = rline(price=None)
+        cases = {"not json": "{oops\n" + reader_lines(), "missing field": reader_lines(no_kind),
+                 "unknown field": reader_lines(rline(color="x")), "bad kind": reader_lines(rline(kind="cw2h")),
+                 "nan": reader_lines(rline()).replace("1.5,", "NaN,", 1), "inf": reader_lines(rline()).replace("1.5,", "Infinity,", 1),
+                 "negative": reader_lines(rline(price=-1)), "bool": reader_lines(rline(price=True)),
+                 "null without why": reader_lines(null_no_why),
+                 "repeat": reader_lines(rline(), rline()), "bad model": reader_lines(rline(model="model a")),
+                 "twelve": reader_lines(rline(ref={"sku": "12345" + "6789012"})), "no done": reader_lines(rline(), done=False),
+                 "done url": reader_lines(rline(), url="https://other.example.test/x.json"),
+                 "region": reader_lines(rline(endpoint="regional", region="region-b")),
+                 "provider": reader_lines(rline(provider="provider-z")), "bad date": reader_lines(rline(effectiveDate="2026-11")),
+                 "done twice": reader_lines(rline()) + reader_lines(), "line after done": reader_lines(rline()) + json.dumps(rline(kind="out")) + "\n"}
+        for why, text in sorted(cases.items()):
+            with self.subTest(why=why):
+                (code, _out, err), before = self.run_raw(text)
+                self.assertEqual(code, 4, (why, err))
+                self.assert_untouched(before)
+
+    def test_j2r3_currency_differs_from_the_file(self):
+        self.declare(source_decl(currency="EUR"))
+        before = self.snapshot()
+        code, _out, err = self.fetch(source="src-a", yes=True)
+        self.assertEqual(code, 1, err)
+        self.assertIn("EUR", err)
+        self.assertEqual(self.requests, [])
+        self.assert_untouched(before)
+
+    def test_j2r15_reader_exit_6_is_exit_4(self):
+        self.served[URL_A] = {"format": "something-else"}
+        before = self.snapshot()
+        code, _out, err = self.fetch(source="src-a", yes=True)
+        self.assertEqual(code, 4, err)
+        self.assertIn("format", err)
+        self.assert_untouched(before)
+
+    def test_j2r16_reader_failure_timeout_or_too_much_is_exit_1(self):
+        (code, _out, err), before = self.run_raw(reader_lines(rline()), code=1)
+        self.assertEqual(code, 1, err)
+        self.assert_untouched(before)
+        saved = pa_costs.run_script
+        for outcome in ("timeout", "toolarge"):
+            pa_costs.run_script = lambda *a, **k: (outcome, "", [])
+            try:
+                before = self.snapshot()
+                code, _out, err = self.fetch(source="src-a", yes=True)
+            finally:
+                pa_costs.run_script = saved
+            self.assertEqual(code, 1, (outcome, err))
+            self.assert_untouched(before)
+
+    def test_j2r17_a_timestamp_version_is_not_an_account_number(self):
+        self.served[URL_A] = dict(self.served[URL_A], version="20261101120000")
+        code, _out, err = self.fetch(source="src-a", yes=True)
+        self.assertEqual(code, 0, err)
+        rows = self.written()["models"]["model-b"]
+        self.assertEqual(rows[-1]["fetched"]["version"], "20261101120000")
+
+
+class J2C_Rules(J2Base):
+    def change_a_global(self, prices, effective="2026-11-01", regions=("region-a", "region-b")):
+        for url in (URL_A, URL_B):
+            value = json.loads(json.dumps(self.served[url]))
+            for r in value["rows"]:
+                if r["model"] == "model-a" and r["endpoint"] == "global":
+                    r["price"] = prices.get(r["kind"], r["price"])
+                    r["effective"] = effective
+            self.served[url] = value
+
+    def old_rows_kept(self, before, after):
+        """Every row the file had is in the new file, unchanged and at its place (R-F4: never edited)."""
+        for model, rows in before["models"].items():
+            self.assertEqual(after["models"][model][:len(rows)], rows, model)
+        for e in before.get("scoped") or []:
+            scope = tuple(e.get(f) for f in pa_costs.SCOPE_FIELDS)
+            for model, rows in e["models"].items():
+                self.assertEqual(self.scoped(after, scope)[model][:len(rows)], rows, (scope, model))
+        for k, v in before.items():
+            if k not in ("models", "scoped", "defaultScope", "source", "asOf"):
+                self.assertEqual(after[k], v, k)
+
+    def test_j2c1_no_rows_yet_adds_one_from_the_effective_date(self):
+        before = self.written()
+        code, out, err = self.fetch(source="src-a", yes=True)
+        self.assertEqual(code, 0, err)
+        after = self.written()
+        b = after["models"]["model-b"]
+        self.assertEqual(len(b), 1)
+        self.assertEqual(b[0]["validFrom"], "2026-11-01")
+        self.assertEqual((b[0]["in"], b[0]["out"], b[0]["cw5m"], b[0]["cw1h"], b[0]["cr"]), (2.0, 20.0, 4.0, None, 1.0))
+        self.assertIn("cw1h", b[0]["why"])
+        self.assertEqual(b[0]["provider"], "provider-a")
+        self.assertEqual((b[0]["endpoint"], b[0]["region"]), ("global", None))
+        self.assertEqual(b[0]["source"], "Neutral list")
+        self.assertEqual(b[0]["fetched"]["url"], URL_A)
+        self.assertEqual(b[0]["fetched"]["publicationDate"], "2026-11-01T12:00:00Z")
+        self.assertEqual(len(b[0]["fetched"]["sha256"]), 64)
+        self.assertEqual(b[0]["refs"]["in"]["sku"], "SKU-model-b")
+        self.old_rows_kept(before, after)
+        table, problem = pa_costs.load_prices(pa.load_profile("test"))
+        self.assertIsNone(problem)
+        self.assertEqual(table["warnings"], [])
+
+    def test_j2c2_same_prices_change_nothing(self):
+        self.fetch(source="src-a", yes=True)
+        after = self.written()
+        self.assertEqual(len(after["models"]["model-a"]), 1)  # the global model-a equals the file's: no row added
+        self.assertEqual(after["models"]["model-a"][0]["source"], "by hand")  # provenance not rewritten
+
+    def test_j2c3_a_change_after_the_latest_row_is_added_at_the_effective_date(self):
+        before = self.written()
+        self.change_a_global({"in": 1.5})
+        code, out, err = self.fetch(source="src-a", yes=True)
+        self.assertEqual(code, 0, err)
+        rows = self.written()["models"]["model-a"]
+        self.assertEqual([r["validFrom"] for r in rows], ["2026-01-01", "2026-11-01"])
+        self.assertEqual((rows[1]["in"], rows[1]["out"]), (1.5, 10.0))
+        self.assertIn("model-a / in: 1.0 → 1.5 (validFrom 2026-11-01)", out)
+        self.old_rows_kept(before, self.written())
+
+    def test_j2c4_an_earlier_effective_date_is_added_from_today(self):
+        self.change_a_global({"in": 1.5}, effective="2025-06-01")
+        code, out, _err = self.fetch(source="src-a", yes=True)
+        self.assertEqual(code, 0)
+        rows = self.written()["models"]["model-a"]
+        self.assertEqual(rows[-1]["validFrom"], "2026-11-17")
+        self.assertIn("source effective 2025-06-01 is before your row of 2026-01-01: added from today", out)
+
+    def test_j2c5_a_model_not_in_the_source_is_kept_and_listed(self):
+        code, out, _err = self.fetch(source="src-a", yes=True)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.written()["models"]["model-old"], fetch_sample("prices-before.json")["models"]["model-old"])
+        self.assertIn("not in source", out)
+        self.assertIn("model-old", out)
+
+    def test_j2c6_a_null_never_removes_a_price(self):
+        self.change_a_global({"cw1h": None})
+        code, out, _err = self.fetch(source="src-a", yes=True)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(self.written()["models"]["model-a"]), 1)
+        self.assertIn("model-a / cw1h: kept 4.0 (source has no price: no cw1h row in the list)", out)
+
+    def test_j2c7_a_null_beside_a_change_carries_the_files_number(self):
+        self.change_a_global({"cw1h": None, "in": 1.5})
+        self.fetch(source="src-a", yes=True)
+        row = self.written()["models"]["model-a"][-1]
+        self.assertEqual((row["in"], row["cw1h"]), (1.5, 4.0))
+
+    def test_j2c9_a_second_identical_fetch_writes_nothing(self):
+        self.assertEqual(self.fetch(source="src-a", yes=True)[0], 0)
+        before = self.snapshot()
+        code, out, _err = self.fetch(source="src-a", yes=True)
+        self.assertEqual(code, 0)
+        self.assertIn("no change", out)
+        self.assertEqual(self.asked, [])
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(len([x for x in before[2] if x.endswith(".bak")]), 1)
+
+    def test_j2c10_source_and_as_of_only_when_the_default_scope_changed(self):
+        value = fetch_sample("prices-before.json")
+        value["defaultScope"] = {"provider": "provider-a", "endpoint": "global", "region": None, "account": None}
+        value["models"]["model-b"] = [{"validFrom": "2026-01-01", "in": 2.0, "out": 20.0, "cw5m": 4.0, "cw1h": None, "cr": 1.0}]
+        self.prices(value)
+        self.fetch(source="src-a", yes=True)
+        after = self.written()
+        self.assertEqual((after["source"], after["asOf"]), ("entered by hand", "2026-01-01"))
+        self.assertIsNotNone(self.scoped(after, ("provider-a", "regional", "region-a", None)))
+        self.change_a_global({"in": 1.5})
+        self.fetch(source="src-a", yes=True)
+        after = self.written()
+        self.assertIn(URL_A, after["source"])
+        self.assertEqual(after["asOf"], "2026-11-01")
+
+    def test_j2c11_a_row_later_than_today_is_never_shadowed(self):
+        value = fetch_sample("prices-before.json")
+        value["models"]["model-a"].append({"validFrom": "2026-12-01", "in": 1.0, "out": 10.0, "cw5m": 2.0, "cw1h": 4.0, "cr": 0.5})
+        self.prices(value)
+        self.change_a_global({"in": 1.5}, effective="2026-11-01")
+        code, out, _err = self.fetch(source="src-a", yes=True)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(self.written()["models"]["model-a"]), 2)
+        self.assertIn("your row of 2026-12-01 is later than today", out)
+
+    def test_j2c12_two_regions_one_region_free_scope_and_two_regional(self):
+        code, out, err = self.fetch(source="src-a", yes=True)
+        self.assertEqual(code, 0, err)
+        after = self.written()
+        self.assertEqual(after["defaultScope"], {"provider": "provider-a", "endpoint": "global", "region": None, "account": None})
+        b = after["models"]["model-b"][0]
+        self.assertEqual([x["region"] for x in b["refs"]["in"]["sameIn"]], ["region-b"])
+        ra = self.scoped(after, ("provider-a", "regional", "region-a", None))
+        rb = self.scoped(after, ("provider-a", "regional", "region-b", None))
+        self.assertEqual(ra["model-a"][0]["in"], 1.1)
+        self.assertEqual(rb["model-a"][0]["in"], 1.2)
+        self.assertEqual((rb["model-a"][0]["endpoint"], rb["model-a"][0]["region"]), ("regional", "region-b"))
+        self.assertEqual(rb["model-a"][0]["fetched"]["url"], URL_B)
+        self.assertIsNone(self.scoped(after, ("provider-a", "global", "region-b", None)))
+        table, problem = pa_costs.load_prices(pa.load_profile("test"))
+        self.assertIsNone(problem)
+        when = "2026-11-17T10:00:00Z"
+        self.assertEqual(pa_costs.price_for(table, "model-a", when, ("provider-a", "regional", "region-b", None))["in"], 1.2)
+        self.assertIsNone(pa_costs.price_for(table, "model-a", when, ("provider-a", "regional", "region-c", None)))
+        self.assertEqual(pa_costs.price_for(table, "model-a", when, ("provider-a", "global", "region-b", None))["in"], 1.0)
+
+    def test_j2c13_a_region_whose_global_row_differs_gets_its_own_scope(self):
+        self.served[URL_B] = fetch_sample("list-region-b-global-differs.json")
+        code, out, _err = self.fetch(source="src-a", yes=True)
+        self.assertEqual(code, 0)
+        after = self.written()
+        gb = self.scoped(after, ("provider-a", "global", "region-b", None))
+        self.assertEqual(gb["model-a"][0]["in"], 0.9)
+        self.assertNotIn("model-b", gb)
+        self.assertIn("differs in region-b", out)
+
+    def test_j2c14_a_model_only_in_another_regions_free_rows_gets_that_region(self):
+        self.served[URL_B] = fetch_sample("list-region-b-third-model.json")
+        self.fetch(source="src-a", yes=True)
+        after = self.written()
+        self.assertNotIn("model-c", after["models"])
+        self.assertEqual(self.scoped(after, ("provider-a", "global", "region-b", None))["model-c"][0]["in"], 5.0)
+
+    def test_j2c15_identical_multi_region_fetch_writes_nothing_the_second_time(self):
+        self.served[URL_B] = fetch_sample("list-region-b-global-differs.json")
+        self.fetch(source="src-a", yes=True)
+        before = self.snapshot()
+        code, out, _err = self.fetch(source="src-a", yes=True)
+        self.assertEqual(code, 0)
+        self.assertIn("no change", out)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_j2c16_model_limits_leave_models_out_and_never_remove(self):
+        self.served[URL_B] = fetch_sample("list-region-b-third-model.json")
+        self.declare(source_decl(models={"include": ["^model-"], "exclude": ["^model-b$"], "onlyWithEndpoint": "regional"}))
+        code, out, _err = self.fetch(source="src-a", yes=True)
+        self.assertEqual(code, 0)
+        after = self.written()
+        self.assertNotIn("model-b", after["models"])
+        self.assertIsNone((self.scoped(after, ("provider-a", "global", "region-b", None)) or {}).get("model-c"))
+        self.assertIn("excluded by the profile: model-b, model-c", out)
+        self.assertEqual(self.scoped(after, ("provider-a", "regional", "region-a", None))["model-a"][0]["in"], 1.1)
+
+    def test_j2c17_the_first_fetch_writes_the_declared_default_scope(self):
+        code, out, _err = self.fetch(source="src-a", yes=True)
+        self.assertEqual(code, 0)
+        self.assertEqual(out.splitlines()[[i for i, x in enumerate(out.splitlines()) if "default scope" in x][0]].split(":")[0], "default scope")
+        self.assertIn("default scope: none → provider-a · global · * · *", out)
+        self.assertEqual(self.written()["defaultScope"]["endpoint"], "global")
+
+    def test_j2c18_a_file_with_another_default_scope_keeps_it(self):
+        value = fetch_sample("prices-before.json")
+        value["defaultScope"] = {"provider": "provider-a", "endpoint": None, "region": None, "account": None}
+        self.prices(value)
+        self.fetch(source="src-a", yes=True)
+        after = self.written()
+        self.assertEqual(after["defaultScope"], value["defaultScope"])
+        self.assertEqual(after["models"], value["models"])
+        self.assertEqual(self.scoped(after, ("provider-a", "global", None, None))["model-b"][0]["in"], 2.0)
+
+
+class J2F_Flow(J2Base):
+    def test_j2f1_dry_run_prints_and_writes_nothing(self):
+        before = self.snapshot()
+        code, out, err = self.fetch(source="src-a", dry_run=True)
+        self.assertEqual(code, 0, err)
+        self.assertIn("model-b", out)
+        self.assertIn("dry run", out)
+        self.assertEqual(self.asked, [])
+        self.assert_untouched(before)
+
+    def test_j2f2_yes_at_the_question_writes_with_a_backup(self):
+        old = raw(self.target())
+        code, out, err = self.fetch(source="src-a")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(self.asked), 1)
+        self.assertIn("[y/N]", self.asked[0])
+        self.assertIn(self.target(), self.asked[0])
+        baks = [x for x in os.listdir(self.profile_dir) if x.endswith(".bak")]
+        self.assertEqual(baks, ["prices.json.20261117T000000Z.bak"])
+        self.assertEqual(raw(os.path.join(self.profile_dir, baks[0])), old)
+        self.assertIn("installed profile", out + err)  # the warning: the next install overwrites it
+
+    def test_j2f3_no_at_the_question_is_exit_5(self):
+        before = self.snapshot()
+        code, _out, _err = self.fetch(source="src-a", answer="n")
+        self.assertEqual(code, 5)
+        self.assert_untouched(before)
+
+    def test_j2f4_yes_flag_skips_the_question(self):
+        code, _out, _err = self.fetch(source="src-a", yes=True)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.asked, [])
+        self.assertIn("model-b", self.written()["models"])
+
+    def test_j2f5_not_on_a_terminal_without_yes_is_refused(self):
+        pa_costs.stdin_is_tty = lambda: False
+        before = self.snapshot()
+        code, _out, err = self.fetch(source="src-a")
+        self.assertEqual(code, 3, err)
+        self.assertEqual(self.requests, [])
+        self.assert_untouched(before)
+        self.assertEqual(self.fetch(source="src-a", dry_run=True)[0], 0)
+
+    def test_j2f6_two_sources_need_source(self):
+        self.declare(source_decl(), **{"src-b": source_decl(label="Other")})
+        before = self.snapshot()
+        code, _out, err = self.fetch()
+        self.assertEqual(code, 2, err)
+        self.assertIn("--source", err)
+        self.assert_untouched(before)
+        self.declare(source_decl())
+        self.assertEqual(self.fetch(dry_run=True)[0], 0)  # one source: no --source needed
+        self.assertEqual(self.fetch(source="src-z", dry_run=True)[0], 2)
+
+    def test_j2f7_no_source_declared(self):
+        prof = load(os.path.join(self.profile_dir, "profile.json"))
+        del prof["prices"]
+        dump(prof, os.path.join(self.profile_dir, "profile.json"))
+        code, _out, err = self.fetch()
+        self.assertEqual(code, 1)
+        self.assertIn("declares no price source", err)
+
+    def test_j2f8_five_backups_are_kept(self):
+        for i in range(7):
+            self.change_in(1.0 + i / 10.0)
+            self.assertEqual(self.fetch(source="src-a", yes=True, now=FETCH_NOW + i * 86400)[0], 0)
+        baks = sorted(x for x in os.listdir(self.profile_dir) if x.endswith(".bak"))
+        self.assertEqual(len(baks), 5)
+        self.assertEqual(baks[0], "prices.json.20261119T000000Z.bak")
+        self.assertEqual(baks[-1], "prices.json.20261123T000000Z.bak")
+
+    def change_in(self, price):
+        for url in (URL_A, URL_B):
+            value = json.loads(json.dumps(self.served[url]))
+            for r in value["rows"]:
+                if r["model"] == "model-b" and r["kind"] == "in":
+                    r["price"] = price
+            self.served[url] = value
+
+    def test_j2f9_a_failed_replace_leaves_the_old_bytes(self):
+        before = raw(self.target())
+        saved = os.replace
+
+        def boom(a, b):
+            raise OSError("injected")
+        with mock.patch.object(pa_costs.os, "replace", side_effect=boom):
+            code, _out, err = self.fetch(source="src-a", yes=True)
+        self.assertIs(os.replace, saved)
+        self.assertEqual(code, 1, err)
+        self.assertEqual(raw(self.target()), before)
+        self.assertEqual([x for x in os.listdir(self.profile_dir) if ".tmp-" in x], [])
+
+    def test_j2f10_a_file_changed_meanwhile_is_not_overwritten(self):
+        other = dict(fetch_sample("prices-before.json"), note="written by someone else")
+
+        def ask(prompt):
+            dump(other, self.target())
+            return "y"
+        code, _out, err = self.fetch(source="src-a", ask=ask)
+        self.assertEqual(code, 1, err)
+        self.assertIn("changed", err)
+        self.assertEqual(self.written()["note"], "written by someone else")
+
+    def test_j2f11_a_symlink_target_is_refused(self):
+        real = os.path.join(TMP, "real-prices.json")
+        shutil.copy(self.target(), real)
+        link = os.path.join(TMP, "link-prices.json")
+        if os.path.lexists(link):
+            os.unlink(link)
+        os.symlink(real, link)
+        code, _out, err = self.fetch(source="src-a", yes=True, into=link)
+        self.assertEqual(code, 1, err)
+        self.assertIn("link", err)
+        self.assertTrue(os.path.islink(link))
+        self.assertEqual(self.requests, [])
+
+    def test_j2f12_a_file_with_a_skipped_scoped_entry_is_refused(self):
+        value = fetch_sample("prices-before.json")
+        value["scoped"] = [{"provider": "provider-a", "tier": "x", "models": {}}]
+        self.prices(value)
+        before = self.snapshot()
+        code, _out, err = self.fetch(source="src-a", yes=True)
+        self.assertEqual(code, 1, err)
+        self.assertIn("scoped[0]", err)
+        self.assertEqual(self.requests, [])
+        self.assert_untouched(before)
+
+    def test_j2f13_into_another_file(self):
+        folder = os.path.join(TMP, "checkout", "profiles", "test")
+        os.makedirs(folder, exist_ok=True)
+        into = os.path.join(folder, "prices.json")
+        dump(fetch_sample("prices-before.json"), into)
+        installed = raw(self.target())
+        code, out, err = self.fetch(source="src-a", yes=True, into=into)
+        self.assertEqual(code, 0, err)
+        self.assertIn("model-b", load(into)["models"])
+        self.assertEqual(raw(self.target()), installed)
+        self.assertNotIn("installed profile", out + err)
+
+    def test_j2f14_the_cli(self):
+        self.assertEqual(self.run_cmd(pa_costs.main, ["prices", "fetch", "--bogus"])[0], 2)
+        self.assertEqual(self.run_cmd(pa_costs.main, ["prices", "--yes"])[0], 2)  # fetch options without fetch
+        fake = mock.Mock()
+        fake.open = lambda request, timeout: self.opener(request, timeout)
+        with mock.patch.object(pa_costs, "http_opener", return_value=fake):
+            code, out, err = self.run_cmd(pa_costs.main, ["prices", "fetch", "--source", "src-a", "--dry-run"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("dry run", out)
+        self.assertEqual(len(self.requests), 2)
+        self.assertEqual(self.run_cmd(pa_costs.main, ["prices", "--space", "sp1"])[0], 0)
+
+    def test_j2f15_readme_names_the_fetch(self):
+        with open(os.path.join(HERE, "..", "README.md")) as f:
+            readme = f.read()
+        for want in ("pa-costs prices fetch", "prices.sources", "--into", "--dry-run", "maxBytes", "regionFree", "defaultRegion",
+                     "effectiveDate"):
+            self.assertIn(want, readme)
+
+
 class ZZ_V1_Privacy(unittest.TestCase):
     """Run last: the canary of every fixture reached no file under costs/ or billing/ and no captured output."""
 

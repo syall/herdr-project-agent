@@ -1,0 +1,40 @@
+{
+ "v": 1,
+ "currency": "USD",
+ "unit": "per-1M-tokens",
+ "source": "entered by hand",
+ "asOf": "2026-01-01",
+ "note": "t-032 J2 test fixture: the installed shape (no defaultScope); neutral names only",
+ "unverified": [
+  "a note kept as it is"
+ ],
+ "models": {
+  "model-a": [
+   {
+    "validFrom": "2026-01-01",
+    "in": 1.0,
+    "out": 10.0,
+    "cw5m": 2.0,
+    "cw1h": 4.0,
+    "cr": 0.5,
+    "source": "by hand"
+   }
+  ],
+  "model-old": [
+   {
+    "validFrom": "2026-01-01",
+    "in": 3.0,
+    "out": 30.0,
+    "cw5m": 6.0,
+    "cw1h": 12.0,
+    "cr": 1.5
+   }
+  ]
+ },
+ "aliases": [
+  {
+   "match": "^model-a-",
+   "model": "model-a"
+  }
+ ]
+}

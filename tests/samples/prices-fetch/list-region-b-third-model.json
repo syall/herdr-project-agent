@@ -1,0 +1,150 @@
+{
+ "format": "neutral-list-1",
+ "url": "https://prices.example.test/list/region-b/index.json",
+ "version": "v-2026-11-01",
+ "publication": "2026-11-01T12:00:00Z",
+ "effective": "2026-11-01",
+ "rows": [
+  {
+   "provider": "provider-a",
+   "endpoint": "global",
+   "model": "model-a",
+   "kind": "in",
+   "price": 1.0
+  },
+  {
+   "provider": "provider-a",
+   "endpoint": "global",
+   "model": "model-a",
+   "kind": "out",
+   "price": 10.0
+  },
+  {
+   "provider": "provider-a",
+   "endpoint": "global",
+   "model": "model-a",
+   "kind": "cw5m",
+   "price": 2.0
+  },
+  {
+   "provider": "provider-a",
+   "endpoint": "global",
+   "model": "model-a",
+   "kind": "cw1h",
+   "price": 4.0
+  },
+  {
+   "provider": "provider-a",
+   "endpoint": "global",
+   "model": "model-a",
+   "kind": "cr",
+   "price": 0.5
+  },
+  {
+   "provider": "provider-a",
+   "endpoint": "global",
+   "model": "model-b",
+   "kind": "in",
+   "price": 2.0
+  },
+  {
+   "provider": "provider-a",
+   "endpoint": "global",
+   "model": "model-b",
+   "kind": "out",
+   "price": 20.0
+  },
+  {
+   "provider": "provider-a",
+   "endpoint": "global",
+   "model": "model-b",
+   "kind": "cw5m",
+   "price": 4.0
+  },
+  {
+   "provider": "provider-a",
+   "endpoint": "global",
+   "model": "model-b",
+   "kind": "cw1h",
+   "price": null,
+   "why": "no cw1h row in the list"
+  },
+  {
+   "provider": "provider-a",
+   "endpoint": "global",
+   "model": "model-b",
+   "kind": "cr",
+   "price": 1.0
+  },
+  {
+   "provider": "provider-a",
+   "endpoint": "regional",
+   "model": "model-a",
+   "kind": "in",
+   "price": 1.2
+  },
+  {
+   "provider": "provider-a",
+   "endpoint": "regional",
+   "model": "model-a",
+   "kind": "out",
+   "price": 12.0
+  },
+  {
+   "provider": "provider-a",
+   "endpoint": "regional",
+   "model": "model-a",
+   "kind": "cw5m",
+   "price": 2.4
+  },
+  {
+   "provider": "provider-a",
+   "endpoint": "regional",
+   "model": "model-a",
+   "kind": "cw1h",
+   "price": 4.8
+  },
+  {
+   "provider": "provider-a",
+   "endpoint": "regional",
+   "model": "model-a",
+   "kind": "cr",
+   "price": 0.6
+  },
+  {
+   "provider": "provider-a",
+   "endpoint": "global",
+   "model": "model-c",
+   "kind": "in",
+   "price": 5.0
+  },
+  {
+   "provider": "provider-a",
+   "endpoint": "global",
+   "model": "model-c",
+   "kind": "out",
+   "price": 50.0
+  },
+  {
+   "provider": "provider-a",
+   "endpoint": "global",
+   "model": "model-c",
+   "kind": "cw5m",
+   "price": 6.0
+  },
+  {
+   "provider": "provider-a",
+   "endpoint": "global",
+   "model": "model-c",
+   "kind": "cw1h",
+   "price": 8.0
+  },
+  {
+   "provider": "provider-a",
+   "endpoint": "global",
+   "model": "model-c",
+   "kind": "cr",
+   "price": 0.6
+  }
+ ]
+}
