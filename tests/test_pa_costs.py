@@ -5992,6 +5992,22 @@ class J2S_Net(J2Base):
         self.assertIn("404", err)
         self.assert_untouched(before)
 
+    def test_j2n13_the_network_code_is_its_own_module(self):
+        """pa_costs.py stays free of network modules (S_Summary.test_n1); the download is in pa_net.py, which imports
+        urllib and ssl only inside its functions and parses as Python 3.7 (run-all's parse list is fixed by test_run_all)."""
+        import ast
+        path = os.path.join(TOOLS, "pa_net.py")
+        with open(path) as f:
+            text = f.read()
+        tree = ast.parse(text, feature_version=(3, 7))
+        top = [n for n in tree.body if isinstance(n, (ast.Import, ast.ImportFrom))]
+        self.assertEqual(top, [])
+        names = {a.name.split(".")[0] for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names}
+        self.assertLessEqual(names, {"hashlib", "os", "ssl", "urllib"})
+        self.assertNotIn("netrc", text)
+        self.assertNotIn("Cookie", text)
+        self.assertNotIn("Authorization", text)
+
     def test_j2n12_no_socket_is_opened(self):
         import socket
         with self.assertRaises(AssertionError):
