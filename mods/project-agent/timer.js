@@ -13,7 +13,7 @@
 // turned it on). Neither is awaited: a slow or hung machine never delays a pass.
 
 import { terminals, hc, readTextFile, exec, shared, setShared, notify, spaces } from "herdr";
-import { paHome, replaceFile, localId, keeperJudging } from "./store.js";
+import { paHome, replaceFile, localId, keeperJudging, missingTool } from "./store.js";
 
 export const MIN_MINUTES = 5;
 export const PRESETS = [5, 10, 15, 30, 60];
@@ -135,12 +135,11 @@ export const SHOWN_FRESH = 30000; // a costsShown stamp younger than this counts
 export const COLLECT_STALE = 90000; // a collect still running after this counts as gone (the tool's lock refuses a second run anyway)
 export const BILLING_EVERY = 3600000; // the scheduled billing query is asked at most this often (shared stamp)
 const COLLECT_TIMEOUT = 30000, FETCH_TIMEOUT = 180000, LOG_EVERY = 3600000;
-const NOT_FOUND = /not found|no such file|ENOENT|cannot (start|find)/i;
 const logged = {}; // what -> when a failure was last written to the console
 const logOnce = (what, text, now) => { if (now - (logged[what] ?? 0) < LOG_EVERY) return; logged[what] = now; console.log(`project-agent timer: ${text}`); };
 const outcome = (r) => (r.code === 0 ? { ok: true } : r.code === 127 ? { ok: false, code: 127, missing: true }
   : { ok: false, code: r.code, error: String(r.stderr || r.stdout || "").trim().split("\n")[0].slice(0, 200) });
-const failure = (e) => { const why = String(e?.message ?? e).slice(0, 200); return NOT_FOUND.test(why) ? { ok: false, missing: true, error: why } : { ok: false, error: why }; };
+const failure = (e) => { const why = String(e?.message ?? e).slice(0, 200); return missingTool(why, "pa-costs") ? { ok: false, missing: true, error: why } : { ok: false, error: why }; };
 
 // The space's collect, when due (shared "project-agent.costsRun": { [space]: { at, busy } }, kept across a takeover).
 // The result goes to shared "project-agent.costs" ({ [space]: { at, ok, code?, error?, missing? } }), written on change only.

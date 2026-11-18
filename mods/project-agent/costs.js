@@ -17,7 +17,7 @@
 import { div } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
 import { exec } from "herdr";
-import { loadCosts, localId, withTimeout, TIMED_OUT, READ_LIMIT } from "./store.js";
+import { loadCosts, localId, withTimeout, TIMED_OUT, READ_LIMIT, missingTool } from "./store.js";
 import { Copier, sel } from "./copy.js";
 
 export const COSTS_EVERY = 10000; // the summary of a shown space: at most one read this often
@@ -47,7 +47,7 @@ async function call(cx, machine, args, timeout) {
     return { r };
   } catch (e) {
     const why = String(e?.message ?? e);
-    return NOT_FOUND.test(why) ? { error: notInstalled(machine), missing: true } : { error: why };
+    return missingTool(why, "pa-costs") ? { error: notInstalled(machine), missing: true } : { error: why }; // not an unreachable machine (t-028)
   }
 }
 const said = (r) => firstLine(r?.stderr || r?.stdout).slice(0, 300) || `pa-costs exited with ${r?.code}`;
@@ -118,7 +118,8 @@ export class CostsPane {
     const st = this.of(space.id), now = Date.now();
     if (!this.shown(space.id)) { st.stale = true; return; }
     if (st.busy && now - st.at < READ_STALE) { if (force) st.stale = true; return; }
-    if (!force && !st.stale && st.at && now - st.at < COSTS_EVERY) return;
+    // Inside COSTS_EVERY: no read; a billed compare refused while the view was left runs now (t-028).
+    if (!force && !st.stale && st.at && now - st.at < COSTS_EVERY) { if (st.billing.due) this.wantBilling(space, cx, true); return; }
     const mine = ++this.seq;
     st.busy = true; st.at = now; st.seq = mine; st.stale = false;
     cx.spawn(async (cx) => {
@@ -131,8 +132,18 @@ export class CostsPane {
       else if (r.error) { st.error = r.error; st.timedOut = false; st.readFailed = null; }
       else { st.summary = r.summary; st.missing = r.missing; st.error = null; st.timedOut = false; st.readFailed = null; st.readAt = Date.now(); }
       if (st.summary?.totals) this.wantBilling(space, cx);
+      if (st.stale) this.want(space, cx); // asked for while this read ran (a Refresh ended): reread now (t-028), if shown
       cx.notify();
     });
+  }
+
+  // From main.js's 1 s tick while this view is chosen (t-028): shown again with a reread or a billed compare that was
+  // asked for while it was left: start it now, not at the next 10 s reload. Shown only; nothing else is read or run.
+  due(space, cx) {
+    const st = this.peek(space.id);
+    if (!st || !this.shown(space.id)) return;
+    if (st.stale && !st.busy) this.want(space, cx);
+    else if (st.billing.due && !st.billing.busy && st.summary?.totals) this.wantBilling(space, cx, true);
   }
 
   // Refresh: `pa-costs collect` on the space's machine, one at a time, then one read.
@@ -156,12 +167,15 @@ export class CostsPane {
   // remote's `report --account-wide` and the compare again with it ("all spaces here" are that machine's spaces).
   wantBilling(space, cx, force = false) {
     const st = this.of(space.id), b = st.billing, now = Date.now(), s = st.summary;
-    if (!this.shown(space.id)) { if (force) b.at = 0; return; } // not shown: none; a forced one runs with the next shown read
+    // Not shown: none; it is due, and runs as soon as the view is shown again (want(), due(); t-028).
+    if (!this.shown(space.id)) { b.due = true; if (force) b.at = 0; return; }
     if (b.busy || (!force && b.at && now - b.at < BILLING_EVERY) || !s) return;
-    b.busy = true; b.at = now;
+    const mine = (b.seq ?? 0) + 1; // the newest compare: an older one that ends later commits nothing (Turn off, t-028)
+    b.busy = true; b.at = now; b.seq = mine; b.due = false;
     cx.spawn(async (cx) => {
-      // Asked before each step after the first: the view was left -> stop; the next shown read runs the whole chain.
-      const left = () => { if (this.shown(space.id)) return false; b.busy = false; b.at = 0; st.stale = true; cx.notify(); return true; };
+      // Asked before each step after the first: a newer compare started -> stop; the view was left -> stop, and the
+      // next shown read runs the whole chain.
+      const left = () => { if (b.seq !== mine) return true; if (this.shown(space.id)) return false; b.busy = false; b.at = 0; st.stale = true; cx.notify(); return true; };
       const compare = async (extra) => {
         const { r, error } = await call(cx, null, ["billed", "compare", "--json", ...extra], TOOL_TIMEOUT);
         if (error) return { error };
@@ -183,6 +197,7 @@ export class CostsPane {
           }
         }
       }
+      if (b.seq !== mine) return; // a newer compare started (Turn off): this result is older than its
       b.busy = false;
       if (got.error) b.error = got.error; else { b.data = got; b.error = null; }
       cx.notify();
@@ -370,7 +385,10 @@ export class CostsPane {
     const days = list(s.byDay);
     out.child(titled("day", "By day (UTC)"));
     days.slice(0, st.moreDays ? DAYS_MORE : DAYS_SHOWN).forEach((d, i) => out.child(row("day", i, d, d.key === "older" ? `older (${num(d.days)} days)` : str(d.key), null,
-      () => Object.entries(d.byActivity && typeof d.byActivity === "object" ? d.byActivity : {}).map(([k, v]) => sub(`${ACTIVITY[k] ?? k} · ${money(v, cur)} est.`)))));
+      // Each activity with its tokens and est., marked as the rows are (t-028; activities from pa-costs of t-028 on);
+      // an older summary's byActivity (priced money only) as before.
+      () => (Array.isArray(d.activities) ? list(d.activities).map((a) => sub(`${ACTIVITY[a.key] ?? str(a.key)} · ${tokens(a.tokens)} tokens · ${est(a, cur)}${priceTag(a) ? ` · ${priceTag(a)}` : ""}`))
+        : Object.entries(d.byActivity && typeof d.byActivity === "object" ? d.byActivity : {}).map(([k, v]) => sub(`${ACTIVITY[k] ?? k} · ${money(v, cur)} est.`))))));
     if (days.length > DAYS_SHOWN && !st.moreDays) out.child(div().id("costs-days-more").px(4).text_size(11.5).text_color(t.accent).cursor_pointer().on_click((_e, cx) => { st.moreDays = true; cx.notify(); }).child("Show more"));
     return out;
   }

@@ -1581,6 +1581,7 @@ def summarize(directory, rows, records, table, price_problem, profile_name, now,
     act_tasks, reasons = {}, {}  # activity -> task -> Bucket (the Costs view's drill); unattributed's reasons
     dims = {d: {} for d in ("kind", "role", "program", "model", "machine")}
     days, day_acts, day_model, hours, passes, sess_b, sess_info = {}, {}, {}, {}, {}, {}, {}
+    day_act_b = {}  # day -> activity -> Bucket: the day drill's activities with their unpriced part (t-028)
     sess_tasks, sess_split = {}, set()  # the tasks of each session's rows; sessions with a split row
     hour_floor = iso(now - HOURS * 3600)[:13]
     for r in rows:
@@ -1643,6 +1644,10 @@ def summarize(directory, rows, records, table, price_problem, profile_name, now,
             da[act] = da.get(act, 0.0) + m - (rb_m or 0)
             if rb_m:
                 da["cache-rebuild"] = da.get("cache-rebuild", 0.0) + rb_m
+        dab = day_act_b.setdefault(day, {})
+        group(dab, act).add(t - rb_t, None if m is None else m - (rb_m or 0), calls, rec)
+        if rb_t:
+            group(dab, "cache-rebuild").add(rb_t, rb_m, 0, rec)
         group(day_model, (day, r.get("model") or "(unknown model)")).add(t, m, calls, rec, tokens)
         hour = (r.get("from") or "")[:13]
         if hour >= hour_floor:
@@ -1701,7 +1706,10 @@ def summarize(directory, rows, records, table, price_problem, profile_name, now,
             older.money += b.money
             older.priced = True
             older.recon += b.recon
-    by_day = [days[d].out(d, byActivity={k: round(v, 6) for k, v in sorted(day_acts.get(d, {}).items())}) for d in day_list[:DAYS]]
+    # byActivity: the priced money of each activity (as before); activities: every activity with its tokens, money
+    # (None: no price) and unpricedTokens, for the day drill's marks (t-028).
+    by_day = [days[d].out(d, byActivity={k: round(v, 6) for k, v in sorted(day_acts.get(d, {}).items())},
+                          activities=drill(day_act_b.get(d, {}), keep=20)) for d in day_list[:DAYS]]
     if day_list[DAYS:]:
         by_day.append(older.out("older", days=len(day_list) - DAYS))
     kept_days = set(day_list[:DAYS])

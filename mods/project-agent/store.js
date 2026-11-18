@@ -365,6 +365,11 @@ export async function answerDecision(space, entry, label, note) {
   return next;
 }
 
+// An exec's rejection that says `program` is not there (t-028): a not-found text that names the program and is not
+// about the machine ("machine m1 not found", an unreachable machine: those are not a missing tool).
+const NOT_FOUND = /not found|no such file|ENOENT|cannot (start|find)/i;
+export const missingTool = (why, program) => NOT_FOUND.test(String(why)) && String(why).includes(program) && !/\bmachine\b|unreachable/i.test(String(why));
+
 // Tells the orchestrator at `address` (machine-qualified, from liveTarget: chosen when sending).
 // hc holds a message while someone is typing there, and refuses while the agent is blocked on a
 // question; the caller keeps the notice and tries again later.

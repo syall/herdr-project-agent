@@ -133,7 +133,7 @@ export default class ProjectAgent extends View {
     if (props()?.timer) return; // the always-on copy only keeps time; it shows nothing
     this.reload(cx);
     cx.timer.every(10000, (cx) => { this.reload(cx); this.resend(cx); });
-    cx.timer.every(1000, (cx) => { this.wake(cx); if ((this.armed && !this.armedTask(this.space)) || (this.rules.armed && !this.rules.armedRule(this.space))) cx.notify(); }); // shown again (render may not run for a hidden copy); an armed Delete timed out
+    cx.timer.every(1000, (cx) => { this.wake(cx); this.costsDue(cx); if ((this.armed && !this.armedTask(this.space)) || (this.rules.armed && !this.rules.armedRule(this.space))) cx.notify(); }); // shown again (render may not run for a hidden copy); an armed Delete timed out
     cx.spawn(async (cx) => {
       for (;;) {
         try { await watchFolder(`${paHome(null)}/spaces`); } catch { return; }
@@ -292,6 +292,13 @@ export default class ProjectAgent extends View {
       if (!((cards === null && !wasCurrent) || token < (this.committed[space.id] ?? 0))) this.commit(space, token, data, cards, rules, cx, missed);
       if (wasCurrent && this.again[space.id]) { delete this.again[space.id]; if (shown()) this.reload(cx); }
     });
+  }
+
+  // The Costs view chosen: a reread or a billed compare asked for while it was left starts once it is shown (costs.js due()).
+  costsDue(cx) {
+    if (this.view !== "costs") return;
+    const space = spaces().find((s) => s.active);
+    if (space) this.costs.due(space, cx);
   }
 
   // The Costs view is shown for `space` in this shown copy: its summary (at most every 10 s, costs.js), and the
