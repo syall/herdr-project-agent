@@ -18,6 +18,9 @@ import time
 import types
 import unittest
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import child_fakes  # noqa: E402
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 TMP = tempfile.mkdtemp(prefix="t001-unit-")
 os.environ["HERDR_PA_HOME"] = os.path.join(TMP, "pa")
@@ -270,11 +273,13 @@ class ReviewRound(Base):
             raise Stop()
         saved = (pa.threading.Thread, pa.subprocess.call, signal.getsignal(signal.SIGINT))
         pa.threading.Thread, pa.subprocess.call = FirstBeat, fake_call
+        undo_child = child_fakes.patch(pa, fake_call)  # t-037 J2: the launcher starts Claude with pa.spawn
         try:
             args = types.SimpleNamespace(space="sp1", project=self.project, profile="test", name=None, auto=False, ask=False, fresh=False)
             with self.assertRaises(Stop):
                 pa.run_session(args, "t1", {}, "sp1", self.project, {"beat": False})
         finally:
+            undo_child()
             pa.threading.Thread, pa.subprocess.call = saved[0], saved[1]
             signal.signal(signal.SIGINT, saved[2])
         argv = started[0]
@@ -335,11 +340,13 @@ class Round3(Base):
             raise Stop()
         saved = (pa.threading.Thread, pa.subprocess.call, signal.getsignal(signal.SIGINT))
         pa.threading.Thread, pa.subprocess.call = NoThread, fake_call
+        undo_child = child_fakes.patch(pa, fake_call)  # t-037 J2: the launcher starts Claude with pa.spawn
         try:
             args = types.SimpleNamespace(space="sp1", project=self.project, profile="test", name=None, auto=False, ask=False, fresh=False)
             with self.assertRaises(Stop):
                 pa.run_session(args, "t1", {}, "sp1", self.project, ctx)
         finally:
+            undo_child()
             pa.threading.Thread, pa.subprocess.call = saved[0], saved[1]
             signal.signal(signal.SIGINT, saved[2])
         return started[0]
@@ -605,12 +612,14 @@ class ProfileReload(Base):
             raise Stop()
         saved = (pa.subprocess.call, pa.time.sleep, os.environ.pop("PA_NO_CC_STATUSLINE", None))
         pa.subprocess.call, pa.time.sleep = fake_call, (lambda s: None)
+        undo_child = child_fakes.patch(pa, fake_call)  # t-037 J2: the launcher starts Claude with pa.spawn
         p = pa.load_profile("test")
         try:
             with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(Stop):
                 pa.run_agent(types.SimpleNamespace(fresh=True), "t1", self.project, p, self.dir,
                              load(os.path.join(self.dir, "agent.json")), {"beat": True, "previous": None}, time.time())
         finally:
+            undo_child()
             pa.subprocess.call, pa.time.sleep = saved[0], saved[1]
             if saved[2] is not None:
                 os.environ["PA_NO_CC_STATUSLINE"] = saved[2]
@@ -772,6 +781,7 @@ class ProfileReload(Base):
         dump(first or self.full_profile(), os.path.join(self.prof, "profile.json"))
         saved = (pa.subprocess.call, pa.time.sleep, os.environ.pop("PA_NO_CC_STATUSLINE", None))
         pa.subprocess.call, pa.time.sleep = fake_call, (lambda s: None)
+        undo_child = child_fakes.patch(pa, fake_call)  # t-037 J2: the launcher starts Claude with pa.spawn
         p = pa.load_profile("test")
         err = None
         try:
@@ -783,6 +793,7 @@ class ProfileReload(Base):
         except Exception as e:  # noqa: BLE001 - reported to the test
             err = e
         finally:
+            undo_child()
             pa.subprocess.call, pa.time.sleep = saved[0], saved[1]
             if saved[2] is not None:
                 os.environ["PA_NO_CC_STATUSLINE"] = saved[2]

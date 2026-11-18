@@ -20,6 +20,9 @@ import time
 import types
 import unittest
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import child_fakes  # noqa: E402
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 TMP = tempfile.mkdtemp(prefix="t037-stamp-")
@@ -279,12 +282,14 @@ class R2_Launcher(Base):
             return 0
         saved = (pa.threading.Thread, pa.subprocess.call, signal.getsignal(signal.SIGINT), time.sleep)
         pa.threading.Thread, pa.subprocess.call = NoThread, fake_call
+        undo_child = child_fakes.patch(pa, fake_call)  # t-037 J2: the launcher starts Claude with pa.spawn
         time.sleep = lambda s: None  # the 3 s pause after an exit
         try:
             args = types.SimpleNamespace(space="sp1", project=self.project, profile="test", name=None, auto=False, ask=False, fresh=False)
             with self.assertRaises(Stop), contextlib.redirect_stdout(io.StringIO()) as out:
                 pa.run_session(args, "t1", {}, "sp1", self.project, ctx if ctx is not None else {"beat": False})
         finally:
+            undo_child()
             pa.threading.Thread, pa.subprocess.call, time.sleep = saved[0], saved[1], saved[3]
             signal.signal(signal.SIGINT, saved[2])
         self.out = out.getvalue()
@@ -409,11 +414,13 @@ class R2_Launcher(Base):
             raise Stop()
         saved = pa.subprocess.call
         pa.subprocess.call = fake_call
+        undo_child = child_fakes.patch(pa, fake_call)  # t-037 J2: the launcher starts Claude with pa.spawn
         try:
             with self.assertRaises(Stop):
                 pa.run_agent(types.SimpleNamespace(fresh=False), "t1", self.project, p, self.dir, agent,
                              {"beat": True, "previous": None}, time.time())
         finally:
+            undo_child()
             pa.subprocess.call = saved
         self.assertFalse(os.path.exists(os.path.join(self.dir, "launcher.json")))
 
