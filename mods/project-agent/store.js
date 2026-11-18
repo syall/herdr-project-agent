@@ -263,7 +263,19 @@ export function cardEvidence(card, files) {
 // ---- decision cards (milestone 2) ----------------------------------------------------------------
 
 const CARD_NAME = /^[A-Za-z0-9_.-]+\.json$/;
+// At most this many cards in the list (t-061), but never by leaving out a card that is not closed: every open card
+// (and every card whose status is something else, or whose file is not a card) is kept whatever the count; only
+// answered and withdrawn cards are dropped, the oldest first, and the list's `omitted` says how many.
 export const MAX_CARDS = 200;
+const closed = (c) => Boolean(c.card) && (c.card.status === "answered" || c.card.status === "withdrawn");
+// parseCards' list (open first, newest first) capped as above. The order is kept.
+export function capCards(list) {
+  const room = Math.max(0, MAX_CARDS - list.filter((c) => !closed(c)).length);
+  let seen = 0, omitted = 0;
+  const out = list.filter((c) => { if (!closed(c)) return true; if (seen++ < room) return true; omitted += 1; return false; });
+  out.omitted = omitted;
+  return out;
+}
 
 // Cards from [{ name, path, text }] (text null: the file is gone, skipped):
 // [{ id, path, text, card | null, error | null }], open first, newest first.
@@ -298,7 +310,7 @@ function splitBatch(stdout) {
 }
 const byteOrder = (a, b) => (a < b ? -1 : a > b ? 1 : 0); // names are ASCII: code units are bytes
 
-// Every card in decisions/ (the first 200 names): see parseCards. One call reads them all, on this computer or another
+// Every card in decisions/, capped (capCards: every open card, MAX_CARDS in all at most): see parseCards. One call reads them all, on this computer or another
 // machine (t-053: here too); if that call fails, times out or prints something unreadable, they are read one by one,
 // at most CARD_READS at a time, all within READ_LIMIT of the fallback's start.
 // Options: cx (each call capped; with the copy's Host, keyed), batchOnly (no fallback: null when the call
@@ -319,7 +331,7 @@ export async function loadDecisions(space, { cx, batchOnly = false, live, known 
   if (r?.busy) { out.busy = true; return null; } // the last batch is still pending: skipped, quietly
   if (r && !gaveUp(r) && r.code === 3 && !r.stdout) return []; // no decisions folder: no cards (as a failing ls)
   const files = r && !gaveUp(r) && r.code === 0 ? splitBatch(r.stdout) : null;
-  if (files) return parseCards(files.sort((a, b) => byteOrder(a.name, b.name)).slice(0, MAX_CARDS).map((f) => ({ ...f, path: `${dir}/${f.name}` })));
+  if (files) return capCards(parseCards(files.sort((a, b) => byteOrder(a.name, b.name)).map((f) => ({ ...f, path: `${dir}/${f.name}` }))));
   if (batchOnly || (live && !live())) return null;
   let names = [];
   try {
@@ -328,8 +340,11 @@ export async function loadDecisions(space, { cx, batchOnly = false, live, known 
     if (gaveUp(ls)) return null;
     if (ls.code === 0) names = ls.stdout.split("\n").filter((n) => CARD_NAME.test(n));
   } catch { return null; }
-  const picked = names.slice(0, MAX_CARDS);
   const last = new Map((known ?? []).filter((c) => c?.path && typeof c.text === "string").map((c) => [c.path, c.text]));
+  // Every name is read (t-061); those whose last known copy is answered or withdrawn last, so that within READ_LIMIT
+  // the reads that can show an open card come first.
+  const knownClosed = (name) => { try { const k = JSON.parse(last.get(`${dir}/${name}`) ?? "null"); return closed({ card: k }); } catch { return false; } };
+  const picked = [...names.filter((n) => !knownClosed(n)), ...names.filter(knownClosed)];
   const unread = new Set(), texts = new Array(picked.length), until = Date.now() + READ_LIMIT;
   let next = 0;
   const worker = async () => {
@@ -342,7 +357,7 @@ export async function loadDecisions(space, { cx, batchOnly = false, live, known 
     }
   };
   await Promise.all(Array.from({ length: Math.min(CARD_READS, picked.length) }, worker));
-  const list = parseCards(picked.map((name, i) => ({ name, path: `${dir}/${name}`, text: texts[i], fallback: unread.has(`${dir}/${name}`) && texts[i] !== null })));
+  const list = capCards(parseCards(picked.map((name, i) => ({ name, path: `${dir}/${name}`, text: texts[i], fallback: unread.has(`${dir}/${name}`) && texts[i] !== null }))));
   list.unread = unread; // t-045: a card's mark is resolved only by a read made now (main.js resolveMarks)
   return list;
 }
