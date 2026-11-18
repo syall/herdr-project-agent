@@ -496,6 +496,7 @@ CONTENT_CHECK = "the checks saw this content"
 CHECKED_LINE = re.compile(r"^Checked: ([0-9a-f]{40}|[0-9a-f]{64})[ \t]*$", re.M)
 CONTENT_FILES_SHOWN = 10  # files named in a failing content check, per repository
 CHECKER_ROLES = ("verifier", "check")
+NO_REPLACE = "--no-replace-objects"  # every content-path git call: refs/replace/* never changes what a commit holds
 RAW_DIFF = ("diff", "--raw", "-z", "--no-renames", "--no-abbrev", "--no-ext-diff", "--no-textconv", "--ignore-submodules=none")
 
 
@@ -549,28 +550,37 @@ def is_commit(run, path, sha):
     return run(path, "cat-file", "-e", sha + "^{commit}")[0] == 0
 
 
+def no_replace(run):
+    """run, with --no-replace-objects before every subcommand (t-052 J1 round 2, verify MF-1). gate_git drops GIT_*,
+    so the option, not GIT_NO_REPLACE_OBJECTS, is what reaches git in pa-push-main too."""
+    return lambda path, *args, **kw: run(path, NO_REPLACE, *args, **kw)
+
+
 def content_main(run, path, profile):
-    """The branch a repository's change sits on until the queue says otherwise (J2): the local branch of origin/HEAD's
-    target, then main, master, trunk, then the profile's mainBranches; the first that exists. None if none does."""
-    names = []
-    code, target, _ = run(path, "symbolic-ref", "--short", "-q", "refs/remotes/origin/HEAD")
-    if not code and target.startswith("origin/"):
-        names.append(target[len("origin/"):])
-    names += ["main", "master", "trunk"] + [b for b in (profile or {}).get("mainBranches") or [] if isinstance(b, str)]
+    """The branch a repository's change sits on until the queue says otherwise (J2): main, master, trunk, then the
+    profile's mainBranches; the first that exists. None if none does. origin/HEAD is not read: the spec names main
+    (3.3), and a symbolic ref the repository sets must not pick the base (t-052 J1 round 2, review L2)."""
+    names = ["main", "master", "trunk"] + [b for b in (profile or {}).get("mainBranches") or [] if isinstance(b, str)]
     for name in dict.fromkeys(names):
         if name and run(path, "rev-parse", "--verify", "-q", "refs/heads/" + name + "^{commit}")[0] == 0:
             return name
     return None
 
 
-def content_record(run, path, tip, onto):
-    """The content record of tip against its base on onto (spec 3.2), or {"error": why}. Never raises."""
+def content_record(run, path, tip, onto, base=None):
+    """The content record of tip against its base on onto (spec 3.2), or {"error": why}. Never raises.
+    base: the base the record was made on (a stored record's), checked to be an ancestor of tip; default the merge
+    base of tip and onto now (t-052 J1 round 2)."""
     try:
         if not onto:
             raise ContentError("no base branch (none of main, master, trunk or the profile's main branches)")
-        code, base, err = run(path, "merge-base", tip, "refs/heads/" + onto)
-        if code or not base:
-            raise ContentError("no merge base of {} and {}".format(tip[:7], onto))
+        if base:
+            if run(path, "merge-base", "--is-ancestor", base, tip)[0] != 0:
+                raise ContentError("the stored base {} is not an ancestor of {}".format(clean(base)[:7], tip[:7]))
+        else:
+            code, base, err = run(path, "merge-base", tip, "refs/heads/" + onto)
+            if code or not base:
+                raise ContentError("no merge base of {} and {}".format(tip[:7], onto))
         code, merges, err = run(path, "rev-list", "--min-parents=2", base + ".." + tip)
         if code:
             raise ContentError("git rev-list failed ({})".format(clean(err)[-200:]))
@@ -639,7 +649,7 @@ def compare_records(checked, now):
 def content_check(directory, task, pins, runner=None, records=None):
     """(check, GATE.json content) for the review gate: the commit on VERIFY.md's last Checked: line makes the same
     change as HEAD, per pin (t-052 R5). records: computed records are appended here (with source verify or head)."""
-    run = globals()["git"] if runner is None else runner
+    run = no_replace(globals()["git"] if runner is None else runner)
     evidence = os.path.join(directory, "evidence", str(task.get("id")))
     verify = checked_commits(pa.read_text(os.path.join(evidence, "VERIFY.md")))
     review = checked_commits(pa.read_text(os.path.join(evidence, "REVIEW.md")))
@@ -658,6 +668,15 @@ def content_check(directory, task, pins, runner=None, records=None):
         mine = [r for r in stored if r.get("common") == common and not r.get("error")]
         known = {r.get("commit") for r in mine}
 
+        def made(sha):
+            """The stored records of sha with a change (a base below it), oldest first."""
+            return [r for r in mine if r.get("commit") == sha and isinstance(r.get("base"), str) and r["base"] and r["base"] != sha]
+
+        def made_on(sha):
+            """The first stored record of sha with a change: the base it was made on, or None."""
+            found = made(sha)
+            return found[0] if found else None
+
         def last(ids):
             found = [x for x in ids if x in known or is_commit(run, path, x)]
             return found[-1] if found else None
@@ -667,11 +686,19 @@ def content_check(directory, task, pins, runner=None, records=None):
         entry = {"repo": path, "common": common, "onto": onto, "base": None, "change": None, "sequence": None,
                  "checked": x, "review": rv, "same": None}
         now = content_record(run, path, head, onto) if head else {"error": "no commit in the worktree"}
+        if not now.get("error") and now["base"] == head and x != head:
+            # HEAD is already on onto (a hand merge, a push card's ff): its change is where it was made, not today's
+            # empty one (review M1, verify MF-2). Unknown: it cannot be compared.
+            saved_head = made_on(head)
+            now = content_record(run, path, head, onto, saved_head["base"]) if saved_head else {"error": (
+                "HEAD {} is already on {} and no stored record says where its change began; the content cannot be "
+                "compared".format(head[:7], onto))}
         if now.get("error"):
             entry["error"] = now["error"]
         else:
             entry.update(base=now["base"], change=now["change"], sequence=now["sequence"])
-            keep.append(dict(now, source="head"))
+            if now["base"] != head:  # a record with no change says nothing of where it began: never stored
+                keep.append(dict(now, source="head"))
         summary.append(entry)
         if x is None:
             if verify and len(pins) == 1:
@@ -686,17 +713,40 @@ def content_check(directory, task, pins, runner=None, records=None):
             continue
         if x == head:
             entry["same"] = True
-            keep.append(dict(now, source="verify"))
+            if now["base"] != head:
+                keep.append(dict(now, source="verify"))
             notes.append("{}the checked commit is HEAD".format(label))
             continue
-        computed = content_record(run, path, x, onto) if is_commit(run, path, x) else {"error": "not a commit"}
-        saved = [r for r in mine if r.get("commit") == x]
-        saved = saved[-1] if saved else None
-        if not computed.get("error") and saved and (computed.get("change"), computed.get("sequence")) != (saved.get("change"), saved.get("sequence")):
-            entry["same"] = False
-            fails.append("{}the record of the checked {} computed now differs from the record stored at {}".format(
-                label, x[:7], clean(saved.get("at"))))
-            continue
+        saved = made_on(x)
+        if not is_commit(run, path, x):
+            computed = {"error": "not a commit"}
+        elif saved:  # computed now against the stored base (spec-amendment 6): never the file alone, never today's onto
+            computed = content_record(run, path, x, onto, saved["base"])
+            if computed.get("error"):
+                fails.append("{}the checked {}: {}".format(label, x[:7], computed["error"]))
+                continue
+        else:
+            computed = content_record(run, path, x, onto)
+            if not computed.get("error") and computed["base"] == x:
+                fails.append("{}the checked {} is already on {} and no stored record says where its change began; "
+                             "the content cannot be compared".format(label, x[:7], onto))
+                continue
+        if not computed.get("error") and saved:
+            # Every stored record of X is recomputed against its own base, never trusted alone (D-J1-4).
+            again = {saved["base"]: computed}
+            differs = None
+            for r in made(x):
+                if r["base"] not in again:
+                    again[r["base"]] = content_record(run, path, x, onto, r["base"])
+                c = again[r["base"]]
+                if c.get("error") or (c.get("change"), c.get("sequence")) != (r.get("change"), r.get("sequence")):
+                    differs = r
+                    break
+            if differs is not None:
+                entry["same"] = False
+                fails.append("{}the record of the checked {} computed now differs from the record stored at {}".format(
+                    label, x[:7], clean(differs.get("at"))))
+                continue
         checked = computed if not computed.get("error") else saved
         if checked is None:
             fails.append("{}the checked {}: {}".format(label, x[:7], computed["error"]))
