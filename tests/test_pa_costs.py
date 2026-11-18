@@ -5605,6 +5605,84 @@ class PX_StatusLineCtx(CCBase):
         self.assertIsNone(pa_costs.cc_clean(dict(old, ctx="5"))["ctx"])
 
 
+# ---- t-032 J2a: d-117 limits 1 (key per scope) and 4 (unknown scoped keys) ------------------------------------------
+
+def keys_fixture():
+    """RL-1 probe 1: top-level model-a with the alias ^model-a; a provider-b scope with the exact key model-a-x."""
+    return {"v": 1, "currency": "USD", "defaultScope": {"provider": "provider-a", "endpoint": None, "region": None, "account": None},
+            "models": {"model-a": [{"validFrom": "2026-01-01", "in": 1.0, "out": 10.0, "cw5m": 2.0, "cw1h": 4.0, "cr": 0.5}]},
+            "aliases": [{"match": "^model-a", "model": "model-a"}],
+            "scoped": [{"provider": "provider-b", "models": {"model-a-x": [{"validFrom": "2026-01-01", "in": 7.0, "out": 70.0,
+                                                                                "cw5m": 1.0, "cw1h": 1.0, "cr": 0.7}]}}]}
+
+
+class J2A_Keys(CostsBase):
+    """Limit 1: a model's key is resolved per candidate scope. Limit 4: an unknown key in a scoped entry skips it."""
+
+    table = J1A_Scopes.table
+    look = J1A_Scopes.look
+
+    def test_j2k1_scoped_exact_key_does_not_hide_a_top_level_alias(self):
+        t = self.table(keys_fixture())
+        self.assertEqual(self.look(t, "model-a-x", None), (1.0, ["provider-a", "*", "*", "*"]))
+        self.assertEqual(self.look(t, "model-a-x", ("provider-a", None, None, None)), (1.0, ["provider-a", "*", "*", "*"]))
+        self.assertEqual(self.look(t, "model-a-x", (None, None, None, None))[0], 1.0)
+
+    def test_j2k2_the_scope_with_the_exact_key_uses_it(self):
+        t = self.table(keys_fixture())
+        self.assertEqual(self.look(t, "model-a-x", ("provider-b", None, None, None)), (7.0, ["provider-b", "*", "*", "*"]))
+        self.assertEqual(self.look(t, "model-a", ("provider-b", None, None, None)), (None, None))  # no crossing of providers
+
+    def test_j2k3_a_scoped_alias_reaches_only_scopes_that_have_its_target(self):
+        value = keys_fixture()
+        value["scoped"].append({"provider": "provider-a", "region": "region-a",
+                                "models": {"model-c": [{"validFrom": "2026-01-01", "in": 3.0, "out": 3.0, "cw5m": 3.0, "cw1h": 3.0, "cr": 3.0}]}})
+        value["aliases"] = [{"match": "^model-a", "model": "model-a"}]
+        value["scopedAliases"] = [{"match": "^model-", "model": "model-c"}]
+        t = self.table(value)
+        # region-a has model-c only: the top-level alias ^model-a (target model-a) is skipped there, the scoped one applies
+        self.assertEqual(self.look(t, "model-a-y", ("provider-a", None, "region-a", None)), (3.0, ["provider-a", "*", "region-a", "*"]))
+        # the default scope has model-a: its alias applies
+        self.assertEqual(self.look(t, "model-a-y", ("provider-a", None, "region-z", None)), (1.0, ["provider-a", "*", "*", "*"]))
+        # a model only the scoped alias names: priced in region-a, nowhere else
+        self.assertEqual(self.look(t, "model-q", ("provider-a", None, "region-a", None))[0], 3.0)
+        self.assertEqual(self.look(t, "model-q", ("provider-a", None, None, None)), (None, None))
+
+    def test_j2k4_files_without_scoped_resolve_as_before(self):
+        for value in (PRICES, scoped_fixture()):
+            self.prices(value)
+            prof = pa.load_profile("test")
+            old, new = old_pricing.load_prices(prof)[0], pa_costs.load_prices(prof)[0]
+            for model in J1A_Parity.MODELS:
+                for day in J1A_Parity.DAYS:
+                    when = day + "T10:00:00Z"
+                    self.assertEqual(pa_costs.price_for(new, model, when), old_pricing.price_for(old, model, when), (model, day))
+
+    def test_j2k5_an_unknown_key_skips_the_scoped_entry_with_a_warning(self):
+        value = keys_fixture()
+        value["scoped"].insert(0, {"provider": "provider-a", "tier": "x",
+                                   "models": {"model-a": [{"validFrom": "2026-01-01", "in": 9.0, "out": 9.0, "cw5m": 9.0, "cw1h": 9.0, "cr": 9.0}]}})
+        t = self.table(value)
+        self.assertEqual([e["scope"] for e in t["scoped"]], [("provider-b", None, None, None)])
+        self.assertTrue(any("scoped[0]" in w and "tier" in w for w in t["warnings"]), t["warnings"])
+        self.assertEqual(t["skippedScoped"], [0])
+        self.assertEqual(self.look(t, "model-a", ("provider-a", None, None, None))[0], 1.0)
+
+    def test_j2k6_a_skipped_entry_is_not_a_duplicate(self):
+        value = keys_fixture()
+        value["scoped"].append({"provider": "provider-b", "tier": "x", "models": {}})
+        t = self.table(value)
+        self.assertEqual(len(t["scoped"]), 1)
+        self.assertTrue(any("scoped[1]" in w for w in t["warnings"]), t["warnings"])
+
+    def test_j2k7_unknown_key_in_default_scope_is_a_warning(self):
+        value = keys_fixture()
+        value["defaultScope"]["tier"] = "x"
+        t = self.table(value)
+        self.assertTrue(any("defaultScope" in w and "tier" in w for w in t["warnings"]), t["warnings"])
+        self.assertEqual(self.look(t, "model-a", None)[0], 1.0)
+
+
 class ZZ_V1_Privacy(unittest.TestCase):
     """Run last: the canary of every fixture reached no file under costs/ or billing/ and no captured output."""
 
