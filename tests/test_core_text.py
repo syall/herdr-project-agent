@@ -892,8 +892,8 @@ T046_T1 = ("Every card also takes an answer in the person's own words: the panel
            "options, even when it sounds like one. Read the words on the card; the panel's notice may cut them. When "
            "they are unclear, ask in chat or open a new card. When they ask for something the card did not ask (a "
            "push, a publish, a merge, a delete), that needs its own card. No tool acts on an Other answer: a rule "
-           "change, `pa-worktree remove`, `pa-worker close --card` and `pa-push-main run` act only on their own "
-           "option, and say so.")
+           "change, `pa-worktree remove`, `pa-worker close --card` and `pa-push-main run` (which you never run) act "
+           "only on their own option, and say so.")  # J2: "(which you never run)" added, DECISIONS.md
 T046_T2 = ("The label must be one of the card's options, or `Other` when their words answer the question but pick none "
            "of them (`pa-decide <card-id> --answer Other --quote \"<their words>\"`), and the quote must be what they "
            "actually wrote. If their words do not clearly pick an option, ask; do not round a comment up to a "

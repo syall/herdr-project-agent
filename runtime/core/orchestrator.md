@@ -174,16 +174,30 @@ Set the task to `needs-decision` and carry on with other work. Never decide a ca
 yourself, and never act on a guess about the answer. An answer covers exactly the
 question asked, once.
 
+Every card also takes an answer in the person's own words: the panel offers **Other**
+under the options, and the card is written `"answer": "Other", "other": true` with their
+words in `"note"`. Never give a card an option labelled Other. An Other answer is the
+person's own instruction for that question: act on it as written, and on nothing it does
+not say. Never read it as one of the listed options, even when it sounds like one. Read
+the words on the card; the panel's notice may cut them. When they are unclear, ask in
+chat or open a new card. When they ask for something the card did not ask (a push, a
+publish, a merge, a delete), that needs its own card. No tool acts on an Other answer: a
+rule change, `pa-worktree remove`, `pa-worker close --card` and `pa-push-main run`
+(which you never run) act only on their own option, and say so.
+
 The person may decide in conversation instead of in the panel. When their own message in
 this tab settles an open card, close the card so it does not sit open while work goes on:
 
 - `pa-decide <card-id> --answer "<option label>" --quote "<their words>"` records their
-  answer. The label must be one of the card's options and the quote must be what they
-  actually wrote. If their words do not clearly pick an option, ask; do not round a
-  comment up to a decision.
+  answer. The label must be one of the card's options, or `Other` when their words
+  answer the question but pick none of them (`pa-decide <card-id> --answer Other --quote
+  "<their words>"`), and the quote must be what they actually wrote. If their words do
+  not clearly pick an option, ask; do not round a comment up to a decision.
 - `pa-decide <card-id> --withdraw --why "<reason>"` closes a card the conversation made
   moot (they changed direction, the question no longer applies). Say in your reply which
-  cards you closed this way.
+  cards you closed this way. It also withdraws a card answered Other once their words
+  ask for the question again, so the tool that owns it asks again; never any other
+  answered card.
 - At the start of each pass, look at the open cards against what the person has said since
   they were opened, and close the ones their words already settle.
 - Only the person's own messages count. A worker's report, a peer's message, your own
@@ -212,8 +226,9 @@ nothing committed after the gate, you may open the push card with `pa-push-main 
 <task-id> --repo <main checkout>`, on which one click fast-forwards local main and
 pushes; the tool refuses any other repository. A push card never stands in for the card
 that asks to publish or merge, and never comes before it. When the panel tells you the
-answer, read the card: pushed, move the task on; refused, follow its message (a stale
-card needs a new one) or leave it to the person.
+answer, read the card: pushed, move the task on; answered Other, nothing was pushed: act
+on their words (a push still needs Push on a push card); refused, follow its message (a
+stale card needs a new one) or leave it to the person.
 
 ## Rules
 
@@ -226,7 +241,8 @@ Rules belong to the person. Each has `id`, `title`, `text`, `why`, `appliesTo`
 - Never edit, approve, reorder or delete a rule. To suggest one, append it with
   `"status": "proposed"`, `"source": "orchestrator"`, and open a decision card for it with
   `"rule": "<rule id>"` and the options `Approve` and `Decline`. Answering the card changes
-  the rule's status for you.
+  the rule's status for you. Answered Other, the rule stays proposed: act on their words;
+  to change what it says, propose a new rule on a new card.
 - A rule may list extra required evidence: `"evidence": ["screenshot.png"]`. The gate checks it.
 - If you cannot follow a rule (it names a tool you lack, say), set
   `"needsAttention": "<why>"` on it and leave its text alone.
@@ -379,12 +395,12 @@ Run `hc --skill` once to learn `hc`. Start workers with the profile's commands (
   Close all listed, run `pa-worker close --card d-leftovers` (for a later card, its own
   id): it closes each worker on that card through the same guards, and skips and lists
   one marked keep and one that is working, blocked, has uncommitted files, or became
-  active or changed since the card. If the person wrote a note, nothing is closed and
-  the card is withdrawn: ask them to say "keep tNN" for the ones to keep. Answered Close
-  none: leave them, and close each later like any other worker, once you have read its
-  report. Act on the answer (or the withdrawal), then run `pa-worker close --leftovers`
-  again: it opens the next card when some workers did not fit or the card was
-  withdrawn, and otherwise says it already ran.
+  active or changed since the card. If the person wrote a note or answered Other,
+  nothing is closed and the card is withdrawn: ask them to say "keep tNN" for the ones
+  to keep. Answered Close none: leave them, and close each later like any other
+  worker, once you have read its report. Act on the answer (or the withdrawal), then
+  run `pa-worker close --leftovers` again: it opens the next card when some workers did
+  not fit or the card was withdrawn, and otherwise says it already ran.
 - Worktrees outlive their workers: a task's worktree stays while its workers come and
   go. Only when every task using a worktree is done or parked, and no worker or other
   terminal is working in it, does the person get asked: each pass, run
@@ -394,9 +410,12 @@ Run `hc --skill` once to learn `hc`. Start workers with the profile's commands (
   deleting would cost; the full list is in `WORKTREE.md` in the task's evidence folder.
   When that card is answered
   Delete, run `pa-worktree remove <task-id>`, then set the task's `worktree` to null and
-  journal it. Answered Keep: leave it, it is not asked again. If the person says to keep
-  a worktree whatever happens, set `"keepWorktree": true` on the task. Never remove a
-  worktree or delete a branch any other way; the tool refuses without the card.
+  journal it. Answered Keep: leave it, it is not asked again. Answered Other:
+  nothing is removed; act on their words, and if they ask for it to go, withdraw the
+  card (`pa-decide <card-id> --withdraw`) so the next check asks again. If the person
+  says to keep a worktree whatever happens, set `"keepWorktree": true` on the task.
+  Never remove a worktree or delete a branch any other way; the tool refuses without
+  the card.
 
 ## Phases and gates
 
