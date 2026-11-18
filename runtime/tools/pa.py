@@ -933,7 +933,9 @@ def restarted_session(args):
     """pa-session exec'd by a restart (t-037 R6; round 2, VERIFY MF4). The new code passed the self-check but may
     still raise later, on the session path: any exception goes to error_wait (the tab says what failed and how to
     recover) instead of ending the process, its terminal and the workers tied to it. Enter execs the installed
-    pa.py again with the same flags, so a fixed install is loaded without closing the terminal."""
+    pa.py again with the same flags, so a fixed install is loaded without closing the terminal; that exec first runs
+    the restart's own pre-check (round 3, REVIEW A/B M2, VERIFY MF-r2-1): an install half done or a pa.py that cannot
+    start is not exec'd, the tab says why and waits again."""
     address = os.environ.get("HC_TERMINAL_ID")
     try:
         return cmd_session(args)
@@ -943,16 +945,24 @@ def restarted_session(args):
         traceback.print_exc()
         failure = e
     argv = [sys.executable, os.path.join(ROOT, "tools", "pa.py"), "session"] + sys.argv[1:]
+    message = ("the restarted launcher failed: {}: {}. Its terminal and workers stay. Install a fixed pa.py (install.sh "
+               "or pa-sync), then press Enter: it loads the installed launcher again".format(type(failure).__name__, failure))
     try:
         while True:
-            error_wait(address, "the restarted launcher failed: {}: {}. Its terminal and workers stay. Install a fixed "
-                                "pa.py (install.sh or pa-sync), then press Enter: it loads the installed launcher "
-                                "again".format(type(failure).__name__, failure))
+            error_wait(address, message)
+            try:
+                _pre, why = restart_precheck({}, args.space, args.profile, argv)  # installed.json, argv + --self-check
+            except Exception as e:  # noqa: BLE001 - a check that cannot run is a failed check
+                why = "the check could not run: {}: {}".format(type(e).__name__, e)
+            if why:
+                message = ("the installed launcher cannot be loaded yet: {}. Its terminal and workers stay. Install a "
+                           "fixed pa.py (install.sh or pa-sync), then press Enter to check again".format(why))
+                continue
             signal.signal(signal.SIGINT, signal.SIG_IGN)  # as across a restart's exec (spec S5)
             try:
                 os.execv(sys.executable, argv)
             except (OSError, ValueError, TypeError) as e:
-                failure = e
+                message = "the installed launcher could not be exec'd: {}. Its terminal and workers stay. Press Enter to try again".format(e)
     except KeyboardInterrupt:  # the person stops it: the tab's shell takes over (as cmd_session)
         sys.exit(2)
 
@@ -1744,10 +1754,15 @@ def exec_restart(ctx, after, project, directory, address):
             try:
                 sys.stdout.flush()
                 sys.stderr.flush()
-                # SIGINT stays ignored across the exec (spec S5): a Ctrl-C before the new launcher's claim cannot end
-                # the terminal and its workers. The new process ignores it again in run_session.
-                os.execv(sys.executable, argv)
-                failed = "exec returned"
+                # SIGINT ignored across the exec (spec S5), whatever path leads here (round 3, REVIEW A/B M1: from
+                # cmd_session's error_wait it is handled): a Ctrl-C before the new launcher's claim cannot end the
+                # terminal and its workers. The new process ignores it again in run_session.
+                previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
+                try:
+                    os.execv(sys.executable, argv)
+                    failed = "exec returned"
+                finally:  # only when the exec did not happen
+                    signal.signal(signal.SIGINT, previous)
             except (OSError, ValueError, TypeError) as e:  # ValueError: a NUL in a value (REVIEW A M1)
                 failed = "exec: {}".format(e)
     finally:
