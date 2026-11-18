@@ -4687,6 +4687,67 @@ cases["P53-pool-full"] = async () => { // AC6.1: the runtime refuses: one plain 
   check(!/Too many calls waiting/.test(text) && /PA: proj/.test(text), `the line goes at the next load (got ${text.slice(0, 300)})`);
 };
 
+cases["P53-hidden-older-ends-last"] = async () => { // AC8.2 (review P-M3; t-053 round 2, the verifier's case): A's ledger read slow, its cards answered; B reads cards (fresh), ledger BUSY; A ends last: it must write nothing
+  world({ machine: M });
+  remoteCards(3);
+  g.__layout = panelLayout("changes");
+  const v = await mount(); await settle();
+  check((g.__shared["project-agent.open"] ?? {})[RS] === 3, "3 open");
+  g.__sleepHang = true; g.__delay[`${M}:${RDIR}/ledger.json`] = 30000;
+  await step(10000); await fire(10000); // read A at 10 s: cards at once (3 open), ledger answers at 40 s
+  for (const c of ["d-01", "d-02"]) g.__files[`${M}:${RDIR}/decisions/${c}.json`] = openCard(c, { status: "answered", answer: "Yes" });
+  await step(12000); await fire(10000); // 22 s: read B: its card batch answers (1 open), its ledger read is BUSY
+  check((g.__shared["project-agent.open"] ?? {})[RS] === 1, `read B wrote 1 open (got ${JSON.stringify(g.__shared["project-agent.open"])})`);
+  await step(20000); // A ends at 40 s, older than B
+  check((g.__shared["project-agent.open"] ?? {})[RS] === 1, `A, ending last, wrote nothing (got ${JSON.stringify(g.__shared["project-agent.open"])})`);
+  void v;
+};
+
+cases["P53-tick-write-hung"] = async () => { // round 2 (review MF-1): m1's reads and send answer, its stamp writes hang: the pass sends once, the local passes and the lease go on
+  world({ extraTabs: [paTab], extraPanes: [paPane()], extraTerms: [liveIdle("t4w")] });
+  g.__machines.push({ name: "m1", layout: "ready" });
+  const hdir = ".config/herdr-pa/spaces/spH";
+  g.__spaces.push({ id: "m1/spH", name: "hung", machine: "m1", folder: "/hung", active: false, tabs: [{ id: "m1/tb-spH", index: 1, name: "PA: hung", named: true }] });
+  g.__files[`m1:${hdir}/agent.json`] = JSON.stringify({ space: "spH", project: "/hung", profile: "test", name: "hung" });
+  g.__files[`m1:${hdir}/schedule.json`] = JSON.stringify({ everyMinutes: 0 });
+  g.__files[`m1:${hdir}/pass-request.json`] = JSON.stringify({ pending: true, at: "x", by: "panel" });
+  g.__panes.push({ pane: "m1/p-spH", terminal: "m1/t-spH", tab: "m1/tb-spH", title: "PA: hung", cwd: "/hung", status: "idle", program: claude });
+  g.__terminals.push(liveIdle("m1/t-spH", "spH"));
+  g.__shared["project-agent.tabs"] = { "m1/tb-spH": { space: "m1/spH", project: "/hung", profile: "test", name: "hung", terminal: "m1/t-spH", alive: true },
+    tb1: { space: S, project: "/proj", profile: "test", name: "proj", terminal: "t4w", alive: true } };
+  delete g.__shared["project-agent.timer"]; delete g.__shared["project-agent.keeper"];
+  g.__files[`:${DIR}/schedule.json`] = JSON.stringify({ everyMinutes: 0 });
+  g.__props = { timer: true }; g.__pool = { limit: 1024 }; g.__execHang = ["m1:python3"]; // every write on m1 hangs
+  await mount(); await settle();
+  const passes = (to) => sends().filter((a) => a[1] === to && /manual pass/.test(a[2])).length;
+  let asked = 0, live10 = null;
+  const r = await drive(1200000, { stepMs: 5000, lease: false, each: (t) => {
+    g.__files[`:${DIR}/heartbeat`] = `${Math.floor(g.__now / 1000)} t4w\n`; g.__files[`m1:${hdir}/heartbeat`] = `${Math.floor(g.__now / 1000)} t-spH\n`;
+    if (t % 300000 === 0) { g.__files[`:${DIR}/pass-request.json`] = JSON.stringify({ pending: true, at: "x", by: "panel" }); asked += 1; }
+    if (t === 600000) live10 = pool().live;
+  } });
+  check(r.stopped === null && pool().live <= (live10 ?? 0) + 2, `the pool does not grow while m1's writes hang (10 min ${live10}, 20 min ${pool().live}; ${poolSaid()})`);
+  check(passes("m1/t-spH") === 1, `m1's pass is sent once, never again while its stamp write is pending (got ${passes("m1/t-spH")})`);
+  check(passes("t4w") >= asked - 1 && asked >= 3, `the local space's passes still go out (${passes("t4w")} of ${asked})`);
+  const lease = g.__shared["project-agent.timer"];
+  check(lease && g.__now - lease.at < 50000, `the lease is still renewed (${lease ? g.__now - lease.at : "none"} ms old)`);
+};
+
+cases["P53-click-after-refusal"] = async () => { // round 2 (review MF-2), R6: in the quiet second after a refusal a click's reload still loads
+  world(); g.__files[`:${DIR}/ledger.json`] = ledgerOf(2); g.__pool = { limit: 1024 };
+  const v = await mount(); await settle();
+  check(/Tasks · 2/.test(look(v).text), "loaded");
+  pool().full = true;
+  advance(10000); await fire(10000); await settle();
+  check(/Too many calls waiting/.test(look(v).text), `refused (got ${look(v).text.slice(0, 300)})`);
+  pool().full = false; g.__files[`:${DIR}/ledger.json`] = ledgerOf(4);
+  advance(300);
+  const before = loadsLocal();
+  v.reload(cx); await settle(); await settle();
+  check(loadsLocal() === before + 1, `the click's load started (loads ${loadsLocal() - before})`);
+  check(/Tasks · 4/.test(look(v).text), `the click's load shows the new tasks (got ${look(v).text.slice(0, 300)})`);
+};
+
 cases["P53-grep-host-calls"] = async () => { // AC1.3, AC6.2: no cx.sleep outside host.js; every host call goes through host.js
   const files = fs.readdirSync(src).filter((n) => n.endsWith(".js") && n !== "host.js");
   const code = (f) => fs.readFileSync(path.join(src, f), "utf8").split("\n").filter((l) => !/^\s*\/\//.test(l)).join("\n");
