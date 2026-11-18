@@ -131,6 +131,18 @@ D4_FORMS = [
     ("if pa-push-main check x; then :; fi", "if pa-push-main check x"),
 ]
 ROWS = [("D1", D1, D1_FORMS), ("D2", D2, D2_FORMS), ("D3", D3, D3_FORMS), ("D4", D4, D4_FORMS)]
+# t-037 J2: pa-restart is the person's (or the Project Agent's at their word), never a worker's.
+D5 = ("Refused by the Project Agent's guard: {}. pa-restart is the person's command, or the Project Agent's at "
+      "their word: a worker never restarts a Project Agent. Say in your report what should be restarted and why. "
+      "There is no override.")
+D5_FORMS = [
+    ("pa-restart --space s",), ("pa-restart",), ("~/.local/bin/pa-restart --now",), ("PA-RESTART",),
+    ("python3 ~/.config/herdr-pa/tools/pa.py restart --space s",), ("python3 -I runtime/tools/pa.py restart",),
+    ("./runtime/tools/pa.py restart --dry-run",), ("env X=1 pa-restart",), ("cd x && pa-restart", "pa-restart"),
+    ("sh -c 'pa-restart --now'", "pa-restart --now"), ("y=$(pa-restart --dry-run)", "pa-restart --dry-run"),
+]
+D5_ALLOWED = ["grep -n pa-restart README.md", "python3 runtime/tools/pa.py peers", "pa-peers --older",
+              "echo pa-restart", "man pa-restart-notes"]
 
 # ---- Table 4.1: must be allowed ----------------------------------------------------------------------------------
 ALLOWED = {
@@ -820,6 +832,19 @@ class Split_PersonalSettings(GuardTest):
                 self.assertEqual(HookGuard.run_hook(self, tool, {key: os.path.join(self.user, ".gitconfig")})[0], 2)
                 self.assertEqual(HookGuard.run_hook(self, tool, {key: os.path.join(self.user, ".config", "gh", "config.yml")})[0], 2)
         self.assertEqual(HookGuard.run_hook(self, "Read", {"file_path": os.path.join(self.user, ".gitconfig")})[0], 0)
+
+
+class T037Restart(GuardTest):  # t-037 J2: workers never run pa-restart
+    def test_d5_forms(self):
+        for form in D5_FORMS:
+            line, inner = form[0], form[-1]
+            with self.subTest(line=line):
+                self.assertEqual(self.check(line), msg(D5, inner))
+
+    def test_d5_allowed(self):
+        for line in D5_ALLOWED:
+            with self.subTest(line=line):
+                self.assertIsNone(self.check(line))
 
 
 if __name__ == "__main__":

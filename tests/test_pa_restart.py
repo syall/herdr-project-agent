@@ -1017,5 +1017,325 @@ class Prompt(Requests):  # spec S1, S2: what the model runs with on a resume
         self.assertEqual(pa.code_state(rec, inst, "t1")[0], "current")
 
 
+
+# ---- pa-restart (R5, R8, R9; S3, S4) -----------------------------------------------------------------------------
+
+INSTANCE = "abcdefab-cdef-abcd-efab-cdefabcdefab"
+
+
+class Command(Base):
+    def setUp(self):
+        super().setUp()
+        self.agent()
+        self.rec = {"version": 2, "accepts": ["restart"], "instance": INSTANCE, "pid": 777, "terminal": "t1", "space": SP,
+                    "started": pa.now(), "code": {"tools": "T" * 64, "commit": "c" * 40, "installed": "T" * 64},
+                    "profile": {"name": "test", "readAt": pa.now()},
+                    "session": {"id": SID, "resume": True, "prompt": "rebuilt", "promptCore": "C" * 64, "core": "C" * 64},
+                    "restart": None, "restartedFrom": None}
+        dump(self.rec, os.path.join(self.dir, "launcher.json"))
+        dump({"version": 1, "tools": "T" * 64, "core": "C" * 64}, os.path.join(pa.ROOT, "installed.json"))
+        write(os.path.join(self.dir, "heartbeat"), "{} t1\n".format(int(time.time())))
+        dump({"version": 1, "tasks": [{"id": "t-1", "workers": [{"address": "w1"}, {"address": "w2", "finished": True}]}]},
+             os.path.join(self.dir, "ledger.json"))
+        self.term = {"address": "t1", "state": "live", "labels": {"herdr.pa": SP}, "pid": 777, "parent": None,
+                     "status": {"state": "idle"}}
+        self.terms = {"t1": self.term,
+                      "w1": {"address": "w1", "state": "live", "parent": "t1", "name": "t-1-build"},
+                      "w4": {"address": "w4", "state": "live", "parent": "t1", "name": "helper"},
+                      "w3": {"address": "w3", "state": "live", "parent": "t9", "name": "other-space"}}
+        pa.hc_get = lambda address: dict(self.terms.get(address) or {})
+        pa.live_terminals = lambda: {k: dict(v) for k, v in self.terms.items()}
+        self.saved_env = {k: os.environ.get(k) for k in ("CLAUDECODE", "HC_TERMINAL_ID")}
+        for k in self.saved_env:
+            os.environ.pop(k, None)
+        self.saved_poll, self.saved_relay = pa.RESTART_POLL, pa.relay
+        pa.RESTART_POLL = 0.05
+
+    def tearDown(self):
+        pa.RESTART_POLL, pa.relay = self.saved_poll, self.saved_relay
+        for k, v in self.saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        super().tearDown()
+
+    def run_cmd(self, **over):
+        args = dict(space=SP, on=None, now=False, fresh=False, why=None, wait=1, dry_run=False, json=False)
+        args.update(over)
+        return quiet(pa.cmd_restart, argparse.Namespace(**args))
+
+    def request_file(self):
+        path = os.path.join(self.dir, "restart-request.json")
+        return load(path) if os.path.exists(path) else None
+
+    def no_ending_calls(self):
+        self.assertFalse([c for c in self.calls if "kill" in c or "rm" in c], self.calls)
+
+
+class AC5_1_Identification(Command):
+    def refused(self, part, **over):
+        code, out, err = self.run_cmd(**over)
+        self.assertEqual(code, 2, out + err)
+        self.assertIn(part, out + err)
+        self.assertIsNone(self.request_file())
+        self.no_ending_calls()
+
+    def test_no_agent_json(self):
+        os.remove(os.path.join(self.dir, "agent.json"))
+        self.refused("no Project Agent")
+
+    def test_closed(self):
+        self.agent(closed=pa.now())
+        self.refused("closed")
+
+    def test_no_launcher_json_is_the_r10_message(self):
+        os.remove(os.path.join(self.dir, "launcher.json"))
+        self.refused("started before restart support")
+
+    def test_a_j1_record_is_the_r10_message(self):  # spec S4
+        dump(dict(self.rec, version=1, accepts=None), os.path.join(self.dir, "launcher.json"))
+        self.refused("started before restart support")
+
+    def test_launcher_json_for_another_terminal(self):
+        dump(dict(self.rec, terminal="t2"), os.path.join(self.dir, "launcher.json"))
+        self.refused("terminal")
+
+    def test_stale_heartbeat(self):
+        write(os.path.join(self.dir, "heartbeat"), "{} t1\n".format(int(time.time()) - 300))
+        self.refused("heartbeat")
+
+    def test_heartbeat_for_another_terminal(self):
+        write(os.path.join(self.dir, "heartbeat"), "{} t5\n".format(int(time.time())))
+        self.refused("heartbeat")
+
+    def test_label_missing(self):
+        self.term["labels"] = {}
+        self.refused("label")
+
+    def test_not_live(self):
+        self.term["state"] = "finished"
+        self.refused("live")
+
+    def test_has_a_parent(self):
+        self.term["parent"] = "t0"
+        self.refused("parent")
+
+    def test_pid_mismatch(self):
+        self.term["pid"] = 778
+        self.refused("pid")
+
+
+class AC5_2_Summary(Command):
+    def test_dry_run_lists_the_live_workers_and_writes_nothing(self):
+        code, out, err = self.run_cmd(dry_run=True)
+        self.assertEqual(code, 0, err)
+        self.assertIn("w1", out)
+        self.assertIn("w4", out)
+        self.assertNotIn("w2", out)
+        self.assertNotIn("w3", out)
+        self.assertIn("keeps running", out)
+        self.assertIn("restarts when this turn ends", out)
+        self.assertIsNone(self.request_file())
+        self.no_ending_calls()
+
+    def test_mid_turn_and_now_words(self):
+        self.term["status"] = {"state": "working"}
+        _c, out, _e = self.run_cmd(dry_run=True)
+        self.assertIn("mid-turn", out)
+        _c, out, _e = self.run_cmd(dry_run=True, now=True)
+        self.assertIn("cut off", out)
+
+
+class Answering(threading.Thread):
+    """Stands in for the launcher: once the request is there, writes what a launcher writes."""
+
+    def __init__(self, case, test):
+        super().__init__(daemon=True)
+        self.case, self.test = case, test
+
+    def run(self):
+        path = os.path.join(self.case.dir, "restart-request.json")
+        for _ in range(200):
+            if os.path.exists(path):
+                break
+            time.sleep(0.01)
+        req = load(path)
+        self.test(req)
+
+
+class AC5_3_Wait(Command):
+    def answer(self, fn):
+        a = Answering(self, fn)
+        a.start()
+        return a
+
+    def test_success_prints_what_was_loaded(self):
+        def ok(req):
+            time.sleep(0.1)
+            rec = dict(self.rec, instance="new-instance", restartedFrom=INSTANCE,
+                       restart={"request": req["id"], "outcome": "ok", "by": "pa-restart"})
+            dump(rec, os.path.join(self.dir, "launcher.json"))
+        self.answer(ok)
+        code, out, err = self.run_cmd(wait=5)
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("Restarted", out)
+        self.assertIn("core text: current", out)
+        self.assertIn("resumed", out)
+
+    def test_the_request(self):
+        seen = {}
+        self.answer(lambda req: seen.update(req))
+        self.run_cmd(wait=0.5, now=True, fresh=True, why="the person said so")
+        self.assertEqual((seen["space"], seen["instance"], seen["terminal"], seen["by"], seen["now"], seen["fresh"]),
+                         (SP, INSTANCE, "t1", "pa-restart", True, True))
+        self.assertEqual(pa.parse_time(seen["expires"]) - pa.parse_time(seen["at"]), 600)
+
+    def test_recorded_says_fresh(self):
+        def ok(req):
+            rec = dict(self.rec, instance="new", restartedFrom=INSTANCE,
+                       restart={"request": req["id"], "outcome": "ok"},
+                       session={"id": SID, "resume": True, "prompt": "recorded", "promptCore": "B" * 64, "core": "C" * 64})
+            dump(rec, os.path.join(self.dir, "launcher.json"))
+        self.answer(ok)
+        code, out, _err = self.run_cmd(wait=5)
+        self.assertEqual(code, 0)
+        self.assertIn("pa-restart --fresh", out)
+
+    def test_a_failed_outcome(self):
+        def failed(req):
+            dump(dict(self.rec, restart={"request": req["id"], "outcome": "failed", "why": "boom: self-check"}),
+                 os.path.join(self.dir, "launcher.json"))
+        self.answer(failed)
+        code, out, err = self.run_cmd(wait=5)
+        self.assertEqual(code, 1)
+        self.assertIn("boom: self-check", out + err)
+
+    def test_timeout_removes_its_own_request(self):
+        code, out, err = self.run_cmd(wait=0.3)
+        self.assertEqual(code, 1)
+        self.assertIn("did not happen", out + err)
+        self.assertIsNone(self.request_file())
+
+    def test_timeout_keeps_a_newer_request(self):
+        def newer(req):
+            dump(dict(req, id="someone-newer"), os.path.join(self.dir, "restart-request.json"))
+        self.answer(newer)
+        code, _out, _err = self.run_cmd(wait=0.4)
+        self.assertEqual(code, 1)
+        self.assertEqual(self.request_file()["id"], "someone-newer")
+
+    def test_wait_is_capped(self):
+        self.assertEqual(pa.restart_wait(10000), pa.RESTART_WAIT_MAX)
+        self.assertLess(pa.RESTART_WAIT_MAX, 600)
+
+
+class AC5_4_On(Command):
+    def test_on_relays_through_hc_exec_and_reads_nothing_here(self):
+        calls = []
+        pa.relay = lambda argv: calls.append(list(argv)) or 0
+        empty = tempfile.mkdtemp(prefix="empty-", dir=TMP)
+        saved_root = pa.ROOT
+        pa.ROOT = empty
+        try:
+            code, _out, err = self.run_cmd(on="m2", space=SP, now=True, why="it's 'quoted'", wait=30)
+        finally:
+            pa.ROOT = saved_root
+        self.assertEqual(code, 0, err)
+        self.assertEqual(os.listdir(empty), [])
+        self.assertEqual(len(calls), 1)
+        c = calls[0]
+        self.assertEqual(c[:7], ["hc", "exec", "--on", "m2", "--", "sh", "-c"])
+        script = c[7]
+        self.assertTrue(script.startswith('"$HOME/.config/herdr-pa/tools/pa.py" restart --space ' + SP))
+        for part in ("--now", "--wait 30", "--why"):
+            self.assertIn(part, script)
+        import shlex
+        words = shlex.split(script)
+        self.assertEqual(words[words.index("--why") + 1], "it's 'quoted'")
+        self.assertEqual(self.calls, [])
+
+    def test_on_needs_a_space_and_says_when_missing_there(self):
+        code, _o, err = self.run_cmd(on="m2", space=None)
+        self.assertEqual(code, 2)
+        self.assertIn("--space", err)
+        pa.relay = lambda argv: 127
+        code, out, err = self.run_cmd(on="m2")
+        self.assertEqual(code, 127)
+        self.assertIn("pa-sync --on m2", out + err)
+
+
+class AC5_5_FromTheProjectAgent(Command):
+    def test_needs_why(self):
+        os.environ["CLAUDECODE"] = "1"
+        code, _o, err = self.run_cmd()
+        self.assertEqual(code, 2)
+        self.assertIn("--why", err)
+        self.assertIsNone(self.request_file())
+
+    def test_with_why_journals_and_does_not_wait(self):
+        os.environ["CLAUDECODE"] = "1"
+        os.environ["HC_TERMINAL_ID"] = "t1"
+        began = time.time()
+        code, out, err = self.run_cmd(why="restart it now please", wait=30)
+        self.assertEqual(code, 0, err)
+        self.assertLess(time.time() - began, 5)
+        self.assertIn("when this turn ends", out)
+        req = self.request_file()
+        self.assertEqual((req["by"], req["why"]), ("orchestrator", "restart it now please"))
+        with open(os.path.join(self.dir, "journal.jsonl")) as f:
+            lines = [json.loads(x) for x in f.read().splitlines() if x.strip()]
+        self.assertEqual(len(lines), 1)
+        self.assertEqual((lines[0]["by"], lines[0]["trigger"], lines[0]["why"]),
+                         ("orchestrator", "conversation", "restart: restart it now please"))
+
+
+class MainAndInstall(Base):
+    def test_main_knows_pa_restart(self):
+        for argv0, extra in (("pa-restart", []), ("pa.py", ["restart"])):
+            seen = {}
+            saved = (sys.argv, pa.cmd_restart)
+            sys.argv = [argv0] + extra + ["--space", SP, "--dry-run", "--now", "--fresh", "--why", "w", "--wait", "9", "--on", "m"]
+            pa.cmd_restart = lambda args: seen.update(vars(args))
+            try:
+                pa.main()
+            finally:
+                sys.argv, pa.cmd_restart = saved
+            self.assertEqual((seen["space"], seen["dry_run"], seen["now"], seen["fresh"], seen["why"], seen["wait"], seen["on"]),
+                             (SP, True, True, True, "w", 9.0, "m"))
+
+    def test_install_links_pa_restart(self):
+        home = tempfile.mkdtemp(prefix="home-", dir=TMP)
+        env = {k: v for k, v in os.environ.items() if not k.startswith("HC_") and k != "CLAUDECODE"}
+        env.update(HOME=home, HERDR_PA_HOME=os.path.join(home, ".config", "herdr-pa"),
+                   HERDR_APP_HOME=os.path.join(home, ".config", "herdr-app"))
+        r = subprocess.run(["sh", os.path.join(REPO, "install.sh")], env=env, stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, universal_newlines=True)
+        self.assertEqual(r.returncode, 0, r.stdout[-2000:])
+        link = os.path.join(home, ".local", "bin", "pa-restart")
+        self.assertTrue(os.path.islink(link))
+        self.assertEqual(os.path.realpath(link), os.path.realpath(os.path.join(env["HERDR_PA_HOME"], "tools", "pa.py")))
+
+
+class AC9_1_OnlyTheOwnChild(unittest.TestCase):
+    def test_signals_only_in_end_child_and_run_child(self):
+        import ast
+        with open(os.path.join(REPO, "runtime", "tools", "pa.py")) as f:
+            text = f.read()
+        self.assertNotIn("os.kill(", text)
+        self.assertNotIn("killpg", text)
+        self.assertEqual(text.count('"kill"'), 1, "hc kill only in cmd_cleanup")
+        tree = ast.parse(text)
+        found = []
+        for fn in ast.walk(tree):
+            if isinstance(fn, ast.FunctionDef):
+                for node in ast.walk(fn):
+                    if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                            and node.func.attr in ("send_signal", "kill", "terminate")):
+                        found.append(fn.name)
+        self.assertTrue(found)
+        self.assertEqual(set(found) - {"end_child", "run_child"}, set(), found)
+
+
 if __name__ == "__main__":
     unittest.main()

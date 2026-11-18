@@ -4,6 +4,7 @@
 #   STUB_SLEEP             seconds to stay running (default 3600)
 #   STUB_EXIT              exit code after sleeping (default 0)
 #   STUB_FAIL_RESUME_ONCE  1: the first start with --resume exits 1 at once (marker: $STUB_LOG.failed)
+#   STUB_TERM_LOG          file that gets "TERM" when the stub is sent SIGTERM (it then exits 143 at once)
 log=${STUB_LOG:-/dev/null}
 printf '%s\n' "$*" | tr '\n' ' ' >> "$log"; echo >> "$log"
 if [ "${STUB_FAIL_RESUME_ONCE:-0}" = 1 ]; then
@@ -11,6 +12,13 @@ if [ "${STUB_FAIL_RESUME_ONCE:-0}" = 1 ]; then
     *" --resume "*)
       if [ ! -e "$log.failed" ]; then : > "$log.failed"; exit 1; fi ;;
   esac
+fi
+if [ -n "${STUB_TERM_LOG:-}" ]; then  # t-037: log a SIGTERM and end at once (sleep in the background, so the trap runs)
+  sleep "${STUB_SLEEP:-3600}" &
+  child=$!
+  trap 'echo TERM >> "$STUB_TERM_LOG"; kill "$child" 2>/dev/null; exit 143' TERM
+  wait "$child"
+  exit "${STUB_EXIT:-0}"
 fi
 sleep "${STUB_SLEEP:-3600}"
 exit "${STUB_EXIT:-0}"

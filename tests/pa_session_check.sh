@@ -1,5 +1,6 @@
 #!/bin/sh
-# Integration check for pa-session (t-001, spec §4.1: S1 S2 S3 S4 S5 S6a S7) against a PRIVATE hc core.
+# Integration check for pa-session (t-001, spec §4.1: S1 S2 S3 S4 S5 S6a S7; t-037 J2: S8 S9 S10, the restart in
+# place) against a PRIVATE hc core.
 # Usage: tests/pa_session_check.sh <scratch dir made by tests/setup-scratch.sh>
 # Every hc call goes through scratch(): its own HC_SESSION and XDG folders under the scratch dir,
 # HC_TERMINAL_ID / HC_SOCKET / HC_TERMINAL_SOCKET / HC_SCOPE unset (HC_TERMINAL_SOCKET names the live
@@ -90,9 +91,10 @@ for fd in (0, 1, 2):
 os.execvp(sys.argv[2], sys.argv[2:])
 PY
 cleanup() {
-  for t in n1 n2 n3 n4 n5 n6 n7 n8; do scratch hc kill "$t" >/dev/null 2>&1; done
+  [ -n "${sampler:-}" ] && kill "$sampler" 2>/dev/null
+  for t in n1 n2 n3 n4 n5 n6 n7 n8 n9 n10 w8 w9; do scratch hc kill "$t" >/dev/null 2>&1; done
   sleep 1
-  for t in n1 n2 n3 n4 n5 n6 n7 n8; do scratch hc rm "$t" >/dev/null 2>&1; done
+  for t in n1 n2 n3 n4 n5 n6 n7 n8 n9 n10 w8 w9; do scratch hc rm "$t" >/dev/null 2>&1; done
   scratch hc server stop >/dev/null 2>&1
   # Whatever the hc calls did not end (an hc call that failed under load), and then the watcher, not needed now.
   sh "$here/pa_session_reap.sh" reap "$S" "$SESSION" "$pid" "$core_began"
@@ -204,6 +206,76 @@ if wait_for $START_WAIT has_lines $((before + 1)); then
   case "$(last)" in *"--resume $X4 "*) pass "S4 migration resumed (--resume $X4)" ;; *) fail S4 "stub argv: $(last | cut -c1-90)" ;; esac
   tail -n 1 "$S/pa/spaces/$SP4/session.log" | grep -q "start resume=True session=$X4 reason=ran" && pass "S4 session.log reason=ran" || fail S4 "session.log: $(tail -n 1 "$S/pa/spaces/$SP4/session.log")"
 else fail S4 "stub never started; n8: $(scratch hc read n8 2>&1 | tail -n 5)"; fi
+
+# S8 (t-037 J2, AC6.6/AC11.1): pa-restart restarts the launcher in place. The terminal keeps its address and pid
+# and is never finished; its worker W stays live and still its child; the next Claude resumes the same session with
+# the new core text (S8b: a marker, --system-prompt-snapshot off from the profile, prompt rebuilt).
+SP8=sp8888888888888888888888888888bbbb
+L8="$S/pa/spaces/$SP8/launcher.json"
+jf() { python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(eval(sys.argv[2]))" "$@" 2>/dev/null; }
+before=$(lines)
+start n9 "$SP8" "$S/proj" "STUB_TERM_LOG=$S/term.log"
+if wait_for 15 has_lines $((before + 1)); then
+  sid8=$(agent "$SP8" sessionId)
+  addr0=$(scratch hc get n9 --json | json "d['address']")
+  pid0=$(scratch hc get n9 --json | json "d.get('pid')")
+  scratch hc run --bg --parent n9 --no-notify --name w8 -- sleep 600 >/dev/null
+  inst0=$(jf "$L8" "d['instance']")
+  sleep 24  # the session must have run (RAN) to be resumed
+  echo "MARKER-T037-$$" >> "$S/pa/core/orchestrator.md"
+  printf '{"name":"test","claude":["%s/bin/stub-claude"],"codex":["true"],"systemPromptSnapshot":"off"}\n' "$S" > "$S/pa/profiles/test/profile.json"
+  scratch python3 "$S/pa/tools/pa.py" stamp >/dev/null
+  : > "$S/samples"
+  ( while :; do scratch hc get n9 --json 2>/dev/null | json "'{} {}'.format(d.get('state'), d.get('pid'))" >> "$S/samples"; sleep 0.5; done ) &
+  sampler=$!
+  before=$(lines)
+  scratch pa-restart --space "$SP8" --wait 90 > "$S/restart.out" 2>&1
+  rc=$?
+  kill "$sampler" 2>/dev/null; sampler=""
+  [ "$rc" = 0 ] && grep -q "Restarted" "$S/restart.out" && pass "S8 pa-restart reports the restart" || fail S8 "pa-restart exit $rc: $(tail -n 5 "$S/restart.out")"
+  [ "$(state n9)" = live ] && pass "S8 terminal still live" || fail S8 "n9 state $(state n9)"
+  [ "$(scratch hc get n9 --json | json "d['address']")" = "$addr0" ] && pass "S8 same address $addr0" || fail S8 "address changed"
+  [ "$(scratch hc get n9 --json | json "d.get('pid')")" = "$pid0" ] && pass "S8 same pid $pid0" || fail S8 "pid now $(scratch hc get n9 --json | json "d.get('pid')")"
+  bad=$(grep -v "^live $pid0\$" "$S/samples" | head -1)
+  [ -s "$S/samples" ] && [ -z "$bad" ] && pass "S8 live with pid $pid0 in all $(wc -l < "$S/samples" | tr -d ' ') samples" || fail S8 "a sample: ${bad:-none taken}"
+  [ "$(state w8)" = live ] && pass "S8 worker w8 still live" || fail S8 "w8 state $(state w8)"
+  [ "$(scratch hc get w8 --json | json "d.get('parent')")" = "$addr0" ] && pass "S8 w8 still the PA terminal's child" || fail S8 "w8 parent $(scratch hc get w8 --json | json "d.get('parent')")"
+  scratch hc send n9 "report from w8" >/dev/null 2>&1 && pass "S8 hc send to the PA still works" || fail S8 "hc send failed"
+  if wait_for 15 has_lines $((before + 1)); then
+    new=$(sed -n "$((before + 1))p" "$LOG")
+    case "$new" in *"--resume $sid8 "*) pass "S8 resumed the same session" ;; *) fail S8 "stub argv: $(echo "$new" | cut -c1-100)" ;; esac
+    case "$new" in *"--system-prompt-snapshot off"*) pass "S8b --system-prompt-snapshot off passed" ;; *) fail S8b "no snapshot flag" ;; esac
+    case "$new" in *"MARKER-T037-$$"*) pass "S8b the new core text is in the resumed launch" ;; *) fail S8b "no marker in the argv" ;; esac
+  else fail S8 "no Claude start after the restart; n9: $(scratch hc read n9 2>&1 | tail -n 5)"; fi
+  grep -q TERM "$S/term.log" 2>/dev/null && pass "S8 Claude was sent SIGTERM" || fail S8 "no TERM in the stub's log"
+  [ "$(jf "$L8" "d['restartedFrom']")" = "$inst0" ] && [ "$(jf "$L8" "d['instance']")" != "$inst0" ] && pass "S8 launcher.json: a new instance restarted from the old" || fail S8 "launcher.json: $(head -c 300 "$L8")"
+  [ "$(jf "$L8" "d['restart']['outcome']")" = ok ] && [ "$(jf "$L8" "d['pid']")" = "$pid0" ] && pass "S8 outcome ok, same pid" || fail S8 "restart $(jf "$L8" "d['restart']")"
+  wait_for 10 sh -c "[ \"\$(python3 -c \"import json;print((json.load(open('$L8')).get('session') or {}).get('prompt'))\")\" = rebuilt ]" && pass "S8b session.prompt rebuilt" || fail S8b "session $(jf "$L8" "d['session']")"
+  [ ! -e "$S/pa/spaces/$SP8/restart-request.json" ] && pass "S8 request consumed" || fail S8 "request left"
+  [ -z "$(label n9 herdr.pa.restarting)" ] && pass "S8 herdr.pa.restarting removed" || fail S8 "label $(label n9 herdr.pa.restarting)"
+
+  # S10: a request for another instance is refused: nothing restarts, nothing ends.
+  before=$(lines)
+  python3 - "$S/pa/spaces/$SP8" "$SP8" "$addr0" <<'PY2'
+import json, sys, time
+d, sp, t = sys.argv[1:4]
+at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+exp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 600))
+json.dump({"version": 1, "id": "s10-request", "space": sp, "instance": "not-this-one", "terminal": t, "at": at,
+           "expires": exp, "by": "pa-restart", "why": "S10", "now": True}, open(d + "/restart-request.json", "w"))
+PY2
+  refused() { [ "$(jf "$L8" "(d.get('restart') or {}).get('outcome')")" = refused ]; }
+  wait_for 10 refused && pass "S10 another instance's request refused" || fail S10 "launcher.json restart: $(jf "$L8" "d.get('restart')")"
+  sleep 2
+  [ "$(lines)" = "$before" ] && [ "$(scratch hc get n9 --json | json "d.get('pid')")" = "$pid0" ] && [ "$(state w8)" = live ] && pass "S10 nothing restarted or ended" || fail S10 "stub restarted or a terminal changed"
+else fail S8 "stub never started; n9: $(scratch hc read n9 2>&1 | tail -n 5)"; fi
+
+# S9 (negative control): in this core a child does end with its parent's program, so S8's "w8 still live" means it.
+scratch hc run --bg --no-parent --no-notify --name n10 -- sleep 600 >/dev/null
+scratch hc run --bg --parent n10 --no-notify --name w9 -- sleep 600 >/dev/null
+sleep 1
+scratch hc kill n10 >/dev/null
+wait_for 10 not_live w9 && pass "S9 a child ends when its parent's program ends" || fail S9 "w9 state $(state w9)"
 
 # R (t-044): the reap ends only what this run started. Two decoys this script starts itself, which the run's
 # core and launchers did not: a `tail -f` on a file in the scratch folder, and the leader of a group of its

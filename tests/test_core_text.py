@@ -860,5 +860,12 @@ class T041DiskState(unittest.TestCase):  # t-041 J2: R7, R8, R9 (text), R10 (AC1
                       "one line.", p)
 
 
+class T037Restart(unittest.TestCase):  # t-037 R16: pa-restart is the person's
+    def test_orchestrator_line(self):
+        text = flat(section(read("runtime", "core", "orchestrator.md"), "## After a restart or a compaction"))
+        text = text[:text.index("## Files")]
+        self.assertIn("`pa-restart` is the person's: run it only at their word, with `--why` quoting them.", text)
+
+
 if __name__ == "__main__":
     unittest.main()
