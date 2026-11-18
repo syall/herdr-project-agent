@@ -1055,6 +1055,13 @@ def job_over(row, facts, profile):
     return why is None, why, desc
 
 
+def under_rule_b(row, card=None):
+    """True when rule (b) decides this worktree: a task using it is not done or parked, exactly one task records it, and
+    (when a card is given) the card was opened under rule (b). A worktree two or more tasks record keeps rule (a): offered
+    and removed only once every task using it is done or parked (spec AC7.1, VP2). check and remove both ask this."""
+    return bool(tasks_still(row)) and len(set(row["tasks"])) == 1 and (card is None or card.get("rule") == "b")
+
+
 def withdraw_card(directory, path, card, task, why):
     card.update(status="withdrawn", answer=None, note="Withdrawn by pa-worktree check: " + why, answered=pa.now(),
                 answeredBy="pa-worktree check: withdrawn")
@@ -1071,9 +1078,8 @@ def open_worktree_card(directory, row, facts, profile, owner, rule, gone, desc=N
     extra = []
     if named:
         extra.append("Job: {}{}".format(clean(job), "" if row["jobRecorded"].get(task, True) else " (named from its folder; not recorded)"))
-    if rule == "b":
-        extra.append("{}; this job's commits are all merged".format(
-            "Task still {}".format(clean(row["states"].get(task))) if len(row["tasks"]) == 1 else "Tasks still " + tasks_still(row)))
+    if rule == "b":  # one task records the worktree (under_rule_b)
+        extra.append("Task still {}; this job's commits are all merged".format(state_word(row["states"].get(task))))
     if desc is None:
         try:
             desc = describe_worktree(row, facts, profile)
@@ -1147,7 +1153,7 @@ def cmd_worktree(args):
                 print("{}: {} is not under a worktrees folder; not offered".format(task, row["path"]))
             elif card and card.get("status") == "answered":
                 delete = str(card.get("answer", "")).lower().startswith("delete")
-                if delete and still and card.get("rule") == "b":
+                if delete and under_rule_b(row, card):
                     print("{}: card {} answered {!r}: run `{}`; it re-checks".format(task, card["id"], card.get("answer"), remove_command(*owner)))
                 elif delete and still:
                     print("{}: card {} answered {!r}, but tasks still {}; pa-worktree remove refuses until every task using it is "
@@ -1155,7 +1161,7 @@ def cmd_worktree(args):
                 else:
                     print("{}: card {} answered {!r}{}".format(task, card["id"], card.get("answer"),
                           ": run `{}`".format(remove_command(*owner)) if delete else ": kept, not asked again"))
-            elif card and still and card.get("rule") == "b":
+            elif card and under_rule_b(row, card):
                 over, why, _desc = job_over(row, facts, profile)
                 if over:
                     print("{}: card {} is open".format(task, card["id"]))
@@ -1171,6 +1177,9 @@ def cmd_worktree(args):
                               "tasks still {}; it is asked again once every task using the worktree is done or parked".format(still))
             elif card:
                 print("{}: card {} is open".format(task, card["id"]))
+            elif still and not under_rule_b(row):
+                print("{}: tasks still {}; asked once every task using it is done or parked; rule (b) is only for a worktree "
+                      "one task records".format(task, still))
             elif still:
                 over, why, desc = job_over(row, facts, profile)
                 if not over:
@@ -1215,7 +1224,7 @@ def cmd_worktree(args):
     if not main and not in_worktrees_folder(row["path"]):
         raise pa.Problem("{} is not under a worktrees folder; nothing was removed".format(row["path"]))
     still = tasks_still(row)
-    if still and card.get("rule") != "b":
+    if still and not under_rule_b(row, card):
         raise pa.Problem("tasks still {}; a worktree is removed only once every task using it is done or parked. Nothing was removed".format(still))
     if still:
         over, why, _desc = job_over(row, facts, profile)
