@@ -3549,9 +3549,10 @@ def net():
     return module
 
 
-def http_opener():
-    """The only opener the fetch uses (R-S1, R-S2): pa_net.http_opener with NoRedirect."""
-    return net().http_opener(NoRedirect())
+def http_opener(deadline=None, clock=None):
+    """The only opener the fetch uses (R-S1, R-S2): pa_net.http_opener with NoRedirect; with a deadline, every TLS read
+    waits at most the budget left (R-S3)."""
+    return net().http_opener(NoRedirect(), deadline, clock, FetchFailed, FETCH_BUDGET)
 
 
 def download(url, max_bytes, dest, deadline, opener, clock):
@@ -3744,25 +3745,6 @@ def plan_changes(raw, batches, source, name, today, at, legacy_default):
     kept = {m for m in models_seen if keep(m)}
     excluded = [m for m in models_seen if m not in kept]
 
-    # A-F3: region-free endpoints from the default region's file; another region's row goes to its own scope only when
-    # it differs (or the default file lacks it); every other endpoint: one scope per fetched region.
-    default_batch = batches[0]
-    dgroups = dict(_groups(default_batch, kept))
-    placements, same_in = [], {}
-    for gk, g in sorted(dgroups.items(), key=lambda x: tuple("" if v is None else v for v in x[0])):
-        placements.append(((gk[0], gk[1], None if gk[1] in free else default_batch["region"], gk[2]), gk[3], g, default_batch))
-    for b in batches[1:]:
-        for gk, g in _groups(b, kept):
-            if gk[1] in free:
-                d = dgroups.get(gk)
-                if d is not None and _same_prices(d, g):
-                    same_in.setdefault(gk, []).append((b, g))
-                    continue
-                if d is not None:
-                    notes.append("{} / {}: differs in {}: its own scope".format(
-                        scope_text((gk[0], gk[1], b["region"], gk[2])), gk[3], b["region"] or b["key"]))
-            placements.append(((gk[0], gk[1], b["region"], gk[2]), gk[3], g, b))
-
     changes = 0
     if raw.get("defaultScope") is not None:
         default = _scope(raw["defaultScope"], "defaultScope")
@@ -3788,12 +3770,37 @@ def plan_changes(raw, batches, source, name, today, at, legacy_default):
         raw.setdefault("scoped", []).append(e)
         return e["models"]
 
+    # A-F3: region-free endpoints from the default region's file; another region's row goes to its own scope only when
+    # it differs (or the default file lacks it), or when the file already has that region's own scope for the model;
+    # every other endpoint: one scope per fetched region.
+    default_batch = batches[0]
+    dgroups = dict(_groups(default_batch, kept))
+    placements, same_in = [], {}
+    for gk, g in sorted(dgroups.items(), key=lambda x: tuple("" if v is None else v for v in x[0])):
+        placements.append(((gk[0], gk[1], None if gk[1] in free else default_batch["region"], gk[2]), gk[3], g, default_batch))
+    for b in batches[1:]:
+        for gk, g in _groups(b, kept):
+            if gk[1] in free:
+                d = dgroups.get(gk)
+                if d is not None and _same_prices(d, g):
+                    same_in.setdefault(gk, []).append((b, g))
+                    # M2 (J2 round 2): a region with its own scope from an earlier fetch (it differed then) is compared
+                    # against that scope too (R-F4), so its old row stops pricing the region once it converges.
+                    if gk[3] in (models_of((gk[0], gk[1], b["region"], gk[2]), False) or {}):
+                        placements.append(((gk[0], gk[1], b["region"], gk[2]), gk[3], g, b))
+                    continue
+                if d is not None:
+                    notes.append("{} / {}: differs in {}: its own scope".format(
+                        scope_text((gk[0], gk[1], b["region"], gk[2])), gk[3], b["region"] or b["key"]))
+            placements.append(((gk[0], gk[1], b["region"], gk[2]), gk[3], g, b))
+
     default_changed = False
     for scope, model, g, batch in placements:
         where = "{} / {}".format(scope_text(scope), model)
         base = {k: (g["kinds"][k]["price"] if k in g["kinds"] else None) for k in KINDS}
         whys = {k: (g["kinds"][k].get("why") if k in g["kinds"] else "not in the source") for k in KINDS if base[k] is None}
         long_src = {k: g["kinds"]["long." + k]["price"] for k in KINDS if "long." + k in g["kinds"]}
+        long_whys = {k: g["kinds"]["long." + k].get("why") for k, v in long_src.items() if v is None}
         existing = _rows_of(models_of(scope, False) or {}, model)
         latest = sorted(existing, key=lambda e: e.get("validFrom") or "")[-1] if existing else None
         eff = g["eff"]
@@ -3812,7 +3819,11 @@ def plan_changes(raw, batches, source, name, today, at, legacy_default):
             old_long = latest.get("long") if isinstance(latest.get("long"), dict) else {}
             for k, s in sorted(long_src.items()):
                 f = old_long.get(k, latest.get(k, 0))
-                if s is not None and (f is None or float(s) != float(f)):
+                if s is None:  # M1 (J2 round 2): a null never removes a long price either
+                    if k in old_long and old_long[k] is not None:
+                        notes.append("{} / long.{}: kept {} (source has no price: {})".format(
+                            where, k, _price_text(old_long[k]), long_whys[k]))
+                elif f is None or isinstance(f, bool) or float(s) != float(f):
                     changed.append(("long." + k, f, s))
             if not changed:
                 continue
@@ -3828,9 +3839,13 @@ def plan_changes(raw, batches, source, name, today, at, legacy_default):
             whys = {k: w for k, w in whys.items() if row[k] is None}
             for k, f, s in changed:
                 diff.append("{} / {}: {} → {} (validFrom {})".format(where, k, _price_text(f), _price_text(s), valid))
-            if old_long and not long_src:
-                row["long"] = json.loads(json.dumps(old_long))
-        if long_src:
+            # M1: the new row keeps the latest row's long part (its kinds and `above`); the source's numbers replace
+            # only the kinds it priced, a null or an unsent kind keeps the file's.
+            new_long = json.loads(json.dumps(old_long))
+            new_long.update({k: v for k, v in long_src.items() if v is not None})
+            if new_long:
+                row["long"] = new_long
+        if latest is None and long_src:
             row["long"] = dict(long_src)
         refs = {}
         for k, ln in sorted(g["kinds"].items()):
@@ -4022,15 +4037,15 @@ def _fetch_in(folder, profile, name, src, path, installed, dry_run, yes, opener,
     if installed:  # Q4 (accepted): the default target, with a warning
         print("Note: this writes the installed profile's prices.json; the next install of the profile overwrites it. "
               "Use --into <profile package checkout>/profiles/{}/prices.json".format(profile.get("name")), file=sys.stderr)
+    deadline = clock() + FETCH_BUDGET
     if opener is None:
-        real = http_opener()
+        real = http_opener(deadline, clock)
 
         def opener(request, timeout):
             return real.open(request, timeout=timeout)
     keys = list(src["urls"])
     default_key = src.get("defaultRegion") or keys[0]
     keys = [default_key] + [k for k in keys if k != default_key]
-    deadline = clock() + FETCH_BUDGET
     files = []
     for i, key in enumerate(keys):
         u = src["urls"][key]

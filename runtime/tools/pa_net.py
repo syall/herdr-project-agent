@@ -6,20 +6,47 @@ urllib and ssl are imported inside the functions, never at module load.
 What it does and does not do (spec R-S1 to R-S3): one HTTPS GET per declared URL through an opener built by hand
 (environment proxies, https with certificate checks, no redirect, no plain http, file, ftp or data, no cookie, no
 authentication); only `User-Agent: herdr-pa-costs` and `Accept-Encoding: identity` are sent; the body is streamed into
-a new file and refused past its maxBytes or past the whole fetch's deadline. Nothing here reads a credential, a
-credential file or a cookie store."""
+a new file and refused past its maxBytes or past the whole fetch's deadline. Every TLS read (headers and body) waits at
+most the budget left, and the body is read one socket read at a time with the clock checked before each (J2 round 2,
+REVIEW M3). Nothing here reads a credential, a credential file or a cookie store."""
 
 CONNECT_TIMEOUT = 20  # seconds one blocking network operation may take
 CHUNK = 65536
 
 
-def http_opener(no_redirect):
+def read_timeout(deadline, clock, fail, budget):
+    """The seconds one blocking read may wait: CONNECT_TIMEOUT or the budget left, the smaller; raises fail(3) once the
+    clock has passed the deadline."""
+    left = deadline - clock()
+    if left <= 0:
+        raise fail(3, "the downloads took longer than {} s: stopped".format(budget))
+    return min(CONNECT_TIMEOUT, left)
+
+
+def http_opener(no_redirect, deadline=None, clock=None, fail=None, budget=None):
     """The only opener the fetch uses: environment proxies (Q5), https with the default certificate checks, the given
-    handler refusing every redirect, the default error handling. Nothing else."""
+    handler refusing every redirect, the default error handling. Nothing else. With a deadline, every read of a TLS
+    socket (the response's headers and body) first sets the socket's timeout to the budget left (read_timeout), so a
+    server sending a byte at a time cannot hold the fetch past its deadline (R-S3)."""
     import ssl
     import urllib.request
+    context = ssl.create_default_context()
+    if deadline is not None:
+        class BoundedSocket(ssl.SSLSocket):
+            def recv_into(self, buffer, nbytes=None, flags=0):
+                self.settimeout(read_timeout(deadline, clock, fail, budget))
+                return super().recv_into(buffer, nbytes, flags)
+
+            def recv(self, buflen=1024, flags=0):
+                self.settimeout(read_timeout(deadline, clock, fail, budget))
+                return super().recv(buflen, flags)
+
+            def read(self, len=1024, buffer=None):  # noqa: A002 - SSLSocket.read's own parameter name
+                self.settimeout(read_timeout(deadline, clock, fail, budget))
+                return super().read(len, buffer)
+        context.sslsocket_class = BoundedSocket
     opener = urllib.request.OpenerDirector()
-    for h in (urllib.request.ProxyHandler(), urllib.request.HTTPSHandler(context=ssl.create_default_context()), no_redirect,
+    for h in (urllib.request.ProxyHandler(), urllib.request.HTTPSHandler(context=context), no_redirect,
               urllib.request.HTTPDefaultErrorHandler(), urllib.request.HTTPErrorProcessor()):
         opener.add_handler(h)
     return opener
@@ -67,11 +94,13 @@ def download(url, max_bytes, dest, deadline, opener, clock, fail, scrub, budget)
         if length is not None and length > max_bytes:
             raise fail(1, "{} is {} bytes, more than its maxBytes {}".format(url, length, max_bytes))
         fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        # read1: one socket read per call (read would loop inside a BufferedReader until CHUNK bytes), so the clock is
+        # checked before every socket read, not only between chunks.
+        read = getattr(resp, "read1", None) or resp.read
         with os.fdopen(fd, "wb") as out:
             while True:
-                if clock() > deadline:
-                    raise fail(3, "the downloads took longer than {} s: stopped".format(budget))
-                chunk = resp.read(CHUNK)
+                read_timeout(deadline, clock, fail, budget)
+                chunk = read(CHUNK)
                 if not chunk:
                     break
                 total += len(chunk)
@@ -80,6 +109,8 @@ def download(url, max_bytes, dest, deadline, opener, clock, fail, scrub, budget)
                 digest.update(chunk)
                 out.write(chunk)
     except (OSError, ValueError) as e:
+        if clock() > deadline:  # a read that timed out at the budget's end
+            raise fail(3, "the downloads took longer than {} s: stopped".format(budget))
         raise fail(1, "download of {} failed: {}".format(url, scrub(str(e))[:200]))
     finally:
         try:
