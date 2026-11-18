@@ -413,10 +413,11 @@ Run `hc --skill` once to learn `hc`. Start workers with the profile's commands (
   not fit or the card was withdrawn, and otherwise says it already ran.
 - One card per worktree: a worktree's Delete/Keep card (below) answers for the one
   worktree it names (its path and branch), never for another, and the card of a removed
-  worktree never counts again. A task's next worktree gets its own card, with `-2` and
-  on added to the id when that id is taken. Never point the task's `worktree` at a later
-  job's folder while the first one exists: add it as a `worktrees` entry, or the first
-  is no longer recorded and is never offered.
+  worktree never counts again. A task's next worktree gets its own card: when its id is
+  taken, the main worktree's is `d-wt-<task>-main` (`WORKTREE-main.md`), and a taken id
+  then gets `-2` and on (`d-wt-<task>-<job>-2`). Never point the task's `worktree` at
+  a later job's folder while the first one exists: add it as a `worktrees` entry, or
+  the first is no longer recorded and is never offered.
 - Worktrees outlive their workers: a task's worktrees stay while its workers come and
   go. Each pass, run `pa-worktree check --open-cards`. It opens a Delete/Keep card for
   each recorded worktree whose job is over: `d-wt-<task>` for the task's main worktree,
