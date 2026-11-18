@@ -3515,6 +3515,92 @@ class CC_Collect(Collecting):
         self.assertEqual(raw(self.costs("summary.json")), before)  # nothing new: not rewritten
 
 
+class CC_Resume(CCBase):
+    """t-043: a resumed session's Claude Code figure is counted once. On a resume Claude Code's first update comes before
+    it restores the saved totals (cost and duration near 0), then it reports the restored total; a real restart (totals
+    from zero) still counts as a new segment."""
+
+    def readings(self, steps):
+        for now, cost, dur in steps:
+            self.run_sl(cc_bytes(cost=cost, dur=dur), now=now)
+        return self.cc_record()
+
+    def test_r1_a_resume_like_the_project_agents_is_counted_once(self):
+        rec = self.readings([(T0, 524.0, 100000000), (T0 + 300, 530.0, 100300000),
+                             (T0 + 600, 0.0, 2000),  # the resumed process's first update
+                             (T0 + 610, 530.5, 100305000),  # its restored totals
+                             (T0 + 900, 538.0, 100600000), (T0 + 1200, 0.0, 1500), (T0 + 1210, 589.0, 101000000)])
+        self.assertEqual((rec["base"], rec["cost"], rec["segments"]), (0, 589.0, 1))
+        self.assertAlmostEqual(pa_costs.cc_figure(pa_costs.cc_clean(rec)), 589.0)
+        self.assertNotIn("heldCost", rec)
+        self.assertNotIn("heldMs", rec)
+
+    def test_r2_a_real_restart_keeps_its_segment(self):
+        rec = self.readings([(T0, 5.0, 200000), (T0 + 40, 0.4, 1000)])  # a drop: held until it is seen a restore or not
+        self.assertEqual((rec["base"], rec["cost"], rec["segments"], rec["heldCost"], rec["heldMs"]), (5.0, 0.4, 2, 5.0, 200000))
+        self.assertAlmostEqual(pa_costs.cc_figure(pa_costs.cc_clean(rec)), 5.4)
+        rec = self.readings([(T0 + 400, 2.0, 361000), (T0 + 800, 6.0, 761000)])  # grows at the clock's speed past both
+        self.assertEqual((rec["base"], rec["cost"], rec["segments"]), (5.0, 6.0, 2))
+        self.assertAlmostEqual(pa_costs.cc_figure(pa_costs.cc_clean(rec)), 11.0)
+
+    def test_r3_duration_back_but_not_faster_than_the_clock_is_no_restore(self):
+        rec = self.readings([(T0, 5.0, 100000), (T0 + 10, 0.4, 1000),
+                             (T0 + 200, 5.5, 150000)])  # 149 s more in 190 s: back above both, but at the clock's speed
+        self.assertEqual((rec["base"], rec["segments"]), (5.0, 2))
+        rec = self.readings([(T0 + 210, 0.2, 500), (T0 + 220, 5.5, 155000)])  # a new drop replaces the hold; then restored
+        self.assertEqual((rec["base"], rec["cost"], rec["segments"]), (5.0, 5.5, 2))  # only the second drop is undone
+        self.assertNotIn("heldCost", rec)
+
+    def test_r4_a_restore_with_a_lower_cost_than_held_is_no_restore(self):
+        rec = self.readings([(T0, 5.0, 100000), (T0 + 10, 0.4, 1000), (T0 + 20, 1.0, 120000)])
+        self.assertEqual((rec["base"], rec["segments"], rec["heldCost"]), (5.0, 2, 5.0))
+
+    def test_r5_a_written_record_with_restored_totals_reads_once(self):
+        sid = "e6885e5e-8522-4200-8df9-5bb232342b0a"
+        stored = {"v": 1, "session": sid, "cost": 589.2501290000005, "base": 1070.2945344000002, "segments": 3,
+                  "durationMs": 133402117, "apiDurationMs": 27521511, "model": None, "version": None, "terminal": None,
+                  "first": "2026-11-18T02:25:51Z", "at": "2026-11-18T07:36:51Z"}  # the space's PA record (t-043 data copy)
+        rec = pa_costs.cc_clean(stored, sid)
+        self.assertEqual((rec["base"], rec["segments"], rec["corrected"]), (0, 1, True))
+        self.assertAlmostEqual(pa_costs.cc_figure(rec), 589.250129)
+        span_ok = dict(stored, durationMs=18660000 + 300000)  # within the span plus slack: a real restart, kept
+        rec = pa_costs.cc_clean(span_ok, sid)
+        self.assertEqual((rec["base"], rec["segments"]), (1070.2945344000002, 3))
+        self.assertNotIn("corrected", rec)
+        held = dict(stored, heldCost=500.0, heldMs=133000000)  # a hold in progress is the recorder's: not corrected
+        rec = pa_costs.cc_clean(held, sid)
+        self.assertEqual((rec["base"], rec["segments"], rec["heldCost"], rec["heldMs"]), (1070.2945344000002, 3, 500.0, 133000000))
+        bad = pa_costs.cc_clean(dict(stored, heldCost=500.0, heldMs="x"), sid)  # half a hold: neither is kept
+        self.assertNotIn("heldCost", bad)
+        self.assertNotIn("heldMs", bad)
+
+    def test_r6_the_next_reading_rewrites_a_corrected_record(self):
+        dump({"v": 1, "session": CC_SID, "cost": 10.0, "base": 20.0, "segments": 3, "durationMs": 90000000, "apiDurationMs": 1,
+              "model": "model-a", "version": "2.1.999", "terminal": "t5", "first": iso(T0), "at": iso(T0 + 3600)}, self.cc_path())
+        rec = self.readings([(T0 + 3660, 10.5, 90060000)])
+        self.assertEqual((rec["base"], rec["cost"], rec["segments"], rec["first"]), (0, 10.5, 1, iso(T0)))
+
+
+class CC_ResumeSummary(CCFixture):
+    """t-043: the summary reads a written record with restored totals as counted once, and marks it."""
+
+    def test_rs1_corrected_session_is_marked(self):
+        self.fixture()
+        self.cc(self.SA, 1.5, base=4.0, segments=3, durationMs=7200000, at=T0 + 600)  # 2 h of totals in a 10 min record
+        pa_costs.write_summary(self.dir, now=T0 + 5000)
+        s = load(self.costs("summary.json"))
+        by = {e["key"]: e for e in s["sessions"]}
+        a = by[self.SA[:8]]
+        self.assertAlmostEqual(a["cc"], 1.75)  # 1.5 alone, plus the /clear continuation SD's 0.25
+        self.assertEqual(a["ccCorrected"], 1)
+        self.assertNotIn("ccSegments", a)
+        c = by[self.SC[:8]]  # a real restart (1 s of totals in a 60 s record): unchanged
+        self.assertAlmostEqual(c["cc"], 3.5)
+        self.assertEqual(c["ccSegments"], 2)
+        self.assertNotIn("ccCorrected", c)
+        self.assertAlmostEqual(s["totals"]["cc"]["money"], 7.25)
+
+
 class CC_Report(CCFixture):
     """R6: report shows CC beside est., est. first; CC never in shares, sorting or est."""
 
