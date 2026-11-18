@@ -2162,7 +2162,9 @@ class TaskWorktrees(Base):
         self.assertEqual(json.dumps(led["tasks"][0], sort_keys=True), before)
         self.assertEqual(led["tasks"][1]["worktree"], self.wt)
 
-    def test_tw16_old_shape_shared_main_no_field_unchanged(self):
+    def test_tw16_old_shape_shared_main_no_field_follows_rule_a(self):
+        # card d-094, limit 1: the old shape (both tasks have the path as `worktree`, the worker no field) no longer removes a
+        # worktree another unfinished task shares; once it is done, both tasks are marked (was: removed always, only its own marked)
         for state in ("in-progress", "done"):
             with self.subTest(state=state):
                 self.ledger({"version": 1, "tasks": []})
@@ -2174,12 +2176,20 @@ class TaskWorktrees(Base):
                 t009 = json.dumps(self.ledger()["tasks"][0], sort_keys=True)
                 code, out, err = self.worker("delete", "t31")
                 self.assertEqual(code, 0, err)
-                self.assertEqual(out, "Ended and removed worker t31 (a).\nRemoved the worktree {}. Branch t-003-g-{} is kept.\n"
-                                 "(The Project Agent is not running; it reads the ledger when it starts.)\n".format(os.path.realpath(shared), state))
-                self.assertFalse(os.path.exists(shared))
                 led = self.ledger()
-                self.assertEqual(json.dumps(led["tasks"][0], sort_keys=True), t009, "as at 4c52361, the other task's entry is not written")
-                self.assertIsNone(led["tasks"][1]["worktree"])
+                if state == "in-progress":
+                    self.assertEqual(out, "Ended and removed worker t31 (a).\nKept the worktree: still used by task t-009 (in-progress).\n"
+                                     "(The Project Agent is not running; it reads the ledger when it starts.)\n")
+                    self.assertTrue(os.path.isdir(shared))
+                    self.assertEqual(json.dumps(led["tasks"][0], sort_keys=True), t009)
+                    self.assertEqual(led["tasks"][1]["worktree"], shared)
+                else:
+                    self.assertEqual(out, "Ended and removed worker t31 (a).\nRemoved the worktree {}. Branch t-003-g-{} is kept.\n"
+                                     "(The Project Agent is not running; it reads the ledger when it starts.)\n".format(os.path.realpath(shared), state))
+                    self.assertFalse(os.path.exists(shared))
+                    self.assertEqual([t["worktree"] for t in led["tasks"]], [None, None])
+                    for task in led["tasks"]:
+                        self.assertEqual(pa.task_worktrees(task), [])
 
     def test_tw17_close_never_removes_a_shared_worktree(self):
         other = self.shared_with_t009("in-progress", "t-009-other")
@@ -2706,6 +2716,141 @@ class Containers(Base):
         self.assertEqual(code, 0, err)
         self.assertNotIn("empty folder", out)
         self.assertTrue(os.path.isdir(other))
+
+
+class D094Limits(Base):
+    """t-020, card d-094 (the person's limits to J2): an old-shape shared main worktree follows rule (a) too; pa-worktree remove
+    marks the worktree removed on every task that records it; a failed removal still writes the ledger consistently; and the
+    gaps J1's checkers named (a field on a shared main, a field with a trailing slash or through a symlink, a task with no state)."""
+
+    def setUp(self):
+        super().setUp()
+        self.proj = self.repo()
+        self.wt = self.worktree(self.proj, "t-003-x")
+
+    def answered_main_card(self, task="t-003"):
+        code, out, err = self.run_cmd("pa-worktree", "check", "--open-cards", "--space", "sp1")
+        self.assertEqual(code, 0, err)
+        path = os.path.join(self.dir, "decisions", "d-wt-{}.json".format(task))
+        card = load(path)
+        card.update(status="answered", answer="Delete")
+        dump(card, path)
+
+    def test_l2_worktree_remove_marks_every_task_that_records_it(self):
+        self.add_task("t-003", "done", self.wt, [])
+        self.add_task("t-004", "parked", self.wt, [])
+        self.add_task("t-005", "done", None, [], worktrees=[{"path": self.wt, "job": "shared"}])
+        self.answered_main_card()
+        code, out, err = self.run_cmd("pa-worktree", "remove", "t-003", "--space", "sp1")
+        self.assertEqual(code, 0, err)
+        self.assertFalse(os.path.exists(self.wt))
+        led = self.ledger()
+        for task in led["tasks"]:
+            self.assertEqual(pa.task_worktrees(task), [], "no ledger entry names the removed folder ({})".format(task["id"]))
+        self.assertEqual([t["worktree"] for t in led["tasks"]], [None, None, None])
+        self.assertTrue(led["tasks"][2]["worktrees"][0]["removed"])
+        self.assertEqual([e["job"] for e in led["tasks"][0]["worktrees"]], ["main"])
+        line = self.journal()[-1]
+        self.assertEqual((line["trigger"], line["task"]), ("worktree", "t-003"))
+        self.assertIn("removed the worktree {} (card d-wt-t-003)".format(os.path.realpath(self.wt)), line["why"])
+
+    def failing_kind(self, removes_folder):
+        kind = os.path.join(self.tmp, "kind-wt")
+        write(os.path.join(kind, "marker.txt"), "")
+        status, remove = os.path.join(self.tmp, "status.sh"), os.path.join(self.tmp, "remove.sh")
+        write(status, "#!/bin/sh\necho '{\"uncommitted\": 0, \"unpushed\": 0, \"branch\": \"b\", \"kind\": \"custom worktree\"}'\n")
+        write(remove, "#!/bin/sh\n{}echo 'remove broke halfway'\nexit 1\n".format('rm -rf "$1"\n' if removes_folder else ""))
+        for f in (status, remove):
+            os.chmod(f, 0o755)
+        dump({"name": "test2", "claude": ["true"], "codex": ["true"],
+              "worktree": {"marker": "marker.txt", "status": status, "remove": remove}}, os.path.join(pa.ROOT, "profiles", "test2", "profile.json"))
+        agent = load(os.path.join(self.dir, "agent.json"))
+        agent["profile"] = "test2"
+        dump(agent, os.path.join(self.dir, "agent.json"))
+        return kind
+
+    def test_l3_failed_removal_in_delete_still_writes_the_ledger(self):
+        for removes_folder in (False, True):
+            with self.subTest(removes_folder=removes_folder):
+                self.ledger({"version": 1, "tasks": []})
+                shutil.rmtree(os.path.join(self.tmp, "kind-wt"), ignore_errors=True)
+                kind = self.failing_kind(removes_folder)
+                self.add_task("t-003", "done", kind, [{"address": "t31", "role": "build", "name": "a"},
+                                                      {"address": "t32", "role": "build", "name": "b", "finished": True}])
+                self.term("t31", "a", cwd=self.tmp)
+                code, out, err = self.worker("delete", "t31")
+                self.assertEqual(code, 2, (out, err))
+                self.assertIn("Ended and removed worker t31 (a).", out)
+                self.assertIn("Could not remove the worktree {}: ".format(os.path.realpath(kind)), out)
+                self.assertIn("remove broke halfway", out)
+                self.assertIn("the worker is ended and the ledger updated", err)
+                task = self.ledger()["tasks"][0]
+                self.assertEqual([w["address"] for w in task["workers"]], ["t32"], "the ended worker is not left listed")
+                if removes_folder:
+                    self.assertIsNone(task["worktree"], "a folder that is gone is marked removed")
+                    self.assertTrue(task["worktrees"][0]["removed"])
+                else:
+                    self.assertEqual(task["worktree"], kind, "a folder still there is not marked removed")
+                    self.assertNotIn("worktrees", task)
+                self.assertIn("the person deleted worker t31", self.journal()[-1]["why"])
+
+    def test_l3b_failed_removal_in_worktree_remove_marks_a_gone_folder(self):
+        kind = self.failing_kind(True)
+        self.add_task("t-003", "done", kind, [])
+        self.add_task("t-004", "done", kind, [])
+        self.answered_main_card()
+        code, out, err = self.run_cmd("pa-worktree", "remove", "t-003", "--space", "sp1")
+        self.assertEqual(code, 2)
+        self.assertIn("remove broke halfway", err)
+        self.assertFalse(os.path.exists(kind))
+        self.assertEqual([t["worktree"] for t in self.ledger()["tasks"]], [None, None])
+
+    def test_l4a_field_on_a_main_shared_with_an_unfinished_task(self):
+        self.add_task("t-009", "in-progress", self.wt, [])
+        self.add_task("t-003", "done", self.wt, [{"address": "t31", "role": "build", "name": "a", "worktree": self.wt}])
+        before = json.dumps(self.ledger()["tasks"][0], sort_keys=True)
+        code, out, err = self.worker("delete", "t31")
+        self.assertEqual(code, 0, err)
+        self.assertIn("Kept the worktree: still used by task t-009 (in-progress).", out)
+        self.assertTrue(os.path.isdir(self.wt))
+        led = self.ledger()
+        self.assertEqual(json.dumps(led["tasks"][0], sort_keys=True), before)
+        self.assertEqual((led["tasks"][1]["worktree"], led["tasks"][1]["workers"]), (self.wt, []))
+
+    def test_l4b_field_with_a_trailing_slash_or_through_a_symlink(self):
+        billing = self.worktree(self.proj, "t-003-billing")
+        link = os.path.join(self.tmp, "link-to-billing")
+        os.symlink(billing, link)
+        for label, field in (("slash", billing + "/"), ("symlink", link), ("symlink, slash", link + "/")):
+            with self.subTest(field=label):
+                self.ledger({"version": 1, "tasks": []})
+                self.add_task("t-003", "done", self.wt, [{"address": "t32", "role": "build", "name": "b", "worktree": field}],
+                              worktrees=[{"path": billing, "job": "billing"}])
+                task = self.ledger()["tasks"][0]
+                self.assertEqual(pa_hooks.worker_tree(task, task["workers"][0]), os.path.realpath(billing))
+                self.assertEqual(pa_hooks.uncommitted_in(task, None, task["workers"][0])[0], os.path.realpath(billing))
+                facts, _row = pa_hooks.worker_facts(self.dir, {"terminal": "t0"}, None, "t32")
+                self.assertEqual(facts["worktree"]["path"], os.path.realpath(billing))
+        code, out, err = self.worker("delete", "t32")
+        self.assertEqual(code, 0, err)
+        self.assertFalse(os.path.exists(billing))
+        self.assertTrue(os.path.isdir(self.wt), "the main worktree is not the worker's")
+        task = self.ledger()["tasks"][0]
+        self.assertEqual(task["worktree"], self.wt)
+        self.assertTrue(task["worktrees"][0]["removed"])
+
+    def test_l4c_a_task_with_no_state_counts_as_unfinished(self):
+        self.add_task("t-009", "in-progress", self.wt, [])
+        self.add_task("t-003", "done", self.wt, [{"address": "t31", "role": "build", "name": "a"}])
+        led = self.ledger()
+        del led["tasks"][0]["state"]
+        self.ledger(led)
+        code, out, _ = self.run_cmd("pa-worktree", "check", "--open-cards", "--space", "sp1")
+        self.assertIn("t-009: tasks still t-009 no state; asked once every task using it is done or parked", out)
+        code, out, err = self.worker("delete", "t31")
+        self.assertEqual(code, 0, err)
+        self.assertIn("Kept the worktree: still used by task t-009 (no state).", out)
+        self.assertTrue(os.path.isdir(self.wt))
 
 
 if __name__ == "__main__":
