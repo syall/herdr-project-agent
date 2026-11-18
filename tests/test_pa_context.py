@@ -614,7 +614,8 @@ class Launch(J3Base):
                 self.assertEqual(h["type"], "command")
                 self.assertEqual(h["timeout"], 10)
                 words = pa.shlex.split(h["command"])
-                self.assertEqual(words, [sys.executable, pa.PA_FILE, "context", sub, "--space", "sp1"])
+                # round 2 (REVIEW MF-J3-1): the shell-form line ends in `|| true`, so the line itself never exits 2
+                self.assertEqual(words, [sys.executable, pa.PA_FILE, "context", sub, "--space", "sp1", "||", "true"])
 
     def test_l2_new_session_and_resume_alike(self):
         for resume in (False, True):
@@ -910,6 +911,40 @@ class Hooks(J3Base):
             self.assertEqual(code, 0, (sub, err))
         code, out, err = self.cli("start-pack", "--space", "sp1", stdin="{}")
         self.assertIn("Your state is on disk.", out)
+
+    def run_line(self, sub):
+        """One hook command line as Claude Code runs it (shell form), with the given PA_FILE in force."""
+        line = pa.hook_command("sp1", sub)
+        env = dict(os.environ, HERDR_PA_HOME=pa.ROOT, HERDR_APP_HOME=pa.APP, CLAUDE_CONFIG_DIR=os.path.join(TMP, "claude"),
+                   HOME=os.path.join(TMP, "home"))
+        return pa.subprocess.run(line, shell=True, env=env, input=b"{}", stdout=pa.subprocess.PIPE,
+                                 stderr=pa.subprocess.PIPE, timeout=30)
+
+    def test_p10_missing_pa_file_never_exits_2(self):  # REVIEW MF-J3-1 (a): CPython exits 2 on a missing script
+        saved = pa.PA_FILE
+        pa.PA_FILE = os.path.join(TMP, "gone", "pa.py")
+        try:
+            for sub in ("compact-instructions", "start-pack", "compacted"):
+                r = self.run_line(sub)
+                self.assertEqual(r.returncode, 0, (sub, r.stderr))
+                self.assertIn(b"gone", r.stderr)  # the interpreter did fail: the line, not pa.py, gives the 0
+        finally:
+            pa.PA_FILE = saved
+
+    def test_p11_pa_py_without_pa_context_never_exits_2(self):  # REVIEW MF-J3-1 (b): a pre-J3 pa.py exits 2
+        folder = os.path.join(TMP, "pre-j3")
+        os.makedirs(folder, exist_ok=True)
+        old = os.path.join(folder, "pa.py")
+        write(old, "import sys\nsys.stderr.write('pa: invoke as pa-session, pa-task, ...\\n')\nsys.exit(2)\n")
+        saved = pa.PA_FILE
+        pa.PA_FILE = old
+        try:
+            for sub in ("compact-instructions", "start-pack", "compacted"):
+                r = self.run_line(sub)
+                self.assertEqual(r.returncode, 0, (sub, r.stderr))
+                self.assertIn(b"invoke as", r.stderr)
+        finally:
+            pa.PA_FILE = saved
 
 
 if __name__ == "__main__":
