@@ -9,7 +9,7 @@ const here = path.dirname(new URL(import.meta.url).pathname);
 const src = path.join(here, "..", "..", "mods", "project-agent");
 const dst = fs.mkdtempSync(path.join(os.tmpdir(), "t001-keeper-"));
 fs.copyFileSync(path.join(here, "stubs.mjs"), path.join(dst, "stubs.mjs"));
-for (const f of ["keeper.js", "store.js", "timer.js"]) fs.writeFileSync(path.join(dst, f), fs.readFileSync(path.join(src, f), "utf8").replace(/from "herdr"/g, 'from "./stubs.mjs"'));
+for (const f of ["keeper.js", "store.js", "timer.js", "zone.js"]) fs.writeFileSync(path.join(dst, f), fs.readFileSync(path.join(src, f), "utf8").replace(/from "herdr"/g, 'from "./stubs.mjs"'));
 const stubs = await import(path.join(dst, "stubs.mjs"));
 const { Keeper } = await import(path.join(dst, "keeper.js"));
 const timer = await import(path.join(dst, "timer.js"));

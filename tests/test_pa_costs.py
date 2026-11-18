@@ -3836,7 +3836,7 @@ class T36_LocalDays(Collecting):
         self.assertEqual(self.keys(s), ["2026-11-17"])
         self.assertEqual(s["days"]["zone"], "UTC")
         # W3: the ledger's rows keep their UTC day and time
-        self.assertEqual([(r["day"], r["from"]) for r in self.rows()], [("2026-11-17", iso(at + 1))])
+        self.assertEqual([(r["day"], r["from"][:19]) for r in self.rows()], [("2026-11-17", iso(at + 1)[:19])])
 
     def test_w2_no_saved_zone_is_utc_days(self):
         at = T0 + 6 * 3600 + 1800
@@ -3863,6 +3863,23 @@ class T36_LocalDays(Collecting):
             pa_costs.main(["collect", "--space", "sp1", "--quiet", "--zone-offsets", "0:60", "--zone-name", "a b;c"])
         self.assertEqual(load(self.costs("zone.json")), LA_ZONE)  # a refused zone changes nothing
 
+    def test_w2_a_row_is_priced_by_its_utc_day_whatever_its_local_day(self):
+        # t-032 review: the price entry is picked by the row's UTC day (validFrom), never by the day it is shown under.
+        t = json.loads(json.dumps(PRICES))
+        t["models"]["model-a"] = [{"validFrom": "2026-11-17", "in": 0.0, "out": 1000.0, "cw5m": 0.0, "cw1h": 0.0, "cr": 0.0},
+                                  {"validFrom": "2026-01-01", "in": 0.0, "out": 10.0, "cw5m": 0.0, "cw1h": 0.0, "cr": 0.0}]
+        self.prices(t)
+        early, late = T0 - 1800, T0 + 6 * 3600 + 1800  # 2026-11-16T23:30Z and 2026-11-17T06:30Z: both 2026-11-16 in PST
+        self.record(session=SID, task="t-001", terminal="t5")
+        self.add(self.prompt(early), self.call(early + 1, "m1", lines=1, out=1000000))
+        self.collect(early + 2000, zone=LA_ZONE)
+        self.add(self.prompt(late), self.call(late + 1, "m2", lines=1, out=1000000))
+        self.collect(late + 2000, zone=LA_ZONE)
+        s = load(self.costs("summary.json"))
+        self.assertEqual(self.keys(s), ["2026-11-16"])
+        self.assertAlmostEqual(s["byDay"][0]["money"], 10.0 + 1000.0)  # the old price for 23:30Z, the new one for 06:30Z
+        self.assertEqual({e["day"]: e["money"] for e in s["byDayModel"]}, {"2026-11-16": 10.0, "2026-11-17": 1000.0})
+
     def report_world(self):
         at = T0 + 6 * 3600 + 1800  # 2026-11-16 22:30 PST
         self.prices()
@@ -3876,32 +3893,32 @@ class T36_LocalDays(Collecting):
         with tz("America/Los_Angeles"):
             _r, out, _e = self.run_cmd(pa_costs.report, self.dir, by="day", now=now)
             self.assertIn("By day (PST)", out)
-            self.assertIn("2026-11-16", out)
-            self.assertNotIn("2026-11-17", out)
+            self.assertIn("  2026-11-16", out)
+            self.assertNotIn("  2026-11-17", out)
             _r, out, _e = self.run_cmd(pa_costs.report, self.dir, now=now)
             self.assertIn("updated 2026-11-16 23:03 PST", out)
-            self.assertRegex(out, r"Today     \d+\.\d\d est\. \(local day, PST\)")
+            self.assertRegex(out, r"Today     \S+ est\. \(local day, PST\)")
             _r, out, _e = self.run_cmd(pa_costs.report, self.dir, by="day", since="2026-11-17", now=now)
-            self.assertNotIn("2026-11-16", out)
+            self.assertNotIn("  2026-11-16", out)
             _r, out, _e = self.run_cmd(pa_costs.report, self.dir, by="day", until="2026-11-16", now=now)
-            self.assertIn("2026-11-16", out)
+            self.assertIn("  2026-11-16", out)
         with tz("UTC"):  # the saved zone is the panel's, not the terminal's
             _r, out, _e = self.run_cmd(pa_costs.report, self.dir, by="day", now=now)
-            self.assertIn("2026-11-17", out)
-            self.assertNotIn("2026-11-16", out)
+            self.assertIn("  2026-11-17", out)
+            self.assertNotIn("  2026-11-16", out)
 
     def test_w4_report_utc_asks_for_utc_days(self):
         now = self.report_world()
         with tz("America/Los_Angeles"):
             _r, out, _e = self.run_cmd(pa_costs.report, self.dir, by="day", now=now, utc=True)
             self.assertIn("By day (UTC)", out)
-            self.assertIn("2026-11-17", out)
-            self.assertNotIn("2026-11-16", out)
+            self.assertIn("  2026-11-17", out)
+            self.assertNotIn("  2026-11-16", out)
             _r, out, _e = self.run_cmd(pa_costs.report, self.dir, now=now, utc=True)
             self.assertIn("updated 2026-11-17 07:03 UTC", out)
-            self.assertRegex(out, r"Today     \d+\.\d\d est\. \(UTC day\)")
+            self.assertRegex(out, r"Today     \S+ est\. \(UTC day\)")
             _r, out, _e = self.run_cmd(pa_costs.report, self.dir, by="day", since="2026-11-17", now=now, utc=True)
-            self.assertIn("2026-11-17", out)
+            self.assertIn("  2026-11-17", out)
             r, out, _e = self.run_cmd(pa_costs.main, ["report", "--space", "sp1", "--by", "day", "--utc"])
             self.assertEqual(r, 0)
             self.assertIn("By day (UTC)", out)

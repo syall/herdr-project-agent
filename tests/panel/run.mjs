@@ -2618,7 +2618,9 @@ cases["P-costs-actions"] = async () => { // R12: across every click the only pa-
   check(subs.every((x) => allowed.includes(x)) && subs.includes("collect") && subs.includes("billed disable"), `only ${allowed} (got ${JSON.stringify(subs)})`);
   check(!(g.__writes ?? []).length && !g.__execs.some(([c, a]) => c === "python3" && a[0] === "-c"), `nothing written (got ${JSON.stringify(g.__writes)})`);
   check(!g.__costsUnexpected.length, `no unanswered pa-costs call (got ${JSON.stringify(g.__costsUnexpected)})`);
-  for (const [, a] of costsExecs()) for (const x of a) check(typeof x === "string" && (x.startsWith("{") || /^[a-z-]+$|^sp1$/.test(x)), `fixed argv words only (got ${x.slice(0, 80)})`);
+  // The collect's zone (t-036) is the one value besides them: a checked offset table and zone name.
+  const zoneValue = (a, i) => (a[i - 1] === "--zone-offsets" && /^\d+:-?\d+(,\d+:-?\d+)*$/.test(a[i])) || (a[i - 1] === "--zone-name" && /^[A-Za-z0-9_+\-/:.]{1,64}$/.test(a[i]));
+  for (const [, a] of costsExecs()) a.forEach((x, i) => check(typeof x === "string" && (x.startsWith("{") || /^[a-z-]+$|^sp1$/.test(x) || zoneValue(a, i)), `fixed argv words only (got ${x.slice(0, 80)})`));
 };
 
 // ---- t-009 round 2 (MF-1): a run or a read that ends after the Costs view was left reads and runs nothing ----
