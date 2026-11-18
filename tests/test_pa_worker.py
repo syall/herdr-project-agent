@@ -2610,5 +2610,103 @@ class JobCards(Base):
             return f.read()
 
 
+class Containers(Base):
+    """t-020 J3 (AC6.2, AC6.3): removing a worktree also removes the empty container folder it leaves
+    (<project>/worktrees/<container>), and nothing else."""
+
+    def setUp(self):
+        super().setUp()
+        self.proj = self.repo()
+        self.project = os.path.join(self.tmp, "Project")
+        self.container = os.path.join(self.project, "worktrees", "t-003-x")
+        self.wt = os.path.join(self.container, "proj")
+        sh(self.proj, "git", "worktree", "add", "-q", "-b", "t-003-x", self.wt, "main")
+
+    def removed_by_card(self, task="t-003"):
+        code, out, err = self.run_cmd("pa-worktree", "check", "--open-cards", "--space", "sp1")
+        self.assertEqual(code, 0, err)
+        path = os.path.join(self.dir, "decisions", "d-wt-{}.json".format(task))
+        card = load(path)
+        card.update(status="answered", answer="Delete")
+        dump(card, path)
+        return self.run_cmd("pa-worktree", "remove", task, "--space", "sp1")
+
+    def test_k1_remove_takes_the_empty_container(self):
+        self.add_task("t-003", "done", self.wt, [])
+        code, out, err = self.removed_by_card()
+        self.assertEqual(code, 0, err)
+        self.assertIn("Removed the worktree {}".format(os.path.realpath(self.wt)), out)
+        self.assertIn("Removed the empty folder {}.".format(self.container), out)
+        self.assertFalse(os.path.exists(self.container))
+        self.assertTrue(os.path.isdir(os.path.join(self.project, "worktrees")), "the worktrees folder itself stays")
+        self.assertTrue(os.path.isdir(self.project))
+
+    def test_k2_non_empty_container_kept_and_named(self):
+        for name in ("other-repo", "b.txt", "c.txt", "d.txt"):
+            write(os.path.join(self.container, name, "x") if name == "other-repo" else os.path.join(self.container, name), "x\n")
+        self.add_task("t-003", "done", self.wt, [])
+        code, out, err = self.removed_by_card()
+        self.assertEqual(code, 0, err)
+        self.assertFalse(os.path.exists(self.wt))
+        self.assertIn("kept {}: not empty (b.txt, c.txt, d.txt, …)".format(self.container), out)
+        self.assertEqual(sorted(os.listdir(self.container)), ["b.txt", "c.txt", "d.txt", "other-repo"])
+        self.assertTrue(os.path.isfile(os.path.join(self.container, "other-repo", "x")))
+
+    def test_k3_no_container_outside_worktrees_or_for_a_workspace_layout(self):
+        # a worktree directly in a folder that is not a container under `worktrees`
+        loose = os.path.join(self.tmp, "loose", "wt")
+        sh(self.proj, "git", "worktree", "add", "-q", "-b", "loose", loose, "main")
+        self.add_task("t-003", "done", loose, [])
+        code, out, err = self.removed_by_card()
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("empty folder", out)
+        self.assertTrue(os.path.isdir(os.path.join(self.tmp, "loose")), "a parent outside a worktrees folder is never removed")
+        # the function alone: a workspace's worktree (<ws>/worktrees/<name>) has no container; nothing above it goes
+        ws = os.path.join(self.tmp, "Ws", "worktrees")
+        os.makedirs(ws)
+        self.assertIsNone(pa_hooks.remove_container(os.path.join(ws, "t-003-pkg")))
+        self.assertTrue(os.path.isdir(ws))
+        # a `worktrees` folder inside a `worktrees` folder is never taken for a container
+        nested = os.path.join(self.tmp, "N", "worktrees", "worktrees")
+        os.makedirs(nested)
+        self.assertIsNone(pa_hooks.remove_container(os.path.join(nested, "name")))
+        self.assertTrue(os.path.isdir(nested))
+        # a container that is not a folder, or is gone: nothing
+        self.assertIsNone(pa_hooks.remove_container(os.path.join(self.tmp, "Gone", "worktrees", "c", "repo")))
+
+    def test_k4_symlinked_container_kept(self):
+        real = os.path.join(self.tmp, "real-container")
+        os.makedirs(real)
+        link = os.path.join(self.project, "worktrees", "t-003-link")
+        os.symlink(real, link)
+        self.assertIsNone(pa_hooks.remove_container(os.path.join(link, "proj")))
+        self.assertTrue(os.path.islink(link))
+        self.assertTrue(os.path.isdir(real))
+        # a container reached through a symlinked `worktrees` folder is not removed either
+        elsewhere = os.path.join(self.tmp, "Else", "worktrees")
+        os.makedirs(os.path.join(elsewhere, "c"))
+        os.symlink(elsewhere, os.path.join(self.tmp, "Linked"))
+        self.assertIsNone(pa_hooks.remove_container(os.path.join(self.tmp, "Linked", "c", "proj")))
+        self.assertTrue(os.path.isdir(os.path.join(elsewhere, "c")))
+
+    def test_k5_worker_delete_same_cleanup(self):
+        self.add_task("t-003", "done", self.wt, [{"address": "t31", "role": "build", "name": "t-003-x"}])
+        code, out, err = self.worker("delete", "t31")
+        self.assertEqual(code, 0, err)
+        self.assertIn("Removed the worktree {}".format(os.path.realpath(self.wt)), out)
+        self.assertIn("Removed the empty folder {}.".format(self.container), out)
+        self.assertFalse(os.path.exists(self.container))
+        self.assertTrue(os.path.isdir(os.path.join(self.project, "worktrees")))
+        # kept when the worktree is kept
+        other = os.path.join(self.project, "worktrees", "t-004-y", "proj")
+        sh(self.proj, "git", "worktree", "add", "-q", "-b", "t-004-y", other, "main")
+        write(os.path.join(other, "unsaved.txt"), "x\n")
+        self.add_task("t-004", "done", other, [{"address": "t41", "role": "build", "name": "t-004-y"}])
+        code, out, err = self.worker("delete", "t41")
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("empty folder", out)
+        self.assertTrue(os.path.isdir(other))
+
+
 if __name__ == "__main__":
     unittest.main()
