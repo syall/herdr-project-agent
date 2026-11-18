@@ -279,7 +279,9 @@ sessions). With two or more scopes, a **By scope** section, one row per `provide
 account` (an unknown fact is `?` with how it was found, e.g. `? (unknown)`), with `priced as <scope>
 (from <date>)` where its price came from another, wider scope and `no price` where none applies; each
 session line then names its scope (and `rows in N scopes` when it spans several: the largest is shown),
-and a model's drill lists its scopes. A summary from before these labels draws as before.
+and a model's drill lists its scopes. With one scope priced from another, one line under the tiles
+says so (`All costs: <scope> · priced as <scope> (from <date>)`). A summary from before these labels
+draws as before.
 
 **Billed amounts** (optional): rows in a neutral shape in `<HERDR_PA_HOME>/billing/billed.jsonl` on
 the panel's machine (`{account, from, to, label, model, kind, quantity, unit, amount, currency, final,
