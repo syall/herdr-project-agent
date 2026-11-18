@@ -30,6 +30,7 @@ A failing hook exits with code 2, which sends the agent back to fix it.
 """
 import argparse
 import contextlib
+import hashlib
 import json
 import os
 import re
@@ -428,10 +429,11 @@ def gate_commits(worktree, runner=None):
     return found
 
 
-def evaluate_gate(directory, task, phase, rules=None, runner=None):
+def evaluate_gate(directory, task, phase, rules=None, runner=None, records=None):
     """The gate's verdict for one ledger task, as GATE.json holds it. Reads only: writes and prints nothing.
-    rules: the space's rules list (default: read from rules.json in directory). runner: how gate_commits runs
-    git (default: git())."""
+    rules: the space's rules list (default: read from rules.json in directory). runner: how gate_commits and the
+    content check run git (default: git()). records: a list the content check appends the content records it
+    computed to (cmd_gate stores them; t-052)."""
     tier = str(task.get("tier") or "normal").lower()
     code = bool(task.get("worktree")) or str(task.get("type", "")).lower() in ("feature", "bug", "chore", "code")
     # Leaving `review` (the default) needs every earlier phase's artifact too.
@@ -478,9 +480,276 @@ def evaluate_gate(directory, task, phase, rules=None, runner=None):
         else:
             why = "the ledger lists no reviewer worker separate from the build workers (a check worker counts for low tier only)"
         checks.append({"check": "reviewer is not the author", "ok": separate, **({} if separate else {"why": why})})
+    pins = gate_commits(task.get("worktree"), runner)
+    content = []
+    if phase == "review" and pins:
+        check, content = content_check(directory, task, pins, runner, records)
+        checks.append(check)
     ok = all(c["ok"] for c in checks)
     return {"task": task.get("id"), "phase": phase, "tier": tier, "passed": ok, "at": pa.now(), "checks": checks,
-            "commits": gate_commits(task.get("worktree"), runner)}
+            "commits": pins, "content": content}
+
+
+# ---- t-052: what a check saw, as content ------------------------------------------------------------
+
+CONTENT_CHECK = "the checks saw this content"
+CHECKED_LINE = re.compile(r"^Checked: ([0-9a-f]{40}|[0-9a-f]{64})[ \t]*$", re.M)
+CONTENT_FILES_SHOWN = 10  # files named in a failing content check, per repository
+CHECKER_ROLES = ("verifier", "check")
+RAW_DIFF = ("diff", "--raw", "-z", "--no-renames", "--no-abbrev", "--no-ext-diff", "--no-textconv", "--ignore-submodules=none")
+
+
+class ContentError(Exception):
+    pass
+
+
+def content_dir(directory):
+    return os.path.join(directory, "content")
+
+
+def digest(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def checked_commits(text):
+    """The ids on `Checked: <full id>` lines, in file order: exact lines only (no short ids, no Markdown)."""
+    return CHECKED_LINE.findall(text or "")
+
+
+def raw_files(run, path, a, b):
+    """[{path, status, baseMode, tipMode, baseBlob, tipBlob}] of a..b, sorted by path. NUL-separated, so any path is exact."""
+    code, out, err = run(path, *(RAW_DIFF + (a, b)))
+    if code:
+        raise ContentError("git diff {}..{} failed ({})".format(a[:7], b[:7], clean(err)[-200:]))
+    parts, files, i = out.split("\0"), [], 0
+    while i < len(parts):
+        meta = parts[i].strip("\n")
+        if not meta:
+            i += 1
+            continue
+        fields = meta.lstrip(":").split()
+        if not meta.startswith(":") or len(fields) != 5 or i + 1 >= len(parts):
+            raise ContentError("git diff gave a line it cannot read")
+        files.append({"path": parts[i + 1], "status": fields[4], "baseMode": fields[0], "tipMode": fields[1],
+                      "baseBlob": fields[2], "tipBlob": fields[3]})
+        i += 2
+    return sorted(files, key=lambda f: f["path"])
+
+
+def commit_message(run, path, sha):
+    """The commit's message as stored (git cat-file: no program runs, no signature is checked)."""
+    code, out, err = run(path, "cat-file", "commit", sha)
+    if code:
+        raise ContentError("cannot read commit {} ({})".format(sha[:7], clean(err)[-200:]))
+    head, sep, message = out.partition("\n\n")
+    return message if sep else ""
+
+
+def is_commit(run, path, sha):
+    return run(path, "cat-file", "-e", sha + "^{commit}")[0] == 0
+
+
+def content_main(run, path, profile):
+    """The branch a repository's change sits on until the queue says otherwise (J2): the local branch of origin/HEAD's
+    target, then main, master, trunk, then the profile's mainBranches; the first that exists. None if none does."""
+    names = []
+    code, target, _ = run(path, "symbolic-ref", "--short", "-q", "refs/remotes/origin/HEAD")
+    if not code and target.startswith("origin/"):
+        names.append(target[len("origin/"):])
+    names += ["main", "master", "trunk"] + [b for b in (profile or {}).get("mainBranches") or [] if isinstance(b, str)]
+    for name in dict.fromkeys(names):
+        if name and run(path, "rev-parse", "--verify", "-q", "refs/heads/" + name + "^{commit}")[0] == 0:
+            return name
+    return None
+
+
+def content_record(run, path, tip, onto):
+    """The content record of tip against its base on onto (spec 3.2), or {"error": why}. Never raises."""
+    try:
+        if not onto:
+            raise ContentError("no base branch (none of main, master, trunk or the profile's main branches)")
+        code, base, err = run(path, "merge-base", tip, "refs/heads/" + onto)
+        if code or not base:
+            raise ContentError("no merge base of {} and {}".format(tip[:7], onto))
+        code, merges, err = run(path, "rev-list", "--min-parents=2", base + ".." + tip)
+        if code:
+            raise ContentError("git rev-list failed ({})".format(clean(err)[-200:]))
+        if merges.split():
+            raise ContentError("the branch has a merge commit ({}); the content check takes linear branches".format(merges.split()[0][:7]))
+        code, listed, err = run(path, "rev-list", "--reverse", "--first-parent", base + ".." + tip)
+        if code:
+            raise ContentError("git rev-list failed ({})".format(clean(err)[-200:]))
+        code, tree, err = run(path, "rev-parse", "--verify", "-q", tip + "^{tree}")
+        files = raw_files(run, path, base, tip)
+        commits = []
+        for sha in listed.split():
+            message = commit_message(run, path, sha)
+            commits.append({"sha": sha, "raw": digest(raw_files(run, path, sha + "^", sha)),
+                            "message": hashlib.sha256(message.encode("utf-8")).hexdigest()})
+        _c, common, _e = run(path, "rev-parse", "--path-format=absolute", "--git-common-dir")
+        return {"repo": os.path.realpath(path), "common": os.path.realpath(common) if common else None, "commit": tip,
+                "tree": tree or None, "onto": onto, "base": base, "files": files, "commits": commits,
+                "change": digest(files), "sequence": digest([[c["raw"], c["message"]] for c in commits]),
+                "at": pa.now(), "by": "pa-gate"}
+    except ContentError as e:
+        return {"error": str(e)}
+    except Exception as e:  # a decode error, an unexpected answer: a record error, never a crash of the gate
+        return {"error": "could not compute the content of {} ({}: {})".format(tip[:7], type(e).__name__, clean(e)[:200])}
+
+
+def content_required(directory, task):
+    """True when the task's newest verifier or check worker in the ledger started at or after content/since.json:
+    it was started under the worker.md that asks for a Checked: line. False for a task in flight (t-052 AC5.2)."""
+    since = pa.read_json_safe(os.path.join(content_dir(directory), "since.json"))
+    stamp = pa.parse_time(str(since.get("at"))) if isinstance(since, dict) and since.get("at") else None
+    if stamp is None:
+        return False
+    starts = [pa.parse_time(str(w.get("started"))) for w in task.get("workers") or []
+              if isinstance(w, dict) and str(w.get("role") or "").lower() in CHECKER_ROLES and w.get("started")]
+    starts = [t for t in starts if t is not None]
+    return bool(starts) and max(starts) >= stamp
+
+
+def stored_records(directory, task_id):
+    data = pa.read_json_safe(os.path.join(content_dir(directory), "{}.json".format(task_id)))
+    records = data.get("records") if isinstance(data, dict) else None
+    return [r for r in records if isinstance(r, dict)] if isinstance(records, list) else []
+
+
+def compare_records(checked, now):
+    """'' when both digests are equal, else why: the files whose entry differs and what happened to the commits."""
+    if checked.get("change") == now.get("change") and checked.get("sequence") == now.get("sequence"):
+        return ""
+    parts = []
+    if checked.get("change") != now.get("change"):
+        a = {f.get("path"): f for f in checked.get("files") or [] if isinstance(f, dict)}
+        b = {f.get("path"): f for f in now.get("files") or [] if isinstance(f, dict)}
+        paths = sorted(p for p in set(a) | set(b) if a.get(p) != b.get(p) and isinstance(p, str))
+        shown = ", ".join(clean(p) for p in paths[:CONTENT_FILES_SHOWN])
+        more = " and {} more".format(len(paths) - CONTENT_FILES_SHOWN) if len(paths) > CONTENT_FILES_SHOWN else ""
+        parts.append("{}{} {}".format(shown, more, "differs" if len(paths) == 1 else "differ") if paths else "the change differs")
+    n, m = len(checked.get("commits") or []), len(now.get("commits") or [])
+    if n != m:
+        parts.append("{} commit{} checked, {} now".format(n, "" if n == 1 else "s", m))
+    elif checked.get("sequence") != now.get("sequence"):
+        parts.append("commits changed: reworded, reordered or split differently after the check")
+    return "; ".join(parts)
+
+
+def content_check(directory, task, pins, runner=None, records=None):
+    """(check, GATE.json content) for the review gate: the commit on VERIFY.md's last Checked: line makes the same
+    change as HEAD, per pin (t-052 R5). records: computed records are appended here (with source verify or head)."""
+    run = globals()["git"] if runner is None else runner
+    evidence = os.path.join(directory, "evidence", str(task.get("id")))
+    verify = checked_commits(pa.read_text(os.path.join(evidence, "VERIFY.md")))
+    review = checked_commits(pa.read_text(os.path.join(evidence, "REVIEW.md")))
+    required = content_required(directory, task)
+    stored = stored_records(directory, task.get("id"))
+    try:
+        agent = pa.read_json_safe(os.path.join(directory, "agent.json")) or {}
+        profile = pa.load_profile(agent.get("profile")) if agent.get("profile") else None
+    except (pa.Problem, OSError, ValueError):
+        profile = None
+    keep = records if records is not None else []
+    fails, notes, summary = [], [], []
+    for pin in pins:
+        path, head, common = pin["repo"], pin.get("commit"), pin.get("common")
+        label = (os.path.basename(path) + ": ") if len(pins) > 1 else ""
+        mine = [r for r in stored if r.get("common") == common and not r.get("error")]
+        known = {r.get("commit") for r in mine}
+
+        def last(ids):
+            found = [x for x in ids if x in known or is_commit(run, path, x)]
+            return found[-1] if found else None
+
+        x, rv = last(verify), last(review)
+        onto = content_main(run, path, profile)
+        entry = {"repo": path, "common": common, "onto": onto, "base": None, "change": None, "sequence": None,
+                 "checked": x, "review": rv, "same": None}
+        now = content_record(run, path, head, onto) if head else {"error": "no commit in the worktree"}
+        if now.get("error"):
+            entry["error"] = now["error"]
+        else:
+            entry.update(base=now["base"], change=now["change"], sequence=now["sequence"])
+            keep.append(dict(now, source="head"))
+        summary.append(entry)
+        if x is None:
+            if verify and len(pins) == 1:
+                fails.append("{}VERIFY.md's Checked commit {} is not a commit in this repository".format(label, verify[-1][:7]))
+            elif required:
+                fails.append("{}VERIFY.md has no Checked: line for this repository".format(label))
+            else:
+                notes.append("{}content not recorded: VERIFY.md has no Checked: line, and its verifier started before the content check".format(label))
+            continue
+        if now.get("error"):
+            fails.append(label + now["error"])
+            continue
+        if x == head:
+            entry["same"] = True
+            keep.append(dict(now, source="verify"))
+            notes.append("{}the checked commit is HEAD".format(label))
+            continue
+        computed = content_record(run, path, x, onto) if is_commit(run, path, x) else {"error": "not a commit"}
+        saved = [r for r in mine if r.get("commit") == x]
+        saved = saved[-1] if saved else None
+        if not computed.get("error") and saved and (computed.get("change"), computed.get("sequence")) != (saved.get("change"), saved.get("sequence")):
+            entry["same"] = False
+            fails.append("{}the record of the checked {} computed now differs from the record stored at {}".format(
+                label, x[:7], clean(saved.get("at"))))
+            continue
+        checked = computed if not computed.get("error") else saved
+        if checked is None:
+            fails.append("{}the checked {}: {}".format(label, x[:7], computed["error"]))
+            continue
+        if checked is computed:
+            keep.append(dict(computed, source="verify"))
+        why = compare_records(checked, now)
+        entry["same"] = not why
+        if why:
+            fails.append("{}{}; HEAD {} against the checked {}".format(label, why, head[:7], x[:7]))
+        else:
+            notes.append("{}same content as the checked {}".format(label, x[:7]))
+    check = {"check": CONTENT_CHECK, "ok": not fails}
+    if fails:
+        check["why"] = "; ".join(fails)
+    elif notes:
+        check["note"] = "; ".join(notes)
+    return check, summary
+
+
+@contextlib.contextmanager
+def content_lock(directory):
+    import fcntl
+    os.makedirs(content_dir(directory), exist_ok=True)
+    with open(os.path.join(content_dir(directory), ".lock"), "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
+def store_records(directory, task_id, records):
+    """Append the gate's content records to content/<task-id>.json, one per (common, commit, base, source)."""
+    if not records:
+        return
+    path = os.path.join(content_dir(directory), "{}.json".format(task_id))
+    with content_lock(directory):
+        data = pa.read_json_safe(path)
+        if not isinstance(data, dict) or not isinstance(data.get("records"), list):
+            data = {"version": 1, "records": []}
+        seen = {(r.get("common"), r.get("commit"), r.get("base"), r.get("source")) for r in data["records"] if isinstance(r, dict)}
+        for r in records:
+            key = (r.get("common"), r.get("commit"), r.get("base"), r.get("source"))
+            if key not in seen:
+                seen.add(key)
+                data["records"].append(r)
+        pa.write_json(path, data)
+
+
+def stamp_content(directory):
+    """content/since.json: when this space's gate first ran with the content check (t-052 AC5.2). Written once."""
+    path = os.path.join(content_dir(directory), "since.json")
+    with content_lock(directory):
+        if not os.path.exists(path):
+            pa.write_json(path, {"version": 1, "at": pa.now()})
 
 
 def cmd_gate(args):
@@ -501,12 +770,16 @@ def cmd_gate(args):
     phase = (args.phase or "review").lower()
     if phase not in PHASES:
         raise pa.Problem("unknown phase {!r}; one of {}".format(phase, ", ".join(PHASES)))
-    result = evaluate_gate(directory, task, phase)
+    stamp_content(directory)
+    records = []
+    result = evaluate_gate(directory, task, phase, records=records)
     evidence, checks, ok = os.path.join(directory, "evidence", args.task), result["checks"], result["passed"]
+    store_records(directory, args.task, records)
     if os.path.isdir(evidence):
         pa.write_json(os.path.join(evidence, "GATE.json"), result)
     for c in checks:
-        print("{}  {}{}".format("ok  " if c["ok"] else "FAIL", c["check"], "" if c["ok"] else "  ({})".format(c["why"])))
+        print("{}  {}{}".format("ok  " if c["ok"] else "FAIL", c["check"],
+                                "  ({})".format(c["why"]) if not c["ok"] else "  ({})".format(c["note"]) if c.get("note") else ""))
     print("pa-gate {} ({} phase, {} tier): {}".format(args.task, phase, result["tier"], "PASSED" if ok else "FAILED. The task does not move."))
     sys.exit(0 if ok else 1)
 
@@ -2695,9 +2968,30 @@ def cmd_full_suite(_args):
     os.makedirs(evidence, exist_ok=True)
     with open(os.path.join(evidence, "build.log"), "a") as f:
         f.write("=== {} full suite: `{}` in {} -> exit {} after {:.0f}s ===\n{}\n".format(pa.now(), command, record["root"], code, time.time() - began, tail(out, 200)))
+    seconds = round(time.time() - began, 1)
+    try:
+        suite_record(directory, record, command, code, seconds)
+    except OSError as e:
+        print("pa-full-suite: could not record the run in {} ({})".format(os.path.join(content_dir(directory), "suites.jsonl"), e))
     print(tail(out, 40))
     print("full suite exit {} (appended to {})".format(code, os.path.join(evidence, "build.log")))
     sys.exit(code)
+
+
+def suite_record(directory, record, command, code, seconds):
+    """One line per repository of the worktree in content/suites.jsonl: what the full suite ran on (t-052 AC7.1)."""
+    lines = []
+    for pin in gate_commits(record["root"]) or [{"repo": os.path.realpath(record["root"]), "commit": None, "uncommitted": None}]:
+        tree = None
+        if pin.get("commit"):
+            c, out, _ = git(pin["repo"], "rev-parse", "--verify", "-q", pin["commit"] + "^{tree}")
+            tree = out if not c and out else None
+        lines.append({"at": pa.now(), "task": record.get("task"), "worker": os.environ.get("HC_TERMINAL_ID") or None,
+                      "repo": pin["repo"], "commit": pin.get("commit"), "tree": tree, "uncommitted": pin.get("uncommitted"),
+                      "exit": code, "seconds": seconds, "command": command})
+    os.makedirs(content_dir(directory), exist_ok=True)
+    with open(os.path.join(content_dir(directory), "suites.jsonl"), "a") as f:
+        f.write("".join(json.dumps(l) + "\n" for l in lines))
 
 
 def main():

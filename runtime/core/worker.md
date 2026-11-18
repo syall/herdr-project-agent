@@ -76,7 +76,8 @@ folder and the address to report to.
 - Verifiers, reviewers and check workers label every finding **Must fix** (it breaks a
   requirement, the plan, a verification point, safety or security; say why it blocks
   the merge), **Recorded limit** (real, but not Must fix; name a follow-up) or **Nit**,
-  and end the file with `Verdict: pass` or `Verdict: must fix (<n>)`.
+  and end the file with `Checked: <full id of the commit you checked>` and, on the next
+  line, `Verdict: pass` or `Verdict: must fix (<n>)`.
 
 ## Verification
 
