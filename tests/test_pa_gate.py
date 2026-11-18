@@ -20,6 +20,8 @@ import unittest
 HERE = os.path.dirname(os.path.abspath(__file__))
 TOOLS = os.path.join(HERE, "..", "runtime", "tools")
 TMP = os.path.realpath(tempfile.mkdtemp(prefix="t007-gate-"))
+sys.path.insert(0, HERE)
+from steer_fixtures import forge_parent  # noqa: E402 (t-052 J1 round 3)
 
 _HOMES = {"HERDR_PA_HOME": os.path.join(TMP, "pa"), "CLAUDE_CONFIG_DIR": os.path.join(TMP, "claude"),
           "HERDR_APP_HOME": os.path.join(TMP, "app")}
@@ -955,6 +957,86 @@ class C12SteeringRefs(ContentBase):
         self.assertNotIn("same content", line)
         self.assertEqual(self.gate_json("t-1")["content"][0]["onto"], "main")
 
+
+
+class C13SteeringFiles(ContentBase):
+    """t-052 J1 round 3 (verify MF-R2-1): files a repository can write under its git directory (info/grafts, shallow,
+    the commit-graph) do not change what the content check says a commit's parents are."""
+
+    def sibling_base(self):
+        """Verify n13: E, a root commit with main's tree plus an unreviewed evil.txt (not a child of main's M); the
+        branch reset to E + f1 + f2. Returns (M, E, the common git directory)."""
+        m = sh(self.proj, "git", "rev-parse", "main")
+        write(os.path.join(self.proj, "evil.txt"), "evil\n")
+        sh(self.proj, "git", "add", "evil.txt")
+        tree = sh(self.proj, "git", "write-tree")
+        sh(self.proj, "git", "rm", "-q", "--cached", "evil.txt")
+        os.remove(os.path.join(self.proj, "evil.txt"))
+        e = sh(self.proj, "git", "commit-tree", tree, "-m", "base")
+        sh(self.wt, "git", "reset", "-q", "--hard", e)
+        sh(self.wt, "git", "cherry-pick", self.f1)
+        sh(self.wt, "git", "cherry-pick", self.f2)
+        common = sh(self.wt, "git", "rev-parse", "--path-format=absolute", "--git-common-dir")
+        return m, e, common
+
+    def assertNotSame(self, *why):
+        line = self.assertContentFails(*why)
+        self.assertNotIn("same content", line)
+        result = pa_hooks.evaluate_gate(self.dir, self.task, "review")
+        check = [c for c in result["checks"] if c["check"] == CHECK][0]
+        self.assertFalse(check["ok"], check)
+        return line
+
+    def test_c13_a_graft_does_not_make_unchecked_content_look_checked(self):  # verify n13
+        self.checked(self.f2)
+        self.assertContentOk()
+        m, e, common = self.sibling_base()
+        self.assertNotSame("no merge base")
+        write(os.path.join(common, "info", "grafts"), "{} {}\n".format(m, e))
+        self.assertEqual(sh(self.wt, "git", "merge-base", "HEAD", "main"), e)  # plain git honours the graft
+        self.assertEqual(sh(self.wt, "git", "--no-replace-objects", "merge-base", "HEAD", "main"), e)
+        self.assertNotSame("grafts")
+
+    def test_c13b_a_graft_file_named_by_git_graft_file(self):
+        self.checked(self.f2)
+        m, e, _common = self.sibling_base()
+        graft = os.path.join(self.tmp, "elsewhere-grafts")
+        write(graft, "{} {}\n".format(m, e))
+        saved = os.environ.get("GIT_GRAFT_FILE")
+        os.environ["GIT_GRAFT_FILE"] = graft
+        try:
+            self.assertEqual(sh(self.wt, "git", "merge-base", "HEAD", "main"), e)
+            self.assertNotSame("grafts")
+        finally:
+            if saved is None:
+                os.environ.pop("GIT_GRAFT_FILE", None)
+            else:
+                os.environ["GIT_GRAFT_FILE"] = saved
+
+    def test_c13c_a_shallow_file_fails(self):
+        self.checked(self.f1)
+        self.assertContentFails("c.txt")
+        common = sh(self.wt, "git", "rev-parse", "--path-format=absolute", "--git-common-dir")
+        write(os.path.join(common, "shallow"), self.f1 + "\n")  # f1 reads as a root (this fails safe; the reason must say shallow)
+        self.assertNotSame("shallow")
+
+    def test_c13d_a_forged_commit_graph_does_not_steer_parents(self):
+        self.checked(self.f2)
+        self.assertContentOk()
+        m, e, _common = self.sibling_base()
+        forge_parent(self.wt, m, e)
+        self.assertEqual(sh(self.wt, "git", "rev-parse", m + "^"), e)  # plain git believes the graph
+        self.assertEqual(sh(self.wt, "git", "--no-replace-objects", "merge-base", "HEAD", "main"), e)
+        line = self.assertNotSame("no merge base")
+        self.assertNotIn("grafts", line)
+
+    def test_c13e_an_empty_graft_file_still_fails(self):  # existence, not content: no parsing of git's format
+        self.checked(self.f2)
+        common = sh(self.wt, "git", "rev-parse", "--path-format=absolute", "--git-common-dir")
+        write(os.path.join(common, "info", "grafts"), "")
+        self.assertNotSame("grafts")
+        os.remove(os.path.join(common, "info", "grafts"))
+        self.assertContentOk("the checked commit is HEAD")
 
 class S1FullSuiteRecord(Base):
     def test_s1_each_run_is_recorded(self):

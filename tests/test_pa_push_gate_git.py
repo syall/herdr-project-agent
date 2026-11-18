@@ -11,6 +11,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from push_fixtures import *  # noqa: F401,F403 (the shared fixture and helpers)
 from push_fixtures import setUpModule, tearDownModule  # noqa: F401 (the module's temp homes and environment)
+from steer_fixtures import forge_parent  # noqa: E402 (t-052 J1 round 3)
 
 # ---- fix round 2: the gate's git in the task worktree is the tool's hardened git ----------------------
 
@@ -156,6 +157,45 @@ class GateGit(Runs):
         self.assertFalse(check["ok"], check)
         r = self.assertRefused(self.run_push(), "C8a", "the checks saw this content")
         self.assertIn("d.txt", r["refusal"]["message"])
+
+    def sibling_base(self):
+        """Verify n13 here: E, a root commit with main's tree plus an unreviewed evil.txt; the task branch reset to
+        E + the checked commit. Returns (M, E, the common git directory)."""
+        m = self.head(self.main, "refs/heads/main")
+        write(os.path.join(self.main, "evil.txt"), "evil\n")
+        sh(self.main, "git", "add", "evil.txt")
+        tree = sh(self.main, "git", "write-tree")
+        sh(self.main, "git", "rm", "-q", "--cached", "evil.txt")
+        os.remove(os.path.join(self.main, "evil.txt"))
+        e = sh(self.main, "git", "commit-tree", tree, "-m", "base")
+        sh(self.wt, "git", "reset", "-q", "--hard", e)
+        sh(self.wt, "git", "cherry-pick", self.task_commit)
+        return m, e, sh(self.wt, "git", "rev-parse", "--path-format=absolute", "--git-common-dir")
+
+    def assertC8aRefusesSteered(self, e):
+        self.assertEqual(sh(self.wt, "git", "merge-base", "HEAD", "main"), e)  # plain git is steered
+        task = load(os.path.join(self.dir, "ledger.json"))["tasks"][0]
+        result = pa_push.pa_hooks.evaluate_gate(self.dir, task, "review", runner=pa_push.Session().gate_git)
+        check = [c for c in result["checks"] if c["check"] == "the checks saw this content"][0]
+        self.assertFalse(check["ok"], check)
+        self.assertNotIn("same content", check.get("note", "") + check.get("why", ""))
+        return self.assertRefused(self.run_push(), "C8a", "the checks saw this content")
+
+    def test_g12_c8a_refuses_a_graft_over_unchecked_content(self):  # t-052 J1 round 3 (verify MF-R2-1, n13)
+        self.require_content(self.task_commit)
+        self.assertEqual(self.gate(), 0)
+        m, e, common = self.sibling_base()
+        write(os.path.join(common, "info", "grafts"), "{} {}\n".format(m, e))
+        r = self.assertC8aRefusesSteered(e)
+        self.assertIn("grafts", r["refusal"]["message"])
+
+    def test_g13_c8a_refuses_a_forged_commit_graph_over_unchecked_content(self):  # t-052 J1 round 3
+        self.require_content(self.task_commit)
+        self.assertEqual(self.gate(), 0)
+        m, e, _common = self.sibling_base()
+        forge_parent(self.wt, m, e)
+        r = self.assertC8aRefusesSteered(e)
+        self.assertIn("no merge base", r["refusal"]["message"])
 
     def nested_repo(self, commit=True):
         """A nested repository wt/sub (a submodule entry), committed or only staged in the task worktree."""
