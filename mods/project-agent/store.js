@@ -372,9 +372,13 @@ export const missingTool = (why, program) => NOT_FOUND.test(String(why)) && Stri
 
 // Tells the orchestrator at `address` (machine-qualified, from liveTarget: chosen when sending).
 // hc holds a message while someone is typing there, and refuses while the agent is blocked on a
-// question; the caller keeps the notice and tries again later.
-export async function notifyOrchestrator(address, message) {
-  const r = await hc(["send", address, message]);
+// question; the caller keeps the notice and tries again later. With `cx` (the sending task's), a send
+// that has not answered in SEND_LIMIT is given up (t-028): hc waits up to 60 s for a draft, so this is
+// longer. Giving up stops only the waiting: the text may still be typed, so a retry can repeat it.
+export const SEND_LIMIT = 90000;
+export async function notifyOrchestrator(address, message, cx) {
+  const r = await withTimeout(cx, hc(["send", address, message]), SEND_LIMIT);
+  if (r === TIMED_OUT) throw new Error(`hc send did not answer in ${SEND_LIMIT / 1000} s; it may still arrive`);
   if (r.code !== 0) throw new Error((r.stderr || r.stdout || "hc send failed").trim().slice(0, 300));
 }
 

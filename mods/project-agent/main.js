@@ -497,7 +497,7 @@ export default class ProjectAgent extends View {
             const item = items[at];
             const target = !held.has(item.spaceId) && liveTarget(item.spaceId);
             if (!target) { held.add(item.spaceId); left.push(item); continue; }
-            try { await notifyOrchestrator(target.address, item.message); }
+            try { await notifyOrchestrator(target.address, item.message, { sleep: (ms) => cx.sleep(ms) }); } // capped (store.js SEND_LIMIT)
             catch (e) { held.add(item.spaceId); left.push({ ...item, why: String(e.message ?? e) }); }
           }
         } finally {
