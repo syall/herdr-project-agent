@@ -33,11 +33,13 @@ A failing hook exits with code 2, which sends the agent back to fix it.
 """
 import argparse
 import contextlib
+import datetime
 import hashlib
 import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -720,7 +722,7 @@ def content_check(directory, task, pins, runner=None, records=None):
                 return found[-1] if found else None
 
             x, rv = last(verify), last(review)
-            onto = content_main(run, path, profile)
+            onto = content_onto(directory, task.get("id"), common, pin.get("branch")) or content_main(run, path, profile)
             entry.update(onto=onto, checked=x, review=rv)
             now = content_record(run, path, head, onto) if head else {"error": "no commit in the worktree"}
             if not now.get("error") and now["base"] == head and x != head:
@@ -792,6 +794,18 @@ def content_check(directory, task, pins, runner=None, records=None):
             why = compare_records(checked, now)
             entry["same"] = not why
             if why:
+                moved, _mwhy, shared = moved_only(run, path, checked, now)
+                if moved:  # the shared-file rule (t-052 J2): change lines only moved, counted only with a short review
+                    names = ", ".join(clean(f["path"]) for f in shared[:CONTENT_FILES_SHOWN])
+                    entry["moved"] = [f["path"] for f in shared]
+                    passed = short_review_passed(run, directory, task, common, path, head, now.get("tree"))
+                    if passed:
+                        entry["shortReview"] = passed.get("file")
+                        notes.append("{}change lines only moved in {}; short review {} passed".format(label, names, clean(passed.get("file"))))
+                    else:
+                        fails.append("{}change lines only moved in {}: a short review is needed (pa-queue verify names it); "
+                                     "HEAD {} against the checked {}".format(label, names, head[:7], x[:7]))
+                    continue
                 fails.append("{}{}; HEAD {} against the checked {}".format(label, why, head[:7], x[:7]))
             else:
                 notes.append("{}same content as the checked {}".format(label, x[:7]))
@@ -807,6 +821,191 @@ def content_check(directory, task, pins, runner=None, records=None):
     elif notes:
         check["note"] = "; ".join(notes)
     return check, summary
+
+
+def content_onto(directory, task_id, common, branch):
+    """The branch a pin's change sits on as the merge queue says (t-052 J2): the queue entry of this repository whose
+    branch is the pin's, its onto; else, for a task planned on another task's branch (pa-queue plan, dependsOn), that
+    entry's branch; else None (the caller falls back to content_main)."""
+    data = pa.read_json_safe(os.path.join(directory, "queue.json"))
+    repos = data.get("repos") if isinstance(data, dict) else None
+    if not isinstance(repos, dict) or not common:
+        return None
+    for rec in repos.values():
+        if not isinstance(rec, dict) or rec.get("common") != common:
+            continue
+        entries = [e for e in rec.get("entries") or [] if isinstance(e, dict)]
+        for e in entries:
+            if branch and e.get("branch") == branch and isinstance(e.get("onto"), str) and e["onto"]:
+                return e["onto"]
+        for p in rec.get("planned") or []:
+            dep = p.get("dependsOn") if isinstance(p, dict) and p.get("task") == task_id else None
+            if isinstance(dep, dict):
+                ahead = next((e for e in entries if e.get("task") == dep.get("task") and e.get("job") == dep.get("job")), None)
+                if ahead and isinstance(ahead.get("branch"), str) and ahead["branch"]:
+                    return ahead["branch"]
+    return None
+
+
+HUNK = re.compile(rb"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+
+
+def diff_hunks(run, path, a, b):
+    """The -U0 hunks of blob a -> blob b: [{"old": [start, count], "new": [start, count], "lines": [bytes, ...]}], the
+    change lines exact (git writes the patch to a file: the runners strip their output, which would lose trailing
+    whitespace on the last line). Raises ContentError for a binary diff or a git failure."""
+    folder = tempfile.mkdtemp(prefix="pa-hunks-")
+    out = os.path.join(folder, "diff")
+    try:
+        code, _o, err = run(path, "diff", "-U0", "--no-color", "--no-ext-diff", "--no-textconv", "--diff-algorithm=myers",
+                            "--output=" + out, a, b)
+        if code:
+            raise ContentError("git diff {}..{} failed ({})".format(a[:7], b[:7], clean(err)[-200:]))
+        with open(out, "rb") as f:
+            data = f.read()
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+    hunks = []
+    for line in data.split(b"\n"):
+        if line.startswith(b"Binary files ") or line.startswith(b"GIT binary patch"):
+            raise ContentError("a binary file")
+        m = HUNK.match(line)
+        if m:
+            hunks.append({"old": [int(m.group(1)), int(m.group(2) if m.group(2) is not None else 1)],
+                          "new": [int(m.group(3)), int(m.group(4) if m.group(4) is not None else 1)], "lines": []})
+        elif hunks and line[:1] in (b"-", b"+", b"\\"):
+            hunks[-1]["lines"].append(line)
+    return hunks
+
+
+def same_lines(run, path, a, b):
+    """True when the change of one file entry a and of b is the same change lines, only moved: both modified (M) with
+    the same modes, different bases (the base changed the file: a shared file), and equal -U0 hunks once positions are
+    dropped. Any doubt is False."""
+    if a.get("status") != "M" or b.get("status") != "M":
+        return False
+    if (a.get("baseMode"), a.get("tipMode")) != (b.get("baseMode"), b.get("tipMode")) or a.get("baseBlob") == b.get("baseBlob"):
+        return False
+    one = [h["lines"] for h in diff_hunks(run, path, a["baseBlob"], a["tipBlob"])]
+    two = [h["lines"] for h in diff_hunks(run, path, b["baseBlob"], b["tipBlob"])]
+    return bool(one) and one == two
+
+
+def moved_only(run, path, checked, now):
+    """(True, "", shared) when now makes checked's change with identical change lines that only moved in files its base
+    also changed (the person's shared-file rule, t-052): the same paths; every differing file a shared file whose
+    hunks are equal; the same commits (count, messages, paths), each the same or moved in the same sense. shared:
+    [{path, oldBase, newBase, tip}]. Else (False, why, []). Never raises; it is never clean alone (a short review)."""
+    try:
+        a = {f.get("path"): f for f in checked.get("files") or [] if isinstance(f, dict)}
+        b = {f.get("path"): f for f in now.get("files") or [] if isinstance(f, dict)}
+        if set(a) != set(b):
+            return False, "the files touched differ", []
+        shared = []
+        for p in sorted(x for x in a if isinstance(x, str)):
+            if a[p] == b[p]:
+                continue
+            if not same_lines(run, path, a[p], b[p]):
+                return False, "{} changed".format(clean(p)), []
+            shared.append({"path": p, "oldBase": a[p]["baseBlob"], "newBase": b[p]["baseBlob"], "tip": b[p]["tipBlob"]})
+        if not shared:
+            return False, "the commits changed", []
+        ca, cb = checked.get("commits") or [], now.get("commits") or []
+        if len(ca) != len(cb) or [c.get("message") for c in ca] != [c.get("message") for c in cb]:
+            return False, "the commits changed", []
+        for x, y in zip(ca, cb):
+            if x.get("raw") == y.get("raw"):
+                continue
+            for sha in (x.get("sha"), y.get("sha")):
+                if not isinstance(sha, str) or not is_commit(run, path, sha):
+                    return False, "cannot compare the commits (one is not in the repository)", []
+            fx = {f["path"]: f for f in raw_files(run, path, x["sha"] + "^", x["sha"])}
+            fy = {f["path"]: f for f in raw_files(run, path, y["sha"] + "^", y["sha"])}
+            if set(fx) != set(fy):
+                return False, "the commits changed", []
+            for p in fx:
+                if fx[p] != fy[p] and not same_lines(run, path, fx[p], fy[p]):
+                    return False, "the commits changed ({})".format(clean(p)), []
+        return True, "", shared
+    except ContentError as e:
+        return False, str(e), []
+    except Exception as e:  # an unexpected answer: never moved
+        return False, "{}: {}".format(type(e).__name__, clean(e)[:200]), []
+
+
+def iso_at(ts):
+    return datetime.datetime.fromtimestamp(round(ts), datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def read_lines(path):
+    out = []
+    try:
+        with open(path) as f:
+            for line in f:
+                try:
+                    value = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(value, dict):
+                    out.append(value)
+    except OSError:
+        pass
+    return out
+
+
+def suite_runs(directory):
+    """Every full suite run of content/suites.jsonl, in file order, in one shape (t-052 J2): {kind, task, worker, repo,
+    commit, tree, uncommitted, exit, started, ended, seconds, parts}. J1's lines have `at` (the end) and `seconds`;
+    t-056's standard record adds `started`, `ended` and `parts`. This is the one reader of both shapes."""
+    runs = []
+    for l in read_lines(os.path.join(content_dir(directory), "suites.jsonl")):
+        seconds = l.get("seconds") if isinstance(l.get("seconds"), (int, float)) else None
+        ended = l.get("ended") if isinstance(l.get("ended"), str) else l.get("at")
+        started = l.get("started") if isinstance(l.get("started"), str) else None
+        end_ts = pa.parse_time(ended) if isinstance(ended, str) else None
+        if started is None and end_ts is not None and seconds is not None:
+            started = iso_at(end_ts - seconds)
+        runs.append({"kind": l.get("kind") or "suite", "task": l.get("task"), "worker": l.get("worker"), "repo": l.get("repo"),
+                     "commit": l.get("commit"), "tree": l.get("tree"), "uncommitted": l.get("uncommitted"), "exit": l.get("exit"),
+                     "started": started, "ended": ended, "seconds": seconds,
+                     "parts": l.get("parts") if isinstance(l.get("parts"), list) else None})
+    return runs
+
+
+def review_runs(directory):
+    """Every short review run of content/reviews.jsonl (written by pa-queue refresh only), in file order."""
+    return [l for l in read_lines(os.path.join(content_dir(directory), "reviews.jsonl")) if l.get("kind") == "short-review"]
+
+
+def committer_time(run, path, sha):
+    code, out, _err = run(path, "cat-file", "commit", sha)
+    if code:
+        return None
+    for line in out.split("\n\n", 1)[0].splitlines():
+        if line.startswith("committer "):
+            parts = line.rsplit(" ", 2)
+            if len(parts) == 3 and parts[1].isdigit():
+                return int(parts[1])
+    return None
+
+
+def short_review_passed(run, directory, task, common, path, head, tree):
+    """The passing short review record for HEAD, or None: one of reviews.jsonl for this task, repository, commit and
+    tree, by a ledger reviewer of the task who is not an author, started at or after HEAD was committed."""
+    workers = [w for w in task.get("workers") or [] if isinstance(w, dict) and isinstance(w.get("address"), str)]
+    authors = {w["address"] for w in workers if str(w.get("role") or "").lower() in ("build", "design")}
+    reviewers = {w["address"] for w in workers if str(w.get("role") or "").lower() == "reviewer"} - authors
+    committed = committer_time(run, path, head)
+    for r in reversed(review_runs(directory)):
+        if (r.get("task"), r.get("common"), r.get("tip")) != (task.get("id"), common, head) or not tree or r.get("tree") != tree:
+            continue
+        if r.get("verdict") != "pass" or r.get("worker") not in reviewers:
+            continue
+        started = pa.parse_time(str(r.get("started"))) if r.get("started") else None
+        if committed is None or started is None or started < committed:
+            continue
+        return r
+    return None
 
 
 @contextlib.contextmanager

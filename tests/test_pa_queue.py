@@ -336,10 +336,10 @@ class Q8Q9Review(QBase):
 class ChainBase(QBase):
     """Four entries A, B, C, D, each its own file, each stacked on the one ahead; gates passed at their tips."""
 
-    def build(self, c_edits=None, c_start=None):
-        self.task("t-A", [("fa.txt", "a\n")])
+    def build(self, c_edits=None, c_start=None, a_edits=None):
+        self.task("t-A", a_edits or [("fa.txt", "a\n")])
         self.add("t-A")
-        self.task("t-B", [("fb.txt", "b\n"), ("a.txt", (30, "thirty"))])
+        self.task("t-B", [("fb.txt", "b\n")])
         self.add("t-B")
         self.gate("t-B")
         if c_start:
@@ -367,7 +367,8 @@ class Chain(ChainBase):
         self.assertEqual(code, 0, out + err)
         self.assertEqual(self.entry("t-A")["state"], "passed")
         self.assertEqual(self.entry("t-B")["state"], "checking")
-        self.assertIn("mergeable: t-A", out)
+        code, out, err = self.queue("show", "--repo", self.proj)
+        self.assertIn("mergeable: t-A\n", out)
 
     def test_q11_failure_restacks_the_chain(self):
         self.build()
@@ -443,7 +444,8 @@ class Chain(ChainBase):
         self.assertEqual(self.base_of("t-D", "t-A-x"), self.tip("t-A"))
 
     def test_q14_out_dry_run_then_restack(self):
-        self.build(c_edits=[("a.txt", (100, "hundred"))])
+        # A and C share a.txt (C's change lines move under A's), B shares nothing: C stays moved, D clean
+        self.build(a_edits=[("fa.txt", "a\n"), ("a.txt", (30, "thirty"))], c_edits=[("a.txt", (100, "hundred"))])
         code, out, err = self.queue("out", "t-B", "--repo", self.proj, "--why", "pulled")
         self.assertEqual(code, 0, out + err)
         states = {e["task"]: e["state"] for e in self.entries()}
@@ -458,6 +460,7 @@ class Chain(ChainBase):
         self.assertEqual(len(lines), 2, out)
         self.assertIn("t-C-x", lines[0])
         self.assertIn("t-D-x", lines[1])
+        self.assertIn("<t-C-x after its restack>", lines[1])
         self.assertIn("shared: a.txt", out)
         code, out, err = self.queue("restack", "--repo", self.proj)
         self.assertEqual(code, 0, out + err)
@@ -660,7 +663,7 @@ class V8SuiteRuns(QBase):
         runs = pa_hooks.suite_runs(self.dir)
         self.assertEqual(len(runs), 2)
         keys = ("kind", "task", "tree", "exit", "uncommitted", "started", "ended", "seconds")
-        self.assertEqual([r[k] for k in keys], [runs[1][k] for k in keys])
+        self.assertEqual([runs[0][k] for k in keys], [runs[1][k] for k in keys])
         self.assertIsNone(runs[0]["parts"])
         self.assertEqual(len(runs[1]["parts"]), 1)
 

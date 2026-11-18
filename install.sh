@@ -29,6 +29,7 @@ mkdir -p "$PA/spaces" "$HOME/.local/bin"
 for n in pa-start pa-session pa-claude pa-codex pa-profile pa-peers pa-pass pa-cleanup pa-doctor pa-task pa-decide pa-sync pa-core-check pa-stamp pa-restart pa-context; do ln -sfn "$PA/tools/pa.py" "$HOME/.local/bin/$n"; done
 for n in pa-gate pa-hooks pa-hook pa-full-suite pa-worktree pa-worker pa-trust; do ln -sfn "$PA/tools/pa_hooks.py" "$HOME/.local/bin/$n"; done
 for n in pa-costs; do ln -sfn "$PA/tools/pa_costs.py" "$HOME/.local/bin/$n"; done
+for n in pa-queue; do ln -sfn "$PA/tools/pa_queue.py" "$HOME/.local/bin/$n"; done
 for n in pa-push-main pa-push-allow; do ln -sfn "$PA/tools/pa_push.py" "$HOME/.local/bin/$n"; done
 "$HOME/.local/bin/pa-core-check"
 # Last: installed.json, the hashes of what is installed now, and the commit it came from (t-037).

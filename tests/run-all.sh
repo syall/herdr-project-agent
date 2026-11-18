@@ -49,7 +49,7 @@ if [ "$affected" = 1 ] && [ -n "${PA_CHANGED_FILES:-}" ]; then
 fi
 
 parse37() { "$PY" -c "import ast,sys
-for f in sys.argv[1:]: ast.parse(open(f).read(), feature_version=(3,7)); print(f, 'parses as Python 3.7')" runtime/tools/pa.py runtime/tools/pa_hooks.py runtime/tools/pa_guard.py runtime/tools/pa_costs.py runtime/tools/pa_push.py; }
+for f in sys.argv[1:]: ast.parse(open(f).read(), feature_version=(3,7)); print(f, 'parses as Python 3.7')" runtime/tools/pa.py runtime/tools/pa_hooks.py runtime/tools/pa_guard.py runtime/tools/pa_costs.py runtime/tools/pa_push.py runtime/tools/pa_queue.py; }
 units() { "$PY" -m unittest discover -s tests -p "$1.py" -v; }  # one module: the same loader and top folder
 keeper() { [ -n "$NODE" ] || { echo "no node found (set NODE)"; return 1; }; "$NODE" tests/keeper/run.mjs; }
 # The panel harness is one part per shard (t-031): its time is nearly all short real timers, not CPU, so its
