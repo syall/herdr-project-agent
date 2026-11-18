@@ -36,7 +36,7 @@ const check = (ok, what) => { if (!ok) throw new Failed(what); };
 function world({ agent = true, agentTerminal = "t30", records = {}, extraPanes = [], extraTerms = [], extraTabs = [], agents = [], machine = null } = {}) {
   g.__now = T0; g.__gen = (g.__gen ?? 0) + 1; g.__delay = {};
   cx = stubs.makeCx({ stop_propagation() {} }); g.__draining = false;
-  g.__runs = []; g.__notes = []; g.__reads = []; g.__writes = []; g.__overlays = []; g.__offline = []; g.__hcs = []; g.__hcFail = []; g.__ls = {};
+  g.__runs = []; g.__notes = []; g.__reads = []; g.__writes = []; g.__overlays = []; g.__offline = []; g.__hcs = []; g.__hcFail = []; g.__hcHang = []; g.__ls = {};
   g.__machines = [{ name: null, layout: "ready" }, ...(machine ? [{ name: machine, layout: "ready" }] : [])];
   g.__spaces = [{ id: machine ? `${machine}/${S}` : S, name: "proj", machine, folder: "/proj", active: true, tabs: [{ id: "tb9", index: 1, name: "2", named: false }, ...extraTabs] }];
   g.__panes = [{ pane: "p9", terminal: "t9", tab: "tb9", title: "zsh", cwd: "/proj", status: null, program: shell }, ...extraPanes];
@@ -3735,6 +3735,23 @@ cases["C6-left-keeps-copy"] = async () => { // item 11 (RL-V3-2): summary gone, 
   const st = v.costs.peek(RS);
   check(st.summary?.totals?.money === 12.5 && st.missing === null && st.stale === true, `the kept copy stays, marked stale (got ${JSON.stringify({ money: st.summary?.totals?.money, missing: st.missing, stale: st.stale })})`);
   check(costsLs().length === 0, "no ls while left");
+};
+
+// ---- t-028 group D: the notice sent when a card is answered has a time limit (t-022 REVIEW RL 3, INVESTIGATION §6) ----
+cases["D1-send-timeout"] = async () => { // a hung hc send is given up after 90 s: the line says so, sending clears, later notices go out
+  const v = await cardsWorld({ records: alive("t4w"), extraTabs: [paTab], extraPanes: [paPane()], extraTerms: [paTerm()], agents: [{ address: "t4w", status: "idle" }] }, ["d-x", "d-y"]);
+  g.__hcHang = ["t4w"];
+  await answerCard(v, "d-x"); await settle();
+  check(v.sending === true && sends().length === 1, `the send is in flight (sending ${v.sending}, ${JSON.stringify(sends())})`);
+  for (let s = 0; s < 80; s++) { advance(1000); await settle(); }
+  check(v.sending === true, "still waiting at 80 s (hc itself waits up to 60 s for a draft)");
+  for (let s = 0; s < 12; s++) { advance(1000); await settle(); }
+  check(v.sending === false, `given up after 90 s (sending ${v.sending})`);
+  check(/hasn't been told yet \(hc send did not answer in 90 s; it may still arrive\)\. Trying again every 10 s\./.test(look(v).text), `the line says why (got ${look(v).text.slice(0, 500)})`);
+  g.__hcHang = []; g.__hcs = [];
+  await answerCard(v, "d-y"); await settle();
+  check(JSON.stringify(sends().map((x) => x[2])) === JSON.stringify(["decision d-x answered", "decision d-y answered"]), `sent again, then the next one, in order (got ${JSON.stringify(sends())})`);
+  check(v.sending === false && !/hasn't been told yet/.test(look(v).text), "the line is gone");
 };
 
 // Which cases run (t-031): every case, or the named ones; --shard=<k>/<n> keeps every n-th case by definition

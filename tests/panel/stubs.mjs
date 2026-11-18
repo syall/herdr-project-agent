@@ -21,7 +21,7 @@
 // records every(ms, fn) in __timers ([{ ms, fn }]) and after(ms, fn) in __afters, so a case can fire them;
 // write_to_clipboard(text) appends text to __clipboard (t-026); notify() counts into __notifies (t-028).
 export * from "./keeper-stubs.mjs";
-import { readTextFile as baseRead, exec as baseExec, cx as baseCx } from "./keeper-stubs.mjs";
+import { readTextFile as baseRead, exec as baseExec, cx as baseCx, hc as baseHc } from "./keeper-stubs.mjs";
 const g = globalThis;
 
 const waitFor = async (ms) => {
@@ -92,6 +92,12 @@ export const layout = () => g.__layout ?? {};
 export const watchFolder = () => new Promise(() => {}); // never changes
 export const closeOverlay = (o) => { (g.__closed ??= []).push(o); return null; };
 export const pickFolder = async () => null;
+
+// __hcHang ["<address>"]: an hc send to these is recorded and never settles (t-028 D1: a hung send).
+export const hc = (args = []) => {
+  if (args[0] === "send" && (g.__hcHang ?? []).includes(args[1])) { (g.__hcs ??= []).push(args); return new Promise(() => {}); }
+  return baseHc(args);
+};
 
 // ---- gpui-kit / gpui-base ----
 class El {
