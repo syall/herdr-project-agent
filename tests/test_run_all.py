@@ -1,6 +1,7 @@
 """tests/run-all.sh itself (t-017 J6, R7): parts in parallel, output in a fixed order, a summary that names
 every part and every failure, PA_SERIAL=1, --affected; J9: TERM, INT and HUP stop every part and its children,
-and each unit test module (tests/test_*.py) is its own part. The real script runs in a temp copy of the repo whose
+and each unit test module (tests/test_*.py) is its own part; t-031: the panel harness runs as four parts, one per
+shard (run.mjs --shard=<k>/4), each named in the summary. The real script runs in a temp copy of the repo whose
 parts are stubs (stub.sh, chosen per part by STUB_<part>), so no real suite runs here."""
 import os
 import shutil
@@ -11,8 +12,15 @@ import time
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-NAMES = ["python 3.7 parse", "unit tests: test_stub", "keeper harness", "panel harness", "store harness",
+SHARDS = ["panel harness {}/4".format(k) for k in (1, 2, 3, 4)]
+NAMES = ["python 3.7 parse", "unit tests: test_stub", "keeper harness"] + SHARDS + ["store harness",
          "pa-session integration (private hc core)"]
+# The stub panel run.mjs: records its arguments and runs stub.sh as panel<k> for --shard=<k>/<n> (plain "panel"
+# without one), so STUB_panel<k> picks each shard's mode.
+PANEL = '''echo "$*" >> "$STUB_DIR/panelargs"
+k=${1#--shard=}; k=${k%%/*}
+exec sh stub.sh "panel$k"
+'''
 
 STUB = r'''k=$1
 eval "m=\${STUB_$k:-pass}"
@@ -100,8 +108,9 @@ class RunAll(unittest.TestCase):
             write(os.path.join(self.repo, "runtime", "tools", name + ".py"), "x = 1\n")
         write(os.path.join(self.repo, "stub.sh"), STUB)
         write(os.path.join(self.repo, "tests", "test_stub.py"), UNITS)
-        for part in ("keeper", "panel", "store"):
+        for part in ("keeper", "store"):
             write(os.path.join(self.repo, "tests", part, "run.mjs"), "exec sh stub.sh {}\n".format(part))
+        write(os.path.join(self.repo, "tests", "panel", "run.mjs"), PANEL)
         write(os.path.join(self.repo, "tests", "setup-scratch.sh"), "exit 0\n")
         write(os.path.join(self.repo, "tests", "pa_session_check.sh"), "exec sh stub.sh integration\n")
         self.node = os.path.join(self.tmp, "node")
@@ -137,7 +146,7 @@ class RunAll(unittest.TestCase):
         self.assertTrue(out.rstrip().splitlines()[-1].startswith("=== all passed (outputs: "), out)
         folder = self.outputs(out)
         files = sorted(os.listdir(folder))
-        self.assertEqual(len([f for f in files if f.endswith(".log")]), 6, files)
+        self.assertEqual(len([f for f in files if f.endswith(".log")]), 9, files)
         keeper = [f for f in files if "keeper" in f and f.endswith(".log")][0]
         with open(os.path.join(folder, keeper)) as f:
             self.assertEqual(f.read(), "keeper says hello\nkeeper done\n")
@@ -146,10 +155,10 @@ class RunAll(unittest.TestCase):
             self.assertIn("{}: ok".format(name), tail)
 
     def test_r2_failures_named(self):
-        code, out = self.run_all(units="fail", keeper="fail", panel="crash")
+        code, out = self.run_all(units="fail", keeper="fail", panel2="crash")
         self.assertEqual(code, 1, out)
         last = out.rstrip().splitlines()[-1]
-        self.assertTrue(last.startswith("=== 3 part(s) failed: unit tests: test_stub, keeper harness, panel harness (outputs: "), last)
+        self.assertTrue(last.startswith("=== 3 part(s) failed: unit tests: test_stub, keeper harness, panel harness 2/4 (outputs: "), last)
         tail = self.summary(out)
         self.assertIn("--- unit tests: test_stub: FAILED", tail)
         self.assertIn("FAIL: test_one", tail)
@@ -157,11 +166,11 @@ class RunAll(unittest.TestCase):
         self.assertIn("FAIL K-x: boom", tail)
         self.assertIn("FAIL K-y: bang", tail)
         self.assertNotIn("PASS ok-case", tail)
-        self.assertIn("--- panel harness: FAILED (no failing test named; its last 40 lines:)", tail)
-        self.assertIn("panel line 11\n", tail)
-        self.assertIn("panel line 50\n", tail)
-        self.assertNotIn("panel line 10\n", tail)
-        for name in ("python 3.7 parse", "store harness", "pa-session integration (private hc core)"):
+        self.assertIn("--- panel harness 2/4: FAILED (no failing test named; its last 40 lines:)", tail)
+        self.assertIn("panel2 line 11\n", tail)
+        self.assertIn("panel2 line 50\n", tail)
+        self.assertNotIn("panel2 line 10\n", tail)
+        for name in ["python 3.7 parse", "store harness", "pa-session integration (private hc core)"] + SHARDS[:1] + SHARDS[2:]:
             self.assertIn("{}: ok".format(name), tail)
         self.outputs(out)
 
@@ -183,7 +192,7 @@ class RunAll(unittest.TestCase):
         self.assertIn("=== keeper harness\nkeeper says hello\nkeeper done\n--- keeper harness: ok\n", body)
 
     def test_r4_parallel(self):
-        code, out = self.run_all(keeper="wait:panel", panel="wait:keeper")
+        code, out = self.run_all(keeper="wait:panel1", panel1="wait:keeper")
         self.assertEqual(code, 0, out)
 
     def test_r4b_serial(self):
@@ -192,7 +201,7 @@ class RunAll(unittest.TestCase):
         with open(self.events) as f:
             events = f.read().split()
         pairs = [events[i:i + 4] for i in range(0, len(events), 4)]
-        self.assertEqual(pairs, [["start", k, "end", k] for k in ("keeper", "panel", "store", "integration")], events)
+        self.assertEqual(pairs, [["start", k, "end", k] for k in ("keeper", "panel1", "panel2", "panel3", "panel4", "store", "integration")], events)
         self.assertTrue(out.rstrip().splitlines()[-1].startswith("=== all passed (outputs: "), out)
 
     def test_r4c_serial_failure(self):
@@ -218,10 +227,45 @@ class RunAll(unittest.TestCase):
         code, out = self.run_all("--affected", PA_CHANGED_FILES="README.md")
         self.assertEqual((code, out.strip()), (0, "no tested files changed: nothing to run"))
 
+    def test_r6d_affected_panel_files_run_every_shard(self):
+        # A change to the panel harness runs all four shards (and the store harness when the shared stubs change).
+        for changed, want in (("tests/panel/run.mjs", ["panel1", "panel2", "panel3", "panel4"]),
+                              ("tests/panel/stubs.mjs", ["panel1", "panel2", "panel3", "panel4", "store"]),
+                              ("mods/project-agent/main.js", ["keeper", "panel1", "panel2", "panel3", "panel4", "store"])):
+            with self.subTest(changed=changed):
+                write(self.events, "")
+                code, out = self.run_all("--affected", PA_CHANGED_FILES=changed)
+                self.assertEqual(code, 0, out)
+                with open(self.events) as f:
+                    started = [line.split()[1] for line in f.read().splitlines() if line.startswith("start ")]
+                self.assertEqual(sorted(started), sorted(want), out)
+                for name in SHARDS:
+                    self.assertIn("  {}: ok".format(name), self.summary(out))
+                self.assertNotIn("integration", out)
+
+    def test_r10_panel_in_four_shards(self):
+        # Four panel parts at once (shard 1 and 4 each wait until the other has started), each run once with its
+        # own --shard=<k>/4; a failing shard is named, with its failing cases, in the last 40 lines.
+        code, out = self.run_all(panel1="wait:panel4", panel4="wait:panel1", panel3="fail")
+        self.assertEqual(code, 1, out)
+        with open(os.path.join(self.tmp, "panelargs")) as f:
+            self.assertEqual(sorted(f.read().splitlines()), ["--shard={}/4".format(k) for k in (1, 2, 3, 4)], out)
+        with open(self.events) as f:
+            starts = [line for line in f.read().splitlines() if line.startswith("start panel")]
+        self.assertEqual(sorted(starts), ["start panel{}".format(k) for k in (1, 2, 3, 4)], out)
+        body = out.split("\n=== summary", 1)[0]
+        at = [body.index("=== " + name + "\n") for name in NAMES]
+        self.assertEqual(at, sorted(at), body)
+        tail = "\n".join(out.rstrip().splitlines()[-40:])
+        self.assertIn("--- panel harness 3/4: FAILED\n  FAIL K-x: boom\n  FAIL K-y: bang", tail)
+        for name in NAMES:
+            self.assertIn("  " + name + (": FAILED" if name == "panel harness 3/4" else ": ok"), tail)
+        self.assertTrue(out.rstrip().splitlines()[-1].startswith("=== 1 part(s) failed: panel harness 3/4 (outputs: "), out)
+
     def test_r6b_affected_without_files_runs_the_fast_set(self):
         code, out = self.run_all("--affected")
         self.assertEqual(code, 0, out)
-        for name in NAMES[:5]:
+        for name in NAMES[:-1]:
             self.assertIn("{}: ok".format(name), self.summary(out))
         self.assertNotIn("integration", out)
 
@@ -235,16 +279,17 @@ class RunAll(unittest.TestCase):
             folder = self.outputs(out)
             with open(os.path.join(self.tmp, "tmpdirs")) as f:
                 seen = dict(line.split(" ", 1) for line in f.read().splitlines())
-            self.assertEqual(sorted(seen), sorted(["units", "keeper", "panel", "store", "integration"]), seen)
+            self.assertEqual(sorted(seen), sorted(["units", "keeper", "panel1", "panel2", "panel3", "panel4", "store",
+                                                   "integration"]), seen)
             dirs = [os.path.realpath(d) for d in seen.values()]
-            self.assertEqual(len(set(dirs)), 5, seen)
+            self.assertEqual(len(set(dirs)), 8, seen)
             for d in dirs:
                 self.assertTrue(d.startswith(os.path.realpath(folder) + os.sep) and os.path.isdir(d), (d, folder))
 
     def test_r8_stop(self):
         # TERM, INT or HUP sent to the script alone (a closed pane, a kill, a Ctrl-C) stops every running part
         # and the children it started, in parallel and in PA_SERIAL=1 mode, and exits 128 + the signal.
-        cases = [("", ("keeper", "panel")), ("1", ("keeper",))]
+        cases = [("", ("keeper", "panel1")), ("1", ("keeper",))]
         for serial, hung in cases:
             for sig, want in ((signal.SIGTERM, 143), (signal.SIGINT, 130), (signal.SIGHUP, 129)):
                 with self.subTest(serial=serial, sig=sig.name):
@@ -321,7 +366,7 @@ class RunAll(unittest.TestCase):
             self.assertIn("  {}: ok".format(name), tail)
         self.assertTrue(out.rstrip().splitlines()[-1].startswith("=== 1 part(s) failed: unit tests: test_b (outputs: "), out)
         folder = self.outputs(out)
-        self.assertEqual(len([f for f in os.listdir(folder) if f.endswith(".log")]), 8, os.listdir(folder))
+        self.assertEqual(len([f for f in os.listdir(folder) if f.endswith(".log")]), 11, os.listdir(folder))
 
     def test_r7_usage(self):
         code, out = self.run_all("--nope")
