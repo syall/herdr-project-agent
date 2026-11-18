@@ -443,7 +443,7 @@ class W5Pins(Base):
         self.assertEqual(got["r"][0], 0, got["r"][1])
         line = self.lines()[-1]
         self.assertEqual((line["tree"], line["commit"]), (tree_y, commit_y), "the record names the tree it tested")
-        sh(self.wt, "git", "revert", "--no-edit", "-q", "HEAD")  # tree X again, clean
+        sh(self.wt, "git", "revert", "--no-edit", "HEAD")  # tree X again, clean
         self.assertEqual(sh(self.wt, "git", "rev-parse", "HEAD^{tree}"), tree_x)
         code, out = self.main()
         self.assertNotIn("already passed", out)
@@ -458,7 +458,7 @@ class W5Pins(Base):
         self.assertIn("changed during the run", out)
         line = self.lines()[-1]
         self.assertEqual((line["commit"], line["tree"], line.get("moved")), (commit_x, tree_x, True))
-        sh(self.wt, "git", "revert", "--no-edit", "-q", "HEAD")  # tree X again, clean
+        sh(self.wt, "git", "revert", "--no-edit", "HEAD")  # tree X again, clean
         self.assertEqual(sh(self.wt, "git", "rev-parse", "HEAD^{tree}"), tree_x)
         code, out = self.main()
         self.assertNotIn("already passed", out)
