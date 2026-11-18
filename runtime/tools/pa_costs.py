@@ -71,12 +71,63 @@ def _price_entry(entry, where):
     return entry
 
 
+SCOPE_FIELDS = ("provider", "endpoint", "region", "account")
+LABEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")  # provider and account labels (t-032 D1)
+ENDPOINT = re.compile(r"^[a-z][a-z0-9-]{0,23}$")  # endpoint kinds: global, geo, regional, or a profile's own
+REGION = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")  # a source region label, never a host or an account
+FACT_RULES = {"provider": LABEL, "endpoint": ENDPOINT, "region": REGION, "account": LABEL}
+TWELVE = re.compile(r"\d{12}")  # an account number: refused in every label these tools write or read
+
+
+def fact_label(field, value):
+    """value when it is a valid label for field (and holds no 12 digits), else None."""
+    if isinstance(value, str) and FACT_RULES[field].match(value) and not TWELVE.search(value):
+        return value
+    return None
+
+
+def _scope(obj, where):
+    """(provider, endpoint, region, account) of a scope object; null or missing = any. ValueError when a field is not a label."""
+    if not isinstance(obj, dict):
+        raise ValueError("{} must be an object".format(where))
+    out = []
+    for f in SCOPE_FIELDS:
+        v = obj.get(f)
+        if v is not None and fact_label(f, v) is None:
+            raise ValueError("{}: {} must be a label (or null)".format(where, f))
+        out.append(v)
+    return tuple(out)
+
+
+def _models(raw_models, where):
+    if not isinstance(raw_models, dict):
+        raise ValueError("{}: no models object".format(where))
+    models = {}
+    for name, entries in raw_models.items():
+        if not isinstance(entries, list):
+            entries = [entries]
+        models[name] = sorted((_price_entry(e, name) for e in entries), key=lambda e: e["validFrom"])
+    return models
+
+
+def scope_text(scope):
+    """'provider · endpoint · region · account', null as '*'."""
+    return " · ".join("*" if v is None else v for v in scope)
+
+
 def load_prices(profile):
     """(table, problem). (None, None) when the profile has no prices.json; (None, why) when it is unusable,
-    and then everything is shown as tokens only."""
+    and then everything is shown as tokens only. Scopes (t-032 A-P1): `defaultScope` (or the older `defaultProvider`,
+    or the profile's pricing.defaultProvider) is the scope of the top-level models; `scoped` entries price rows whose
+    facts match them (lookup); `scopedAliases` name keys of scoped models. Older tools read only `models`/`aliases`."""
     path = os.path.join(profile.get("_folder") or "", "prices.json")
     if not os.path.isfile(path):
         return None, None
+    pricing = profile.get("pricing") if isinstance(profile.get("pricing"), dict) else {}
+    prof_default = fact_label("provider", pricing.get("defaultProvider"))
+    price_as = pricing.get("endpointPriceAs") if isinstance(pricing.get("endpointPriceAs"), dict) else {}
+    price_as = {k: v for k, v in price_as.items() if fact_label("endpoint", k) and fact_label("endpoint", v)}
+    warnings = []
     try:
         with open(path) as f:
             raw = json.load(f)
@@ -84,20 +135,52 @@ def load_prices(profile):
             raise ValueError("no models object")
         if not isinstance(raw.get("currency"), str) or not raw["currency"]:
             raise ValueError("no currency")
-        models = {}
-        for name, entries in raw["models"].items():
-            if not isinstance(entries, list):
-                entries = [entries]
-            models[name] = sorted((_price_entry(e, name) for e in entries), key=lambda e: e["validFrom"])
+        models = _models(raw["models"], "models")
         aliases = []
         for a in raw.get("aliases") or []:
             if not isinstance(a, dict) or not isinstance(a.get("match"), str) or a.get("model") not in models:
                 raise ValueError("an alias needs match (a regex) and model (a key in models)")
             aliases.append((re.compile(a["match"]), a["model"]))
+        has_default = "defaultScope" in raw
+        if has_default:
+            default = _scope(raw["defaultScope"], "defaultScope")
+        elif raw.get("defaultProvider") is not None:
+            if fact_label("provider", raw["defaultProvider"]) is None:
+                raise ValueError("defaultProvider must be a label")
+            default = (raw["defaultProvider"], None, None, None)
+        else:
+            default = (prof_default, None, None, None)
+        if prof_default and default[0] != prof_default:
+            warnings.append("prices.json of profile {}: default provider {} differs from the profile's pricing.defaultProvider {}: "
+                            "the file's is used".format(profile.get("name"), default[0], prof_default))
+        if not isinstance(raw.get("scoped") or [], list):
+            raise ValueError("scoped must be a list")
+        scoped, seen = [], {default}
+        for i, e in enumerate(raw.get("scoped") or []):
+            where = "scoped[{}]".format(i)
+            scope = _scope(e, where)
+            if all(v is None for v in scope):
+                raise ValueError("{}: at least one of provider, endpoint, region, account".format(where))
+            if scope in seen:
+                raise ValueError("{}: scope {} appears twice (or is the default scope)".format(where, scope_text(scope)))
+            seen.add(scope)
+            scoped.append({"scope": scope, "models": _models(e.get("models"), where)})
+        scoped_keys = {k for e in scoped for k in e["models"]}
+        scoped_aliases = []
+        for a in raw.get("scopedAliases") or []:
+            if not isinstance(a, dict) or not isinstance(a.get("match"), str) or a.get("model") not in scoped_keys:
+                raise ValueError("a scoped alias needs match (a regex) and model (a key in a scoped models)")
+            scoped_aliases.append((re.compile(a["match"]), a["model"]))
     except (OSError, ValueError, re.error) as e:
         return None, "prices.json of profile {} is not usable ({}): tokens only".format(profile.get("name"), str(e)[:160])
+    if has_default:  # rows' own endpoint/region (informational) should say their scope's; files without one are not checked
+        for scope, table_models in [(default, models)] + [(e["scope"], e["models"]) for e in scoped]:
+            for name, entries in sorted(table_models.items()):
+                for field, want in (("endpoint", scope[1]), ("region", scope[2])):
+                    if any(field in x and x[field] != want for x in entries):
+                        warnings.append("prices.json of profile {}: {} in scope {} has a row whose {} is not the scope's".format(
+                            profile.get("name"), name[:80], scope_text(scope), field))
     # The ledger keeps one long-context part, split at LONG prompt tokens. Another threshold is accepted but named.
-    warnings = []
     for name, entries in sorted(models.items()):
         other = sorted({e["long"]["above"] for e in entries if e.get("long") and e["long"].get("above", LONG) != LONG})
         if other:
@@ -106,30 +189,76 @@ def load_prices(profile):
                                                                                    ", ".join(str(x) for x in other), LONG))
     return {"currency": raw["currency"], "unit": raw.get("unit"), "source": raw.get("source"), "asOf": raw.get("asOf"),
             "note": raw.get("note"), "profile": profile.get("name"), "models": models, "aliases": aliases,
-            "warnings": warnings}, None
+            "warnings": warnings, "defaultScope": default, "fileDefault": has_default, "scoped": scoped,
+            "scopedAliases": scoped_aliases, "endpointPriceAs": price_as}, None
 
 
 def model_key(table, model):
+    """The table key of model: an exact key (top-level, then any scope's), then aliases, then scopedAliases."""
     if not table or not model:
         return None
     if model in table["models"]:
         return model
-    for pattern, key in table["aliases"]:
+    for e in table.get("scoped") or []:
+        if model in e["models"]:
+            return model
+    for pattern, key in list(table["aliases"]) + list(table.get("scopedAliases") or []):
         if pattern.search(model):
             return key
     return None
 
 
-def price_for(table, model, when):
-    """The price entry in effect for model at `when` (ISO time): the latest validFrom on or before its day."""
+def facts_of(row):
+    """(provider, endpoint, region, account) a ledger row carries; None where it has none."""
+    return tuple(row.get(f) if isinstance(row.get(f), str) else None for f in SCOPE_FIELDS)
+
+
+def _matches(scope, facts, default_provider):
+    sp = scope[0]
+    if sp is None:
+        if facts[0] is not None and facts[0] != default_provider:  # no crossing of providers
+            return False
+    elif sp != facts[0]:
+        return False
+    return all(s is None or s == f for s, f in zip(scope[1:], facts[1:]))
+
+
+def lookup(table, model, when, facts=None):
+    """(price entry, pricedAs) for model at `when` (ISO time) under facts (provider, endpoint, region, account), t-032
+    A-P2: the scopes that match (null = any; unknown provider and endpoint take the default scope's), most specific first
+    (account, then region, then endpoint, then provider); in each the latest validFrom on or before the day; none: (None,
+    None). pricedAs = {"scope": [p, n, g, a] with null as "*", "validFrom"}. No facts: the default scope alone."""
     key = model_key(table, model)
     if key is None:
+        return None, None
+    day = (when or "")[:10]
+    default = table.get("defaultScope") or (None, None, None, None)
+    scopes = [(default, table["models"])] + [(e["scope"], e["models"]) for e in table.get("scoped") or []]
+    if facts is None:
+        candidates = scopes[:1]
+    else:
+        p, n, g, a = (list(facts) + [None] * 4)[:4]
+        p = default[0] if p is None else p
+        n = default[1] if n is None else n
+        n = (table.get("endpointPriceAs") or {}).get(n, n) if n is not None else None
+        candidates = [x for x in scopes if _matches(x[0], (p, n, g, a), default[0])]
+        candidates.sort(key=lambda x: (x[0][3] is not None, x[0][2] is not None, x[0][1] is not None, x[0][0] is not None), reverse=True)
+    for scope, models in candidates:
+        found = None
+        for entry in models.get(key) or []:
+            if entry["validFrom"] <= day:
+                found = entry
+        if found is not None:
+            return found, {"scope": ["*" if v is None else v for v in scope], "validFrom": found["validFrom"]}
+    return None, None
+
+
+def price_for(table, model, when, facts=None):
+    """The price entry in effect for model at `when` (ISO time): the latest validFrom on or before its day, in the
+    scope lookup() picks for facts (none: the default scope)."""
+    if not table:
         return None
-    day, found = (when or "")[:10], None
-    for entry in table["models"][key]:
-        if entry["validFrom"] <= day:
-            found = entry
-    return found
+    return lookup(table, model, when, facts)[0]
 
 
 def money(tokens, long, price):
@@ -154,7 +283,7 @@ def money(tokens, long, price):
 
 def row_money(row, table):
     """A ledger row's money, from its tokens, model and time only."""
-    return money(row.get("tokens") or {}, row.get("long") or {}, price_for(table, row.get("model"), row.get("from")))
+    return money(row.get("tokens") or {}, row.get("long") or {}, price_for(table, row.get("model"), row.get("from"), facts_of(row)))
 
 
 def price_rows(rows, table):
@@ -1739,7 +1868,7 @@ def summarize(directory, rows, records, table, price_problem, profile_name, now,
         rb_t = rb_tokens["cw5m"] + rb_tokens["cw1h"]
         rb_m = None
         if rb_t:
-            price = price_for(table, r.get("model"), r.get("from"))
+            price = price_for(table, r.get("model"), r.get("from"), facts_of(r))
             rb_m = money(rb_tokens, zero(), price) if m is not None else None
             group(acts, "cache-rebuild").add(rb_t, rb_m, 0, rec)
         act = r.get("activity") or "unattributed"
@@ -2166,7 +2295,6 @@ RUNS_PER_DAY = 3  # query runs (scheduled and --now) per UTC day
 EVERY = 86400  # the scheduled query runs at most this often
 RANGE_DAYS = 35
 WIDE = re.compile(r"(?i)admin|poweruser|fullaccess|root|owner")
-TWELVE = re.compile(r"\d{12}")
 AGENT_MARKERS = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CODEX_SANDBOX", "CODEX_HOME_SESSION")
 CURRENCY = re.compile(r"^[A-Z]{3}$")
 
