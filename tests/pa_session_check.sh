@@ -1,6 +1,7 @@
 #!/bin/sh
 # Integration check for pa-session (t-001, spec §4.1: S1 S2 S3 S4 S5 S6a S7; t-037 J2: S8 S9 S10, the restart in
-# place; round 2: S11 S12; round 3: D4 inside S11; J3: S13, the --end-terminal bridge) against a PRIVATE hc core.
+# place; round 2: S11 S12; round 3: D4 inside S11; J3: S13, the --end-terminal bridge; t-041 J4: S14, the fresh
+# context) against a PRIVATE hc core.
 # Usage: tests/pa_session_check.sh <scratch dir made by tests/setup-scratch.sh>
 # Every hc call goes through scratch(): its own HC_SESSION and XDG folders under the scratch dir,
 # HC_TERMINAL_ID / HC_SOCKET / HC_TERMINAL_SOCKET / HC_SCOPE unset (HC_TERMINAL_SOCKET names the live
@@ -443,6 +444,78 @@ if wait_for $START_WAIT has_lines $((before + 1)) && wait_for 10 test -s "$S/pa/
     [ "$(agent "$SP13B" terminal)" = "$t13" ] && [ "$(pa_count "$SP13B")" = 1 ] && beats "$SP13B" "$t13" && pass "S13d still one launcher for the space" || fail S13d "agent terminal $(agent "$SP13B" terminal), count $(pa_count "$SP13B")"
   else fail S13d "no question or no answer: $(tail -n 4 "$S/r13d.out")"; fi
 else fail S13d "stub never started; n13b: $(scratch hc read n13b 2>&1 | tail -n 5)"; fi
+
+# S14 (t-041 J4, AC4.2, AC11.1): over the cap at a clean point, the launcher starts Claude in a fresh session in the
+# same terminal: a new --session-id, no --resume, the start prompt; the terminal keeps its address and pid, and its
+# worker stays live and its child. The stub is a shell, so hc gives it no agent status: an hc shim on the launcher's
+# PATH only (plan Q2) adds status idle to `hc get` while $S/stub-idle exists; everything else goes to the real hc.
+SP14=sp1414141414141414141414141414cccc
+D14="$S/pa/spaces/$SP14"
+real_hc=$(command -v hc)
+mkdir -p "$S/bin14"
+cat > "$S/bin14/hc" <<SHIM
+#!/bin/sh
+if [ "\${1:-}" = get ] && [ -e "$S/stub-idle" ]; then
+  out=\$("$real_hc" "\$@") || exit \$?
+  printf '%s' "\$out" | python3 -c 'import json, sys
+raw = sys.stdin.read()
+try:
+    d = json.loads(raw)
+except ValueError:
+    sys.stdout.write(raw)
+    sys.exit(0)
+d["status"] = {"state": "idle"}
+print(json.dumps(d))'
+  exit 0
+fi
+exec "$real_hc" "\$@"
+SHIM
+chmod +x "$S/bin14/hc"
+: > "$S/stub-idle"
+before=$(lines)
+start n14 "$SP14" "$S/proj" "PATH=$S/bin14:$S/bin:$PATH" "STUB_USAGE=300000"
+if wait_for $START_WAIT has_lines $((before + 1)); then
+  sid14=$(agent "$SP14" sessionId)
+  addr14=$(addr n14)
+  pid14=$(scratch hc get n14 --json | json "d.get('pid')")
+  scratch hc run --bg --parent n14 --no-notify --name w14 -- sleep 600 >/dev/null
+  w14=$(addr w14)
+  mkdir -p "$D14/evidence/t-1"
+  echo "Do the job." > "$D14/evidence/t-1/handoff-build.md"
+  sleep 2  # the stub's transcript is written; the checkpoint comes after its turn
+  python3 - "$D14" "$sid14" "$w14" <<'PY14'
+import json, sys, time
+d, sid, w = sys.argv[1:4]
+path = d + "/ledger.json"
+try:
+    led = json.load(open(path))
+except Exception:
+    led = {"version": 1, "passCount": 0, "tasks": []}
+led["context"] = {"pass": 1, "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "session": sid, "clean": True,
+                  "boundary": "pass", "why": None}
+led["tasks"] = [{"id": "t-1", "state": "build", "workers": [{"address": w, "name": "t-1-build"}]}]
+json.dump(led, open(path, "w"), indent=2)
+PY14
+  if wait_for 90 has_lines $((before + 2)); then
+    new=$(sed -n "$((before + 2))p" "$LOG")
+    sid14b=$(agent "$SP14" sessionId)
+    [ -n "$sid14b" ] && [ "$sid14b" != "$sid14" ] && case "$new" in *"--session-id $sid14b "*) true ;; *) false ;; esac \
+      && pass "S14a a fresh session (--session-id $sid14b)" || fail S14a "stub argv: $(echo "$new" | cut -c1-120)"
+    case "$new" in *"--resume"*) fail S14a "the fresh start resumed" ;; *) pass "S14a no --resume" ;; esac
+    case "$new" in *"Fresh context (reset 1 today, reason pass-cap; previous session $sid14)"*) pass "S14a the start prompt" ;; *) fail S14a "no start prompt in the argv" ;; esac
+    grep -q "fresh from=$sid14 to=$sid14b ctx=300000 reason=pass-cap" "$D14/session.log" && pass "S14a session.log fresh line" || fail S14a "session.log: $(tail -n 3 "$D14/session.log")"
+    [ "$(state n14)" = live ] && [ "$(addr n14)" = "$addr14" ] && [ "$(scratch hc get n14 --json | json "d.get('pid')")" = "$pid14" ] \
+      && pass "S14b same terminal $addr14, pid $pid14" || fail S14b "n14 $(state n14) $(addr n14)"
+    [ "$(state w14)" = live ] && [ "$(scratch hc get w14 --json | json "d.get('parent')")" = "$addr14" ] \
+      && pass "S14c worker w14 still live and its child" || fail S14c "w14 $(state w14)"
+    scratch hc send n14 "report from w14 S14" >/dev/null 2>&1
+    seen14() { scratch hc read n14 2>&1 | grep -q "report from w14 S14"; }
+    if wait_for 5 seen14; then pass "S14d the report reached the PA's terminal"
+    elif [ "$(state w14)" = live ]; then pass "S14d (recorded limit C2) w14 still live for t-034's recovery"
+    else fail S14d "report not seen and w14 gone"; fi
+  else fail S14a "no fresh start; n14: $(scratch hc read n14 2>&1 | tail -n 5); session.log: $(tail -n 4 "$D14/session.log" 2>/dev/null)"; fi
+else fail S14 "stub never started; n14: $(scratch hc read n14 2>&1 | tail -n 5)"; fi
+rm -f "$S/stub-idle"
 
 # S9 (negative control): in this core a child does end with its parent's program, so S8's "w8 still live" means it.
 scratch hc run --bg --no-parent --no-notify --name n10 -- sleep 600 >/dev/null

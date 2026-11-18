@@ -152,6 +152,8 @@ D6 = ("Refused by the Project Agent's guard: {}. pa-context is the person's comm
 D6_FORMS = [
     ("pa-context set --mode off",), ("pa-context",), ("~/.local/bin/pa-context compacted --space s",), ("PA-CONTEXT start-pack",),
     ("python3 ~/.config/herdr-pa/tools/pa.py context set --net 500k",), ("python3 -I runtime/tools/pa.py context fresh",),
+    ("pa-context fresh --why x",), ("pa-context fresh --space s --withdraw",),  # t-041 J4 (W1)
+    ("python3 runtime/tools/pa.py context followup --space s",),
     ("./runtime/tools/pa.py context set",), ("env X=1 pa-context set",), ("cd x && pa-context set", "pa-context set"),
     ("sh -c 'pa-context set --mode off'", "pa-context set --mode off"), ("y=$(pa-context set)", "pa-context set"),
 ]

@@ -929,6 +929,22 @@ class T037Restart(unittest.TestCase):  # t-037 R16: pa-restart is the person's
         self.assertIn("`pa-restart` is the person's: run it only at their word, with `--why` quoting them.", text)
 
 
+class T041FreshReset(unittest.TestCase):  # t-041 J4 (plan Q1): the launcher's line and the fresh request
+    def setUp(self):
+        self.raw = read("runtime", "core", "orchestrator.md")
+
+    def test_t1_fresh_request_is_the_persons(self):
+        text = flat(section(self.raw, "## After a restart or a compaction"))
+        text = text[:text.index("## What must be on disk")]
+        self.assertIn("`pa-context fresh` is the person's too: run it only at their word, with `--why` quoting them.", text)
+
+    def test_t1_the_launchers_line(self):
+        text = flat(section(self.raw, "## The pass"))
+        text = text[:text.index("## After a restart or a compaction")]
+        self.assertIn("A message starting `[launcher] context` comes from your launcher: journal it with "
+                      "`\"trigger\": \"context\"`, write the checkpoint (clean only if it is) and end the turn.", text)
+
+
 def part(raw, start, end):
     return flat(raw[raw.index(start):raw.index(end)])
 

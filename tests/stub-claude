@@ -7,10 +7,27 @@
 #   STUB_TERM_LOG          file that gets "TERM" when the stub is sent SIGTERM (it then exits 143 at once)
 #   STUB_HELP_SLEEP        `--help` (the launcher's snapshot probe): sleep this long, print a usage line, exit 0 (not logged)
 #   STUB_VERSION           `--version` (the launcher's version probe, t-041 J3) prints this (default "2.1.300 (Claude Code)"), exit 0 (not logged)
+#   STUB_USAGE             tokens (t-041 J4): write a transcript for this session (--session-id or --resume) under
+#                          $CLAUDE_CONFIG_DIR/projects/<slug of the cwd>/ with one user message and one assistant
+#                          entry whose usage sums to it (stop_reason end_turn), stamped now
 log=${STUB_LOG:-/dev/null}
 if [ "${1:-}" = --version ]; then echo "${STUB_VERSION:-2.1.300 (Claude Code)}"; exit 0; fi
 if [ "${1:-}" = --help ]; then sleep "${STUB_HELP_SLEEP:-0}"; echo "usage: stub-claude"; exit 0; fi
 printf '%s\n' "$*" | tr '\n' ' ' >> "$log"; echo >> "$log"
+if [ -n "${STUB_USAGE:-}" ] && [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
+  sid=""; prev=""
+  for a in "$@"; do
+    case "$prev" in --session-id|--resume) sid=$a ;; esac
+    prev=$a
+  done
+  if [ -n "$sid" ]; then
+    slug=$(pwd -P | sed 's/[^A-Za-z0-9]/-/g')
+    mkdir -p "$CLAUDE_CONFIG_DIR/projects/$slug"
+    now=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
+    printf '{"type":"user","timestamp":"%s","message":{"role":"user","content":"stub"}}\n' "$now" >> "$CLAUDE_CONFIG_DIR/projects/$slug/$sid.jsonl"
+    printf '{"type":"assistant","timestamp":"%s","message":{"role":"assistant","stop_reason":"end_turn","usage":{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":%s,"output_tokens":1}}}\n' "$now" "$STUB_USAGE" >> "$CLAUDE_CONFIG_DIR/projects/$slug/$sid.jsonl"
+  fi
+fi
 if [ "${STUB_FAIL_RESUME_ONCE:-0}" = 1 ]; then
   case " $* " in
     *" --resume "*)
