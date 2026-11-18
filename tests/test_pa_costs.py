@@ -2864,7 +2864,7 @@ class CC_StatusLine(CCBase):
         self.assertEqual(out, b"STATUS-LINE ok")
         self.assertEqual(self.cc_record(), {"v": 1, "session": CC_SID, "cost": 1.25, "base": 0, "segments": 1, "durationMs": 60000,
                                             "apiDurationMs": 30000, "model": "model-a", "version": "2.1.999", "terminal": "t5",
-                                            "first": iso(T0), "at": iso(T0)})
+                                            "first": iso(T0), "at": iso(T0), "ctx": 1000})
         names = sorted(n for n in os.listdir(os.path.join(self.dir, "costs", "cc")) if not n.startswith("."))
         self.assertEqual(names, [CC_SID + ".json"])  # the temp file was replaced into place
 
@@ -5005,6 +5005,247 @@ class J1C_Docs(unittest.TestCase):
             self.assertIn(want, readme)
 
 
+D1 = "2026-11-17"  # T0's UTC day
+D0 = "2026-11-16"
+
+
+class PX_PaContext(Collecting):
+    """t-041 J1 (R15, R16 readers): the Project Agent's context per day: segment peak and first call, summary
+    paContext, the PA context line under Today, --by context, the reset and compact records read."""
+
+    def put_rows(self, *rows):
+        """Rows written straight to turns.jsonl (as the collector would), each with a seq."""
+        os.makedirs(os.path.join(self.dir, "costs"), exist_ok=True)
+        with open(self.costs("turns.jsonl"), "a") as f:
+            for i, r in enumerate(rows):
+                base = {"v": 1, "seq": i + 1, "session": SID, "program": "claude", "kind": "pa", "model": "model-a",
+                        "from": D1 + "T01:00:00Z", "to": D1 + "T01:01:00Z", "day": D1, "calls": 1, "tokens": toks(),
+                        "long": toks(), "rebuild": {"calls": 0, "cw5m": 0, "cw1h": 0, "gapS": 0}, "turn": D1 + "T01:00:00Z",
+                        "task": None, "pass": None, "trigger": None, "source": "recorded"}
+                base.update(r)
+                f.write(json.dumps(base) + "\n")
+
+    def put_record(self, rec):
+        os.makedirs(os.path.join(self.dir, "costs"), exist_ok=True)
+        with open(self.costs("sessions.jsonl"), "a") as f:
+            f.write(json.dumps(rec) + "\n")
+
+    def summary(self, now=T0 + 5000):
+        return pa_costs.write_summary(self.dir, now=now)
+
+    def day(self, s, day=D1):
+        found = [e for e in s["paContext"] if e["day"] == day]
+        self.assertEqual(len(found), 1, s["paContext"])
+        return found[0]
+
+    def test_px1_peak_first_and_mean_of_one_segment(self):
+        self.record(session=SID, kind="pa", terminal="t0", parent=None)
+        self.add(self.prompt(T0 + 10), self.call(T0 + 12, "p1", lines=1, inp=0, cr=100000),
+                 self.call(T0 + 14, "p2", lines=1, inp=0, cr=300000), self.call(T0 + 16, "p3", lines=1, inp=0, cr=200000))
+        self.collect(T0 + 5000)
+        rows = self.rows()
+        self.assertEqual(len(rows), 1, rows)
+        self.assertEqual((rows[0]["peak"], rows[0]["first"]), (300000, 100000))
+        e = self.day(load(self.costs("summary.json")))
+        self.assertEqual((e["calls"], e["mean"], e["peak"], e["peakExact"]), (3, 200000, 300000, True))
+        self.assertEqual((e["firstCall"], e["firstCalls"]), (100000, 1))  # a start record with resumed false: fresh
+
+    def test_px2_old_row_without_peak_is_a_lower_bound(self):
+        self.put_rows({"calls": 2, "tokens": toks(cr=400000)}, {"calls": 1, "tokens": toks(cr=250000), "peak": 250000})
+        s = self.summary()
+        e = self.day(s)
+        self.assertEqual((e["calls"], e["mean"], e["peak"], e["peakExact"]), (3, 216667, 250000, False))
+        line = [x for x in pa_costs.report_lines(s) if x.startswith("PA context")]
+        self.assertEqual(len(line), 1)
+        self.assertIn("peak ≥250k", line[0])
+        self.assertIn("mean 217k", line[0])
+
+    def test_px3_reset_and_compact_records_are_counted(self):
+        self.record(session=SID2, kind="worker", terminal="t5")
+        self.put_rows({"calls": 1, "tokens": toks(cr=100000), "peak": 100000})
+        for rec in (fx.reset_record(D1 + "T02:00:00Z", SID, SID3, reason="pass-cap"),
+                    fx.reset_record(D1 + "T03:00:00Z", SID3, SID4, reason="task-cap"),
+                    fx.reset_record("not a time", SID4, "x", reason="person"),
+                    fx.compact_record(D1 + "T04:00:00Z", SID4),
+                    fx.compact_record(D1 + "T04:30:00Z", SID2),  # a worker session's: not the PA's
+                    fx.compact_record(D0 + "T04:00:00Z", SID)):
+            self.put_record(rec)
+        s = self.summary()
+        e = self.day(s)
+        self.assertEqual(e["resets"], {"fresh": 2, "compact": 1})
+        self.assertEqual(e["reasons"], {"pass-cap": 1, "task-cap": 1})
+        self.assertEqual(self.day(s, D0)["resets"], {"fresh": 0, "compact": 1})  # a day with records only
+        line = [x for x in pa_costs.report_lines(s) if x.startswith("PA context")][0]
+        self.assertIn("resets 3 (fresh 2, compact 1)", line)
+        self.assertIn("peak 100k", line)
+        self.assertNotIn("≥", line)
+
+    def test_px4_only_the_pa_main_conversation_counts(self):
+        self.put_rows({"calls": 1, "tokens": toks(cr=100000), "peak": 100000},
+                      {"calls": 1, "tokens": toks(cr=900000), "peak": 900000, "sub": "agent-x"},
+                      {"calls": 1, "tokens": toks(cr=800000), "peak": 800000, "kind": "worker", "session": SID2},
+                      {"calls": 0, "tokens": toks(out=5)})
+        e = self.day(self.summary())
+        self.assertEqual((e["calls"], e["mean"], e["peak"]), (1, 100000, 100000))
+
+    def test_px5_since_and_until_drop_rows_and_records_outside(self):
+        self.put_rows({"calls": 1, "tokens": toks(cr=100000), "peak": 100000},
+                      {"calls": 1, "tokens": toks(cr=500000), "peak": 500000, "day": D0, "from": D0 + "T01:00:00Z", "to": D0 + "T01:01:00Z"})
+        self.put_record(fx.reset_record(D0 + "T02:00:00Z", SID, SID3))
+        self.put_record(fx.reset_record(D1 + "T02:00:00Z", SID3, SID4))
+        _r, out, _e = self.run_cmd(pa_costs.report, self.dir, since=D1, as_json=True, now=T0 + 5000)
+        pc = json.loads(out)["paContext"]
+        self.assertEqual([e["day"] for e in pc], [D1])
+        self.assertEqual(pc[0]["resets"]["fresh"], 1)
+        _r, out, _e = self.run_cmd(pa_costs.report, self.dir, until=D0, as_json=True, now=T0 + 5000)
+        pc = json.loads(out)["paContext"]
+        self.assertEqual([(e["day"], e["mean"], e["resets"]["fresh"]) for e in pc], [(D0, 500000, 1)])
+
+    def test_px6_first_call_of_fresh_sessions_only(self):
+        self.record(session=SID, kind="pa", terminal="t0", parent=None, resumed=False)
+        self.record(session=SID2, kind="pa", terminal="t0", parent=None, resumed=True)
+        self.put_record(fx.reset_record(D1 + "T05:00:00Z", SID2, SID3))
+        self.put_rows({"session": SID, "first": 100000, "peak": 100000, "tokens": toks(cr=100000)},
+                      {"session": SID, "first": 999, "peak": 999, "tokens": toks(cr=999), "from": D1 + "T02:00:00Z"},
+                      {"session": SID2, "first": 500000, "peak": 500000, "tokens": toks(cr=500000)},
+                      {"session": SID3, "first": 80000, "peak": 80000, "tokens": toks(cr=80000), "from": D1 + "T05:01:00Z"},
+                      {"session": SID4, "tokens": toks(cr=70000), "day": D0, "from": D0 + "T05:00:00Z", "to": D0 + "T05:01:00Z"})
+        self.record(session=SID4, kind="pa", terminal="t0", parent=None, resumed=False)
+        s = self.summary()
+        e = self.day(s)
+        self.assertEqual((e["firstCall"], e["firstCalls"]), (90000, 2))
+        e0 = self.day(s, D0)  # a fresh session whose rows predate `first`: no guess
+        self.assertEqual((e0["firstCall"], e0["firstCalls"]), (None, 0))
+
+    def test_px7_money_and_per_pass(self):
+        self.prices()
+        self.put_rows({"pass": 1, "tokens": toks(cr=100000, out=1000), "peak": 100000},
+                      {"pass": 2, "tokens": toks(cr=200000, out=2000), "peak": 200000},
+                      {"pass": 2, "tokens": toks(cr=200000, out=2000), "peak": 200000})
+        s = self.summary()
+        e = self.day(s)
+        pa_money = [k for k in s["byKind"]["kind"] if k["key"] == "pa"][0]["money"]
+        self.assertGreater(pa_money, 0)
+        self.assertAlmostEqual(e["money"], pa_money, places=5)
+        self.assertEqual(e["passes"], 2)
+        self.assertAlmostEqual(e["perPass"], pa_money / 2, places=5)
+        self.ledger({"version": 1, "tasks": []})
+        os.remove(os.path.join(self.profile_dir, "prices.json"))
+        e = self.day(self.summary())
+        self.assertEqual((e["money"], e["perPass"]), (None, None))
+
+    def test_px8_by_context_report(self):
+        self.assertIn("context", pa_costs.REPORT_BY)
+        self.prices()
+        self.put_rows({"pass": 1, "calls": 2, "tokens": toks(cr=400000), "peak": 300000},
+                      {"pass": 1, "calls": 1, "tokens": toks(cr=500000), "day": D0, "from": D0 + "T01:00:00Z", "to": D0 + "T01:01:00Z"})
+        self.put_record(fx.reset_record(D1 + "T02:00:00Z", SID, SID3))
+        s = self.summary()
+        out = pa_costs.report_lines(s, "context")
+        head = [x for x in out if "first call" in x]
+        self.assertEqual(len(head), 1, out)
+        self.assertIn("(UTC)", head[0])
+        for want in ("calls", "mean", "peak", "resets", "est.", "est./pass"):
+            self.assertIn(want, head[0])
+        d1 = [x for x in out if x.strip().startswith(D1)][0]
+        self.assertEqual(d1.split()[:5], [D1, "2", "200k", "300k", "1"])
+        d0 = [x for x in out if x.strip().startswith(D0)][0]
+        self.assertIn("≥500k", d0)
+        self.assertTrue(any("≥ marks a lower bound" in x for x in out), out)
+        self.assertFalse(any(x.startswith("By activity") for x in out))
+        self.assertFalse([x for x in pa_costs.report_lines(s, "day") if "first call" in x])
+        _r, out, _e = self.run_cmd(pa_costs.report, self.dir, by="context", now=T0 + 5000)
+        self.assertIn("first call", out)
+
+    def test_px9_no_pa_calls_today(self):
+        s = self.summary()
+        self.assertEqual(s["paContext"], [])
+        line = [x for x in pa_costs.report_lines(s) if x.startswith("PA context")]
+        self.assertEqual(line, ["PA context  — (no Project Agent calls today)"])
+
+    def test_px10_json_round_trip_and_shrink(self):
+        self.put_rows({"calls": 1, "tokens": toks(cr=100000), "peak": 100000})
+        s = self.summary()
+        self.assertEqual(json.loads(pa_costs.compact(s))["paContext"], s["paContext"])
+        self.assertEqual(load(self.costs("summary.json"))["paContext"], s["paContext"])
+        big = {"sessions": [], "byTask": [], "passes": [], "byDayModel": [],
+               "paContext": [{"day": "d{:05d}".format(9999 - i), "calls": 1, "mean": 1, "peak": 1, "peakExact": True,
+                              "resets": {"fresh": 0, "compact": 0}, "firstCall": None, "firstCalls": 0, "money": None,
+                              "passes": 0, "perPass": None, "pad": "x" * 200} for i in range(2000)]}
+        newest = big["paContext"][0]
+        text = pa_costs.compact(big)
+        while len(text.encode()) > pa_costs.SUMMARY_MAX and pa_costs.shrink(big):
+            text = pa_costs.compact(big)
+        self.assertLessEqual(len(text.encode()), pa_costs.SUMMARY_MAX)
+        self.assertEqual(big["paContext"][0], newest)
+        self.assertTrue(big["truncated"])
+
+    def test_px11_days_are_capped(self):
+        rows = []
+        for i in range(100):
+            d = time.strftime("%Y-%m-%d", time.gmtime(T0 - i * 86400))
+            rows.append({"day": d, "from": d + "T01:00:00Z", "to": d + "T01:01:00Z", "tokens": toks(cr=1000), "peak": 1000})
+        self.put_rows(*rows)
+        pc = self.summary()["paContext"]
+        self.assertEqual(len(pc), pa_costs.DAYS)
+        self.assertEqual(pc[0]["day"], D1)  # newest first
+
+    def test_px12_old_open_segment_without_peak(self):
+        seg = pa_costs.new_segment(D1 + "T01:00:00Z", D1 + "T01:00:00Z", "model-a")
+        self.assertEqual((seg["peak"], seg["first"]), (0, None))
+        for k in ("peak", "first"):
+            seg.pop(k)
+        seg["calls"] = 1
+        row = pa_costs.make_row({"session": SID, "kind": "pa"}, seg)
+        self.assertNotIn("peak", row)
+        self.assertNotIn("first", row)
+
+    def test_px13_readme_names_the_report(self):
+        with open(os.path.join(HERE, "..", "README.md")) as f:
+            readme = f.read()
+        self.assertIn("--by context", readme)
+        self.assertIn("PA context", readme)
+
+
+class PX_StatusLineCtx(CCBase):
+    """t-041 J1 (R15): the status line record keeps context_window.total_input_tokens as ctx, a number only."""
+
+    def test_px20_ctx_recorded(self):
+        self.run_sl(cc_bytes(context_window={"total_input_tokens": 251234, "context_window_size": fx.CANARY}))
+        rec = self.cc_record()
+        self.assertEqual(rec["ctx"], 251234)
+        self.assertNotIn(fx.CANARY.encode(), raw(self.cc_path()))
+        self.assertEqual(sorted(rec), sorted(pa_costs.CC_KEYS))
+
+    def test_px21_bad_ctx_is_null(self):
+        for i, bad in enumerate(("251234", True, -1, 1e9, float("nan"), None, [1])):
+            sid = "ffff000{}-0000-4000-8000-abcdef000000".format(i)
+            self.run_sl(cc_bytes(sid=sid, context_window={"total_input_tokens": bad}))
+            self.assertIsNone(self.cc_record(sid)["ctx"], bad)
+        sid = "ffff0010-0000-4000-8000-abcdef000000"
+        self.run_sl(cc_bytes(sid=sid, context_window=fx.CANARY))
+        self.assertIsNone(self.cc_record(sid)["ctx"])
+        inp = cc_input(sid="ffff0011-0000-4000-8000-abcdef000000")
+        del inp["context_window"]
+        self.run_sl(json.dumps(inp).encode())
+        self.assertIsNone(self.cc_record("ffff0011-0000-4000-8000-abcdef000000")["ctx"])
+
+    def test_px22_kept_and_rewritten(self):
+        self.run_sl(cc_bytes(context_window={"total_input_tokens": 1000}), now=T0)
+        self.run_sl(cc_bytes(context_window={"total_input_tokens": 2000}), now=T0 + 5)  # only ctx changed: rewritten
+        self.assertEqual(self.cc_record()["ctx"], 2000)
+        inp = cc_input(cost=1.5)
+        del inp["context_window"]
+        self.run_sl(json.dumps(inp).encode(), now=T0 + 10)  # a reading without ctx keeps the stored one
+        rec = self.cc_record()
+        self.assertEqual((rec["cost"], rec["ctx"]), (1.5, 2000))
+
+    def test_px23_old_record_reads_with_null_ctx(self):
+        old = {"v": 1, "session": CC_SID, "cost": 1.0, "base": 0, "segments": 1, "durationMs": 1, "apiDurationMs": 1,
+               "model": "model-a", "version": "2.1.0", "terminal": "t5", "first": iso(T0), "at": iso(T0)}
+        self.assertIsNone(pa_costs.cc_clean(old)["ctx"])
+        self.assertEqual(pa_costs.cc_clean(dict(old, ctx=5))["ctx"], 5)
+        self.assertIsNone(pa_costs.cc_clean(dict(old, ctx="5"))["ctx"])
 
 
 class ZZ_V1_Privacy(unittest.TestCase):

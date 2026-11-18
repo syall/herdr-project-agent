@@ -106,3 +106,14 @@ def codex_path(codex_home, day, sid):
     """day: YYYY-MM-DD."""
     y, m, d = day.split("-")
     return os.path.join(codex_home, "sessions", y, m, d, "rollout-{}T00-00-00-{}.jsonl".format(day, sid))
+
+
+def reset_record(at, frm, to, ctx=260000, reason="pass-cap", pass_no=7, terminal="t0"):
+    """A sessions.jsonl `reset` record as t-041 R4 specifies it (J4 writes them; J1 reads them)."""
+    return {"v": 1, "ev": "reset", "at": at, "from": frm, "to": to, "ctx": ctx, "reason": reason, "pass": pass_no,
+            "terminal": terminal}
+
+
+def compact_record(at, session, trigger="auto"):
+    """A sessions.jsonl `compact` record as t-041 R5 specifies it (J3's PostCompact hook writes them; J1 reads them)."""
+    return {"ev": "compact", "trigger": trigger, "session": session, "at": at}
