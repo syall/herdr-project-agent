@@ -656,6 +656,15 @@ def content_required(directory, task):
     return bool(starts) and max(starts) >= stamp
 
 
+def first_checked(records):
+    """Of one commit's stored records with a change, oldest first: the first stored while it was VERIFY.md's checked
+    commit (source verify), else the first; None for none. The base the check saw (t-052 J2 round 2, MF-J2-1)."""
+    for r in records:
+        if r.get("source") == "verify":
+            return r
+    return records[0] if records else None
+
+
 def stored_records(directory, task_id):
     data = pa.read_json_safe(os.path.join(content_dir(directory), "{}.json".format(task_id)))
     records = data.get("records") if isinstance(data, dict) else None
@@ -717,12 +726,17 @@ def content_check(directory, task, pins, runner=None, records=None):
                 found = made(sha)
                 return found[0] if found else None
 
+            def checked_on(sha):
+                """The record of the checked sha: the first made while VERIFY.md named it (source verify), else the
+                first (MF-J2-1: a gate run before an R8 check may store the tip against main first)."""
+                return first_checked(made(sha))
+
             def last(ids):
                 found = [x for x in ids if x in known or is_commit(run, path, x)]
                 return found[-1] if found else None
 
             x, rv = last(verify), last(review)
-            onto = content_onto(directory, task.get("id"), common, pin.get("branch")) or content_main(run, path, profile)
+            onto = content_onto(directory, task.get("id"), common, pin.get("branch"), run, path, x) or content_main(run, path, profile)
             entry.update(onto=onto, checked=x, review=rv)
             now = content_record(run, path, head, onto) if head else {"error": "no commit in the worktree"}
             if not now.get("error") and now["base"] == head and x != head:
@@ -755,7 +769,7 @@ def content_check(directory, task, pins, runner=None, records=None):
                     keep.append(dict(now, source="verify"))
                 notes.append("{}the checked commit is HEAD".format(label))
                 continue
-            saved = made_on(x)
+            saved = checked_on(x)
             if not is_commit(run, path, x):
                 computed = {"error": "not a commit"}
             elif saved:  # computed now against the stored base (spec-amendment 6): never the file alone, never today's onto
@@ -823,10 +837,14 @@ def content_check(directory, task, pins, runner=None, records=None):
     return check, summary
 
 
-def content_onto(directory, task_id, common, branch):
+def content_onto(directory, task_id, common, branch, run=None, path=None, commit=None):
     """The branch a pin's change sits on as the merge queue says (t-052 J2): the queue entry of this repository whose
     branch is the pin's, its onto; else, for a task planned on another task's branch (pa-queue plan, dependsOn), that
-    entry's branch; else None (the caller falls back to content_main)."""
+    entry's branch; else, given git (run, path) and the checked commit (VERIFY.md's), the branch of the last entry (of
+    another task) whose tip the checked commit sits on and main does not hold: a task refused for a conflict or a
+    changed rebase whose R8 check saw it there, joining again with add (spec-amendment R3 step 3, R8; review MF-J2-1).
+    The checked commit, not HEAD: a branch taken out of the queue whose check saw it on main stays against main (C14,
+    Q21). Else None (the caller falls back to content_main)."""
     data = pa.read_json_safe(os.path.join(directory, "queue.json"))
     repos = data.get("repos") if isinstance(data, dict) else None
     if not isinstance(repos, dict) or not common:
@@ -844,6 +862,35 @@ def content_onto(directory, task_id, common, branch):
                 ahead = next((e for e in entries if e.get("task") == dep.get("task") and e.get("job") == dep.get("job")), None)
                 if ahead and isinstance(ahead.get("branch"), str) and ahead["branch"]:
                     return ahead["branch"]
+        if run is not None and path and commit:
+            below = entry_below(run, path, rec, entries, task_id, commit)
+            if below:
+                return below
+    return None
+
+
+def entry_below(run, path, rec, entries, task_id, commit):
+    """The branch of the last entry, in queue order, of another task whose tip is a proper ancestor of commit and not
+    in main; None on any doubt (main unreadable, a git error): the caller then compares against main, as in J1."""
+    def tip(name):
+        if not isinstance(name, str) or not name:
+            return None
+        code, out, _e = run(path, "rev-parse", "--verify", "-q", "refs/heads/" + name + "^{commit}")
+        return out.strip() if code == 0 and out.strip() else None
+
+    def below(a, b):
+        return run(path, "merge-base", "--is-ancestor", a, b)[0] == 0
+
+    try:
+        main_tip = tip(rec.get("main"))
+        if not main_tip:
+            return None
+        for e in reversed(entries):
+            at = tip(e.get("branch")) if e.get("task") != task_id else None
+            if at and at != commit and below(at, commit) and not below(at, main_tip):
+                return e["branch"]
+    except Exception:  # a refused call (grafts, shallow) or an unexpected answer: doubt, so main (J1)
+        return None
     return None
 
 

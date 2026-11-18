@@ -302,15 +302,15 @@ def may_rebase(ctx, entry, task):
 # ---- what the checks saw, and the decision ---------------------------------------------------------
 
 def stored_base(ctx, task_id, common, sha):
-    for r in pa_hooks.stored_records(ctx.directory, task_id):
-        if r.get("common") == common and r.get("commit") == sha and not r.get("error") and isinstance(r.get("base"), str) \
-                and r["base"] and r["base"] != sha:
-            return r
-    return None
+    """The stored record of the checked sha the gate compares on (pa_hooks.first_checked): the gate and add agree."""
+    return pa_hooks.first_checked([r for r in pa_hooks.stored_records(ctx.directory, task_id)
+                                   if r.get("common") == common and r.get("commit") == sha and not r.get("error")
+                                   and isinstance(r.get("base"), str) and r["base"] and r["base"] != sha])
 
 
-def checked_at_add(ctx, rec, task, onto):
-    """The record of VERIFY.md's last Checked: commit, against its first stored base (or its merge base with onto)."""
+def checked_at_add(ctx, rec, task, branch):
+    """The record of VERIFY.md's last Checked: commit, against its first stored base (or its merge base with onto); onto
+    as the gate takes it for that commit (pa_hooks.content_onto, else main): the gate and add agree (MF-J2-1)."""
     evidence = os.path.join(ctx.directory, "evidence", task["id"])
     verify = pa_hooks.checked_commits(pa.read_text(os.path.join(evidence, "VERIFY.md")))
     review = pa_hooks.checked_commits(pa.read_text(os.path.join(evidence, "REVIEW.md")))
@@ -320,6 +320,7 @@ def checked_at_add(ctx, rec, task, onto):
     if not x:
         raise Refused("VERIFY.md has no Checked: line naming a commit here; the queue takes only checks recorded as "
                       "content (R5 AC5.2): a fresh verifier writes it")
+    onto = pa_hooks.content_onto(ctx.directory, task["id"], rec["common"], branch, ctx.run, ctx.repo, x) or rec["main"]
     saved = stored_base(ctx, task["id"], rec["common"], x)
     if saved:
         r = pa_hooks.content_record(ctx.run, ctx.repo, x, onto, saved["base"])
@@ -824,7 +825,7 @@ def add(ctx, data, rec, tid, job):
         raise Refused("it depends on {} (they share planned files), which is not ahead of it in the queue".format(dep.get("task")))
     onto = rec["entries"][-1]["branch"] if rec["entries"] else rec["main"]
     onto_tip = ctx.tip(onto)
-    checked = checked_at_add(ctx, rec, task, pa_hooks.content_onto(ctx.directory, tid, rec["common"], branch) or rec["main"])
+    checked = checked_at_add(ctx, rec, task, branch)
     entry = {"task": tid, "job": job, "branch": branch, "worktree": tree, "onto": onto, "dependsOn": dep, "state": "checking",
              "added": now(), "base": ctx.merge_base(tip, onto_tip), "tip": tip, "checked": checked,
              "files": sorted(set((planned or {}).get("files") or []) | touched(ctx, checked["base"], checked["commit"])),
@@ -958,8 +959,8 @@ def cmd_verify(args):
             if not pin or not pin.get("commit"):
                 raise Refused("{} has no worktree on a branch of {}".format(args.task, ctx.repo))
             onto = rec["entries"][-1]["branch"] if rec["entries"] else rec["main"]
-            checked = checked_at_add(ctx, rec, task, pa_hooks.content_onto(ctx.directory, args.task, rec["common"], pin.get("branch")) or rec["main"])
             tip = pin["commit"]
+            checked = checked_at_add(ctx, rec, task, pin.get("branch"))
             d = decide(ctx, checked, tip, onto, ctx.tip(onto))
             subject = {"task": args.task, "job": args.job, "rebases": []}
             need = needs_for(ctx, subject, tip, d, checked["base"], ctx.tip(onto)) if d["result"] == "moved" else None
