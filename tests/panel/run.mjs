@@ -4275,6 +4275,98 @@ cases["P45-push-answer-differs"] = async () => { // W4: a run whose exit 0 says 
   check(told.length === 1 && told[0].startsWith(`decision ${PID} was already answered Push; `) && !told.some((m) => /answered Not now/.test(m)), `the notice (got ${JSON.stringify(told)})`);
 };
 
+// ---- t-045 round 2: the mark's resolution (REVIEW MF2, VERIFY MF1), push unlock (REVIEW MF1 = VERIFY MF2), push across windows (REVIEW MF3) ----
+cases["P45-saved-then-fallback-read"] = async () => { // REVIEW MF2: the write landed, its exec said an error, the re-read found it answered; a later load's card read falls back to the open copy
+  const v = await remoteCardWorld();
+  g.__execFn = (command, args, on) => {
+    if (command === "python3" && args[0] === "-c" && args.length === 5) { g.__files[`${on}:${args[2]}`] = args[4]; return { code: 1, stdout: "", stderr: "connection reset" }; }
+    return undefined;
+  };
+  g.__delay = { [`${M}:${RDIR}/agent.json`]: 5000 }; // the reload after the write is slow
+  await click(v, "opt-d-01-0"); await click(v, "submit-d-01"); await settle(); await settle();
+  check(JSON.parse(g.__files[R1]).answer === "Yes", "the file is answered Yes");
+  locked(v, "d-01", "Yes", "the re-read found it answered");
+  g.__execFn = null; g.__batchFail = { [M]: { code: 1 } }; g.__fail = [R1]; // the batch fails; R1's own read fails: its last known (open) copy
+  await step(5000); await settle(); await settle(); g.__delay = {};
+  for (let i = 0; i < 4; i++) { advance(11000); v.reload(cx); await step(D); await step(D); await step(D); }
+  const t = locked(v, "d-01", "Yes", "a load whose card read fell back to the open copy");
+  check(!/Not saved/.test(t), `not called Not saved (got ${t.slice(0, 800)})`);
+  g.__batchFail = {}; g.__fail = [];
+  for (let i = 0; i < 6 && !look(v).text.includes("1 answered"); i++) { advance(11000); v.reload(cx); await step(D); await step(D); await step(D); }
+  const t2 = look(v).text;
+  check(t2.includes("1 answered") && !/\| open \|/.test(t2), `a real read: in the answered fold (got ${t2.slice(0, 600)})`);
+};
+
+cases["P45-unsure-then-fallback-read"] = async () => { // VERIFY MF1 (V-unsure-then-fallback-read): the write landed, its exec errored, the re-read failed; a fallback copy is not a read
+  const v = await remoteCardWorld();
+  g.__execFn = (command, args, on) => {
+    if (command === "python3" && args[0] === "-c" && args.length === 5) { g.__files[`${on}:${args[2]}`] = args[4]; g.__fail = [R1]; g.__batchFail = { [M]: { code: 1 } }; return { code: 1, stdout: "", stderr: "connection reset" }; }
+    return undefined;
+  };
+  await click(v, "opt-d-01-0"); await click(v, "submit-d-01"); await settle(); await settle();
+  check(JSON.parse(g.__files[R1]).answer === "Yes", "the file is answered Yes");
+  const t0 = locked(v, "d-01", "Yes", "unsure");
+  check(t0.includes("Could not tell whether the answer was saved"), `says it could not tell (got ${t0.slice(0, 800)})`);
+  g.__execFn = null;
+  for (let i = 0; i < 4; i++) { advance(11000); v.reload(cx); await step(D); await step(D); await step(D); }
+  const t = locked(v, "d-01", "Yes", "a load whose card read fell back to the open copy");
+  check(!/Not saved/.test(t) && t.includes("Could not tell whether the answer was saved"), `still unsure, not Not saved (got ${t.slice(0, 800)})`);
+  g.__fail = []; g.__batchFail = {};
+  for (let i = 0; i < 6 && !look(v).text.includes("1 answered"); i++) { advance(11000); v.reload(cx); await step(D); await step(D); await step(D); }
+  const t2 = look(v).text;
+  check(t2.includes("1 answered") && !/\| open \|/.test(t2) && !/Not saved/.test(t2), `a real read: in the answered fold (got ${t2.slice(0, 600)})`);
+};
+
+// An unknown run result (exit 2, no JSON), then the check `after` gives: whether Not now can be picked and submitted.
+async function pushUnknownThen(after) {
+  let ran = false;
+  const { v } = await pushWorld({ tool: { run: () => { ran = true; return { code: 2, stdout: "", stderr: "crashed" }; }, check: () => (!ran ? json(0, checkReply()) : after()) } });
+  await click(v, `opt-${PID}-0`); await settle(); await click(v, `submit-${PID}`); await settle(); await settle(); await settle();
+  return v;
+}
+cases["P45-push-unknown-refused-open"] = async () => { // REVIEW MF1 = VERIFY MF2: after an unknown result, a check that reads the card open but refuses unlocks it
+  for (const refusal of [{ check: "C9", message: "remote moved" }, { check: "C8", message: "the remote did not answer" }]) {
+    const v = await pushUnknownThen(() => json(1, checkReply({ ok: false, refusal, seen: null })));
+    const { text, clicks } = look(v);
+    check(text.includes("The result is unknown") && Boolean(clicks[`opt-${PID}-1`]), `${refusal.check}: Not now can be picked (got ${optClicks(clicks, PID)})`);
+    await click(v, `opt-${PID}-1`); await settle();
+    check(Boolean(look(v).clicks[`submit-${PID}`]), `${refusal.check}: Not now can be submitted`);
+  }
+  // Not known open: a check that could not run, one that reads the card answered, one that finds it pushed (C4): locked.
+  for (const [what, reply] of [["no check", () => { throw new Error("unreachable"); }],
+    ["answered", () => json(1, checkReply({ ok: false, status: "answered", refusal: { check: "C4", message: "answered" }, seen: null }))],
+    ["pushed", () => json(1, checkReply({ ok: false, done: true, refusal: { check: "C4", message: "already pushed" }, seen: null }))]]) {
+    const v = await pushUnknownThen(reply);
+    check(optClicks(look(v).clicks, PID).length === 0, `${what}: still locked (got ${optClicks(look(v).clicks, PID)})`);
+  }
+};
+
+cases["P45-push-second-window"] = async () => { // REVIEW MF3: a push answered in one window is locked in another, which never runs the tool
+  const gate = deferred();
+  let file;
+  const { v, file: f } = await pushWorld({ tool: { run: () => gate.promise.then((reply) => { g.__files[file] = answeredByTool(); return reply; }) } });
+  file = f;
+  const w = await mount(); await settle();
+  await click(v, `opt-${PID}-0`); await settle();
+  await click(v, `submit-${PID}`); await settle();
+  const t = locked(w, PID, "Push", "the other window, run in flight");
+  check(t.includes("Answered in another panel window."), `says where (got ${t.slice(0, 600)})`);
+  w.answer(g.__spaces[0], w.cards.find((c) => c.id === PID), "Not now", cx); await settle(); // a stale click there
+  advance(130000); // a long push: still locked past the 120 s mark
+  locked(w, PID, "Push", "the run still in flight after 130 s");
+  gate.resolve(json(0, toolPushed)); await settle(); await settle();
+  locked(w, PID, "Push", "the run ended, before its own read");
+  check(pushExecs("run").length === 1, `one run (got ${pushExecs("run").length})`);
+  // A refusal leaves the card open: the other window may answer it again.
+  const gate2 = deferred();
+  const { v: v2 } = await pushWorld({ tool: { run: () => gate2.promise } });
+  const w2 = await mount(); await settle();
+  await click(v2, `opt-${PID}-0`); await settle(); await click(v2, `submit-${PID}`); await settle();
+  locked(w2, PID, "Push", "second world, in flight");
+  gate2.resolve(json(1, { ok: false, refusal: { check: "C9", message: "remote moved" } })); await settle(); await settle();
+  check(Boolean(look(w2).clicks[`opt-${PID}-1`]), "refused: the other window can answer again");
+};
+
 // Which cases run (t-031): every case, or the named ones; --shard=<k>/<n> keeps every n-th case by definition
 // order (index mod n == k - 1), so n shards together run each case once, and a case added later lands in one.
 // --list prints the names that would run and runs none. An unknown name or option exits 2.

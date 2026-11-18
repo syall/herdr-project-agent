@@ -492,6 +492,20 @@ tmp = sys.argv[1] + ".tmp"; open(tmp, "w").write("HOLDER"); os.replace(tmp, sys.
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 };
 
+cases["S45-fallback-marked"] = async () => { // t-045 round 2: a card whose own read failed and came from its last known copy says so (fallback); one left out is named (unread)
+  world(); cards({ "d-1.json": card("d-1"), "d-2.json": card("d-2"), "d-3.json": card("d-3") }); g.__batchFail = { [M]: { code: 1 } };
+  g.__hang = [keyOf(remote, "/decisions/d-2.json")]; g.__fail = [keyOf(remote, "/decisions/d-3.json")];
+  const known = [{ id: "d-2", path: `${rdir}/decisions/d-2.json`, text: card("d-2", { question: "known copy?" }) }];
+  const r = await within(store.loadDecisions(remote, { cx, known }), 10000);
+  const by = (id) => r.value?.find?.((c) => c.id === id);
+  check(r.done && by("d-2")?.fallback === true && !by("d-1")?.fallback && !by("d-3"), `d-2 is its fallback copy, d-1 a read, d-3 left out (got ${JSON.stringify(r.value?.map?.((c) => [c.id, c.fallback ?? false]))})`);
+  check(r.value.unread instanceof Set && r.value.unread.has(`${rdir}/decisions/d-3.json`) && r.value.unread.has(`${rdir}/decisions/d-2.json`) && !r.value.unread.has(`${rdir}/decisions/d-1.json`),
+    `unread names the cards not read now (got ${JSON.stringify([...(r.value.unread ?? [])])})`);
+  world(); cards({ "d-1.json": card("d-1") });
+  const b = await store.loadDecisions(remote, { cx });
+  check(b.length === 1 && !b[0].fallback && !(b.unread?.size), "a batch read: no fallback, nothing unread");
+};
+
 const pick = process.argv.slice(2);
 let failed = 0;
 for (const [name, fn] of Object.entries(cases)) {
