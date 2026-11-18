@@ -140,6 +140,7 @@ D5_FORMS = [
     ("python3 ~/.config/herdr-pa/tools/pa.py restart --space s",), ("python3 -I runtime/tools/pa.py restart",),
     ("./runtime/tools/pa.py restart --dry-run",), ("env X=1 pa-restart",), ("cd x && pa-restart", "pa-restart"),
     ("sh -c 'pa-restart --now'", "pa-restart --now"), ("y=$(pa-restart --dry-run)", "pa-restart --dry-run"),
+    ("pa-restart --space s --end-terminal --anyway",),  # t-037 J3
 ]
 D5_ALLOWED = ["grep -n pa-restart README.md", "python3 runtime/tools/pa.py peers", "pa-peers --older",
               "echo pa-restart", "man pa-restart-notes"]

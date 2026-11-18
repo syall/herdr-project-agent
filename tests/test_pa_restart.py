@@ -1335,8 +1335,16 @@ class AC9_1_OnlyTheOwnChild(unittest.TestCase):
             text = f.read()
         self.assertNotIn("os.kill(", text)
         self.assertNotIn("killpg", text)
-        self.assertEqual(text.count('"kill"'), 1, "hc kill only in cmd_cleanup")
+        self.assertEqual(text.count('"kill"'), 2, "hc kill only in cmd_cleanup and end_terminal (spec AC9.1, R10)")
         tree = ast.parse(text)
+        hc_kill = set()
+        for fn in ast.walk(tree):
+            if isinstance(fn, ast.FunctionDef):
+                for node in ast.walk(fn):
+                    if (isinstance(node, ast.List) and len(node.elts) >= 2
+                            and [getattr(e, "value", None) for e in node.elts[:2]] == ["hc", "kill"]):
+                        hc_kill.add(fn.name)
+        self.assertEqual(hc_kill, {"cmd_cleanup", "end_terminal"})
         found = []
         for fn in ast.walk(tree):
             if isinstance(fn, ast.FunctionDef):
@@ -1911,6 +1919,483 @@ class R3_2_RecoveryPreCheck(Base):
         self.assertEqual(execs, [])
         self.assertEqual(len(seen), 2, seen)
         self.assertIn("installed.json", seen[1][1])
+
+
+# ---- J3: pa-restart --end-terminal, the bridge for launchers from before J2 (spec R10, AC10.1; plan.md J3) --------
+
+PA_ARGV = ["pa-session", "--space", SP, "--project", "/p", "--profile", "test", "--name", "proj"]
+
+
+class EndTerminal(Command):
+    """A launcher from before restart support (no launcher.json) in t1 with workers w1 (ledger) and w4 (child of
+    t1); w3 is another space's. The fake hc ends t1 and its children on `hc kill t1`; nothing real is called."""
+
+    def setUp(self):
+        super().setUp()
+        os.remove(os.path.join(self.dir, "launcher.json"))
+        self.term["argv"] = list(PA_ARGV)
+        self.kill_fails = None  # None | "live" | "finished"
+        self.keeper = False
+        self.at_kill = None
+        self.asked = []
+        self.answer = "yes"
+        self.started = []
+        self.app = "/usr/bin/herdr-app-fake"
+        self.relayed = []
+        self.relay_answer = (0, "")
+        self.saved_j3 = {k: getattr(pa, k) for k in ("ask_yes", "interactive", "cmd_start", "herdr_app",
+                                                     "KEEPER_WAIT", "END_WAIT", "END_POLL", "relay_output")}
+        self.saved_kill = os.kill
+        pa.KEEPER_WAIT, pa.END_WAIT, pa.END_POLL = 0.3, 0.3, 0.02
+
+        def ask(prompt):
+            self.asked.append(prompt)
+            a = self.answer
+            return a() if callable(a) else a
+
+        pa.ask_yes = ask
+        pa.interactive = lambda: True
+        pa.cmd_start = lambda args: self.started.append(vars(args))
+        pa.herdr_app = lambda: self.app
+
+        def relay_output(argv):
+            self.relayed.append(list(argv))
+            return self.relay_answer
+
+        pa.relay_output = relay_output
+        pa.relay = lambda argv: self.relayed.append(list(argv)) or 0
+
+        def fake_call(argv, check=True):
+            self.calls.append(list(argv))
+            if argv[:2] == ["hc", "kill"]:
+                self.at_kill = (os.path.exists(os.path.join(self.dir, "session.log")),
+                                os.path.exists(os.path.join(self.dir, "journal.jsonl")))
+                if self.kill_fails != "live":
+                    self.terms[argv[2]]["state"] = "finished"
+                    for v in self.terms.values():
+                        if v.get("parent") == argv[2]:
+                            v["state"] = "finished"
+                    if self.keeper:
+                        self.terms["t7"] = {"address": "t7", "state": "live", "labels": {"herdr.pa": SP}, "pid": 900}
+                        a = load(os.path.join(self.dir, "agent.json"))
+                        a["terminal"] = "t7"
+                        dump(a, os.path.join(self.dir, "agent.json"))
+                        write(os.path.join(self.dir, "heartbeat"), "{} t7\n".format(int(time.time())))
+                if self.kill_fails:
+                    raise pa.Problem("hc kill failed: boom")
+            return ""
+
+        pa.call = fake_call
+
+    def tearDown(self):
+        for k, v in self.saved_j3.items():
+            setattr(pa, k, v)
+        os.kill = self.saved_kill
+        super().tearDown()
+
+    def run_end(self, **over):
+        args = dict(end_terminal=True, anyway=False, confirmed_terminal=None, confirmed_workers=None)
+        args.update(over)
+        return self.run_cmd(**args)
+
+    def kills(self):
+        return [c for c in self.calls if "kill" in c or "rm" in c or "pane.close" in " ".join(c)]
+
+    def nothing_written(self):
+        for name in ("session.log", "journal.jsonl", "restart-request.json"):
+            self.assertFalse(os.path.exists(os.path.join(self.dir, name)), name)
+
+    def no_workers(self):
+        for k in ("w1", "w4"):
+            self.terms[k]["state"] = "finished"
+
+
+class AC10_1_Identification(EndTerminal):
+    def refused(self, part, code=2, **over):
+        c, out, err = self.run_end(**over)
+        self.assertEqual(c, code, out + err)
+        self.assertIn(part, out + err)
+        self.assertEqual(self.kills(), [])
+        self.nothing_written()
+        self.assertEqual(self.started, [])
+
+    def test_plain_pa_restart_names_end_terminal(self):  # the R10 message
+        code, out, err = self.run_cmd()
+        self.assertEqual(code, 2)
+        self.assertIn("started before restart support", err)
+        self.assertIn("pa-restart --space {} --end-terminal".format(SP), err)
+        self.assertIn("--anyway", err)
+        self.assertIn("w1", err)
+        self.assertEqual(self.kills(), [])
+
+    def test_a_no_agent_json(self):
+        os.remove(os.path.join(self.dir, "agent.json"))
+        self.refused("no Project Agent")
+
+    def test_a_closed(self):
+        self.agent(closed=pa.now())
+        self.refused("closed")
+
+    def test_a_no_terminal(self):
+        self.agent(terminal=None)
+        self.refused("names no terminal")
+
+    def test_c_no_heartbeat(self):
+        os.remove(os.path.join(self.dir, "heartbeat"))
+        self.refused("heartbeat")
+
+    def test_c_stale_heartbeat(self):
+        write(os.path.join(self.dir, "heartbeat"), "{} t1\n".format(int(time.time()) - 300))
+        self.refused("heartbeat")
+
+    def test_c_heartbeat_for_another_terminal(self):
+        write(os.path.join(self.dir, "heartbeat"), "{} t5\n".format(int(time.time())))
+        self.refused("heartbeat")
+
+    def test_d_not_live(self):
+        self.term["state"] = "finished"
+        self.refused("live")
+
+    def test_d_label_for_another_space(self):
+        self.term["labels"] = {"herdr.pa": "sp9"}
+        self.refused("label")
+
+    def test_d_has_a_parent(self):
+        self.term["parent"] = "t0"
+        self.refused("parent")
+
+    def test_e_a_shell(self):
+        self.term["argv"] = ["/bin/zsh", "-l"]
+        self.refused("not this space's pa-session")
+
+    def test_e_another_space(self):
+        self.term["argv"] = ["pa-session", "--space", "sp9", "--project", "/p"]
+        self.refused("not this space's pa-session")
+
+    def test_e_no_argv(self):
+        self.term.pop("argv")
+        self.refused("not this space's pa-session")
+
+    def test_e_forms(self):
+        ok = [PA_ARGV, ["/home/u/.local/bin/pa-session", "--space=" + SP], ["python3", "/x/pa.py", "session", "--space", SP],
+              ["/usr/bin/python3.11", "/x/tools/pa.py", "session", "--profile", "t", "--space", "m1/" + SP]]
+        bad = [["python3", "/x/pa.py", "restart", "--space", SP], ["env", "X=1", "pa-session", "--space", SP],
+               ["pa-session", "--space"], ["pa-session", "--project", SP], ["pa-sessions", "--space", SP],
+               ["python3", "/x/pa.py", "session", "--space", SP, "--space", "sp9"], [], "pa-session --space " + SP,
+               ["pa-session", 3], None]
+        for argv in ok:
+            self.assertTrue(pa.pa_session_argv(argv, SP), argv)
+        for argv in bad:
+            self.assertFalse(pa.pa_session_argv(argv, SP), argv)
+
+    def test_restart_capable_launcher_is_pointed_to_the_in_place_restart(self):
+        dump(self.rec, os.path.join(self.dir, "launcher.json"))
+        self.refused("takes an in-place restart")
+
+    def test_restart_capable_after_a_failed_restart_says_why(self):
+        dump(dict(self.rec, restart={"request": "r1", "outcome": "failed", "why": "self-check: boom"}),
+             os.path.join(self.dir, "launcher.json"))
+        c, out, err = self.run_end()
+        self.assertEqual(c, 2)
+        self.assertIn("self-check: boom", err)
+        self.assertIn("same installed code", err)
+        self.assertEqual(self.kills(), [])
+
+    def test_a_j1_record_with_another_pid_is_refused(self):
+        dump(dict(self.rec, version=1, accepts=None, pid=778), os.path.join(self.dir, "launcher.json"))
+        self.refused("disagrees")
+
+    def test_a_j1_record_for_this_launcher_is_allowed(self):  # spec S4
+        dump(dict(self.rec, version=1, accepts=None), os.path.join(self.dir, "launcher.json"))
+        c, out, err = self.run_end(dry_run=True)
+        self.assertEqual(c, 0, err)
+        self.assertIn("Ends:", out)
+
+    def test_a_capable_record_for_another_terminal_is_not_this_launchers(self):
+        dump(dict(self.rec, terminal="t2"), os.path.join(self.dir, "launcher.json"))
+        c, out, err = self.run_end(dry_run=True)
+        self.assertEqual(c, 0, err)
+        self.assertIn("not this launcher", out)
+
+    def test_inside_claude_refused(self):
+        os.environ["CLAUDECODE"] = "1"
+        self.refused("person's command", why="the person said so")
+        self.refused("person's command", on="m2", why="the person said so")
+        self.assertEqual(self.relayed, [])
+
+    def test_now_or_fresh_refused(self):
+        self.refused("--now", now=True)
+        self.refused("--fresh", fresh=True)
+
+    def test_from_the_terminal_itself_or_its_child(self):
+        for address in ("t1", "w4"):
+            os.environ["HC_TERMINAL_ID"] = address
+            self.refused("another tab", anyway=True)
+        os.environ.pop("HC_TERMINAL_ID")
+
+
+class AC10_1_Asking(EndTerminal):
+    def test_workers_without_anyway_refused_and_listed(self):
+        c, out, err = self.run_end()
+        self.assertEqual(c, 1, out + err)
+        self.assertIn("--anyway", err)
+        for name in ("w1 t-1-build", "w4 helper"):
+            self.assertIn(name, out)
+        self.assertNotIn("w3", out)
+        self.assertEqual(self.asked, [])
+        self.assertEqual(self.kills(), [])
+        self.nothing_written()
+
+    def test_not_a_tty_refused(self):
+        pa.interactive = lambda: False
+        c, out, err = self.run_end(anyway=True)
+        self.assertEqual(c, 1)
+        self.assertIn("type yes", err)
+        self.assertEqual(self.asked, [])
+        self.assertEqual(self.kills(), [])
+        self.nothing_written()
+
+    def test_anything_but_yes_ends_nothing(self):
+        for answer in ("no", "", None, "yes please", "y"):
+            with self.subTest(answer=answer):
+                self.answer, self.asked = answer, []
+                c, out, err = self.run_end(anyway=True)
+                self.assertEqual(c, 1, out + err)
+                self.assertIn("Not ended", out + err)
+                self.assertEqual(len(self.asked), 1)
+                self.assertEqual(self.kills(), [])
+                self.nothing_written()
+
+    def test_ask_yes_maps_eof_and_ctrl_c_to_none(self):
+        pa.ask_yes = self.saved_j3["ask_yes"]
+        import builtins
+        saved = builtins.input
+        try:
+            for exc in (EOFError, KeyboardInterrupt):
+                def raising(prompt="", exc=exc):
+                    raise exc
+                builtins.input = raising
+                self.assertIsNone(pa.ask_yes("? "))
+            builtins.input = lambda prompt="": " YES "
+            self.assertEqual(pa.ask_yes("? "), " YES ")
+        finally:
+            builtins.input = saved
+
+    def test_asked_even_without_workers(self):  # Q-J3-4
+        self.no_workers()
+        self.answer = "no"
+        c, _out, _err = self.run_end()
+        self.assertEqual(c, 1)
+        self.assertEqual(len(self.asked), 1)
+        self.assertEqual(self.kills(), [])
+
+    def test_summary_says_what_ends_and_what_stays_before_the_question(self):
+        out_at_ask = []
+        self.answer = lambda: out_at_ask.append(sys.stdout.getvalue()) or "no"
+        self.run_end(anyway=True)
+        text = out_at_ask[0]
+        for part in ("Ends: terminal t1", "its Claude", SID, "w1 t-1-build", "w4 helper", "Keeps:", "state folder",
+                     "worktrees", "Then:"):
+            self.assertIn(part, text)
+        self.assertIn("2 worker", self.asked[0])
+
+    def test_yes_ends_exactly_that_terminal_once(self):
+        def trap(*a):
+            raise AssertionError("os.kill called: {}".format(a))
+
+        os.kill = trap
+        c, out, err = self.run_end(anyway=True, why="replace the old one")
+        os.kill = self.saved_kill
+        self.assertEqual(c, 0, out + err)
+        self.assertEqual(self.kills(), [["hc", "kill", "t1"]])
+        self.assertEqual(self.at_kill, (True, True), "session.log and journal lines come before the kill")
+        with open(os.path.join(self.dir, "session.log")) as f:
+            self.assertIn("end-terminal terminal=t1 workers=2 by=pa-restart", f.read())
+        with open(os.path.join(self.dir, "journal.jsonl")) as f:
+            entry = json.loads(f.read().splitlines()[-1])
+        self.assertEqual((entry["by"], entry["trigger"], entry["why"], entry["terminal"], entry["workers"]),
+                         ("person", "pa-restart --end-terminal", "replace the old one", "t1", ["w1", "w4"]))
+
+    def test_changed_after_the_answer_refuses(self):
+        def moved():
+            write(os.path.join(self.dir, "heartbeat"), "{} t2\n".format(int(time.time())))
+            return "yes"
+
+        def new_worker():
+            self.terms["w5"] = {"address": "w5", "state": "live", "parent": "t1", "name": "late"}
+            return "yes"
+
+        for answer in (moved, new_worker):
+            with self.subTest(answer=answer.__name__):
+                write(os.path.join(self.dir, "heartbeat"), "{} t1\n".format(int(time.time())))
+                self.terms.pop("w5", None)
+                self.answer = answer
+                c, out, err = self.run_end(anyway=True)
+                self.assertEqual(c, 1, out + err)
+                self.assertIn("changed since you answered", err)
+                self.assertEqual(self.kills(), [])
+                self.nothing_written()
+
+
+class AC10_1_After(EndTerminal):
+    def setUp(self):
+        super().setUp()
+        self.no_workers()
+
+    def test_kill_failing_ends_nothing_and_starts_nothing(self):
+        self.kill_fails = "live"
+        c, out, err = self.run_end()
+        self.assertEqual(c, 1)
+        self.assertIn("did not end terminal t1", err)
+        self.assertIn("boom", err)
+        self.assertEqual(self.started, [])
+
+    def test_kill_error_but_ended_counts_as_ended(self):
+        self.kill_fails = "finished"
+        c, out, err = self.run_end()
+        self.assertEqual(c, 0, out + err)
+        self.assertIn("ended", out)
+        self.assertEqual(len(self.started), 1)
+
+    def test_keeper_restore_seen_no_pa_start(self):
+        self.keeper = True
+        pa.KEEPER_WAIT = 5
+        c, out, err = self.run_end(json=True)
+        self.assertEqual(c, 0, out + err)
+        self.assertIn("Restored by the keeper in terminal t7", out)
+        self.assertEqual(self.started, [])
+        self.assertEqual(json.loads(out.strip().splitlines()[-1])["restoredBy"], "keeper")
+
+    def test_no_keeper_runs_pa_start_once(self):
+        c, out, err = self.run_end(json=True)
+        self.assertEqual(c, 0, out + err)
+        self.assertEqual(len(self.started), 1)
+        s = self.started[0]
+        self.assertEqual((s["space"], s["folder"], s["profile"], s["dry_run"]), (SP, self.project, "test", False))
+        self.assertEqual(json.loads(out.strip().splitlines()[-1])["restoredBy"], "pa-start")
+
+    def test_pa_start_failing_says_open(self):
+        def boom(args):
+            raise pa.Problem("herdr-app is not running")
+
+        pa.cmd_start = boom
+        c, out, err = self.run_end()
+        self.assertEqual(c, 1)
+        self.assertIn("herdr-app is not running", err)
+        self.assertIn("Open Project Agent", err)
+
+    def test_no_herdr_app_says_open(self):
+        self.app = None
+        c, out, err = self.run_end()
+        self.assertEqual(c, 0, out + err)
+        self.assertIn("panel's Open Project Agent", out)
+        self.assertEqual(self.started, [])
+
+    def test_dry_run_ends_and_writes_nothing(self):
+        c, out, err = self.run_end(dry_run=True, json=True)
+        self.assertEqual(c, 0, err)
+        self.assertIn("Dry run: nothing ended", out)
+        self.assertEqual(json.loads(out.strip().splitlines()[-1])["outcome"], "dry-run")
+        self.assertEqual(self.asked, [])
+        self.assertEqual(self.kills(), [])
+        self.nothing_written()
+
+
+class AC10_1_On(EndTerminal):
+    def dry(self, workers):
+        return (0, "Ends: terminal t1 ...\n" + json.dumps({"outcome": "dry-run", "terminal": "t1", "workers": workers}) + "\n")
+
+    def test_on_asks_here_then_relays_bound_to_what_was_confirmed(self):
+        self.relay_answer = self.dry(["w4", "w1"])
+        empty = tempfile.mkdtemp(prefix="empty-", dir=TMP)
+        saved_root, pa.ROOT = pa.ROOT, empty
+        try:
+            c, out, err = self.run_end(on="m2", anyway=True)
+        finally:
+            pa.ROOT = saved_root
+        self.assertEqual(c, 0, out + err)
+        self.assertEqual(os.listdir(empty), [])
+        self.assertEqual(len(self.asked), 1)
+        self.assertEqual(len(self.relayed), 2)
+        import shlex
+        first, second = self.relayed
+        self.assertEqual(first[:5], ["hc", "exec", "--on", "m2", "--timeout"])
+        w1 = shlex.split(first[-1])
+        self.assertEqual(w1[:3], ["$HOME/.config/herdr-pa/tools/pa.py", "restart", "--space"])
+        for part in ("--end-terminal", "--dry-run", "--json", "--anyway"):
+            self.assertIn(part, w1)
+        w2 = shlex.split(second[-1])
+        self.assertNotIn("--dry-run", w2)
+        self.assertEqual(w2[w2.index("--confirmed-terminal") + 1], "t1")
+        self.assertEqual(w2[w2.index("--confirmed-workers") + 1], "w1,w4")
+        self.assertEqual(self.calls, [])
+
+    def test_on_workers_without_anyway_refused_here(self):
+        self.relay_answer = self.dry(["w1"])
+        c, out, err = self.run_end(on="m2")
+        self.assertEqual(c, 1)
+        self.assertEqual(len(self.relayed), 1)
+        self.assertEqual(self.asked, [])
+
+    def test_on_not_installed_there(self):
+        self.relay_answer = (127, "")
+        c, out, err = self.run_end(on="m2")
+        self.assertEqual(c, 127)
+        self.assertIn("pa-sync --on m2", err)
+
+    def test_on_no_yes_no_second_relay(self):
+        self.relay_answer = self.dry([])
+        self.answer = "no"
+        c, out, err = self.run_end(on="m2")
+        self.assertEqual(c, 1)
+        self.assertEqual(len(self.relayed), 1)
+
+    def test_on_not_a_tty_here_refused(self):
+        self.relay_answer = self.dry([])
+        pa.interactive = lambda: False
+        c, out, err = self.run_end(on="m2")
+        self.assertEqual(c, 1)
+        self.assertEqual(len(self.relayed), 1)
+
+    def test_remote_side_bound_to_the_confirmed_set(self):
+        pa.interactive = lambda: False
+
+        def never():
+            raise AssertionError("the bound form never asks")
+
+        self.answer = never
+        c, out, err = self.run_end(anyway=True, confirmed_terminal="t1", confirmed_workers="w1")
+        self.assertEqual(c, 1, out + err)
+        self.assertIn("changed since you answered", err)
+        self.assertEqual(self.kills(), [])
+        c, out, err = self.run_end(anyway=True, confirmed_terminal="t2", confirmed_workers="w1,w4")
+        self.assertEqual(c, 1, out + err)
+        self.assertEqual(self.kills(), [])
+        c, out, err = self.run_end(anyway=True, confirmed_terminal="t1", confirmed_workers="w1,w4")
+        self.assertEqual(c, 0, out + err)
+        self.assertEqual(self.kills(), [["hc", "kill", "t1"]])
+
+    def test_remote_side_bound_no_workers(self):
+        self.no_workers()
+        pa.interactive = lambda: False
+        c, out, err = self.run_end(confirmed_terminal="t1", confirmed_workers="-")
+        self.assertEqual(c, 0, out + err)
+        self.assertEqual(self.kills(), [["hc", "kill", "t1"]])
+
+
+class J3Main(Base):
+    def test_main_knows_end_terminal(self):
+        seen = {}
+        saved = (sys.argv, pa.cmd_restart)
+        sys.argv = ["pa-restart", "--space", SP, "--end-terminal", "--anyway", "--confirmed-terminal", "t1",
+                    "--confirmed-workers", "-"]
+        pa.cmd_restart = lambda args: seen.update(vars(args))
+        try:
+            pa.main()
+        finally:
+            sys.argv, pa.cmd_restart = saved
+        self.assertEqual((seen["end_terminal"], seen["anyway"], seen["confirmed_terminal"], seen["confirmed_workers"]),
+                         (True, True, "t1", "-"))
 
 
 if __name__ == "__main__":

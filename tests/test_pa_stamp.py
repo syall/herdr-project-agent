@@ -512,7 +512,7 @@ class NoEnding(unittest.TestCase):
         with open(os.path.join(REPO, "runtime", "tools", "pa.py")) as f:
             text = f.read()
         self.assertNotIn("os.kill(", text)
-        self.assertEqual(text.count('"kill"'), 1, "hc kill only in cmd_cleanup (today's)")
+        self.assertEqual(text.count('"kill"'), 2, "hc kill only in cmd_cleanup (today's) and end_terminal (t-037 J3, R10)")
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 #!/bin/sh
 # Integration check for pa-session (t-001, spec §4.1: S1 S2 S3 S4 S5 S6a S7; t-037 J2: S8 S9 S10, the restart in
-# place; round 2: S11 S12; round 3: D4 inside S11) against a PRIVATE hc core.
+# place; round 2: S11 S12; round 3: D4 inside S11; J3: S13, the --end-terminal bridge) against a PRIVATE hc core.
 # Usage: tests/pa_session_check.sh <scratch dir made by tests/setup-scratch.sh>
 # Every hc call goes through scratch(): its own HC_SESSION and XDG folders under the scratch dir,
 # HC_TERMINAL_ID / HC_SOCKET / HC_TERMINAL_SOCKET / HC_SCOPE unset (HC_TERMINAL_SOCKET names the live
@@ -92,9 +92,9 @@ os.execvp(sys.argv[2], sys.argv[2:])
 PY
 cleanup() {
   [ -n "${sampler:-}" ] && kill "$sampler" 2>/dev/null
-  for t in n1 n2 n3 n4 n5 n6 n7 n8 n9 n10 n11 n12 w8 w9 w11; do scratch hc kill "$t" >/dev/null 2>&1; done
+  for t in n1 n2 n3 n4 n5 n6 n7 n8 n9 n10 n11 n12 w8 w9 w11 n13 w13 k13 r13 n13b w13b k13b r13b tab13; do scratch hc kill "$t" >/dev/null 2>&1; done
   sleep 1
-  for t in n1 n2 n3 n4 n5 n6 n7 n8 n9 n10 n11 n12 w8 w9 w11; do scratch hc rm "$t" >/dev/null 2>&1; done
+  for t in n1 n2 n3 n4 n5 n6 n7 n8 n9 n10 n11 n12 w8 w9 w11 n13 w13 k13 r13 n13b w13b k13b r13b tab13; do scratch hc rm "$t" >/dev/null 2>&1; done
   scratch hc server stop >/dev/null 2>&1
   # Whatever the hc calls did not end (an hc call that failed under load), and then the watcher, not needed now.
   sh "$here/pa_session_reap.sh" reap "$S" "$SESSION" "$pid" "$core_began"
@@ -342,6 +342,106 @@ if wait_for 15 test -s "$L12"; then
   [ -z "$(label n12 herdr.pa.restarting)" ] && pass "S12 herdr.pa.restarting removed" || fail S12 "label $(label n12 herdr.pa.restarting)"
   [ "$(lines)" = $((before + 1)) ] && pass "S12 one Claude start (after the restart)" || fail S12 "stub starts $(( $(lines) - before ))"
 else fail S12 "no launcher.json; n12: $(scratch hc read n12 2>&1 | tail -n 5)"; fi
+
+# S13 (t-037 J3, spec R10, AC10.2): a launcher from before restart support (here: a J1-era version-1 launcher.json)
+# is ended only by pa-restart --end-terminal after a typed yes, and comes back as one launcher per space.
+# S13a plain pa-restart names --end-terminal; S13b workers without --anyway: refused; S13c the keeper restores first
+# (pa-start not needed); S13d no keeper: pa-start opens it (fake herdr-app), and a late keeper's launcher is refused.
+SP13=sp1313131313131313131313131313ffff
+SP13B=sp1313131313131313131313131313bbbb
+mkdir -p "$S/proj13" "$S/proj13b"
+: > "$S/herdr-app.log"
+old_launcher() { # name space project: its terminal's argv is exactly pa-session for the space (R10 check (e))
+  scratch hc run --bg --no-parent --no-notify --name "$1" --cwd "$3" -- "$S/bin/pa-session" --space "$2" --project "$3" --profile test >/dev/null
+}
+as_j1() { python3 - "$S/pa/spaces/$1/launcher.json" <<'PY13'
+import json, sys
+f = sys.argv[1]
+d = json.load(open(f))
+d["version"] = 1
+d.pop("accepts", None)
+json.dump(d, open(f, "w"))
+PY13
+}
+addr() { scratch hc get "$1" --json 2>/dev/null | json "d.get('address','')"; }
+beats() { hb=$(cat "$S/pa/spaces/$1/heartbeat" 2>/dev/null); [ "${hb#* }" = "$2" ] && [ $(( $(date +%s) - ${hb%% *} )) -le 30 ]; }
+pa_count() { # space: live terminals labelled for it that are not a refused launcher (no herdr.pa.error)
+  scratch python3 - "$1" <<'PY13'
+import json, subprocess, sys
+listed = json.loads(subprocess.run(["hc", "ls", "--json"], stdout=subprocess.PIPE, universal_newlines=True).stdout or "{}")
+n = 0
+for t in listed.get("terminals", []):
+    if t.get("state") != "live":
+        continue
+    d = json.loads(subprocess.run(["hc", "get", t["address"], "--json"], stdout=subprocess.PIPE, universal_newlines=True).stdout or "{}")
+    labels = d.get("labels") or {}
+    if labels.get("herdr.pa") == sys.argv[1] and not labels.get("herdr.pa.error"):
+        n += 1
+print(n)
+PY13
+}
+end13() { # terminal space outfile: pa-restart --end-terminal --anyway in its own terminal (a tty to type yes in)
+  scratch hc run --bg --no-parent --no-notify --name "$1" --cwd "$S" -- \
+    sh -c '"$0" --space "$1" --end-terminal --anyway --why S13 > "$2" 2>&1; echo "rc=$?" >> "$2"' "$S/bin/pa-restart" "$2" "$3" >/dev/null
+}
+answer13() { # terminal outfile: wait for the question, type yes, wait for the exit code
+  wait_for 30 grep -q "Type yes" "$2" || return 1
+  scratch hc send "$1" yes >/dev/null 2>&1
+  wait_for 120 grep -q "^rc=" "$2"
+}
+
+before=$(lines)
+old_launcher n13 "$SP13" "$S/proj13"
+if wait_for $START_WAIT has_lines $((before + 1)) && wait_for 10 test -s "$S/pa/spaces/$SP13/launcher.json"; then
+  sid13=$(agent "$SP13" sessionId)
+  a13=$(addr n13)
+  scratch hc run --bg --parent n13 --no-notify --name w13 -- sleep 600 >/dev/null
+  sleep 1
+  as_j1 "$SP13"
+  scratch pa-restart --space "$SP13" > "$S/r13a.out" 2>&1
+  rc=$?
+  [ "$rc" = 2 ] && grep -q "started before restart support" "$S/r13a.out" && grep -q -- "--end-terminal" "$S/r13a.out" && pass "S13a plain pa-restart refuses and names --end-terminal" || fail S13a "exit $rc: $(tail -n 2 "$S/r13a.out")"
+  scratch pa-restart --space "$SP13" --end-terminal < /dev/null > "$S/r13b.out" 2>&1
+  rc=$?
+  [ "$rc" = 1 ] && grep -q "w13" "$S/r13b.out" && grep -q -- "--anyway" "$S/r13b.out" && [ "$(state n13)" = live ] && [ "$(state w13)" = live ] && pass "S13b workers without --anyway: refused, nothing ended" || fail S13b "exit $rc n13 $(state n13) w13 $(state w13): $(tail -n 2 "$S/r13b.out")"
+  # The simulated keeper: once n13 has ended, a new launcher for the space a few seconds later (keeper.js restores
+  # with the same argv in a new pane).
+  ( wait_for 90 not_live n13 && sleep 4 && old_launcher k13 "$SP13" "$S/proj13" ) &
+  keeper13=$!
+  before=$(lines)
+  end13 r13 "$SP13" "$S/r13c.out"
+  if answer13 r13 "$S/r13c.out"; then
+    wait "$keeper13"
+    grep -q "^rc=0" "$S/r13c.out" && grep -q "Restored by the keeper" "$S/r13c.out" && pass "S13c ended after yes; the keeper's restore was seen" || fail S13c "$(tail -n 4 "$S/r13c.out")"
+    not_live n13 && not_live w13 && pass "S13c the terminal and its worker ended (as it said)" || fail S13c "n13 $(state n13) w13 $(state w13)"
+    k13=$(addr k13)
+    wait_for 20 beats "$SP13" "$k13" && [ "$(agent "$SP13" terminal)" = "$k13" ] && [ "$(pa_count "$SP13")" = 1 ] && pass "S13c one launcher for the space (k13)" || fail S13c "agent terminal $(agent "$SP13" terminal), k13 $k13, count $(pa_count "$SP13")"
+    [ ! -s "$S/herdr-app.log" ] && pass "S13c pa-start not needed" || fail S13c "herdr-app called: $(cat "$S/herdr-app.log")"
+    wait_for 20 has_lines $((before + 1)) && tail -n 1 "$LOG" | grep -q -- "--resume $sid13 " && pass "S13c the new launcher resumes the same session" || fail S13c "stub: $(tail -n 1 "$LOG" | cut -c1-100)"
+    [ "$(jf "$S/pa/spaces/$SP13/launcher.json" "d.get('version')")" = 2 ] && pass "S13c the new launcher is restart-capable" || fail S13c "launcher.json $(head -c 200 "$S/pa/spaces/$SP13/launcher.json")"
+    grep -q "end-terminal terminal=$a13 workers=1 by=pa-restart" "$S/pa/spaces/$SP13/session.log" && pass "S13c session.log line" || fail S13c "session.log: $(tail -n 3 "$S/pa/spaces/$SP13/session.log")"
+  else fail S13c "no question or no answer: $(tail -n 4 "$S/r13c.out")"; kill "$keeper13" 2>/dev/null; fi
+else fail S13 "stub never started; n13: $(scratch hc read n13 2>&1 | tail -n 5)"; fi
+
+before=$(lines)
+old_launcher n13b "$SP13B" "$S/proj13b"
+if wait_for $START_WAIT has_lines $((before + 1)) && wait_for 10 test -s "$S/pa/spaces/$SP13B/launcher.json"; then
+  scratch hc run --bg --parent n13b --no-notify --name w13b -- sleep 600 >/dev/null
+  sleep 1
+  as_j1 "$SP13B"
+  end13 r13b "$SP13B" "$S/r13d.out"
+  if answer13 r13b "$S/r13d.out"; then
+    grep -q "^rc=0" "$S/r13d.out" && grep -q "pa-start" "$S/r13d.out" && pass "S13d no keeper: pa-start opened it" || fail S13d "$(tail -n 4 "$S/r13d.out")"
+    [ "$(grep -c "do tab.new" "$S/herdr-app.log")" = 1 ] && grep -q "$SP13B" "$S/herdr-app.log" && pass "S13d herdr-app tab.new once, for the space" || fail S13d "herdr-app log: $(cat "$S/herdr-app.log")"
+    t13=$(addr tab13)
+    wait_for 30 beats "$SP13B" "$t13" && pass "S13d the opened launcher beats" || fail S13d "heartbeat $(cat "$S/pa/spaces/$SP13B/heartbeat" 2>/dev/null), tab13 $t13"
+    not_live w13b && pass "S13d its worker ended" || fail S13d "w13b $(state w13b)"
+    old_launcher k13b "$SP13B" "$S/proj13b"
+    refused13() { scratch hc read k13b 2>&1 | grep -q "already has a Project Agent"; }
+    wait_for 40 refused13 && pass "S13d a late keeper's launcher is refused" || fail S13d "k13b: $(scratch hc read k13b 2>&1 | tail -n 3)"
+    [ "$(agent "$SP13B" terminal)" = "$t13" ] && [ "$(pa_count "$SP13B")" = 1 ] && beats "$SP13B" "$t13" && pass "S13d still one launcher for the space" || fail S13d "agent terminal $(agent "$SP13B" terminal), count $(pa_count "$SP13B")"
+  else fail S13d "no question or no answer: $(tail -n 4 "$S/r13d.out")"; fi
+else fail S13d "stub never started; n13b: $(scratch hc read n13b 2>&1 | tail -n 5)"; fi
 
 # S9 (negative control): in this core a child does end with its parent's program, so S8's "w8 still live" means it.
 scratch hc run --bg --no-parent --no-notify --name n10 -- sleep 600 >/dev/null

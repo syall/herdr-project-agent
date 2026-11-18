@@ -1,0 +1,14 @@
+#!/bin/sh
+# Test stand-in for herdr-app (t-037 J3, S13 of tests/pa_session_check.sh). Logs its argv to <scratch>/herdr-app.log;
+# `do tab.new <json>` starts the request's argv in the private core with hc run (no parent), named tab13, and prints
+# {"tab": "tab13"}. Anything else: {"error": ...}. It shadows a real herdr-app on PATH in the scratch environment.
+log="$(cd "$(dirname "$0")/.." && pwd)/herdr-app.log"
+printf '%s\n' "$*" >> "$log"
+[ "${1:-} ${2:-}" = "do tab.new" ] || { echo '{"error": "fake herdr-app: only do tab.new"}'; exit 0; }
+exec python3 -c '
+import json, subprocess, sys
+req = json.loads(sys.argv[1])
+r = subprocess.run(["hc", "run", "--bg", "--no-parent", "--no-notify", "--name", "tab13", "--cwd", req.get("folder") or ".", "--"]
+                   + list(req["argv"]), stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+print(json.dumps({"tab": "tab13"} if r.returncode == 0 else {"error": (r.stderr or r.stdout).strip()}))
+' "$3"
