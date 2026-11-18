@@ -2221,9 +2221,12 @@ class JobCards(Base):
         sh(self.proj, "git", "worktree", "add", "-q", "-b", branch or name, path, "main")
         return path
 
-    def merged_commit(self, path, file="a.txt", message="billing work"):
-        sha = self.commit(path, file, file + "\n", message)
-        sh(self.proj, "git", "merge", "-q", "--ff-only", sh(path, "git", "rev-parse", "HEAD"))
+    def merged_commit(self, path, file=None, message="billing work"):
+        """A commit in the worktree, merged into the main branch (a file of its own each time, so it is never empty)."""
+        self.merges = getattr(self, "merges", 0) + 1
+        file = file or "m{}.txt".format(self.merges)
+        sha = self.commit(path, file, "{} {}\n".format(file, self.merges), message)
+        sh(self.proj, "git", "merge", "-q", "--no-edit", sh(path, "git", "rev-parse", "HEAD"))
         return sha
 
     def billing_task(self, state="in-progress", workers=(), **extra):
