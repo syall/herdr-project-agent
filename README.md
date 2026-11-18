@@ -285,6 +285,46 @@ and so is any label with 12 digits. `pa-doctor` notes refused rules and values (
 recorded before this get their provider and endpoint from the same model rules, region unknown, and the
 account from that chain.
 
+**Fetching prices from a public price list** (the person's command; agents and workers cannot run
+it, `--dry-run` included, since it downloads): `pa-costs prices fetch [--source NAME] [--into PATH]
+[--dry-run] [--yes] [--profile NAME]`. A profile declares its sources in `profile.json` as `prices.sources` (this repo
+declares none, so the command says "declares no price source"):
+```json
+"prices": {"sources": {"src-a": {"label": "<text>", "providers": ["provider-a"],
+  "defaultScope": {"provider": "provider-a", "endpoint": "global", "region": null, "account": null},
+  "urls": {"region-a": {"url": "https://prices.example.test/region-a/index.json", "region": "region-a", "maxBytes": 5000000},
+           "region-b": {"url": "https://prices.example.test/region-b/index.json", "region": "region-b", "maxBytes": 5000000}},
+  "defaultRegion": "region-a", "regionFree": ["global"],
+  "read": ["prices/<reader script>", "--file", "{file}", "--region", "{region}"], "currency": "USD",
+  "models": {"include": [], "exclude": [], "onlyWithEndpoint": null}}}}
+```
+- **Download**: only the declared `https` URLs (a DNS host name, no port, user, query or IP address),
+  no redirect followed, no credential, cookie or authentication sent (`User-Agent: herdr-pa-costs`
+  only; proxies from `HTTPS_PROXY`), each file at most its `maxBytes` (50 MB at most), all of them
+  within 120 s, into a temporary folder removed at the end. Certificate checks are never turned off.
+- **Reader**: the profile's script (inside its folder, no shell, with only `PATH`, `LANG`, `HOME` and
+  `TMPDIR` in its environment) runs once per file and prints one JSON line per price
+  (`provider, account, endpoint, region, model, kind` (`in|out|cw5m|cw1h|cr` or `long.<kind>`),
+  `price` (a number, or null with `why`), `effectiveDate`, `ref`), then
+  `{"done": true, "source": {"url", "version", "publicationDate"}}`. One bad line refuses the whole
+  batch (exit 4); exit 6 means it did not recognise the file's format (exit 4).
+- **What is written**: a price of a `regionFree` endpoint comes from the `defaultRegion` file into a
+  scope with no region (the other files' equal rows are named in `refs.<kind>.sameIn`; a region whose
+  row differs gets a scope of its own); every other endpoint gets one scope per region. Existing rows
+  are never edited or removed: a changed price is a new row from the source's `effectiveDate` (or from
+  today when that is not after your latest row, so earlier days keep their prices); a null from the
+  source never removes a price; models the source lacks, or the profile's `models` limits leave out,
+  stay as they are. A file without `defaultScope` gets the declared one on its first fetch (the diff
+  says so). Each new row carries `source`, `fetched` (url, version, publicationDate, sha256) and `refs`.
+- **Flow**: it prints every change (`scope / model / kind: old → new (validFrom)`), then asks before
+  writing (`--yes` skips only the question; off a terminal it needs `--yes`), copies the old file to
+  `prices.json.<stamp>.bak` (the last 5 kept) and replaces it in one step. It writes nothing when the
+  file changed meanwhile, is a link, or has a scoped entry this tool cannot read. The default target is
+  the installed profile's `prices.json`, which the next install overwrites: use `--into <profile
+  package checkout>/profiles/<name>/prices.json`. Exit 0 written or no change, 1 failed, 2 bad
+  arguments, 3 refused (an agent, a worker's terminal, no terminal, over 120 s), 4 the source's format
+  or the reader's output not accepted, 5 declined. `pa-costs prices` lists the declared sources.
+
 The account label of estimates and of billed rows is the same chain: on a machine without
 `costs.account`, a profile's `billing.account` now labels the estimates too (they said `default`
 before), so `billed compare` sets this space's estimates beside the bill of that account, and

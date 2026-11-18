@@ -96,6 +96,8 @@ DENY_COMMANDS = [
     (r"(^|[\s'\"=/])\.env(\.[\w.-]+)?(\s|$|['\"])|~/\.ssh\b|/\.ssh/|\bid_(rsa|ed25519|ecdsa)\b", "reading secrets"),
     # t-009 R15: billed amounts come only from the person (quotes and backslashes between the words do not hide it)
     (r"\bpa-costs['\"\s\\]+billed['\"\s\\]+(fetch|enable|import)\b", "the person's billing command (pa-costs billed fetch, enable or import)"),
+    # t-032 R-S5: the price fetch downloads a price list and writes the price file: the person's (--dry-run too: it downloads)
+    (r"\bpa-costs\b[^;&|\n]*?['\"\s\\]prices['\"\s\\]+([^;&|\n]*?['\"\s\\])?fetch\b", "the person's price fetch (pa-costs prices fetch)"),
 ]
 DENY_PATHS = [(r"(^|/)\.env(\.[^/]*)?$", "an environment file with secrets"), (r"(^|/)\.ssh(/|$)", "SSH keys"),
               (r"(^|/)(credentials|\.netrc|\.npmrc|\.pypirc)$", "a credentials file")]

@@ -16,17 +16,21 @@ turns.jsonl (the cost ledger: tokens per settled segment, append-only), state.js
 (what the panel reads), cc/<session>.json (Claude Code's own per-session cost figure, list price, from its status
 line input: ids and numbers only). Billed rows: <HERDR_PA_HOME>/billing/. Counters and ids only: no session text is kept,
 printed or logged. Nothing here uses the network or reads any account; billed rows come only from a script the
-profile declares, which only the person turns on (pa-costs billed enable, in a terminal).
+profile declares, which only the person turns on (pa-costs billed enable, in a terminal). The one exception is
+`pa-costs prices fetch` (the person's): its download is in pa_net.py, loaded only for a fetch (t-032 J2).
 """
 import argparse
 import datetime
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -2708,7 +2712,7 @@ def scrub(text):
     return TWELVE.sub("<number>", text or "")
 
 
-def run_script(profile, entry, values, timeout=None):
+def run_script(profile, entry, values, timeout=None, env=None, what="billing script"):
     """Runs a profile billing script: argv from its run list with {placeholders} filled, no shell, path inside the
     profile folder. (exit code or 'timeout', stdout text, last 5 stderr lines scrubbed)."""
     folder = os.path.realpath(profile["_folder"])
@@ -2719,11 +2723,11 @@ def run_script(profile, entry, values, timeout=None):
         if i == 0:
             word = os.path.realpath(os.path.join(folder, word))
             if not word.startswith(folder + os.sep) or not os.path.isfile(word):
-                raise pa.Problem("billing script {} is not a file inside the profile folder".format(entry["run"][0]))
+                raise pa.Problem("{} {} is not a file inside the profile folder".format(what, entry["run"][0]))
         argv.append(word)
     try:
         r = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
-                           timeout=SCRIPT_TIMEOUT if timeout is None else timeout, cwd=folder)
+                           timeout=SCRIPT_TIMEOUT if timeout is None else timeout, cwd=folder, env=env)
     except subprocess.TimeoutExpired:
         return "timeout", "", []
     except OSError as e:
@@ -3365,6 +3369,709 @@ def cmd_billed(args):
         billed_import(args.file, args.via, dry_run=args.dry_run)
         return 0
     raise pa.Problem("billed: give status, list, remove, compare, disable, enable, fetch or import")
+
+
+# ---- the price fetch (t-032 J2: R-F1-F4, R-S1-S5, A-F1-F4, A-S): the person's command, a declared public list ---------
+
+FETCH_BUDGET = 120  # seconds all the downloads of one fetch may take together
+FETCH_HARD_MAX = 50 * 1024 * 1024  # bytes: no declared maxBytes may be above this
+BACKUPS_KEPT = 5
+MAX_URLS = 8
+SOURCE_KEYS = ("label", "providers", "defaultScope", "urls", "defaultRegion", "regionFree", "read", "currency", "models")
+LINE_NEEDS = ("provider", "account", "endpoint", "region", "model", "kind", "price", "effectiveDate", "ref")
+LINE_KINDS = KINDS + tuple("long." + k for k in KINDS)
+HOST_LABEL = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
+PLACEHOLDER = re.compile(r"\{[A-Za-z]+(:[^{}]*)?\}")
+STAMP_VERSION = re.compile(r"^\d{8}(\d{6})?$")  # a version that is a date (and time) stamp, not an account number
+
+
+class FetchFailed(Exception):
+    """A price fetch stopped: code is the command's exit code (1 failed, 2 bad arguments, 3 refused, 4 the source's format
+    or the reader's output not accepted, 5 declined); nothing was written."""
+
+    def __init__(self, code, why):
+        Exception.__init__(self, why)
+        self.code, self.why = code, why
+
+
+URL_SHAPE = re.compile(r"^https://([^/?#@:\[\]\s\\]+)(/[^?#\s]*)?$")
+
+
+def check_url(url):
+    """None when url may be declared as a price source (R-S1): https, a DNS host name (no IP, no localhost), no port, no
+    user, no query or fragment, no 12 digits; else why not. (No urllib: pa_costs.py imports no network module.)"""
+    import ipaddress
+    if not isinstance(url, str) or not url or len(url) > 2048:
+        return "a URL of 1 to 2048 characters"
+    if TWELVE.search(url):
+        return "a URL with 12 digits in a row"
+    if not url.startswith("https://"):
+        return "only https URLs"
+    authority = re.split(r"[/?#]", url[len("https://"):], 1)[0]
+    if "@" in authority:
+        return "no user or password in the URL"
+    if "?" in url or "#" in url:
+        return "no query or fragment in the URL"
+    if ":" in authority and not authority.startswith("["):
+        return "no port in the URL"
+    m = URL_SHAPE.match(url)
+    if not m:
+        return "a URL of the form https://<host name>/<path>"
+    host = m.group(1)
+    try:
+        ipaddress.ip_address(host)
+        return "a host name, not an IP address"
+    except ValueError:
+        pass
+    labels = host.split(".")
+    if len(labels) < 2 or not all(HOST_LABEL.match(x) for x in labels) or not labels[-1].isalpha():
+        return "a DNS host name"
+    if host == "localhost" or host.endswith(".localhost"):
+        return "not localhost"
+    return None
+
+
+def price_sources(profile):
+    """({name: source}, problems) of the profile's prices.sources (R-F2, A-F1). A source with any problem is left out
+    and named; never raises."""
+    block = profile.get("prices") if isinstance(profile.get("prices"), dict) else {}
+    raw_sources = block.get("sources") if isinstance(block.get("sources"), dict) else {}
+    sources, problems = {}, []
+    for name, s in sorted(raw_sources.items()):
+        why = _source_problem(name, s)
+        if why:
+            problems.append("price source {}: {}: refused".format(str(name)[:40], why))
+        else:
+            sources[name] = s
+    return sources, problems
+
+
+def _source_problem(name, s):
+    if not isinstance(name, str) or not LABEL.match(name) or TWELVE.search(name):
+        return "the name must be a label"
+    if not isinstance(s, dict):
+        return "must be an object"
+    extra = sorted(str(k)[:40] for k in s if k not in SOURCE_KEYS)
+    if extra:
+        return "keys this tool does not know ({})".format(", ".join(extra[:5]))
+    if not isinstance(s.get("label"), str) or not s["label"].strip() or len(s["label"]) > 200 or TWELVE.search(s["label"]):
+        return "label must be a short text (no 12 digits)"
+    providers = s.get("providers")
+    if not isinstance(providers, list) or not providers or not all(fact_label("provider", p) for p in providers):
+        return "providers must be a list of provider labels"
+    if s.get("defaultScope") is not None:
+        try:
+            scope = _scope(s["defaultScope"], "defaultScope")
+        except ValueError as e:
+            return str(e)
+        if scope[0] not in providers or any(k not in SCOPE_FIELDS for k in s["defaultScope"]):
+            return "defaultScope must name one of its providers (and only provider, endpoint, region, account)"
+    urls = s.get("urls")
+    if not isinstance(urls, dict) or not urls or len(urls) > MAX_URLS:
+        return "urls must name 1 to {} files".format(MAX_URLS)
+    for key, u in urls.items():
+        if not isinstance(key, str) or not LABEL.match(key) or TWELVE.search(key):
+            return "a urls key must be a label"
+        if not isinstance(u, dict) or any(k not in ("url", "region", "maxBytes") for k in u):
+            return "urls.{} must be {{url, region, maxBytes}}".format(key)
+        why = check_url(u.get("url"))
+        if why:
+            return "urls.{}: {}".format(key, why)
+        if u.get("region") is not None and fact_label("region", u["region"]) is None:
+            return "urls.{}: region must be a region label or null".format(key)
+        mb = u.get("maxBytes")
+        if isinstance(mb, bool) or not isinstance(mb, int) or not 0 < mb <= FETCH_HARD_MAX:
+            return "urls.{}: maxBytes must be a whole number from 1 to {}".format(key, FETCH_HARD_MAX)
+    if s.get("defaultRegion") is None:
+        if len(urls) > 1:
+            return "defaultRegion must name one of the urls keys"
+    elif s["defaultRegion"] not in urls:
+        return "defaultRegion must name one of the urls keys"
+    free = s.get("regionFree", [])
+    if not isinstance(free, list) or not all(fact_label("endpoint", x) for x in free):
+        return "regionFree must be a list of endpoint kinds"
+    read = s.get("read")
+    if not isinstance(read, list) or not read or not all(isinstance(x, str) and x for x in read):
+        return "read must be a non-empty list of words"
+    first = os.path.normpath(read[0])
+    if os.path.isabs(read[0]) or first == ".." or first.startswith(".." + os.sep) or PLACEHOLDER.search(read[0]):
+        return "read's first word must be a script inside the profile folder"
+    if not isinstance(s.get("currency"), str) or not CURRENCY.match(s["currency"]):
+        return "currency must be a code such as EUR"
+    limits = s.get("models", {})
+    if not isinstance(limits, dict) or any(k not in ("include", "exclude", "onlyWithEndpoint") for k in limits):
+        return "models must be {include, exclude, onlyWithEndpoint}"
+    for k in ("include", "exclude"):
+        v = limits.get(k, [])
+        if not isinstance(v, list) or not all(isinstance(x, str) for x in v):
+            return "models.{} must be a list of patterns".format(k)
+        for x in v:
+            try:
+                re.compile(x)
+            except re.error:
+                return "models.{}: {!r} is not a pattern".format(k, x[:40])
+    if limits.get("onlyWithEndpoint") is not None and fact_label("endpoint", limits["onlyWithEndpoint"]) is None:
+        return "models.onlyWithEndpoint must be an endpoint kind or null"
+    return None
+
+
+class NoRedirect:
+    """An opener handler that refuses every redirect (R-S1): only the declared URL is ever fetched. A plain class (no
+    urllib import at module load: the status line imports this module)."""
+    handler_order = 400
+
+    def add_parent(self, parent):
+        self.parent = parent
+
+    def close(self):
+        pass
+
+    def __lt__(self, other):
+        return self.handler_order < getattr(other, "handler_order", 500)
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise FetchFailed(1, "redirect (HTTP {}) to {} refused: only the declared URL is fetched".format(code, scrub(str(newurl))[:200]))
+
+    def _refuse(self, req, fp, code, msg, headers):
+        target = (headers.get("Location") or headers.get("URI") or "?") if headers is not None else "?"
+        return self.redirect_request(req, fp, code, msg, headers, target)
+
+    http_error_301 = http_error_302 = http_error_303 = http_error_307 = http_error_308 = _refuse
+
+
+def net():
+    """pa_net.py beside this file (found through the pa-costs symlink too): the fetch's only network code."""
+    import importlib.util
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "pa_net.py")
+    spec = importlib.util.spec_from_file_location("pa_net", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def http_opener():
+    """The only opener the fetch uses (R-S1, R-S2): pa_net.http_opener with NoRedirect."""
+    return net().http_opener(NoRedirect())
+
+
+def download(url, max_bytes, dest, deadline, opener, clock):
+    """GET url into dest (pa_net.download, R-S3): at most max_bytes, before clock() passes deadline."""
+    return net().download(url, max_bytes, dest, deadline, opener, clock, FetchFailed, scrub, FETCH_BUDGET)
+
+
+def reader_env(folder):
+    """The reader's whole environment: no credential variable of the person's terminal reaches it (Q-J2-3)."""
+    env = {"PATH": os.environ.get("PATH") or "/usr/bin:/bin", "HOME": folder, "TMPDIR": folder}
+    for k in ("LANG", "LC_ALL", "LC_CTYPE", "SYSTEMROOT"):
+        if os.environ.get(k):
+            env[k] = os.environ[k]
+    return env
+
+
+def run_reader(profile, source, key, path, folder):
+    """(stdout, stderr lines) of the profile's reader on one downloaded file, or FetchFailed."""
+    region = source["urls"][key].get("region") or ""
+    fill = {"{file}": path, "{region}": region, "{file:" + key + "}": path, "{region:" + key + "}": region}
+    argv = []
+    for i, word in enumerate(source["read"]):
+        if i:
+            for k, v in fill.items():
+                word = word.replace(k, v)
+            if PLACEHOLDER.search(word):
+                raise FetchFailed(1, "the reader's word {!r} has a placeholder for another file".format(word[:60]))
+        argv.append(word)
+    try:
+        code, out, err = run_script(profile, {"run": argv}, {}, env=reader_env(folder), what="price reader")
+    except pa.Problem as e:
+        raise FetchFailed(1, str(e))
+    if code == 0:
+        return out, err
+    tail = "; " + " | ".join(err[-2:]) if err else ""
+    if code == 6:
+        raise FetchFailed(4, "the reader did not recognise the format of {} (exit 6): nothing written{}".format(key, tail))
+    words = {"timeout": "timed out after {} s".format(SCRIPT_TIMEOUT), "toolarge": "printed more than 5 MB"}.get(
+        code, "failed (exit {})".format(code))
+    raise FetchFailed(1, "the reader {} on {}{}".format(words, key, tail))
+
+
+def _no_constant(name):
+    raise ValueError("{} is not a number".format(name))
+
+
+def parse_reader(text, source, key):
+    """(lines, done) of one reader run (R-F3, A-F2); FetchFailed(4) for the whole batch at the first breach."""
+    region, url = source["urls"][key].get("region"), source["urls"][key]["url"]
+    lines, done, seen = [], None, set()
+
+    def bad(n, why):
+        raise FetchFailed(4, "the reader's output for {} is refused (line {}: {}): nothing written".format(key, n, why))
+    for n, line in enumerate(text.splitlines(), 1):
+        if not line.strip():
+            continue
+        if done is not None:
+            bad(n, "a line after the done line")
+        try:
+            obj = json.loads(line, parse_constant=_no_constant)
+        except ValueError as e:
+            bad(n, "not JSON ({})".format(str(e)[:60]))
+        if not isinstance(obj, dict):
+            bad(n, "not an object")
+        if obj.get("done") is True:
+            src = obj.get("source")
+            if set(obj) != {"done", "source"} or not isinstance(src, dict) or set(src) - {"url", "version", "publicationDate"}:
+                bad(n, "the done line is {done, source: {url, version, publicationDate}}")
+            if src.get("url") != url:
+                bad(n, "the done line's url is not the declared {}".format(url))
+            for f in ("version", "publicationDate"):
+                v = src.get(f)
+                if not isinstance(v, str) or not 0 < len(v) <= 64:
+                    bad(n, "the done line's {} must be a short text".format(f))
+                if TWELVE.search(v) and not (f == "version" and STAMP_VERSION.match(v)):
+                    bad(n, "12 digits in a row in {}".format(f))
+            done = obj
+            continue
+        missing = [f for f in LINE_NEEDS if f not in obj]
+        extra = sorted(str(k)[:30] for k in obj if k not in LINE_NEEDS + ("why",))
+        if missing or extra:
+            bad(n, "missing {} / unknown {}".format(", ".join(missing) or "-", ", ".join(extra) or "-"))
+        if TWELVE.search(line):
+            bad(n, "12 digits in a row")
+        if obj["provider"] not in source["providers"]:
+            bad(n, "provider {!r} is not one this source declares".format(str(obj["provider"])[:40]))
+        if obj["account"] is not None and fact_label("account", obj["account"]) is None:
+            bad(n, "account must be a label or null")
+        if obj["endpoint"] is not None and fact_label("endpoint", obj["endpoint"]) is None:
+            bad(n, "endpoint must be an endpoint kind or null")
+        if obj["region"] is not None and obj["region"] != region:
+            bad(n, "region {!r} is not the file's {!r}".format(str(obj["region"])[:32], region))
+        if not isinstance(obj["model"], str) or not MODEL.match(obj["model"]):
+            bad(n, "model is not a model key")
+        if obj["kind"] not in LINE_KINDS:
+            bad(n, "kind must be one of " + ", ".join(LINE_KINDS))
+        p = obj["price"]
+        if p is None:
+            if not isinstance(obj.get("why"), str) or not obj["why"].strip() or len(obj["why"]) > 300:
+                bad(n, "a null price needs a short why")
+        elif isinstance(p, bool) or not isinstance(p, (int, float)) or not math.isfinite(p) or p < 0:
+            bad(n, "price must be a finite number >= 0 or null")
+        if "why" in obj and (not isinstance(obj["why"], str) or len(obj["why"]) > 300):
+            bad(n, "why must be a short text")
+        if not isinstance(obj["effectiveDate"], str) or not DATE.match(obj["effectiveDate"]):
+            bad(n, "effectiveDate must be YYYY-MM-DD")
+        try:
+            datetime.datetime.strptime(obj["effectiveDate"], "%Y-%m-%d")
+        except ValueError:
+            bad(n, "effectiveDate is not a date")
+        ref = obj["ref"]
+        if not isinstance(ref, dict) or len(ref) > 20 or not all(
+                isinstance(k, str) and len(k) <= 40 and (v is None or (isinstance(v, (str, int, float)) and not isinstance(v, bool)
+                                                                     and len(str(v)) <= 400)) for k, v in ref.items()):
+            bad(n, "ref must be an object of short texts")
+        k = tuple(obj[f] for f in ("provider", "endpoint", "region", "account", "model", "kind"))
+        if k in seen:
+            bad(n, "a second line for {}".format(" · ".join("*" if x is None else str(x) for x in k)))
+        seen.add(k)
+        lines.append(obj)
+    if done is None:
+        raise FetchFailed(4, "the reader's output for {} has no done line: nothing written".format(key))
+    return lines, done
+
+
+def _price_text(v):
+    if v is None:
+        return "—"
+    if isinstance(v, float) and v == int(v):
+        return "{:.1f}".format(v)
+    return repr(v)
+
+
+def _rows_of(models_obj, model):
+    v = models_obj.get(model)
+    if v is None:
+        return []
+    return v if isinstance(v, list) else [v]
+
+
+def _scope_of_entry(e):
+    return tuple(e.get(f) for f in SCOPE_FIELDS)
+
+
+def _file_rows(raw, default):
+    """{(scope, model): [rows]} of a price file's raw JSON, the top-level models under `default` (the never-edited check)."""
+    out = {}
+    for model in (raw.get("models") or {}):
+        out[(default, model)] = list(_rows_of(raw["models"], model))
+    for e in raw.get("scoped") or []:
+        for model in (e.get("models") or {}):
+            out[(_scope_of_entry(e), model)] = list(_rows_of(e["models"], model))
+    return out
+
+
+def _groups(batch, kept):
+    out = {}
+    for ln in batch["lines"]:
+        if ln["model"] not in kept:
+            continue
+        g = out.setdefault((ln["provider"], ln["endpoint"], ln["account"], ln["model"]), {"kinds": {}, "eff": ln["effectiveDate"]})
+        g["kinds"][ln["kind"]] = ln
+        g["eff"] = max(g["eff"], ln["effectiveDate"])
+    return sorted(out.items(), key=lambda x: tuple("" if v is None else v for v in x[0]))
+
+
+def _same_prices(a, b):
+    return set(a["kinds"]) == set(b["kinds"]) and all(a["kinds"][k]["price"] == b["kinds"][k]["price"] for k in a["kinds"])
+
+
+def plan_changes(raw, batches, source, name, today, at, legacy_default):
+    """(raw after, diff lines, notes, number of changes). raw is the target file's parsed JSON, changed in place; batches
+    are the reader runs [{key, region, url, lines, done, sha256}], the default region first. R-F4 per (scope, model),
+    A-F3 for several regions, A-F4 model limits. Existing rows are never edited or removed."""
+    diff, notes = [], []
+    free = set(source.get("regionFree") or [])
+    limits = source.get("models") or {}
+    include = [re.compile(x) for x in limits.get("include") or []]
+    exclude = [re.compile(x) for x in limits.get("exclude") or []]
+    only = limits.get("onlyWithEndpoint")
+    every = [ln for b in batches for ln in b["lines"]]
+
+    def keep(m):
+        if include and not any(p.search(m) for p in include):
+            return False
+        if any(p.search(m) for p in exclude):
+            return False
+        return only is None or any(ln["model"] == m and ln["endpoint"] == only for ln in every)
+    models_seen = sorted({ln["model"] for ln in every})
+    kept = {m for m in models_seen if keep(m)}
+    excluded = [m for m in models_seen if m not in kept]
+
+    # A-F3: region-free endpoints from the default region's file; another region's row goes to its own scope only when
+    # it differs (or the default file lacks it); every other endpoint: one scope per fetched region.
+    default_batch = batches[0]
+    dgroups = dict(_groups(default_batch, kept))
+    placements, same_in = [], {}
+    for gk, g in sorted(dgroups.items(), key=lambda x: tuple("" if v is None else v for v in x[0])):
+        placements.append(((gk[0], gk[1], None if gk[1] in free else default_batch["region"], gk[2]), gk[3], g, default_batch))
+    for b in batches[1:]:
+        for gk, g in _groups(b, kept):
+            if gk[1] in free:
+                d = dgroups.get(gk)
+                if d is not None and _same_prices(d, g):
+                    same_in.setdefault(gk, []).append((b, g))
+                    continue
+                if d is not None:
+                    notes.append("{} / {}: differs in {}: its own scope".format(
+                        scope_text((gk[0], gk[1], b["region"], gk[2])), gk[3], b["region"] or b["key"]))
+            placements.append(((gk[0], gk[1], b["region"], gk[2]), gk[3], g, b))
+
+    changes = 0
+    if raw.get("defaultScope") is not None:
+        default = _scope(raw["defaultScope"], "defaultScope")
+    elif source.get("defaultScope") is not None:  # A-P1 migration (Q-J2-2): the first fetch writes the declared one
+        default = _scope(source["defaultScope"], "defaultScope")
+        raw["defaultScope"] = dict(zip(SCOPE_FIELDS, default))
+        diff.append("default scope: none → {} (the file had none: its top-level prices now apply to this scope only)".format(
+            scope_text(default)))
+        changes += 1
+    else:
+        default = legacy_default
+
+    def models_of(scope, create):
+        if scope == default:
+            return raw.setdefault("models", {})
+        for e in raw.get("scoped") or []:
+            if _scope_of_entry(e) == scope:
+                return e.setdefault("models", {})
+        if not create:
+            return None
+        e = dict(zip(SCOPE_FIELDS, scope))
+        e["models"] = {}
+        raw.setdefault("scoped", []).append(e)
+        return e["models"]
+
+    default_changed = False
+    for scope, model, g, batch in placements:
+        where = "{} / {}".format(scope_text(scope), model)
+        base = {k: (g["kinds"][k]["price"] if k in g["kinds"] else None) for k in KINDS}
+        whys = {k: (g["kinds"][k].get("why") if k in g["kinds"] else "not in the source") for k in KINDS if base[k] is None}
+        long_src = {k: g["kinds"]["long." + k]["price"] for k in KINDS if "long." + k in g["kinds"]}
+        existing = _rows_of(models_of(scope, False) or {}, model)
+        latest = sorted(existing, key=lambda e: e.get("validFrom") or "")[-1] if existing else None
+        eff = g["eff"]
+        if latest is None:
+            row, valid = dict(base), eff
+            diff.append("{}: added (validFrom {}): {}".format(where, eff, ", ".join("{} {}".format(k, _price_text(base[k])) for k in KINDS)))
+        else:
+            changed = []
+            for k in KINDS:
+                s, f = base[k], latest.get(k, 0)
+                if s is None:
+                    if f is not None:
+                        notes.append("{} / {}: kept {} (source has no price: {})".format(where, k, _price_text(f), whys[k]))
+                elif f is None or isinstance(f, bool) or float(s) != float(f):
+                    changed.append((k, f, s))
+            old_long = latest.get("long") if isinstance(latest.get("long"), dict) else {}
+            for k, s in sorted(long_src.items()):
+                f = old_long.get(k, latest.get(k, 0))
+                if s is not None and (f is None or float(s) != float(f)):
+                    changed.append(("long." + k, f, s))
+            if not changed:
+                continue
+            latest_from = latest.get("validFrom") or ""
+            valid = eff if eff > latest_from else today
+            if valid <= latest_from:
+                notes.append("{}: your row of {} is later than today: not changed".format(where, latest_from))
+                continue
+            if valid != eff:
+                notes.append("{}: source effective {} is before your row of {}: added from today; earlier days keep their prices".format(
+                    where, eff, latest_from))
+            row = {k: (base[k] if base[k] is not None else latest.get(k, 0)) for k in KINDS}
+            whys = {k: w for k, w in whys.items() if row[k] is None}
+            for k, f, s in changed:
+                diff.append("{} / {}: {} → {} (validFrom {})".format(where, k, _price_text(f), _price_text(s), valid))
+            if old_long and not long_src:
+                row["long"] = json.loads(json.dumps(old_long))
+        if long_src:
+            row["long"] = dict(long_src)
+        refs = {}
+        for k, ln in sorted(g["kinds"].items()):
+            ref = dict(ln["ref"])
+            ref["url"] = batch["url"]
+            same = []
+            if scope[2] is None:
+                for b2, g2 in same_in.get((scope[0], scope[1], scope[3], model), []):
+                    if k in g2["kinds"]:
+                        other = {"region": b2["region"], "url": b2["url"], "same": True}
+                        other.update({f: g2["kinds"][k]["ref"][f] for f in ("sku", "usagetype", "raw") if f in g2["kinds"][k]["ref"]})
+                        same.append(other)
+            if same:
+                ref["sameIn"] = same
+            refs[k] = ref
+        row.update({"provider": scope[0], "endpoint": scope[1], "region": scope[2], "source": source["label"],
+                    "fetched": {"source": name, "url": batch["url"], "version": batch["done"]["source"]["version"],
+                                "publicationDate": batch["done"]["source"]["publicationDate"], "at": at, "sha256": batch["sha256"]},
+                    "refs": refs})
+        if whys:
+            row["why"] = "; ".join("{}: {}".format(k, w) for k, w in sorted(whys.items()))
+        row = dict([("validFrom", valid)] + list(row.items()))
+        target = models_of(scope, True)
+        if model in target and not isinstance(target[model], list):
+            target[model] = [target[model]]
+        target.setdefault(model, []).append(row)
+        changes += 1
+        if scope == default:
+            default_changed = True
+
+    source_models = {p[1] for p in placements} | {gk[3] for gk in same_in}
+    providers = set(source["providers"])
+    missing = set()
+    scopes = [(default, raw.get("models") or {})] + [(_scope_of_entry(e), e.get("models") or {}) for e in raw.get("scoped") or []]
+    for scope, models in scopes:
+        if scope[0] in providers or (scope[0] is None and scope == default):
+            missing.update(m for m in models if m not in source_models and m not in excluded)
+    if missing:
+        notes.append("not in source (kept): {}".format(", ".join(sorted(missing))))
+    if excluded:
+        notes.append("excluded by the profile (left as they are): {}".format(", ".join(excluded)))
+    if default_changed:
+        d = default_batch["done"]["source"]
+        raw["source"] = "{}: {} (version {}, published {})".format(source["label"], default_batch["url"], d["version"], d["publicationDate"])
+        raw["asOf"] = d["publicationDate"][:10] if DATE.match(d["publicationDate"][:10]) else today
+    return raw, diff, notes, changes
+
+
+def _stamp(now):
+    return time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(now))
+
+
+def write_prices(path, new_raw, old_bytes, old_raw, folder, profile, now):
+    """Writes new_raw to path (R-F1): only when path still holds old_bytes, the new file loads with no problem and keeps
+    every old row as it was; the old file copied to PATH.<stamp>.bak first (the last 5 kept); temp file + rename."""
+    current = None
+    if os.path.lexists(path):
+        if os.path.islink(path):
+            raise FetchFailed(1, "{} became a symbolic link: nothing written".format(path))
+        with open(path, "rb") as f:
+            current = f.read()
+    if current != old_bytes:
+        raise FetchFailed(1, "{} changed while the fetch ran: nothing written (run it again)".format(path))
+    text = json.dumps(new_raw, indent=1, ensure_ascii=False) + "\n"
+    check = os.path.join(folder, "candidate")
+    os.makedirs(check, exist_ok=True)
+    with open(os.path.join(check, "prices.json"), "w") as f:
+        f.write(text)
+    table, problem = load_prices({"_folder": check, "name": profile.get("name"), "pricing": profile.get("pricing")})
+    if problem or table is None or table.get("skippedScoped"):
+        raise FetchFailed(1, "the new file would not load ({}): nothing written".format(problem or "a skipped scoped entry"))
+    default = table["defaultScope"]
+    old_default = _scope(old_raw["defaultScope"], "defaultScope") if old_raw and old_raw.get("defaultScope") is not None else default
+    before, after = _file_rows(old_raw or {}, old_default), _file_rows(json.loads(text), default)
+    for (scope, model), rows in before.items():
+        got = after.get((scope, model)) or after.get((default, model)) if scope == old_default else after.get((scope, model))
+        if (got or [])[:len(rows)] != rows:
+            raise FetchFailed(1, "the new file would change an existing row of {}: nothing written".format(model[:80]))
+    if old_bytes is not None:
+        base = os.path.basename(path)
+        stamp, n = _stamp(now), 0
+        bak = "{}.{}.bak".format(path, stamp)
+        while os.path.lexists(bak):
+            n += 1
+            bak = "{}.{}-{}.bak".format(path, stamp, n)
+        fd = os.open(bak, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        with os.fdopen(fd, "wb") as f:
+            f.write(old_bytes)
+        pattern = re.compile(r"^" + re.escape(base) + r"\.(\d{8}T\d{6}Z)(?:-(\d+))?\.bak$")
+        dirname = os.path.dirname(path) or "."
+        found = []
+        for x in os.listdir(dirname):
+            m = pattern.match(x)
+            if m:
+                found.append(((m.group(1), int(m.group(2) or 0)), x))
+        for _key, x in sorted(found)[:-BACKUPS_KEPT]:
+            os.unlink(os.path.join(dirname, x))  # the tool's own backups beyond the last 5 (R-F1)
+    tmp = "{}.tmp-{}".format(path, os.getpid())
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except OSError as e:
+        if os.path.lexists(tmp):
+            os.unlink(tmp)  # this run's own temp file
+        raise FetchFailed(1, "writing {} failed ({}): the old file is unchanged".format(path, scrub(str(e))[:120]))
+
+
+def prices_fetch(source=None, into=None, dry_run=False, yes=False, profile_name=None, opener=None, now=None, ask=input, clock=None):
+    """`pa-costs prices fetch` (R-F1): the person's command. Returns the exit code; nothing is written on any failure."""
+    try:
+        return _prices_fetch(source, into, dry_run, yes, profile_name, opener, now, ask, clock)
+    except FetchFailed as e:
+        print("pa-costs: {}".format(scrub(e.why)), file=sys.stderr)
+        return e.code
+    except pa.Problem as e:
+        print("pa-costs: {}".format(scrub(str(e))), file=sys.stderr)
+        return 1
+
+
+def _prices_fetch(source_name, into, dry_run, yes, profile_name, opener, now, ask, clock):
+    try:  # R-S5: before anything is read or downloaded, --dry-run included (it downloads)
+        refuse_agent("pa-costs prices fetch")
+        refuse_worker_terminal("pa-costs prices fetch", False)
+    except pa.Problem as e:
+        raise FetchFailed(3, str(e))
+    now = time.time() if now is None else now
+    clock = clock or time.monotonic
+    profile = pa.load_profile(profile_name)
+    sources, problems = price_sources(profile)
+    block = profile.get("prices") if isinstance(profile.get("prices"), dict) else {}
+    declared = sorted(block.get("sources") or {}) if isinstance(block.get("sources"), dict) else []
+    if not declared:
+        raise FetchFailed(1, "the profile {} declares no price source (prices.sources): nothing to fetch".format(profile.get("name")))
+    if source_name is None:
+        if len(declared) > 1:
+            raise FetchFailed(2, "the profile declares {} price sources: name one with --source ({})".format(len(declared), ", ".join(declared)))
+        source_name = declared[0]
+    if source_name not in declared:
+        raise FetchFailed(2, "the profile declares no price source {!r} ({})".format(str(source_name)[:40], ", ".join(declared)))
+    if source_name not in sources:
+        raise FetchFailed(1, "; ".join(p for p in problems if p.startswith("price source {}:".format(source_name))) or "source refused")
+    src = sources[source_name]
+    installed = into is None
+    path = os.path.abspath(into) if into else os.path.join(profile["_folder"], "prices.json")
+    if os.path.islink(path):
+        raise FetchFailed(1, "{} is a symbolic link: name the real file".format(path))
+    if not os.path.isdir(os.path.dirname(path)):
+        raise FetchFailed(1, "no folder {}".format(os.path.dirname(path)))
+    if not dry_run and not yes and not stdin_is_tty():  # Q-J2-4
+        raise FetchFailed(3, "not on a terminal: give --yes to write without the question, or --dry-run")
+    folder = tempfile.mkdtemp(prefix="pa-prices-")
+    try:
+        return _fetch_in(folder, profile, source_name, src, path, installed, dry_run, yes, opener, now, ask, clock)
+    finally:
+        real = os.path.realpath(folder)
+        if os.path.dirname(real) == os.path.realpath(tempfile.gettempdir()) and os.path.basename(real).startswith("pa-prices-"):
+            shutil.rmtree(real, ignore_errors=True)
+
+
+def _fetch_in(folder, profile, name, src, path, installed, dry_run, yes, opener, now, ask, clock):
+    old_bytes, old_raw = None, None
+    if os.path.lexists(path):
+        if not os.path.isfile(path):
+            raise FetchFailed(1, "{} is not a file".format(path))
+        with open(path, "rb") as f:
+            old_bytes = f.read()
+        check = os.path.join(folder, "current")
+        os.makedirs(check)
+        with open(os.path.join(check, "prices.json"), "wb") as f:
+            f.write(old_bytes)
+        table, problem = load_prices({"_folder": check, "name": profile.get("name"), "pricing": profile.get("pricing")})
+        if problem or table is None:
+            raise FetchFailed(1, "{} is not usable ({}): fix it first".format(path, problem))
+        if table.get("skippedScoped"):  # Q-J2-6
+            raise FetchFailed(1, "{}: fix it first; nothing is fetched into a file whose scoped entries this tool cannot read".format(
+                "; ".join(w for w in table["warnings"] if "skipped" in w)))
+        old_raw = json.loads(old_bytes.decode("utf-8"))
+        legacy = table["defaultScope"]
+        if old_raw.get("currency") != src["currency"]:
+            raise FetchFailed(1, "the source's currency {} differs from the file's {}: nothing fetched".format(
+                src["currency"], str(old_raw.get("currency"))[:8]))
+    else:
+        pricing = profile.get("pricing") if isinstance(profile.get("pricing"), dict) else {}
+        legacy = (fact_label("provider", pricing.get("defaultProvider")), None, None, None)
+    if installed:  # Q4 (accepted): the default target, with a warning
+        print("Note: this writes the installed profile's prices.json; the next install of the profile overwrites it. "
+              "Use --into <profile package checkout>/profiles/{}/prices.json".format(profile.get("name")), file=sys.stderr)
+    if opener is None:
+        real = http_opener()
+
+        def opener(request, timeout):
+            return real.open(request, timeout=timeout)
+    keys = list(src["urls"])
+    default_key = src.get("defaultRegion") or keys[0]
+    keys = [default_key] + [k for k in keys if k != default_key]
+    deadline = clock() + FETCH_BUDGET
+    files = []
+    for i, key in enumerate(keys):
+        u = src["urls"][key]
+        dest = os.path.join(folder, "{}.download".format(i))
+        files.append((key, dest, download(u["url"], u["maxBytes"], dest, deadline, opener, clock)))
+    batches = []
+    for key, dest, got in files:
+        out, err = run_reader(profile, src, key, dest, folder)
+        for line in err:
+            print("reader ({}): {}".format(key, line))
+        lines, done = parse_reader(out, src, key)
+        batches.append({"key": key, "region": src["urls"][key].get("region"), "url": src["urls"][key]["url"], "lines": lines,
+                        "done": done, "sha256": got["sha256"]})
+    print("Source {} ({}) of profile {} → {}".format(name, src["label"], profile.get("name"), path))
+    for b in batches:
+        d = b["done"]["source"]
+        print("  {}: {} version {} published {}, {} lines, sha256 {}".format(b["key"], b["url"], d["version"], d["publicationDate"],
+                                                                         len(b["lines"]), b["sha256"][:12]))
+    if old_raw is not None:
+        base = json.loads(json.dumps(old_raw))
+    else:
+        base = {"v": 1, "currency": src["currency"], "unit": "per-1M-tokens", "models": {}}
+    new_raw, diff, notes, changes = plan_changes(base, batches, src, name, iso(now)[:10], iso(now), legacy)
+    for line in diff:
+        print(line)
+    for line in notes:
+        print("  " + line)
+    if not changes:
+        print("no change: {} is up to date with {}".format(path, name))
+        return 0
+    if dry_run:
+        print("dry run: {} change(s), nothing written".format(changes))
+        return 0
+    if not yes:
+        answer = ask("write {} change(s) to {}? [y/N] ".format(changes, path))
+        if (answer or "").strip().lower() not in ("y", "yes"):
+            raise FetchFailed(5, "declined: nothing written")
+    write_prices(path, new_raw, old_bytes, old_raw, folder, profile, now)
+    print("written: {} change(s) to {}{}".format(changes, path, " (the old file is beside it as .bak)" if old_bytes is not None else ""))
+    print("Figures follow at each space's next collect (pa-costs collect --resummarize, or the panel's timer).")
+    return 0
 
 
 # ---- launch records (called by pa.py: pa-claude, pa-codex, pa-session) ---------------------------
@@ -4066,6 +4773,19 @@ def cmd_prices(directory):
             print("Note: scoped prices are ignored by pa-costs from before t-032 (it prices everything from the default scope).")
         if rules and rules.get("providers") and not rules.get("defaultProvider") and not (table.get("defaultScope") or (None,))[0]:
             print("Note: the profile has provider rules but no pricing.defaultProvider: rows with a provider are priced only by scopes that name it.")
+    try:
+        prof = pa.load_profile((pa.read_json(os.path.join(directory, "agent.json"), {}) or {}).get("profile"))
+    except pa.Problem:
+        prof = {}
+    sources, source_problems = price_sources(prof)
+    if sources or source_problems:
+        print("Sources: (pa-costs prices fetch --dry-run, in your own terminal)")
+        for sname, src in sorted(sources.items()):
+            print("  {} ({}): {} file{} ({}){}".format(sname, src["label"][:80], len(src["urls"]), "" if len(src["urls"]) == 1 else "s",
+                                                  ", ".join(sorted(src["urls"])),
+                                                  ", default region {}".format(src["defaultRegion"]) if src.get("defaultRegion") else ""))
+        for problem in source_problems:
+            print("  " + problem)
     records, _bad = read_lines(os.path.join(costs_dir(directory), "sessions.jsonl"))
     sessions, chain = sessions_of(records), account_chain(directory)
     unpriced, by_facts = set(), {}
@@ -4111,8 +4831,14 @@ def main(argv=None):
     x = sub.add_parser("reconstruct", help="find and bind the space's sessions from before launch records")
     x.add_argument("--space")
     x.add_argument("--dry-run", action="store_true")
-    p = sub.add_parser("prices", help="the price table in use, and models seen without a price")
+    p = sub.add_parser("prices", help="the price table in use, and models seen without a price; `prices fetch`: the person's")
+    p.add_argument("action", nargs="?", choices=["fetch"], help="fetch: read the profile's declared public price list (the person's)")
     p.add_argument("--space")
+    p.add_argument("--source", help="fetch: a key of the profile's prices.sources")
+    p.add_argument("--into", help="fetch: the prices.json to update (default: the installed profile's)")
+    p.add_argument("--dry-run", action="store_true", help="fetch: show the changes, write nothing")
+    p.add_argument("--yes", action="store_true", help="fetch: write without the question")
+    p.add_argument("--profile", help="fetch: the profile (default: this machine's)")
     add_billed_parser(sub)
     args = parser.parse_args(argv)
     if args.cmd == "collect":
@@ -4137,6 +4863,10 @@ def main(argv=None):
         reconstruct(space_directory(args.space), dry_run=args.dry_run)
         return 0
     if args.cmd == "prices":
+        if args.action == "fetch":
+            return prices_fetch(source=args.source, into=args.into, dry_run=args.dry_run, yes=args.yes, profile_name=args.profile)
+        if args.source or args.into or args.dry_run or args.yes or args.profile:
+            p.error("--source, --into, --dry-run, --yes and --profile go with `prices fetch`")
         return cmd_prices(space_directory(args.space))
     if args.cmd == "billed":
         return cmd_billed(args)
