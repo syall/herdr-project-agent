@@ -16,7 +16,7 @@ import { RulesPane, arm, armHolds, fieldState } from "./rules.js"; // arm, armHo
 import { SetupPane } from "./setup.js";
 import { Keeper, idleShell } from "./keeper.js";
 import { WorkerPane } from "./worker.js";
-import { PushCards, isPush, shownOnly, PUSH, PUSH_OPTIONS } from "./push.js";
+import { PushCards, isPush, shownOnly, PUSH, PUSH_OPTIONS, RUN_TIMEOUT, GRACE } from "./push.js";
 import { CostsPane } from "./costs.js";
 import { Copier, sel } from "./copy.js";
 import { tick, cadence, holdReason, setSchedule, requestPass, PRESETS, MIN_MINUTES } from "./timer.js";
@@ -42,6 +42,7 @@ const noteKey = (spaceId, cardId) => `${spaceId}\0${cardId}`; // note fields are
 // t-045: a card answered from a panel copy is marked there (this.sent, the same key as noteKey) and, for the other
 // copies, in shared ANSWERING { key: { label, note, at, by } }, no longer than ANSWERING_TTL.
 const ANSWERING = "project-agent.answering", ANSWERING_TTL = 120000;
+const ttlOf = (x) => (typeof x?.ttl === "number" ? Math.min(x.ttl, RUN_TIMEOUT + GRACE + ANSWERING_TTL) : ANSWERING_TTL); // a push run in flight carries its own (t-045 round 2)
 const isoAt = (ms) => new Date(ms).toISOString().replace(/\.\d+Z$/, "Z");
 
 // Whether this panel is on screen: a block showing it in the shown layout with no hidden node above
@@ -96,7 +97,8 @@ export default class ProjectAgent extends View {
     this.viewShown = null; // the view the last render drew (this.view, or the one picked for null)
     this.rules = new RulesPane((options) => this.field(options));
     this.copier = new Copier(); // the Copy controls of cards and tasks (copy.js, t-026)
-    this.push = new PushCards(); // push cards: the last pa-push-main check and run of each (push.js)
+    // push cards: the last pa-push-main check and run of each (push.js); its runs take the shared mark (t-045 round 2)
+    this.push = new PushCards((spaceId, id, label, running) => this.sharePush(spaceId, id, label, running));
     // The Costs view: each space's last summary and billed comparison (costs.js); it reads and runs only while
     // this check holds (asked live: `asleep` is updated only by the next reload).
     this.costs = new CostsPane((id) => this.view === "costs" && spaces().find((s) => s.active)?.id === id && onScreen());
@@ -490,14 +492,15 @@ export default class ProjectAgent extends View {
     const k = noteKey(space.id, entry.id), own = this.sent[k];
     if (own) return own;
     const o = (shared(ANSWERING) ?? {})[k];
-    if (o && o.by !== this.me && typeof o.at === "number" && Date.now() - o.at < ANSWERING_TTL) return { label: String(o.label ?? ""), note: o.note ?? null, at: o.at, state: "elsewhere" };
+    if (o && o.by !== this.me && typeof o.at === "number" && Date.now() - o.at < ttlOf(o)) return { label: String(o.label ?? ""), note: o.note ?? null, at: o.at, state: "elsewhere" };
     return null;
   }
 
   // Marks the card saving, here and in the shared key (expired entries pruned).
   markSaving(space, entry, label, note) {
     const k = noteKey(space.id, entry.id), at = Date.now();
-    const m = { label, note: note || null, at, state: "saving", before: null, after: null, why: null, seq: this.seq };
+    // before: the open copy the panel had (answerDecision's own read replaces it on success); path: to tell a card not read.
+    const m = { label, note: note || null, at, state: "saving", before: typeof entry.text === "string" ? entry.text : null, after: null, why: null, seq: this.seq, path: entry.path };
     this.sent[k] = m;
     this.shareMark(k, { label, note: note || null, at, by: this.me });
     return m;
@@ -505,14 +508,24 @@ export default class ProjectAgent extends View {
 
   shareMark(k, value) {
     const now = Date.now(), all = {};
-    for (const [key, x] of Object.entries(shared(ANSWERING) ?? {})) if (key !== k && typeof x?.at === "number" && now - x.at < ANSWERING_TTL) all[key] = x;
+    for (const [key, x] of Object.entries(shared(ANSWERING) ?? {})) if (key !== k && typeof x?.at === "number" && now - x.at < ttlOf(x)) all[key] = x;
     if (value) all[k] = value;
     setShared(ANSWERING, all);
   }
 
+  // A push card's run (push.js share, t-045 round 2): the same shared mark, so another window draws the card locked and
+  // never runs pa-push-main. While the run is in flight the mark lasts as long as the run may (RUN_TIMEOUT); once it ended
+  // answered (or unknown) ANSWERING_TTL from then; label null (refused, or a check read it open): this copy's mark goes.
+  sharePush(spaceId, id, label, running) {
+    const k = noteKey(spaceId, id);
+    if (label === null) { if ((shared(ANSWERING) ?? {})[k]?.by === this.me) this.shareMark(k, null); return; }
+    this.shareMark(k, { label, note: null, at: Date.now(), by: this.me, ...(running ? { ttl: RUN_TIMEOUT + GRACE + ANSWERING_TTL } : {}) });
+  }
+
   // The card's write threw: read the file once to tell. Answered (here, or before by another route): it stays answered.
-  // Open: the write really failed; the mark goes and the card says so (W3). Unreadable: unsure, locked until a load
-  // newer than now reads it (resolveMarks).
+  // Open and unchanged (the text the panel had): the write really failed; the mark goes and the card says so (W3). Open
+  // with other text: the card changed since; the mark goes and the file is shown. Unreadable: unsure, locked until a
+  // load newer than now reads it (resolveMarks).
   async notSaved(space, entry, m, why, cx) {
     const k = noteKey(space.id, entry.id);
     let text;
@@ -520,9 +533,12 @@ export default class ProjectAgent extends View {
     let card = null;
     if (typeof text === "string") { try { card = JSON.parse(text); } catch { card = null; } }
     Object.assign(m, { why, seq: this.seq });
-    if (text === null || (card && card.status === "open")) {
+    if (text === null || (card && card.status === "open" && (m.before === null || text === m.before))) {
       delete this.sent[k]; this.shareMark(k, null);
       this.failed[entry.id] = `Not saved: ${why.replace(/\.?\s*$/, ".")} Pick an option and submit again.`;
+    } else if (card && card.status === "open") {
+      delete this.sent[k]; this.shareMark(k, null);
+      this.failed[entry.id] = `Not saved: ${why.replace(/\.?\s*$/, ".")} The card has changed since; it is shown as it is now.`;
     } else if (card && typeof card === "object") {
       Object.assign(m, { state: "saved", label: String(card.answer ?? card.status ?? m.label), note: card.note ?? null }); // what the file has
       this.shareMark(k, { label: m.label, note: m.note, at: m.at, by: this.me });
@@ -531,17 +547,21 @@ export default class ProjectAgent extends View {
   }
 
   // From commit() of a load of `space` that listed its cards (token: the load's): each of this copy's marks there.
+  // Only a read of the card file made by this load resolves a mark: a card whose read failed (its last known copy,
+  // `fallback`, or left out and named in `cards.unread`) never does (t-045 round 2).
   resolveMarks(space, token, cards) {
     for (const [k, m] of Object.entries(this.sent)) {
       if (!k.startsWith(noteKey(space.id, ""))) continue;
       if (m.state === "saving") continue; // the write is in flight
       const entry = cards.find((c) => noteKey(space.id, c.id) === k);
+      if (entry?.fallback || (!entry && m.path && cards.unread?.has(m.path))) continue; // not read now
       // Gone, not a card, read answered, or the text written: the file shows it now.
       if (!entry?.card || entry.card.status !== "open" || (m.after && entry.text === m.after)) { delete this.sent[k]; continue; }
       if (token <= m.seq) continue; // a read that started before the write ended: the old copy
-      if (m.state === "unsure") { // a fresh read finds it open: the write did not happen
+      if (m.state === "unsure") { // a fresh read finds it open
         delete this.sent[k]; this.shareMark(k, null);
-        this.failed[entry.id] = `Not saved: ${String(m.why ?? "the write failed").replace(/\.?\s*$/, ".")} Pick an option and submit again.`;
+        // Unchanged (the text the panel had): the write did not happen. Other text: the card changed since; shown as it is.
+        if (m.before !== null && entry.text === m.before) this.failed[entry.id] = `Not saved: ${String(m.why ?? "the write failed").replace(/\.?\s*$/, ".")} Pick an option and submit again.`;
         continue;
       }
       if (m.before !== null && entry.text === m.before) continue; // the copy from before the write (a read's fallback)
@@ -552,6 +572,7 @@ export default class ProjectAgent extends View {
   // A push card's Submit: pa-push-main run (push.js) records the answer and pushes; the panel shows
   // its result, reloads and tells the orchestrator.
   answerPush(space, entry, label, cx) {
+    if (this.mark(space, entry)) return; // answered in another panel window: never a run from here (t-045 round 2)
     const note = (this.notes[noteKey(space.id, entry.id)]?.value() ?? "").trim();
     // told() runs when the tool's run has ended, long after this click: it gets the run task's cx
     // (a cx is valid only for the call that gave it; this click's would throw "stale context").
@@ -874,12 +895,13 @@ export default class ProjectAgent extends View {
     }
     const push = isPush(entry.card), running = push ? this.push.running(space.id, entry.id) : null;
     // t-045: a card answered from here (or another copy) is drawn answered while the file read still says open.
-    const m = !push && c.status === "open" ? this.mark(space, entry) : null;
-    if (m) c = { ...c, status: "answered", answer: m.label, note: m.note, answered: isoAt(m.at) };
+    // A push card: only another window's mark (this copy's own lock is push.js locked()); its block stays the open one.
+    const m = c.status === "open" ? this.mark(space, entry) : null;
+    if (m && !push) c = { ...c, status: "answered", answer: m.label, note: m.note, answered: isoAt(m.at) };
     const markLine = m?.state === "saving" ? "Saving…" : m?.state === "unsure" ? "Could not tell whether the answer was saved; reading the card again."
       : m?.state === "elsewhere" ? "Answered in another panel window." : null;
-    const pushAnswered = push && c.status === "open" ? this.push.answeredHere(space.id, entry.id) : null; // a run from here ended answered
-    const open = c.status === "open", busy = Boolean(this.busy[entry.id]) || Boolean(running) || (push && this.push.locked(space.id, entry.id));
+    const pushAnswered = push && c.status === "open" ? this.push.answeredHere(space.id, entry.id) ?? m?.label ?? null : null; // a run from here (or another window) answered it
+    const open = c.status === "open", busy = Boolean(this.busy[entry.id]) || Boolean(running) || (push && (this.push.locked(space.id, entry.id) || Boolean(m)));
     const task = c.task && (this.data?.ledger?.tasks ?? []).find((x) => x.id === c.task);
     const picked = open ? this.choice[entry.id] ?? null : null;
     const ready = Boolean(picked) && !busy && !(push && shownOnly(entry)) && (!push || picked !== PUSH || this.push.canSubmit(space.id, entry.id)); // Push: a fresh check that passed; a shown-only card: never

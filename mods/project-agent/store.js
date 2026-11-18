@@ -258,7 +258,7 @@ export const MAX_CARDS = 200;
 // [{ id, path, text, card | null, error | null }], open first, newest first.
 export function parseCards(files) {
   const cards = [];
-  for (const { name, path, text } of files) {
+  for (const { name, path, text, fallback } of files) {
     if (text === null || text === undefined) continue;
     let value = null, error = null;
     try { value = JSON.parse(text); } catch (e) { error = String(e.message ?? e); }
@@ -267,7 +267,7 @@ export function parseCards(files) {
     // mismatch: its own id when that differs (shown only, never checked or run); dash: a name that reads as an option.
     const fileId = name.replace(/\.json$/, ""), push = Boolean(valid && isPush(value));
     const flags = !push ? {} : { ...(value.id !== undefined && String(value.id) !== fileId ? { mismatch: String(value.id) } : {}), ...(fileId.startsWith("-") ? { dash: true } : {}) };
-    cards.push({ id: push ? fileId : value?.id ?? fileId, path, text, card: valid ? value : null, error: error ?? (valid ? null : "not a decision card (needs question and options)"), ...flags });
+    cards.push({ id: push ? fileId : value?.id ?? fileId, path, text, card: valid ? value : null, error: error ?? (valid ? null : "not a decision card (needs question and options)"), ...flags, ...(fallback ? { fallback: true } : {}) });
   }
   const when = (c) => String(c.card?.created ?? "");
   return cards.sort((a, b) => Number(b.card?.status === "open") - Number(a.card?.status === "open") || when(b).localeCompare(when(a)) || b.id.localeCompare(a.id));
@@ -294,7 +294,8 @@ const byteOrder = (a, b) => (a < b ? -1 : a > b ? 1 : 0); // names are ASCII: co
 // fails), live() (false: the caller no longer wants the result; the fallback is skipped and the
 // result is null, which the caller must not take for "no cards"), known (the last known cards,
 // [{ path, text }]: a card whose own read times out or fails on the fallback path is that copy, else
-// left out). Only exit 0 is a whole batch (exit 3 with no output: no folder); a call killed part way
+// left out; such a card has fallback: true, and the list's `unread` (a Set of paths) names every card not read now,
+// t-045). Only exit 0 is a whole batch (exit 3 with no output: no folder); a call killed part way
 // can print whole-looking pairs. null also when the listing never answered (the batch gave no whole
 // answer and `ls` timed out or failed): unknown, not "no cards". A listing that answered (no folder,
 // an empty one) is [].
@@ -316,12 +317,16 @@ export async function loadDecisions(space, { cx, batchOnly = false, live, known 
   } catch { return null; }
   const picked = names.slice(0, MAX_CARDS);
   const last = new Map((known ?? []).filter((c) => c?.path && typeof c.text === "string").map((c) => [c.path, c.text]));
+  const unread = new Set();
   const texts = await Promise.all(picked.map(async (name) => {
     let text;
     try { text = await withTimeout(cx, readTextFile(`${dir}/${name}`, { on })); } catch { text = TIMED_OUT; }
+    if (text === TIMED_OUT) unread.add(`${dir}/${name}`);
     return text === TIMED_OUT ? last.get(`${dir}/${name}`) ?? null : text; // a read that hangs or fails: its last known copy, else left out
   }));
-  return parseCards(picked.map((name, i) => ({ name, path: `${dir}/${name}`, text: texts[i] })));
+  const list = parseCards(picked.map((name, i) => ({ name, path: `${dir}/${name}`, text: texts[i], fallback: unread.has(`${dir}/${name}`) && texts[i] !== null })));
+  list.unread = unread; // t-045: a card's mark is resolved only by a read made now (main.js resolveMarks)
+  return list;
 }
 
 // Compare-and-write on the space's machine: the file must be unchanged since it was read. Under an exclusive flock
