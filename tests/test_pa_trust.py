@@ -754,6 +754,153 @@ class R3dGitFailures(Base):
         self.assertIn("dubious ownership", why)
 
 
+class R4aSpaceFolderSymlinks(Base):
+    """Review F1-R3 (round 4): a project folder holding the real path of any space folder (<pa home>/spaces/<id>,
+    through a symlink) is refused like one overlapping the PA home: this space's or another's; no key sent."""
+
+    def link_space(self, space_id):
+        kept = os.path.join(self.P, "kept-" + space_id)
+        link = os.path.join(self.pa_home, "spaces", space_id)
+        if os.path.isdir(link):
+            shutil.move(link, kept)
+        else:
+            dump({"version": 1, "tasks": []}, os.path.join(kept, "ledger.json"))
+            os.makedirs(os.path.join(kept, "evidence", "t-1"))
+        os.symlink(kept, link)
+        return kept
+
+    def refused_with(self, space_id):
+        kept = self.link_space(space_id)
+        self.assertIsNotNone(pa_hooks.trust_project(self.P, self.home, self.pa_home)[1])
+        for shown in (os.path.join(kept, "evidence", "t-1"), kept, self.P, self.tree):
+            with self.subTest(shown):
+                os.makedirs(shown, exist_ok=True)
+                shutil.rmtree(self.hc)
+                os.makedirs(self.hc)
+                self.terminal(shown)
+                self.screens(fx.new_screen(shown), fx.new_screen(shown))
+                self.expect("refused", "Project Agent's home")
+
+    def test_this_space_symlinked_into_the_project_folder(self):
+        self.refused_with("sp1")
+
+    def test_another_space_symlinked_into_the_project_folder(self):
+        self.refused_with("sp2")
+
+    def test_space_symlinked_elsewhere_leaves_the_project_folder_allowed(self):
+        kept = os.path.join(self.root, "elsewhere", "sp2")
+        os.makedirs(os.path.join(kept, "evidence", "t-1"))
+        os.symlink(kept, os.path.join(self.pa_home, "spaces", "sp2"))
+        self.assertIsNone(pa_hooks.trust_project(self.P, self.home, self.pa_home)[1])
+        folder = os.path.join(self.space, "evidence", "t-1")
+        os.makedirs(folder)
+        self.assertIn("evidence", self.accepts(folder, cwd=folder)["why"])
+
+
+class R4bBrokenGitFile(Base):
+    """Verify L7 (round 4): git's 'not a git repository: <gitdir>' (a .git file naming a missing git dir, as a
+    stale worktree leaves) is not outside git: uncertain with git's reason. Outside git only when git finds no
+    repository at all ('not a git repository (or any ...')."""
+
+    def broken(self, folder):
+        write(os.path.join(folder, ".git"), "gitdir: {}\n".format(os.path.join(self.root, "missing", "worktrees", "x")))
+
+    def test_broken_git_file_in_the_folder(self):
+        n = os.path.join(self.P, "n")
+        os.makedirs(n)
+        self.broken(n)
+        self.terminal(n)
+        self.screens(fx.new_screen(n), fx.new_screen(n))
+        self.expect("uncertain", "not a git repository")
+        key, why = pa_hooks.trust_key_why(n)
+        self.assertIsNone(key)
+        self.assertIn("not a git repository", why)
+
+    def test_broken_git_file_in_an_ancestor_of_the_project_folder(self):
+        big = os.path.join(self.root, "big")
+        project = os.path.join(big, "proj")
+        notes = os.path.join(project, "notes")
+        os.makedirs(notes)
+        self.broken(big)
+        self.agent({"space": "sp1", "terminal": "t0", "profile": "test", "project": project})
+        self.terminal(notes)
+        self.screens(fx.new_screen(notes), fx.new_screen(notes))
+        self.expect("uncertain", "not a git repository")
+
+    def test_no_repository_at_all_still_outside_git(self):
+        notes = os.path.join(self.P, "notes")
+        os.makedirs(notes)
+        self.assertEqual((os.path.realpath(notes), None), pa_hooks.trust_key_why(notes))
+
+
+TRUST_GIT_VARS = ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_CEILING_DIRECTORIES",
+                  "GIT_DISCOVERY_ACROSS_FILESYSTEM")
+
+
+class R4cGitEnvironment(Base):
+    """Review L-R3a (round 4): pa-trust's git calls run without GIT_DIR, GIT_WORK_TREE, GIT_COMMON_DIR,
+    GIT_CEILING_DIRECTORIES and GIT_DISCOVERY_ACROSS_FILESYSTEM, and with LC_ALL=C (Review N-R3a): each variable
+    set in the caller's environment does not change the key."""
+
+    def setUp(self):
+        super().setUp()
+        self.outer = make_repo(os.path.join(self.home, "outer"))
+        self.wt_out = os.path.join(self.P, "worktrees", "b")  # main checkout outside P: key self.outer
+        git(self.outer, "worktree", "add", "-q", "-b", "b", self.wt_out)
+        self.big = make_repo(os.path.join(self.root, "big"))
+        self.big_n = os.path.join(self.big, "proj", "n")  # inside a larger repository: key self.big
+        os.makedirs(self.big_n)
+
+    def values(self):
+        return {"GIT_DIR": os.path.join(self.repo, ".git"), "GIT_COMMON_DIR": os.path.join(self.repo, ".git"),
+                "GIT_WORK_TREE": self.repo, "GIT_CEILING_DIRECTORIES": self.big + os.pathsep + self.P,
+                "GIT_DISCOVERY_ACROSS_FILESYSTEM": "1"}
+
+    def with_env(self, extra):
+        saved = {k: os.environ.get(k) for k in extra}
+        os.environ.update(extra)
+
+        def restore():
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        self.addCleanup(restore)
+        return restore
+
+    def test_each_variable_leaves_the_key_alone(self):
+        clean = {f: pa_hooks.trust_key_why(f) for f in (self.wt_out, self.big_n, self.tree)}
+        self.assertEqual(os.path.realpath(self.outer), clean[self.wt_out][0])
+        self.assertEqual(os.path.realpath(self.big), clean[self.big_n][0])
+        for var, value in list(self.values().items()) + [("GIT_DIR", "/nonexistent")]:
+            restore = self.with_env({var: value})
+            for folder, want in clean.items():
+                with self.subTest(var=var, folder=folder):
+                    self.assertEqual(want, pa_hooks.trust_key_why(folder))
+            restore()
+
+    def test_end_to_end_with_the_variables_set(self):
+        self.with_env(self.values())
+        self.terminal(self.wt_out)
+        self.screens(fx.new_screen(self.wt_out), fx.new_screen(self.wt_out))
+        self.expect("outside", os.path.realpath(self.outer))
+        self.agent({"space": "sp1", "terminal": "t0", "profile": "test", "project": os.path.join(self.big, "proj")})
+        shutil.rmtree(self.hc)
+        os.makedirs(self.hc)
+        self.terminal(self.big_n)
+        self.screens(fx.new_screen(self.big_n), fx.new_screen(self.big_n))
+        self.expect("outside", os.path.realpath(self.big))
+
+    def test_unit_git_environment(self):
+        given = dict({v: "x" for v in TRUST_GIT_VARS}, LC_ALL="fr_FR.UTF-8", LANG="fr_FR.UTF-8", PATH="/bin")
+        env = pa_hooks.trust_git_env(given)
+        for var in TRUST_GIT_VARS:
+            self.assertNotIn(var, env)
+        self.assertEqual("C", env["LC_ALL"])
+        self.assertEqual("/bin", env["PATH"])
+
+
 # ---- R5 no grants of its own --------------------------------------------------------------------------------
 
 class R5NoGrants(Base):
