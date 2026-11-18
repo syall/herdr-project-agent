@@ -125,6 +125,38 @@ class GateGit(Runs):
         r = self.assertRefused(self.run_push(), "C8a", "the checks saw this content")
         self.assertIn("1 commit checked, 2 now", r["refusal"]["message"])
 
+    def test_g10_c8a_passes_a_clean_rebase_once_local_main_has_the_tip(self):  # t-052 J1 round 2 (verify MF-2)
+        self.require_content(self.task_commit)
+        self.assertEqual(self.gate(), 0)  # the check at X == HEAD: X's record stored with its base
+        self.commit_on(self.main, "m.txt", "main moves")
+        sh(self.wt, "git", "rebase", "-q", "main")
+        tip = self.head(self.wt)
+        self.assertNotEqual(tip, self.task_commit)
+        self.assertEqual(self.gate(), 0)  # the rebased tip's record stored with its base
+        sh(self.main, "git", "merge", "-q", "--ff-only", tip)  # local main == commit (pa-push-main's merge False)
+        task = load(os.path.join(self.dir, "ledger.json"))["tasks"][0]
+        result = pa_push.pa_hooks.evaluate_gate(self.dir, task, "review", runner=pa_push.Session().gate_git)
+        check = [c for c in result["checks"] if c["check"] == "the checks saw this content"][0]
+        self.assertTrue(check["ok"], check)
+        self.assertIn("same content as the checked " + self.task_commit[:7], check.get("note", ""))
+        os.remove(self.card_path())
+        code, _o, err = self.plan()
+        self.assertEqual(code, 0, err)
+        self.assertIs(self.card()["push"]["merge"], False)
+        r = self.check()
+        self.assertTrue(r["ok"], r)
+
+    def test_g11_c8a_refuses_a_replace_ref_over_unchecked_content(self):  # t-052 J1 round 2 (verify MF-1)
+        self.require_content(self.task_commit)
+        unchecked = self.commit_on(self.wt, "d.txt", "after the check")
+        sh(self.wt, "git", "replace", unchecked, self.task_commit)
+        task = load(os.path.join(self.dir, "ledger.json"))["tasks"][0]
+        result = pa_push.pa_hooks.evaluate_gate(self.dir, task, "review", runner=pa_push.Session().gate_git)
+        check = [c for c in result["checks"] if c["check"] == "the checks saw this content"][0]
+        self.assertFalse(check["ok"], check)
+        r = self.assertRefused(self.run_push(), "C8a", "the checks saw this content")
+        self.assertIn("d.txt", r["refusal"]["message"])
+
     def nested_repo(self, commit=True):
         """A nested repository wt/sub (a submodule entry), committed or only staged in the task worktree."""
         sub = os.path.join(self.wt, "sub")

@@ -860,6 +860,102 @@ class C10Refusals(ContentBase):
         sh(self.wt, "git", "rebase", "-q", branch)
 
 
+class C11Position(ContentBase):
+    """t-052 J1 round 2 (review M1, L1; verify MF-2): each record is computed against the base it was made on, not
+    today's onto. Local main at or past the tip (a hand merge, a push card's ff) neither passes unseen commits nor
+    fails a clean carry-over."""
+
+    def ff_main(self, sha=None):
+        sh(self.proj, "git", "merge", "-q", "--ff-only", sha or self.head())
+
+    def test_c11_main_at_head_with_an_unreviewed_commit_no_records(self):  # review probe a, A2
+        self.checked(self.f2)
+        self.commit(self.wt, "evil.txt", "unreviewed\n")
+        self.ff_main()
+        line = self.assertContentFails("already on main")
+        self.assertNotIn("same content", line)
+        self.assertIs(self.gate_json("t-1")["content"][0]["same"], None)
+
+    def test_c11b_main_at_head_with_an_unreviewed_commit_after_records(self):
+        self.checked(self.f2)
+        self.assertContentOk()  # X == HEAD: X's record (and HEAD's) stored with the old base
+        self.commit(self.wt, "evil.txt", "unreviewed\n")
+        self.assertContentFails("evil.txt")
+        self.ff_main()
+        line = self.assertContentFails("evil.txt")
+        self.assertNotIn("same content", line)
+
+    def test_c11c_main_fast_forwarded_to_a_cleanly_rebased_tip(self):  # verify MF-2, review probe b B2
+        self.checked(self.f2)
+        self.assertContentOk()
+        first = self.gate_json("t-1")["content"][0]
+        self.on_main("b.txt", "b moved\n")
+        tip = self.rebase()
+        self.assertContentOk("same content as the checked " + self.f2[:7])
+        self.ff_main(tip)
+        self.assertContentOk("same content as the checked " + self.f2[:7])
+        now = self.gate_json("t-1")["content"][0]
+        self.assertEqual((now["change"], now["sequence"]), (first["change"], first["sequence"]))
+        self.assertIs(now["same"], True)
+        self.assertNotEqual(now["base"], tip)
+
+    def test_c11d_main_at_a_rebased_tip_whose_base_was_never_stored(self):  # review probe b B3
+        self.checked(self.f2)
+        self.assertContentOk()
+        self.on_main("b.txt", "b moved\n")
+        self.ff_main(self.rebase())  # no gate run between the rebase and the ff: HEAD's base is not known
+        self.assertContentFails("already on main")
+
+    def test_c11e_checked_commit_already_on_main_no_record(self):
+        self.checked(self.f1)
+        self.ff_main(self.f1)  # X is on main, HEAD (f2) one commit past it; nothing stored
+        line = self.assertContentFails("already on main")
+        self.assertIn(self.f1[:7], line)
+
+    def test_c11f_checked_commit_on_main_with_a_stored_record(self):
+        self.checked(self.f1)
+        self.assertContentFails("c.txt")  # stores X's record against the old base
+        self.ff_main(self.f1)
+        self.assertContentFails("c.txt")  # X's change stays f1's, so HEAD still adds c.txt
+
+    def test_c11g_a_stored_base_that_is_not_an_ancestor_fails(self):
+        self.checked(self.f1)
+        self.commit(self.wt, "d.txt", "d\n")
+        self.assertContentFails()
+        data = self.records()
+        self.on_main("m.txt", "m\n")
+        other = sh(self.proj, "git", "rev-parse", "HEAD")
+        for r in data["records"]:
+            if r["commit"] == self.f1:
+                r["base"] = other
+        dump(data, os.path.join(self.dir, "content", "t-1.json"))
+        self.assertContentFails("not an ancestor")
+
+
+class C12SteeringRefs(ContentBase):
+    """t-052 J1 round 2 (verify MF-1, review L2): refs a repository can set do not change the answer."""
+
+    def test_c12_a_replace_ref_does_not_make_unchecked_content_look_checked(self):  # verify s11
+        self.checked(self.f2)
+        unchecked = self.commit(self.wt, "d.txt", "unchecked\n")
+        sh(self.wt, "git", "replace", unchecked, self.f2)
+        line = self.assertContentFails("d.txt", "2 commits checked, 3 now")
+        self.assertNotIn("same content", line)
+        result = pa_hooks.evaluate_gate(self.dir, self.task, "review")
+        check = [c for c in result["checks"] if c["check"] == CHECK][0]
+        self.assertFalse(check["ok"], check)
+
+    def test_c12c_origin_head_does_not_pick_the_base_branch(self):
+        self.checked(self.f1)
+        unchecked = self.head()
+        sh(self.proj, "git", "branch", "steer", unchecked)
+        sh(self.proj, "git", "update-ref", "refs/remotes/origin/steer", unchecked)
+        sh(self.proj, "git", "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/steer")
+        line = self.assertContentFails("c.txt")
+        self.assertNotIn("same content", line)
+        self.assertEqual(self.gate_json("t-1")["content"][0]["onto"], "main")
+
+
 class S1FullSuiteRecord(Base):
     def test_s1_each_run_is_recorded(self):
         proj = self.repo()
