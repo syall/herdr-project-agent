@@ -434,5 +434,590 @@ class Child(Base):
         self.assertNotIn("not restarting by itself", out.getvalue())
 
 
+
+# ---- the request, the watcher, the pre-check and the exec (R4, R6, R7, S1, S2, S5) -----------------------------
+
+class Execd(Exception):
+    """Raised by the os.execv recorder: the test process is never replaced."""
+
+
+def real_tools():
+    """The real pa.py and pa_costs.py as the installed tools of the temp home, stamped."""
+    for name in ("pa.py", "pa_costs.py"):
+        shutil.copy2(os.path.join(REPO, "runtime", "tools", name), os.path.join(pa.ROOT, "tools", name))
+
+
+class Requests(Base):
+    def setUp(self):
+        super().setUp()
+        self.agent(sessionStarted=True)
+        self.execs = []
+
+        def recorder(path, argv):
+            self.execs.append((path, list(argv)))
+            raise Execd()
+        self.recorder = recorder
+        self.saved_timeouts = (pa.SELF_CHECK_TIMEOUT, pa.PROBE_TIMEOUT)
+
+    def tearDown(self):
+        pa.SELF_CHECK_TIMEOUT, pa.PROBE_TIMEOUT = self.saved_timeouts
+        super().tearDown()
+
+    def ctx(self, child=None):
+        ctx = self.record()
+        ctx.update(child=child if child is not None else FakeChild(), directory=self.dir, project=self.project,
+                   running={"since": time.time() - pa.RAN - 5, "session": SID, "marked": False})
+        return ctx
+
+    def request(self, ctx, **over):
+        at = time.time()
+        req = {"version": 1, "id": "r-" + str(len(self.calls)) + "-" + str(int(at * 1000) % 100000), "space": SP,
+               "instance": ctx["launcher"]["instance"], "terminal": "t1", "at": pa.iso_time(at),
+               "expires": pa.iso_time(at + 600), "by": "pa-restart", "why": "test", "now": False, "fresh": False}
+        req.update(over)
+        dump(req, os.path.join(self.dir, "restart-request.json"))
+        return req
+
+    def outcome(self):
+        return load(os.path.join(self.dir, "launcher.json")).get("restart")
+
+    def gone(self):
+        return not os.path.exists(os.path.join(self.dir, "restart-request.json"))
+
+    def poll(self, ctx):
+        with contextlib.redirect_stdout(io.StringIO()):
+            pa.watch_once(ctx, self.dir, "t1", SP)
+
+    def passing_precheck(self):
+        pa.restart_precheck = lambda *a, **k: ({"tools": pa.hash_or_none(os.path.join(pa.ROOT, "tools"), True),
+                                                "core": pa.hash_or_none(os.path.join(pa.ROOT, "core"))}, None)
+
+
+class AC6_3_Refusals(Requests):
+    def test_each_bad_request_is_refused_and_deleted(self):
+        cases = {"space": {"space": "sp9"}, "instance": {"instance": "someone-else"}, "terminal": {"terminal": "t7"},
+                 "expired": {"expires": pa.iso_time(time.time() - 1)}, "types": {"instance": 3},
+                 "too long": {"expires": pa.iso_time(time.time() + 7200)}}
+        for name, over in cases.items():
+            with self.subTest(case=name):
+                ctx = self.ctx()
+                req = self.request(ctx, **over)
+                self.poll(ctx)
+                out = self.outcome()
+                self.assertEqual(out["outcome"], "refused", out)
+                self.assertTrue(out["why"])
+                if name != "types":
+                    self.assertEqual(out["request"], req["id"])
+                self.assertTrue(self.gone())
+                self.assertEqual(ctx["child"].signals, [])
+                self.assertNotIn("after", ctx)
+
+    def test_unparseable(self):
+        ctx = self.ctx()
+        write(os.path.join(self.dir, "restart-request.json"), "{not json")
+        self.poll(ctx)
+        self.assertEqual(self.outcome()["outcome"], "refused")
+        self.assertTrue(self.gone())
+        self.assertEqual(ctx["child"].signals, [])
+
+    def test_an_older_instance_of_this_launcher_is_deleted_silently(self):
+        ctx = self.ctx()
+        ctx["formerInstances"] = {"old-instance"}
+        self.request(ctx, instance="old-instance")
+        self.poll(ctx)
+        self.assertTrue(self.gone())
+        self.assertIsNone(self.outcome())
+        self.assertEqual(ctx["child"].signals, [])
+
+    def test_no_request_nothing_happens(self):
+        ctx = self.ctx()
+        self.poll(ctx)
+        self.assertIsNone(self.outcome())
+        self.assertEqual(self.calls, [])
+
+
+class AC6_4_TheTurn(Requests):
+    def statuses(self, *seq):
+        seq = list(seq)
+        pa.hc_get = lambda address: {"state": "live", "status": {"state": seq.pop(0) if len(seq) > 1 else seq[0]}}
+
+    def test_waits_while_working(self):
+        self.passing_precheck()
+        self.statuses("working", "working", "idle")
+        ctx = self.ctx()
+        self.request(ctx)
+        self.poll(ctx)
+        self.poll(ctx)
+        self.assertEqual(ctx["child"].signals, [])
+        self.assertFalse(self.gone())
+        self.poll(ctx)
+        self.assertEqual(ctx["child"].signals, [signal.SIGTERM])
+        self.assertEqual(ctx["after"]["kind"], "exec")
+
+    def test_blocked_waits_too(self):
+        self.passing_precheck()
+        self.statuses("blocked")
+        ctx = self.ctx()
+        self.request(ctx)
+        for _ in range(3):
+            self.poll(ctx)
+        self.assertEqual(ctx["child"].signals, [])
+
+    def test_now_acts_at_once(self):
+        self.passing_precheck()
+        self.statuses("working")
+        ctx = self.ctx()
+        req = self.request(ctx, now=True)
+        self.poll(ctx)
+        self.assertEqual(ctx["child"].signals, [signal.SIGTERM])
+        self.assertIn(["hc", "label", "t1", "herdr.pa.restarting=" + req["id"]], self.calls)
+        self.assertTrue(load(os.path.join(self.dir, "agent.json"))["sessionStarted"])
+
+    def test_expiry_while_working_is_refused(self):
+        self.passing_precheck()
+        self.statuses("working")
+        ctx = self.ctx()
+        self.request(ctx, expires=pa.iso_time(time.time() + 1))
+        self.poll(ctx)
+        time.sleep(1.3)
+        self.poll(ctx)
+        out = self.outcome()
+        self.assertEqual(out["outcome"], "refused")
+        self.assertIn("mid-turn", out["why"])
+        self.assertEqual(ctx["child"].signals, [])
+        self.assertTrue(self.gone())
+
+    def test_agent_turn_words(self):
+        for status, word in (({"state": "working"}, "working"), ("blocked", "blocked"), ({"state": "idle"}, "idle"),
+                             (None, "unknown"), ({"state": "done"}, "idle")):
+            pa.hc_get = lambda address, s=status: {"status": s} if s is not None else {}
+            self.assertEqual(pa.agent_turn("t1"), word)
+
+
+class AC6_2_PreCheck(Requests):
+    def failing(self, why_part):
+        ctx = self.ctx()
+        self.request(ctx, now=True)
+        self.poll(ctx)
+        out = self.outcome()
+        self.assertEqual(out["outcome"], "failed", out)
+        self.assertIn(why_part, out["why"])
+        self.assertEqual(ctx["child"].signals, [])
+        self.assertNotIn("after", ctx)
+        self.assertTrue(self.gone())
+
+    def test_no_installed_json(self):
+        self.failing("installed.json")
+
+    def test_tools_differ_from_the_stamp(self):
+        real_tools()
+        self.stamp()
+        write(os.path.join(pa.ROOT, "tools", "pa_costs.py"), "y = 2\n")
+        self.failing("tools")
+
+    def test_core_differs_from_the_stamp(self):
+        real_tools()
+        self.stamp()
+        write(os.path.join(pa.ROOT, "core", "orchestrator.md"), "# changed\n")
+        self.failing("core")
+
+    def test_self_check_exit_1(self):
+        write(os.path.join(pa.ROOT, "tools", "pa.py"), "import sys\nsys.exit(1)\n")
+        self.stamp()
+        self.failing("self-check")
+
+    def test_self_check_prints_no_result(self):
+        self.stamp()  # tools/pa.py prints 'pa'
+        self.failing("self-check")
+
+    def test_self_check_hangs(self):
+        write(os.path.join(pa.ROOT, "tools", "pa.py"), "import time\ntime.sleep(30)\n")
+        self.stamp()
+        pa.SELF_CHECK_TIMEOUT = 1
+        began = time.time()
+        self.failing("did not finish")
+        self.assertLess(time.time() - began, 10)
+
+    def test_the_real_launcher_passes(self):
+        real_tools()
+        self.stamp()
+        pre, why = pa.restart_precheck({}, SP, "test")
+        self.assertIsNone(why)
+        self.assertEqual(pre["tools"], load(os.path.join(pa.ROOT, "installed.json"))["tools"])
+
+
+class SelfCheck(Base):
+    def test_self_check_writes_nothing_and_reports_the_hashes(self):
+        real_tools()
+        self.stamp()
+
+        def listing():
+            return sorted(os.path.relpath(os.path.join(d, f), pa.ROOT) for d, _s, fs in os.walk(pa.ROOT) for f in fs
+                          if "__pycache__" not in d)
+        before = listing()
+        env = dict(os.environ, PATH="/usr/bin:/bin")  # no hc on PATH: a call to it would fail the check
+        r = subprocess.run([sys.executable, os.path.join(pa.ROOT, "tools", "pa.py"), "session", "--self-check",
+                            "--space", SP, "--profile", "test"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           universal_newlines=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        result = json.loads(r.stdout.strip().splitlines()[-1])
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["tools"], pa.tree_hash(os.path.join(pa.ROOT, "tools"), top_py_only=True))
+        self.assertEqual(result["core"], pa.tree_hash(os.path.join(pa.ROOT, "core")))
+        self.assertEqual(listing(), before)
+
+    def test_self_check_fails_on_a_bad_profile(self):
+        real_tools()
+        r = subprocess.run([sys.executable, os.path.join(pa.ROOT, "tools", "pa.py"), "session", "--self-check",
+                            "--space", SP, "--profile", "nope"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           universal_newlines=True, timeout=60)
+        self.assertNotEqual(r.returncode, 0)
+
+
+class AC6_1_Exec(Requests):
+    def taken(self, **over):
+        self.passing_precheck()
+        ctx = self.ctx()
+        req = self.request(ctx, now=True, **over)
+        self.poll(ctx)
+        return ctx, req
+
+    def test_exec_argv_is_exact(self):
+        ctx, req = self.taken()
+        self.assertEqual(ctx["child"].signals, [signal.SIGTERM])
+        os.execv = self.recorder
+        with self.assertRaises(Execd), contextlib.redirect_stdout(io.StringIO()):
+            pa.exec_restart(ctx, ctx.pop("after"), self.project, self.dir, "t1")
+        path, argv = self.execs[0]
+        self.assertEqual(path, sys.executable)
+        self.assertEqual(argv, [sys.executable, os.path.join(pa.ROOT, "tools", "pa.py"), "session", "--space", SP,
+                                "--project", self.project, "--profile", "test", "--name", "proj",
+                                "--restarted", req["id"], "--from-instance", ctx["launcher"]["instance"],
+                                "--restart-by", "pa-restart"])
+        self.assertEqual(signal.getsignal(signal.SIGINT), signal.getsignal(signal.SIGINT))  # unchanged (S5)
+
+    def test_fresh_passes_fresh(self):
+        ctx, _req = self.taken(fresh=True)
+        os.execv = self.recorder
+        with self.assertRaises(Execd), contextlib.redirect_stdout(io.StringIO()):
+            pa.exec_restart(ctx, ctx.pop("after"), self.project, self.dir, "t1")
+        self.assertEqual(self.execs[0][1][-1], "--fresh")
+
+    def test_sigint_stays_ignored_across_the_exec(self):  # spec S5
+        ctx, _req = self.taken()
+        seen = []
+        os.execv = lambda path, argv: seen.append(signal.getsignal(signal.SIGINT)) or (_ for _ in ()).throw(Execd())
+        saved = signal.signal(signal.SIGINT, signal.SIG_IGN)
+        try:
+            with self.assertRaises(Execd), contextlib.redirect_stdout(io.StringIO()):
+                pa.exec_restart(ctx, ctx.pop("after"), self.project, self.dir, "t1")
+        finally:
+            signal.signal(signal.SIGINT, saved)
+        self.assertEqual(seen, [signal.SIG_IGN])
+
+    def test_tools_changed_after_the_check_refuses_the_exec(self):
+        ctx, req = self.taken()
+        write(os.path.join(pa.ROOT, "tools", "pa.py"), "print('newer')\n")
+        with contextlib.redirect_stdout(io.StringIO()):
+            pa.exec_restart(ctx, ctx.pop("after"), self.project, self.dir, "t1")  # no_exec would raise
+        out = self.outcome()
+        self.assertEqual((out["outcome"], out["request"]), ("failed", req["id"]))
+        self.assertIn("changed", out["why"])
+        self.assertIn(["hc", "label", "t1", "herdr.pa.restarting="], self.calls)
+
+    def loop(self, exec_fn, starts_before_stop=2):
+        """run_agent where the first Claude is ended for a restart (as the watcher does) and execv is exec_fn."""
+        ctx = self.ctx(child=None)
+        ctx.pop("child")
+        starts = []
+
+        class Stop(Exception):
+            pass
+        req = self.request(ctx, now=True)
+
+        def fake_call(argv, cwd=None):
+            starts.append(list(argv))
+            if len(starts) == 1:
+                ctx["after"] = {"kind": "exec", "request": dict(req), "by": "pa-restart",
+                                "pre": {"tools": pa.hash_or_none(os.path.join(pa.ROOT, "tools"), True)}}
+                ctx["restarting"] = req["id"]
+                ctx["ended"] = "restart"
+                return 143
+            raise Stop()
+        undo = child_fakes.patch(pa, fake_call)
+        saved_sleep = pa.time.sleep
+        pa.time.sleep = lambda s: None
+        os.execv = exec_fn
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                pa.run_agent(types.SimpleNamespace(fresh=False), "t1", self.project, pa.load_profile("test"), self.dir,
+                             load(os.path.join(self.dir, "agent.json")), ctx, time.time())
+        except (Stop, Execd) as e:
+            return starts, ctx, req, e
+        finally:
+            undo()
+            pa.time.sleep = saved_sleep
+        return starts, ctx, req, None
+
+    def test_the_loop_execs_after_the_child_ends(self):
+        starts, _ctx, req, e = self.loop(self.recorder)
+        self.assertIsInstance(e, Execd)
+        self.assertEqual(len(starts), 1)
+        self.assertIn("--restarted", self.execs[0][1])
+        self.assertEqual(self.execs[0][1][self.execs[0][1].index("--restarted") + 1], req["id"])
+
+    def test_ac6_5_exec_failing_resumes_in_the_same_process(self):
+        def broken(path, argv):
+            raise OSError(8, "Exec format error")
+        starts, ctx, req, e = self.loop(broken)
+        self.assertEqual(type(e).__name__, "Stop")
+        self.assertEqual(len(starts), 2)
+        self.assertIn("--resume", starts[1])
+        self.assertEqual(starts[1][starts[1].index("--resume") + 1], SID)
+        out = self.outcome()
+        self.assertEqual((out["outcome"], out["request"]), ("failed", req["id"]))
+        self.assertIn("exec", out["why"])
+        self.assertIn(["hc", "label", "t1", "herdr.pa.restarting="], self.calls)
+        self.assertTrue(self.gone())
+        self.assertNotIn("restarting", ctx)
+
+
+class NewProcessSide(Requests):
+    def launch(self, ctx=None, **flags):
+        class Stop(Exception):
+            pass
+
+        class NoThread:
+            def __init__(self, target=None, daemon=None):
+                pass
+
+            def start(self):
+                pass
+
+        def fake_call(argv, cwd=None):
+            raise Stop()
+        undo = child_fakes.patch(pa, fake_call)
+        saved = (pa.threading.Thread, signal.getsignal(signal.SIGINT))
+        pa.threading.Thread = NoThread
+        pa.__file__ = os.path.join(pa.ROOT, "tools", "pa.py")
+        args = types.SimpleNamespace(space=SP, project=self.project, profile="test", name=None, auto=False, ask=False,
+                                     fresh=False, **flags)
+        try:
+            with self.assertRaises(Stop), contextlib.redirect_stdout(io.StringIO()):
+                pa.run_session(args, "t1", {}, SP, self.project, ctx if ctx is not None else {"beat": False})
+        finally:
+            undo()
+            pa.threading.Thread = saved[0]
+            signal.signal(signal.SIGINT, saved[1])
+
+    def test_restarted_records_and_clears(self):
+        dump({"version": 1, "id": "r1", "space": SP}, os.path.join(self.dir, "restart-request.json"))
+        ctx = {"beat": False}
+        self.launch(ctx, restarted="r1", from_instance="old-i", restart_by="panel")
+        rec = load(os.path.join(self.dir, "launcher.json"))
+        self.assertEqual(rec["restartedFrom"], "old-i")
+        self.assertEqual((rec["restart"]["request"], rec["restart"]["outcome"], rec["restart"]["by"]), ("r1", "ok", "panel"))
+        self.assertNotEqual(rec["instance"], "old-i")
+        self.assertTrue(self.gone())
+        self.assertIn(["hc", "label", "t1", "herdr.pa.restarting="], self.calls)
+        with open(os.path.join(self.dir, "session.log")) as f:
+            self.assertIn("restarted request=r1 from=old-i", f.read())
+        self.assertIn("old-i", ctx["formerInstances"])
+
+    def test_a_newer_request_is_kept(self):
+        dump({"version": 1, "id": "r2", "space": SP}, os.path.join(self.dir, "restart-request.json"))
+        self.launch(restarted="r1", from_instance="old-i", restart_by="pa-restart")
+        self.assertFalse(self.gone())
+
+    def test_a_plain_start_has_no_restart(self):
+        self.launch()
+        rec = load(os.path.join(self.dir, "launcher.json"))
+        self.assertIsNone(rec["restart"])
+        self.assertIsNone(rec["restartedFrom"])
+
+
+class AC7_1_ExitReloads(Requests):
+    def run_loop(self, exits=1):
+        ctx = self.ctx(child=None)
+        ctx.pop("child")
+        starts = []
+
+        class Stop(Exception):
+            pass
+
+        def fake_call(argv, cwd=None):
+            starts.append(list(argv))
+            if len(starts) <= exits:
+                return 0
+            raise Stop()
+        undo = child_fakes.patch(pa, fake_call)
+        saved_sleep = pa.time.sleep
+        pa.time.sleep = lambda s: None
+        os.execv = self.recorder
+        try:
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                pa.run_agent(types.SimpleNamespace(fresh=False), "t1", self.project, pa.load_profile("test"), self.dir,
+                             load(os.path.join(self.dir, "agent.json")), ctx, time.time())
+        except (Stop, Execd) as e:
+            return starts, type(e).__name__, out.getvalue()
+        finally:
+            undo()
+            pa.time.sleep = saved_sleep
+
+    def test_equal_hashes_loop_as_today(self):
+        real_tools()
+        self.stamp()
+        starts, how, _out = self.run_loop()
+        self.assertEqual((len(starts), how, self.execs), (2, "Stop", []))
+
+    def test_an_install_since_the_start_execs(self):
+        self.stamp()  # the launcher starts on these tools ...
+        ctx_hash = pa.hash_or_none(os.path.join(pa.ROOT, "tools"), True)
+        self.record()
+        real_tools()  # ... then an install changes them
+        self.stamp()
+        self.assertNotEqual(ctx_hash, load(os.path.join(pa.ROOT, "installed.json"))["tools"])
+        starts, how, _out = self.run_loop_with_record(ctx_hash)
+        self.assertEqual((len(starts), how), (1, "Execd"))
+        argv = self.execs[0][1]
+        self.assertTrue(argv[argv.index("--restarted") + 1].startswith("exit-"))
+        self.assertEqual(argv[argv.index("--restart-by") + 1], "exit")
+
+    def run_loop_with_record(self, tools):
+        saved = pa.launcher_start
+
+        def start(ctx, *a, **k):
+            saved(ctx, *a, **k)
+            ctx["launcher"]["code"]["tools"] = tools
+        pa.launcher_start = start
+        try:
+            return self.run_loop()
+        finally:
+            pa.launcher_start = saved
+
+    def test_a_failing_precheck_loops_and_says_so_once(self):
+        self.stamp()
+        old = pa.hash_or_none(os.path.join(pa.ROOT, "tools"), True)
+        write(os.path.join(pa.ROOT, "tools", "pa_costs.py"), "z = 3\n")
+        self.stamp()  # installed differs; tools/pa.py prints 'pa': the self-check fails
+        starts, how, out = self.run_loop_with_record_exits(old, exits=3)
+        self.assertEqual((len(starts), how, self.execs), (4, "Stop", []))
+        self.assertEqual(out.count("not reloading"), 1, out)
+
+    def run_loop_with_record_exits(self, tools, exits):
+        saved = pa.launcher_start
+
+        def start(ctx, *a, **k):
+            saved(ctx, *a, **k)
+            ctx["launcher"]["code"]["tools"] = tools
+        pa.launcher_start = start
+        try:
+            return self.run_loop(exits=exits)
+        finally:
+            pa.launcher_start = saved
+
+
+class Prompt(Requests):  # spec S1, S2: what the model runs with on a resume
+    def test_profile_key_decides(self):
+        base = {"name": "test", "claude": ["true"], "codex": ["true"]}
+        self.assertTrue(pa.snapshot_flag(dict(base, systemPromptSnapshot="off"), {}))
+        self.assertFalse(pa.snapshot_flag(dict(base, systemPromptSnapshot="keep"), {}))
+
+    def probe(self, script, timeout=10):
+        path = os.path.join(TMP, "fake-claude-" + str(abs(hash(script))))
+        write(path, "#!/bin/sh\n" + script)
+        os.chmod(path, 0o755)
+        pa.PROBE_TIMEOUT = timeout
+        return pa.snapshot_flag({"name": "test", "claude": [path], "codex": ["true"]}, {})
+
+    def test_probe(self):
+        self.assertTrue(self.probe('echo "  --system-prompt-snapshot <mode>  rebuild the prompt"\n'))
+        self.assertFalse(self.probe('echo "  --append-system-prompt <text>"\n'))
+        self.assertFalse(self.probe("exit 3\n"))
+        began = time.time()
+        self.assertFalse(self.probe("sleep 20\n", timeout=1))
+        self.assertLess(time.time() - began, 8)
+        self.assertFalse(pa.snapshot_flag({"name": "test", "claude": ["/no/such/claude"], "codex": ["true"]}, {}))
+
+    def test_probe_runs_once_per_launcher(self):
+        ctx, count = {}, os.path.join(TMP, "probe-count")
+        if os.path.exists(count):
+            os.remove(count)
+        path = os.path.join(TMP, "fake-claude-count")
+        write(path, "#!/bin/sh\necho x >> '{}'\necho --system-prompt-snapshot\n".format(count))
+        os.chmod(path, 0o755)
+        prof = {"name": "test", "claude": [path], "codex": ["true"]}
+        for _ in range(3):
+            self.assertTrue(pa.snapshot_flag(prof, ctx))
+        with open(count) as f:
+            self.assertEqual(len(f.read().split()), 1)
+
+    def test_launch_command_flag(self):
+        p = pa.load_profile("test")
+        agent = load(os.path.join(self.dir, "agent.json"))
+        argv, _m = pa.launch_command(p, agent, True, self.dir, snapshot=True)
+        i = argv.index("--system-prompt-snapshot")
+        self.assertEqual(argv[i + 1], "off")
+        self.assertEqual(argv[i - 2], "--append-system-prompt")
+        self.assertNotIn("--system-prompt-snapshot", pa.launch_command(p, agent, True, self.dir)[0])
+
+    def test_run_agent_passes_it_when_the_profile_says_so(self):
+        dump({"name": "test", "claude": ["true"], "codex": ["true"], "systemPromptSnapshot": "off"},
+             os.path.join(pa.ROOT, "profiles", "test", "profile.json"))
+        starts = []
+
+        class Stop(Exception):
+            pass
+
+        def fake_call(argv, cwd=None):
+            starts.append(list(argv))
+            raise Stop()
+        undo = child_fakes.patch(pa, fake_call)
+        try:
+            with self.assertRaises(Stop), contextlib.redirect_stdout(io.StringIO()):
+                pa.run_agent(types.SimpleNamespace(fresh=False), "t1", self.project, pa.load_profile("test"), self.dir,
+                             load(os.path.join(self.dir, "agent.json")), {"beat": True, "previous": None}, time.time())
+        finally:
+            undo()
+        self.assertIn("--system-prompt-snapshot", starts[0])
+
+    def test_session_prompt_modes(self):
+        ctx = self.record()
+        agent = load(os.path.join(self.dir, "agent.json"))
+        core1 = pa.hash_or_none(os.path.join(pa.ROOT, "core"))
+        pa.launcher_session(ctx, self.dir, agent, False, snapshot=False)
+        s = load(os.path.join(self.dir, "launcher.json"))["session"]
+        self.assertEqual((s["prompt"], s["promptCore"]), ("new", core1))
+        self.assertEqual(load(os.path.join(self.dir, "agent.json"))["prompt"]["core"], core1)
+        write(os.path.join(pa.ROOT, "core", "orchestrator.md"), "# o2\n")
+        core2 = pa.hash_or_none(os.path.join(pa.ROOT, "core"))
+        pa.launcher_session(ctx, self.dir, agent, True, snapshot=False)
+        s = load(os.path.join(self.dir, "launcher.json"))["session"]
+        self.assertEqual((s["prompt"], s["promptCore"], s["core"]), ("recorded", core1, core2))
+        pa.launcher_session(ctx, self.dir, agent, True, snapshot=True)
+        s = load(os.path.join(self.dir, "launcher.json"))["session"]
+        self.assertEqual((s["prompt"], s["promptCore"]), ("rebuilt", core2))
+        self.assertEqual(load(os.path.join(self.dir, "agent.json"))["prompt"]["core"], core2)
+
+    def test_recorded_without_a_known_prompt_is_unknown(self):
+        ctx = self.record()
+        agent = load(os.path.join(self.dir, "agent.json"))
+        pa.launcher_session(ctx, self.dir, agent, True, snapshot=False)
+        s = load(os.path.join(self.dir, "launcher.json"))["session"]
+        self.assertEqual(s["prompt"], "recorded")
+        self.assertIsNone(s["promptCore"])
+
+    def test_code_state_reads_the_prompt_core(self):  # AC-P3
+        inst = {"tools": "T", "core": "C2"}
+        rec = {"terminal": "t1", "code": {"tools": "T"}, "session": {"core": "C2", "prompt": "recorded", "promptCore": "C1"}}
+        word, detail = pa.code_state(rec, inst, "t1")
+        self.assertEqual(word, "older (core)")
+        self.assertIn("--fresh", detail)
+        rec["session"]["promptCore"] = None
+        self.assertEqual(pa.code_state(rec, inst, "t1")[0], "unknown")
+        rec["session"].update(prompt="rebuilt", promptCore="C2")
+        self.assertEqual(pa.code_state(rec, inst, "t1")[0], "current")
+
+
 if __name__ == "__main__":
     unittest.main()
