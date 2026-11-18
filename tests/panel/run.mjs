@@ -4012,7 +4012,7 @@ cases["P-costs-j1d-accounts"] = async () => { // R-A3 AC: two accounts: an Accou
   let text = costsView(v).text;
   check(!/· account /.test(text), `no single account beside Total (got ${text.slice(0, 900)})`);
   const a = section(text, "| Accounts | Copy", ["| By scope", "| By day"]);
-  check(/acct-a \| 900 tokens \| [^|]*9\.50[^|]* est\. · 76% \|/.test(a) && /acct-b \| 100 tokens \| [^|]*3\.00[^|]* est\. · 24% \|/.test(a), `one row per account (got ${a})`);
+  check(/acct-a \| 900 tokens \| [^|]*9\.50[^|]* est\. · 76% \|/.test(a) && /acct-b \| 100 tokens \| [^|]*3\.00[^|]* est\. · 24% \|/.test(`${a}|`), `one row per account (got ${a})`); // section() ends before the next head's |
   check(text.indexOf("| Accounts |") > text.indexOf("| By session type") && text.indexOf("| Accounts |") < text.indexOf("| By scope"), "after session type, before By scope");
   await click(v, "costs-account-1"); await settle(); text = costsView(v).text;
   const d = section(text, "| Accounts | Copy", ["| By scope", "| By day"]);
