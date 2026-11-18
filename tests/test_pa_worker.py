@@ -3448,5 +3448,282 @@ class CloseWhenIdle(Base):
         self.assertEqual(kw.get("cwd"), self.dir)
 
 
+class Unrecorded(Base):
+    """t-020 J4 (R4, R5): pa-worktree check finds worktrees under the scanned `worktrees` folders that no task of any space
+    on the same project records, lists them once on a card d-wt-unrecorded-<n> (never a Delete), counts the person's own
+    and the empty folders. A second space sp2 has the same project."""
+
+    def setUp(self):
+        super().setUp()
+        self.proj = self.repo()
+        self.project = os.path.join(self.tmp, "Project")
+        os.makedirs(os.path.join(self.project, "worktrees"))
+        agent = load(os.path.join(self.dir, "agent.json"))
+        agent["project"] = self.project
+        dump(agent, os.path.join(self.dir, "agent.json"))
+        self.folder = os.path.realpath(os.path.join(self.project, "worktrees"))
+        self.space2()
+
+    def space2(self, tasks=(), project=None, name="sp2"):
+        folder = os.path.join(pa.ROOT, "spaces", name)
+        dump({"space": name, "terminal": "t90", "profile": "test", "name": "S2", "project": project or self.project},
+             os.path.join(folder, "agent.json"))
+        dump({"version": 1, "tasks": list(tasks)}, os.path.join(folder, "ledger.json"))
+        return folder
+
+    def tree(self, name, commits=0):
+        """A git worktree <project>/worktrees/<name>/proj on branch <name>; its realpath."""
+        path = os.path.join(self.project, "worktrees", name, "proj")
+        sh(self.proj, "git", "worktree", "add", "-q", "-b", name, path, "main")
+        for i in range(commits):
+            self.commit(path, "u{}.txt".format(i), "x\n", "work {}".format(i))
+        return os.path.realpath(path)
+
+    def check(self, *extra):
+        return self.run_cmd("pa-worktree", "check", "--space", "sp1", *extra)
+
+    def card(self, n=1):
+        return pa.read_json(os.path.join(self.dir, "decisions", "d-wt-unrecorded-{}.json".format(n)))
+
+    def answer(self, n, label):
+        path = os.path.join(self.dir, "decisions", "d-wt-unrecorded-{}.json".format(n))
+        card = load(path)
+        card.update(status="answered", answer=label, answered="2026-11-18T00:00:00Z")
+        dump(card, path)
+        return path
+
+    def unrecorded_cards(self):
+        names = []
+        for sub in ("decisions", "decisions-archive"):
+            folder = os.path.join(self.dir, sub)
+            names += [n for n in os.listdir(folder) if n.startswith("d-wt-unrecorded-")] if os.path.isdir(folder) else []
+        return sorted(names)
+
+    def test_u1_unrecorded_listed_once_with_guess(self):
+        mine = self.tree("t-003-x")
+        self.add_task("t-003", "in-progress", mine)
+        self.add_task("t-017", "in-progress")
+        timing = self.tree("t-017-timing-test", commits=1)
+        self.term("t77", "someone", cwd=timing)
+        code, out, err = self.check()
+        self.assertEqual(code, 0, err)
+        self.assertIn("unrecorded: {} (guess t-017, job timing-test); --open-cards lists it on a card".format(timing), out)
+        self.assertNotIn("unrecorded: " + mine, out)
+        self.assertEqual(self.unrecorded_cards(), [], "without --open-cards no card is written")
+        code, out, err = self.check("--open-cards")
+        self.assertEqual(code, 0, err)
+        self.assertIn("opened card d-wt-unrecorded-1 (1 worktree no task records)", out)
+        card = self.card()
+        self.assertEqual((card["id"], card["task"], card["kind"], card["status"], card["paths"]),
+                         ("d-wt-unrecorded-1", None, "unrecorded-worktrees", "open", [timing]))
+        self.assertNotIn("worktree", card)
+        self.assertEqual(card["items"], [{"path": timing, "kind": "git worktree", "branch": "t-017-timing-test", "commits": 1, "merged": 0,
+                                          "pushed": 0, "uncommitted": 0, "terminals": ["t77"], "guess": "t-017", "job": "timing-test"}])
+        self.assertEqual(card["question"], "Record these worktrees no task records under the tasks they seem to belong to?")
+        self.assertEqual(card["context"].split("\n"), [
+            "Worktrees under {} that no task records. Nothing on this card deletes anything.".format(self.folder),
+            "{} (git worktree): branch t-017-timing-test, 1 commits (0 merged, 0 pushed), 0 uncommitted; terminals in it: t77; "
+            "guess: t-017, job timing-test".format(timing),
+            'In the note you can say per folder: "t-017-timing-test: t-017" or "t-017-timing-test: leave".'])
+        self.assertEqual(card["options"], [
+            {"label": "Record as guessed", "detail": "Add each to its guessed task's worktrees with that job; it then gets its own "
+                                                      "Delete/Keep card when its job is over."},
+            {"label": "Leave them alone", "detail": "Record nothing; these are not listed again."}])
+        self.assertEqual(card["recommendation"], "Record as guessed")
+        # listed once: the next check leaves the same card
+        code, out, err = self.check("--open-cards")
+        self.assertEqual(code, 0, err)
+        self.assertIn("card d-wt-unrecorded-1 is open", out)
+        self.assertEqual(self.unrecorded_cards(), ["d-wt-unrecorded-1.json"])
+        self.assertTrue(os.path.isdir(timing), "nothing is deleted")
+
+    def test_u2_recorded_in_another_space_same_project_not_listed(self):
+        self.add_task("t-017", "in-progress")
+        theirs = self.tree("t-017-theirs")
+        gone = self.tree("t-017-gone")
+        elsewhere = self.tree("t-017-elsewhere")
+        self.space2([{"id": "t-001", "state": "in-progress", "worktree": theirs,
+                      "worktrees": [{"path": gone, "job": "gone", "removed": "2026-11-01T00:00:00Z"}]}])
+        self.space2([{"id": "t-001", "state": "in-progress", "worktree": elsewhere}], project=os.path.join(self.tmp, "Other"), name="sp3")
+        code, out, err = self.check()
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("unrecorded: " + theirs, out)
+        self.assertNotIn("unrecorded: " + gone, out, "a removed entry still counts as recorded")
+        self.assertIn("unrecorded: {} (guess t-017, job elsewhere)".format(elsewhere), out, "another project's space does not count")
+        # an unreadable ledger of a space on the same project: nothing is listed as unrecorded (D5), and it is named
+        write(os.path.join(pa.ROOT, "spaces", "sp2", "ledger.json"), "{not json")
+        code, out, err = self.check("--open-cards")
+        self.assertEqual(code, 0, err)
+        self.assertIn("could not read the ledger of space sp2", out)
+        self.assertNotIn("unrecorded: ", out)
+        self.assertEqual(self.unrecorded_cards(), [])
+
+    def test_u3_person_named_worktree_only_counted(self):
+        self.add_task("t-017", "in-progress")
+        mine = self.tree("my-experiment", commits=1)
+        other = self.tree("t-999-x")
+        code, out, err = self.check("--open-cards")
+        self.assertEqual(code, 0, err)
+        self.assertIn("No task in the ledger has a worktree.", out)
+        self.assertIn("2 worktrees under {} not named after a task of this ledger: left alone, not listed".format(self.folder), out)
+        self.assertNotIn(mine, out)
+        self.assertNotIn(other, out)
+        self.assertEqual(self.unrecorded_cards(), [])
+
+    def test_u4_empty_containers_counted_not_listed(self):
+        self.add_task("t-005", "done")
+        os.makedirs(os.path.join(self.project, "worktrees", "t-005-old"))
+        os.makedirs(os.path.join(self.project, "worktrees", "empty"))
+        write(os.path.join(self.project, "worktrees", "t-005-notes", "a.txt"), "not a worktree\n")
+        code, out, err = self.check("--open-cards")
+        self.assertEqual(code, 0, err)
+        self.assertIn("2 empty folders under {} (left by earlier removals)".format(self.folder), out)
+        self.assertNotIn("t-005-notes", out)
+        self.assertNotIn("unrecorded: ", out)
+        self.assertEqual(self.unrecorded_cards(), [])
+        self.assertTrue(os.path.isdir(os.path.join(self.project, "worktrees", "t-005-old")), "an empty folder is never removed by check")
+
+    def test_u5_open_card_updated_in_place_new_card_after_answer(self):
+        self.add_task("t-017", "in-progress")
+        a = self.tree("t-017-a")
+        self.assertEqual(self.check("--open-cards")[0], 0)
+        self.assertEqual(self.card()["paths"], [a])
+        self.assertIsNone(self.card().get("updated"))
+        b = self.tree("t-017-b")
+        code, out, err = self.check("--open-cards")
+        self.assertEqual(code, 0, err)
+        self.assertIn("updated card d-wt-unrecorded-1 (2 worktrees no task records)", out)
+        card = self.card()
+        self.assertEqual((card["id"], card["paths"], card["status"]), ("d-wt-unrecorded-1", [a, b], "open"))
+        self.assertTrue(card.get("updated"))
+        self.assertEqual(self.unrecorded_cards(), ["d-wt-unrecorded-1.json"])
+        self.answer(1, "Record as guessed")
+        c = self.tree("t-017-c")
+        code, out, err = self.check("--open-cards")
+        self.assertEqual(code, 0, err)
+        self.assertIn("opened card d-wt-unrecorded-2 (1 worktree no task records)", out)
+        self.assertEqual(self.card(2)["paths"], [c])
+        self.assertEqual(self.card()["status"], "answered", "the answered card is left as it is")
+        # once the orchestrator records it, the open card has nothing left: withdrawn
+        led = self.ledger()
+        led["tasks"][0]["worktrees"] = [{"path": c, "job": "c"}]
+        self.ledger(led)
+        code, out, err = self.check("--open-cards")
+        self.assertEqual(code, 0, err)
+        self.assertIn("withdrew card d-wt-unrecorded-2: no unrecorded worktree is left", out)
+        card = self.card(2)
+        self.assertEqual((card["status"], card["note"]), ("withdrawn", "Withdrawn by pa-worktree check: no unrecorded worktree is left"))
+        self.assertTrue(any("d-wt-unrecorded-2" in j.get("why", "") for j in self.journal()))
+
+    def test_u6_left_alone_never_listed_again(self):
+        self.add_task("t-017", "in-progress")
+        a = self.tree("t-017-a")
+        self.check("--open-cards")
+        self.answer(1, "Leave them alone")
+        code, out, err = self.check("--open-cards")
+        self.assertEqual(code, 0, err)
+        self.assertNotIn(a, out)
+        self.assertEqual(self.unrecorded_cards(), ["d-wt-unrecorded-1.json"])
+        # an answered card in decisions-archive/ (t-054) still counts, and its number is not used again
+        os.makedirs(os.path.join(self.dir, "decisions-archive"))
+        os.rename(os.path.join(self.dir, "decisions", "d-wt-unrecorded-1.json"),
+                  os.path.join(self.dir, "decisions-archive", "d-wt-unrecorded-1.json"))
+        b = self.tree("t-017-b")
+        code, out, err = self.check("--open-cards")
+        self.assertEqual(code, 0, err)
+        self.assertNotIn(a, out)
+        self.assertIn("opened card d-wt-unrecorded-2 (1 worktree no task records)", out)
+        self.assertEqual(self.card(2)["paths"], [b])
+        self.assertEqual(load(os.path.join(self.dir, "decisions-archive", "d-wt-unrecorded-1.json"))["status"], "answered")
+
+    def test_u7_card_has_no_worktree_field_remove_refuses_it(self):
+        self.add_task("t-017", "in-progress")
+        a = self.tree("t-017-a")
+        self.check("--open-cards")
+        self.assertNotIn("worktree", self.card())
+        self.answer(1, "Delete")  # forged: the card has no Delete option
+        before = self.snapshot()
+        for task in ("unrecorded-1", "t-017"):
+            code, out, err = self.run_cmd("pa-worktree", "remove", task, "--space", "sp1")
+            self.assertEqual(code, 2, (out, err))
+            self.assertIn("has no worktree in the ledger", err)
+        self.assertTrue(os.path.isdir(a))
+        self.assertEqual(self.snapshot(), before)
+
+    def test_u8_workspace_folder_scanned_via_recorded_one(self):
+        ws = os.path.join(self.tmp, "Ws", "worktrees")
+        status = os.path.join(self.tmp, "status.sh")
+        write(status, '#!/bin/sh\nprintf \'{"uncommitted": 0, "unpushed": 1, "branch": "A:feat", "removesBranches": true, '
+                      '"kind": "workspace worktree", "repos": ["%s/src/A"]}\' "$1"\n')
+        os.chmod(status, 0o755)
+        dump({"name": "test2", "claude": ["true"], "codex": ["true"],
+              "worktree": {"marker": "marker.txt", "status": status, "remove": status}}, os.path.join(pa.ROOT, "profiles", "test2", "profile.json"))
+        agent = load(os.path.join(self.dir, "agent.json"))
+        agent["profile"] = "test2"
+        dump(agent, os.path.join(self.dir, "agent.json"))
+        for name in ("t-003-pkg", "t-017-pkg"):
+            write(os.path.join(ws, name, "marker.txt"), "")
+            pkg = os.path.join(ws, name, "src", "A")
+            os.makedirs(pkg)
+            sh(pkg, "git", "init", "-q", "-b", "main")
+            self.commit(pkg, "README", "base\n", "base")
+            sh(pkg, "git", "checkout", "-q", "-b", "feat")
+            self.commit(pkg, "f.txt", "x\n", "feat work")
+        self.add_task("t-003", "in-progress", os.path.join(ws, "t-003-pkg"))
+        self.add_task("t-017", "in-progress")
+        code, out, err = self.check("--open-cards")
+        self.assertEqual(code, 0, err)
+        theirs = os.path.realpath(os.path.join(ws, "t-017-pkg"))
+        card = self.card()
+        self.assertEqual(card["paths"], [theirs])
+        item = card["items"][0]
+        self.assertEqual((item["kind"], item["branch"], item["commits"], item["guess"], item["job"]),
+                         ("workspace worktree", "A:feat", 1, "t-017", "pkg"))
+        self.assertEqual(card["context"].split("\n")[0],
+                         "Worktrees under {} that no task records. Nothing on this card deletes anything.".format(os.path.realpath(ws)))
+
+    def test_u9_cap_20_and_more_line(self):
+        self.add_task("t-017", "in-progress")
+        paths = [self.tree("t-017-j{:02d}".format(i)) for i in range(1, 23)]
+        code, out, err = self.check("--open-cards")
+        self.assertEqual(code, 0, err)
+        card = self.card()
+        self.assertEqual(card["paths"], paths[:20])
+        self.assertEqual(len(card["items"]), 20)
+        lines = card["context"].split("\n")
+        self.assertIn("… and 2 more (more than 20; listed on the next card)", lines)
+        self.assertEqual(lines[-1], 'In the note you can say per folder: "t-017-j01: t-017" or "t-017-j01: leave".')
+        self.answer(1, "Leave them alone")
+        self.assertEqual(self.check("--open-cards")[0], 0)
+        self.assertEqual(self.card(2)["paths"], paths[20:])
+
+    def test_u10_outside_scanned_folders_never_seen(self):
+        self.add_task("t-017", "in-progress")
+        loose = os.path.realpath(self.worktree(self.proj, "t-017-loose"))
+        far = os.path.join(self.tmp, "elsewhere", "t-017-far")
+        sh(self.proj, "git", "worktree", "add", "-q", "-b", "t-017-far", far, "main")
+        os.symlink(far, os.path.join(self.project, "worktrees", "t-017-link"))
+        code, out, err = self.check("--open-cards")
+        self.assertEqual(code, 0, err)
+        self.assertNotIn(loose, out)
+        self.assertNotIn("t-017-far", out)
+        self.assertNotIn("t-017-link", out)
+        self.assertEqual(self.unrecorded_cards(), [])
+
+    def test_u11_pa_decide_accepts_it_in_conversation(self):
+        self.add_task("t-017", "in-progress")
+        self.tree("t-017-a")
+        self.check("--open-cards")
+        with contextlib.redirect_stdout(io.StringIO()):
+            pa.cmd_decide(argparse.Namespace(space="sp1", card="d-wt-unrecorded-1", answer="Record as guessed",
+                                             quote="yes, record them", withdraw=False, why=None))
+        card = self.card()
+        self.assertEqual((card["status"], card["answer"], card["note"]), ("answered", "Record as guessed", "yes, record them"))
+        code, out, err = self.check("--open-cards")
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("unrecorded: ", out)
+        self.assertEqual(self.unrecorded_cards(), ["d-wt-unrecorded-1.json"], "answered: not listed again")
+
+
 if __name__ == "__main__":
     unittest.main()
