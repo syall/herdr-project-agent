@@ -893,7 +893,8 @@ def reload_profile(p):
 
 
 def launch_command(p, agent, resume, directory):
-    """(argv, model) for one launch of the Project Agent from profile p; raises when p cannot give one."""
+    """(argv, model) for one launch of the Project Agent from profile p; raises when p cannot give one (also when
+    the exec would refuse the argv: an element not a str, or with a NUL byte)."""
     argv = list(p["claude"])
     model = (agent.get("models") or {}).get("orchestrator") or (p.get("models") or {}).get("orchestrator")
     if model:
@@ -911,7 +912,14 @@ def launch_command(p, agent, resume, directory):
                  "journal is a hold, start nothing at all until the person says go. `paused` in "
                  "`schedule.json` stops timed passes only; it is not a hold."]
     argv += cc_settings_args(p, agent.get("space") or os.path.basename(directory), [])  # last (t-029 R4)
-    return resolve(argv, p), model
+    argv = resolve(argv, p)
+    # The exec refuses anything else (TypeError / ValueError); refuse it here, so run_agent's trial build of a
+    # re-read profile fails and the loop keeps the one in hand (t-033 round 3). A no-op for every valid profile.
+    for a in argv:
+        if not isinstance(a, str) or "\0" in a:
+            raise Problem("profile {}: the launch command has an argument that is not text or holds a NUL byte: "
+                          "{!r} (check models.orchestrator and the profile's strings)".format(p.get("name"), a)[:300])
+    return argv, model
 
 
 def run_agent(args, address, project, p, directory, agent, ctx, started):
