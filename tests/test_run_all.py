@@ -4,6 +4,7 @@ and each unit test module (tests/test_*.py) is its own part; t-031: the panel ha
 shard (run.mjs --shard=<k>/4), each named in the summary; t-072: every run takes pa-full-suite's slot (s1-s7). The real script runs in a temp copy of the repo whose
 parts are stubs (stub.sh, chosen per part by STUB_<part>), so no real suite runs here."""
 import fcntl
+import importlib.util
 import os
 import re
 import shutil
@@ -92,8 +93,8 @@ class T(unittest.TestCase):
 
 
 # Holds slot-0 of the suite slots (an flock, its holder line as pa_suite writes it), then touches the ready file.
-# With a command after them, runs it as its child with PA_SUITE_SLOT naming the slot (as pa-full-suite does) and
-# exits with its code; else sleeps until killed.
+# With a command after them, runs it as its child with PA_SUITE_SLOT naming the slot (as pa-full-suite does; not
+# with STUB_NO_MARKER, as the pa-full-suite before t-072 does) and exits with its code; else sleeps until killed.
 HOLDER = r'''import fcntl, json, os, subprocess, sys, time
 path, ready = sys.argv[1], sys.argv[2]
 os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -104,8 +105,9 @@ f.truncate()
 f.write(json.dumps({"task": "t-holder", "worker": "w-holder", "pid": os.getpid(), "start": "then"}))
 f.flush()
 open(ready, "w").close()
-if len(sys.argv) > 3:
-    sys.exit(subprocess.run(sys.argv[3:], env=dict(os.environ, PA_SUITE_SLOT=path)).returncode)
+if len(sys.argv) > 3:  # STUB_NO_MARKER: a caller from before t-072, which holds the slot but sets no PA_SUITE_SLOT
+    marker = {} if os.environ.get("STUB_NO_MARKER") else {"PA_SUITE_SLOT": path}
+    sys.exit(subprocess.run(sys.argv[3:], env=dict(os.environ, **marker)).returncode)
 time.sleep(600)
 '''
 
@@ -525,6 +527,49 @@ class RunAll(unittest.TestCase):
         code, out = self.run_all("--affected")
         self.assertEqual(code, 0, out)
         self.assertIn("  suite slot: none", self.summary(out))
+
+    def test_s8_a_caller_holding_the_slot_without_a_marker_is_not_waited_for(self):
+        # t-072 round 2 (MF-1): a pa-full-suite from before t-072 holds the slot (its pid in the holder line) and
+        # sets no PA_SUITE_SLOT. The run under it sees its caller holds the slot and goes on, not waiting for itself.
+        p = self.holder("sh", os.path.join(self.repo, "tests", "run-all.sh"), "--affected", PA_SUITE_WAIT_LIMIT="5",
+                        NO_MARKER="1")
+        out, _ = p.communicate(timeout=60)
+        self.assertEqual(p.returncode, 0, out)
+        self.assertNotIn("waiting for the suite slot", out)
+        self.assertIn("  suite slot: held by the caller (task t-holder, pid {}, slot-0)".format(p.pid), self.summary(out))
+
+    def test_s9_a_wait_never_outlasts_its_caller(self):
+        # The default wait is under the shortest caller timeout (the affected-tests hook's 900 s run), and a run
+        # whose caller is gone (killed, or timed out by it) stops waiting.
+        self.holder()
+        launcher = os.path.join(self.tmp, "launcher.py")
+        write(launcher, "import subprocess, sys, time\n"
+                        "p = subprocess.Popen(sys.argv[2:], stdout=open(sys.argv[1], 'w'), stderr=subprocess.STDOUT)\n"
+                        "print(p.pid, flush=True)\ntime.sleep(600)\n")
+        log = os.path.join(self.tmp, "s9.out")
+        caller = subprocess.Popen([sys.executable, launcher, log, "sh", os.path.join(self.repo, "tests", "run-all.sh"),
+                                   "--affected"], cwd=self.tmp, env=self.env_for(), stdout=subprocess.PIPE,
+                                  universal_newlines=True)
+        self.addCleanup(lambda: (caller.poll() is None and caller.kill(), caller.wait(), caller.stdout.close()))
+        run = int(caller.stdout.readline())
+        self.addCleanup(lambda: alive(run) and os.kill(run, signal.SIGKILL))
+        end = time.time() + 20
+        while "waiting for the suite slot" not in pa_text(log) and time.time() < end:
+            time.sleep(0.05)
+        self.assertIn("waiting for the suite slot", pa_text(log))
+        caller.kill()
+        caller.wait()
+        end = time.time() + 15
+        while alive(run) and time.time() < end:
+            time.sleep(0.1)
+        self.assertFalse(alive(run), "the run went on waiting after its caller was gone: " + pa_text(log))
+        self.assertIn("caller is gone", pa_text(log))
+        with open(self.events) as f:
+            self.assertEqual(f.read(), "")
+        spec = importlib.util.spec_from_file_location("pa_suite_s9", os.path.join(self.repo, "runtime", "tools", "pa_suite.py"))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        self.assertLess(module.SLOT_WAIT_LIMIT, 900)
 
 
 def pa_text(path):
