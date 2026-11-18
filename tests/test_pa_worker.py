@@ -2902,6 +2902,223 @@ class JobCards(Base):
             return f.read()
 
 
+class CardPerWorktree(Base):
+    """t-073 (R1-R4): a worktree card answers only for the worktree path (and branch) it names. An answered card for
+    another path, a removed one or another branch never counts; the worktree gets its own card under a new id; remove
+    refuses on such a card. The four live cases: t-020, t-032, t-037, t-046."""
+
+    LIVE = (("t-020", "t-020-j2", "t-020-unrecorded"), ("t-032", "t-032-price-list", "t-032-price-fetch"),
+            ("t-037", "t-037-pa-restart", "t-037-end-terminal"), ("t-046", "t-046-other-answer", "t-046-panel"))
+    ANSWERED, REMOVED = "2026-11-01T00:00:00Z", "2026-11-02T00:00:00Z"
+
+    def setUp(self):
+        super().setUp()
+        self.proj = self.repo()
+
+    job_tree = JobCards.job_tree
+    merged_commit = JobCards.merged_commit
+    check = JobCards.check
+    card = JobCards.card
+    answer = JobCards.answer
+
+    def gone(self, name):
+        """A worktree path that was removed: recorded removed in the ledger, no folder."""
+        return os.path.realpath(self.tmp) + "/worktrees/{}/proj".format(name)
+
+    def dec(self, name, folder="decisions"):
+        return os.path.join(self.dir, folder, name + ".json")
+
+    def old_card(self, cid, task, worktree, answer="Delete", folder="decisions", **extra):
+        card = dict({"id": cid, "task": task, "worktree": worktree, "job": "main", "main": True, "rule": "b", "tasks": [task],
+                     "status": "answered", "answer": answer, "note": None, "answered": self.ANSWERED, "snapshot": {}}, **extra)
+        dump(card, self.dec(cid, folder))
+        return raw(self.dec(cid, folder))
+
+    def live_case(self, task, old, new, folder="decisions"):
+        """A task in progress whose old worktree is removed and whose `worktree` names a new one with a merged commit;
+        its old card d-wt-<task> answered Delete for the old path. Returns (new path, old card bytes)."""
+        path = self.job_tree(new)
+        self.merged_commit(path)
+        self.add_task(task, "in-progress", path, [], worktrees=[{"path": self.gone(old), "job": "j1", "removed": self.REMOVED}])
+        return path, self.old_card("d-wt-" + task, task, self.gone(old), folder=folder)
+
+    def remove(self, task, *extra):
+        return self.run_cmd("pa-worktree", "remove", task, "--space", "sp1", *extra)
+
+    def test_k1_live_cases_old_delete_is_not_the_new_worktrees(self):
+        made = {task: self.live_case(task, old, new) for task, old, new in self.LIVE}
+        code, out, err = self.check()
+        self.assertEqual(code, 0, err)
+        for task, _old, _new in self.LIVE:
+            self.assertNotIn("{}: card d-wt-{} answered".format(task, task), out)
+            self.assertIn("{}: candidate, job main is over (every commit merged); --open-cards asks the person".format(task), out)
+        code, out, err = self.check("--open-cards")
+        self.assertEqual(code, 0, err)
+        for task, _old, _new in self.LIVE:
+            with self.subTest(task=task):
+                path, before = made[task]
+                self.assertIn("{}: opened card d-wt-{}-main (recommends Delete)".format(task, task), out)
+                card = self.card("d-wt-{}-main".format(task))
+                self.assertEqual((card["id"], card["task"], card["worktree"], card["job"], card["main"], card["rule"], card["status"]),
+                                 ("d-wt-{}-main".format(task), task, os.path.realpath(path), "main", True, "b", "open"))
+                self.assertEqual(card["evidence"], ["WORKTREE-main.md"])
+                self.assertEqual(raw(self.dec("d-wt-" + task)), before, "the old card is never touched")
+        self.assertIn("card d-wt-t-020-main is open", self.check("--open-cards")[1])
+
+    def test_k2_remove_refuses_an_old_delete_for_another_path(self):
+        for task, old, new in self.LIVE:
+            with self.subTest(task=task):
+                path, before = self.live_case(task, old, new)
+                ledger = self.snapshot()
+                code, _, err = self.remove(task)
+                self.assertEqual(code, 2, err)
+                self.assertIn("the card is for {}, not {} (card d-wt-{} answered 'Delete')".format(self.gone(old), os.path.realpath(path), task), err)
+                self.assertIn("gets its own card from `pa-worktree check --open-cards`", err)
+                self.assertIn("nothing was removed", err)
+                self.assertTrue(os.path.isdir(path))
+                self.assertEqual(self.snapshot(), ledger)
+                self.assertEqual(raw(self.dec("d-wt-" + task)), before)
+        self.assertNotIn(["git", "worktree", "remove"], [c[:3] for c in self.calls])
+
+    def test_k3_new_card_answered_delete_removes_only_its_worktree(self):
+        path, before = self.live_case("t-032", "t-032-price-list", "t-032-price-fetch")
+        self.assertIn("t-032: opened card d-wt-t-032-main", self.check("--open-cards")[1])
+        self.answer("d-wt-t-032-main")
+        code, out, err = self.remove("t-032")
+        self.assertEqual(code, 0, err)
+        self.assertIn("(card d-wt-t-032-main)", out)
+        self.assertFalse(os.path.isdir(path))
+        task = self.ledger()["tasks"][0]
+        self.assertIsNone(task["worktree"])
+        self.assertTrue(any(e.get("removed") and os.path.realpath(e["path"]) == os.path.realpath(path) for e in task["worktrees"]))
+        self.assertTrue(self.card("d-wt-t-032-main").get("worktreeRemoved"), "a removal marks its card spent")
+        self.assertEqual(raw(self.dec("d-wt-t-032")), before)
+
+    def test_k4_t046_each_job_worktree_on_its_own_card(self):
+        panel = self.job_tree("t-046-panel")  # J3: no commits yet
+        core = self.job_tree("t-046-core-text")  # J2: merged
+        self.merged_commit(core)
+        self.add_task("t-046", "in-progress", panel, [], worktrees=[
+            {"path": self.gone("t-046-other-answer"), "job": "J1", "removed": self.REMOVED}, {"path": core, "job": "J2"}])
+        before = self.old_card("d-wt-t-046", "t-046", self.gone("t-046-other-answer"))
+        code, out, err = self.check("--open-cards")
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("t-046: card d-wt-t-046 answered", out)
+        self.assertIn("t-046: opened card d-wt-t-046-j2 (recommends Delete)", out)
+        self.assertIn("t-046: tasks still t-046 in-progress; asked once every task using it is done or parked; job main not over yet "
+                      "(no commits since its fork)", out)
+        self.assertEqual(self.card("d-wt-t-046-j2")["worktree"], os.path.realpath(core))
+        self.assertIsNone(self.card("d-wt-t-046-main"))
+        self.assertEqual(raw(self.dec("d-wt-t-046")), before)
+
+    def test_k5_one_push_offers_every_finished_job(self):
+        t063 = self.job_tree("t-063-x")
+        self.merged_commit(t063)
+        self.add_task("t-063", "done", t063, [])
+        fetch = self.job_tree("t-032-price-fetch")
+        self.merged_commit(fetch)
+        self.add_task("t-032", "in-progress", fetch, [], worktrees=[{"path": self.gone("t-032-price-list"), "job": "j1", "removed": self.REMOVED}])
+        self.old_card("d-wt-t-032", "t-032", self.gone("t-032-price-list"))
+        panel, core = self.job_tree("t-046-panel"), self.job_tree("t-046-core-text")
+        self.merged_commit(core)
+        self.add_task("t-046", "in-progress", panel, [], worktrees=[{"path": core, "job": "J2"}])
+        out = self.check("--open-cards")[1]
+        for cid, path in (("d-wt-t-063", t063), ("d-wt-t-032-main", fetch), ("d-wt-t-046-j2", core)):
+            with self.subTest(card=cid):
+                self.assertIn("opened card {} (recommends Delete)".format(cid), out)
+                self.assertEqual(self.card(cid)["worktree"], os.path.realpath(path))
+
+    def test_k6_same_folder_made_again_old_card_is_spent(self):
+        path = self.job_tree("t-003-again")
+        self.merged_commit(path)
+        # the card was answered for the worktree that was here before; the ledger says it was removed after that answer
+        self.add_task("t-003", "in-progress", path, [], worktrees=[{"path": path, "job": "j1", "removed": self.REMOVED}])
+        before = self.old_card("d-wt-t-003", "t-003", os.path.realpath(path))
+        code, out, err = self.check()
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("t-003: card d-wt-t-003 answered", out)
+        code, _, err = self.remove("t-003")
+        self.assertEqual(code, 2, err)
+        self.assertTrue(os.path.isdir(path), "an answer given before the folder was made again never removes it")
+        self.assertIn("t-003: opened card d-wt-t-003-j1 (recommends Delete)", self.check("--open-cards")[1])
+        self.assertEqual(self.card("d-wt-t-003-j1")["worktree"], os.path.realpath(path))
+        self.assertEqual(raw(self.dec("d-wt-t-003")), before)
+
+    def test_k7_a_card_marked_removed_never_counts(self):
+        path = self.job_tree("t-003-x")
+        self.add_task("t-003", "done", path, [])
+        before = self.old_card("d-wt-t-003", "t-003", os.path.realpath(path), rule="a", worktreeRemoved=self.REMOVED)
+        self.assertNotIn("t-003: card d-wt-t-003 answered", self.check()[1])
+        code, _, err = self.remove("t-003")
+        self.assertEqual(code, 2, err)
+        self.assertTrue(os.path.isdir(path))
+        self.assertIn("t-003: opened card d-wt-t-003-main", self.check("--open-cards")[1])
+        self.assertEqual(raw(self.dec("d-wt-t-003")), before)
+
+    def test_k8_a_card_for_another_branch_never_counts(self):
+        path = self.job_tree("t-003-x")
+        self.add_task("t-003", "done", path, [])
+        before = self.old_card("d-wt-t-003", "t-003", os.path.realpath(path), rule="a", branch="t-003-before")
+        self.assertNotIn("t-003: card d-wt-t-003 answered", self.check()[1])
+        code, _, err = self.remove("t-003")
+        self.assertEqual(code, 2, err)
+        self.assertTrue(os.path.isdir(path))
+        self.assertIn("t-003: opened card d-wt-t-003-main", self.check("--open-cards")[1])
+        self.assertEqual(self.card("d-wt-t-003-main")["branch"], "t-003-x")
+        self.assertEqual(raw(self.dec("d-wt-t-003")), before)
+
+    def test_k9_open_card_for_a_path_no_task_records_is_withdrawn(self):
+        path = self.job_tree("t-003-x")
+        self.add_task("t-003", "in-progress", path, [], worktrees=[{"path": self.gone("t-003-old"), "job": "old", "removed": self.REMOVED}])
+        self.old_card("d-wt-t-003-old", "t-003", self.gone("t-003-old"), status="open", answer=None, answered=None, job="old", main=False)
+        answered = self.old_card("d-wt-t-003-older", "t-003", self.gone("t-003-older"), job="older", main=False)
+        before = raw(self.dec("d-wt-t-003-old"))
+        code, out, err = self.check()
+        self.assertEqual(code, 0, err)
+        self.assertIn("t-003: card d-wt-t-003-old is open, but its worktree {} is no longer recorded; --open-cards withdraws it".format(
+            self.gone("t-003-old")), out)
+        self.assertEqual(raw(self.dec("d-wt-t-003-old")), before, "without --open-cards nothing is written")
+        code, out, err = self.check("--open-cards")
+        self.assertEqual(code, 0, err)
+        self.assertIn("t-003: withdrew card d-wt-t-003-old: its worktree {} is no longer recorded".format(self.gone("t-003-old")), out)
+        self.assertEqual(self.card("d-wt-t-003-old")["status"], "withdrawn")
+        self.assertIn("withdrew card d-wt-t-003-old", self.journal()[-1]["why"])
+        self.assertEqual(raw(self.dec("d-wt-t-003-older")), answered, "an answered card is never touched")
+
+    def test_k10_a_new_id_never_overwrites_another_paths_card(self):
+        path = self.job_tree("t-003-x")
+        self.add_task("t-003", "done", path, [])
+        first = self.old_card("d-wt-t-003", "t-003", self.gone("t-003-a"), answer="Keep", rule="a")
+        second = self.old_card("d-wt-t-003-main", "t-003", self.gone("t-003-b"), rule="a")
+        md1 = self.evidence("t-003", "WORKTREE.md", "old one\n")
+        md2 = self.evidence("t-003", "WORKTREE-main.md", "old two\n")
+        out = self.check("--open-cards")[1]
+        self.assertIn("t-003: opened card d-wt-t-003-main-2 (recommends Delete)", out)
+        card = self.card("d-wt-t-003-main-2")
+        self.assertEqual((card["worktree"], card["evidence"]), (os.path.realpath(path), ["WORKTREE-main-2.md"]))
+        self.assertTrue(os.path.isfile(os.path.join(self.dir, "evidence", "t-003", "WORKTREE-main-2.md")))
+        self.assertEqual((raw(self.dec("d-wt-t-003")), raw(self.dec("d-wt-t-003-main"))), (first, second))
+        self.assertEqual((raw(md1), raw(md2)), (b"old one\n", b"old two\n"))
+
+    def test_k11_an_archived_old_card_is_not_the_new_worktrees_either(self):
+        path, before = self.live_case("t-020", "t-020-j2", "t-020-unrecorded", folder=pa.ARCHIVE)
+        out = self.check("--open-cards")[1]
+        self.assertNotIn("t-020: card d-wt-t-020 answered", out)
+        self.assertIn("t-020: opened card d-wt-t-020-main", out)
+        self.assertTrue(os.path.isfile(self.dec("d-wt-t-020-main")))
+        self.assertEqual(raw(self.dec("d-wt-t-020", pa.ARCHIVE)), before)
+        self.assertFalse(os.path.exists(self.dec("d-wt-t-020")), "the archived card stays in the archive")
+
+    def test_k12_a_withdrawn_card_for_the_same_worktree_keeps_its_id(self):  # a guard: passes before the fix too
+        path = self.job_tree("t-003-x")
+        self.add_task("t-003", "done", path, [])
+        self.old_card("d-wt-t-003", "t-003", os.path.realpath(path), rule="a", status="withdrawn", answer=None,
+                      previousAnswer="Delete", previousAnswered=self.ANSWERED)
+        self.assertIn("t-003: opened card d-wt-t-003 (recommends Delete)", self.check("--open-cards")[1])
+        card = self.card("d-wt-t-003")
+        self.assertEqual((card["status"], card["worktree"], card["previousAnswer"]), ("open", os.path.realpath(path), "Delete"))
+
+
 class Containers(Base):
     """t-020 J3 (AC6.2, AC6.3): removing a worktree also removes the empty container folder it leaves
     (<project>/worktrees/<container>), and nothing else."""
