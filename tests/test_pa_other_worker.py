@@ -146,6 +146,15 @@ class Decide(Cards):
         self.assertEqual(self.journal()[-1]["why"], "withdrawn: moot")
         self.assertNotIn("previousAnswered", self.read("d-2"))
 
+    def test_d13_withdraw_other_without_words_has_no_previous_note(self):
+        """J1b round 2: absent words leave no previousNote key; an older carried one is dropped."""
+        self.put("d-1", status="answered", answer="Other", note=None, answered="2026-11-01T10:00:00Z",
+                 previousAnswer="Delete", previousNote="older words", previousAnswered="2026-10-01T10:00:00Z")
+        self.assertEqual(self.decide("d-1", withdraw=True, why="asked again")[0], 0)
+        c = self.read("d-1")
+        self.assertEqual((c["previousAnswer"], c["previousAnswered"]), ("Other", "2026-11-01T10:00:00Z"))
+        self.assertNotIn("previousNote", c)
+
     def test_d09_withdraw_any_other_answered_card_is_refused(self):
         self.put("d-1", status="answered", answer="B", note="B it is")
         self.put("d-5", status="withdrawn", answer=None, previousAnswer="Other", other=True, note="old")
@@ -272,6 +281,36 @@ class Worktree(Cards):
         for key in ("previousAnswer", "previousNote", "previousAnswered", "previousCard"):
             self.assertNotIn(key, c)
 
+    def delete_on_the_card_asked_again(self, note):
+        """Other, withdrawn, asked again; then the person answers Delete and the worktree changes, so pa-worktree remove
+        withdraws that card. Returns the card the next check opens."""
+        self.answered_other(answered="2026-11-01T10:00:00Z")
+        self.assertEqual(self.decide("d-wt-t-003", withdraw=True, why="the person now wants it deleted")[0], 0)
+        self.assertIn("opened card d-wt-t-003", self.check()[1])
+        path = self.card_path("d-wt-t-003")
+        card = load(path)
+        card.update(status="answered", answer="Delete", note=note, answered="2026-11-03T09:00:00Z", answeredBy="person, in the panel")
+        dump(card, path)
+        self.commit(self.wt, "late.txt", "late\n", "a commit after the card")
+        code, _o, err = self.remove()
+        self.assertEqual(code, 2)
+        self.assertIn("the card is withdrawn", err)
+        c = self.read("d-wt-t-003")
+        self.assertEqual((c["status"], c["previousAnswer"], c["previousAnswered"]), ("withdrawn", "Delete", "2026-11-03T09:00:00Z"))
+        self.assertIn("opened card d-wt-t-003", self.check()[1])
+        return self.read("d-wt-t-003")
+
+    def test_w08_a_listed_answer_withdrawn_drops_the_older_words(self):
+        """J1b round 2: the three carried keys describe the Delete answer, not the older Other words and time."""
+        c = self.delete_on_the_card_asked_again(None)
+        self.assertEqual((c["status"], c["previousAnswer"], c["previousAnswered"]), ("open", "Delete", "2026-11-03T09:00:00Z"))
+        self.assertNotIn("previousNote", c)
+
+    def test_w09_a_listed_answer_withdrawn_carries_its_own_words(self):
+        c = self.delete_on_the_card_asked_again("  keep the branch  ")
+        self.assertEqual((c["previousAnswer"], c["previousNote"], c["previousAnswered"]),
+                         ("Delete", "  keep the branch  ", "2026-11-03T09:00:00Z"))
+
 
 class Leftovers(Cards):
     """R9: pa-worker close --card closes nothing on an Other answer, withdraws the card and quotes the words."""
@@ -346,6 +385,37 @@ class Leftovers(Cards):
         self.assertEqual((c["previousCard"], c["previousAnswer"], c["previousNote"], c["previousAnswered"]),
                          ("d-leftovers", "Other", "close all but t32", answered))
 
+
+    def test_l05_a_note_withdrawn_carries_its_own_words(self):
+        """J1b round 2 (the review's chain): Other on d-leftovers, then Close all with a note on d-leftovers-2; the next
+        card carries that answer, that note and that time, never the older Other words."""
+        self.ready()
+        self.answer("Other", note="close all but t32")
+        self.worker("close", "--card", "d-leftovers")
+        self.assertIn("opened card d-leftovers-2", self.sweep()[1])
+        path = self.card_path("d-leftovers-2")
+        card = load(path)
+        card.update(status="answered", answer=pa_hooks.CLOSE_ALL, note="keep t35", answered="2026-11-04T08:00:00Z")
+        dump(card, path)
+        code, _o, err = self.worker("close", "--card", "d-leftovers-2")
+        self.assertEqual(code, 2)
+        self.assertIn("card d-leftovers-2 has a note, so nothing was closed", err)
+        self.assertEqual(self.ended(), [])
+        code, out, err = self.sweep()
+        self.assertEqual(code, 0, err)
+        self.assertIn("opened card d-leftovers-3", out)
+        c = pa.read_json(self.card_path("d-leftovers-3"))
+        self.assertEqual((c["status"], c["answer"], c["note"]), ("open", None, None))
+        self.assertEqual((c["previousCard"], c["previousAnswer"], c["previousNote"], c["previousAnswered"]),
+                         ("d-leftovers-2", pa_hooks.CLOSE_ALL, "keep t35", "2026-11-04T08:00:00Z"))
+
+    def test_l06_other_without_words_has_no_previous_note(self):
+        self.ready()
+        self.answer("other")
+        self.worker("close", "--card", "d-leftovers")
+        c = self.card()
+        self.assertEqual(c["previousAnswer"], "Other")
+        self.assertNotIn("previousNote", c)
 
 if __name__ == "__main__":
     unittest.main()
