@@ -617,6 +617,22 @@ def worktree_state(directory, agent, profile=None):
                                                                   "killed" if info.get("reason") == "killed" else
                                                                   "removed" if not info else "exited")
                 row["workers"].append({"address": w.get("address"), "name": w.get("name") or info.get("name"), "fate": fate})
+    # A task counts on a row when the path it records is the worktree, inside it (a workspace package src/<Pkg>) or the
+    # container that holds it (REVIEW M2, round 3): `counted` (distinct, exact ones first) is what rule (a), rule (b) and
+    # a card's task set use; `related` names the paths those other tasks record, which a removal marks once they are gone.
+    for row in rows.values():
+        row["counted"], row["related"] = list(dict.fromkeys(row["tasks"])), {}
+    for row in rows.values():
+        for other in rows.values():
+            if other is row or not (inside(other["path"], row["path"]) or inside(row["path"], other["path"])):
+                continue
+            for t in other["tasks"]:
+                if t in row["tasks"]:
+                    continue
+                row["related"].setdefault(t, []).append(other["path"])
+                if t not in row["counted"]:
+                    row["counted"].append(t)
+                    row["states"][t], row["titles"][t] = other["states"][t], other["titles"][t]
     for row in rows.values():
         mine = {w["address"] for w in row["workers"]}
         row["others"] = sorted(a for a, info in live.items() if a not in mine and a != agent.get("terminal") and (
@@ -1058,8 +1074,34 @@ def job_over(row, facts, profile):
 def under_rule_b(row, card=None):
     """True when rule (b) decides this worktree: a task using it is not done or parked, exactly one task records it, and
     (when a card is given) the card was opened under rule (b). A worktree two or more tasks record keeps rule (a): offered
-    and removed only once every task using it is done or parked (spec AC7.1, VP2). check and remove both ask this."""
-    return bool(tasks_still(row)) and len(set(row["tasks"])) == 1 and (card is None or card.get("rule") == "b")
+    and removed only once every task using it is done or parked (spec AC7.1, VP2). check and remove both ask this.
+    A task that records a path inside the worktree or its container counts too (row["counted"], round 3)."""
+    return bool(tasks_still(row)) and len(row_tasks(row)) == 1 and (card is None or card.get("rule") == "b")
+
+
+def row_tasks(row):
+    """The distinct tasks that count on a worktree row, sorted: what a card records as the set it was asked about."""
+    return sorted(set(row.get("counted") or row["tasks"]))
+
+
+def card_mismatch(row, card, answered):
+    """Why a card no longer stands for the worktree as the ledger has it now, or None (VERIFY M2, round 3). A card is for
+    the task set it was asked about: a different set now (a card from before round 3 records none: it differs once two or
+    more tasks count on the row, and stands for one). An open rule-(b) card also stops standing once every task using the
+    worktree is done or parked (rule (a) asks then); an answered one keeps standing there (RL-V4, not changed here)."""
+    now = row_tasks(row)
+    asked = card.get("tasks")
+    if not isinstance(asked, list):
+        if len(now) > 1:
+            return "the card does not record which tasks it was asked for, and {} record the worktree now".format(
+                ", ".join(clean(t) for t in now))
+    elif sorted(set(str(t) for t in asked)) != now:
+        return "the card was asked for {}; the worktree is recorded by {} now".format(
+            ", ".join(clean(t) for t in sorted(set(str(t) for t in asked))) or "no task", ", ".join(clean(t) for t in now))
+    if not answered and card.get("rule") == "b" and not tasks_still(row):
+        return ("the card was asked under rule (b), and every task using the worktree is done or parked now; it is asked again "
+                "under rule (a)")
+    return None
 
 
 def withdraw_card(directory, path, card, task, why):
@@ -1098,9 +1140,9 @@ def open_worktree_card(directory, row, facts, profile, owner, rule, gone, desc=N
     except OSError:
         pass
     squash = (" " + SQUASH if any(c["merged"] is False for r in desc["repos"] for c in r["commits"]) else "")
-    titles = ", ".join('{} "{}"'.format(clean(t), cut(clean(row["titles"].get(t, "")), 60)) for t in row["tasks"])
+    titles = ", ".join('{} "{}"'.format(clean(t), cut(clean(row["titles"].get(t, "")), 60)) for t in row.get("counted") or row["tasks"])
     pa.write_json(card_path(directory, task, job, main), {
-        "id": cid, "task": task, "worktree": row["path"], "job": job, "main": main, "rule": rule,
+        "id": cid, "task": task, "worktree": row["path"], "job": job, "main": main, "rule": rule, "tasks": row_tasks(row),
         "question": "Delete the worktree for {}{}?".format(titles, ", job {}".format(clean(job)) if named else ""),
         "context": card_context(desc, row, facts, gone, extra, md_file),
         "evidence": evidence,
@@ -1140,6 +1182,7 @@ def cmd_worktree(args):
                 card = None  # asked again once its job is over or every task is done or parked
             fates = [w["fate"] for w in row["workers"]]
             still = tasks_still(row)
+            mismatch = card and card_mismatch(row, card, card.get("status") == "answered")
             gone = ", ".join("{} ({})".format(clean(w["name"] or w["address"]), w["fate"]) for w in row["workers"]) or "no workers recorded"
             if not facts:
                 print("{}: gone or not a git worktree ({})".format(task, row["path"]))
@@ -1153,15 +1196,18 @@ def cmd_worktree(args):
                 print("{}: {} is not under a worktrees folder; not offered".format(task, row["path"]))
             elif card and card.get("status") == "answered":
                 delete = str(card.get("answer", "")).lower().startswith("delete")
-                if delete and under_rule_b(row, card):
+                if delete and under_rule_b(row, card) and not mismatch:
                     print("{}: card {} answered {!r}: run `{}`; it re-checks".format(task, card["id"], card.get("answer"), remove_command(*owner)))
                 elif delete and still:
                     print("{}: card {} answered {!r}, but tasks still {}; pa-worktree remove refuses until every task using it is "
                           "done or parked".format(task, card["id"], card.get("answer"), still))
+                elif delete and mismatch:
+                    print("{}: card {} answered {!r}, but {}; pa-worktree remove refuses it and withdraws it, and the next "
+                          "--open-cards asks again".format(task, card["id"], card.get("answer"), mismatch))
                 else:
                     print("{}: card {} answered {!r}{}".format(task, card["id"], card.get("answer"),
                           ": run `{}`".format(remove_command(*owner)) if delete else ": kept, not asked again"))
-            elif card and under_rule_b(row, card):
+            elif card and under_rule_b(row, card) and not mismatch:
                 over, why, _desc = job_over(row, facts, profile)
                 if over:
                     print("{}: card {} is open".format(task, card["id"]))
@@ -1175,6 +1221,10 @@ def cmd_worktree(args):
                 # A task was reopened after the card opened: the question no longer stands.
                 withdraw_card(directory, path, card, task,
                               "tasks still {}; it is asked again once every task using the worktree is done or parked".format(still))
+            elif card and mismatch and not args.open_cards:
+                print("{}: card {} is open, but {}; --open-cards withdraws it".format(task, card["id"], mismatch))
+            elif card and mismatch:
+                withdraw_card(directory, path, card, task, mismatch)
             elif card:
                 print("{}: card {} is open".format(task, card["id"]))
             elif still and not under_rule_b(row):
@@ -1233,6 +1283,11 @@ def cmd_worktree(args):
     busy = [w["address"] for w in row["workers"] if w["fate"] == "live"] + row["others"]
     if busy:
         raise pa.Problem("still in use by {}; nothing was removed".format(", ".join(busy)))
+    mismatch = card_mismatch(row, card, True)
+    if mismatch:
+        # The person answered for other tasks than the ones the worktree belongs to now: ask again with a fresh card.
+        withdraw_answered(directory, path, card, task, "the card no longer stands: " + mismatch)
+        raise pa.Problem(mismatch + "; the card is withdrawn and the next `pa-worktree check --open-cards` asks again. Nothing was removed")
     snapshot = card.get("snapshot") or {}
     changed = None
     if facts["uncommitted"] > snapshot.get("uncommitted", 0):
@@ -1245,12 +1300,7 @@ def cmd_worktree(args):
         changed = changed_since_card(snapshot)
     if changed:
         # The person answered about a worktree that is no longer the same: ask again with a fresh card.
-        why = "the worktree changed since the person answered {!r}: {}".format(card.get("answer"), changed)
-        card.update(status="withdrawn", previousAnswer=card.get("answer"), answer=None, answered=pa.now(),
-                    answeredBy="pa-worktree remove: withdrawn", note="Withdrawn by pa-worktree remove: " + why)
-        pa.write_json(path, card)
-        append_journal(directory, {"by": "agent" if by_an_agent() else "person", "trigger": "worktree", "task": task,
-                                   "why": "withdrew card {}: {}".format(card["id"], why)})
+        withdraw_answered(directory, path, card, task, "the worktree changed since the person answered {!r}: {}".format(card.get("answer"), changed))
         raise pa.Problem(changed + "; the card is withdrawn and the next `pa-worktree check --open-cards` asks again. Nothing was removed")
     try:
         done = remove_worktree(row["path"], facts)
@@ -1258,11 +1308,20 @@ def cmd_worktree(args):
         if not os.path.lexists(row["path"]):  # it failed, but the folder is gone: the ledger must not name it
             mark_removed_everywhere(directory, row, "the worktree {} is gone after a failed removal (card {})".format(row["path"], card["id"]))
         raise
-    mark_removed_everywhere(directory, row, "removed the worktree {} (card {})".format(row["path"], card["id"]))
     print(done + " (card {})".format(card["id"]))
     tidy = remove_container(row["given"])
     if tidy:
         print(tidy)
+    mark_removed_everywhere(directory, row, "removed the worktree {} (card {})".format(row["path"], card["id"]))
+
+
+def withdraw_answered(directory, path, card, task, why):
+    """pa-worktree remove withdraws an answered card that no longer stands; the next check asks again."""
+    card.update(status="withdrawn", previousAnswer=card.get("answer"), answer=None, answered=pa.now(),
+                answeredBy="pa-worktree remove: withdrawn", note="Withdrawn by pa-worktree remove: " + why)
+    pa.write_json(path, card)
+    append_journal(directory, {"by": "agent" if by_an_agent() else "person", "trigger": "worktree", "task": task,
+                               "why": "withdrew card {}: {}".format(card["id"], why)})
 
 
 def pick_row(rows, task, job=None):
@@ -1297,12 +1356,19 @@ def tasks_still(row):
 
 def mark_removed_everywhere(directory, row, why):
     """After a worktree was removed (or is gone after a failed removal): every task that records it gets it marked
-    removed (mark_removed), under the ledger lock, and the journal says so. No entry is left naming the folder."""
+    removed (mark_removed), under the ledger lock, and the journal says so. No entry is left naming the folder. A task that
+    counts on the row through a path inside the worktree or its container (row["related"]) gets that path marked once
+    it is gone (a package inside is gone with the worktree; a container only once remove_container took it)."""
     with ledger_lock(directory):
         ledger = read_ledger(directory)
         for t in ledger.get("tasks", []):
             if t.get("id") in row["tasks"]:
                 mark_removed(t, row["path"], pa.now())
+                t["updated"] = pa.now()
+            gone = [p for p in (row.get("related") or {}).get(t.get("id"), []) if not os.path.lexists(p)]
+            for p in gone:
+                mark_removed(t, p, pa.now())
+            if gone:
                 t["updated"] = pa.now()
         if ledger:
             pa.write_json(os.path.join(directory, "ledger.json"), ledger)
