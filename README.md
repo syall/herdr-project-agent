@@ -312,7 +312,10 @@ than its 2 s limit (a slower command shows nothing that update), and never fails
 `report` show it beside `est.`: est. leads wherever a price table gives one; CC is shown next to it,
 labelled "Claude Code ... USD list price (n of m Claude sessions)", and is the only money figure where
 there is no price. It is never added to est. and never called billed: it is Claude Code's estimate,
-not the bill (no provider tiers or discounts).
+not the bill (no provider tiers or discounts). A resumed session is counted once: Claude Code's figure
+already holds the session's earlier turns, and a restart from zero (lower cost and duration that then grow no
+faster than the clock) adds a segment. A record written before this that counted the history again (its duration
+longer than its own time span) is read as its last figure alone, marked `ccCorrected` in the summary.
 - Not added when: the caller gave its own `--settings`, the profile has no valid `statusLine`, or
   `PA_NO_CC_STATUSLINE=1` is set (the off switch; removing the key also turns it off). Your status
   line command must be found when the session starts, or nothing is added.

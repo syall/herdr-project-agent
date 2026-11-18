@@ -2110,6 +2110,9 @@ def summarize(directory, rows, records, table, price_problem, profile_name, now,
             cleared = sum(1 for _rec, c in parts if c)
             if cleared:
                 entry["ccCleared"] = cleared
+            corrected = sum(1 for rec, _c in parts if rec.get("corrected"))
+            if corrected:  # t-043: a written record that counted a resumed session's history again, read as counted once
+                entry["ccCorrected"] = corrected
         sess_list.append(entry)
     sess_list.sort(key=lambda e: e["to"] or "", reverse=True)
     um = [x for x in records if x.get("ev") == "unmatched"]
@@ -3515,6 +3518,8 @@ RECORD_BUDGET = 0.3  # seconds the record may take after it started; past that i
 STDIN_MAX = 1 << 20  # bytes of stdin read; more is cut (passed on cut) and nothing is recorded
 CC_WRITE_EVERY = 300  # seconds: an unchanged record is rewritten at most this often (keeps `at` fresh)
 CC_DROP = 0.01  # a cost lower than the stored one by more than this, with a lower duration, starts a new segment
+CC_RESTORE_SLACK = 60  # seconds: a held drop is a resume when the duration comes back faster than the clock by more
+CC_SPAN_SLACK = 300  # seconds: a written record whose duration passes its own span by more has restored totals (t-043)
 CC_MAX_FILES = 5000  # costs/cc/ files a summary reads, newest first
 CC_SESSION = re.compile(r"^[0-9A-Za-z-]{8,64}$")
 CC_VERSION = re.compile(r"^[0-9A-Za-z.+-]{1,32}$")
@@ -3563,12 +3568,22 @@ def cc_clean(rec, session=None):
     if not isinstance(at, str) or parse_ts(at) is None:
         return None
     segments = rec.get("segments")
-    return {"v": 1, "session": sid, "cost": cc_number(rec.get("cost"), 1e6), "base": cc_number(rec.get("base"), 1e9),
-            "segments": segments if isinstance(segments, int) and not isinstance(segments, bool) and segments >= 1 else None,
-            "durationMs": cc_number(rec.get("durationMs")), "apiDurationMs": cc_number(rec.get("apiDurationMs")),
-            "model": cc_text(rec.get("model"), MODEL), "version": cc_text(rec.get("version"), CC_VERSION),
-            "terminal": cc_text(rec.get("terminal"), pa.ID),
-            "first": first if isinstance(first, str) and parse_ts(first) is not None else at, "at": at}
+    out = {"v": 1, "session": sid, "cost": cc_number(rec.get("cost"), 1e6), "base": cc_number(rec.get("base"), 1e9),
+           "segments": segments if isinstance(segments, int) and not isinstance(segments, bool) and segments >= 1 else None,
+           "durationMs": cc_number(rec.get("durationMs")), "apiDurationMs": cc_number(rec.get("apiDurationMs")),
+           "model": cc_text(rec.get("model"), MODEL), "version": cc_text(rec.get("version"), CC_VERSION),
+           "terminal": cc_text(rec.get("terminal"), pa.ID),
+           "first": first if isinstance(first, str) and parse_ts(first) is not None else at, "at": at}
+    held_cost, held_ms = cc_number(rec.get("heldCost"), 1e6), cc_number(rec.get("heldMs"))
+    if held_cost is not None and held_ms is not None:  # a drop record_cc holds until it knows it a resume or a restart
+        out["heldCost"], out["heldMs"] = held_cost, held_ms
+    elif (out["segments"] or 1) > 1 and out["durationMs"] is not None and out["base"] is not None:
+        # t-043: totals holding more wall time than the record's own span were restored by a resume, so they hold
+        # every earlier segment already (after a real restart the duration is at most the time since it).
+        span = (parse_ts(out["at"]) or 0) - (parse_ts(out["first"]) or 0)
+        if out["durationMs"] > (span + CC_SPAN_SLACK) * 1000:
+            out.update(base=0, segments=1, corrected=True)
+    return out
 
 
 def cc_figure(rec):
@@ -3640,15 +3655,27 @@ def record_cc(directory, fields, now):
             rec["first"] = old["first"]
             if rec["cost"] is None:  # a reading without a valid cost never takes the figure away; other fields are the latest
                 rec["cost"] = old["cost"]
+            then = parse_ts(old["at"]) or 0
             if (fields["cost"] is not None and old["cost"] is not None and fields["cost"] < old["cost"] - CC_DROP
                     and fields["durationMs"] is not None and old["durationMs"] is not None and fields["durationMs"] < old["durationMs"]):
-                rec["base"] += old["cost"]  # a resume after a crash restarted the totals: a new segment
+                # Lower totals: a restart from zero, or (t-043) a resume's first update before Claude Code restores the
+                # session's saved totals. Counted as a new segment and held; undone below if the totals come back.
+                rec["base"] += old["cost"]
                 rec["segments"] += 1
-            then = parse_ts(old["at"]) or 0
+                rec["heldCost"], rec["heldMs"] = old["cost"], old["durationMs"]
+            elif "heldCost" in old:
+                if (fields["cost"] is not None and fields["durationMs"] is not None and old["durationMs"] is not None
+                        and fields["durationMs"] >= old["heldMs"] and fields["cost"] >= old["heldCost"] - CC_DROP
+                        and fields["durationMs"] - old["durationMs"] > (now - then + CC_RESTORE_SLACK) * 1000):
+                    # wall time grew faster than the clock: Claude Code restored the totals, which hold the old segment
+                    rec["base"] = max(0, rec["base"] - old["heldCost"])
+                    rec["segments"] = max(1, rec["segments"] - 1)
+                else:
+                    rec["heldCost"], rec["heldMs"] = old["heldCost"], old["heldMs"]
             if (rec["cost"] == old["cost"] and rec["model"] == old["model"] and rec["segments"] == old["segments"]
-                    and now - then < CC_WRITE_EVERY):
+                    and rec.get("heldCost") == old.get("heldCost") and not old.get("corrected") and now - then < CC_WRITE_EVERY):
                 return False
-        text = json.dumps({k: rec[k] for k in CC_KEYS}, separators=(",", ":")) + "\n"
+        text = json.dumps({k: rec[k] for k in CC_KEYS + ("heldCost", "heldMs") if k in rec}, separators=(",", ":")) + "\n"
         tmp = os.path.join(folder, ".{}.{}.tmp".format(fields["session"], os.getpid()))
         with CC_STOP["write"]:  # a cancel waits for a write in progress (statusline_stop), and none starts after it
             if CC_STOP["stopping"]:
