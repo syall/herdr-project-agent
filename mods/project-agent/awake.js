@@ -6,7 +6,8 @@
 // survives a restart) and mirrored to shared AWAKE so every copy sees a click at once. Off macOS it does nothing.
 // Every call goes through host.js (key "awake", a limit, the budget).
 
-import { div, h_flex, v_flex } from "gpui-kit";
+import { div } from "gpui-kit";
+import { h_flex, v_flex } from "gpui-base";
 import { shared, setShared, window as herdrWindow } from "herdr";
 import { run as hostRun, gaveUp } from "./host.js";
 
