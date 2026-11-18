@@ -400,11 +400,27 @@ class Round3Addition(Round3):
         argv = self.run_once({"beat": False})
         self.assertIn("--resume", argv)
         self.assertEqual(argv[-1], "Your session was restarted. Read your state folder (ledger.json, journal.jsonl, "
-                         "decisions/, rules.json), then say in one line where things stand. Continue in-flight work "
-                         "as orchestrator.md defines it under \"After a restart or a compaction\"; start nothing new "
-                         "until asked, and nothing at all if passes are paused or the person's last message asked "
-                         "you to hold.")
+                         "decisions/, rules.json), then say in one line where things stand. Continue where you left "
+                         "off without asking, as orchestrator.md defines it under \"After a restart or a "
+                         "compaction\": read the reports that came in, take the next planned step, and start a fresh "
+                         "worker for a job whose worker stopped. Start nothing else until asked: no new task, no move "
+                         "to a phase that needs the person, no worker for a task with an open card. If the last hold "
+                         "or resume line in the journal is a hold, start nothing at all until the person says go. "
+                         "`paused` in `schedule.json` stops timed passes only; it is not a hold.")  # t-034
         self.assertNotIn("Do not start new work until asked.", argv[-1])
+        self.assertNotIn("start nothing new", argv[-1])
+        self.assertNotIn("passes are paused", argv[-1])
+        # t-034: the prompt and orchestrator.md agree word for word where they overlap
+        here = os.path.dirname(os.path.abspath(__file__))
+        with open(os.path.join(here, "..", "runtime", "core", "orchestrator.md"), encoding="utf-8") as f:
+            core = " ".join(f.read().split())
+        for clause in ("where you left off without asking",
+                       "Start nothing else until asked: no new task, no move to a phase that needs the person, no "
+                       "worker for a task with an open card.",
+                       "is a hold, start nothing at all until the person says go.",
+                       "`paused` in `schedule.json` stops timed passes only; it is not a hold."):
+            self.assertIn(clause, argv[-1])
+            self.assertIn(clause, core)
 
     def test_u22_two_launchers_never_claim_at_once(self):
         # Two launchers for one space start together. While the first is inside claim (init_state,

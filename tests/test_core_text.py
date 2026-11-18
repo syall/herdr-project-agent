@@ -60,14 +60,15 @@ class Orchestrator(unittest.TestCase):
 
     def test_r3_restart_continues_in_flight_work(self):  # t-017 R3 AC3.1-AC3.3, G5 (J4)
         restart = flat(self.raw[self.raw.index("## After a restart or a compaction"):self.raw.index("## Files")])
-        new = ("After a restart, continue in-flight work: read and close the reports of workers started before it, "
+        new = ("After a restart or a compaction, continue where you left off without asking: read and close the "
+               "reports of workers started before it, "
                "and take the next step the journal already set for a task in its current phase (a fix round after "
                "check findings, a recheck after a fix, the gate, a card). "
                "Start nothing else until asked: no new task, no move to a phase that needs the person, no worker "
                "for a task with an open card. "
                "When the person says to hold or to resume, append a journal line recording it, in their words. "
-               "If passes are paused in `schedule.json`, or the last such line in the journal is a hold, start "
-               "nothing at all until they say go.")  # J10 RL-J4-1
+               "If the last such line in the journal is a hold, start nothing at all until the person says go. "
+               "`paused` in `schedule.json` stops timed passes only; it is not a hold.")  # J10 RL-J4-1, t-034
         self.assertIn(new, restart)
         self.assertLess(restart.index("start a fresh worker for the job or park the task;"), restart.index(new))
 
@@ -76,12 +77,17 @@ class Orchestrator(unittest.TestCase):
         restart = flat(self.raw[self.raw.index("## After a restart or a compaction"):self.raw.index("## Files")])
         self.assertIn("When the person says to hold or to resume, append a journal line recording it, in their "
                       "words.", restart)
-        self.assertIn("or the last such line in the journal is a hold, start nothing at all", restart)
+        self.assertIn("If the last such line in the journal is a hold, start nothing at all", restart)
         self.assertNotIn("the person's last message asked you to hold", self.text)
+        # t-034: the schedule's paused setting is about timed passes only, not a hold
+        self.assertIn("`paused` in `schedule.json` stops timed passes only; it is not a hold.", restart)
+        self.assertNotIn("If passes are paused in", self.text)
+        self.assertNotIn("continue in-flight work", self.text)
 
     def test_t017_j10_stopped_worker_under_hold(self):  # RL-J4-3
         self.assertIn("read its evidence folder, then start a fresh worker for the job or park the task; while "
-                      "passes are paused or a hold is on, do neither and only report it.", self.text)
+                      "a hold is on, do neither and only report it.", self.text)  # t-034
+        self.assertNotIn("while passes are paused or a hold is on", self.text)
 
     def test_t017_j10_gate_reads_task_tier(self):  # RL-J5-1 / RL-J5-2
         self.assertIn("the gate counts it as the reviewer only for a low-tier task.", self.text)
@@ -257,6 +263,14 @@ class Worker(unittest.TestCase):
     def setUp(self):
         self.raw = read("runtime", "core", "worker.md")
         self.text = flat(self.raw)
+
+    def test_t034_restart_continues_own_job(self):  # t-034 intent item 5
+        self.assertIn("- If your session restarts or is compacted, continue your own job without asking: read your "
+                      "evidence folder and your worktree (`git status`, `git log`) for what you wrote and committed "
+                      "before, and go on from there. If you were started for a job whose worker stopped, read what "
+                      "that worker left the same way first.", self.text)
+        rules = self.raw[self.raw.index("## Rules of the job"):self.raw.index("## Roles")]
+        self.assertIn("continue your own job without asking", flat(rules))
 
     def test_r1_one_job(self):  # AC1.3
         self.assertIn("You are started for one job.", self.text)
