@@ -530,27 +530,95 @@ def cc_statusline(p):
     return {"command": list(command), "refreshInterval": refresh}, None
 
 
-def cc_settings_args(p, space, argv):
-    """["--settings", <json>] that makes Claude Code's status line `pa-costs statusline`, which records the session's
-    own cost figure and prints the profile's status line unchanged (t-029 R4); [] when the caller gave its own
-    --settings, the profile has no valid statusLine, PA_NO_CC_STATUSLINE is set, or anything is missing. Never raises:
-    a launch never fails because of it."""
+def cc_statusline_setting(p, space):
+    """The "statusLine" setting that makes Claude Code's status line `pa-costs statusline`, which records the session's
+    own cost figure and prints the profile's status line unchanged (t-029 R4); None when the profile has no valid
+    statusLine, PA_NO_CC_STATUSLINE is set, or anything is missing. Never raises."""
     try:
         if os.environ.get("PA_NO_CC_STATUSLINE") not in (None, "", "0"):
-            return []
-        if any(a == "--settings" or a.startswith("--settings=") for a in argv):
-            return []
+            return None
         space = local_id(space or "")
         cfg, _problem = cc_statusline(p)
         if not cfg or not ID.match(space) or not sys.executable or not os.path.isfile(COSTS_FILE):
-            return []
+            return None
         inner = resolve(cfg["command"], p)  # as the profile's own commands are found; not found: no status line of ours
         command = " ".join([shlex.quote(sys.executable), shlex.quote(COSTS_FILE), "statusline", "--space", space, "--then"]
                            + [shlex.quote(a) for a in inner])
-        return ["--settings", json.dumps({"statusLine": {"type": "command", "command": command,
-                                                         "refreshInterval": cfg["refreshInterval"]}}, separators=(",", ":"))]
+        return {"type": "command", "command": command, "refreshInterval": cfg["refreshInterval"]}
+    except Exception:  # noqa: BLE001 - the launch goes on without it
+        return None
+
+
+def cc_settings_args(p, space, argv):
+    """["--settings", <json>] with the recording status line, for a worker's launch (t-029 R4); [] when the caller gave
+    its own --settings or there is no status line of ours. Never raises: a launch never fails because of it."""
+    try:
+        if any(a == "--settings" or a.startswith("--settings=") for a in argv):
+            return []
+        status = cc_statusline_setting(p, space)
+        return ["--settings", json.dumps({"statusLine": status}, separators=(",", ":"))] if status else []
     except Exception:  # noqa: BLE001 - the launch goes on without it
         return []
+
+
+# t-040: the Project Agent's own session asks Claude Code for the one-hour prompt cache with the `promptCacheTtl`
+# setting in its --settings (never an environment variable, which the workers it starts would inherit). Workers keep
+# Claude Code's default. The profile key chooses: "1h" (the default when absent), "5m", or "default" (set nothing).
+PA_CACHE_KEY = "orchestratorPromptCacheTtl"
+PA_CACHE_DEFAULT = "1h"
+CACHE_TTLS = ("5m", "1h")  # the values Claude Code takes; it ignores any other
+
+
+def pa_cache_ttl(p):
+    """(ttl, problem) for the Project Agent's promptCacheTtl from profile p: ("1h", None) when the key is absent,
+    (value, None) for "1h" or "5m", (None, None) for "default", (None, why) for anything else (nothing is set)."""
+    if PA_CACHE_KEY not in p:
+        return PA_CACHE_DEFAULT, None
+    v = p[PA_CACHE_KEY]
+    if isinstance(v, str) and v in CACHE_TTLS:
+        return v, None
+    if v == "default":
+        return None, None
+    return None, '{} must be "1h", "5m" or "default"'.format(PA_CACHE_KEY)
+
+
+def cache_in_effect(p, env):
+    """(ttl, by): the main conversation's cache lifetime the Project Agent launched from p with environment env asks
+    for, in Claude Code's documented order: FORCE_PROMPT_CACHING_5M, CLAUDE_CODE_PROMPT_CACHE_TTL, the setting (by
+    "profile" when the profile names it, "pa" for this file's default), ENABLE_PROMPT_CACHING_1H, else ("default",
+    "claude-code"). What is asked for, not what the provider gives (some models on some providers have no 1h)."""
+    if env.get("FORCE_PROMPT_CACHING_5M") not in (None, "", "0"):
+        return "5m", "FORCE_PROMPT_CACHING_5M"
+    if env.get("CLAUDE_CODE_PROMPT_CACHE_TTL") in CACHE_TTLS:
+        return env["CLAUDE_CODE_PROMPT_CACHE_TTL"], "CLAUDE_CODE_PROMPT_CACHE_TTL"
+    ttl, _why = pa_cache_ttl(p)
+    if ttl:
+        return ttl, ("profile" if PA_CACHE_KEY in p else "pa")
+    if env.get("ENABLE_PROMPT_CACHING_1H") not in (None, "", "0"):
+        return "1h", "ENABLE_PROMPT_CACHING_1H"
+    return "default", "claude-code"
+
+
+def pa_settings(p, space):
+    """The Project Agent's own Claude Code settings: the recording status line (when there is one) and promptCacheTtl
+    (t-040). One dict, given as one --settings, so another setting for the Project Agent only is added here."""
+    out = {}
+    status = cc_statusline_setting(p, space)
+    if status:
+        out["statusLine"] = status
+    try:
+        ttl, _why = pa_cache_ttl(p)
+    except Exception:  # noqa: BLE001 - the launch goes on without it
+        ttl = None
+    if ttl:
+        out["promptCacheTtl"] = ttl
+    return out
+
+
+def pa_settings_args(p, space):
+    """["--settings", <json>] for the Project Agent's own launch, or [] when there is nothing to set."""
+    settings = pa_settings(p, space)
+    return ["--settings", json.dumps(settings, separators=(",", ":"))] if settings else []
 
 
 def exec_plain(p, extra=()):
@@ -912,7 +980,7 @@ def launch_command(p, agent, resume, directory):
                  "the person, no worker for a task with an open card. If the last hold or resume line in the "
                  "journal is a hold, start nothing at all until the person says go. `paused` in "
                  "`schedule.json` stops timed passes only; it is not a hold."]
-    argv += cc_settings_args(p, agent.get("space") or os.path.basename(directory), [])  # last (t-029 R4)
+    argv += pa_settings_args(p, agent.get("space") or os.path.basename(directory))  # last (t-029 R4, t-040)
     argv = resolve(argv, p)
     # The exec refuses anything else (TypeError / ValueError); refuse it here, so run_agent's trial build of a
     # re-read profile fails and the loop keeps the one in hand (t-033 round 3). A no-op for every valid profile.
@@ -979,7 +1047,9 @@ def run_agent(args, address, project, p, directory, agent, ctx, started):
             argv, model = launch_command(p, agent, resume, directory)
 
         def starting(model):  # what is written as a launch starts; returns its start time
-            session_log(directory, "start resume={} session={} reason={}".format(resume, agent["sessionId"], why))
+            ttl, by = cache_in_effect(p, os.environ)  # t-040: the cache lifetime this start asks for
+            session_log(directory, "start resume={} session={} reason={} cache={} cacheBy={}".format(
+                resume, agent["sessionId"], why, ttl, by))
             began = time.time()
             running.update(since=began, session=agent["sessionId"], marked=False)
             launcher_session(ctx, directory, agent, resume)
@@ -1332,6 +1402,26 @@ def cost_fact_notes(directory, agent):
     return notes
 
 
+def cache_notes(directory, agent):
+    """pa-doctor's notes on the Project Agent's prompt cache (t-040): what the profile gives, the last start line's
+    cache= and cacheBy= (what the launcher asked for, with its own environment), and a malformed profile key."""
+    try:
+        p = load_profile(agent.get("profile"))
+    except Problem:
+        return []
+    ttl, why = pa_cache_ttl(p)
+    if why:
+        return ["profile {} is malformed ({}): the Project Agent gets Claude Code's default prompt cache".format(PA_CACHE_KEY, why)]
+    last = None
+    for line in read_text(os.path.join(directory, "session.log")).splitlines():
+        words = line.split()
+        if len(words) >= 2 and words[1] == "start":
+            last = [w for w in words[2:] if w.startswith(("cache=", "cacheBy="))]
+    shown = " ".join(last) if last else "not recorded (started before t-040)" if last is not None else "none yet"
+    return ["prompt cache (Project Agent): the profile gives {}; last start: {}".format(
+        ttl or "Claude Code's default", shown)]
+
+
 def cmd_doctor(args):
     """Checks one space's state files. For the orchestrator after a restart or a compaction, and for people."""
     directory, agent = space_for_command(args.space)
@@ -1406,6 +1496,7 @@ def cmd_doctor(args):
         why = None
     if why:  # a note only: the launches go on without the recording status line
         notes.append("profile statusLine is malformed ({}): Claude Code's own cost figure is not recorded".format(why))
+    notes.extend(cache_notes(directory, agent))
     term = hc_get(agent.get("terminal"))
     running = term.get("state") == "live" and (term.get("labels") or {}).get("herdr.pa") == agent.get("space")
     notes.append("agent {} in terminal {}".format("running" if running else "NOT running", agent.get("terminal")))

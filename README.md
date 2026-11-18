@@ -338,6 +338,28 @@ other commands; `refreshInterval` 1-300 s, default 30). Sessions started by `pa-
 status line your Claude command would otherwise set. A malformed key adds nothing and `pa-doctor`
 notes it.
 
+The Project Agent's own session asks Claude Code for the one-hour prompt cache: `pa-session` puts
+`"promptCacheTtl": "1h"` in its `--settings` (the same one as the status line above, last on the command
+line). A Project Agent sits idle between passes and reports for longer than five minutes, so with the
+default five-minute cache each turn back rebuilds its whole context. It is a setting, not an environment
+variable, so the workers it starts inherit nothing: workers (`pa-claude`) keep Claude Code's default cache,
+which costs them less. `"orchestratorPromptCacheTtl"` in `profile.json` chooses: `"1h"` (the default when
+the key is absent), `"5m"`, or `"default"` to set nothing and leave it to Claude Code (the off switch).
+Any other value sets nothing and `pa-doctor` notes it. `PA_NO_CC_STATUSLINE=1` drops only the status line.
+- Environment variables in the launcher's environment come first, in Claude Code's order:
+  `FORCE_PROMPT_CACHING_5M=1`, then `CLAUDE_CODE_PROMPT_CACHE_TTL`, then this setting, then
+  `ENABLE_PROMPT_CACHING_1H=1`. Needs Claude Code v2.1.242 or later (an earlier one ignores the key).
+- Recorded: each `start` line in the space's `session.log` ends `cache=<1h|5m|default> cacheBy=<pa|profile|`
+  the variable`|claude-code>` (what the launch asked for), and `pa-doctor` shows what the profile gives and
+  the last start's line. Whether the provider gave it shows in the costs: one-hour cache writes (`cw1h`) are counted
+  apart from five-minute ones. Some providers offer the one-hour cache for some models only; where the
+  provider has none, the session runs with five minutes. A profile for such a provider sets `"5m"` or
+  `"default"`.
+- Idle compaction: with the one-hour cache, Claude Code can compact a long conversation (200,000 tokens by
+  default) after about an hour idle. The Project Agent's `--settings` is the place to turn that off
+  (`"idleCompaction": false`) where the Project Agent resets at its own clean points instead.
+- Takes effect for Project Agents started (or restarted) after the update.
+
 ## Checks
 
 `pa-core-check` fails if `runtime/core`, `runtime/tools` or the mod names a profile's tools. Each

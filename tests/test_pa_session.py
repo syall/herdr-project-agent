@@ -399,6 +399,8 @@ class Round3Addition(Round3):
         self.heartbeat(began + 86400, "t9")
         argv = self.run_once({"beat": False})
         self.assertIn("--resume", argv)
+        if argv[-2] == "--settings":  # t-040: the Project Agent's --settings (promptCacheTtl) comes after the prompt
+            argv = argv[:-2]
         self.assertEqual(argv[-1], "Your session was restarted. Read your state folder (ledger.json, journal.jsonl, "
                          "decisions/, rules.json), then say in one line where things stand. Continue where you left "
                          "off without asking, as orchestrator.md defines it under \"After a restart or a "
@@ -1016,7 +1018,7 @@ class PromptCache(Base):
             self.profile()
             self.log("{} start resume=False session={} reason=new cache=1h cacheBy=pa".format(iso(T), SID))
             out = io.StringIO()
-            with contextlib.redirect_stdout(out):
+            with contextlib.redirect_stdout(out), contextlib.suppress(SystemExit):  # exits 1: no ledger here
                 pa.cmd_doctor(argparse.Namespace(space="sp1"))
             lines = [l for l in out.getvalue().splitlines() if "prompt cache" in l]
             self.assertEqual(len(lines), 1, out.getvalue())
@@ -1025,7 +1027,7 @@ class PromptCache(Base):
             self.assertNotIn("PROBLEM", lines[0])
             self.profile(orchestratorPromptCacheTtl="2h")
             out = io.StringIO()
-            with contextlib.redirect_stdout(out):
+            with contextlib.redirect_stdout(out), contextlib.suppress(SystemExit):  # exits 1: no ledger here
                 pa.cmd_doctor(argparse.Namespace(space="sp1"))
             lines = [l for l in out.getvalue().splitlines() if "orchestratorPromptCacheTtl" in l]
             self.assertEqual(len(lines), 1, out.getvalue())
