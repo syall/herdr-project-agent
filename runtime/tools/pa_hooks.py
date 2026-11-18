@@ -601,8 +601,8 @@ def worktree_state(directory, agent, profile=None):
             continue
         for tree in pa.task_worktrees(task):
             path = tree["path"]
-            row = rows.setdefault(path, {"path": path, "tasks": [], "states": {}, "titles": {}, "jobs": {}, "mains": {}, "jobRecorded": {},
-                                         "keep": False, "workers": []})
+            row = rows.setdefault(path, {"path": path, "given": tree["given"], "tasks": [], "states": {}, "titles": {}, "jobs": {}, "mains": {},
+                                         "jobRecorded": {}, "keep": False, "workers": []})
             row["tasks"].append(task["id"])
             row["states"][task["id"]] = task.get("state")
             row["titles"][task["id"]] = task.get("title") or ""
@@ -842,38 +842,81 @@ def repo_lines(r):
     return lines
 
 
-def deleting_text(facts):
+def branch_loss(desc, facts):
+    """When deleting also deletes the branches (removesBranches) and the repositories were described: what the
+    branches' commits would come to (AC3.3). A commit merged into a main branch (the local one counts: it keeps
+    the commit) or on a remote is kept. {"lost": n or None (unknown), "lostIn": [names], "lines": {index: line}};
+    None when deleting keeps the branches or only counts are known."""
+    if not facts.get("removesBranches") or not desc.get("repos"):
+        return None
+    out = {"lost": 0, "lostIn": [], "lines": {}}
+    unknown = bool(desc.get("error") or desc.get("notDescribed"))
+    for i, r in enumerate(desc["repos"]):
+        n = r["commitsTotal"]
+        lost = sum(1 for c in r["commits"] if c["merged"] is not True and not c["pushed"])
+        if r["error"]:
+            why = r["error"]
+        elif len(r["commits"]) < n or n > MD_COMMITS:
+            why = "more commits than described"
+        elif any(c["merged"] is None and not c["pushed"] for c in r["commits"]):
+            why = "merged unknown"
+        else:
+            why = None
+        if why:
+            unknown = True
+            out["lines"][i] = "  unknown if deleted: {}; Keep is recommended".format(why)
+        elif lost:
+            out["lost"] += lost
+            out["lostIn"].append(r["name"])
+            out["lines"][i] = "  LOST if deleted: {} of {} commits neither merged nor on a remote".format(lost, n)
+        elif n:
+            out["lines"][i] = "  kept if deleted: all {} commits merged or pushed".format(n)
+    if unknown:
+        out["lost"] = None
+    return out
+
+
+def deleting_text(facts, loss=None):
     loses_commits = facts.get("removesBranches") and facts.get("unpushed", 0) > 0
     n = facts.get("uncommitted", 0)
     lost = "; the {} uncommitted files are DISCARDED".format(n) if n else ""
+    if facts.get("removesBranches") and loss is not None:
+        said = ("; whether every commit is merged or pushed is unknown" if loss["lost"] is None else
+                "; {} commits ({}) are neither merged nor on a remote and would be LOST".format(loss["lost"], ", ".join(loss["lostIn"]))
+                if loss["lost"] else "; all their commits are merged or pushed")
+        return "Deleting also deletes its branches ({}){}{}.".format(facts.get("branch"), said, lost)
     if facts.get("removesBranches"):
         return "Deleting also deletes its branches ({}){}{}.".format(
             facts.get("branch"), "; the commits that are on no remote would be LOST" if loses_commits else "", lost)
     return "Deleting: the branch {} and its commits are kept{}.".format(facts.get("branch"), lost or "; nothing uncommitted is lost")
 
 
-def card_context(desc, row, facts, gone):
-    """The card's context: one fact per line, at most CONTEXT_MAX characters (spec 4.5)."""
+def card_context(desc, row, facts, gone, extra=(), md_file="WORKTREE.md"):
+    """The card's context: one fact per line, at most CONTEXT_MAX characters (spec 4.5). extra: lines after the
+    Tasks line (the job, rule (b)); md_file: the evidence file with the full list."""
+    loss = branch_loss(desc, facts)
     lines = ["{} ({})".format(row["path"], desc.get("kind") or facts.get("kind") or "git worktree"),
-             "Tasks: " + ", ".join('{} "{}" ({})'.format(t["id"], cut(t["title"], 60), t["state"]) for t in desc["tasks"])]
+             "Tasks: " + ", ".join('{} "{}" ({})'.format(t["id"], cut(t["title"], 60), t["state"]) for t in desc["tasks"])] + list(extra)
     if desc.get("error"):
         lines.append("could not read the changes: {}".format(desc["error"]))
     if desc.get("note") or desc.get("error"):
         lines += [desc["note"]] if desc.get("note") else []
         lines.append("Uncommitted files: {}. Commits not on any remote: {}.".format(facts.get("uncommitted", 0), facts.get("unpushed", 0)))
-    changed = [r for r in desc["repos"] if not unchanged(r)]
-    for r in changed[:CARD_REPOS]:
+    changed = [(i, r) for i, r in enumerate(desc["repos"]) if not unchanged(r)]
+    for i, r in changed[:CARD_REPOS]:
         lines += repo_lines(r)
+        if loss and i in loss["lines"]:
+            lines.append(loss["lines"][i])
     more = max(0, len(changed) - CARD_REPOS) + len(desc.get("notDescribed") or [])
     if more:
-        lines.append("… and {} more repositories (WORKTREE.md)".format(more))
+        lines.append("… and {} more repositories ({})".format(more, md_file))
     still = [r["name"] for r in desc["repos"] if unchanged(r)]
     if still:
         lines.append("Unchanged: " + ", ".join(still))
-    lines += ["Workers: " + gone, "No other terminal is working in it.", deleting_text(facts), "Full list: WORKTREE.md"]
+    lines += ["Workers: " + gone, "No other terminal is working in it.", deleting_text(facts, loss), "Full list: " + md_file]
     text = "\n".join(lines)
     if len(text) > CONTEXT_MAX:
-        tail_ = "… (full list in WORKTREE.md)"
+        tail_ = "… (full list in {})".format(md_file)
         keep = text[:CONTEXT_MAX - len(tail_) - 1]
         text = (keep[:keep.rfind("\n")] if "\n" in keep else keep) + "\n" + tail_
     return text
@@ -891,18 +934,23 @@ def card_changes(desc):
     return {"tasks": desc["tasks"], "repos": repos, "note": desc.get("note"), "error": desc.get("error"), "truncated": truncated, "at": pa.now()}
 
 
-def worktree_md(desc, row, facts, gone, card_id):
-    """WORKTREE.md: the same sections as the card, with the larger caps (spec 4.6). Every piece of
-    repository or ledger text goes through md(), so it stays inside its own line, code span or cell."""
+def worktree_md(desc, row, facts, gone, card_id, extra=()):
+    """WORKTREE.md (WORKTREE-<job>.md for a job's card): the same sections as the card, with the larger caps
+    (spec 4.6). Every piece of repository or ledger text goes through md(), so it stays inside its own line,
+    code span or cell."""
+    loss = branch_loss(desc, facts)
     out = ["# Worktree {}".format(md(row["path"], 1000)), "", "{}. Written {} with decision card {}.".format(
         md(desc.get("kind") or "git worktree"), pa.now(), card_id), "", "## Tasks", ""]
     out += ['- {} "{}" ({})'.format(md(t["id"]), md(t["title"]), md(t["state"])) for t in desc["tasks"]]
+    out += ([""] + [md(line, 1000) for line in extra]) if extra else []
     if desc.get("note") or desc.get("error"):
         out += [""] + ([desc["note"]] if desc.get("note") else []) + (["Could not read the changes: " + md(desc["error"])] if desc.get("error") else [])
         out.append("Uncommitted files: {}. Commits not on any remote: {}.".format(facts.get("uncommitted", 0), facts.get("unpushed", 0)))
-    for r in desc["repos"]:
+    for i, r in enumerate(desc["repos"]):
         out += ["", "## {}".format(md(r["name"])), "", "`{}`: branch `{}`{}.".format(md(r["path"], 1000), md(r["branch"] or "?"),
                 ", from `{}` at `{}`".format(md(r["base"] or "its start"), md(r["fork"])) if r["fork"] else "")]
+        if loss and i in loss["lines"]:
+            out += ["", md(loss["lines"][i].strip(), 1000) + "."]
         if r["commitsTotal"]:
             out += ["", "Merged and pushed are from local refs; last fetch: {}.".format(r.get("fetched") or "never")]
         if r["error"]:
@@ -924,12 +972,149 @@ def worktree_md(desc, row, facts, gone, card_id):
         out += ["- `{}` {}".format(md(u["status"]), md(u["path"])) for u in r["uncommitted"]] or ["None."]
     for why, names in (desc.get("notDescribedWhy") or {}).items():
         out += ["", "Not described ({}): {}".format(why, ", ".join(md(n) for n in names))]
-    out += ["", "## Workers", "", md(gone, 2000), "", "## Deleting", "", md(deleting_text(facts), 2000), ""]
+    out += ["", "## Workers", "", md(gone, 2000), "", "## Deleting", "", md(deleting_text(facts, loss), 2000), ""]
     return "\n".join(out)
 
 
-def card_path(directory, task):
-    return os.path.join(directory, "decisions", "d-wt-{}.json".format(task))
+def card_id(task, job, main=True):
+    """The Delete/Keep card of a worktree: d-wt-<task> for the task's main one (cards from before t-020 stay valid),
+    d-wt-<task>-<job> for any other."""
+    return "d-wt-{}".format(task) if main else "d-wt-{}-{}".format(task, job)
+
+
+def md_name(job, main=True):
+    """The evidence file with a worktree card's full list: WORKTREE.md, or WORKTREE-<job>.md for a job's card."""
+    return "WORKTREE.md" if main else "WORKTREE-{}.md".format(job)
+
+
+def card_path(directory, task, job=None, main=True):
+    return os.path.join(directory, "decisions", card_id(task, job, main) + ".json")
+
+
+def card_owner(row):
+    """(task, job, main) whose card a worktree row gets: the first task whose main worktree it is, else the row's
+    first task with the job it records it for. check and remove both use this, so they agree on the card."""
+    task = next((t for t in row["tasks"] if row["mains"].get(t)), None)
+    if task:
+        return task, row["jobs"][task], True
+    return row["tasks"][0], row["jobs"][row["tasks"][0]], False
+
+
+def in_worktrees_folder(path):
+    """True when the worktree sits in a folder named `worktrees`: <project>/worktrees/<container>/<repo> or
+    <workspace>/worktrees/<name>. A job's worktree elsewhere is neither offered nor removed (D4)."""
+    parent = os.path.dirname(path)
+    return os.path.basename(parent) == "worktrees" or os.path.basename(os.path.dirname(parent)) == "worktrees"
+
+
+def not_over(desc):
+    """Why a described worktree's job is not over under rule (b), or None when it is: every repository has at least
+    one commit since its fork, all of them merged into a main branch (pushed is not enough while the task is in
+    progress), nothing uncommitted, and the whole of it described (spec R2, AC2.1, AC2.2)."""
+    if desc.get("error"):
+        return "cannot tell ({})".format(desc["error"])
+    if desc.get("note"):
+        return "cannot tell ({})".format(desc["note"])
+    if desc.get("notDescribed"):
+        return "cannot tell (not every repository was described)"
+    if not desc.get("repos"):
+        return "cannot tell (no repository in it)"
+    for r in desc["repos"]:
+        n = r["commitsTotal"]
+        if r["error"]:
+            return "cannot tell ({})".format(r["error"])
+        if not n:
+            return "no commits since its fork"
+        if len(r["commits"]) < n or n > MD_COMMITS:
+            return "cannot tell (more commits than described)"
+        if r["uncommittedTotal"]:
+            return "{} uncommitted file(s)".format(r["uncommittedTotal"])
+        if any(c["merged"] is None for c in r["commits"]):
+            return "merged unknown"
+        k = sum(1 for c in r["commits"] if c["merged"] is not True)
+        if k:
+            return "{} of {} commits not merged into {}".format(k, n, r["base"] or "the main branch")
+    return None
+
+
+def job_over(row, facts, profile):
+    """Rule (b): (True, None, desc) when the worktree's job is over although a task using it is not done or parked;
+    else (False, why, desc or None). The cheap checks come first; describing (git calls) only when they pass."""
+    live = [w["address"] for w in row["workers"] if w["fate"] == "live"]
+    if live:
+        return False, "in use by " + ", ".join(live), None
+    if row["others"]:
+        return False, "another terminal is working in it: " + ", ".join(row["others"]), None
+    if facts.get("uncommitted"):
+        return False, "{} uncommitted file(s)".format(facts["uncommitted"]), None
+    try:
+        desc = describe_worktree(row, facts, profile)
+    except Exception as e:  # noqa: BLE001 - unknown is never over
+        return False, "cannot tell ({})".format(clean(e)[:200]), None
+    why = not_over(desc)
+    return why is None, why, desc
+
+
+def withdraw_card(directory, path, card, task, why):
+    card.update(status="withdrawn", answer=None, note="Withdrawn by pa-worktree check: " + why, answered=pa.now(),
+                answeredBy="pa-worktree check: withdrawn")
+    pa.write_json(path, card)
+    append_journal(directory, {"by": "agent" if by_an_agent() else "person", "trigger": "worktree", "task": task,
+                               "why": "withdrew card {}: {}".format(card["id"], why)})
+    print("{}: withdrew card {}: {}".format(task, card["id"], why))
+
+
+def open_worktree_card(directory, row, facts, profile, owner, rule, gone, desc=None):
+    """Writes the Delete/Keep card of one worktree and its evidence file; returns the recommendation."""
+    task, job, main = owner
+    named = rule == "b" or not main or job != "main"
+    extra = []
+    if named:
+        extra.append("Job: {}{}".format(clean(job), "" if row["jobRecorded"].get(task, True) else " (named from its folder; not recorded)"))
+    if rule == "b":
+        extra.append("{}; this job's commits are all merged".format(
+            "Task still {}".format(clean(row["states"].get(task))) if len(row["tasks"]) == 1 else "Tasks still " + tasks_still(row)))
+    if desc is None:
+        try:
+            desc = describe_worktree(row, facts, profile)
+        except Exception as e:  # noqa: BLE001 - describing never stops the card (AC7.5)
+            desc = {"tasks": [{"id": clean(t), "title": clean(row["titles"].get(t, "")), "state": clean(row["states"].get(t))} for t in row["tasks"]],
+                    "repos": [], "notDescribed": [], "notDescribedWhy": {}, "note": None, "error": clean(e)[:200],
+                    "kind": clean(facts.get("kind") or "git worktree")}
+    loss = branch_loss(desc, facts)
+    loses_commits = facts.get("removesBranches") and (loss["lost"] != 0 if loss else facts["unpushed"] > 0)
+    dirty = facts["uncommitted"] > 0 or loses_commits
+    cid, md_file = card_id(task, job, main), md_name(job, main)
+    evidence = []
+    try:
+        pa.write_text(os.path.join(directory, "evidence", task, md_file), worktree_md(desc, row, facts, gone, cid, extra))
+        evidence = [md_file]
+    except OSError:
+        pass
+    squash = (" " + SQUASH if any(c["merged"] is False for r in desc["repos"] for c in r["commits"]) else "")
+    titles = ", ".join('{} "{}"'.format(clean(t), cut(clean(row["titles"].get(t, "")), 60)) for t in row["tasks"])
+    pa.write_json(card_path(directory, task, job, main), {
+        "id": cid, "task": task, "worktree": row["path"], "job": job, "main": main, "rule": rule,
+        "question": "Delete the worktree for {}{}?".format(titles, ", job {}".format(clean(job)) if named else ""),
+        "context": card_context(desc, row, facts, gone, extra, md_file),
+        "evidence": evidence,
+        "changes": card_changes(desc),
+        "options": [{"label": "Delete", "detail": "Remove the {}{}.{}".format(facts.get("kind", "worktree folder"),
+                     " with everything listed above that is not saved elsewhere" if dirty else "", squash)},
+                    {"label": "Keep", "detail": "Leave the worktree. It will not be asked about again."}],
+        "recommendation": "Keep" if dirty else "Delete", "status": "open", "answer": None, "note": None,
+        "snapshot": {"uncommitted": facts["uncommitted"], "unpushed": facts["unpushed"],
+                     "commits": sum(r["commitsTotal"] for r in desc["repos"]),
+                     # what pa-worktree remove compares: each repository's HEAD and its uncommitted files
+                     "heads": {r["path"]: r["head"] for r in desc["repos"] if r.get("head")},
+                     "uncommittedFiles": {r["path"]: [u["path"] for u in r["uncommitted"]] for r in desc["repos"]
+                                          if r.get("head") and r["uncommittedTotal"] == len(r["uncommitted"])}},
+        "created": pa.now(), "answered": None})
+    print("{}: opened card {} (recommends {})".format(task, cid, "Keep" if dirty else "Delete"))
+
+
+def remove_command(task, job, main):
+    return "pa-worktree remove {}{}".format(task, "" if main else " --job " + job)
 
 
 def cmd_worktree(args):
@@ -941,17 +1126,15 @@ def cmd_worktree(args):
     rows = worktree_state(directory, agent, profile)
     if args.action == "check":
         for row in rows.values():
-            mains = [t for t in row["tasks"] if row["mains"].get(t)]
-            if not mains:  # another job's worktree: its own card comes with per-job cards (t-020 J2)
-                task = row["tasks"][0]
-                print("{}: {} (job {}) is not the task's main worktree; not offered yet".format(task, row["path"], clean(row["jobs"][task])))
-                continue
-            task, facts = mains[0], row["facts"]
-            card = pa.read_json(card_path(directory, task))
+            owner = card_owner(row)
+            task, job, main = owner
+            facts, path = row["facts"], card_path(directory, task, job, main)
+            card = pa.read_json(path)
             if card and card.get("status") == "withdrawn":
-                card = None  # asked again once every task is done or parked
+                card = None  # asked again once its job is over or every task is done or parked
             fates = [w["fate"] for w in row["workers"]]
             still = tasks_still(row)
+            gone = ", ".join("{} ({})".format(clean(w["name"] or w["address"]), w["fate"]) for w in row["workers"]) or "no workers recorded"
             if not facts:
                 print("{}: gone or not a git worktree ({})".format(task, row["path"]))
             elif facts.get("unreadable"):
@@ -960,82 +1143,61 @@ def cmd_worktree(args):
                 print("{}: {} is the project's main checkout; never removed".format(task, row["path"]))
             elif row["keep"]:
                 print("{}: kept (keepWorktree is set)".format(task))
+            elif not main and not in_worktrees_folder(row["path"]):
+                print("{}: {} is not under a worktrees folder; not offered".format(task, row["path"]))
             elif card and card.get("status") == "answered":
                 delete = str(card.get("answer", "")).lower().startswith("delete")
-                if delete and still:
+                if delete and still and card.get("rule") == "b":
+                    print("{}: card {} answered {!r}: run `{}`; it re-checks".format(task, card["id"], card.get("answer"), remove_command(*owner)))
+                elif delete and still:
                     print("{}: card {} answered {!r}, but tasks still {}; pa-worktree remove refuses until every task using it is "
                           "done or parked".format(task, card["id"], card.get("answer"), still))
                 else:
                     print("{}: card {} answered {!r}{}".format(task, card["id"], card.get("answer"),
-                          ": run `pa-worktree remove {}`".format(task) if delete else ": kept, not asked again"))
+                          ": run `{}`".format(remove_command(*owner)) if delete else ": kept, not asked again"))
+            elif card and still and card.get("rule") == "b":
+                over, why, _desc = job_over(row, facts, profile)
+                if over:
+                    print("{}: card {} is open".format(task, card["id"]))
+                elif not args.open_cards:
+                    print("{}: card {} is open, but the job is no longer over ({}); --open-cards withdraws it".format(task, card["id"], why))
+                else:
+                    withdraw_card(directory, path, card, task, "the job is no longer over: " + why)
             elif card and still and not args.open_cards:
                 print("{}: card {} is open, but tasks still {}; --open-cards withdraws it".format(task, card["id"], still))
             elif card and still:
                 # A task was reopened after the card opened: the question no longer stands.
-                why = "tasks still {}; it is asked again once every task using the worktree is done or parked".format(still)
-                card.update(status="withdrawn", answer=None, note="Withdrawn by pa-worktree check: " + why, answered=pa.now(),
-                            answeredBy="pa-worktree check: withdrawn")
-                pa.write_json(card_path(directory, task), card)
-                append_journal(directory, {"by": "agent" if by_an_agent() else "person", "trigger": "worktree", "task": task,
-                                           "why": "withdrew card {}: {}".format(card["id"], why)})
-                print("{}: withdrew card {}: {}".format(task, card["id"], why))
+                withdraw_card(directory, path, card, task,
+                              "tasks still {}; it is asked again once every task using the worktree is done or parked".format(still))
             elif card:
                 print("{}: card {} is open".format(task, card["id"]))
             elif still:
-                print("{}: tasks still {}; asked once every task using it is done or parked".format(task, still))
+                over, why, desc = job_over(row, facts, profile)
+                if not over:
+                    print("{}: tasks still {}; asked once every task using it is done or parked; job {} not over yet ({})".format(
+                        task, still, clean(job), why))
+                elif not args.open_cards:
+                    print("{}: candidate, job {} is over (every commit merged); --open-cards asks the person".format(task, clean(job)))
+                else:
+                    open_worktree_card(directory, row, facts, profile, owner, "b", gone, desc)
             elif "live" in fates:
                 print("{}: in use by {}".format(task, ", ".join(w["address"] for w in row["workers"] if w["fate"] == "live")))
             elif row["others"]:
                 print("{}: another terminal is working in it ({})".format(task, ", ".join(row["others"])))
-            else:
+            elif not args.open_cards:
                 # Every task is done or parked and nothing runs inside: a candidate, however its workers ended.
-                gone = ", ".join("{} ({})".format(clean(w["name"] or w["address"]), w["fate"]) for w in row["workers"]) or "no workers recorded"
-                if not args.open_cards:
-                    print("{}: candidate, every task done or parked ({}); --open-cards asks the person".format(task, gone))
-                    continue
-                loses_commits = facts.get("removesBranches") and facts["unpushed"] > 0
-                dirty = facts["uncommitted"] > 0 or loses_commits
-                try:
-                    desc = describe_worktree(row, facts, profile)
-                except Exception as e:  # noqa: BLE001 - describing never stops the card (AC7.5)
-                    desc = {"tasks": [{"id": clean(t), "title": clean(row["titles"].get(t, "")), "state": clean(row["states"].get(t))} for t in row["tasks"]],
-                            "repos": [], "notDescribed": [], "notDescribedWhy": {}, "note": None, "error": clean(e)[:200],
-                            "kind": clean(facts.get("kind") or "git worktree")}
-                card_id = "d-wt-" + task
-                evidence = []
-                try:
-                    pa.write_text(os.path.join(directory, "evidence", task, "WORKTREE.md"), worktree_md(desc, row, facts, gone, card_id))
-                    evidence = ["WORKTREE.md"]
-                except OSError:
-                    pass
-                squash = (" " + SQUASH if any(c["merged"] is False for r in desc["repos"] for c in r["commits"]) else "")
-                pa.write_json(card_path(directory, task), {
-                    "id": card_id, "task": task, "worktree": row["path"],
-                    "question": "Delete the worktree for {}?".format(", ".join('{} "{}"'.format(clean(t), cut(clean(row["titles"].get(t, "")), 60)) for t in row["tasks"])),
-                    "context": card_context(desc, row, facts, gone),
-                    "evidence": evidence,
-                    "changes": card_changes(desc),
-                    "options": [{"label": "Delete", "detail": "Remove the {}{}.{}".format(facts.get("kind", "worktree folder"),
-                                 " with everything listed above that is not saved elsewhere" if dirty else "", squash)},
-                                {"label": "Keep", "detail": "Leave the worktree. It will not be asked about again."}],
-                    "recommendation": "Keep" if dirty else "Delete", "status": "open", "answer": None, "note": None,
-                    "snapshot": {"uncommitted": facts["uncommitted"], "unpushed": facts["unpushed"],
-                                 "commits": sum(r["commitsTotal"] for r in desc["repos"]),
-                                 # what pa-worktree remove compares: each repository's HEAD and its uncommitted files
-                                 "heads": {r["path"]: r["head"] for r in desc["repos"] if r.get("head")},
-                                 "uncommittedFiles": {r["path"]: [u["path"] for u in r["uncommitted"]] for r in desc["repos"]
-                                                      if r.get("head") and r["uncommittedTotal"] == len(r["uncommitted"])}},
-                    "created": pa.now(), "answered": None})
-                print("{}: opened card d-wt-{} (recommends {})".format(task, task, "Keep" if dirty else "Delete"))
+                print("{}: candidate, every task done or parked ({}); --open-cards asks the person".format(task, gone))
+            else:
+                open_worktree_card(directory, row, facts, profile, owner, "a", gone)
         if not rows:
             print("No task in the ledger has a worktree.")
         return
     # remove: only what an answered card allows, re-checked now.
-    row = next((r for r in rows.values() if r["mains"].get(args.task)), None)
-    if not row:
-        raise pa.Problem("task {} has no worktree in the ledger".format(args.task))
-    owner = next(t for t in row["tasks"] if row["mains"].get(t))  # the task whose card is d-wt-<task> (check's choice)
-    card = pa.read_json(card_path(directory, owner)) or {}
+    row = pick_row(rows, args.task, args.job)
+    owner = card_owner(row)
+    task, job, main = owner
+    path = card_path(directory, task, job, main)
+    card = pa.read_json(path) or {}
     if card.get("status") != "answered" or not str(card.get("answer", "")).lower().startswith("delete"):
         raise pa.Problem("no answered \"Delete\" decision card for this worktree (run `pa-worktree check --open-cards`; the person answers it)")
     if os.path.realpath(card.get("worktree") or "") != row["path"]:
@@ -1050,9 +1212,15 @@ def cmd_worktree(args):
         raise pa.Problem("{} is the project's main checkout; it is never removed".format(row["path"]))
     if row["keep"]:
         raise pa.Problem("keepWorktree is set on the task")
+    if not main and not in_worktrees_folder(row["path"]):
+        raise pa.Problem("{} is not under a worktrees folder; nothing was removed".format(row["path"]))
     still = tasks_still(row)
-    if still:
+    if still and card.get("rule") != "b":
         raise pa.Problem("tasks still {}; a worktree is removed only once every task using it is done or parked. Nothing was removed".format(still))
+    if still:
+        over, why, _desc = job_over(row, facts, profile)
+        if not over:
+            raise pa.Problem("tasks still {} and job {} is not over ({}); nothing was removed".format(still, clean(job), why))
     busy = [w["address"] for w in row["workers"] if w["fate"] == "live"] + row["others"]
     if busy:
         raise pa.Problem("still in use by {}; nothing was removed".format(", ".join(busy)))
@@ -1071,11 +1239,31 @@ def cmd_worktree(args):
         why = "the worktree changed since the person answered {!r}: {}".format(card.get("answer"), changed)
         card.update(status="withdrawn", previousAnswer=card.get("answer"), answer=None, answered=pa.now(),
                     answeredBy="pa-worktree remove: withdrawn", note="Withdrawn by pa-worktree remove: " + why)
-        pa.write_json(card_path(directory, owner), card)
-        append_journal(directory, {"by": "agent" if by_an_agent() else "person", "trigger": "worktree", "task": owner,
+        pa.write_json(path, card)
+        append_journal(directory, {"by": "agent" if by_an_agent() else "person", "trigger": "worktree", "task": task,
                                    "why": "withdrew card {}: {}".format(card["id"], why)})
         raise pa.Problem(changed + "; the card is withdrawn and the next `pa-worktree check --open-cards` asks again. Nothing was removed")
     print(remove_worktree(row["path"], facts) + " (card {})".format(card["id"]))
+
+
+def pick_row(rows, task, job=None):
+    """The row `pa-worktree remove <task> [--job <job>]` means: the job's worktree, else the task's main one, else its
+    only one. Refuses (nothing removed) when there is none, or several and no main one."""
+    mine = [r for r in rows.values() if task in r["tasks"]]
+    if job:
+        hit = [r for r in mine if r["jobs"][task] in (job, pa.job_slug(job))]
+        if not hit:
+            raise pa.Problem("task {} has no worktree for job {}; nothing was removed".format(task, clean(job)))
+        return hit[0]
+    row = next((r for r in mine if r["mains"].get(task)), None)
+    if row:
+        return row
+    if not mine:
+        raise pa.Problem("task {} has no worktree in the ledger".format(task))
+    if len(mine) > 1:
+        raise pa.Problem("task {} has no main worktree; name one: {}; nothing was removed".format(
+            task, ", ".join("--job " + clean(r["jobs"][task]) for r in mine)))
+    return mine[0]
 
 
 def tasks_still(row):
@@ -2362,6 +2550,7 @@ def main():
         parser.add_argument("action", choices=("check", "remove"))
         parser.add_argument("task", nargs="?")
         parser.add_argument("--open-cards", action="store_true", help="open a decision card for each candidate")
+        parser.add_argument("--job", help="remove: the job whose worktree to remove (default: the task's main worktree)")
         parser.add_argument("--space")
         args = parser.parse_args()
         if args.action == "remove" and not args.task:
