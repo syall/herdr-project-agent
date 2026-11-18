@@ -201,8 +201,13 @@ ships none, so without one the figures are tokens only).
 
 - `pa-costs collect [--space ID] [--quiet]` reads the new bytes of the space's session files into
   `spaces/<id>/costs/` and rewrites `costs/summary.json`. The panel's timer runs it on the space's
-  machine: every 120 s while that space's Costs view is shown, every 30 min otherwise.
-- `pa-costs report [--by KEY] [--json] [--billed]` prints the same figures as the Costs view;
+  machine: every 120 s while that space's Costs view is shown, every 30 min otherwise. It passes the
+  panel's timezone (`--zone-offsets`, `--zone-name`, kept in `costs/zone.json`), so the view's Today,
+  Last 7 days and By day are the person's own days, cut at their local midnight, daylight saving
+  included, wherever the space runs. Everything stored stays UTC; prices are looked up by a row's UTC
+  day; a summary in another zone (or from an older pa-costs) is drawn with that zone named, e.g. "(UTC)".
+- `pa-costs report [--by KEY] [--json] [--billed] [--utc]` prints the same figures as the Costs view, by
+  this terminal's local days (`--since`/`--until` too), or UTC days with `--utc`;
   `pa-costs report --account-wide` prints the estimates of every space on the machine with the
   same account label.
 - `pa-costs reconstruct [--dry-run]` finds the space's sessions from before launch records existed,

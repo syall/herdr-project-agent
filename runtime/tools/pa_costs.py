@@ -3,7 +3,7 @@
 Python standard library only (3.7+). Linked as pa-costs.
 
   pa-costs collect [--space ID] [--quiet] [--resummarize]   read new session bytes into the space's cost ledger
-  pa-costs report [--space ID] [--by KEY] [--since D] [--until D] [--json] [--billed] [--account-wide]
+  pa-costs report [--space ID] [--by KEY] [--since D] [--until D] [--json] [--billed] [--account-wide] [--utc]
   pa-costs reconstruct [--space ID] [--dry-run]              find the space's sessions from before launch records
   pa-costs prices [--space ID]                               the price table in use, and models seen without a price
   pa-costs billed status|list|remove|disable|enable|fetch|import ...   billed amounts (the person's commands)
@@ -783,10 +783,13 @@ def state_problems(state):
     return out
 
 
-def collect(directory, now=None, quiet=True, resummarize=False):
-    """Read the new bytes of the space's sessions into costs/turns.jsonl. One collector per space at a time."""
+def collect(directory, now=None, quiet=True, resummarize=False, zone=None):
+    """Read the new bytes of the space's sessions into costs/turns.jsonl. One collector per space at a time. zone: the
+    panel's (t-036), kept in costs/zone.json for later collects; a changed one rewrites the summary."""
     now = time.time() if now is None else now
     folder = costs_dir(directory)
+    if zone is not None and os.path.isdir(folder) and save_zone(directory, zone):
+        resummarize = True
     if not os.path.isfile(os.path.join(folder, "sessions.jsonl")):
         if not quiet:
             print("No cost records yet: spend is recorded for sessions started from now on (pa-costs reconstruct finds older ones).")
@@ -1394,6 +1397,110 @@ SUMMARY_MAX = 65536
 DAYS, SESSIONS, PASSES, HOURS = 92, 200, 20, 48
 
 
+# ---- days in a timezone (t-036): on disk everything stays UTC; only the day buckets are cut in a zone ----------------
+# A zone is {"zone": name, "offsets": [[epoch, minutes east of UTC in force from it on], ...]}, the first from 0. The
+# panel passes its own (its machine's getTimezoneOffset over now - 100 d .. now + 35 d, so daylight saving is in it and
+# no zone database is needed here); costs/zone.json keeps it for the collects that pass none. The report uses the
+# terminal's (time.localtime, which honours TZ), or UTC with --utc.
+UTC_ZONE = {"zone": "UTC", "offsets": [[0, 0]]}
+ZONE_BACK, ZONE_AHEAD, ZONE_MAX = (DAYS + 8) * 86400, 35 * 86400, 64
+ZONE_NAME = re.compile(r"^[A-Za-z0-9_+\-/:.]{1,64}$")
+
+
+def offset_at(offsets, epoch):
+    """Minutes east of UTC in force at `epoch` (before the first entry: the first entry's)."""
+    minutes = offsets[0][1]
+    for start, m in offsets:
+        if epoch < start:
+            break
+        minutes = m
+    return minutes
+
+
+def day_in(zone, text):
+    """The day (YYYY-MM-DD) of an ISO UTC time in `zone`; None when it is not one."""
+    epoch = parse_ts(text or "")
+    if epoch is None:
+        return None
+    return iso(epoch + offset_at(zone["offsets"], epoch) * 60)[:10]
+
+
+def offset_name(minutes):
+    return "UTC{}{:02d}:{:02d}".format("-" if minutes < 0 else "+", abs(minutes) // 60, abs(minutes) % 60)
+
+
+def machine_zone(now):
+    """This machine's zone (the terminal's: TZ is honoured) as a table over now - ZONE_BACK .. now + ZONE_AHEAD."""
+    def off(t):
+        return int(time.localtime(t).tm_gmtoff // 60)
+    t, end, step = int(now) - ZONE_BACK, int(now) + ZONE_AHEAD, 6 * 3600  # changes are months apart
+    offsets = [[0, off(t)]]
+    while t < end:
+        nxt = t + step
+        if off(nxt) != offsets[-1][1]:
+            lo, hi = t, nxt  # off(lo) is the old offset, off(hi) the new one: the second it changes
+            while hi - lo > 1:
+                mid = (lo + hi) // 2
+                lo, hi = (mid, hi) if off(mid) == offsets[-1][1] else (lo, mid)
+            offsets.append([hi, off(hi)])
+        t = nxt
+    if offsets == [[0, 0]]:
+        return dict(UTC_ZONE)
+    name = time.strftime("%Z", time.localtime(now))
+    return {"zone": name if ZONE_NAME.match(name or "") else offset_name(off(int(now))), "offsets": offsets}
+
+
+def parse_zone(offsets_text, name=None):
+    """The panel's --zone-offsets "0:<min>,<epoch>:<min>,..." and --zone-name, checked; pa.Problem when not one."""
+    offsets = []
+    for part in (offsets_text or "").split(","):
+        m = re.match(r"^(\d{1,12}):(-?\d{1,4})$", part.strip())
+        if not m:
+            raise pa.Problem("--zone-offsets is <epoch>:<minutes>[,...], the first from 0")
+        offsets.append([int(m.group(1)), int(m.group(2))])
+    if not offsets or offsets[0][0] != 0 or len(offsets) > ZONE_MAX:
+        raise pa.Problem("--zone-offsets: from 0, at most {} entries".format(ZONE_MAX))
+    if any(b[0] <= a[0] for a, b in zip(offsets, offsets[1:])) or any(abs(m) > 900 for _e, m in offsets):
+        raise pa.Problem("--zone-offsets: epochs ascending, offsets within ±15 h")
+    if name is not None and not ZONE_NAME.match(name):
+        raise pa.Problem("--zone-name is letters, digits and _+-/:. only")
+    return {"zone": name or offset_name(offsets[-1][1]), "offsets": offsets}
+
+
+def load_zone(directory):
+    """The zone the panel last passed (costs/zone.json), else UTC."""
+    z = pa.read_json(os.path.join(costs_dir(directory), "zone.json"), None)
+    try:
+        return parse_zone(",".join("{}:{}".format(e, m) for e, m in z["offsets"]), z["zone"])
+    except (TypeError, KeyError, ValueError, pa.Problem):
+        return dict(UTC_ZONE)
+
+
+def save_zone(directory, zone):
+    """Keeps the panel's zone for the collects that pass none; True when it changed."""
+    if load_zone(directory) == zone and os.path.exists(os.path.join(costs_dir(directory), "zone.json")):
+        return False
+    pa.write_text(os.path.join(costs_dir(directory), "zone.json"), compact(zone))
+    return True
+
+
+def zone_of(s):
+    """A summary's zone (an older summary's: UTC)."""
+    z = s.get("days") if isinstance(s.get("days"), dict) else None
+    try:
+        return parse_zone(",".join("{}:{}".format(e, m) for e, m in z["offsets"]), z["zone"])
+    except (TypeError, KeyError, ValueError, pa.Problem):
+        return dict(UTC_ZONE)
+
+
+def local_clock(text, zone):
+    """An ISO UTC time as "YYYY-MM-DD HH:MM <zone>"."""
+    epoch = parse_ts(text or "")
+    if epoch is None:
+        return str(text)
+    return "{} {}".format(iso(epoch + offset_at(zone["offsets"], epoch) * 60)[:16].replace("T", " "), zone["zone"])
+
+
 def ledger_rows(directory):
     """The ledger rows that count: a void line drops the earlier rows of its session."""
     rows, _bad = read_lines(os.path.join(costs_dir(directory), "turns.jsonl"))
@@ -1533,7 +1640,7 @@ def cc_signature(directory):
     return [count, newest, size]
 
 
-def cc_join(cc, records, sessions, sess_b, since=None, until=None):
+def cc_join(cc, records, sessions, sess_b, since=None, until=None, zone=None):
     """Claude Code figure records joined to the summary's sessions (AC5.2): (parts: sid -> [(record, cleared)],
     unmatched count, unmatched money). By id; else, for an id no record names (a /clear), the latest start record of the
     same terminal at or before the record's first reading; else unmatched. A known session without rows is left out."""
@@ -1550,7 +1657,7 @@ def cc_join(cc, records, sessions, sess_b, since=None, until=None):
                 continue
             found = [c for c in starts.get(rec.get("terminal") or "", []) if c[0] <= rec["first"]]
             if not found:
-                day = rec["at"][:10]
+                day = day_in(zone or UTC_ZONE, rec["at"]) or rec["at"][:10]
                 if (not since or day >= since) and (not until or day <= until):
                     um_n += 1
                     um_money += cc_figure(rec) or 0.0
@@ -1562,9 +1669,12 @@ def cc_join(cc, records, sessions, sess_b, since=None, until=None):
     return parts, um_n, um_money
 
 
-def summarize(directory, rows, records, table, price_problem, profile_name, now, problems=(), cc=None, since=None, until=None):
+def summarize(directory, rows, records, table, price_problem, profile_name, now, problems=(), cc=None, since=None, until=None,
+              zone=None):
     """The summary.json object (spec 2.3) for the given ledger rows. cc: Claude Code's figure records (default: read
-    costs/cc/); they add cc fields beside est., never to it (t-029 R5)."""
+    costs/cc/); they add cc fields beside est., never to it (t-029 R5). zone: byDay's days (t-036; default UTC); a row
+    counts on the day of its start. byDayModel keeps UTC days (the billed rows' days)."""
+    zone = zone or UTC_ZONE
     problems = list(problems)
     if cc is None:
         cc, cc_problems = read_cc(directory)
@@ -1581,6 +1691,7 @@ def summarize(directory, rows, records, table, price_problem, profile_name, now,
     act_tasks, reasons = {}, {}  # activity -> task -> Bucket (the Costs view's drill); unattributed's reasons
     dims = {d: {} for d in ("kind", "role", "program", "model", "machine")}
     days, day_acts, day_model, hours, passes, sess_b, sess_info = {}, {}, {}, {}, {}, {}, {}
+    utc_days = set()  # byDayModel's own days (UTC)
     day_act_b = {}  # day -> activity -> Bucket: the day drill's activities with their unpriced part (t-028)
     sess_tasks, sess_split = {}, set()  # the tasks of each session's rows; sessions with a split row
     hour_floor = iso(now - HOURS * 3600)[:13]
@@ -1637,7 +1748,9 @@ def summarize(directory, rows, records, table, price_problem, profile_name, now,
         for dim, value in (("kind", r.get("kind")), ("role", r.get("role")), ("program", r.get("program")),
                            ("model", r.get("model")), ("machine", sess.get("host"))):
             group(dims[dim], value or ("unknown" if dim == "machine" else "(none)")).add(t, m, calls, rec)
-        day = r.get("day") or (r.get("from") or "")[:10]
+        utc_day = r.get("day") or (r.get("from") or "")[:10]
+        utc_days.add(utc_day)
+        day = day_in(zone, r.get("from")) or utc_day
         group(days, day).add(t, m, calls, rec)
         da = day_acts.setdefault(day, {})
         if m is not None:
@@ -1648,7 +1761,7 @@ def summarize(directory, rows, records, table, price_problem, profile_name, now,
         group(dab, act).add(t - rb_t, None if m is None else m - (rb_m or 0), calls, rec)
         if rb_t:
             group(dab, "cache-rebuild").add(rb_t, rb_m, 0, rec)
-        group(day_model, (day, r.get("model") or "(unknown model)")).add(t, m, calls, rec, tokens)
+        group(day_model, (utc_day, r.get("model") or "(unknown model)")).add(t, m, calls, rec, tokens)
         hour = (r.get("from") or "")[:13]
         if hour >= hour_floor:
             group(hours, hour).add(t, m, calls, rec)
@@ -1670,7 +1783,7 @@ def summarize(directory, rows, records, table, price_problem, profile_name, now,
         info["tasks"][r.get("task")] = info["tasks"].get(r.get("task"), 0) + t
         info["role"] = r.get("role") or info["role"]
         info["row"] = r
-    cc_parts, um_n, um_money = cc_join(cc, records, sessions, sess_b, since, until) if cc else ({}, 0, 0.0)
+    cc_parts, um_n, um_money = cc_join(cc, records, sessions, sess_b, since, until, zone) if cc else ({}, 0, 0.0)
     cc_money, task_cc = {}, {}
     for sid, parts in cc_parts.items():
         figures = [cc_figure(rec) for rec, _cleared in parts if cc_figure(rec) is not None]
@@ -1712,7 +1825,7 @@ def summarize(directory, rows, records, table, price_problem, profile_name, now,
                           activities=drill(day_act_b.get(d, {}), keep=20)) for d in day_list[:DAYS]]
     if day_list[DAYS:]:
         by_day.append(older.out("older", days=len(day_list) - DAYS))
-    kept_days = set(day_list[:DAYS])
+    kept_days = set(sorted(utc_days, reverse=True)[:DAYS])
     by_day_model = [dict(day=d, model=mod, tokens=b.kinds or zero(), money=round(b.money, 6) if b.priced else None,
                          **({"unpricedTokens": b.partial()} if b.partial() else {}))
                     for (d, mod), b in sorted(day_model.items(), reverse=True) if d in kept_days]
@@ -1762,6 +1875,7 @@ def summarize(directory, rows, records, table, price_problem, profile_name, now,
         "byPhase": by_money(phases),
         "byKind": {d: by_money(v) for d, v in dims.items()},
         "byDay": by_day,
+        "days": {"zone": zone["zone"], "offsets": zone["offsets"]},
         "byDayModel": by_day_model,
         "passes": sorted(({**{k: v for k, v in p.items() if k != "unpricedTokens"},
                            "money": None if p["money"] is None else round(p["money"], 6),
@@ -1858,7 +1972,7 @@ def write_summary(directory, state=None, now=None, records=None):
     problems = list(state.get("problems") or [])
     if bad:
         problems.append("{} lines of sessions.jsonl are not JSON".format(bad))
-    s = summarize(directory, ledger_rows(directory), records, table, problem, name, now, problems)
+    s = summarize(directory, ledger_rows(directory), records, table, problem, name, now, problems, zone=load_zone(directory))
     text = compact(s)
     while len(text.encode()) > SUMMARY_MAX and shrink(s):
         text = compact(s)
@@ -1889,7 +2003,8 @@ def report_lines(s, by=None):
         head = "estimated from {} prices as of {} ({})".format(p.get("source") or "?", p.get("asOf") or "?", p.get("currency") or "?")
     else:
         head = "No price table in profile {}: tokens only".format(p.get("profile") or "?")
-    out.append("Space {} · {} · updated {}".format(s["space"], head, s["updated"]))
+    zone = zone_of(s)
+    out.append("Space {} · {} · updated {}".format(s["space"], head, local_clock(s["updated"], zone)))
     share = (100.0 * tot["tokens"]["cr"] / tot["tokens"]["all"]) if tot["tokens"]["all"] else 0
     cc = tot.get("cc") if isinstance(tot.get("cc"), dict) else None  # Claude Code's own figure: beside est., never in it
     line = "Total     {} est.{}   {} tokens (cache read {:.0f}%)".format(fmt_money(tot["money"]), " (no price)" if cc and tot["money"] is None else "",
@@ -1904,9 +2019,10 @@ def report_lines(s, by=None):
             cc.get("sessions", 0), cc.get("claudeSessions", 0))
     if by is None:
         out.append(line)
-        days = [e for e in s["byDay"] if e["key"] == s["updated"][:10]]
+        days = [e for e in s["byDay"] if e["key"] == day_in(zone, s["updated"])]
         today = days[0]["money"] if days else (0.0 if p.get("source") or p.get("currency") else None)
-        out.append("Today     {}{} est. (UTC day)".format(fmt_money(today), "+" if days and days[0].get("unpricedTokens") else ""))
+        out.append("Today     {}{} est. ({})".format(fmt_money(today), "+" if days and days[0].get("unpricedTokens") else "",
+                                                     "UTC day" if zone["offsets"] == [[0, 0]] else "local day, " + zone["zone"]))
 
     def table(title, entries, label=lambda e: str(e["key"]), with_cc=False, ratio=False):
         total = sum(e["money"] or 0 for e in entries) or 0  # shares are of est. only, never of CC (AC6.4)
@@ -1929,7 +2045,7 @@ def report_lines(s, by=None):
     sections = [("activity", "By activity", s["byActivity"], None), ("task", "By task", s["byTask"], None),
                 ("phase", "By phase", s["byPhase"], None)]
     sections += [(d, "By " + d, s["byKind"].get(d, []), None) for d in ("kind", "role", "program", "model", "machine")]
-    sections += [("day", "By day", s["byDay"], None),
+    sections += [("day", "By day ({})".format(zone["zone"]), s["byDay"], None),
                  ("pass", "Costliest passes", [dict(p, key="pass {} ({})".format(p["pass"], p.get("trigger") or "?") + (" rebuild" if p.get("rebuild") else ""))
                                                for p in s["passes"]], None),
                  ("session", "Sessions", s["sessions"], lambda e: "{} {} {}".format(e["key"], e.get("role") or e.get("kind"), e.get("task") or ""))]
@@ -1981,22 +2097,25 @@ def account_wide_summary(account, now):
             "byDayModel": [merged[k] for k in sorted(merged, key=lambda k: (k[0] or "", k[1] or ""), reverse=True)]}
 
 
-def report(directory, by=None, since=None, until=None, as_json=False, account_wide=False, billed=False, now=None):
+def report(directory, by=None, since=None, until=None, as_json=False, account_wide=False, billed=False, now=None, utc=False):
+    """The space's costs; days are the terminal's local days (t-036), or UTC days with utc."""
     now = time.time() if now is None else now
     if account_wide:
         print(json.dumps(account_wide_summary(costs_account(), now), indent=2))
         return 0
     for d in (since, until):
         if d is not None and not DATE.match(d):
-            raise pa.Problem("dates are YYYY-MM-DD (UTC)")
+            raise pa.Problem("dates are YYYY-MM-DD (this terminal's days; --utc for UTC days)")
     if by is not None and by not in REPORT_BY:
         raise pa.Problem("--by is one of " + ", ".join(REPORT_BY))
     folder = costs_dir(directory)
-    rows = [r for r in ledger_rows(directory) if (not since or r.get("day", "") >= since) and (not until or r.get("day", "") <= until)]
+    zone = dict(UTC_ZONE) if utc else machine_zone(now)
+    day = lambda r: day_in(zone, r.get("from")) or r.get("day", "")  # noqa: E731
+    rows = [r for r in ledger_rows(directory) if (not since or day(r) >= since) and (not until or day(r) <= until)]
     records, _bad = read_lines(os.path.join(folder, "sessions.jsonl"))
     table, problem, name = space_prices(directory)
     state = pa.read_json(os.path.join(folder, "state.json"), {}) or {}
-    s = summarize(directory, rows, records, table, problem, name, now, state.get("problems") or [], since=since, until=until)
+    s = summarize(directory, rows, records, table, problem, name, now, state.get("problems") or [], since=since, until=until, zone=zone)
     if as_json:
         print(json.dumps(s, indent=2))
         return 0
@@ -3163,6 +3282,8 @@ def main(argv=None):
     c.add_argument("--space")
     c.add_argument("--quiet", action="store_true")
     c.add_argument("--resummarize", action="store_true", help="only rewrite summary.json (after a price table change)")
+    c.add_argument("--zone-offsets", help="the panel's timezone: <epoch>:<minutes east of UTC>[,...], the first from 0")
+    c.add_argument("--zone-name", help="its name (shown beside the days)")
     r = sub.add_parser("report", help="the space's costs as text, or --json")
     r.add_argument("--space")
     r.add_argument("--by", choices=REPORT_BY)
@@ -3171,6 +3292,7 @@ def main(argv=None):
     r.add_argument("--json", action="store_true")
     r.add_argument("--billed", action="store_true", help="add the comparison with billed amounts")
     r.add_argument("--account-wide", action="store_true", help="byDayModel of every space here with the same account")
+    r.add_argument("--utc", action="store_true", help="UTC days (default: this terminal's local days)")
     x = sub.add_parser("reconstruct", help="find and bind the space's sessions from before launch records")
     x.add_argument("--space")
     x.add_argument("--dry-run", action="store_true")
@@ -3179,9 +3301,10 @@ def main(argv=None):
     add_billed_parser(sub)
     args = parser.parse_args(argv)
     if args.cmd == "collect":
+        zone = parse_zone(args.zone_offsets, args.zone_name) if args.zone_offsets is not None or args.zone_name is not None else None
         directory = space_directory(args.space)
         try:
-            collect(directory, quiet=args.quiet, resummarize=args.resummarize)
+            collect(directory, quiet=args.quiet, resummarize=args.resummarize, zone=zone)
         except pa.Problem as e:  # our own text: shown to the panel, scrubbed and short
             note_collect_failure(directory, scrub(str(e))[:200])
             raise
@@ -3192,7 +3315,8 @@ def main(argv=None):
     if args.cmd == "report":
         if args.account_wide:
             return report(None, account_wide=True)
-        return report(space_directory(args.space), by=args.by, since=args.since, until=args.until, as_json=args.json, billed=args.billed)
+        return report(space_directory(args.space), by=args.by, since=args.since, until=args.until, as_json=args.json, billed=args.billed,
+                      utc=args.utc)
     if args.cmd == "reconstruct":
         reconstruct(space_directory(args.space), dry_run=args.dry_run)
         return 0

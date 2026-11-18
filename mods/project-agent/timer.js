@@ -6,7 +6,7 @@
 // schedule.json ownership: the person (this panel) and the orchestrator write the settings;
 // only this timer writes lastPass and nextPass. pass-request.json is the on-demand queue.
 //
-// Costs (t-009): the lease holder also runs `pa-costs collect --space <id> --quiet` for each space,
+// Costs (t-009): the lease holder also runs `pa-costs collect --space <id> --quiet` (+ its zone, t-036) for each space,
 // on its machine, every 120 s while some copy shows that space's Costs view (shared
 // "project-agent.costsShown"), else every 30 min; and `pa-costs billed fetch --scheduled --quiet`
 // here at most once an hour (the tool itself queries at most once a day, and only once the person
@@ -14,6 +14,7 @@
 
 import { terminals, hc, readTextFile, exec, shared, setShared, notify, spaces } from "herdr";
 import { paHome, replaceFile, localId, keeperJudging, missingTool } from "./store.js";
+import { zoneArgs, oldTool } from "./zone.js";
 
 export const MIN_MINUTES = 5;
 export const PRESETS = [5, 10, 15, 30, 60];
@@ -153,7 +154,9 @@ export function collectCosts(agent, now) {
   if (run && now - run.at < every) return;
   setShared("project-agent.costsRun", { ...runs, [id]: { at: now, busy: true } });
   let p;
-  try { p = exec("pa-costs", ["collect", "--space", localId(id), "--quiet"], { on: agent.machine, timeout: COLLECT_TIMEOUT }); } catch (e) { p = Promise.reject(e); }
+  // With this panel's zone (t-036, zone.js); a pa-costs from before it refuses that: run again without it.
+  const args = ["collect", "--space", localId(id), "--quiet"], collectWith = (a) => exec("pa-costs", a, { on: agent.machine, timeout: COLLECT_TIMEOUT });
+  try { p = Promise.resolve(collectWith([...args, ...zoneArgs(now)])).then((r) => (oldTool(r) ? collectWith(args) : r)); } catch (e) { p = Promise.reject(e); }
   Promise.resolve(p).then(outcome, failure).then((res) => {
     const all = { ...(shared("project-agent.costsRun") ?? {}) };
     if (all[id]?.at === now) { all[id] = { at: now, busy: false }; setShared("project-agent.costsRun", all); }

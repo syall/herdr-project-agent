@@ -11,7 +11,9 @@
 //           `shown(spaceId)` (main.js) is asked live before each read and exec, also between the steps of one
 //           (before the ls, the remote report and the second compare): a run, read or compare that ends after
 //           the view was left starts nothing; the space is marked stale and read at once when shown.
-//   runs:   on a click only: Refresh (`pa-costs collect`), Reconstruct (`pa-costs reconstruct`) on the
+//   days:   Today, Last 7 days and By day are this machine's local days when the summary's days are in its zone (t-036:
+//           the collect passes it, zone.js); else they are the summary's days, named ("(UTC)" for an older summary).
+//   runs:   on a click only: Refresh (`pa-costs collect`, with this panel's zone), Reconstruct (`pa-costs reconstruct`) on the
 //           space's machine, Turn off (`pa-costs billed disable`, here). Nothing else writes (R12).
 
 import { div } from "gpui-kit";
@@ -19,6 +21,7 @@ import { v_flex, h_flex } from "gpui-base";
 import { exec } from "herdr";
 import { loadCosts, localId, withTimeout, TIMED_OUT, READ_LIMIT, missingTool } from "./store.js";
 import { Copier, sel } from "./copy.js";
+import { zoneArgs, oldTool, localDate, daysBefore, summaryZone } from "./zone.js";
 
 export const COSTS_EVERY = 10000; // the summary of a shown space: at most one read this often
 export const BILLING_EVERY = 60000; // the billed comparison: at most one this often
@@ -147,15 +150,16 @@ export class CostsPane {
   }
 
   // Refresh: `pa-costs collect` on the space's machine, one at a time, then one read.
-  refresh(space, cx) { this.runTool(space, cx, "collect", ["collect", "--space", localId(space.id)], COLLECT_TIMEOUT); }
+  refresh(space, cx) { this.runTool(space, cx, "collect", ["collect", "--space", localId(space.id)], COLLECT_TIMEOUT, true); }
   // Reconstruct from session files: `pa-costs reconstruct` (it collects itself), then one read.
   reconstruct(space, cx) { this.runTool(space, cx, "reconstruct", ["reconstruct", "--space", localId(space.id)], RECONSTRUCT_TIMEOUT); }
-  runTool(space, cx, what, args, timeout) {
+  runTool(space, cx, what, args, timeout, withZone = false) {
     const st = this.of(space.id);
     if (st.run?.busy) return;
     st.run = { what, busy: true, error: null };
     cx.spawn(async (cx) => {
-      const { r, error } = await call(cx, space.machine, args, timeout);
+      let { r, error } = await call(cx, space.machine, withZone ? [...args, ...zoneArgs(Date.now())] : args, timeout);
+      if (withZone && !error && oldTool(r)) ({ r, error } = await call(cx, space.machine, args, timeout)); // a pa-costs from before t-036
       st.run = { what, busy: false, error: error ?? (r.code !== 0 ? said(r) : null) };
       this.want(space, cx, true);
       cx.notify();
@@ -278,15 +282,18 @@ export class CostsPane {
 
   tiles(t, s, tot, cur, priced, lines = []) {
     const hours = Array.isArray(s.hours) ? s.hours.filter((h) => Array.isArray(h) && h[1] && typeof h[1] === "object") : [];
-    const today = new Date(Date.now()), localDay = (d) => `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
-    const mine = hours.filter(([k]) => { const d = new Date(`${k}:00:00Z`); return !Number.isNaN(d.getTime()) && localDay(d) === localDay(today); }).map(([, v]) => v);
+    const now = Date.now(), today = new Date(now), localToday = localDate(now), z = summaryZone(s, now);
+    const dayList = list(s.byDay).filter((d) => /^\d{4}-\d{2}-\d{2}$/.test(str(d.key)));
+    // Today: the summary's local today when its days are this machine's (exact); else the local day of its UTC hours.
+    const mine = z.local ? dayList.filter((d) => d.key === localToday)
+      : hours.filter(([k]) => { const ms = Date.parse(`${k}:00:00Z`); return !Number.isNaN(ms) && localDate(ms) === localToday; }).map(([, v]) => v);
     const sum = (entries) => {
       const pr = entries.filter((e) => e.money !== null && e.money !== undefined);
       const unpriced = entries.reduce((a, e) => a + (e.money === null || e.money === undefined ? num(e.tokens) : num(e.unpricedTokens)), 0);
       return { money: pr.length ? pr.reduce((a, e) => a + num(e.money), 0) : entries.length || !priced ? null : 0, unpricedTokens: pr.length ? unpriced : 0, tokens: entries.reduce((a, e) => a + num(e.tokens), 0) };
     };
-    const day0 = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate() - 6)).toISOString().slice(0, 10);
-    const week = sum(list(s.byDay).filter((d) => /^\d{4}-\d{2}-\d{2}$/.test(str(d.key)) && d.key >= day0));
+    const day0 = z.local ? daysBefore(localToday, 6) : new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate() - 6)).toISOString().slice(0, 10);
+    const week = sum(dayList.filter((d) => d.key >= day0));
     // alt: the figure instead of est. (Claude Code's, where there is no est.); cc: Claude Code's line under it.
     const tile = (title, e, small, alt = null, cc = null) => {
       const figure = alt ?? (priced ? est(e, cur) : `${tokens(e.tokens)} tokens`);
@@ -308,7 +315,7 @@ export class CostsPane {
     return h_flex().gap(6)
       .child(tile("Total", { money: tot.money, unpricedTokens: tot.unpricedTokens, tokens: all }, `${tokens(all)} tokens${all ? ` · ${Math.round((cr / all) * 100)}% cache read` : ""}`, ccAlt, ccLine))
       .child(tile("Today", sum(mine), `${tokens(sum(mine).tokens)} tokens`))
-      .child(tile("Last 7 days (UTC)", week, `${tokens(week.tokens)} tokens`));
+      .child(tile(z.local ? "Last 7 days" : `Last 7 days (${z.label})`, week, `${tokens(week.tokens)} tokens`));
   }
 
   // The notes under the tiles where the summary has Claude Code's figure: the legend of "CC", how many sessions have it
@@ -319,7 +326,7 @@ export class CostsPane {
     const out = [];
     if (ccNum(cc.money) !== null) out.push("CC = Claude Code's own list-price estimate (USD), per session; not the bill");
     if (num(cc.sessions) < num(cc.claudeSessions)) {
-      const days = list(s.sessions).filter((x) => ccNum(x.cc) !== null && /^\d{4}-\d{2}-\d{2}/.test(str(x.ccAt))).map((x) => x.ccAt.slice(0, 10)).sort();
+      const days = list(s.sessions).filter((x) => ccNum(x.cc) !== null && /^\d{4}-\d{2}-\d{2}/.test(str(x.ccAt))).map((x) => (Number.isNaN(Date.parse(x.ccAt)) ? x.ccAt.slice(0, 10) : localDate(Date.parse(x.ccAt)))).sort();
       const covers = days.length ? `covers sessions started from ${days[0]}` : num(cc.sessions) ? `covers ${num(cc.sessions)} of ${num(cc.claudeSessions)} Claude sessions` : "covers none of these sessions yet";
       out.push(`Claude Code's figure ${covers}; older, Codex and killed-at-the-end sessions have none or a partial one.`);
     }
@@ -383,7 +390,8 @@ export class CostsPane {
     dimRows.forEach((x, i) => out.child(row("kind", i, x, str(x.key), null, () => sessionsOf((ss) => st.dim === "machine" || str(ss[st.dim] ?? "(none)") === str(x.key)))));
     // By day: newest first; Show more reveals up to 92.
     const days = list(s.byDay);
-    out.child(titled("day", "By day (UTC)"));
+    const z = summaryZone(s, Date.now());
+    out.child(titled("day", z.local ? "By day" : `By day (${z.label})`));
     days.slice(0, st.moreDays ? DAYS_MORE : DAYS_SHOWN).forEach((d, i) => out.child(row("day", i, d, d.key === "older" ? `older (${num(d.days)} days)` : str(d.key), null,
       // Each activity with its tokens and est., marked as the rows are (t-028; activities from pa-costs of t-028 on);
       // an older summary's byActivity (priced money only) as before.
@@ -438,7 +446,7 @@ export class CostsPane {
     if (d.hereError) box.child(line(`All spaces on ${str(space.machine)} could not be read (${str(d.hereError)}); the comparison is not shown.`, t.blocked));
     if (c && c.covered) {
       const cov = c.covered, ccur = c.currency ?? cur;
-      box.child(line(`Covered ${str(cov.from)} – ${str(cov.to)} (${num(cov.days)} of ${num(cov.of)} days${Array.isArray(cov.missing) && cov.missing.length ? `; not billed: ${cov.missing.map(str).join(", ")}` : ""}) · source ${(Array.isArray(c.sources) ? c.sources : []).map(str).join(", ")}, fetched ${clock(c.fetchedAt)}`, t.dim));
+      box.child(line(`Covered ${str(cov.from)} – ${str(cov.to)} (${num(cov.days)} of ${num(cov.of)} days${Array.isArray(cov.missing) && cov.missing.length ? `; not billed: ${cov.missing.map(str).join(", ")}` : ""}) · source ${(Array.isArray(c.sources) ? c.sources : []).map(str).join(", ")}, fetched ${clock(c.fetchedAt)} (billing days are UTC days)`, t.dim));
       const missing = Array.isArray(s.prices?.missing) ? s.prices.missing.map(str) : [];
       const cell = (v, partial) => (v === null || v === undefined ? "— est. (no price)" : `${money(v, ccur)} est.${partial ? " + unpriced" : ""}`);
       const fig = (cols) => { lines.push(cols.map(String).join(" | ").replace(/^ \| /, "")); return figRow(cols); };
