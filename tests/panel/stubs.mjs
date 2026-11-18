@@ -135,7 +135,8 @@ export function makeCx(extra = {}) {
       Promise.resolve(p).then(end, end);
       return p;
     },
-    sleep: (ms) => { const end = hold("sleep"); if (g.__sleepHang) return new Promise(() => {}); const p = waitFor(ms ?? 0); p.then(end, end); return p; },
+    // sleep(0): one turn (t-053: the runtime's executor runs what is ready first), on the clock otherwise.
+    sleep: (ms) => { const end = hold("sleep"); if (g.__sleepHang) return new Promise(() => {}); const p = ms ? waitFor(ms) : new Promise((r) => setTimeout(r, 1)); p.then(end, end); return p; },
     timer: {
       every(ms, fn) { if (gen === undefined || g.__gen === gen) { hold("every"); (g.__timers ??= []).push({ ms, fn, store: g.__als?.getStore() }); } },
       after(ms, fn) { if (gen === undefined || g.__gen === gen) { const end = hold("after"); (g.__afters ??= []).push({ ms, fn, end, store: g.__als?.getStore() }); } },

@@ -158,6 +158,7 @@ export class Host {
           for (const d of this.deadlines) next = Math.min(next, d.due);
           const wait = Math.min(1000, next - Date.now());
           if (wait > 0) await counted("a sleep", () => c.sleep(wait), this);
+          await counted("a sleep", () => c.sleep(0), this); // one turn of the executor: a call that answered by now settles before its deadline fires
           this.sweep(Date.now());
         }
       } catch { /* refused, or the copy is gone: the next capped call starts the clock again */ }
