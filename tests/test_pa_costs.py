@@ -3600,21 +3600,37 @@ class CC_Resume(CCBase):
         rec = self.readings([(T0 + 3660, 10.5, 90060000)])
         self.assertEqual((rec["base"], rec["cost"], rec["segments"], rec["first"]), (0, 10.5, 1, iso(T0)))
 
-    def test_r7_a_backward_clock_step_after_a_real_restart_passed_held_keeps_its_segment(self):
-        # t-051 (t-043 REVIEW RL-A, s7): the restarted process outlives the old one at the clock's speed, then the
-        # clock steps back 60 s; growing at the clock's speed now looks faster than the clock, but it is no restore
+    def test_r7_a_backward_clock_step_as_a_real_restart_crosses_held_keeps_its_segment(self):
+        # t-051 (t-043 check, s7): the restarted process crosses the held duration at the clock's speed in the same
+        # reading as the clock steps back 60 s; growing at the clock's speed then looks faster than the clock
         rec = self.readings([(T0, 5.0, 600000), (T0 + 30, 0.0, 1000), (T0 + 620, 4.9, 591000),
                              (T0 + 560, 5.2, 621000)])
         self.assertEqual((rec["base"], rec["cost"], rec["segments"]), (5.0, 5.2, 2))
         self.assertAlmostEqual(pa_costs.cc_figure(pa_costs.cc_clean(rec)), 10.2)
 
-    def test_r8_a_resume_with_several_low_readings_and_a_backward_clock_step_is_counted_once(self):
-        # t-051: the restore still undoes the drop when it jumps across the held duration in one reading
+    def test_r7b_a_real_restart_past_held_is_never_undone_even_by_an_unseen_clock_step(self):
+        # t-051 (t-043 REVIEW RL-A): the restarted process has outlived the old one; then the clock steps back 80 s
+        # inside a 100 s gap, so the clock still reads forward (20 s) and 100 s of growth looks faster than the clock
+        rec = self.readings([(T0, 5.0, 600000), (T0 + 30, 0.0, 1000), (T0 + 640, 5.1, 611000),
+                             (T0 + 660, 5.3, 711000)])
+        self.assertEqual((rec["base"], rec["cost"], rec["segments"]), (5.0, 5.3, 2))
+        self.assertAlmostEqual(pa_costs.cc_figure(pa_costs.cc_clean(rec)), 10.3)
+
+    def test_r8_a_resume_with_several_low_readings_is_counted_once(self):
+        # t-051: the restore still undoes the drop: it jumps across the held duration in one reading
         rec = self.readings([(T0, 30.0, 28800000), (T0 + 100, 0.0, 500), (T0 + 110, 0.05, 10500), (T0 + 120, 0.1, 20500),
-                             (T0 + 50, 30.1, 28805000)])  # the clock stepped back 70 s before the restored totals
+                             (T0 + 130, 30.1, 28805000)])
         self.assertEqual((rec["base"], rec["cost"], rec["segments"]), (0, 30.1, 1))
         self.assertAlmostEqual(pa_costs.cc_figure(pa_costs.cc_clean(rec)), 30.1)
         self.assertNotIn("heldCost", rec)
+
+    def test_r9_a_restore_while_the_clock_reads_backward_is_no_restore(self):
+        # t-051: with the clock behind the last reading the time between them is unknown; the drop stays counted (an
+        # over count, never an under count), and it stays so once the totals are past the held duration
+        rec = self.readings([(T0, 30.0, 28800000), (T0 + 100, 0.0, 500), (T0 + 30, 30.1, 28805000)])
+        self.assertEqual((rec["base"], rec["cost"], rec["segments"], rec["heldCost"]), (30.0, 30.1, 2, 30.0))
+        rec = self.readings([(T0 + 40, 30.2, 28815000)])
+        self.assertEqual((rec["base"], rec["cost"], rec["segments"]), (30.0, 30.2, 2))
 
 
 class CC_ResumeSummary(CCFixture):
