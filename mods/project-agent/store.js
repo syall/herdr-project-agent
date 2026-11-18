@@ -404,10 +404,24 @@ export async function replaceFile(path, text, expected, on, cx = null) {
 // writes the answer itself; answerDecision never writes one.
 export const isPush = (card) => Boolean(card && typeof card === "object" && ((card.push && typeof card.push === "object") || card.kind === "push"));
 
+// t-046: every card also takes an answer in the person's own words. It is written `answer: "Other", other: true`
+// with the words in `note`; no tool acts on it. isOther is pa.is_other exactly (wide: the marker, or the label in any
+// case, even on a card with its own option of that name), so it can only make a tool do less.
+export const OTHER = "Other", OTHER_MAX = 2000;
+export const OTHER_TOO_LONG = `Your answer is longer than ${OTHER_MAX} characters; shorten it, or write it in a file and give the path.`;
+export const isOther = (card) => Boolean(card && typeof card === "object" && (card.other === true || String(card.answer ?? "").trim().toLowerCase() === "other"));
+// The words for a notice typed by hc send: one line (every whitespace run one space), cut at `max` with a tail
+// (as the tools cut theirs at 200). The card keeps them whole.
+export const oneLine = (words, max = 400) => {
+  const s = String(words ?? "").replace(/\s+/g, " ").trim();
+  return s.length > max ? `${s.slice(0, max - 1)}… (the rest is on the card)` : s;
+};
+
 // Writes the person's answer into the card file. The only fields this mod ever changes. A push card (as
 // read from disk now) is refused: only pa-push-main run, from its own Submit, answers it. A card that is not open
 // (as read now) is refused, and the write is a compare-and-write against that open copy: an answer already written
 // is never changed. Returns { card, before, after }: the answered card, the file text it replaced, the text written.
+// label OTHER: `note` is the answer (trimmed, required, at most OTHER_MAX); a listed label gets no `other` key.
 export async function answerDecision(space, entry, label, note) {
   const on = space.machine ?? null;
   const now = await read(entry.path, { on });
@@ -416,8 +430,17 @@ export async function answerDecision(space, entry, label, note) {
   try { card = JSON.parse(now); } catch { throw new Error("The card file is not valid JSON; fix it by hand."); }
   if (isPush(card)) throw new Error("A push card is answered with its own Submit; its answer runs pa-push-main.");
   if (card.status !== "open") throw new Error("This card was already answered.");
-  if (!(card.options ?? []).some((o) => o.label === label)) throw new Error("That option is no longer on the card.");
-  const next = { ...card, status: "answered", answer: label, note: note || null, answered: new Date().toISOString().replace(/\.\d+Z$/, "Z") };
+  const stamp = new Date().toISOString().replace(/\.\d+Z$/, "Z");
+  let next;
+  if (label === OTHER) {
+    const words = String(note ?? "").trim();
+    if (!words) throw new Error("An Other answer needs your own words.");
+    if (words.length > OTHER_MAX) throw new Error(OTHER_TOO_LONG);
+    next = { ...card, status: "answered", answer: OTHER, other: true, note: words, answered: stamp };
+  } else {
+    if (!(card.options ?? []).some((o) => o.label === label)) throw new Error("That option is no longer on the card.");
+    next = { ...card, status: "answered", answer: label, note: note || null, answered: stamp };
+  }
   const after = `${JSON.stringify(next, null, 2)}\n`;
   await replaceFile(entry.path, after, now, on);
   return { card: next, before: now, after };
