@@ -43,7 +43,7 @@ def new_screen(path, cursor="no", extra=None, after_path=None):
     return "\n".join(out)
 
 
-INNER = 96
+INNER = 160
 
 
 def box(rows):
