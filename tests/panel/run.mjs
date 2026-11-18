@@ -4574,6 +4574,41 @@ cases["P53-fallback-peak-8"] = async () => { // AC3.2, AC1.2: the batch fails: a
   check(!w.loads[RS] && g.__cardReads.peak <= 8 && (pool().kinds.sleep ?? 0) <= 1, `given up by 11 s, <= 8 card reads, <= 1 sleep (peak ${g.__cardReads.peak}; ${poolSaid()})`);
 };
 
+// ---- t-061: every open card is shown, whatever the count and the names -----------------------------------------
+// 200 answered cards named a-* and 30 open ones named d-wt-* (sorting after every a-*), in `dir` on `on`.
+function cards61({ dir = DIR, on = "" } = {}) {
+  const names = [];
+  for (let i = 0; i < 200; i++) {
+    const id = `a-${String(i).padStart(3, "0")}`; names.push(`${id}.json`);
+    g.__files[`${on}:${dir}/decisions/${id}.json`] = JSON.stringify({ id, status: "answered", answer: "Yes", question: `Q ${id}?`, options: [{ label: "Yes" }], created: `2026-10-${String(1 + Math.floor(i / 10)).padStart(2, "0")}T10:${String(i % 10).padStart(2, "0")}:00Z` });
+  }
+  for (let i = 0; i < 30; i++) {
+    const id = `d-wt-t-${String(i).padStart(3, "0")}`; names.push(`${id}.json`);
+    g.__files[`${on}:${dir}/decisions/${id}.json`] = JSON.stringify({ id, status: "open", question: `Keep ${id}?`, options: [{ label: "Keep" }, { label: "Remove" }], created: `2026-11-17T10:${String(i).padStart(2, "0")}:00Z` });
+  }
+  g.__ls[`${on}:${dir}/decisions`] = names;
+}
+const check61 = (v) => {
+  const text = look(v).text;
+  check(/Decisions · 30/.test(text), `the Decisions tab counts all 30 open cards (got ${text.match(/Decisions[^\n]{0,8}/)?.[0]})`);
+  const shown = v.cards.filter((c) => c.card?.status === "open").map((c) => c.id);
+  check(shown.length === 30 && shown.includes("d-wt-t-029"), `every open card listed, the last name too (got ${shown.length})`);
+  check(/170 answered · 30 older not shown/.test(text), `the answered line says how many were left out (got ${text.match(/\d+ answered[^\n]*/)?.[0]})`);
+};
+
+cases["P61-open-last-batch"] = async () => { // R1, R2, R3: local batch, 230 cards, the 30 open ones sorting last: all shown, the count said
+  world(); cards61();
+  const v = await mount(); await settle();
+  check61(v);
+};
+
+cases["P61-open-last-fallback"] = async () => { // R1, R2, R3: another machine, the batch fails: the per-card fallback shows them all too
+  world({ machine: M }); cards61({ dir: RDIR, on: M }); g.__batchFail = { [M]: { code: 1 } };
+  const v = await mount();
+  for (let s = 0; s < 6; s++) await step(500);
+  check61(v);
+};
+
 cases["P53-hidden-batchonly-local"] = async () => { // AC3.3: hidden, a local batch that fails: no card read
   world(); localCards(5, { open: 2 }); g.__batchFail = { "": { code: 1 } }; g.__layout = panelLayout("changes");
   await mount(); await settle();

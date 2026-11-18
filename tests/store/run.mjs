@@ -93,13 +93,13 @@ cases["S-parity"] = async () => { // AC2.2: the same cards as the per-card path:
   check(ids.includes("noid") && batched.find((c) => c.id === "broken").card === null && /JSON|Unexpected|Expected/i.test(batched.find((c) => c.id === "broken").error ?? ""), "id fallback and the JSON error");
   check(batched.find((c) => c.id === "x1").error === "not a decision card (needs question and options)", "the not-a-card text");
   check(ids[0] === "d-open" || batched[0].card?.status === "open", `open first (got ${ids})`);
-  // 201 cards: the first 200 names, as the per-card path takes them.
+  // 201 open cards: every one (t-061: the cap never drops an open card), as the per-card path takes them.
   world();
   const big = {}; for (let i = 0; i < 201; i++) big[`c-${String(i).padStart(3, "0")}.json`] = card(`c-${String(i).padStart(3, "0")}`);
   cards(big);
   const b2 = await store.loadDecisions(remote, { cx }), p2 = await store.loadDecisions(local, { cx });
-  check(b2.length === 200 && !b2.some((c) => c.id === "c-200"), `200 cap (got ${b2.length})`);
-  check(norm(b2) === norm(p2), "the same 200 as the per-card path");
+  check(b2.length === 201 && b2.some((c) => c.id === "c-200") && !b2.omitted, `201 open cards, all kept (got ${b2.length}, omitted ${b2.omitted})`);
+  check(norm(b2) === norm(p2), "the same 201 as the per-card path");
   check(remoteCalls("batch").length === 1, "one batch");
 };
 
@@ -515,6 +515,59 @@ cases["S53-batch-local"] = async () => { // R3: on this computer the cards are o
   const localCalls = g.__issued.filter((x) => x.on === null);
   check(localCalls.length === 1 && localCalls[0].kind === "batch", `one local call, the batch (got ${JSON.stringify(localCalls.map((x) => x.kind))})`);
   check(norm(here) === norm(there), "the same list as the remote batch");
+};
+
+// ---- t-061 -----------------------------------------------------------------------------------------------------
+// 200 answered cards named a-* (a-000 the oldest) and `open` open cards named z-* (sorting after every a-*), plus
+// `extra` answered ones named b-*: the cap of 200 cards keeps every open card and drops the oldest answered.
+const minute = (i) => `2026-11-${String(1 + Math.floor(i / 600)).padStart(2, "0")}T${String(Math.floor(i / 60) % 10).padStart(2, "0")}:${String(i % 60).padStart(2, "0")}:00Z`;
+function many61({ answered = 200, open = 30 } = {}) {
+  const m = {};
+  for (let i = 0; i < answered; i++) { const id = `a-${String(i).padStart(3, "0")}`; m[`${id}.json`] = card(id, { status: i % 10 === 9 ? "withdrawn" : "answered", answer: "A", created: minute(i) }); }
+  for (let i = 0; i < open; i++) { const id = `z-${String(i).padStart(3, "0")}`; m[`${id}.json`] = card(id, { created: minute(i) }); }
+  cards(m);
+}
+const check61 = (list, { total, open, omitted, gone }) => {
+  const ids = list.map((c) => c.id), opens = list.filter((c) => c.card?.status === "open");
+  check(opens.length === open, `every open card shown: ${open} (got ${opens.length}: ${opens.slice(-3).map((c) => c.id)})`);
+  check(list.length === total, `${total} cards in all (got ${list.length})`);
+  check(list.omitted === omitted, `omitted ${omitted} (got ${list.omitted})`);
+  for (const id of gone) check(!ids.includes(id), `the oldest answered ${id} is the one left out`);
+  if (omitted) check(ids.includes(`a-${String(omitted).padStart(3, "0")}`) && ids.includes("a-199"), "the newer answered cards are kept");
+};
+
+cases["S61-batch-open-last"] = async () => { // R1, R2: 230 cards in one batch, the 30 open ones sorting last: all 30 shown, 30 oldest answered left out
+  world(); many61();
+  check61(await store.loadDecisions(remote, { cx }), { total: 200, open: 30, omitted: 30, gone: ["a-000", "a-029"] });
+  check(remoteCalls("batch").length === 1 && cardReads().length === 0, "one batch");
+  world(); many61();
+  check61(await store.loadDecisions(local, { cx }), { total: 200, open: 30, omitted: 30, gone: ["a-000", "a-029"] });
+};
+
+cases["S61-fallback-open-last"] = async () => { // R1, R2, R3: the same on the per-card fallback (the batch fails): every name is read
+  world(); many61(); g.__batchFail = { [M]: { code: 1 } };
+  const r = await within(store.loadDecisions(remote, { cx }), 10000);
+  check(r.done && Array.isArray(r.value), "the fallback answered");
+  check61(r.value, { total: 200, open: 30, omitted: 30, gone: ["a-000", "a-029"] });
+  check(cardReads().length === 230, `every card read (got ${cardReads().length})`);
+};
+
+cases["S61-more-open-than-cap"] = async () => { // R1: 250 open cards and 10 answered: all 250 shown, the 10 answered left out and counted
+  world(); many61({ answered: 10, open: 250 });
+  const b = await store.loadDecisions(remote, { cx });
+  check(b.length === 250 && b.every((c) => c.card?.status === "open") && b.omitted === 10, `250 open, omitted 10 (got ${b.length}, ${b.omitted})`);
+  world(); many61({ answered: 10, open: 250 }); g.__batchFail = { [M]: { code: 1 } };
+  const r = await within(store.loadDecisions(remote, { cx }), 10000);
+  check(r.done && r.value.length === 250 && r.value.omitted === 10, `the fallback too (got ${r.value?.length}, ${r.value?.omitted})`);
+};
+
+cases["S61-fallback-known-closed-last"] = async () => { // R1: on the fallback, names whose last known copy is answered are read after the others
+  world(); many61({ answered: 20, open: 5 }); g.__batchFail = { [M]: { code: 1 } };
+  const known = Array.from({ length: 20 }, (_, i) => { const id = `a-${String(i).padStart(3, "0")}`; return { id, path: `${rdir}/decisions/${id}.json`, text: card(id, { status: "answered", answer: "A" }) }; });
+  const r = await within(store.loadDecisions(remote, { cx, known }), 10000);
+  check(r.done && r.value.length === 25, `all 25 (got ${r.value?.length})`);
+  const order = cardReads().map((x) => x.path.split("/").pop());
+  check(order.slice(0, 5).every((n) => n.startsWith("z-")), `the open (not known answered) ones read first (got ${order.slice(0, 7)})`);
 };
 
 const hostMod = fs.existsSync(path.join(dst, "host.js")) ? await import(path.join(dst, "host.js")) : null;
