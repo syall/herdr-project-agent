@@ -445,6 +445,16 @@ def real_tools():
         shutil.copy2(os.path.join(REPO, "runtime", "tools", name), os.path.join(pa.ROOT, "tools", name))
 
 
+def flag(argv, name):
+    """The value of `name` in an exec argv: `--name=value` (round 2) or `--name value`; None when absent."""
+    for i, word in enumerate(argv):
+        if word.startswith(name + "="):
+            return word[len(name) + 1:]
+        if word == name and i + 1 < len(argv):
+            return argv[i + 1]
+    return None
+
+
 class Requests(Base):
     def setUp(self):
         super().setUp()
@@ -689,10 +699,10 @@ class AC6_1_Exec(Requests):
             pa.exec_restart(ctx, ctx.pop("after"), self.project, self.dir, "t1")
         path, argv = self.execs[0]
         self.assertEqual(path, sys.executable)
-        self.assertEqual(argv, [sys.executable, os.path.join(pa.ROOT, "tools", "pa.py"), "session", "--space", SP,
-                                "--project", self.project, "--profile", "test", "--name", "proj",
-                                "--restarted", req["id"], "--from-instance", ctx["launcher"]["instance"],
-                                "--restart-by", "pa-restart"])
+        self.assertEqual(argv, [sys.executable, os.path.join(pa.ROOT, "tools", "pa.py"), "session", "--space=" + SP,
+                                "--project=" + self.project, "--profile=test", "--name=proj",
+                                "--restarted=" + req["id"], "--from-instance=" + ctx["launcher"]["instance"],
+                                "--restart-by=pa-restart"])  # J2 round 2: every value as --flag=value
         self.assertEqual(signal.getsignal(signal.SIGINT), signal.getsignal(signal.SIGINT))  # unchanged (S5)
 
     def test_fresh_passes_fresh(self):
@@ -762,8 +772,7 @@ class AC6_1_Exec(Requests):
         starts, _ctx, req, e = self.loop(self.recorder)
         self.assertIsInstance(e, Execd)
         self.assertEqual(len(starts), 1)
-        self.assertIn("--restarted", self.execs[0][1])
-        self.assertEqual(self.execs[0][1][self.execs[0][1].index("--restarted") + 1], req["id"])
+        self.assertEqual(flag(self.execs[0][1], "--restarted"), req["id"])
 
     def test_ac6_5_exec_failing_resumes_in_the_same_process(self):
         def broken(path, argv):
@@ -879,8 +888,8 @@ class AC7_1_ExitReloads(Requests):
         starts, how, _out = self.run_loop_with_record(ctx_hash)
         self.assertEqual((len(starts), how), (1, "Execd"))
         argv = self.execs[0][1]
-        self.assertTrue(argv[argv.index("--restarted") + 1].startswith("exit-"))
-        self.assertEqual(argv[argv.index("--restart-by") + 1], "exit")
+        self.assertTrue(flag(argv, "--restarted").startswith("exit-"))
+        self.assertEqual(flag(argv, "--restart-by"), "exit")
 
     def run_loop_with_record(self, tools):
         saved = pa.launcher_start
@@ -996,7 +1005,8 @@ class Prompt(Requests):  # spec S1, S2: what the model runs with on a resume
         pa.launcher_session(ctx, self.dir, agent, True, snapshot=True)
         s = load(os.path.join(self.dir, "launcher.json"))["session"]
         self.assertEqual((s["prompt"], s["promptCore"]), ("rebuilt", core2))
-        self.assertEqual(load(os.path.join(self.dir, "agent.json"))["prompt"]["core"], core2)
+        # J2 round 2 (REVIEW A M5): the record is the session's first prompt; a rebuilt start does not replace it
+        self.assertEqual(load(os.path.join(self.dir, "agent.json"))["prompt"]["core"], core1)
 
     def test_recorded_without_a_known_prompt_is_unknown(self):
         ctx = self.record()
@@ -1246,8 +1256,8 @@ class AC5_4_On(Command):
         self.assertEqual(os.listdir(empty), [])
         self.assertEqual(len(calls), 1)
         c = calls[0]
-        self.assertEqual(c[:7], ["hc", "exec", "--on", "m2", "--", "sh", "-c"])
-        script = c[7]
+        self.assertEqual(c[:9], ["hc", "exec", "--on", "m2", "--timeout", "90", "--", "sh", "-c"])  # round 2: wait + 60
+        script = c[9]
         self.assertTrue(script.startswith('"$HOME/.config/herdr-pa/tools/pa.py" restart --space ' + SP))
         for part in ("--now", "--wait 30", "--why"):
             self.assertIn(part, script)
@@ -1336,6 +1346,410 @@ class AC9_1_OnlyTheOwnChild(unittest.TestCase):
                         found.append(fn.name)
         self.assertTrue(found)
         self.assertEqual(set(found) - {"end_child", "run_child"}, set(), found)
+
+
+# ---- J2 round 2: the seven Must fix items (REVIEW J2 A M1-M5, B M1-M3; VERIFY J2 MF1-MF4; handoff-fix-j2.md) -------
+
+class R2_1_Fields(Requests):
+    """Item 1: every request field is checked before use; the exec passes values as --flag=value; the self-check
+    parses the exact exec argv; execv raising anything resumes the loop."""
+
+    def test_bad_fields_are_refused_before_anything_is_ended(self):
+        cases = {"by dash": {"by": "-x"}, "by nul": {"by": "pa-restart\u0000"}, "by unknown": {"by": "someone"},
+                 "by exit": {"by": "exit"}, "id dash": {"id": "-x"}, "id long": {"id": "a" * 100},
+                 "id nul": {"id": "ab\u0000"}, "instance space": {"instance": "a b"}, "terminal newline": {"terminal": "t1\n"},
+                 "space bad": {"space": "../sp1"}, "why nul": {"why": "x\u0000y"}, "why long": {"why": "w" * 2001},
+                 "at long": {"at": "2026-11-18T07:24:47Z" + " " * 40}}
+        for name, over in cases.items():
+            with self.subTest(case=name):
+                self.passing_precheck()
+                ctx = self.ctx()
+                self.request(ctx, now=True, **over)
+                self.poll(ctx)
+                out = self.outcome()
+                self.assertEqual(out["outcome"], "refused", out)
+                self.assertTrue(self.gone())
+                self.assertEqual(ctx["child"].signals, [])
+                self.assertNotIn("after", ctx)
+
+    def test_a_good_why_with_a_newline_is_taken(self):
+        self.passing_precheck()
+        ctx = self.ctx()
+        self.request(ctx, now=True, why="the person said:\n'restart it'")
+        self.poll(ctx)
+        self.assertEqual(ctx["child"].signals, [signal.SIGTERM])
+
+    def test_a_name_starting_with_a_dash_parses_in_the_real_launcher(self):
+        real_tools()
+        self.stamp()
+        self.agent(sessionStarted=True, name="-x")
+        ctx = self.ctx()
+        req = self.request(ctx, now=True)
+        argv = pa.restart_argv(ctx, req["id"], "pa-restart", False, self.project, self.dir)
+        self.assertIn("--name=-x", argv)
+        pre, why = pa.restart_precheck(ctx, SP, "test", argv)
+        self.assertIsNone(why)
+        self.assertEqual(pre["argv"], argv)
+
+    def test_the_self_check_parses_the_exec_argv(self):  # REVIEW B M3: a parser without --restart-by
+        real_tools()
+        path = os.path.join(pa.ROOT, "tools", "pa.py")
+        with open(path) as f:
+            text = f.read()
+        line = '        parser.add_argument("--restart-by", help=argparse.SUPPRESS)\n'
+        self.assertIn(line, text)
+        write(path, text.replace(line, ""))
+        self.stamp()
+        ctx = self.ctx()
+        self.request(ctx, now=True)
+        self.poll(ctx)
+        out = self.outcome()
+        self.assertEqual(out["outcome"], "failed", out)
+        self.assertIn("self-check", out["why"])
+        self.assertEqual(ctx["child"].signals, [])
+        self.assertNotIn("after", ctx)
+
+    def test_execv_value_error_resumes_the_loop(self):  # REVIEW A M1: a NUL reached execv
+        def nul(path, argv):
+            raise ValueError("embedded null byte")
+        starts, ctx, req, e = AC6_1_Exec.loop(self, nul)
+        self.assertEqual(type(e).__name__, "Stop")
+        self.assertEqual(len(starts), 2)
+        out = self.outcome()
+        self.assertEqual((out["outcome"], out["request"]), ("failed", req["id"]))
+        self.assertNotIn("restarting", ctx)
+
+
+class R2_2_NoChild(Requests):
+    """Item 2: a request taken while no Claude handle is held is acted on at the next safe point."""
+
+    def test_p3_run_child_does_not_start_claude_once_a_restart_is_taken(self):
+        ctx = self.ctx()
+        ctx["child"] = None  # the loop is past take_after, building the next launch
+        self.request(ctx, now=True)
+        self.passing_precheck()
+        self.poll(ctx)
+        self.assertTrue(ctx.get("after"))
+        spawned = []
+        saved = pa.spawn
+        pa.spawn = lambda argv, cwd=None: spawned.append(argv) or FakeChild()
+        try:
+            code = pa.run_child(ctx, ["claude"], self.project)
+        finally:
+            pa.spawn = saved
+        self.assertEqual(spawned, [])
+        self.assertIsNone(code)
+        self.assertEqual(ctx.get("ended"), "restart")
+        self.assertIsNone(ctx.get("child"))
+
+    def test_taken_during_the_probe_execs_before_any_claude_starts(self):
+        ctx = self.ctx(child=None)
+        ctx.pop("child")
+        req = self.request(ctx, now=True)
+        starts = []
+
+        class Stop(Exception):
+            pass
+
+        def fake_call(argv, cwd=None):
+            starts.append(list(argv))
+            raise Stop()
+        saved_flag = pa.snapshot_flag
+
+        def probing(p, c=None):  # the watcher takes the request while the main thread runs the --help probe
+            if not ctx.get("restarting"):
+                pa.begin_restart(ctx, self.dir, "t1", dict(req), {"tools": pa.hash_or_none(os.path.join(pa.ROOT, "tools"), True)})
+            return False
+        undo = child_fakes.patch(pa, fake_call)
+        pa.snapshot_flag = probing
+        os.execv = self.recorder
+        try:
+            with self.assertRaises(Execd), contextlib.redirect_stdout(io.StringIO()):
+                pa.run_agent(types.SimpleNamespace(fresh=False), "t1", self.project, pa.load_profile("test"), self.dir,
+                             load(os.path.join(self.dir, "agent.json")), ctx, time.time())
+        finally:
+            undo()
+            pa.snapshot_flag = saved_flag
+        self.assertEqual(starts, [])
+        self.assertEqual(flag(self.execs[0][1], "--restarted"), req["id"])
+
+    def pipe_stdin(self):
+        r, w = os.pipe()
+        saved = sys.stdin
+        sys.stdin = os.fdopen(r)
+        self.addCleanup(os.close, w)
+        self.addCleanup(lambda: (sys.stdin.close(), setattr(sys, "stdin", saved)))
+
+    def later(self, ctx, after=0.3):
+        def go():
+            time.sleep(after)
+            ctx["after"] = {"kind": "exec", "request": {"id": "rX"}, "by": "pa-restart"}
+        threading.Thread(target=go, daemon=True).start()
+
+    def test_the_enter_wait_returns_when_a_restart_is_taken(self):  # the quick-exit wait (FINDINGS L5)
+        ctx = self.ctx(child=None)
+        self.pipe_stdin()
+        self.later(ctx)
+        began = time.time()
+        self.assertFalse(pa.wait_enter(ctx))
+        self.assertLess(time.time() - began, 5)
+
+    def test_error_wait_returns_when_a_restart_is_taken(self):
+        ctx = self.ctx(child=None)
+        self.pipe_stdin()
+        self.later(ctx)
+        saved = signal.getsignal(signal.SIGINT)
+        began = time.time()
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                pa.error_wait("t1", pa.Problem("x"), ctx)
+        finally:
+            signal.signal(signal.SIGINT, saved)
+        self.assertLess(time.time() - began, 5)
+        self.assertIn(["hc", "label", "t1", "herdr.pa.error="], self.calls)
+
+    def test_cmd_session_execs_a_restart_taken_during_error_wait(self):
+        ctx_seen, runs = {}, []
+
+        class Stop(Exception):
+            pass
+        req = None
+
+        def run_session(args, address, labels, space, project, ctx):
+            runs.append(1)
+            if len(runs) > 1:
+                raise Stop()
+            ctx.update(self.ctx(child=None))
+            ctx_seen["ctx"] = ctx
+            raise pa.Problem("the project folder is gone")
+
+        def error_wait(address, problem, ctx=None):
+            c = ctx_seen["ctx"]
+            r = self.request(c, now=True)
+            ctx_seen["req"] = r
+            pa.begin_restart(c, self.dir, "t1", dict(r), {"tools": pa.hash_or_none(os.path.join(pa.ROOT, "tools"), True)})
+
+        class Tty(io.StringIO):
+            def isatty(self):
+                return True
+        saved = (pa.run_session, pa.error_wait, sys.stdin, os.environ.get("HC_TERMINAL_ID"))
+        pa.run_session, pa.error_wait, sys.stdin = run_session, error_wait, Tty()
+        os.environ["HC_TERMINAL_ID"] = "t1"
+        os.execv = self.recorder
+        try:
+            args = types.SimpleNamespace(space=SP, project=self.project, profile="test", name=None, auto=False, ask=False,
+                                         fresh=False, restarted=None)
+            with self.assertRaises(Execd), contextlib.redirect_stdout(io.StringIO()):
+                pa.cmd_session(args)
+        finally:
+            pa.run_session, pa.error_wait, sys.stdin = saved[:3]
+            if saved[3] is None:
+                os.environ.pop("HC_TERMINAL_ID", None)
+            else:
+                os.environ["HC_TERMINAL_ID"] = saved[3]
+        self.assertEqual(len(runs), 1)
+        self.assertEqual(flag(self.execs[0][1], "--restarted"), ctx_seen["req"]["id"])
+
+
+class R2_3_Withdrawn(Requests):
+    """Item 3: a request withdrawn or replaced before the exec is not acted on."""
+
+    def test_p2_withdrawn_during_the_precheck_ends_nothing(self):
+        ctx = self.ctx()
+        req = self.request(ctx, now=True)
+        path = os.path.join(self.dir, "restart-request.json")
+
+        def precheck(*a, **k):  # pa-restart's timeout removes its own request while the pre-check runs
+            os.remove(path)
+            return ({"tools": "x", "core": "y"}, None)
+        pa.restart_precheck = precheck
+        self.poll(ctx)
+        self.assertFalse(ctx.get("after"))
+        self.assertEqual(ctx["child"].signals, [])
+        out = self.outcome()
+        self.assertEqual((out["outcome"], out["request"]), ("refused", req["id"]))
+        self.assertIn("withdrawn", out["why"])
+        self.assertNotIn(["hc", "label", "t1", "herdr.pa.restarting=" + req["id"]], self.calls)
+
+    def taken(self, **over):
+        self.passing_precheck()
+        ctx = self.ctx()
+        req = self.request(ctx, now=True, **over)
+        self.poll(ctx)
+        self.assertEqual(ctx["child"].signals, [signal.SIGTERM])
+        return ctx, req
+
+    def exec_now(self, ctx):
+        os.execv = self.recorder
+        with contextlib.redirect_stdout(io.StringIO()):
+            pa.exec_restart(ctx, ctx.pop("after"), self.project, self.dir, "t1")
+
+    def test_withdrawn_before_the_exec(self):
+        ctx, req = self.taken()
+        os.remove(os.path.join(self.dir, "restart-request.json"))
+        self.exec_now(ctx)
+        self.assertEqual(self.execs, [])
+        out = self.outcome()
+        self.assertEqual((out["outcome"], out["request"]), ("refused", req["id"]))
+        self.assertIn("withdrawn", out["why"])
+        self.assertIn(["hc", "label", "t1", "herdr.pa.restarting="], self.calls)
+        self.assertNotIn("restarting", ctx)
+
+    def test_replaced_before_the_exec_keeps_the_newer(self):
+        ctx, req = self.taken()
+        newer = dict(req, id="newer-one")
+        dump(newer, os.path.join(self.dir, "restart-request.json"))
+        self.exec_now(ctx)
+        self.assertEqual(self.execs, [])
+        self.assertEqual(self.outcome()["outcome"], "refused")
+        self.assertEqual(load(os.path.join(self.dir, "restart-request.json"))["id"], "newer-one")
+
+    def test_expired_before_the_exec(self):
+        at = time.time()
+        ctx, req = self.taken(at=pa.iso_time(at), expires=pa.iso_time(at + 2))
+        time.sleep(3.1)
+        self.exec_now(ctx)
+        self.assertEqual(self.execs, [])
+        out = self.outcome()
+        self.assertEqual(out["outcome"], "refused")
+        self.assertIn("expired", out["why"])
+
+    def test_still_there_execs(self):
+        ctx, req = self.taken()
+        with self.assertRaises(Execd):
+            self.exec_now(ctx)
+        self.assertEqual(flag(self.execs[0][1], "--restarted"), req["id"])
+
+
+class R2_4_OnTimeout(Command):
+    """Item 4: the relay passes hc exec a timeout that covers the wait; a relay timeout is unknown, not failed."""
+
+    def relayed(self, **over):
+        calls = []
+        pa.relay = lambda argv: calls.append(list(argv)) or 0
+        code, _out, err = self.run_cmd(on="m2", space=SP, **over)
+        self.assertEqual(code, 0, err)
+        return calls[0]
+
+    def test_the_timeout_covers_the_wait(self):
+        for wait, timeout in ((30, "90"), (None, "240"), (540, "600"), (10000, "600"), (0.5, "61")):
+            with self.subTest(wait=wait):
+                c = self.relayed(wait=wait)
+                self.assertEqual(c[:7], ["hc", "exec", "--on", "m2", "--timeout", timeout, "--"])
+
+    def test_a_relay_timeout_is_unknown(self):
+        saved = pa.__dict__.get("RELAY_MARGIN")
+        pa.RELAY_MARGIN = 1
+        self.addCleanup(lambda: setattr(pa, "RELAY_MARGIN", saved) if saved is not None else pa.__dict__.pop("RELAY_MARGIN", None))
+        pa.relay = lambda argv: time.sleep(1.05) or 1
+        code, out, err = self.run_cmd(on="m2", space=SP, wait=0)
+        self.assertEqual(code, 3, out + err)
+        self.assertIn("unknown", out + err)
+
+    def test_a_quick_failure_is_failed(self):
+        pa.relay = lambda argv: 1
+        code, out, err = self.run_cmd(on="m2", space=SP, wait=30)
+        self.assertEqual(code, 1)
+        self.assertNotIn("unknown", out + err)
+
+
+class R2_5_OnInsideClaude(Command):
+    """Item 5: the CLAUDECODE rule and the journal line hold for --on too."""
+
+    def test_p1_on_inside_claude_needs_why(self):
+        os.environ["CLAUDECODE"] = "1"
+        os.environ["HC_TERMINAL_ID"] = "t1"
+        calls = []
+        pa.relay = lambda argv: calls.append(list(argv)) or 0
+        code, _out, err = self.run_cmd(on="m2", space=SP, why=None)
+        self.assertEqual((code, calls), (2, []))
+        self.assertIn("--why", err)
+
+    def test_on_inside_claude_with_why_journals_here(self):
+        os.environ["CLAUDECODE"] = "1"
+        os.environ["HC_TERMINAL_ID"] = "t1"
+        calls = []
+        pa.relay = lambda argv: calls.append(list(argv)) or 0
+        code, _out, err = self.run_cmd(on="m2", space="sp2", why="restart the other one")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(calls), 1)
+        with open(os.path.join(self.dir, "journal.jsonl")) as f:
+            lines = [json.loads(x) for x in f.read().splitlines() if x.strip()]
+        self.assertEqual(len(lines), 1)
+        self.assertEqual((lines[0]["by"], lines[0]["trigger"], lines[0]["on"], lines[0]["space"]),
+                         ("orchestrator", "conversation", "m2", "sp2"))
+        self.assertIn("restart the other one", lines[0]["why"])
+
+
+class R2_6_PromptRecord(Requests):
+    """Item 6: the recorded prompt is the session's first; a rebuilt start reports the current core without
+    replacing it; a later recorded resume reports the first (spec S1)."""
+
+    def test_new_then_rebuilt_then_recorded(self):
+        ctx = self.record()
+        agent = load(os.path.join(self.dir, "agent.json"))
+        core_a = pa.hash_or_none(os.path.join(pa.ROOT, "core"))
+        pa.launcher_session(ctx, self.dir, agent, False)
+        write(os.path.join(pa.ROOT, "core", "orchestrator.md"), "# B\n")
+        core_b = pa.hash_or_none(os.path.join(pa.ROOT, "core"))
+        pa.launcher_session(ctx, self.dir, agent, True, snapshot=True)
+        s = load(os.path.join(self.dir, "launcher.json"))["session"]
+        self.assertEqual((s["prompt"], s["promptCore"]), ("rebuilt", core_b))
+        pa.launcher_session(ctx, self.dir, agent, True, snapshot=False)
+        s = load(os.path.join(self.dir, "launcher.json"))["session"]
+        self.assertEqual((s["prompt"], s["promptCore"]), ("recorded", core_a))
+        word, _detail = pa.code_state(load(os.path.join(self.dir, "launcher.json")),
+                                      {"tools": s and load(os.path.join(self.dir, "launcher.json"))["code"]["tools"],
+                                       "core": core_b}, "t1")
+        self.assertEqual(word, "older (core)")
+
+
+class R2_7_RestartedPathRaises(Base):
+    """Item 7: a launcher exec'd by a restart that raises anything goes to error_wait, and Enter loads the
+    installed launcher again; the terminal and its workers stay."""
+
+    def main_with(self, argv, raising):
+        seen = []
+        saved = (sys.argv, pa.cmd_session, pa.error_wait, os.environ.get("HC_TERMINAL_ID"))
+        sys.argv = argv
+        pa.cmd_session = lambda args: (_ for _ in ()).throw(raising)
+        pa.error_wait = lambda address, problem, ctx=None: seen.append((address, str(problem)))
+        os.environ["HC_TERMINAL_ID"] = "t1"
+        execs = []
+
+        def recorder(path, a):
+            execs.append(list(a))
+            raise Execd()
+        os.execv = recorder
+        try:
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                try:
+                    pa.main()
+                except BaseException as e:  # noqa: BLE001 - what main let through
+                    return seen, execs, e
+            return seen, execs, None
+        finally:
+            sys.argv, pa.cmd_session, pa.error_wait = saved[:3]
+            if saved[3] is None:
+                os.environ.pop("HC_TERMINAL_ID", None)
+            else:
+                os.environ["HC_TERMINAL_ID"] = saved[3]
+
+    def test_any_exception_goes_to_error_wait_and_enter_reloads(self):
+        flags = ["--space", SP, "--restarted=r1", "--from-instance=i0", "--restart-by=pa-restart"]
+        seen, execs, e = self.main_with(["pa-session"] + flags, RuntimeError("a bug only on the restarted path"))
+        self.assertIsInstance(e, Execd)
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0][0], "t1")
+        self.assertIn("RuntimeError", seen[0][1])
+        self.assertIn("a bug only on the restarted path", seen[0][1])
+        self.assertIn("Enter", seen[0][1])
+        self.assertEqual(execs[0], [sys.executable, os.path.join(pa.ROOT, "tools", "pa.py"), "session"] + flags)
+
+    def test_a_plain_start_still_raises(self):
+        seen, execs, e = self.main_with(["pa-session", "--space", SP], RuntimeError("plain"))
+        self.assertIsInstance(e, RuntimeError)
+        self.assertEqual((seen, execs), ([], []))
 
 
 if __name__ == "__main__":

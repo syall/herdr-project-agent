@@ -5,7 +5,9 @@
 #   STUB_EXIT              exit code after sleeping (default 0)
 #   STUB_FAIL_RESUME_ONCE  1: the first start with --resume exits 1 at once (marker: $STUB_LOG.failed)
 #   STUB_TERM_LOG          file that gets "TERM" when the stub is sent SIGTERM (it then exits 143 at once)
+#   STUB_HELP_SLEEP        `--help` (the launcher's snapshot probe): sleep this long, print a usage line, exit 0 (not logged)
 log=${STUB_LOG:-/dev/null}
+if [ "${1:-}" = --help ]; then sleep "${STUB_HELP_SLEEP:-0}"; echo "usage: stub-claude"; exit 0; fi
 printf '%s\n' "$*" | tr '\n' ' ' >> "$log"; echo >> "$log"
 if [ "${STUB_FAIL_RESUME_ONCE:-0}" = 1 ]; then
   case " $* " in

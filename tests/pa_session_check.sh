@@ -1,6 +1,6 @@
 #!/bin/sh
 # Integration check for pa-session (t-001, spec §4.1: S1 S2 S3 S4 S5 S6a S7; t-037 J2: S8 S9 S10, the restart in
-# place) against a PRIVATE hc core.
+# place; round 2: S11 S12) against a PRIVATE hc core.
 # Usage: tests/pa_session_check.sh <scratch dir made by tests/setup-scratch.sh>
 # Every hc call goes through scratch(): its own HC_SESSION and XDG folders under the scratch dir,
 # HC_TERMINAL_ID / HC_SOCKET / HC_TERMINAL_SOCKET / HC_SCOPE unset (HC_TERMINAL_SOCKET names the live
@@ -92,9 +92,9 @@ os.execvp(sys.argv[2], sys.argv[2:])
 PY
 cleanup() {
   [ -n "${sampler:-}" ] && kill "$sampler" 2>/dev/null
-  for t in n1 n2 n3 n4 n5 n6 n7 n8 n9 n10 w8 w9; do scratch hc kill "$t" >/dev/null 2>&1; done
+  for t in n1 n2 n3 n4 n5 n6 n7 n8 n9 n10 n11 n12 w8 w9 w11; do scratch hc kill "$t" >/dev/null 2>&1; done
   sleep 1
-  for t in n1 n2 n3 n4 n5 n6 n7 n8 n9 n10 w8 w9; do scratch hc rm "$t" >/dev/null 2>&1; done
+  for t in n1 n2 n3 n4 n5 n6 n7 n8 n9 n10 n11 n12 w8 w9 w11; do scratch hc rm "$t" >/dev/null 2>&1; done
   scratch hc server stop >/dev/null 2>&1
   # Whatever the hc calls did not end (an hc call that failed under load), and then the watcher, not needed now.
   sh "$here/pa_session_reap.sh" reap "$S" "$SESSION" "$pid" "$core_began"
@@ -269,6 +269,70 @@ PY2
   sleep 2
   [ "$(lines)" = "$before" ] && [ "$(scratch hc get n9 --json | json "d.get('pid')")" = "$pid0" ] && [ "$(state w8)" = live ] && pass "S10 nothing restarted or ended" || fail S10 "stub restarted or a terminal changed"
 else fail S8 "stub never started; n9: $(scratch hc read n9 2>&1 | tail -n 5)"; fi
+
+# S11 (t-037 J2 round 2, VERIFY MF4): the installed pa.py passes the self-check but raises on the restarted path.
+# The exec'd launcher shows the error and waits (herdr.pa.error); its terminal, pid and worker stay. After a fixed
+# install, Enter loads the installed launcher again: it records the restart and starts Claude.
+SP11=sp1111111111111111111111111111dddd
+L11="$S/pa/spaces/$SP11/launcher.json"
+cp "$S/pa/tools/pa.py" "$S/pa.py.good"
+mkdir -p "$S/proj11" "$S/proj12"  # own project folders: a finished space's folder is adopted by project (find_orphan)
+before=$(lines)
+start n11 "$SP11" "$S/proj11"
+if wait_for 15 has_lines $((before + 1)); then
+  scratch hc run --bg --parent n11 --no-notify --name w11 -- sleep 600 >/dev/null
+  pid11=$(scratch hc get n11 --json | json "d.get('pid')")
+  inst11=$(jf "$L11" "d['instance']")
+  python3 - "$S/pa/tools/pa.py" <<'PY3'
+import sys
+f = sys.argv[1]
+t = open(f).read()
+t = t.replace('def cmd_session(args):\n', 'def cmd_session(args):\n    if getattr(args, "restarted", None):\n        raise RuntimeError("S11 a bug only on the restarted path")\n', 1)
+open(f, "w").write(t)
+PY3
+  scratch python3 "$S/pa/tools/pa.py" stamp >/dev/null
+  scratch pa-restart --space "$SP11" --now --wait 15 > "$S/restart11.out" 2>&1
+  errored() { label n11 herdr.pa.error | grep -q "RuntimeError"; }
+  wait_for 10 errored && pass "S11 the restarted launcher shows the error (herdr.pa.error)" || fail S11 "label $(label n11 herdr.pa.error); n11: $(scratch hc read n11 2>&1 | tail -n 4)"
+  [ "$(state n11)" = live ] && [ "$(scratch hc get n11 --json | json "d.get('pid')")" = "$pid11" ] && pass "S11 terminal live, same pid $pid11" || fail S11 "n11 state $(state n11) pid $(scratch hc get n11 --json | json "d.get('pid')")"
+  [ "$(state w11)" = live ] && [ "$(scratch hc get w11 --json | json "d.get('parent')")" = "$(scratch hc get n11 --json | json "d['address']")" ] && pass "S11 worker w11 live and still its child" || fail S11 "w11 state $(state w11)"
+  cp "$S/pa.py.good" "$S/pa/tools/pa.py"
+  scratch python3 "$S/pa/tools/pa.py" stamp >/dev/null
+  before=$(lines)
+  scratch hc send n11 "retry" >/dev/null 2>&1
+  recovered() { [ "$(jf "$L11" "d.get('restartedFrom')")" = "$inst11" ] && [ "$(jf "$L11" "(d.get('restart') or {}).get('outcome')")" = ok ]; }
+  wait_for 20 recovered && pass "S11 Enter after a fixed install loads it: restartedFrom the old instance, outcome ok" || fail S11 "launcher.json: $(head -c 300 "$L11")"
+  wait_for 15 has_lines $((before + 1)) && pass "S11 Claude starts again" || fail S11 "no Claude start; n11: $(scratch hc read n11 2>&1 | tail -n 4)"
+  [ -z "$(label n11 herdr.pa.error)" ] && [ "$(scratch hc get n11 --json | json "d.get('pid')")" = "$pid11" ] && [ "$(state w11)" = live ] && pass "S11 error label gone, same pid, w11 live" || fail S11 "error $(label n11 herdr.pa.error) pid $(scratch hc get n11 --json | json "d.get('pid')") w11 $(state w11)"
+else fail S11 "stub never started; n11: $(scratch hc read n11 2>&1 | tail -n 5)"; fi
+cp "$S/pa.py.good" "$S/pa/tools/pa.py"
+scratch python3 "$S/pa/tools/pa.py" stamp >/dev/null
+
+# S12 (t-037 J2 round 2, VERIFY MF1, REVIEW A M2/B M1): a request taken while no Claude runs (here during the first
+# launch's `--help` probe, 8 s) restarts before any Claude starts, and pa-restart gets the answer.
+SP12=sp1212121212121212121212121212eeee
+L12="$S/pa/spaces/$SP12/launcher.json"
+mkdir -p "$S/pa/profiles/probe"
+printf '{"name":"probe","claude":["%s/bin/stub-claude"],"codex":["true"]}\n' "$S" > "$S/pa/profiles/probe/profile.json"
+before=$(lines)
+scratch hc run --bg --no-parent --no-notify --name n12 --cwd "$S/proj" -- \
+  env "STUB_LOG=$LOG" "CLAUDE_CONFIG_DIR=$S/claude" "STUB_HELP_SLEEP=8" "$S/bin/pa-session" --space "$SP12" --project "$S/proj12" --profile probe >/dev/null
+if wait_for 15 test -s "$L12"; then
+  sleep 1
+  pid12=$(scratch hc get n12 --json | json "d.get('pid')")
+  inst12=$(jf "$L12" "d['instance']")
+  [ "$(lines)" = "$before" ] && pass "S12 no Claude yet (the probe runs)" || fail S12 "a Claude started before the request"
+  scratch pa-restart --space "$SP12" --now --wait 40 > "$S/restart12.out" 2>&1
+  rc=$?
+  [ "$rc" = 0 ] && grep -q "Restarted" "$S/restart12.out" && pass "S12 pa-restart reports the restart" || fail S12 "pa-restart exit $rc: $(tail -n 3 "$S/restart12.out")"
+  log12="$S/pa/spaces/$SP12/session.log"
+  ex=$(grep -n "restart exec" "$log12" | head -1 | cut -d: -f1)
+  st=$(grep -n "start resume=" "$log12" | head -1 | cut -d: -f1)
+  [ -n "$ex" ] && [ -n "$st" ] && [ "$st" -gt "$ex" ] && pass "S12 the exec came before any Claude start" || fail S12 "session.log: $(tr '\n' '|' < "$log12" | cut -c1-400)"
+  [ "$(jf "$L12" "d.get('restartedFrom')")" = "$inst12" ] && [ "$(scratch hc get n12 --json | json "d.get('pid')")" = "$pid12" ] && [ "$(state n12)" = live ] && pass "S12 restarted in place, same pid $pid12" || fail S12 "launcher.json: $(head -c 300 "$L12")"
+  [ -z "$(label n12 herdr.pa.restarting)" ] && pass "S12 herdr.pa.restarting removed" || fail S12 "label $(label n12 herdr.pa.restarting)"
+  [ "$(lines)" = $((before + 1)) ] && pass "S12 one Claude start (after the restart)" || fail S12 "stub starts $(( $(lines) - before ))"
+else fail S12 "no launcher.json; n12: $(scratch hc read n12 2>&1 | tail -n 5)"; fi
 
 # S9 (negative control): in this core a child does end with its parent's program, so S8's "w8 still live" means it.
 scratch hc run --bg --no-parent --no-notify --name n10 -- sleep 600 >/dev/null
