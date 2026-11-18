@@ -3,7 +3,10 @@
 Run: python3 -m unittest -v tests/test_pa_trust.py
 No real terminal is touched: `hc` is a fake script first on PATH (its folder apart from the fixture data) that
 answers from fixture files and logs every call; pa-trust runs as a subprocess with temp HOME, HERDR_PA_HOME,
-CLAUDE_CONFIG_DIR and HERDR_APP_HOME, and git with no global or system config. The screens are in
+CLAUDE_CONFIG_DIR and HERDR_APP_HOME, and git with no global or system config: the tests' own git and the git
+pa-trust runs in process get GIT_CONFIG_GLOBAL and GIT_CONFIG_SYSTEM at empty files and GIT_CONFIG_NOSYSTEM=1
+(pa_hooks.trust_git_env drops every GIT_CONFIG* variable by design, so Base wraps it to add them back after; t-047
+round 2, Review N-R2); the pa-trust subprocess gets a temp HOME and XDG_CONFIG_HOME. The screens are in
 tests/trust_fixtures.py (built from the remembered wording, not a saved real screen: see its docstring).
 """
 import importlib.util
@@ -45,7 +48,11 @@ for _k, _v in _saved_env.items():
         os.environ[_k] = _v
 assert pa.ROOT.startswith(TMP) and pa.CLAUDE_HOME.startswith(TMP), "pa.py must use the temp homes"
 
-GIT_ENV = {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1", "GIT_AUTHOR_NAME": "t",
+REAL_TRUST_GIT_ENV = pa_hooks.trust_git_env
+EMPTY_CONFIG = os.path.join(TMP, "empty-gitconfig")
+NO_GLOBAL = {"GIT_CONFIG_GLOBAL": EMPTY_CONFIG}
+NO_SYSTEM = {"GIT_CONFIG_SYSTEM": EMPTY_CONFIG, "GIT_CONFIG_NOSYSTEM": "1"}
+GIT_ENV = {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull, "GIT_CONFIG_NOSYSTEM": "1", "GIT_AUTHOR_NAME": "t",
            "GIT_AUTHOR_EMAIL": "t@example.invalid", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid"}
 DROP_ENV = ("HC_TERMINAL_ID", "HC_SOCKET", "HC_TERMINAL_SOCKET", "HC_SCOPE", "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT")
 
@@ -102,6 +109,7 @@ else:
 
 def setUpModule():
     os.makedirs(os.path.join(TMP, "bin"))
+    write(EMPTY_CONFIG, "")
     with open(os.path.join(TMP, "bin", "hc"), "w") as f:
         f.write(FAKE_HC.replace("{python}", sys.executable))
     os.chmod(os.path.join(TMP, "bin", "hc"), 0o755)
@@ -152,6 +160,9 @@ def snapshot(folder):
     for top, _dirs, names in os.walk(folder):
         for n in names:
             p = os.path.join(top, n)
+            if os.path.islink(p):  # a link is recorded by its target (a loop or dangling one cannot be opened)
+                out[os.path.relpath(p, folder)] = "link:" + os.readlink(p)
+                continue
             with open(p, "rb") as f:
                 out[os.path.relpath(p, folder)] = f.read()
     return out
@@ -162,6 +173,11 @@ class Base(unittest.TestCase):
     space sp1 (Project Agent t0) whose ledger records worker t5 of task t-1."""
 
     def setUp(self):
+        # In-process git (trust_git) reads no config of the runner's: the wrapper adds self.git_isolation (both
+        # families by default; R4g keeps only the one not under test) after the real trust_git_env.
+        self.git_isolation = dict(NO_GLOBAL, **NO_SYSTEM)
+        pa_hooks.trust_git_env = lambda environ: dict(REAL_TRUST_GIT_ENV(environ), **self.git_isolation)
+        self.addCleanup(setattr, pa_hooks, "trust_git_env", REAL_TRUST_GIT_ENV)
         self.root = tempfile.mkdtemp(dir=TMP)
         self.home = os.path.join(self.root, "w")
         self.P = os.path.join(self.home, "proj")
@@ -207,7 +223,7 @@ class Base(unittest.TestCase):
     def run_trust(self, *extra, address="t5"):
         before = snapshot(self.space)
         env = {k: v for k, v in os.environ.items() if k not in DROP_ENV}
-        env.update(GIT_ENV, HOME=self.home, HERDR_PA_HOME=self.pa_home, CLAUDE_CONFIG_DIR=os.path.join(self.root, "claude"),
+        env.update(GIT_ENV, HOME=self.home, XDG_CONFIG_HOME=os.path.join(self.home, ".config"), HERDR_PA_HOME=self.pa_home, CLAUDE_CONFIG_DIR=os.path.join(self.root, "claude"),
                    HERDR_APP_HOME=os.path.join(self.root, "app"), FAKE_HC=self.hc,
                    PATH=os.pathsep.join(self.first_on_path + [os.path.join(TMP, "bin"), env.get("PATH", "")]))
         r = subprocess.run([sys.executable, os.path.join(TMP, "bin", "pa-trust"), address, "--space", "sp1"] + list(extra),
@@ -894,7 +910,7 @@ class R4cGitEnvironment(Base):
 
     def test_unit_git_environment(self):
         given = dict({v: "x" for v in TRUST_GIT_VARS}, LC_ALL="fr_FR.UTF-8", LANG="fr_FR.UTF-8", PATH="/bin")
-        env = pa_hooks.trust_git_env(given)
+        env = REAL_TRUST_GIT_ENV(given)
         for var in TRUST_GIT_VARS:
             self.assertNotIn(var, env)
         self.assertEqual("C", env["LC_ALL"])
@@ -1051,11 +1067,16 @@ class R4gGitConfigEnvironment(Base):
                 "GLOBAL": {"GIT_CONFIG_GLOBAL": self.config_file("global.cfg")},
                 "SYSTEM": {"GIT_CONFIG_SYSTEM": self.config_file("system.cfg"), "GIT_CONFIG_NOSYSTEM": "0"}}
 
+    # What the Base wrapper may add per route: never the family the route injects through (it would mask a drop).
+    ISOLATE = {"COUNT": dict(NO_GLOBAL, **NO_SYSTEM), "PARAMETERS": dict(NO_GLOBAL, **NO_SYSTEM), "GLOBAL": NO_SYSTEM,
+               "SYSTEM": NO_GLOBAL}
+
     def test_injected_config_runs_nothing(self):
         for name, extra in self.routes().items():
             with self.subTest(name):
                 if os.path.exists(self.marker):
                     os.remove(self.marker)
+                self.git_isolation = self.ISOLATE[name]
                 restore = self.with_env(dict(extra, HOME=self.home, XDG_CONFIG_HOME=os.path.join(self.home, ".config")))
                 try:
                     self.assertEqual([], pa_hooks.folder_grants([self.tree]))
@@ -1083,11 +1104,116 @@ class R4gGitConfigEnvironment(Base):
         names = ("GIT_CONFIG", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0",
                  "GIT_CONFIG_KEY_12", "GIT_CONFIG_VALUE_12", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM",
                  "GIT_CONFIG_NOSYSTEM", "GIT_INDEX_FILE")
-        env = pa_hooks.trust_git_env(dict({n: "x" for n in names}, PATH="/bin", GIT_AUTHOR_NAME="kept"))
+        env = REAL_TRUST_GIT_ENV(dict({n: "x" for n in names}, PATH="/bin", GIT_AUTHOR_NAME="kept"))
         for n in names:
             self.assertNotIn(n, env)
         self.assertEqual("/bin", env["PATH"])
         self.assertEqual("kept", env["GIT_AUTHOR_NAME"])
+
+
+class R4hSpaceLinkChains(Base):
+    """t-047 round 2 (Verify L1 = Review L-R1, judged Must fix; Review N-R1): links under a space folder are
+    followed to their final real path, through folders outside the project folder P, with a cycle guard: P is
+    refused when any entry's real path lands in it. A part that cannot be read (an unreadable folder, a link loop)
+    is uncertain, no key, unless a link into P is found anyway (refused wins)."""
+
+    def tearDown(self):
+        for path in getattr(self, "locked", []):
+            os.chmod(path, 0o755)
+
+    def lock(self, path):
+        if os.geteuid() == 0:
+            self.skipTest("root reads a folder with mode 000")
+        os.makedirs(path, exist_ok=True)
+        os.chmod(path, 0)
+        self.locked = getattr(self, "locked", []) + [path]
+
+    def outcome(self, result, why):
+        project, got = pa_hooks.trust_project(self.P, self.home, self.pa_home)
+        self.assertIsNone(project)
+        self.assertIn(why, got)
+        self.terminal(self.tree)
+        self.screens(fx.new_screen(self.tree), fx.new_screen(self.tree))
+        self.expect(result, why)
+
+    def chain(self, link_name="evidence"):
+        """<space>/<link_name> -> <root>/outside-ev (outside P), whose t-1 -> P/kept-t1."""
+        outside = os.path.join(self.root, "outside-ev")
+        kept = os.path.join(self.P, "kept-t1")
+        os.makedirs(outside)
+        os.makedirs(kept)
+        os.symlink(kept, os.path.join(outside, "t-1"))
+        os.symlink(outside, os.path.join(self.space, link_name))
+        return outside
+
+    def test_chain_through_a_folder_outside_the_project_folder(self):  # the checker's probe case
+        self.chain()
+        self.outcome("refused", "Project Agent's home")
+
+    def test_chain_past_a_cycle(self):
+        os.makedirs(os.path.join(self.space, "evidence", "t-1"))
+        os.symlink(self.space, os.path.join(self.space, "evidence", "t-1", "up"))
+        outside = self.chain("evidence-2")
+        os.symlink(outside, os.path.join(outside, "self"))
+        self.outcome("refused", "Project Agent's home")
+
+    def test_cycle_alone_still_accepted(self):
+        os.makedirs(os.path.join(self.space, "evidence", "t-1"))
+        os.symlink(self.space, os.path.join(self.space, "evidence", "t-1", "up"))
+        outside = os.path.join(self.root, "outside-ring")
+        os.makedirs(os.path.join(outside, "a"))
+        os.symlink(outside, os.path.join(outside, "a", "back"))
+        os.symlink(os.path.join(outside, "a"), os.path.join(self.space, "evidence", "t-1", "ring"))
+        self.assertEqual((os.path.realpath(self.P), None), pa_hooks.trust_project(self.P, self.home, self.pa_home))
+        self.accepts(self.tree)
+
+    def test_dangling_link_into_the_project_folder_refused(self):
+        os.makedirs(os.path.join(self.space, "evidence", "t-1"))
+        os.symlink(os.path.join(self.P, "not-there"), os.path.join(self.space, "evidence", "t-1", "dang"))
+        project, why = pa_hooks.trust_project(self.P, self.home, self.pa_home)
+        self.assertIsNone(project)
+        self.assertIn("Project Agent's home", why)
+
+    def test_link_loop_uncertain(self):
+        ev = os.path.join(self.space, "evidence", "t-1")
+        os.makedirs(ev)
+        os.symlink(os.path.join(ev, "b"), os.path.join(ev, "a"))
+        os.symlink(os.path.join(ev, "a"), os.path.join(ev, "b"))
+        self.outcome("uncertain", "could not be read")
+
+    def test_unreadable_folder_uncertain(self):
+        self.lock(os.path.join(self.space, "evidence", "t-1", "locked"))
+        self.outcome("uncertain", "could not be read")
+
+    def test_unreadable_folder_reached_through_a_link_uncertain(self):
+        outside = os.path.join(self.root, "outside-locked")
+        self.lock(os.path.join(outside, "inner"))
+        os.symlink(outside, os.path.join(self.space, "evidence"))
+        self.outcome("uncertain", "could not be read")
+
+    def test_link_into_the_project_folder_wins_over_an_unreadable_folder(self):
+        self.lock(os.path.join(self.space, "aaa-locked"))
+        self.chain()
+        self.outcome("refused", "Project Agent's home")
+
+
+class R4iGitIsolation(Base):
+    """t-047 round 2 (Review N-R2): the git pa-trust runs in process reads no config file of the runner's (no
+    ~/.gitconfig, no system or Xcode gitconfig): only the repository's own config and the tests' empty files."""
+
+    def test_in_process_git_reads_only_test_config(self):
+        code, out, err = pa_hooks.trust_git(self.tree, "config", "--list", "--show-origin")
+        self.assertEqual(0, code, err)
+        origins = {line.split("\t", 1)[0] for line in out.splitlines()}
+        self.assertTrue(origins, out)
+        for origin in origins:
+            self.assertTrue(origin.startswith("file:"), origin)
+            self.assertTrue(trust_inside(origin[len("file:"):], TMP), origin)
+
+
+def trust_inside(path, base):
+    path = os.path.realpath(path if os.path.isabs(path) else os.path.join(base, path))
+    return path == os.path.realpath(base) or path.startswith(os.path.realpath(base) + os.sep)
 
 
 # ---- R5 no grants of its own --------------------------------------------------------------------------------
