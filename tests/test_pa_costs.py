@@ -5198,32 +5198,84 @@ class PX_PaContext(Collecting):
         pa_costs.fit_summary(small)
         self.assertEqual(len(small["paContext"]), 14)  # under the cap too: summary.json keeps at most 14 days
 
-    def test_px10c_pa_context_cut_to_its_newest_day_before_any_other_list(self):
-        """t-041 J1 round 3 (REVIEW MF-3): when the 14 days still leave the summary over the cap, paContext is cut to
-        its newest day before shrink touches any other list (round 2 ran the existing steps first)."""
-        sessions = [{"session": "s{:04d}".format(i), "pad": "y" * 100} for i in range(10)]
-        big = {"sessions": list(sessions), "byTask": [], "passes": [{"pass": 1}], "byDayModel": [],
-               "paContext": self.pc_days(14, 6000)}
-        newest = big["paContext"][0]
-        text = pa_costs.fit_summary(big)
-        self.assertLessEqual(len(text.encode()), pa_costs.SUMMARY_MAX)
-        self.assertEqual((big["sessions"], big["passes"]), (sessions, [{"pass": 1}]))  # no existing step ran
-        self.assertEqual(big["paContext"], [newest])
-        self.assertNotIn("truncated", big)  # the cut to one day is the summary's form too, not a truncation
+    @staticmethod
+    def shrink_only(s):
+        """The summary without paContext, fitted by shrink alone: cf0de90's write_summary loop."""
+        s.pop("paContext", None)
+        text = pa_costs.compact(s)
+        while len(text.encode()) > pa_costs.SUMMARY_MAX and pa_costs.shrink(s):
+            text = pa_costs.compact(s)
+        return text
 
-    def test_px10d_last_day_dropped_only_as_the_final_resort(self):
-        """t-041 J1 round 3: one day that still does not fit stays while the existing steps run; it goes only when
-        they can do no more."""
-        big = {"sessions": [{"session": "s", "pad": "y" * 100}], "byTask": [], "passes": [{"pass": 1}], "byDayModel": [],
+    def assert_newest_days_that_fit(self, s, days):
+        """s["paContext"] is the newest days of `days` that fit in the room the rest left: all of them, or one more
+        would go over the cap."""
+        kept = s["paContext"]
+        self.assertEqual(kept, days[:len(kept)])
+        self.assertLessEqual(len(pa_costs.compact(s).encode()), pa_costs.SUMMARY_MAX)
+        if len(kept) < len(days):
+            self.assertGreater(len(pa_costs.compact(dict(s, paContext=days[:len(kept) + 1])).encode()), pa_costs.SUMMARY_MAX)
+
+    def test_px10c_days_that_do_not_fit_cause_no_shrink_step(self):
+        """t-041 J1 round 4 (REVIEW RL-4; replaces round 3's px10c, which pinned the cut to one day): when the 14 days
+        do not fit, paContext is set aside, the rest is fitted as without it, and as many of the newest days as fit
+        in the room left are put back. Here the rest fits as it is: no shrink step, no truncated, several days kept."""
+        sessions = [{"session": "s{:04d}".format(i), "pad": "y" * 100} for i in range(10)]
+        days = self.pc_days(14, 6000)
+        big = {"sessions": list(sessions), "byTask": [], "passes": [{"pass": 1}], "byDayModel": [],
+               "paContext": list(days)}
+        text = pa_costs.fit_summary(big)
+        self.assertEqual(json.loads(text), big)
+        self.assertEqual((big["sessions"], big["passes"]), (sessions, [{"pass": 1}]))  # no shrink step ran
+        self.assertNotIn("truncated", big)
+        self.assertGreater(len(big["paContext"]), 1)  # round 3 kept one day here
+        self.assert_newest_days_that_fit(big, days)
+
+    def test_px10d_no_day_fits_and_paContext_is_empty(self):
+        """t-041 J1 round 4 (replaces round 3's px10d, where the existing steps ran before the last day went): a day
+        that does not fit causes no shrink step; paContext is [] and nothing is marked truncated."""
+        sessions = [{"session": "s", "pad": "y" * 100}]
+        big = {"sessions": list(sessions), "byTask": [], "passes": [{"pass": 1}], "byDayModel": [],
                "paContext": self.pc_days(14, 70000)}
         text = pa_costs.fit_summary(big)
         self.assertLessEqual(len(text.encode()), pa_costs.SUMMARY_MAX)
-        self.assertEqual((big["sessions"], big["passes"]), ([], []))  # the existing steps ran first
+        self.assertEqual((big["sessions"], big["passes"]), (sessions, [{"pass": 1}]))
         self.assertEqual(big["paContext"], [])
-        self.assertTrue(big["truncated"])
+        self.assertNotIn("truncated", big)
         fits = {"sessions": [], "byTask": [], "passes": [], "byDayModel": [], "paContext": self.pc_days(14, 60000)}
         pa_costs.fit_summary(fits)
         self.assertEqual(len(fits["paContext"]), 1)  # one day that fits is kept
+
+    def test_px10e_the_rest_is_shrunk_as_without_paContext(self):
+        """t-041 J1 round 4: when the rest is over the cap by itself, shrink runs on it exactly as without paContext
+        (same steps, same truncated), then the newest days that fit in the room left go back, in paContext's place."""
+        for n_sessions, pad in ((400, 200), (330, 200), (300, 210)):
+            sessions = [{"session": "s{:04d}".format(i), "pad": "y" * pad} for i in range(n_sessions)]
+            days = self.pc_days(14, 150)
+            big = {"sessions": list(sessions), "byTask": [], "passes": [{"pass": 1}], "byDayModel": [],
+                   "paContext": list(days), "unmatched": {}}
+            ref = json.loads(json.dumps(big))
+            self.shrink_only(ref)
+            text = pa_costs.fit_summary(big)
+            self.assertEqual({k: v for k, v in big.items() if k != "paContext"}, ref, n_sessions)
+            self.assertEqual(json.loads(text), big)
+            self.assertEqual(list(big), ["sessions", "byTask", "passes", "byDayModel", "paContext", "unmatched"]
+                             + (["truncated"] if "truncated" in big else []))  # paContext keeps its place
+            self.assert_newest_days_that_fit(big, days)
+
+    def test_px10f_not_even_an_empty_list_fits(self):
+        """t-041 J1 round 4: when the rest, fitted as without paContext, leaves less room than an empty paContext
+        needs, the key is left out: summary.json is byte for byte the shrink-only fit (as a summary before J1)."""
+        base = {"sessions": [], "byTask": [], "passes": [], "byDayModel": [], "pad": ""}
+        room = pa_costs.SUMMARY_MAX - len(pa_costs.compact(base).encode())
+        base["pad"] = "x" * (room - 5)  # 5 bytes left: ',"paContext":[]' is 15
+        big = dict(base, paContext=self.pc_days(14, 10))
+        ref = dict(base)
+        ref_text = self.shrink_only(ref)
+        text = pa_costs.fit_summary(big)
+        self.assertEqual(text, ref_text)
+        self.assertNotIn("paContext", big)
+        self.assertNotIn("truncated", big)
 
     def test_px11_days_are_capped(self):
         rows = []
@@ -5294,44 +5346,42 @@ class PX_PaContext(Collecting):
         self.assertNotIn("first", row)
 
     def test_px16_near_the_cap_the_rest_of_the_summary_is_as_before_j1(self):
-        """t-041 J1 round 3 (REVIEW MF-3, review_j1r2_alt_order.sh): K worker sessions plus N Project Agent days,
-        N = 20, 40, 50, 60, 80. Every part of summary.json other than paContext equals what cf0de90 wrote: the same
-        summary without paContext fitted by shrink alone (cf0de90's write_summary loop; shrink is cf0de90's when
-        there is no paContext). K = 165 and 150 sit within paContext's ~3 KB of a shrink step at N = 60 and 80 (and
-        175 at N = 50), where round 2's order shortened the Sessions list; 200 starts truncated."""
-        def before_j1(s):
-            s.pop("paContext", None)
-            text = pa_costs.compact(s)
-            while len(text.encode()) > pa_costs.SUMMARY_MAX and pa_costs.shrink(s):
-                text = pa_costs.compact(s)
-            return text
-
-        for k in (150, 165, 175, 200):
-            for n in (20, 40, 50, 60, 80):
-                shutil.rmtree(os.path.join(self.dir, "costs"), ignore_errors=True)
-                rows = []
-                for i in range(k):
-                    d = time.strftime("%Y-%m-%d", time.gmtime(T0 - (i % 20) * 86400))
-                    rows.append({"session": "{:08d}-0000-4000-8000-{:012d}".format(i, i), "kind": "worker",
-                                 "task": "t-{:03d}".format(i % 30), "day": d, "from": d + "T02:00:00Z",
-                                 "to": d + "T02:10:00Z", "tokens": toks(cr=1000 + i), "peak": 1000})
-                for i in range(n):
-                    d = time.strftime("%Y-%m-%d", time.gmtime(T0 - (i + 1) * 86400))
-                    rows.append({"day": d, "from": d + "T12:00:00Z", "to": d + "T12:01:00Z", "tokens": toks(cr=300000),
-                                 "peak": 300000, "first": 200000})
-                self.put_rows(*rows)
-                with mock.patch.object(pa_costs, "fit_summary", before_j1):
-                    self.summary()
-                old = load(self.costs("summary.json"))
+        """t-041 J1 rounds 3 and 4 (REVIEW MF-3, RL-4; review_j1r2_alt_order.sh, review_j1r3_probe.sh's sweep): K worker
+        sessions plus N Project Agent days. Every part of summary.json other than paContext, truncated included,
+        equals what cf0de90 wrote: the same summary without paContext fitted by shrink alone (cf0de90's
+        write_summary loop; shrink is cf0de90's). The grid: K = 150, 165, 175, 200 at N = 20, 40, 50, 60, 80, and the
+        reviewer's sweep K = 100..259 step 3 at N = 60 and 80, which holds K = 154 and 244..256 at N = 80 (round 3 cut
+        the Sessions list there: 155 -> 116 sessions and truncated). paContext is the newest days that fit in the
+        room left; 'pa-costs report' keeps all N days."""
+        cases = [(k, n) for k in (150, 165, 175, 200) for n in (20, 40, 50, 60, 80)]
+        cases += [(k, n) for n in (60, 80) for k in range(100, 261, 3)]
+        self.assertIn((154, 80), cases)
+        self.assertTrue(all((k, 80) in cases for k in range(244, 257, 3)))
+        for k, n in cases:
+            shutil.rmtree(os.path.join(self.dir, "costs"), ignore_errors=True)
+            rows = []
+            for i in range(k):
+                d = time.strftime("%Y-%m-%d", time.gmtime(T0 - (i % 20) * 86400))
+                rows.append({"session": "{:08d}-0000-4000-8000-{:012d}".format(i, i), "kind": "worker",
+                             "task": "t-{:03d}".format(i % 30), "day": d, "from": d + "T02:00:00Z",
+                             "to": d + "T02:10:00Z", "tokens": toks(cr=1000 + i), "peak": 1000})
+            for i in range(n):
+                d = time.strftime("%Y-%m-%d", time.gmtime(T0 - (i + 1) * 86400))
+                rows.append({"day": d, "from": d + "T12:00:00Z", "to": d + "T12:01:00Z", "tokens": toks(cr=300000),
+                             "peak": 300000, "first": 200000})
+            self.put_rows(*rows)
+            with mock.patch.object(pa_costs, "fit_summary", self.shrink_only):
                 self.summary()
-                new = load(self.costs("summary.json"))
-                self.assertLessEqual(len(pa_costs.compact(new).encode()), pa_costs.SUMMARY_MAX)
-                self.assertIn("paContext", new)
-                self.assertEqual({key: v for key, v in new.items() if key != "paContext"}, old, (k, n))
-                self.assertEqual(new["paContext"][0]["day"], D0, (k, n))  # the newest day is kept
-                if n == 80:
-                    _r, out, _e = self.run_cmd(pa_costs.report, self.dir, as_json=True, now=T0 + 5000)
-                    self.assertEqual(len(json.loads(out)["paContext"]), n, k)  # report keeps all days
+            old = load(self.costs("summary.json"))
+            self.summary()
+            new = load(self.costs("summary.json"))
+            self.assertIn("paContext", new, (k, n))
+            self.assertEqual({key: v for key, v in new.items() if key != "paContext"}, old, (k, n))
+            _r, out, _e = self.run_cmd(pa_costs.report, self.dir, as_json=True, now=T0 + 5000)
+            every = json.loads(out)["paContext"]
+            self.assertEqual(len(every), n, (k, n))  # report keeps all days
+            self.assertEqual(every[0]["day"], D0, (k, n))
+            self.assert_newest_days_that_fit(new, every[:pa_costs.PA_CONTEXT_SUMMARY_DAYS])
 
     def test_px13_readme_names_the_report(self):
         with open(os.path.join(HERE, "..", "README.md")) as f:
