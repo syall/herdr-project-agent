@@ -6,6 +6,8 @@
 # core's socket inside a Herdr terminal). It refuses to run unless `hc server status` under that
 # environment reports a core with no terminals whose listening socket is under the scratch folder. Stops that core at the end,
 # also when this script is killed: a detached tests/pa_session_reap.sh waits for it to go and ends what it started (t-044).
+# The reaper knows what the run started by pid and start time (the core at the gate, each launcher as it starts,
+# their descendants by ancestry), never by a command line; the R step checks it leaves other processes alone.
 # A wait for a start allows START_WAIT seconds: a pass is as quick as before, only a failure waits longer (load, t-044).
 set -u
 S=${1:?usage: pa_session_check.sh <scratch dir>}
@@ -40,8 +42,10 @@ wait_for() { # seconds, then a command that succeeds when ready
   "$@"
 }
 start() { # name space project [env...]: a pa-session in its own terminal
+  # Its first act records its pid and start time for the reaper (then exec keeps that pid for pa-session).
   name=$1 space=$2 project=$3; shift 3
   scratch hc run --bg --no-parent --no-notify --name "$name" --cwd "$S/proj" -- \
+    sh -c 'echo "$$ $(ps -o lstart= -p $$)" >> "$0"; exec "$@"' "$S/reap.started" \
     env "STUB_LOG=$LOG" "CLAUDE_CONFIG_DIR=$S/claude" "$@" "$S/bin/pa-session" --space "$space" --project "$project" --profile test >/dev/null
 }
 not_live() { [ "$(state "$1")" != live ]; }
@@ -93,7 +97,7 @@ cleanup() {
   # Whatever the hc calls did not end (an hc call that failed under load), and then the watcher, not needed now.
   sh "$here/pa_session_reap.sh" reap "$S" "$SESSION" "$pid" "$core_began"
   w=$(cat "$S/reaper.pid" 2>/dev/null)
-  [ -n "$w" ] && ps -o command= -p "$w" 2>/dev/null | grep -qF pa_session_reap.sh && kill "$w" 2>/dev/null
+  [ -n "$w" ] && ps -o command= -p "$w" 2>/dev/null | grep -qF "pa_session_reap.sh watch $$ $S " && kill "$w" 2>/dev/null
   return 0
 }
 trap cleanup EXIT
