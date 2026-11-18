@@ -31,6 +31,10 @@ folder and the address to report to.
   uncommitted changes you made: commit them if your role and handoff allow it, else name
   each one in your report (the orchestrator cannot close a worker that leaves them; it
   decides what to do with them).
+- If your session restarts or is compacted, continue your own job without asking: read
+  your evidence folder and your worktree (`git status`, `git log`) for what you wrote and
+  committed before, and go on from there. If you were started for a job whose worker
+  stopped, read what that worker left the same way first.
 - Before you report, stop every background command you started (a watcher, a server, a
   background shell): your session must go idle, or it cannot be closed.
 - A new job for another task or another role is not yours: reply that it needs a fresh

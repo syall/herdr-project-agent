@@ -784,10 +784,13 @@ def run_agent(args, address, project, p, directory, agent, ctx, started):
         argv += ["--name", "PA: " + agent["name"], "--append-system-prompt", layered(p, "orchestrator", directory, agent)]
         if resume:
             argv += ["Your session was restarted. Read your state folder (ledger.json, journal.jsonl, decisions/, "
-                     "rules.json), then say in one line where things stand. Continue in-flight work as "
-                     "orchestrator.md defines it under \"After a restart or a compaction\"; start nothing new "
-                     "until asked, and nothing at all if passes are paused or the person's last message asked "
-                     "you to hold."]
+                     "rules.json), then say in one line where things stand. Continue where you left off without "
+                     "asking, as orchestrator.md defines it under \"After a restart or a compaction\": read the "
+                     "reports that came in, take the next planned step, and start a fresh worker for a job whose "
+                     "worker stopped. Start nothing else until asked: no new task, no move to a phase that needs "
+                     "the person, no worker for a task with an open card. If the last hold or resume line in the "
+                     "journal is a hold, start nothing at all until the person says go. `paused` in "
+                     "`schedule.json` stops timed passes only; it is not a hold."]
         argv += cc_settings_args(p, agent.get("space") or os.path.basename(directory), [])  # last (t-029 R4)
         argv = resolve(argv, p)
         session_log(directory, "start resume={} session={} reason={}".format(resume, agent["sessionId"], why))
