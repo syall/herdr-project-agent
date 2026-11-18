@@ -721,7 +721,8 @@ def make_row(sess, seg):
             "source": "reconstructed" if pre else (sess.get("source") or "recorded"),
             "match": "resumed-history" if pre else (sess.get("match") or "launch-record"),
             "confidence": sess.get("confidence") or "high", "until": seg.get("until"),
-            **({"sub": sess["sub"]} if sess.get("sub") else {})}
+            **({"sub": sess["sub"]} if sess.get("sub") else {}),
+            **{k: sess[k] for k in FACT_KEYS if k in sess}}  # the launch record's facts (t-032), when it has them
 
 
 PA_TRIGGERS = ("report", "message", "decision", "scheduled", "manual", "conversation")
@@ -1681,8 +1682,33 @@ def space_prices(directory):
     return table, problem, profile.get("name")
 
 
-def costs_account():
-    return ((pa.config().get("costs") or {}).get("account")) or "default"
+def account_chain(directory=None):
+    """(label, by) of the billable account (t-032 R-A1): the space's agent.json costs.account, the machine's
+    config costs.account, the profile's billing.account (the space's profile, else the default one), "default".
+    A value that is not a label (or holds 12 digits) is skipped."""
+    agent = {}
+    if directory:
+        try:
+            agent = pa.read_json(os.path.join(directory, "agent.json"), {}) or {}
+        except (OSError, ValueError):
+            agent = {}
+    steps = [("space", ((agent.get("costs") or {}) if isinstance(agent.get("costs"), dict) else {}).get("account"))]
+    cfg = pa.config()
+    steps.append(("machine", ((cfg.get("costs") or {}) if isinstance(cfg.get("costs"), dict) else {}).get("account")))
+    try:
+        prof = pa.load_profile(agent.get("profile") if agent.get("profile") else None)
+        block = prof.get("billing") if isinstance(prof.get("billing"), dict) else {}
+        steps.append(("profile", block.get("account")))
+    except pa.Problem:
+        pass
+    for by, value in steps:
+        if fact_label("account", value):
+            return value, by
+    return "default", "default"
+
+
+def costs_account(directory=None):
+    return account_chain(directory)[0]
 
 
 class Bucket:
@@ -1828,6 +1854,7 @@ def summarize(directory, rows, records, table, price_problem, profile_name, now,
     counts on the day of its start. byDayModel keeps UTC days (the billed rows' days)."""
     zone = zone or UTC_ZONE
     problems = list(problems)
+    chain = account_chain(directory)
     if cc is None:
         cc, cc_problems = read_cc(directory)
         problems.extend(cc_problems)
@@ -2020,7 +2047,7 @@ def summarize(directory, rows, records, table, price_problem, profile_name, now,
                         "allSessions": len(sess_b),
                         "unmatched": {"sessions": um_n, "money": round(um_money, 6) if um_n else None}, "ccCurrency": "USD"}
     return {
-        "v": 1, "space": os.path.basename(directory), "updated": iso(now), "account": costs_account(),
+        "v": 1, "space": os.path.basename(directory), "updated": iso(now), "account": chain[0], "accountBy": chain[1],
         "prices": {"profile": profile_name, "source": (table or {}).get("source"), "asOf": (table or {}).get("asOf"),
                    "currency": (table or {}).get("currency"), "missing": sorted(missing)},
         "totals": totals,
@@ -2061,7 +2088,7 @@ def note_collect_failure(directory, why, now=None):
         except (OSError, ValueError):
             s = None
         if not isinstance(s, dict):
-            s = {"v": 1, "space": os.path.basename(os.path.normpath(directory)), "updated": iso(now), "account": costs_account()}
+            s = {"v": 1, "space": os.path.basename(os.path.normpath(directory)), "updated": iso(now), "account": costs_account(directory)}
         s["collect"] = {"ok": False, "at": iso(now), "why": why}
         rest = [p for p in s.get("problems") or [] if isinstance(p, str) and not p.startswith("collect failed: ")]
         s["problems"] = (["collect failed: " + why] + rest)[:20]
@@ -2562,8 +2589,8 @@ def billed_fetch(mode="scheduled", now=None, quiet=False, frm=None, to=None):
 
 
 def default_account():
-    _p, block = billing_profile()
-    return (pa.config().get("costs") or {}).get("account") or block.get("account") or "default"
+    """The account label of billed rows: the machine's chain (R-A6: the same as the estimates' without a space)."""
+    return account_chain()[0]
 
 
 def validate_row(row, source, account, now):
@@ -3105,7 +3132,234 @@ def host():
         return None
 
 
-def record_launch(directory, space, kind, argv, command, walked):
+# ---- facts of a session (t-032): provider, endpoint, region, account, recorded at launch -------------------------------
+# Labels only. A variable is read by its declared name and only an accepted label is stored, never another value.
+
+FACT_KEYS = ("provider", "providerBy", "endpoint", "endpointBy", "region", "regionBy", "account", "accountBy")
+ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
+CREDENTIAL_NAME = re.compile(r"(?i)KEY|SECRET|TOKEN|PASSWORD|CREDENTIAL|SESSION")
+
+
+def _env_name(name, where, problems):
+    if not isinstance(name, str) or not ENV_NAME.match(name):
+        problems.append("{}: env must be a variable name".format(where))
+        return None
+    if CREDENTIAL_NAME.search(name):
+        problems.append("{}: variable {} looks like a credential: refused, not read".format(where, name))
+        return None
+    return name
+
+
+def _regex(value, where, problems, optional=False):
+    if value is None and optional:
+        return None
+    try:
+        if not isinstance(value, str):
+            raise re.error("not a string")
+        return re.compile(value)
+    except re.error:
+        problems.append("{}: not a regex".format(where))
+        return False
+
+
+def pricing_rules(profile):
+    """(rules, problems) of the profile's optional pricing block (R-P3, A-R1, A-R2). A bad rule is dropped and named;
+    never raises, so a launch never stops on it. rules: defaultProvider, providers [(program, regex, provider)],
+    endpoints [("model", regex, kind) | ("env", name, regex, kind)], region (names, regex) or None."""
+    problems = []
+    rules = {"defaultProvider": None, "providers": [], "endpoints": [], "region": None}
+    block = (profile or {}).get("pricing")
+    if block is None:
+        return rules, problems
+    if not isinstance(block, dict):
+        return rules, ["pricing must be an object"]
+    if block.get("defaultProvider") is not None:
+        rules["defaultProvider"] = fact_label("provider", block["defaultProvider"])
+        if rules["defaultProvider"] is None:
+            problems.append("pricing.defaultProvider must be a label")
+    providers = block.get("providers")
+    if providers is not None and not isinstance(providers, list):
+        problems.append("pricing.providers must be a list")
+        providers = []
+    for i, r in enumerate(providers or []):
+        where = "pricing.providers[{}]".format(i)
+        if not isinstance(r, dict) or fact_label("provider", r.get("provider")) is None or r.get("program") not in (None, "claude", "codex"):
+            problems.append("{}: needs provider (a label) and program claude, codex or null".format(where))
+            continue
+        rx = _regex(r.get("model"), where, problems, optional=True)
+        if rx is not False:
+            rules["providers"].append((r.get("program"), rx, r["provider"]))
+    endpoints = block.get("endpoints")
+    if endpoints is not None and not isinstance(endpoints, list):
+        problems.append("pricing.endpoints must be a list")
+        endpoints = []
+    for i, r in enumerate(endpoints or []):
+        where = "pricing.endpoints[{}]".format(i)
+        if not isinstance(r, dict) or fact_label("endpoint", r.get("endpoint")) is None:
+            problems.append("{}: needs endpoint (a kind label)".format(where))
+            continue
+        if "env" in r:
+            name = _env_name(r.get("env"), where, problems)
+            rx = _regex(r.get("match"), where, problems)
+            if name and rx is not False:
+                rules["endpoints"].append(("env", name, rx, r["endpoint"]))
+        else:
+            rx = _regex(r.get("model"), where, problems)
+            if rx is not False:
+                rules["endpoints"].append(("model", rx, r["endpoint"]))
+    region = block.get("region")
+    if region is not None:
+        names = region.get("env") if isinstance(region, dict) else None
+        if not isinstance(names, list) or not names:
+            problems.append("pricing.region needs env (a list of variable names) and match")
+        else:
+            ok = [n for n in (_env_name(n, "pricing.region", problems) for n in names) if n]
+            rx = _regex(region.get("match"), "pricing.region", problems)
+            if ok and rx is not False:
+                rules["region"] = (ok, rx)
+    if block.get("endpointPriceAs") is not None and not isinstance(block.get("endpointPriceAs"), dict):
+        problems.append("pricing.endpointPriceAs must be an object")
+    return rules, problems
+
+
+def machine_rules():
+    """(accountRules [(name, regex, label)], region label or None, problems) of the machine's config costs block."""
+    problems, out = [], []
+    costs = pa.config().get("costs")
+    costs = costs if isinstance(costs, dict) else {}
+    rules = costs.get("accountRules")
+    if rules is not None and not isinstance(rules, list):
+        problems.append("costs.accountRules must be a list")
+        rules = []
+    for i, r in enumerate(rules or []):
+        where = "costs.accountRules[{}]".format(i)
+        if not isinstance(r, dict) or fact_label("account", r.get("account")) is None:
+            problems.append("{}: needs account (a label)".format(where))
+            continue
+        name = _env_name(r.get("env"), where, problems)
+        rx = _regex(r.get("match"), where, problems)
+        if name and rx is not False:
+            out.append((name, rx, r["account"]))
+    region = costs.get("region")
+    if region is not None and fact_label("region", region) is None:
+        problems.append("costs.region must be a region label")
+        region = None
+    return out, region, problems
+
+
+def provider_rule(rules, program, model):
+    for prog, rx, provider in (rules or {}).get("providers") or []:
+        if prog is not None and prog != program:
+            continue
+        if rx is not None and not (isinstance(model, str) and rx.search(model)):
+            continue
+        return provider
+    return None
+
+
+def endpoint_rule(rules, model, env=None):
+    """The endpoint kind of the first matching rule; env rules only when env is given (at launch)."""
+    for r in (rules or {}).get("endpoints") or []:
+        if r[0] == "model":
+            if isinstance(model, str) and r[1].search(model):
+                return r[2]
+        elif env is not None:
+            value = env.get(r[1])
+            if value and r[2].search(value):
+                return r[3]
+    return None
+
+
+def unknown_facts():
+    return {"provider": None, "providerBy": "unknown", "endpoint": None, "endpointBy": "default", "region": None,
+            "regionBy": "unknown", "account": "default", "accountBy": "default"}
+
+
+def launch_facts(profile, program, model, directory=None, env=None):
+    """The facts a start record gets (t-032 R-P3, R-A2, A-R1, A-R2), plus `refused` (names, never values) when a value
+    or a rule was refused. Never raises: on any error, unknown facts."""
+    env = os.environ if env is None else env
+    try:
+        rules, _problems = pricing_rules(profile)
+        account_rules, machine_region, _mp = machine_rules()
+        out, refused = {}, []
+        provider = provider_rule(rules, program, model)
+        out["provider"], out["providerBy"] = provider, "launch" if provider else "unknown"
+        endpoint = endpoint_rule(rules, model, env)
+        out["endpoint"], out["endpointBy"] = endpoint, "rule" if endpoint else "default"
+        region, region_by = None, "unknown"
+        if env.get("PA_COST_REGION"):
+            if fact_label("region", env["PA_COST_REGION"]):
+                region, region_by = env["PA_COST_REGION"], "env:PA_COST_REGION"
+            else:
+                refused.append("PA_COST_REGION")
+        if region is None and rules["region"]:
+            names, rx = rules["region"]
+            for name in names:
+                value = env.get(name)
+                if not value:
+                    continue
+                if rx.search(value) and fact_label("region", value):
+                    region, region_by = value, "env:" + name
+                else:
+                    region_by = "refused"
+                    refused.append(name)
+                break
+        if region is None and region_by == "unknown" and machine_region:
+            region, region_by = machine_region, "machine"
+        if region is None and refused and region_by == "unknown":
+            region_by = "refused"
+        out["region"], out["regionBy"] = region, region_by
+        account, account_by = None, None
+        if env.get("PA_COST_ACCOUNT"):
+            if fact_label("account", env["PA_COST_ACCOUNT"]):
+                account, account_by = env["PA_COST_ACCOUNT"], "env"
+            else:
+                refused.append("PA_COST_ACCOUNT")
+        if account is None:
+            for name, rx, label in account_rules:
+                value = env.get(name)
+                if value and rx.search(value):
+                    account, account_by = label, "rule"
+                    break
+        if account is None:
+            account, account_by = account_chain(directory)
+        out["account"], out["accountBy"] = account, account_by
+        if refused:
+            out["refused"] = refused
+        return out
+    except Exception:  # noqa: BLE001 - a launch never fails because of its facts
+        return unknown_facts()
+
+
+def row_facts(row, sess, rules, chain):
+    """The facts a ledger row is priced and shown under (t-032): its own where it has them (from its launch record);
+    else, at summarize time, provider and endpoint from the profile's model rules over its record's program and model
+    (providerBy/endpointBy "rule"), else the default ("default"); region unknown; account from the chain (C7, C15)."""
+    sess = sess or {}
+    out = {}
+    if row.get("provider"):
+        out["provider"], out["providerBy"] = row["provider"], row.get("providerBy") or "launch"
+    else:
+        p = provider_rule(rules, row.get("program") or sess.get("program"), sess.get("model"))
+        out["provider"], out["providerBy"] = (p, "rule") if p else ((rules or {}).get("defaultProvider"), "default")
+    if row.get("endpoint"):
+        out["endpoint"], out["endpointBy"] = row["endpoint"], row.get("endpointBy") or "rule"
+    else:
+        n = endpoint_rule(rules, sess.get("model"))
+        out["endpoint"], out["endpointBy"] = (n, "rule") if n else (None, "default")
+    if row.get("region"):
+        out["region"], out["regionBy"] = row["region"], row.get("regionBy") or "unknown"
+    else:
+        out["region"], out["regionBy"] = None, row.get("regionBy") if row.get("regionBy") in ("refused",) else "unknown"
+    if row.get("account"):
+        out["account"], out["accountBy"] = row["account"], row.get("accountBy") or "default"
+    else:
+        out["account"], out["accountBy"] = chain
+    return out
+
+
+def record_launch(directory, space, kind, argv, command, walked, profile=None):
     """pa-claude / pa-codex under a Project Agent: the command with --session-id added when it is ours to choose,
     after appending one start record (counters' context only: never an argument other than --model's value)."""
     import uuid
@@ -3121,7 +3375,8 @@ def record_launch(directory, space, kind, argv, command, walked):
         "v": 1, "ev": "start", "at": pa.now(), "session": session, "program": kind, "kind": "worker", "space": space,
         "task": task_for(directory, name), "name": name, "role": None, "terminal": os.environ.get("HC_TERMINAL_ID"),
         "parent": me.get("parent"), "model": model, "host": host(), "cwd": os.getcwd(), "pid": os.getpid(),
-        "resumed": plan["resumed"], "bind": plan["bind"], "fork": plan["fork"], "source": "recorded"})
+        "resumed": plan["resumed"], "bind": plan["bind"], "fork": plan["fork"], "source": "recorded",
+        **(launch_facts(profile, kind, model, directory) if profile is not None else unknown_facts())})
     return command
 
 
@@ -3130,13 +3385,14 @@ def record_closed(directory, terminal, by):
     return append_session(directory, {"v": 1, "ev": "closed", "at": pa.now(), "terminal": terminal, "by": by})
 
 
-def record_agent_start(directory, agent, address, project, model, resume):
+def record_agent_start(directory, agent, address, project, model, resume, profile=None):
     """pa-session: one start record per start and resume of the Project Agent's own session."""
+    facts = launch_facts(profile, "claude", model, directory) if profile is not None else unknown_facts()
     return append_session(directory, {
         "v": 1, "ev": "start", "at": pa.now(), "session": agent.get("sessionId"), "program": "claude", "kind": "pa",
         "space": agent.get("space") or os.path.basename(directory), "task": None, "name": None, "role": None,
         "terminal": address, "parent": None, "model": model, "host": host(), "cwd": project, "pid": os.getpid(),
-        "resumed": bool(resume), "bind": None, "fork": False, "source": "recorded"})
+        "resumed": bool(resume), "bind": None, "fork": False, "source": "recorded", **facts})
 
 
 # ---- Claude Code's own per-session cost (t-029): the recording status line -----------------------------

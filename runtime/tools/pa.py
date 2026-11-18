@@ -986,7 +986,7 @@ def run_agent(args, address, project, p, directory, agent, ctx, started):
             costs = costs_module()
             if costs:
                 try:
-                    costs.record_agent_start(directory, agent, address, project, model, resume)
+                    costs.record_agent_start(directory, agent, address, project, model, resume, profile=p)
                 except Exception:  # noqa: BLE001 - never stops the Project Agent
                     pass
             return began
@@ -1132,7 +1132,7 @@ def cmd_launch(kind, argv):
         costs = costs_module()
         if costs:
             try:
-                command = costs.record_launch(space_dir(pa_space), pa_space, kind, argv, command, walked)
+                command = costs.record_launch(space_dir(pa_space), pa_space, kind, argv, command, walked, profile=p)
             except Exception:  # noqa: BLE001 - never stops a launch
                 pass
         if kind == "claude":  # Claude Code's own cost figure, through its status line: the last --settings (t-029 R4)
@@ -1297,6 +1297,41 @@ def cmd_cleanup(args):
         print("No worker terminals of this Project Agent to clean up.")
 
 
+def cost_fact_notes(directory, agent):
+    """Notes (never problems) on the facts the launcher records for costs (t-032): the profile's pricing rules and the
+    machine's costs rules that were refused, and recent launch records with a refused value (names only)."""
+    costs = costs_module()
+    if not costs:
+        return []
+    notes = []
+    try:
+        _rules, problems = costs.pricing_rules(load_profile(agent.get("profile")))
+        _ar, _region, machine = costs.machine_rules()
+        for why in (problems + machine)[:10]:
+            notes.append("costs rule refused: {}".format(why))
+        tail = []
+        path = os.path.join(directory, "costs", "sessions.jsonl")
+        if os.path.isfile(path):
+            with open(path, "rb") as f:
+                f.seek(max(0, os.path.getsize(path) - 256 * 1024))
+                tail = f.read().decode("utf-8", "replace").splitlines()[-200:]
+        names, count = set(), 0
+        for text in tail:
+            try:
+                rec = json.loads(text)
+            except ValueError:
+                continue
+            if isinstance(rec, dict) and (rec.get("regionBy") == "refused" or rec.get("refused")):
+                count += 1
+                names.update(n for n in rec.get("refused") or [] if isinstance(n, str) and len(n) <= 64)
+        if count:
+            notes.append("{} launch record(s) with a refused region or account value (variables: {}): not stored".format(
+                count, ", ".join(sorted(names)) or "?"))
+    except Exception:  # noqa: BLE001 - a note only
+        pass
+    return notes
+
+
 def cmd_doctor(args):
     """Checks one space's state files. For the orchestrator after a restart or a compaction, and for people."""
     directory, agent = space_for_command(args.space)
@@ -1364,6 +1399,7 @@ def cmd_doctor(args):
         notes.append("costs/: {:.1f} KB ({})".format(folder_size(costs) / 1024.0, "summary updated " + updated if updated else "no summary yet"))
     else:
         notes.append("costs/: none yet")
+    notes.extend(cost_fact_notes(directory, agent))
     try:
         _cfg, why = cc_statusline(load_profile(agent.get("profile")))
     except Problem:
