@@ -35,6 +35,11 @@ folder and the address to report to.
   your evidence folder and your worktree (`git status`, `git log`) for what you wrote and
   committed before, and go on from there. If you were started for a job whose worker
   stopped, read what that worker left the same way first.
+  Do the same when your session stopped or your turn was cut off for any other outside reason
+  (the machine slept or restarted, the network or the API failed, the session sat idle, its
+  terminal was closed and restored), or the Project Agent tells you to continue: do not redo
+  work you already committed. Resuming answers no prompt, permission or card: those still go
+  to the person.
 - Before you report, stop every background command you started (a watcher, a server, a
   background shell): your session must go idle, or it cannot be closed.
 - A new job for another task or another role is not yours: reply that it needs a fresh

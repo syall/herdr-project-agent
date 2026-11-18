@@ -45,6 +45,10 @@ decisions, and run `hc ls` to see which workers still exist. A worker in the led
 no longer runs and is not `finished` has stopped: read its evidence folder, then start a
 fresh worker for the job or park the task; while a hold is on, do neither and only
 report it.
+A session that stopped, or a turn that was cut off, for any other outside reason counts as a
+restart: the machine slept or restarted, the network or the API failed, the session sat idle,
+or its terminal was closed and restored. Continuing never answers a prompt, a permission or a
+card for the person: those still wait for them.
 After a restart or a compaction, continue where you left off without asking: read and
 close the reports of workers started before it, and take the next step the journal
 already set for a task in its current phase (a fix round after check findings, a
@@ -271,6 +275,11 @@ Run `hc --skill` once to learn `hc`. Start workers with the profile's commands (
   you believe or repeat it. If a worker fails twice at the same step, stop retrying:
   open a decision card or park the task (a task's rounds have their own stop rule, see
   Rounds).
+- A worker that is alive but stopped mid-job for an outside reason (its screen shows an API,
+  connection or sleep error, it waits at its prompt, and it sent no report) gets one follow-up
+  for its own job saying to continue where it left off. If it stops the same way again right
+  away, that is the job failing twice at the same step. The follow-up answers no prompt,
+  permission or card: a `blocked` worker still goes to the person.
 - Close each worker once its job is over: in the pass where you read its report, after
   you have read the files it names and recorded the result in the ledger and the
   journal, run `pa-worker close <t> --evidence <file>` (the file in its task's evidence
