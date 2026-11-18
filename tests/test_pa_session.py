@@ -924,13 +924,17 @@ class PromptCache(Base):
         return pa.load_profile("test")
 
     def settings(self, argv):
-        """The one --settings JSON of a launch (asserted last and alone), or None when there is none."""
+        """The one --settings JSON of a launch (asserted last and alone), or None when there is none. t-041 J3: the
+        same --settings also holds the compaction hooks (asserted here, then left out, so these tests keep pinning
+        t-040's keys); None when nothing else is set."""
         n = sum(1 for a in argv if a == "--settings" or a.startswith("--settings="))
         if not n:
             return None
         self.assertEqual(n, 1, argv)
         self.assertEqual(argv[-2], "--settings")
-        return json.loads(argv[-1])
+        js = json.loads(argv[-1])
+        self.assertEqual(sorted(js.pop("hooks")), ["PostCompact", "PreCompact", "SessionStart"])
+        return js or None
 
     def launch(self, p, resume=False):
         argv, _model = pa.launch_command(p, dict(self.agent), resume, self.dir)

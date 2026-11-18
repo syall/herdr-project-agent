@@ -3291,12 +3291,15 @@ class CC_Launch(Base):
         self.assertIn("--session-id", calls[0])
         self.assertIn("--resume", calls[1])
         for argv in calls[:2]:
-            sl = self.ours(argv, extra=("promptCacheTtl",))
+            sl = self.ours(argv, extra=("promptCacheTtl", "hooks"))  # t-041 J3: and the compaction hooks
             self.assertEqual(shlex.split(sl["command"])[2:6], ["statusline", "--space", "sp1", "--then"])
             self.assertEqual(self.settings_count(argv), 1)
         # t-040: PA_NO_CC_STATUSLINE drops the status line only; the Project Agent keeps its cache setting
         self.assertEqual(self.settings_count(calls[2]), 1)
-        self.assertEqual(json.loads(calls[2][-1]), {"promptCacheTtl": "1h"})
+        js = json.loads(calls[2][-1])
+        self.assertIn("hooks", js)  # t-041 J3: the compaction hooks, in the same --settings
+        js.pop("hooks")
+        self.assertEqual(js, {"promptCacheTtl": "1h"})
 
     def test_cl10_a_worker_gets_no_cache_setting(self):
         # t-040 W2: the profile key is for the Project Agent's own session; a worker's command is as without it

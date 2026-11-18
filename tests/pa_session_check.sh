@@ -110,6 +110,7 @@ if wait_for $START_WAIT has_lines 1; then
   sid=$(agent "$SP" sessionId)
   case "$(last)" in *"--session-id $sid "*) pass "S1 new session (--session-id $sid)" ;; *) fail S1 "stub argv: $(last | cut -c1-120)" ;; esac
   grep -q "start resume=False session=$sid reason=new" "$S/pa/spaces/$SP/session.log" && pass "S1 session.log reason=new" || fail S1 "session.log: $(tail -n 2 "$S/pa/spaces/$SP/session.log")"
+  case "$(last)" in *"--autocompact 400000 "*) pass "S1 the 400k net (--autocompact 400000, t-041 J3)" ;; *) fail S1 "no --autocompact 400000: $(last | grep -o -- '--autocompact [0-9]*' || echo none)" ;; esac
   [ "$(label n1 herdr.pa)" = "$SP" ] && pass "S1 label herdr.pa" || fail S1 "label herdr.pa=$(label n1 herdr.pa)"
 else fail S1 "stub never started; n1: $(scratch hc read n1 2>&1 | tail -n 5)"; fi
 

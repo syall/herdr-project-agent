@@ -143,6 +143,19 @@ D5_FORMS = [
 ]
 D5_ALLOWED = ["grep -n pa-restart README.md", "python3 runtime/tools/pa.py peers", "pa-peers --older",
               "echo pa-restart", "man pa-restart-notes"]
+# t-041 J3: pa-context (set, and J4's fresh) is the person's; its hook subcommands run in the Project Agent's
+# session, never through a worker's Bash, so every pa-context subcommand is refused to a worker.
+D6 = ("Refused by the Project Agent's guard: {}. pa-context is the person's command (its other subcommands are the "
+      "Project Agent's own hooks): a worker never changes a Project Agent's context settings. Say in your report what "
+      "should change and why. There is no override.")
+D6_FORMS = [
+    ("pa-context set --mode off",), ("pa-context",), ("~/.local/bin/pa-context compacted --space s",), ("PA-CONTEXT start-pack",),
+    ("python3 ~/.config/herdr-pa/tools/pa.py context set --net 500k",), ("python3 -I runtime/tools/pa.py context fresh",),
+    ("./runtime/tools/pa.py context set",), ("env X=1 pa-context set",), ("cd x && pa-context set", "pa-context set"),
+    ("sh -c 'pa-context set --mode off'", "pa-context set --mode off"), ("y=$(pa-context set)", "pa-context set"),
+]
+D6_ALLOWED = ["grep -n pa-context README.md", "python3 runtime/tools/pa.py doctor", "pa-costs report --by context",
+              "echo pa-context", "man pa-context-notes"]
 
 # ---- Table 4.1: must be allowed ----------------------------------------------------------------------------------
 ALLOWED = {
@@ -843,6 +856,20 @@ class T037Restart(GuardTest):  # t-037 J2: workers never run pa-restart
 
     def test_d5_allowed(self):
         for line in D5_ALLOWED:
+            with self.subTest(line=line):
+                self.assertIsNone(self.check(line))
+
+
+
+class T041Context(GuardTest):  # t-041 J3: workers never run pa-context
+    def test_d6_forms(self):
+        for form in D6_FORMS:
+            line, inner = form[0], form[-1]
+            with self.subTest(line=line):
+                self.assertEqual(self.check(line), msg(D6, inner))
+
+    def test_d6_allowed(self):
+        for line in D6_ALLOWED:
             with self.subTest(line=line):
                 self.assertIsNone(self.check(line))
 
