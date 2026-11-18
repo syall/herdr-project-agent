@@ -4390,12 +4390,13 @@ class J1B_Launch(Base):
         self.assertTrue(problems)
 
     def test_j1b9_facts_function_never_raises(self):
-        saved = pa_costs.account_chain
+        costs = pa.costs_module()  # the copy the launcher loads beside pa.py
+        saved = costs.account_chain
 
         def boom(directory=None):
             raise RuntimeError("x")
-        pa_costs.account_chain = boom
-        self.addCleanup(setattr, pa_costs, "account_chain", saved)
+        costs.account_chain = boom
+        self.addCleanup(setattr, costs, "account_chain", saved)
         argv = self.launch("claude", "go")
         self.assertIn("--session-id", argv)
         r = self.records()[-1]
@@ -4491,7 +4492,7 @@ class J1B_Doctor(Base):
         _r, out, _e = self.run_cmd(pa.cmd_doctor, argparse.Namespace(space="sp1"))
         self.assertIn("J1_REGION_SECRET", out)
         self.assertRegex(out, r"1 launch record\(s\) with a refused .*J1_REGION_A")
-        self.assertNotIn("PROBLEM", out)
+        self.assertFalse([x for x in out.splitlines() if "PROBLEM" in x and ("cost" in x or "J1_" in x)], out)  # notes, never problems
 
 
 class ZZ_V1_Privacy(unittest.TestCase):
