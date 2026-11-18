@@ -33,7 +33,9 @@ import datetime
 import fcntl
 import json
 import os
+import math
 import re
+import select
 import shlex
 import shutil
 import signal
@@ -42,6 +44,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 import uuid
 
 HOME = os.path.expanduser("~")
@@ -856,18 +859,46 @@ def ask_setup(p, project, address):
         print("Not one of the choices above.")
 
 
-def error_wait(address, problem):
+def wait_enter(ctx=None):
+    """Waits for Enter: True. A launcher with a record (its watcher may take a restart meanwhile, t-037 round 2)
+    also stops waiting, False, as soon as a restart is taken (ctx["after"]), so the exec happens now rather than at
+    the next Enter. A closed stdin waits 60 s, as input()'s EOFError did."""
+    if not ctx or not ctx.get("launcher"):
+        try:
+            input()
+        except EOFError:
+            time.sleep(60)
+        return True
+    until = None
+    while True:
+        if ctx.get("after"):
+            return False
+        if until is not None:
+            if time.time() >= until:
+                return True
+            time.sleep(0.5)
+            continue
+        try:
+            ready = select.select([sys.stdin], [], [], 0.5)[0]
+        except (OSError, ValueError, TypeError, AttributeError):  # no selectable stdin
+            until = time.time() + 60
+            continue
+        if ready:
+            if sys.stdin.readline():
+                return True
+            until = time.time() + 60  # end of input
+
+
+def error_wait(address, problem, ctx=None):
     """pa-session could not start: show why in the tab and wait for Enter, instead of leaving a
-    plain shell that looks like a Project Agent. The label tells the keeper (and people) why."""
+    plain shell that looks like a Project Agent. The label tells the keeper (and people) why. Returns early when a
+    restart is taken meanwhile (wait_enter); cmd_session then execs it."""
     message = " ".join(str(problem).split())
     signal.signal(signal.SIGINT, signal.default_int_handler)  # Ctrl-C stops the wait, even after the launcher ignored it
     call(["hc", "label", address, "herdr.pa.error=" + message[:120], "herdr.pa.starting="], check=False)
     print("\n[Project Agent] It cannot start: {}\n"
           "               Fix the cause, then press Enter to try again.".format(message), flush=True)
-    try:
-        input()
-    except EOFError:
-        time.sleep(60)
+    wait_enter(ctx)
     call(["hc", "label", address, "herdr.pa.error="], check=False)  # `key=` removes the label
 
 
@@ -889,11 +920,41 @@ def cmd_session(args):
             try:
                 return run_session(args, address, labels, space, project, ctx)
             except (Problem, OSError) as e:
-                error_wait(address, e)
+                error_wait(address, e, ctx)
+                if ctx.get("after"):  # a restart taken while it waited: the exec now (returns only when it failed)
+                    take_after(ctx, ctx.get("project") or project, ctx.get("directory"), address)
     except KeyboardInterrupt:  # the person stops it (in error-wait or before): the tab's shell takes over
         sys.exit(2)
     finally:  # however it ends, it no longer says it is starting or waiting
         call(["hc", "label", address, "herdr.pa.error=", "herdr.pa.starting="], check=False)
+
+
+def restarted_session(args):
+    """pa-session exec'd by a restart (t-037 R6; round 2, VERIFY MF4). The new code passed the self-check but may
+    still raise later, on the session path: any exception goes to error_wait (the tab says what failed and how to
+    recover) instead of ending the process, its terminal and the workers tied to it. Enter execs the installed
+    pa.py again with the same flags, so a fixed install is loaded without closing the terminal."""
+    address = os.environ.get("HC_TERMINAL_ID")
+    try:
+        return cmd_session(args)
+    except Exception as e:  # noqa: BLE001 - whatever the new code raises, the terminal stays
+        if not address:
+            raise
+        traceback.print_exc()
+        failure = e
+    argv = [sys.executable, os.path.join(ROOT, "tools", "pa.py"), "session"] + sys.argv[1:]
+    try:
+        while True:
+            error_wait(address, "the restarted launcher failed: {}: {}. Its terminal and workers stay. Install a fixed "
+                                "pa.py (install.sh or pa-sync), then press Enter: it loads the installed launcher "
+                                "again".format(type(failure).__name__, failure))
+            signal.signal(signal.SIGINT, signal.SIG_IGN)  # as across a restart's exec (spec S5)
+            try:
+                os.execv(sys.executable, argv)
+            except (OSError, ValueError, TypeError) as e:
+                failure = e
+    except KeyboardInterrupt:  # the person stops it: the tab's shell takes over (as cmd_session)
+        sys.exit(2)
 
 
 # ---- the stamp: what is installed (installed.json) and what a launcher loaded (launcher.json), t-037 J1 ----------
@@ -1095,7 +1156,10 @@ def launcher_session(ctx, directory, agent, resume, snapshot=False):
                                            else (None, None))
         else:
             prompt_core, prompt_context = core, context
-            if current:
+            # The record is the prompt of the session's first request (round 2, REVIEW A M5): written only for a new
+            # session; a rebuilt start runs with the current text (reported above) but does not replace it, so a
+            # later recorded resume still reports what it really runs with.
+            if current and mode == "new":
                 current["prompt"] = {"session": sid, "core": core, "context": context, "at": now()}
                 write_json(path, current)
         session = {"id": sid, "resume": bool(resume), "at": now(), "core": core, "context": context,
@@ -1283,10 +1347,21 @@ def spawn(argv, cwd):
     return subprocess.Popen(argv, cwd=cwd)
 
 
+def child_lock(ctx):
+    """One lock between starting the child (run_child) and taking a restart (begin_restart): either the restart sees
+    the child and ends it, or run_child sees the restart and starts nothing (round 2, REVIEW A M2)."""
+    return ctx.setdefault("childLock", threading.Lock())
+
+
 def run_child(ctx, argv, cwd):
-    """subprocess.call(argv, cwd=cwd), keeping the handle in ctx["child"] while it runs (same exceptions at start)."""
-    child = spawn(argv, cwd)
-    ctx["child"] = child
+    """subprocess.call(argv, cwd=cwd), keeping the handle in ctx["child"] while it runs (same exceptions at start).
+    When a restart was taken before the start, nothing starts: None, ended "restart" (the loop execs)."""
+    with child_lock(ctx):
+        if ctx.get("after"):
+            ctx["ended"] = "restart"
+            return None
+        child = spawn(argv, cwd)
+        ctx["child"] = child
     try:
         return child.wait()
     except BaseException:  # as subprocess.call: the child does not outlive an error here
@@ -1342,6 +1417,8 @@ def end_child(ctx, why, grace=None):
 # (exec_restart): the pid, the terminal, its address and its workers stay. A request names no command, path or pid.
 
 REQUEST = "restart-request.json"
+REQUEST_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$")  # a uuid; never a leading `-` (it reaches the argv)
+REQUEST_BY = ("pa-restart", "panel", "orchestrator")  # R4; "exit" is the launcher's own (R7), never a file's
 REQUEST_MAX = 3600  # a request expires at most 60 min after it was written
 WATCH_EVERY = 2  # seconds between two looks at the request file
 SELF_CHECK_TIMEOUT = 20
@@ -1400,13 +1477,26 @@ def read_request(directory):
     for key in ("id", "space", "instance", "terminal", "at", "expires", "by"):
         if not isinstance(req.get(key), str) or not req[key]:
             return None, "field {!r} missing or not text".format(key)
-    if not ID.match(req["id"]):
-        return None, "bad request id"
+    # Every field is checked before use (round 2, REVIEW A M1): shape, characters, length.
+    for key in ("id", "space"):
+        if not REQUEST_ID.match(req[key]):
+            return None, "bad {} (letters, digits, _ and -, starting with a letter or digit, at most 80)".format(key)
+    for key in ("instance", "terminal"):
+        if len(req[key]) > 200 or any(c.isspace() or not c.isprintable() for c in req[key]):
+            return None, "bad {} (printable, no spaces, at most 200)".format(key)
+    if req["by"] not in REQUEST_BY:
+        return None, "field 'by' is not one of {}".format(", ".join(REQUEST_BY))
+    for key in ("at", "expires"):
+        if len(req[key]) > 40:
+            return None, "field {!r} is too long".format(key)
     for key in ("now", "fresh"):
         if not isinstance(req.get(key, False), bool):
             return None, "field {!r} is not true or false".format(key)
-    if req.get("why") is not None and not isinstance(req["why"], str):
+    why = req.get("why")
+    if why is not None and not isinstance(why, str):
         return None, "field 'why' is not text"
+    if why is not None and (len(why) > 2000 or any((ord(c) < 32 and c not in "\t\n") or ord(c) == 127 for c in why)):
+        return None, "field 'why' is longer than 2000 or has control characters"
     at, expires = parse_time(req["at"]), parse_time(req["expires"])
     if at is None or expires is None:
         return None, "at/expires are not times"
@@ -1434,6 +1524,22 @@ def remove_request(directory, request_id=None, text=None):
         return False
 
 
+def request_current(directory, req):
+    """None when restart-request.json still holds this request (same fields) and it has not expired; else why not
+    (round 2, VERIFY MF2): a request pa-restart withdrew, a newer one, or one past its expiry is never acted on."""
+    current, why = read_request(directory)
+    if current is None:
+        return "the request was withdrawn (pa-restart stopped waiting)" if not why else "the request is unreadable now: " + why
+    if current["id"] != req.get("id"):
+        return "the request was replaced by a newer one ({})".format(current["id"])
+    if ({k: v for k, v in current.items() if not k.startswith("_")}
+            != {k: v for k, v in req.items() if not k.startswith("_")}):
+        return "the request changed after it was taken"
+    if time.time() > current["_expires"]:
+        return "the request expired before the restart"
+    return None
+
+
 def restart_outcome(ctx, directory, request_id, outcome, why, by=None):
     entry = {"request": request_id, "outcome": outcome, "why": why, "at": now(), "by": by}
     try:
@@ -1451,10 +1557,27 @@ def agent_turn(address):
     return "idle" if word else "unknown"
 
 
-def restart_precheck(ctx, space, profile):
-    """({tools, core}, None) when the installed launcher may be exec'd: installed.json matches the installed files
-    (no install half done) and `pa.py session --self-check` of the installed file passes within SELF_CHECK_TIMEOUT
-    s. (None, why) otherwise; nothing is ended either way."""
+def restart_argv(ctx, rid, by, fresh, project, directory):
+    """The exec's argv (R6): the installed pa.py with every value as --flag=value, so no value is read as a flag
+    (round 2, REVIEW A M1). The pre-check's self-check parses exactly this argv (REVIEW B M3)."""
+    agent = as_dict(read_json_safe(os.path.join(directory, "agent.json")))
+    record = as_dict(ctx.get("launcher"))
+    argv = [sys.executable, os.path.join(ROOT, "tools", "pa.py"), "session",
+            "--space=" + (as_text(agent.get("space")) or os.path.basename(directory)), "--project=" + project,
+            "--profile=" + (as_text(agent.get("profile")) or as_text(as_dict(record.get("profile")).get("name")) or "")]
+    if as_text(agent.get("name")):
+        argv.append("--name=" + agent["name"])
+    argv += ["--restarted=" + rid, "--from-instance=" + (as_text(record.get("instance")) or ""), "--restart-by=" + by]
+    if fresh:
+        argv.append("--fresh")
+    return argv
+
+
+def restart_precheck(ctx, space, profile, argv=None):
+    """({tools, core, argv}, None) when the installed launcher may be exec'd: installed.json matches the installed
+    files (no install half done) and the installed file's self-check, run as the exec's own argv plus --self-check
+    (so its parser reads every flag the exec passes), passes within SELF_CHECK_TIMEOUT s. (None, why) otherwise;
+    nothing is ended either way."""
     installed = as_dict(installed_stamp())
     if not as_text(installed.get("tools")):
         return None, "no installed.json on this machine (run install.sh or pa-sync)"
@@ -1465,9 +1588,10 @@ def restart_precheck(ctx, space, profile):
     if core != installed.get("core"):
         return None, "the installed core text does not match installed.json (an install not finished?)"
     target = os.path.join(ROOT, "tools", "pa.py")
+    if argv is None:
+        argv = [sys.executable, target, "session", "--space=" + (space or ""), "--profile=" + (profile or "")]
     try:
-        code, output = run_bounded([sys.executable, target, "session", "--self-check", "--space", space or "",
-                                    "--profile", profile or ""], SELF_CHECK_TIMEOUT,
+        code, output = run_bounded(list(argv) + ["--self-check"], SELF_CHECK_TIMEOUT,
                                    env=dict(os.environ, HERDR_PA_HOME=ROOT, HERDR_APP_HOME=APP))  # this launcher's homes
     except subprocess.TimeoutExpired:
         return None, "the installed launcher's self-check did not finish within {} s".format(SELF_CHECK_TIMEOUT)
@@ -1482,7 +1606,7 @@ def restart_precheck(ctx, space, profile):
         result = {}
     if result.get("ok") is not True or result.get("tools") != tools:
         return None, "the installed launcher's self-check printed no matching result: {}".format(last[0][:200])
-    return {"tools": tools, "core": core}, None
+    return {"tools": tools, "core": core, "argv": list(argv)}, None
 
 
 def cmd_self_check(args):
@@ -1552,10 +1676,17 @@ def watch_once(ctx, directory, address, space):
     ctx.pop("waitingFor", None)
     agent = read_json_safe(os.path.join(directory, "agent.json"))
     profile = as_text(as_dict(agent).get("profile")) or as_text(as_dict(me.get("profile")).get("name"))
-    pre, why = restart_precheck(ctx, space, profile)
+    project = ctx.get("project") or as_text(as_dict(agent).get("project")) or os.getcwd()
+    pre, why = restart_precheck(ctx, space, profile,
+                                restart_argv(ctx, rid, by, req.get("fresh") is True, project, directory))
     if not pre:
         restart_outcome(ctx, directory, rid, "failed", why, by)
         remove_request(directory, rid)
+        return
+    stale = request_current(directory, req)  # the pre-check took a while: still the same request? (VERIFY MF2)
+    if stale:
+        restart_outcome(ctx, directory, rid, "refused", stale, by)
+        remove_request(directory, rid)  # only when it is still this one (expired)
         return
     begin_restart(ctx, directory, address, req, pre)
 
@@ -1565,9 +1696,10 @@ def begin_restart(ctx, directory, address, req, pre):
     call(["hc", "label", address, "herdr.pa.restarting=" + req["id"]], check=False)
     session_log(directory, "restart taken request={} by={} now={}: ending the agent".format(req["id"], req["by"],
                                                                                            bool(req.get("now"))))
-    ctx["after"] = {"kind": "exec", "request": {k: v for k, v in req.items() if not k.startswith("_")}, "pre": pre,
-                    "by": req["by"]}
-    end_child(ctx, "restart")  # no child running (between two launches): the loop takes ctx["after"] at its top
+    with child_lock(ctx):  # run_child either started its child before (ended below) or will start none
+        ctx["after"] = {"kind": "exec", "request": {k: v for k, v in req.items() if not k.startswith("_")}, "pre": pre,
+                        "by": req["by"], "file": True}
+    end_child(ctx, "restart")  # no child running (between two launches, a wait): the loop takes ctx["after"] next
 
 
 def watcher(ctx, directory, address, space):
@@ -1580,37 +1712,49 @@ def watcher(ctx, directory, address, space):
 
 
 def exec_restart(ctx, after, project, directory, address):
-    """Execs the installed pa.py in this process (R6). Returns only when it could not: the outcome is `failed`,
-    the label and the request are removed, and the loop goes on (resuming as after /exit)."""
+    """Execs the installed pa.py in this process (R6). Returns only when it could not: the outcome is `failed` (or
+    `refused` for a request withdrawn, replaced or expired since it was taken), the label and the request are
+    removed, and the loop goes on (resuming as after /exit)."""
     req = as_dict(after.get("request"))
     rid, by = req.get("id"), after.get("by") or req.get("by") or "pa-restart"
     pre = as_dict(after.get("pre"))
     agent = as_dict(read_json_safe(os.path.join(directory, "agent.json")))
     record = as_dict(ctx.get("launcher"))
-    failed = None
+    failed, outcome, lock = None, "failed", None
+    argv = restart_argv(ctx, rid, by, req.get("fresh") is True, project, directory)
     if pre.get("tools") and hash_or_none(os.path.join(ROOT, "tools"), top_py_only=True) != pre["tools"]:
         failed = "the installed tools changed after the check (an install running?)"
-    else:
-        argv = [sys.executable, os.path.join(ROOT, "tools", "pa.py"), "session",
-                "--space", as_text(agent.get("space")) or os.path.basename(directory), "--project", project,
-                "--profile", as_text(agent.get("profile")) or as_text(as_dict(record.get("profile")).get("name")) or ""]
-        if as_text(agent.get("name")):
-            argv += ["--name", agent["name"]]
-        argv += ["--restarted", rid, "--from-instance", as_text(record.get("instance")) or "", "--restart-by", by]
-        if req.get("fresh") is True:
-            argv += ["--fresh"]
-        session_log(directory, "restart exec request={} from={}".format(rid, record.get("instance")))
-        print("\n[Project Agent] Restarting in place (request {}): loading the installed launcher.".format(rid), flush=True)
+    elif pre.get("argv") is not None and pre["argv"] != argv:
+        failed = "the launch arguments changed after the check"
+    elif after.get("file"):
+        # pa-restart withdraws its request under the launch lock; holding it from this read to the exec means a
+        # withdrawn request is never exec'd (VERIFY MF2). The file is close-on-exec: the new process can take it.
         try:
-            sys.stdout.flush()
-            sys.stderr.flush()
-            # SIGINT stays ignored across the exec (spec S5): a Ctrl-C before the new launcher's claim cannot end
-            # the terminal and its workers. The new process ignores it again in run_session.
-            os.execv(sys.executable, argv)
-        except OSError as e:
-            failed = "exec: {}".format(e)
-    restart_outcome(ctx, directory, rid, "failed", failed, by)
-    remove_request(directory, rid)
+            lock = launch_lock(as_text(agent.get("space")) or os.path.basename(directory), wait=10)
+        except (Problem, OSError) as e:
+            failed = "the space could not be locked: {}".format(e)
+        else:
+            stale = request_current(directory, req)
+            if stale:
+                failed, outcome = stale, "refused"
+    try:
+        if not failed:
+            session_log(directory, "restart exec request={} from={}".format(rid, record.get("instance")))
+            print("\n[Project Agent] Restarting in place (request {}): loading the installed launcher.".format(rid), flush=True)
+            try:
+                sys.stdout.flush()
+                sys.stderr.flush()
+                # SIGINT stays ignored across the exec (spec S5): a Ctrl-C before the new launcher's claim cannot end
+                # the terminal and its workers. The new process ignores it again in run_session.
+                os.execv(sys.executable, argv)
+                failed = "exec returned"
+            except (OSError, ValueError, TypeError) as e:  # ValueError: a NUL in a value (REVIEW A M1)
+                failed = "exec: {}".format(e)
+    finally:
+        if lock is not None:
+            lock.close()
+    restart_outcome(ctx, directory, rid, outcome, failed, by)
+    remove_request(directory, rid)  # only when it is still this one
     call(["hc", "label", address, "herdr.pa.restarting="], check=False)
     ctx.pop("restarting", None)
     print("[Project Agent] The restart did not happen: {}. The agent resumes here.".format(failed), flush=True)
@@ -1631,15 +1775,17 @@ def reload_after_exit(ctx, project, directory, address, space):
     if not record or not mine or not installed or installed == mine:
         return
     agent = as_dict(read_json_safe(os.path.join(directory, "agent.json")))
-    pre, why = restart_precheck(ctx, space, as_text(agent.get("profile")) or as_text(as_dict(record.get("profile")).get("name")))
+    rid = "exit-" + str(uuid.uuid4())
+    pre, why = restart_precheck(ctx, space, as_text(agent.get("profile")) or as_text(as_dict(record.get("profile")).get("name")),
+                                restart_argv(ctx, rid, "exit", False, project, directory))
     if not pre:
         if ctx.get("reloadSaid") != installed:
             ctx["reloadSaid"] = installed
             print("[Project Agent] The tools were installed again, but not reloading them: {}".format(why), flush=True)
             session_log(directory, "not reloading after exit: {}".format(why))
         return
-    exec_restart(ctx, {"kind": "exec", "request": {"id": "exit-" + str(uuid.uuid4()), "by": "exit"}, "pre": pre,
-                       "by": "exit"}, project, directory, address)
+    exec_restart(ctx, {"kind": "exec", "request": {"id": rid, "by": "exit"}, "pre": pre, "by": "exit"},
+                 project, directory, address)
 
 
 def run_agent(args, address, project, p, directory, agent, ctx, started):
@@ -1671,6 +1817,7 @@ def run_agent(args, address, project, p, directory, agent, ctx, started):
                 pass
             time.sleep(10)
     space = agent.get("space") or os.path.basename(directory)
+    child_lock(ctx)  # made before the watcher thread exists
     if not ctx["beat"]:  # one heartbeat thread, also when a start is retried after an error
         threading.Thread(target=beat, daemon=True).start()
         if ctx.get("launcher"):  # the request watcher (t-037 R6); a separate thread keeps the heartbeat's pace
@@ -1719,6 +1866,9 @@ def run_agent(args, address, project, p, directory, agent, ctx, started):
                 except Exception:  # noqa: BLE001 - never stops the Project Agent
                     pass
             return began
+        if ctx.get("after"):  # taken while this launch was built (the --help probe): the exec, before any Claude starts
+            take_after(ctx, project, directory, address)
+            continue
         began = starting(model)
         try:
             code = run_child(ctx, argv, project)
@@ -1759,10 +1909,7 @@ def run_agent(args, address, project, p, directory, agent, ctx, started):
         if quick >= 3:
             print("[Project Agent] It exited {} times within seconds, so it is not restarting by itself.\n"
                   "               Fix the cause (see the output above), then press Enter to try again.".format(quick), flush=True)
-            try:
-                input()
-            except EOFError:
-                time.sleep(60)
+            wait_enter(ctx)  # also ends when a restart is taken meanwhile: the loop's top execs it
             quick = 0
         else:
             time.sleep(3)
@@ -1996,6 +2143,7 @@ def space_for_command(explicit):
 RESTART_POLL = 1.0  # seconds between two reads of launcher.json while pa-restart waits
 RESTART_WAIT = 180
 RESTART_WAIT_MAX = 540  # below hc exec's 600 s, so `--on` gets the answer
+RELAY_MARGIN = 60  # `--on`: hc exec's --timeout is the wait plus this (at most 600)
 REQUEST_LIFE = 600  # a request expires 10 min after it was written
 
 
@@ -2092,6 +2240,23 @@ def loaded_text(record, installed=None):
         profile.get("readAt"), session.get("id"), "resumed" if session.get("resume") else "new")
 
 
+def journal_caller(entry):
+    """Appends entry to the journal of the Project Agent whose terminal runs this command (pa-restart --on from its
+    Claude, round 2): nothing when this terminal is not a local Project Agent's."""
+    address = os.environ.get("HC_TERMINAL_ID")
+    if not address:
+        return False
+    space = local_id(as_text(as_dict(as_dict(hc_get(address)).get("labels")).get("herdr.pa")) or "")
+    if not space or not ID.match(space):
+        return False
+    directory = space_dir(space)
+    if as_dict(read_json_safe(os.path.join(directory, "agent.json"))).get("terminal") != address:
+        return False
+    with open(os.path.join(directory, "journal.jsonl"), "a") as journal:
+        journal.write(json.dumps(dict({"at": now()}, **entry)) + "\n")
+    return True
+
+
 def restart_flags(args):
     flags = ["--space", args.space]
     for name in ("now", "fresh", "dry_run", "json"):
@@ -2109,19 +2274,32 @@ def cmd_restart(args):
     """pa-restart: asks the space's launcher to restart in place (R5). It checks that the terminal's program is that
     space's launcher, says what runs now and which workers keep running, writes restart-request.json and waits for
     what the new launcher loaded. It ends nothing itself; the launcher ends its own Claude and execs."""
+    in_claude = os.environ.get("CLAUDECODE") not in (None, "", "0")
+    if in_claude and not (args.why or "").strip():  # also for --on (round 2, REVIEW A M4)
+        raise Problem("inside Claude, pa-restart needs --why quoting the person's own words")
     if args.on:
         if not args.space:
             raise Problem("--on needs --space <id> (the space's id on that machine)")
+        wait = restart_wait(args.wait)
+        timeout = min(600, int(math.ceil(wait)) + RELAY_MARGIN)  # hc exec's default 60 s would end a longer wait
         script = '"$HOME/.config/herdr-pa/tools/pa.py" restart ' + " ".join(shlex.quote(a) for a in restart_flags(args))
-        code = relay(["hc", "exec", "--on", args.on, "--", "sh", "-c", script])
+        if in_claude:
+            journal_caller({"by": "orchestrator", "trigger": "conversation", "why": "restart: " + args.why,
+                            "on": args.on, "space": args.space})
+        began = time.time()
+        code = relay(["hc", "exec", "--on", args.on, "--timeout", str(timeout), "--", "sh", "-c", script])
         if code == 127:
             print("pa-restart is not installed on {}: run pa-sync --on {} first".format(args.on, args.on), file=sys.stderr)
+        elif code and time.time() - began >= timeout * 0.9:
+            print("pa-restart on {} gave no answer within {} s (hc exec's timeout): whether it restarted is unknown. "
+                  "See its tab, or run pa-restart --on {} --space {} --dry-run".format(args.on, timeout, args.on, args.space),
+                  file=sys.stderr)
+            if args.json:
+                print(json.dumps({"outcome": "unknown", "why": "hc exec timed out after {} s".format(timeout)}))
+            sys.exit(3)
         if code:
             sys.exit(code)
         return
-    in_claude = os.environ.get("CLAUDECODE") not in (None, "", "0")
-    if in_claude and not (args.why or "").strip():
-        raise Problem("inside Claude, pa-restart needs --why quoting the person's own words")
     directory, agent = space_for_command(args.space)
     record, term = identify_launcher(directory, agent)
     space, terminal = agent.get("space"), agent.get("terminal")
@@ -2815,6 +2993,8 @@ def main():
         args = parser.parse_args()
         if args.self_check:
             return cmd_self_check(args)
+        if args.restarted:
+            return restarted_session(args)
         return cmd_session(args)
     if kind == "pa-profile":
         parser.add_argument("action", nargs="?", default="show", choices=("show", "apply", "set"))
