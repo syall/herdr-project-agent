@@ -7,6 +7,9 @@ only: no real space, no real ~/.config/herdr-pa, and the slot folder is under th
   w3 the cap: a run past the cap waits, says for whom, and starts when the slot frees; a dead holder never blocks
   w4 part times: run-all.sh prints each part's seconds; --report lists parts by median, slowest first
   w6 (t-072) pa-full-suite running run-all.sh, which now takes the slot itself, does not wait for itself
+  w7 (t-076) the run's output file (its path first), its progress file, --status (waiting, running, done, gone),
+     --wait (heartbeat, timeout, the run's exit), a heartbeat while it runs
+  w8 (t-076) --module <test_x>: tests/run-all.sh --module as pa-full-suite's command, recorded and reused per module
 """
 import contextlib
 import fcntl
@@ -496,3 +499,211 @@ class W6RunAllUnderTheSlot(Base):
         self.assertIn("  suite slot: held by the caller", out)
         self.assertEqual(left, saved["PA_SUITE_SLOT"], "pa-full-suite left its slot marker in its environment")
         self.assertEqual(self.lines()[-1]["exit"], 0)
+
+
+PA_FULL_SUITE = os.path.join(TMP, "bin", "pa-full-suite")
+
+
+class W7Status(Base):
+    """t-076: one way to run it (the output file named first), to see it (--status) and to wait for it (--wait)."""
+    holder = W3Cap.holder
+
+    def setUp(self):
+        super().setUp()
+        if not os.path.lexists(PA_FULL_SUITE):
+            os.makedirs(os.path.dirname(PA_FULL_SUITE), exist_ok=True)
+            os.symlink(os.path.join(os.path.realpath(TOOLS), "pa_hooks.py"), PA_FULL_SUITE)
+        self.env = {}
+
+    def setenv(self, **values):
+        for k, v in values.items():
+            self.env.setdefault(k, os.environ.get(k))
+            os.environ[k] = v
+        self.addCleanup(self.restore)
+
+    def restore(self):
+        for k, v in self.env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        self.env = {}
+
+    def background(self, *args):
+        """pa-full-suite in its own process (the run a worker started), its output in a file."""
+        log = os.path.join(self.tmp, "bg.out")
+        with open(log, "w") as f:
+            p = subprocess.Popen([sys.executable, PA_FULL_SUITE] + list(args), cwd=self.wt, stdin=subprocess.DEVNULL,
+                                 stdout=f, stderr=subprocess.STDOUT)
+        self.addCleanup(lambda: (p.poll() is None and p.kill(), p.wait()))
+        return p, log
+
+    def until(self, test, limit=30):
+        end = time.time() + limit
+        while time.time() < end:
+            got = test()
+            if got:
+                return got
+            time.sleep(0.1)
+        return None
+
+    def status(self, *args):
+        return self.main("--status", *args)
+
+    def gated(self, tail="exit 0"):
+        """A suite command that waits for the file go, then runs tail."""
+        return "echo started; while [ ! -f {} ]; do sleep 0.1; done; {}".format(os.path.join(self.tmp, "go"), tail)
+
+    def go(self):
+        write(os.path.join(self.tmp, "go"), "")
+
+    def test_w7a_the_output_file_is_named_first_and_holds_the_whole_output(self):
+        self.set_command(self.counting("i=0; while [ $i -lt 300 ]; do echo line $i; i=$((i + 1)); done"))
+        code, out = self.main()
+        self.assertEqual(code, 0, out)
+        first = out.splitlines()[0]
+        self.assertTrue(first.startswith("pa-full-suite: run "), out)
+        path = first.split("output in ", 1)[1].split(" ", 1)[0]
+        self.assertEqual(os.path.dirname(path), os.path.join(self.dir, "evidence", "t-1"))
+        self.assertTrue(os.path.basename(path).startswith("full-suite-"), path)
+        text = pa.read_text(path)
+        self.assertIn("line 0\n", text)
+        self.assertIn("line 299\n", text)
+        self.assertIn("  keeper harness: ok (7s)", text)
+        line = self.lines()[-1]
+        self.assertEqual(line["output"], path)
+        self.assertIn(line["run"], path)
+        self.assertEqual(line["parts"][1], {"name": "keeper harness", "ok": True, "seconds": 7})
+
+    def test_w7b_status_and_wait_follow_a_run_to_its_end(self):
+        self.set_command(self.gated("sleep 1.5; exit 3"))
+        p, log = self.background()
+        got = self.until(lambda: "running since" in self.status()[1] and self.status())
+        self.assertTrue(got, (self.status(), pa.read_text(log)))
+        self.assertEqual(got[0], 0, got[1])
+        self.setenv(PA_SUITE_HEARTBEAT="0.3")
+        code, out = self.main("--wait", "--timeout", "1")
+        self.assertEqual(code, 75, out)
+        self.assertIn("still running", out)
+        self.assertIn("pa-full-suite --wait again", out)
+        self.go()
+        began = time.time()
+        code, out = self.main("--wait")
+        self.assertEqual(code, 3, out)
+        self.assertGreater(time.time() - began, 1.0)
+        self.assertIn("done: exit 3", out.strip().splitlines()[-1])
+        self.assertGreaterEqual(out.count("running since"), 1, out)  # the heartbeat
+        self.assertEqual(p.wait(timeout=30), 3, pa.read_text(log))
+        code, out = self.status()
+        self.assertEqual(code, 0, out)
+        self.assertIn("done: exit 3", out)
+        self.assertIn("suites.jsonl", out)
+        head = sh(self.wt, "git", "rev-parse", "HEAD")
+        code, out = self.status("--commit", head[:8])
+        self.assertIn("done: exit 3", out)
+        code, out = self.main("--wait")  # a run that is done already: its result at once
+        self.assertEqual(code, 3, out)
+
+    def test_w7c_a_waiting_run_says_for_whom_and_its_place(self):
+        holder = self.holder(0)
+        self.set_command(self.counting())
+        p, log = self.background()
+        got = self.until(lambda: "waiting for the suite slot" in self.status()[1] and self.status()[1])
+        self.assertTrue(got, (self.status(), pa.read_text(log)))
+        self.assertIn("t-holder", got)
+        self.assertIn(str(holder.pid), got)
+        self.assertIn("place 1 of 1", got)
+        holder.kill()
+        holder.wait()
+        code, out = self.main("--wait")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(p.wait(timeout=30), 0)
+
+    def test_w7d_a_run_whose_owner_is_gone_ended_without_a_result(self):
+        dead = subprocess.Popen(["true"])
+        dead.wait()
+        folder = os.path.join(pa.ROOT, "suite-runs")
+        dump({"run": "r1", "kind": "pa-full-suite", "dir": self.wt, "pid": dead.pid, "state": "running",
+              "queued": "2026-01-01T00:00:00Z", "start": "2026-01-01T00:00:01Z"}, os.path.join(folder, "r1.json"))
+        code, out = self.status()
+        self.assertIn("ended without a result", out)
+        code, out = self.main("--wait")
+        self.assertEqual(code, 1, out)
+        self.assertIn("ended without a result", out)
+
+    def test_w7e_no_run_to_show(self):
+        code, out = self.status()
+        self.assertEqual(code, 1, out)
+        self.assertIn("no run", out)
+        code, out = self.main("--wait")
+        self.assertEqual(code, 1, out)
+
+    def test_w7f_status_shows_a_run_all_run_of_this_worktree(self):
+        folder = os.path.join(pa.ROOT, "suite-runs")
+        dump({"run": "r2", "kind": "run-all.sh", "what": "tests/run-all.sh --affected", "dir": self.wt, "pid": os.getpid(),
+              "state": "running", "queued": "2026-01-01T00:00:00Z", "start": "2026-01-01T00:00:01Z",
+              "parts": {"total": 8, "done": 5, "running": [{"name": "keeper harness", "since": time.time() - 30,
+                                                             "last_output": time.time() - 2, "limit": 900}]}},
+             os.path.join(folder, "r2.json"))
+        code, out = self.status()
+        self.assertEqual(code, 0, out)
+        self.assertIn("parts 5 of 8 done", out)
+        self.assertIn("now: keeper harness", out)
+        self.assertIn("limit 900s", out)
+        self.assertIn("last output", out)
+        os.chdir(self.tmp)  # outside a worktree: every run not done
+        code, out = self.status()
+        self.assertEqual(code, 0, out)
+        self.assertIn("now: keeper harness", out)
+
+    def test_w7g_a_heartbeat_while_it_runs_and_the_progress_file(self):
+        self.setenv(PA_SUITE_HEARTBEAT="0.3")
+        self.set_command(self.counting("sleep 1.5"))
+        code, out = self.main()
+        self.assertEqual(code, 0, out)
+        self.assertGreaterEqual(out.count("pa-full-suite: running since"), 1, out)
+        rows = [json.loads(pa.read_text(os.path.join(pa.ROOT, "suite-runs", n)))
+                for n in os.listdir(os.path.join(pa.ROOT, "suite-runs"))]
+        self.assertEqual(len(rows), 1, rows)
+        row = rows[0]
+        self.assertEqual((row["kind"], row["state"], row["exit"], row["task"], row["dir"]),
+                         ("pa-full-suite", "done", 0, "t-1", os.path.realpath(self.wt)))
+        self.assertEqual(row["run"], self.lines()[-1]["run"])
+
+    def test_w7h_pa_full_suite_and_its_run_all_share_one_progress_file(self):
+        fx = types.SimpleNamespace()
+        tra.RunAll.setUp(fx)
+        self.addCleanup(tra.RunAll.tearDown, fx)
+        self.setenv(NODE=fx.node, STUB_DIR=fx.tmp, TMPDIR=fx.tmp, PA_SUITE_WAIT_LIMIT="5")
+        self.set_command("sh {} --affected".format(shlex.quote(os.path.join(fx.repo, "tests", "run-all.sh"))))
+        code, out = self.main()
+        self.assertEqual(code, 0, out)
+        rows = [json.loads(pa.read_text(os.path.join(pa.ROOT, "suite-runs", n)))
+                for n in os.listdir(os.path.join(pa.ROOT, "suite-runs"))]
+        self.assertEqual(len(rows), 1, rows)
+        self.assertEqual((rows[0]["kind"], rows[0]["state"], rows[0]["parts"]["total"], rows[0]["parts"]["done"]),
+                         ("pa-full-suite", "done", 8, 8))
+
+
+class W8Module(Base):
+    def test_w8a_module_needs_run_all(self):
+        with self.assertRaises(pa.Problem):
+            self.main("--module", "test_x")
+
+    def test_w8b_module_runs_run_all_module_recorded_and_reused(self):
+        write(os.path.join(self.wt, "tests", "run-all.sh"),
+              'echo "args $*" >> {}\nprintf "  unit tests: $2: ok (4s)\\n"\n'.format(self.count))
+        write(os.path.join(self.wt, "tests", "test_x.py"), "")
+        sh(self.wt, "git", "add", "-A")
+        sh(self.wt, "git", "commit", "-q", "-m", "t")
+        code, out = self.main("--module", "test_x")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(pa.read_text(self.count), "args --module test_x\n")
+        line = self.lines()[-1]
+        self.assertEqual((line["module"], line["parts"]), ("test_x", [{"name": "unit tests: test_x", "ok": True, "seconds": 4}]))
+        self.assertIn("--module test_x", line["command"])
+        code, out = self.main("--module", "test_x")
+        self.assertEqual((code, self.runs()), (0, 1), out)
+        self.assertIn("already passed", out)
+        with self.assertRaises(pa.Problem):
+            self.main("--module", "../x")

@@ -1,9 +1,13 @@
 """tests/run-all.sh itself (t-017 J6, R7): parts in parallel, output in a fixed order, a summary that names
 every part and every failure, PA_SERIAL=1, --affected; J9: TERM, INT and HUP stop every part and its children,
 and each unit test module (tests/test_*.py) is its own part; t-031: the panel harness runs as four parts, one per
-shard (run.mjs --shard=<k>/4), each named in the summary; t-072: every run takes pa-full-suite's slot (s1-s7). The real script runs in a temp copy of the repo whose
-parts are stubs (stub.sh, chosen per part by STUB_<part>), so no real suite runs here."""
+shard (run.mjs --shard=<k>/4), each named in the summary; t-072: every run takes pa-full-suite's slot (s1-s7);
+t-076: a part past its limit (3x its median, at least PA_PART_LIMIT) is stopped and named hung (h1-h3), every run
+has a progress file under HERDR_PA_HOME/suite-runs (p1-p2), --module runs one unit part (m1). The real script runs
+in a temp copy of the repo whose parts are stubs (stub.sh, chosen per part by STUB_<part>), so no real suite runs here."""
+import json
 import fcntl
+import glob
 import importlib.util
 import os
 import re
@@ -640,6 +644,157 @@ class RunAll(unittest.TestCase):
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         self.assertLess(module.SLOT_WAIT_LIMIT, 900)
+
+    # ---- t-076: the per-part limit, the progress file, --module ----
+
+    def progress(self):
+        """The progress files of this home, oldest first."""
+        rows = []
+        for path in sorted(glob.glob(os.path.join(self.home, "suite-runs", "*.json"))):
+            with open(path) as f:
+                rows.append(json.load(f))
+        return sorted(rows, key=lambda r: r.get("queued") or "")
+
+    def until(self, test, limit=30):
+        end = time.time() + limit
+        while time.time() < end:
+            got = test()
+            if got:
+                return got
+            time.sleep(0.1)
+        return None
+
+    def record_medians(self, seconds):
+        """A suites.jsonl in the space of a task marked in the repo copy: keeper harness took these seconds."""
+        write(os.path.join(self.repo, ".claude", "pa-task.json"), json.dumps({"task": "t-1", "space": "sp1"}))
+        rows = [{"run": "r{}".format(i), "repo": self.repo, "exit": 0,
+                 "parts": [{"name": "keeper harness", "ok": True, "seconds": s}]} for i, s in enumerate(seconds)]
+        write(os.path.join(self.home, "spaces", "sp1", "content", "suites.jsonl"), "".join(json.dumps(r) + "\n" for r in rows))
+
+    def test_h1_a_part_past_its_limit_is_stopped_and_named_hung(self):
+        # The hung part and its children are stopped, the other parts finish, the run exits 1 and names it.
+        for serial in ("", "1"):
+            with self.subTest(serial=serial):
+                pids = os.path.join(self.tmp, "keeper.pids")
+                if os.path.exists(pids):
+                    os.remove(pids)
+                began = time.time()
+                code, out = self.run_all(keeper="child", PA_PART_LIMIT="2", PA_SERIAL=serial)
+                self.assertLess(time.time() - began, 60, out)
+                self.assertEqual(code, 1, out)
+                tail = self.summary(out)
+                self.assertIn("--- keeper harness: HUNG: stopped after ", tail)
+                self.assertIn("  keeper harness: HUNG (", tail)
+                for name in NAMES:
+                    if name != "keeper harness":
+                        self.assertIn("  {}: ok".format(name), tail)
+                self.assertTrue(out.rstrip().splitlines()[-1].startswith(
+                    "=== 1 part(s) failed: keeper harness (hung) (outputs: "), out)
+                with open(pids) as f:
+                    left = [int(p) for p in f.read().split() if alive(int(p))]
+                self.assertEqual(left, [], "the hung part's processes are still running")
+                self.assertTrue(self.slot_free())
+                write(self.events, "")
+
+    def test_h2_the_limit_is_three_times_the_recorded_median(self):
+        spec = importlib.util.spec_from_file_location("pa_suite_h2", os.path.join(self.repo, "runtime", "tools", "pa_suite.py"))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        self.assertEqual(module.part_limit(None, 900), 900)
+        self.assertEqual(module.part_limit(100, 900), 900)
+        self.assertEqual(module.part_limit(400, 900), 1200)
+        self.assertEqual(module.PART_FLOOR, 900)
+        self.record_medians([1, 1, 2])  # median 1: limit 3 s over a floor of 1 s
+        code, out = self.run_all("--affected", PA_CHANGED_FILES="tests/keeper/run.mjs", keeper="sleep:8", PA_PART_LIMIT="1")
+        self.assertEqual(code, 1, out)
+        self.assertIn("--- keeper harness: HUNG: stopped after ", out)
+        self.assertIn("limit 3s", out)
+        self.record_medians([10, 10, 10])  # median 10: limit 30 s, the part's 3 s are fine
+        code, out = self.run_all("--affected", PA_CHANGED_FILES="tests/keeper/run.mjs", keeper="sleep:3", PA_PART_LIMIT="1")
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("HUNG", out)
+
+    def test_h3_hung_parts_parse_as_failed_and_hung(self):
+        spec = importlib.util.spec_from_file_location("pa_suite_h3", os.path.join(self.repo, "runtime", "tools", "pa_suite.py"))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        self.assertEqual(module.parse_parts("  keeper harness: HUNG (12s)\n  store harness: ok (1s)\n"), [
+            {"name": "keeper harness", "ok": False, "seconds": 12, "hung": True},
+            {"name": "store harness", "ok": True, "seconds": 1}])
+
+    def test_p1_every_run_has_a_progress_file(self):
+        # Full and --affected: running (parts done of total, the parts running now and their last output), then done.
+        for args, total in (((), 9), (("--affected",), 8)):
+            with self.subTest(args=args):
+                shutil.rmtree(os.path.join(self.home, "suite-runs"), ignore_errors=True)
+                log = os.path.join(self.tmp, "p1.out")
+                with open(log, "w") as f:
+                    run = subprocess.Popen(["sh", os.path.join(self.repo, "tests", "run-all.sh")] + list(args),
+                                           cwd=self.tmp, env=self.env_for(keeper="sleep:4"), stdin=subprocess.DEVNULL,
+                                           stdout=f, stderr=subprocess.STDOUT)
+                try:
+                    row = self.until(lambda: [r for r in self.progress() if r.get("state") == "running"
+                                              and (r.get("parts") or {}).get("total") == total
+                                              and [p for p in r["parts"].get("running", []) if p["name"] == "keeper harness"]
+                                              and r["parts"].get("done", 0) >= 1])
+                    self.assertTrue(row, (self.progress(), pa_text(log)))
+                    row = row[-1]
+                    self.assertEqual(row["kind"], "run-all.sh")
+                    self.assertEqual(row["dir"], self.repo)
+                    self.assertLess(row["parts"]["done"], total)
+                    keeper = [p for p in row["parts"]["running"] if p["name"] == "keeper harness"][0]
+                    for k in ("since", "last_output", "limit"):
+                        self.assertIn(k, keeper)
+                    self.assertTrue(row.get("folder") and os.path.isdir(row["folder"]), row)
+                    self.assertEqual(run.wait(timeout=60), 0, pa_text(log))
+                finally:
+                    if run.poll() is None:
+                        run.kill()
+                        run.wait()
+                done = self.progress()[-1]
+                self.assertEqual((done["state"], done["exit"], done["parts"]["done"], done["parts"]["total"]),
+                                 ("done", 0, total, total), done)
+                self.assertTrue(done.get("start") and done.get("end"), done)
+                write(self.events, "")
+
+    def test_p2_a_waiting_run_says_for_whom_in_its_progress_file(self):
+        p = self.holder()
+        log = os.path.join(self.tmp, "p2.out")
+        with open(log, "w") as f:
+            run = subprocess.Popen(["sh", os.path.join(self.repo, "tests", "run-all.sh"), "--affected"], cwd=self.tmp,
+                                   env=self.env_for(), stdin=subprocess.DEVNULL, stdout=f, stderr=subprocess.STDOUT)
+        try:
+            row = self.until(lambda: [r for r in self.progress() if r.get("state") == "waiting"])
+            self.assertTrue(row, (self.progress(), pa_text(log)))
+            self.assertIn("t-holder", row[-1]["waiting_for"])
+            self.assertIn(str(p.pid), row[-1]["waiting_for"])
+            p.kill()
+            p.wait()
+            self.assertEqual(run.wait(timeout=60), 0, pa_text(log))
+        finally:
+            if run.poll() is None:
+                run.kill()
+                run.wait()
+        self.assertEqual(self.progress()[-1]["state"], "done")
+
+    def test_m1_module_runs_one_unit_part_under_the_slot(self):
+        write(os.path.join(self.repo, "tests", "test_a.py"), UNIT_MODULE.format(me="a", other="a"))
+        code, out = self.run_all("--module", "test_stub")
+        self.assertEqual(code, 0, out)
+        tail = self.summary(out)
+        self.assertIn("  unit tests: test_stub: ok", tail)
+        self.assertNotIn("test_a", out)
+        for name in NAMES:
+            if name != "unit tests: test_stub":
+                self.assertNotIn("  {}: ok".format(name), tail)
+        self.assertIn("  suite slot: waited", tail)
+        with open(self.events) as f:
+            self.assertEqual(f.read(), "")
+        self.assertEqual(self.progress()[-1]["parts"]["total"], 1)
+        code, out = self.run_all("--module", "test_nope")
+        self.assertEqual(code, 2, out)
+        code, out = self.run_all("--module")
+        self.assertEqual(code, 2, out)
 
 
 def pa_text(path):
