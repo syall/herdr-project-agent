@@ -3624,13 +3624,21 @@ class CC_Resume(CCBase):
         self.assertAlmostEqual(pa_costs.cc_figure(pa_costs.cc_clean(rec)), 30.1)
         self.assertNotIn("heldCost", rec)
 
-    def test_r9_a_restore_while_the_clock_reads_backward_is_no_restore(self):
-        # t-051: with the clock behind the last reading the time between them is unknown; the drop stays counted (an
-        # over count, never an under count), and it stays so once the totals are past the held duration
+    def test_r9_a_restore_while_the_clock_reads_backward_is_still_a_restore(self):
+        # t-051 round 2 (check x1, REVIEW RL-1): the clock steps back 70 s between the low reading and the restore; the
+        # elapsed time counts as 0, the restored jump is still faster than the clock, so the resume is counted once
         rec = self.readings([(T0, 30.0, 28800000), (T0 + 100, 0.0, 500), (T0 + 30, 30.1, 28805000)])
-        self.assertEqual((rec["base"], rec["cost"], rec["segments"], rec["heldCost"]), (30.0, 30.1, 2, 30.0))
-        rec = self.readings([(T0 + 40, 30.2, 28815000)])
-        self.assertEqual((rec["base"], rec["cost"], rec["segments"]), (30.0, 30.2, 2))
+        self.assertEqual((rec["base"], rec["cost"], rec["segments"]), (0, 30.1, 1))
+        self.assertAlmostEqual(pa_costs.cc_figure(pa_costs.cc_clean(rec)), 30.1)
+        self.assertNotIn("heldCost", rec)
+
+    def test_r10_a_crash_resume_with_a_small_backward_step_is_counted_once(self):
+        # t-051 round 2 (check x6): a crash, then a resume whose restore comes with the clock 5 s back
+        rec = self.readings([(T0, 20.0, 14400000), (T0 + 100, 0.0, 800), (T0 + 95, 20.0, 14410000),
+                             (T0 + 400, 22.0, 14700000)])
+        self.assertEqual((rec["base"], rec["cost"], rec["segments"]), (0, 22.0, 1))
+        self.assertAlmostEqual(pa_costs.cc_figure(pa_costs.cc_clean(rec)), 22.0)
+        self.assertNotIn("heldCost", rec)
 
 
 class CC_ResumeSummary(CCFixture):
