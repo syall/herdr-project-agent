@@ -1708,12 +1708,18 @@ class R2_7_RestartedPathRaises(Base):
     """Item 7: a launcher exec'd by a restart that raises anything goes to error_wait, and Enter loads the
     installed launcher again; the terminal and its workers stay."""
 
-    def main_with(self, argv, raising):
+    def main_with(self, argv, raising, precheck=None, error_wait=None):
+        """precheck: restart_precheck for the Enter re-exec (round 3; default: passes); error_wait: its stand-in
+        (default: records the call and returns, i.e. Enter)."""
         seen = []
-        saved = (sys.argv, pa.cmd_session, pa.error_wait, os.environ.get("HC_TERMINAL_ID"))
+        saved = (sys.argv, pa.cmd_session, pa.error_wait, os.environ.get("HC_TERMINAL_ID"), pa.restart_precheck)
         sys.argv = argv
         pa.cmd_session = lambda args: (_ for _ in ()).throw(raising)
-        pa.error_wait = lambda address, problem, ctx=None: seen.append((address, str(problem)))
+        pa.error_wait = error_wait or (lambda address, problem, ctx=None: seen.append((address, str(problem))))
+        if error_wait:
+            seen = error_wait.seen
+        pa.restart_precheck = precheck or (lambda ctx, space, profile, argv=None: ({"tools": "T", "core": "C",
+                                                                                   "argv": list(argv)}, None))
         os.environ["HC_TERMINAL_ID"] = "t1"
         execs = []
 
@@ -1730,6 +1736,7 @@ class R2_7_RestartedPathRaises(Base):
             return seen, execs, None
         finally:
             sys.argv, pa.cmd_session, pa.error_wait = saved[:3]
+            pa.restart_precheck = saved[4]
             if saved[3] is None:
                 os.environ.pop("HC_TERMINAL_ID", None)
             else:
@@ -1750,6 +1757,160 @@ class R2_7_RestartedPathRaises(Base):
         seen, execs, e = self.main_with(["pa-session", "--space", SP], RuntimeError("plain"))
         self.assertIsInstance(e, RuntimeError)
         self.assertEqual((seen, execs), ([], []))
+
+
+
+# ---- J2 round 3 (handoff-fix-j2-r3.md) --------------------------------------------------------------------------
+
+class TtyPipe:
+    """A selectable stdin that says it is a tty (cmd_session shows errors only to a tty)."""
+
+    def __init__(self, f):
+        self.f = f
+
+    def isatty(self):
+        return True
+
+    def fileno(self):
+        return self.f.fileno()
+
+    def readline(self):
+        return self.f.readline()
+
+
+class R3_1_SigintIgnoredAtEveryExec(Requests):
+    """Item 1 (REVIEW A M1 = B M1, spec S5): SIGINT is ignored at the restart's execv whatever path leads there."""
+
+    def sigint_recorder(self, seen, raising=Execd):
+        def recorder(path, argv):
+            seen.append(signal.getsignal(signal.SIGINT))
+            raise raising() if raising is Execd else raising
+        return recorder
+
+    def test_p_s5_a_restart_taken_during_error_wait_execs_with_sigint_ignored(self):  # the reviewers' probe
+        runs, seen, box = [], [], {}
+        r, w = os.pipe()
+        stdin = os.fdopen(r)
+        self.addCleanup(os.close, w)
+        self.addCleanup(stdin.close)
+
+        def run_session(args, address, labels, space, project, ctx):
+            runs.append(1)
+            if len(runs) > 1:
+                raise AssertionError("run_session again: the restart was not exec'd")
+            ctx.update(self.ctx(child=None))
+
+            def take():
+                time.sleep(0.3)
+                req = self.request(ctx, now=True)
+                box["req"] = req
+                pa.begin_restart(ctx, self.dir, "t1", dict(req),
+                                 {"tools": pa.hash_or_none(os.path.join(pa.ROOT, "tools"), True)})
+            threading.Thread(target=take, daemon=True).start()
+            raise pa.Problem("the project folder is gone")
+
+        saved = (pa.run_session, sys.stdin, os.environ.get("HC_TERMINAL_ID"), signal.getsignal(signal.SIGINT))
+        pa.run_session, sys.stdin = run_session, TtyPipe(stdin)
+        os.environ["HC_TERMINAL_ID"] = "t1"
+        os.execv = self.sigint_recorder(seen)
+        try:
+            args = types.SimpleNamespace(space=SP, project=self.project, profile="test", name=None, auto=False, ask=False,
+                                         fresh=False, restarted=None)
+            with self.assertRaises(Execd), contextlib.redirect_stdout(io.StringIO()):
+                pa.cmd_session(args)  # the real error_wait: it installs default_int_handler for its Enter/Ctrl-C
+        finally:
+            pa.run_session, sys.stdin = saved[:2]
+            signal.signal(signal.SIGINT, saved[3])
+            if saved[2] is None:
+                os.environ.pop("HC_TERMINAL_ID", None)
+            else:
+                os.environ["HC_TERMINAL_ID"] = saved[2]
+        self.assertEqual(seen, [signal.SIG_IGN])
+
+    def test_exec_restart_ignores_sigint_at_the_exec_and_restores_it_when_the_exec_fails(self):
+        ctx = self.ctx()
+        self.request(ctx, now=True)
+        self.passing_precheck()
+        self.poll(ctx)
+        seen = []
+        os.execv = self.sigint_recorder(seen, OSError("no such file"))
+        saved = signal.signal(signal.SIGINT, signal.default_int_handler)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                pa.exec_restart(ctx, ctx.pop("after"), self.project, self.dir, "t1")
+            after = signal.getsignal(signal.SIGINT)
+        finally:
+            signal.signal(signal.SIGINT, saved)
+        self.assertEqual(seen, [signal.SIG_IGN])
+        self.assertIs(after, signal.default_int_handler)  # the handler from before the exec is back
+        self.assertEqual(self.outcome()["outcome"], "failed")
+
+
+class R3_2_RecoveryPreCheck(Base):
+    """Item 2 (REVIEW A M2 = B M2 = VERIFY MF-r2-1): the Enter re-exec of restarted_session runs the restart's
+    pre-check (installed.json, the exact argv's --self-check) first; on failure it stays in error_wait and says why."""
+
+    FLAGS = ["--space", SP, "--restarted=r1", "--from-instance=i0", "--restart-by=pa-restart"]
+    main_with = R2_7_RestartedPathRaises.main_with
+
+    def waits(self, enters):
+        """An error_wait stand-in: Enter `enters` times, then Ctrl-C."""
+        def error_wait(address, problem, ctx=None):
+            error_wait.seen.append((address, str(problem)))
+            if len(error_wait.seen) > enters:
+                raise KeyboardInterrupt()
+        error_wait.seen = []
+        return error_wait
+
+    def test_enter_prechecks_the_exact_argv_it_execs(self):
+        checked = []
+
+        def precheck(ctx, space, profile, argv=None):
+            checked.append((space, argv))
+            return {"tools": "T", "core": "C", "argv": list(argv)}, None
+        seen, execs, e = self.main_with(["pa-session"] + self.FLAGS, RuntimeError("bug"), precheck=precheck)
+        self.assertIsInstance(e, Execd)
+        argv = [sys.executable, os.path.join(pa.ROOT, "tools", "pa.py"), "session"] + self.FLAGS
+        self.assertEqual(checked, [(SP, argv)])
+        self.assertEqual(execs, [argv])
+
+    def test_a_failing_precheck_stays_in_error_wait_and_says_why(self):
+        answers = [(None, "the installed launcher's self-check failed (exit 1): SyntaxError: invalid syntax"),
+                   ({"tools": "T", "core": "C"}, None)]
+
+        def precheck(ctx, space, profile, argv=None):
+            return answers.pop(0)
+        wait = self.waits(enters=5)
+        seen, execs, e = self.main_with(["pa-session"] + self.FLAGS, RuntimeError("bug"), precheck=precheck,
+                                        error_wait=wait)
+        self.assertIsInstance(e, Execd)
+        self.assertEqual(len(seen), 2, seen)  # the first Enter was refused: error_wait again
+        self.assertIn("self-check failed", seen[1][1])
+        self.assertIn("SyntaxError", seen[1][1])
+        self.assertIn("Enter", seen[1][1])
+        self.assertEqual(len(execs), 1)  # only after the pre-check passed
+
+    def test_d4_a_fix_that_does_not_compile_is_not_execd(self):  # VERIFY D4, the real pre-check
+        write(os.path.join(pa.ROOT, "tools", "pa.py"), "def broken(:\n")
+        self.stamp()  # installed.json matches: only the self-check can catch it
+        wait = self.waits(enters=1)
+        seen, execs, e = self.main_with(["pa-session"] + self.FLAGS, RuntimeError("bug"), precheck=pa.restart_precheck,
+                                        error_wait=wait)
+        self.assertEqual(execs, [])
+        self.assertIsInstance(e, SystemExit)  # the Ctrl-C after the second wait, nothing else
+        self.assertEqual(len(seen), 2, seen)
+        self.assertIn("self-check", seen[1][1])
+
+    def test_an_install_half_done_is_not_execd(self):
+        real_tools()
+        self.stamp()
+        write(os.path.join(pa.ROOT, "tools", "pa_costs.py"), "y = 2\n")  # the files no longer match installed.json
+        wait = self.waits(enters=1)
+        seen, execs, e = self.main_with(["pa-session"] + self.FLAGS, RuntimeError("bug"), precheck=pa.restart_precheck,
+                                        error_wait=wait)
+        self.assertEqual(execs, [])
+        self.assertEqual(len(seen), 2, seen)
+        self.assertIn("installed.json", seen[1][1])
 
 
 if __name__ == "__main__":

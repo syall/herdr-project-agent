@@ -1,6 +1,6 @@
 #!/bin/sh
 # Integration check for pa-session (t-001, spec §4.1: S1 S2 S3 S4 S5 S6a S7; t-037 J2: S8 S9 S10, the restart in
-# place; round 2: S11 S12) against a PRIVATE hc core.
+# place; round 2: S11 S12; round 3: D4 inside S11) against a PRIVATE hc core.
 # Usage: tests/pa_session_check.sh <scratch dir made by tests/setup-scratch.sh>
 # Every hc call goes through scratch(): its own HC_SESSION and XDG folders under the scratch dir,
 # HC_TERMINAL_ID / HC_SOCKET / HC_TERMINAL_SOCKET / HC_SCOPE unset (HC_TERMINAL_SOCKET names the live
@@ -296,6 +296,14 @@ PY3
   wait_for 10 errored && pass "S11 the restarted launcher shows the error (herdr.pa.error)" || fail S11 "label $(label n11 herdr.pa.error); n11: $(scratch hc read n11 2>&1 | tail -n 4)"
   [ "$(state n11)" = live ] && [ "$(scratch hc get n11 --json | json "d.get('pid')")" = "$pid11" ] && pass "S11 terminal live, same pid $pid11" || fail S11 "n11 state $(state n11) pid $(scratch hc get n11 --json | json "d.get('pid')")"
   [ "$(state w11)" = live ] && [ "$(scratch hc get w11 --json | json "d.get('parent')")" = "$(scratch hc get n11 --json | json "d['address']")" ] && pass "S11 worker w11 live and still its child" || fail S11 "w11 state $(state w11)"
+  # D4 (J2 round 3, VERIFY MF-r2-1): a "fix" that does not compile, stamped, then Enter: the pre-check refuses it,
+  # the tab says why and waits again; the terminal, its pid and w11 stay.
+  { printf 'def broken(:\n'; cat "$S/pa.py.good"; } > "$S/pa/tools/pa.py"
+  scratch python3 "$S/pa.py.good" stamp >/dev/null
+  scratch hc send n11 "retry" >/dev/null 2>&1
+  refused11() { label n11 herdr.pa.error | grep -q "cannot be loaded"; }
+  wait_for 30 refused11 && pass "D4 Enter with a pa.py that does not compile: refused, the tab says why" || fail D4 "label $(label n11 herdr.pa.error); n11: $(scratch hc read n11 2>&1 | tail -n 4)"
+  [ "$(state n11)" = live ] && [ "$(scratch hc get n11 --json | json "d.get('pid')")" = "$pid11" ] && [ "$(state w11)" = live ] && pass "D4 terminal live, same pid $pid11, w11 live" || fail D4 "n11 state $(state n11) pid $(scratch hc get n11 --json | json "d.get('pid')") w11 $(state w11)"
   cp "$S/pa.py.good" "$S/pa/tools/pa.py"
   scratch python3 "$S/pa/tools/pa.py" stamp >/dev/null
   before=$(lines)
