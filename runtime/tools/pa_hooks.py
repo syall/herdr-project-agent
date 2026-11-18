@@ -1643,6 +1643,140 @@ def card_owner(row):
     return row["tasks"][0], row["jobs"][row["tasks"][0]], False
 
 
+# ---- which card is a worktree's (t-073) ----------------------------------------------------------------------------
+# A card answers only for the worktree path it names, on the branch it names (when it records one), and only until that
+# worktree is removed. The id alone never decides: an answered card for another path, an earlier worktree at the same
+# folder or another branch is not this worktree's, and the worktree gets its own card under an id no other card holds.
+
+
+def task_cards(directory, task):
+    """{card id: card} of the task's worktree cards, in decisions/ and decisions-archive/ (decisions/ wins, t-054): files
+    d-wt-<task>.json and d-wt-<task>-*.json whose `task` is the task and which name a `worktree`."""
+    prefix, ids = "d-wt-" + str(task), set()
+    for sub in (pa.ARCHIVE, "decisions"):
+        folder = os.path.join(directory, sub)
+        for name in os.listdir(folder) if os.path.isdir(folder) else []:
+            cid = name[:-len(".json")] if name.endswith(".json") else None
+            if cid and (cid == prefix or cid.startswith(prefix + "-")):
+                ids.add(cid)
+    cards = {}
+    for cid in sorted(ids):
+        card = pa.read_json_safe(pa.card_file(directory, cid))
+        if (isinstance(card, dict) and card.get("task") == task and isinstance(card.get("worktree"), str)
+                and card["worktree"].strip()):
+            cards[cid] = card
+    return cards
+
+
+def card_tree(card):
+    return os.path.realpath(os.path.expanduser(card.get("worktree") or "/nonexistent"))
+
+
+def card_spent(card, entry):
+    """Why a card no longer counts for any worktree, or None: its worktree was removed (`worktreeRemoved`, written by
+    pa-worktree remove), or the ledger task records its path removed at or after the card was answered (or asked, for an
+    open one; any removal when the card has no time): a card from before t-073 for a folder made again later."""
+    if card.get("worktreeRemoved"):
+        return "its worktree was removed at {}".format(clean(card["worktreeRemoved"]))
+    stamp = str(card.get("answered") or card.get("created") or "")
+    path = card_tree(card)
+    for e in (entry or {}).get("worktrees") or [] if isinstance((entry or {}).get("worktrees"), list) else []:
+        if (isinstance(e, dict) and isinstance(e.get("path"), str) and e["path"].strip() and e.get("removed")
+                and os.path.realpath(os.path.expanduser(e["path"])) == path and (not stamp or str(e["removed"]) >= stamp)):
+            return "its worktree was removed at {}, after the card".format(clean(e["removed"]))
+    return None
+
+
+def branch_differs(card, facts):
+    """Why a card names another branch than the worktree is on now, or None (only when both are known)."""
+    then, now = card.get("branch"), (facts or {}).get("branch")
+    if isinstance(then, str) and then and isinstance(now, str) and now and then != now:
+        return "it was asked for branch {}; the worktree is on {} now".format(clean(then), clean(now))
+    return None
+
+
+def card_for(directory, row, task, entry):
+    """(id, path, card) of the worktree's own card among the task's, or (None, None, None): a card whose worktree is the
+    row's path, not spent and not for another branch. An open card first, then the newest answered, then the newest
+    withdrawn (asked again under its id)."""
+    mine = [(cid, c) for cid, c in task_cards(directory, task).items()
+            if card_tree(c) == row["path"] and not card_spent(c, entry) and not branch_differs(c, row.get("facts"))]
+    rank = {"open": 2, "answered": 1}
+    mine.sort(key=lambda x: (rank.get(x[1].get("status"), 0), str(x[1].get("answered") or x[1].get("created") or "")), reverse=True)
+    if not mine:
+        return None, None, None
+    cid, card = mine[0]
+    return cid, pa.card_file(directory, cid), card
+
+
+def new_card_id(directory, task, job, main):
+    """The first free id of a worktree's new card: d-wt-<task> (the main worktree only), d-wt-<task>-<job>, then
+    d-wt-<task>-<job>-2, -3, ... An id held by any card (decisions/ or the archive) is never reused for another worktree."""
+    first = ["d-wt-{}".format(task)] if main else []
+    for cid in first + ["d-wt-{}-{}".format(task, job)]:
+        if not os.path.lexists(pa.card_file(directory, cid)):
+            return cid
+    n = 2
+    while os.path.lexists(pa.card_file(directory, "d-wt-{}-{}-{}".format(task, job, n))):
+        n += 1
+    return "d-wt-{}-{}-{}".format(task, job, n)
+
+
+def md_for(task, cid):
+    """The evidence file of card `cid`: WORKTREE.md for d-wt-<task>, WORKTREE-<rest>.md for d-wt-<task>-<rest>."""
+    prefix = "d-wt-{}".format(task)
+    return "WORKTREE.md" if cid == prefix else "WORKTREE-{}.md".format(cid[len(prefix) + 1:])
+
+
+def stale_open_card(card, rows, entry):
+    """Why an open card of a task stands for no worktree any more, or None: no task records its path, its worktree was
+    removed after it was asked, or the worktree is on another branch now."""
+    path = card_tree(card)
+    if path not in rows:
+        return "its worktree {} is no longer recorded".format(clean(card.get("worktree")))
+    return card_spent(card, entry) or branch_differs(card, rows[path].get("facts"))
+
+
+def ledger_tasks(directory):
+    """{task id: ledger entry} (read only)."""
+    tasks = read_ledger(directory).get("tasks")
+    return {t["id"]: t for t in tasks if isinstance(t, dict) and isinstance(t.get("id"), str)} if isinstance(tasks, list) else {}
+
+
+def withdraw_stale(directory, rows, entries, open_cards):
+    """pa-worktree check: an open worktree card that stands for no worktree any more (stale_open_card) is said, and
+    withdrawn with --open-cards, so it is never answered Delete for nothing. Answered and withdrawn cards stay as they are."""
+    for task in sorted(entries):
+        for cid, card in task_cards(directory, task).items():
+            why = card.get("status") == "open" and stale_open_card(card, rows, entries.get(task))
+            if not why:
+                continue
+            if open_cards:
+                withdraw_card(directory, pa.card_file(directory, cid), card, task, why)
+            else:
+                print("{}: card {} is open, but {}; --open-cards withdraws it".format(task, cid, why))
+
+
+def refuse_others(directory, row, task, entry):
+    """pa-worktree remove with no answered card of the worktree's own: when an answered Delete of the task names another
+    worktree (another path, an earlier worktree at this folder, another branch), refuse and name it (t-073 R3)."""
+    found = []
+    for cid, card in task_cards(directory, task).items():
+        if card.get("status") != "answered" or not str(card.get("answer", "")).lower().startswith("delete"):
+            continue
+        if card_tree(card) != row["path"]:
+            found.append((str(card.get("answered") or ""), "the card is for {}, not {} (card {} answered {!r})".format(
+                clean(card.get("worktree")), row["path"], cid, card.get("answer"))))
+        else:
+            why = card_spent(card, entry) or branch_differs(card, row.get("facts"))
+            if why:
+                found.append((str(card.get("answered") or ""), "card {} answered {!r} was for an earlier worktree at {}: {}".format(
+                    cid, card.get("answer"), row["path"], why)))
+    if found:
+        raise pa.Problem("{}; nothing was removed. {} gets its own card from `pa-worktree check --open-cards`".format(
+            max(found)[1], row["path"]))
+
+
 def in_worktrees_folder(path):
     """True when the worktree sits in a folder named `worktrees`: <project>/worktrees/<container>/<repo> or
     <workspace>/worktrees/<name>. A job's worktree elsewhere is neither offered nor removed (D4)."""
@@ -1740,8 +1874,9 @@ def withdraw_card(directory, path, card, task, why):
     print("{}: withdrew card {}: {}".format(task, card["id"], why))
 
 
-def open_worktree_card(directory, row, facts, profile, owner, rule, gone, desc=None):
-    """Writes the Delete/Keep card of one worktree and its evidence file; returns the recommendation."""
+def open_worktree_card(directory, row, facts, profile, owner, rule, gone, desc=None, cid=None):
+    """Writes the Delete/Keep card of one worktree and its evidence file; returns the recommendation. `cid`: the id of
+    the worktree's own withdrawn card, asked again under it; else a new id no other card holds (new_card_id, t-073)."""
     task, job, main = owner
     named = rule == "b" or not main or job != "main"
     extra = []
@@ -1759,7 +1894,8 @@ def open_worktree_card(directory, row, facts, profile, owner, rule, gone, desc=N
     loss = branch_loss(desc, facts)
     loses_commits = facts.get("removesBranches") and (loss["lost"] != 0 if loss else facts["unpushed"] > 0)
     dirty = facts["uncommitted"] > 0 or loses_commits
-    cid, md_file = card_id(task, job, main), md_name(job, main)
+    cid = cid or new_card_id(directory, task, job, main)
+    md_file = md_for(task, cid)
     evidence = []
     try:
         pa.write_text(os.path.join(directory, "evidence", task, md_file), worktree_md(desc, row, facts, gone, cid, extra))
@@ -1768,9 +1904,10 @@ def open_worktree_card(directory, row, facts, profile, owner, rule, gone, desc=N
         pass
     squash = (" " + SQUASH if any(c["merged"] is False for r in desc["repos"] for c in r["commits"]) else "")
     titles = ", ".join('{} "{}"'.format(clean(t), cut(clean(row["titles"].get(t, "")), 60)) for t in row.get("counted") or row["tasks"])
-    path = card_path(directory, task, job, main)
+    path = pa.card_file(directory, cid)
     pa.write_card(directory, path, dict(carried(pa.read_json(path)), **{
-        "id": cid, "task": task, "worktree": row["path"], "job": job, "main": main, "rule": rule, "tasks": row_tasks(row),
+        "id": cid, "task": task, "worktree": row["path"], "branch": facts.get("branch") or None, "job": job, "main": main,
+        "rule": rule, "tasks": row_tasks(row),
         "question": "Delete the worktree for {}{}?".format(titles, ", job {}".format(clean(job)) if named else ""),
         "context": card_context(desc, row, facts, gone, extra, md_file),
         "evidence": evidence,
@@ -2060,14 +2197,17 @@ def cmd_worktree(args):
         raise pa.Problem("pass --space <id>, or run this from the Project Agent's terminal")
     directory, agent, profile = load_context(space)
     rows = worktree_state(directory, agent, profile)
+    entries = ledger_tasks(directory)
     if args.action == "check":
         for row in rows.values():
             owner = card_owner(row)
             task, job, main = owner
-            facts, path = row["facts"], card_path(directory, task, job, main)
-            card = pa.read_json(path)
+            facts = row["facts"]
+            # The worktree's own card only (t-073): one for another path, an earlier worktree here or another branch never counts.
+            cid, path, card = card_for(directory, row, task, entries.get(task))
+            again = None
             if card and card.get("status") == "withdrawn":
-                card = None  # asked again once its job is over or every task is done or parked
+                card, again = None, cid  # asked again under its id once its job is over or every task is done or parked
             fates = [w["fate"] for w in row["workers"]]
             still = tasks_still(row)
             mismatch = card and card_mismatch(row, card, card.get("status") == "answered")
@@ -2130,7 +2270,7 @@ def cmd_worktree(args):
                 elif not args.open_cards:
                     print("{}: candidate, job {} is over (every commit merged); --open-cards asks the person".format(task, clean(job)))
                 else:
-                    open_worktree_card(directory, row, facts, profile, owner, "b", gone, desc)
+                    open_worktree_card(directory, row, facts, profile, owner, "b", gone, desc, cid=again)
             elif "live" in fates:
                 print("{}: in use by {}".format(task, ", ".join(w["address"] for w in row["workers"] if w["fate"] == "live")))
             elif row["others"]:
@@ -2139,7 +2279,8 @@ def cmd_worktree(args):
                 # Every task is done or parked and nothing runs inside: a candidate, however its workers ended.
                 print("{}: candidate, every task done or parked ({}); --open-cards asks the person".format(task, gone))
             else:
-                open_worktree_card(directory, row, facts, profile, owner, "a", gone)
+                open_worktree_card(directory, row, facts, profile, owner, "a", gone, cid=again)
+        withdraw_stale(directory, rows, entries, args.open_cards)
         if not rows:
             print("No task in the ledger has a worktree.")
         check_unrecorded(directory, agent, profile, rows, args.open_cards)
@@ -2148,8 +2289,10 @@ def cmd_worktree(args):
     row = pick_row(rows, args.task, args.job)
     owner = card_owner(row)
     task, job, main = owner
-    path = card_path(directory, task, job, main)
-    card = pa.read_json(path) or {}
+    _cid, path, card = card_for(directory, row, task, entries.get(task))
+    card = card or {}
+    if card.get("status") != "answered":
+        refuse_others(directory, row, task, entries.get(task))
     if card.get("status") == "answered" and pa.is_other(card):
         raise pa.Problem('card {id} was answered Other, in the person\'s own words: "{words}". pa-worktree removes nothing on it. '
                          'Act on their words; if they ask for the worktree to go, withdraw the card (pa-decide {id} --withdraw '
@@ -2204,13 +2347,21 @@ def cmd_worktree(args):
         done = remove_worktree(row["path"], facts)
     except pa.Problem:
         if not os.path.lexists(row["path"]):  # it failed, but the folder is gone: the ledger must not name it
+            spend_card(directory, path, card)
             mark_removed_everywhere(directory, row, "the worktree {} is gone after a failed removal (card {})".format(row["path"], card["id"]))
         raise
+    spend_card(directory, path, card)
     print(done + " (card {})".format(card["id"]))
     tidy = remove_container(row["given"])
     if tidy:
         print(tidy)
     mark_removed_everywhere(directory, row, "removed the worktree {} (card {})".format(row["path"], card["id"]))
+
+
+def spend_card(directory, path, card):
+    """After its worktree is removed (or gone after a failed removal), the card never counts again (t-073 R3b)."""
+    card["worktreeRemoved"] = pa.now()
+    pa.write_card(directory, path, card)
 
 
 def withdraw_answered(directory, path, card, task, why):
