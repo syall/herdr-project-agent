@@ -4508,12 +4508,12 @@ class J1C_Summary(Collecting):
         dump(prof, os.path.join(self.profile_dir, "profile.json"))
         self.ledger({"version": 1, "tasks": [{"id": "t-001", "state": "in-progress", "workers": []}]})
         self.record(session=SID, task="t-001", terminal="t5", name="t-001-build", model="global.model-a", provider="provider-a",
-                    providerBy="launch", endpoint="global", endpointBy="rule", region="region-a", regionBy="machine",
+                    providerBy="launch", endpoint="global", endpointBy="rule", region=None, regionBy="unknown",
                     account="acct-a", accountBy="env")
         self.add(self.prompt(T0 + 10), self.call(T0 + 12, "g1", lines=1, out=1000000))
         self.record(session=SID2, task="t-001", terminal="t6", name="t-001-check", model="model-a", provider="provider-a",
                     providerBy="launch", endpoint="regional", endpointBy="rule", region="region-a", regionBy="machine",
-                    account="acct-b", accountBy="env")
+                    account="acct-c", accountBy="env")
         self.add(self.prompt(T0 + 20, sid=SID2), self.call(T0 + 22, "r1", sid=SID2, lines=1, out=1000000), sid=SID2)
         self.collect(T0 + 5000)
         return load(self.costs("summary.json"))
@@ -4523,24 +4523,24 @@ class J1C_Summary(Collecting):
         self.assertAlmostEqual(s["totals"]["money"], 10.0 + 11.0, places=4)
         self.assertEqual(s["scopes"], 2)
         scopes = {e["key"]: e for e in s["byScope"]}
-        self.assertEqual(set(scopes), {"provider-a · global · region-a · acct-a", "provider-a · regional · region-a · acct-b"})
-        g = scopes["provider-a · global · region-a · acct-a"]
+        self.assertEqual(set(scopes), {"provider-a · global · ? · acct-a", "provider-a · regional · region-a · acct-c"})
+        g = scopes["provider-a · global · ? · acct-a"]
         self.assertAlmostEqual(g["money"], 10.0, places=4)
-        self.assertEqual(g["scope"], ["provider-a", "global", "region-a", "acct-a"])
+        self.assertEqual(g["scope"], ["provider-a", "global", None, "acct-a"])
         self.assertEqual(g["pricedAs"], [{"scope": ["provider-a", "global", "*", "*"], "validFrom": "2026-01-01"}])
-        r = scopes["provider-a · regional · region-a · acct-b"]
+        r = scopes["provider-a · regional · region-a · acct-c"]
         self.assertEqual(r["pricedAs"], [{"scope": ["provider-a", "regional", "region-a", "*"], "validFrom": "2026-01-01"}])
         self.assertAlmostEqual(money_of(s["byScope"]), s["totals"]["money"], places=4)
         for key in ("byProvider", "byEndpoint", "byRegion", "byAccount"):
             self.assertAlmostEqual(money_of(s[key]), s["totals"]["money"], places=4, msg=key)
-        self.assertEqual({e["key"] for e in s["byAccount"]}, {"acct-a", "acct-b"})
+        self.assertEqual({e["key"] for e in s["byAccount"]}, {"acct-a", "acct-c"})
         self.assertEqual({e["key"] for e in s["byEndpoint"]}, {"global", "regional"})
         dm = {(e["endpoint"], e["account"]): e for e in s["byDayModel"]}
-        self.assertEqual(set(dm), {("global", "acct-a"), ("regional", "acct-b")})
-        self.assertEqual(dm[("regional", "acct-b")]["pricedAs"]["scope"], ["provider-a", "regional", "region-a", "*"])
-        self.assertEqual(dm[("regional", "acct-b")]["region"], "region-a")
+        self.assertEqual(set(dm), {("global", "acct-a"), ("regional", "acct-c")})
+        self.assertEqual(dm[("regional", "acct-c")]["pricedAs"]["scope"], ["provider-a", "regional", "region-a", "*"])
+        self.assertEqual(dm[("regional", "acct-c")]["region"], "region-a")
         sess = {e["key"]: e for e in s["sessions"]}
-        self.assertEqual((sess[SID[:8]]["endpoint"], sess[SID2[:8]]["account"]), ("global", "acct-b"))
+        self.assertEqual((sess[SID[:8]]["endpoint"], sess[SID2[:8]]["account"]), ("global", "acct-c"))
 
     def test_j1c2_unknown_region_and_unpriced_scope(self):
         self.prices(scoped_fixture())
@@ -4588,8 +4588,8 @@ class J1C_Report(J1C_Summary):
 
     def test_j1c5_report_by_each_fact_and_scope(self):
         self.two_scopes()
-        for by, want in (("provider", "provider-a"), ("endpoint", "regional"), ("region", "region-a"), ("account", "acct-b"),
-                         ("scope", "provider-a · regional · region-a · acct-b")):
+        for by, want in (("provider", "provider-a"), ("endpoint", "regional"), ("region", "region-a"), ("account", "acct-c"),
+                         ("scope", "provider-a · regional · region-a · acct-c")):
             out = self.report(by=by)
             self.assertIn(want[:26], out, by)
         out = self.report(by="scope")
@@ -4607,28 +4607,28 @@ class J1C_Report(J1C_Summary):
     def test_j1c7_account_wide_per_entry_label(self):
         self.two_scopes()
         other = os.path.join(pa.ROOT, "spaces", "sp2", "costs", "summary.json")
-        dump({"account": "acct-b", "updated": "2026-11-17T09:00:00Z",
+        dump({"account": "acct-c", "updated": "2026-11-17T09:00:00Z",
               "byDayModel": [{"day": "2026-11-17", "model": "model-a", "tokens": toks(out=5), "money": 2.0}]}, other)
-        here = pa_costs.account_wide_summary("acct-b", T0)
+        here = pa_costs.account_wide_summary("acct-c", T0)
         self.assertEqual(here["spaces"], ["sp1", "sp2"])
         self.assertAlmostEqual(sum(e["money"] for e in here["byDayModel"]), 11.0 + 2.0, places=4)
         here = pa_costs.account_wide_summary("acct-a", T0)
         self.assertEqual(here["spaces"], ["sp1"])
         self.assertAlmostEqual(sum(e["money"] for e in here["byDayModel"]), 10.0, places=4)
-        _r, out, _e = self.run_cmd(pa_costs.main, ["report", "--account-wide", "--account", "acct-b"])
-        self.assertEqual(json.loads(out)["account"], "acct-b")
-        _r, _out, err = self.run_cmd(pa_costs.main, ["report", "--account-wide", "--account", "12345" + "6789012"])
-        self.assertNotEqual(_r, 0)
+        _r, out, _e = self.run_cmd(pa_costs.main, ["report", "--account-wide", "--account", "acct-c"])
+        self.assertEqual(json.loads(out)["account"], "acct-c")
+        with self.assertRaises(pa.Problem):  # the command line turns it into exit 2
+            pa_costs.main(["report", "--account-wide", "--account", "12345" + "6789012"])
 
 
 class J1C_Billed(J1C_Summary):
     def test_j1c8_billed_compare_per_account(self):
         s = self.two_scopes()
         table, _p = pa_costs.load_prices(pa.load_profile("test"))
-        billed = [{"account": "acct-b", "from": "2026-11-17", "to": "2026-11-17", "model": "model-a", "amount": 12.0,
+        billed = [{"account": "acct-c", "from": "2026-11-17", "to": "2026-11-17", "model": "model-a", "amount": 12.0,
                    "currency": "USD", "final": True, "source": "q"}]
-        here = pa_costs.account_wide_summary("acct-b", T0)
-        c = pa_costs.billing_comparison(billed, dict(s, account="acct-b"), here, table)
+        here = pa_costs.account_wide_summary("acct-c", T0)
+        c = pa_costs.billing_comparison(billed, dict(s, account="acct-c"), here, table)
         self.assertAlmostEqual(c["total"]["thisSpace"], 11.0, places=4)
         self.assertAlmostEqual(c["total"]["allSpaces"], 11.0, places=4)
 
