@@ -408,6 +408,7 @@ if wait_for $START_WAIT has_lines $((before + 1)) && wait_for 10 test -s "$S/pa/
   # with the same argv in a new pane).
   ( wait_for 90 not_live n13 && sleep 4 && old_launcher k13 "$SP13" "$S/proj13" ) &
   keeper13=$!
+  sleep 21  # past RAN (20 s): a session that ran is resumed by the next launcher; a shorter one is new (S3)
   before=$(lines)
   end13 r13 "$SP13" "$S/r13c.out"
   if answer13 r13 "$S/r13c.out"; then

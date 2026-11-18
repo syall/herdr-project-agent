@@ -23,6 +23,9 @@ One file, selected by the name it is invoked as (symlinks in ~/.local/bin):
                                                  restart the space's Project Agent in place (terminal, workers stay)
   pa-context set [--mode fresh|off] [--net N] ...   the Project Agent's context settings (t-041; the person's)
   pa-context compact-instructions|start-pack|compacted   the Project Agent's compaction hooks (Claude Code runs them)
+  pa-restart --space ID --end-terminal [--anyway] [--dry-run]
+                                                 for a launcher from before restart support only: end its terminal
+                                                 (and its workers), after a typed yes; the keeper or pa-start reopens it
 
 In pa_costs.py (see its docstring), linked as pa-costs: cost tracking per space (collect, report,
 reconstruct, prices, billed ...). Tokens are measured; money is an estimate from the profile's price table.
@@ -2553,12 +2556,29 @@ def relay(argv):
     return subprocess.run(argv).returncode
 
 
-def r10_message(agent, record, workers):
-    started = as_text(as_dict(record).get("started")) or "before launcher.json existed"
+def last_start(directory):
+    """The time of the last Claude start in the space's session.log, or None."""
+    try:
+        with open(os.path.join(directory, "session.log")) as f:
+            lines = f.read().splitlines()
+    except (OSError, ValueError):
+        return None
+    for line in reversed(lines):
+        parts = line.split()
+        if len(parts) > 1 and parts[1] == "start":
+            return parts[0]
+    return None
+
+
+def r10_message(agent, record, workers, directory=None):
+    started = (as_text(as_dict(record).get("started")) or (last_start(directory) if directory else None)
+               or "before launcher.json existed")
     names = ", ".join("{} {}".format(a, n) for a, n in workers) or "none"
+    space = as_text(as_dict(agent).get("space")) or "ID"
     return ("This Project Agent's launcher started before restart support ({}). It cannot take a restart request; "
-            "it can only be restarted by ending its terminal, which also ends its {} worker(s): {}. Close it and open "
-            "it again from the panel when they are done.".format(started, len(workers), names))
+            "it can only be restarted by ending its terminal, which also ends its {} worker(s): {}. Run "
+            "`pa-restart --space {} --end-terminal` when they are done, or add `--anyway`.".format(
+                started, len(workers), names, space))
 
 
 def live_workers(directory, agent):
@@ -2582,9 +2602,9 @@ def live_workers(directory, agent):
     return rows
 
 
-def identify_launcher(directory, agent):
-    """(launcher record, hc record) of the space's running launcher when every R5 check holds, else Problem naming
-    the check that failed. Nothing is written or ended here."""
+def check_terminal(directory, agent):
+    """(terminal, hc record) when R5's checks (a), (c), (d) hold: agent.json open and naming a terminal, a fresh
+    heartbeat naming it, and hc's terminal live, labelled for the space, with no parent. Else Problem."""
     space = agent.get("space")
     if agent.get("closed"):
         raise Problem("this space's Project Agent is closed ({}); open it first".format(agent.get("closed")))
@@ -2608,15 +2628,24 @@ def identify_launcher(directory, agent):
         problems.append("terminal {} has a parent ({}): not a Project Agent's tab".format(terminal, term.get("parent")))
     if problems:
         raise Problem("cannot restart: " + "; ".join(problems))
+    return terminal, term
+
+
+def identify_launcher(directory, agent):
+    """(launcher record, hc record) of the space's running launcher when every R5 check holds, else Problem naming
+    the check that failed. Nothing is written or ended here."""
+    terminal, term = check_terminal(directory, agent)
+    space = agent.get("space")
     record = read_json_safe(os.path.join(directory, "launcher.json"))
     if not restart_capable(record):
-        raise Problem(r10_message(agent, record, live_workers(directory, agent)))
+        raise Problem(r10_message(agent, record, live_workers(directory, agent), directory))
+    instead = " (pa-restart --space {} --end-terminal ends its terminal instead)".format(space)
     if record.get("space") != space or record.get("terminal") != terminal:
-        raise Problem("cannot restart: launcher.json is for terminal {} in space {}, not terminal {}".format(
-            record.get("terminal"), record.get("space"), terminal))
+        raise Problem("cannot restart: launcher.json is for terminal {} in space {}, not terminal {}{}".format(
+            record.get("terminal"), record.get("space"), terminal, instead))
     if term.get("pid") != record.get("pid"):
         raise Problem("cannot restart: terminal {} runs pid {}, launcher.json says pid {}: not the launcher that "
-                      "wrote it".format(terminal, term.get("pid"), record.get("pid")))
+                      "wrote it{}".format(terminal, term.get("pid"), record.get("pid"), instead))
     return record, term
 
 
@@ -2672,6 +2701,11 @@ def cmd_restart(args):
     space's launcher, says what runs now and which workers keep running, writes restart-request.json and waits for
     what the new launcher loaded. It ends nothing itself; the launcher ends its own Claude and execs."""
     in_claude = os.environ.get("CLAUDECODE") not in (None, "", "0")
+    if getattr(args, "end_terminal", False):  # t-037 J3, R10: the person's command only, also with --on
+        if in_claude:
+            raise Problem("pa-restart --end-terminal is the person's command: it ends the Project Agent's terminal and "
+                          "its workers. Ask the person to run it.")
+        return end_terminal(args)
     if in_claude and not (args.why or "").strip():  # also for --on (round 2, REVIEW A M4)
         raise Problem("inside Claude, pa-restart needs --why quoting the person's own words")
     if args.on:
@@ -2769,6 +2803,292 @@ def cmd_restart(args):
         wait, "it is mid-turn" if agent_turn(terminal) in ("working", "blocked") else "the launcher did not answer",
         "the request was withdrawn" if removed else "a newer request is waiting"), file=sys.stderr)
     sys.exit(1)
+
+
+# ---- pa-restart --end-terminal: the one-time bridge for a launcher from before restart support, t-037 R10 ----------
+# Only for a launcher with no restart-capable launcher.json of its own (spec S4). It ends that terminal through hc
+# (its Claude and every worker tied to it end with it), after every check, the person's typed yes and the checks
+# again under the launch lock; then the keeper restores it, or pa-start opens it, or the person uses the panel's Open.
+# The person's command only: refused inside Claude, and the guard refuses pa-restart in workers.
+
+KEEPER_WAIT = 45  # seconds to wait for the keeper's restore before pa-start (the Mac restores an ended PA in seconds)
+END_WAIT = 15  # seconds for hc kill's terminal to finish
+END_POLL = 0.5
+PYTHON_NAME = re.compile(r"python[0-9.]*$")
+
+
+def pa_session_argv(argv, space):
+    """R10 (e): hc's start argv of the terminal is a launcher for this space: `pa-session ... --space <id>`, or a
+    python running pa.py session with that flag; exactly one --space value, the space's local id."""
+    if not isinstance(argv, list) or not argv or not all(isinstance(a, str) for a in argv):
+        return False
+    base = os.path.basename(argv[0])
+    if base == "pa-session":
+        rest = argv[1:]
+    elif PYTHON_NAME.match(base) and len(argv) >= 3 and os.path.basename(argv[1]) == "pa.py" and argv[2] == "session":
+        rest = argv[3:]
+    else:
+        return False
+    values, i = [], 0
+    while i < len(rest):
+        if rest[i] == "--space":
+            if i + 1 >= len(rest):
+                return False
+            values.append(rest[i + 1])
+            i += 2
+            continue
+        if rest[i].startswith("--space="):
+            values.append(rest[i][len("--space="):])
+        i += 1
+    return bool(space) and len(values) == 1 and local_id(values[0]) == space
+
+
+def identify_old_launcher(directory, agent):
+    """(terminal, hc record, note) of the space's running launcher when R10's checks hold and it cannot take an
+    in-place restart, else Problem naming what failed. Nothing is written or ended here."""
+    terminal, term = check_terminal(directory, agent)
+    space = agent.get("space")
+    argv = term.get("argv")
+    if not pa_session_argv(argv, space):
+        shown = " ".join(a for a in argv[:4] if isinstance(a, str)) if isinstance(argv, list) else ""
+        raise Problem("cannot end it: its terminal's program is {!r}, not this space's pa-session; close it by hand "
+                      "if it is the Project Agent".format(shown or "unknown"))
+    record = read_json_safe(os.path.join(directory, "launcher.json"))
+    rec = as_dict(record)
+    note = None
+    if restart_capable(record):
+        if rec.get("terminal") == terminal and rec.get("pid") == term.get("pid"):
+            text = ("This launcher takes an in-place restart: run pa-restart --space {} (its workers keep "
+                    "running).".format(space))
+            last = as_dict(rec.get("restart"))
+            if last.get("outcome") == "failed":
+                text += (" Its last restart failed: {}. Ending the terminal would start the same installed code; fix "
+                         "the install (pa-doctor), then pa-restart.".format(as_text(last.get("why")) or "no reason recorded"))
+            raise Problem(text)
+        note = "launcher.json is from terminal {} pid {}, not this launcher".format(rec.get("terminal"), rec.get("pid"))
+    elif rec.get("terminal") == terminal and "pid" in rec and rec.get("pid") != term.get("pid"):
+        raise Problem("cannot end it: launcher.json disagrees with the terminal (pid {} in launcher.json, {} in hc): "
+                      "not certain which launcher runs there".format(rec.get("pid"), term.get("pid")))
+    return terminal, term, note
+
+
+def called_from(terminal):
+    """This command runs in `terminal` or in one of its children (it would end with it)."""
+    address, seen = os.environ.get("HC_TERMINAL_ID"), set()
+    while address and address not in seen and len(seen) < 6:
+        if local_id(address) == local_id(terminal):
+            return True
+        seen.add(address)
+        address = as_dict(hc_get(address)).get("parent")
+    return False
+
+
+def interactive():
+    """Someone can type the answer: stdin is a terminal."""
+    return sys.stdin.isatty()
+
+
+def ask_yes(prompt):
+    """The typed answer, or None on end of input or Ctrl-C."""
+    try:
+        return input(prompt)
+    except (EOFError, KeyboardInterrupt):
+        return None
+
+
+def herdr_app():
+    return shutil.which("herdr-app")
+
+
+def relay_output(argv):
+    """Runs argv (pa-restart --end-terminal --on): (exit code, its stdout); its stderr goes to this terminal."""
+    r = subprocess.run(argv, stdout=subprocess.PIPE, universal_newlines=True)
+    return r.returncode, r.stdout
+
+
+def end_result(args, outcome, code, terminal=None, workers=(), restored=None, why=None, err=None):
+    if err:
+        print(err, file=sys.stderr)
+    if getattr(args, "json", False):
+        print(json.dumps({"outcome": outcome, "terminal": terminal, "workers": list(workers), "restoredBy": restored,
+                          "why": why}))
+    if code:
+        sys.exit(code)
+
+
+def end_summary(agent, terminal, workers, note, installed, turn):
+    """What ending the terminal ends and what stays (said before the question, and by --dry-run)."""
+    sid = agent.get("sessionId")
+    turn_text = ("mid-turn ({}): its current turn is cut off".format(turn) if turn in ("working", "blocked")
+                 else "idle" if turn == "idle" else "its turn is not known")
+    lines = ["Project Agent {} (space {}) in terminal {}: its launcher started before restart support{}.".format(
+        agent.get("name"), agent.get("space"), terminal, " ({})".format(note) if note else "")]
+    lines.append("Ends: terminal {} (the Project Agent's tab program), its Claude {} (session {}; {}), and its {} "
+                 "worker(s){}".format(terminal, agent.get("name"), sid, turn_text, len(workers), ":" if workers else "."))
+    lines += ["  {} {}: ends; its work in progress is lost".format(a, n) for a, n in workers]
+    lines.append("Keeps: the state folder (ledger, journal, decisions, evidence), the session id {} (the new launcher "
+                 "resumes it), the worktrees and every commit in them.".format(sid))
+    lines.append("Then: a new launcher running the installed code (tools {}, core {}), restored by the keeper or "
+                 "opened by pa-start; it restarts in place from then on.".format(
+                     (as_text(installed.get("tools")) or "none")[:12], (as_text(installed.get("core")) or "none")[:12]))
+    return lines
+
+
+def end_terminal(args):
+    """pa-restart --end-terminal (R10): the steps of plan.md J3.2. The one ending call is `hc kill <terminal>`."""
+    if getattr(args, "now", False) or getattr(args, "fresh", False):
+        raise Problem("--end-terminal takes neither --now nor --fresh: the terminal ends at once and the new launcher "
+                      "resumes the same session")
+    if getattr(args, "on", None):
+        return end_terminal_on(args)
+    directory, agent = space_for_command(args.space)
+    terminal, term, note = identify_old_launcher(directory, agent)
+    if called_from(terminal):
+        raise Problem("run it from another tab: this one is terminal {} or one of its children and would end with "
+                      "it".format(terminal))
+    space = agent.get("space")
+    workers = live_workers(directory, agent)
+    addresses = sorted(a for a, _n in workers)
+    for line in end_summary(agent, terminal, workers, note, as_dict(installed_stamp()), agent_turn(terminal)):
+        print(line)
+    if args.dry_run:
+        print("Dry run: nothing ended.")
+        return end_result(args, "dry-run", 0, terminal, addresses)
+    if workers and not getattr(args, "anyway", False):
+        return end_result(args, "refused", 1, terminal, addresses, why="workers running",
+                          err="refused: {} worker(s) running (listed above). Run it again when they are done, or add "
+                              "--anyway to end them too.".format(len(workers)))
+    confirmed = getattr(args, "confirmed_terminal", None)
+    if confirmed is not None:  # the --on relay: the person answered yes on the other machine for exactly these
+        want = sorted(w for w in (getattr(args, "confirmed_workers", None) or "").split(",") if w and w != "-")
+        if confirmed != terminal or want != addresses:
+            return end_result(args, "refused", 1, terminal, addresses, why="changed",
+                              err="refused: it changed since you answered (you confirmed terminal {} and workers {}; "
+                                  "now terminal {} and workers {}); nothing ended".format(
+                                      confirmed, ", ".join(want) or "none", terminal, ", ".join(addresses) or "none"))
+    else:
+        if not interactive():
+            return end_result(args, "refused", 1, terminal, addresses, why="no terminal to answer in",
+                              err="refused: --end-terminal asks you to type yes; run it in a terminal")
+        if workers:
+            print("It also ends these {} worker(s):".format(len(workers)))
+            for a, n in workers:
+                print("  {} {}".format(a, n))
+        sys.stdout.flush()
+        answer = ask_yes("Type yes to end terminal {} and {} worker(s): ".format(terminal, len(workers)))
+        if (answer or "").strip().lower() != "yes":
+            print("Not ended.")
+            return end_result(args, "not-ended", 1, terminal, addresses, why="not confirmed")
+    lock = launch_lock(space, wait=10)
+    try:
+        changed = None
+        try:  # the checks again, right before the end: nothing may have moved since the answer
+            again = as_dict(read_json_safe(os.path.join(directory, "agent.json")))
+            terminal2, term2, _note = identify_old_launcher(directory, again)
+            workers2 = sorted(a for a, _n in live_workers(directory, again))
+        except Problem as e:
+            changed = str(e)
+        else:
+            if terminal2 != terminal or term2.get("pid") != term.get("pid"):
+                changed = "the launcher is now terminal {} pid {}".format(terminal2, term2.get("pid"))
+            elif workers2 != addresses:
+                changed = "workers now: {}".format(", ".join(workers2) or "none")
+        if changed:
+            return end_result(args, "refused", 1, terminal, addresses, why="changed",
+                              err="refused: it changed since you answered ({}); nothing ended".format(changed))
+        why = (getattr(args, "why", None) or "").strip() or "replace a launcher from before restart support"
+        with open(os.path.join(directory, "session.log"), "a") as log:
+            log.write("{} end-terminal terminal={} workers={} by=pa-restart\n".format(now(), terminal, len(addresses)))
+        with open(os.path.join(directory, "journal.jsonl"), "a") as journal:
+            journal.write(json.dumps({"at": now(), "by": "person", "trigger": "pa-restart --end-terminal", "why": why,
+                                      "terminal": terminal, "workers": addresses}) + "\n")
+        error = None
+        try:
+            call(["hc", "kill", terminal])  # hc ends the terminal it names; no pid is used (R9)
+        except Problem as e:
+            error = str(e)
+    finally:
+        lock.close()
+    deadline = time.time() + END_WAIT
+    while as_dict(hc_get(terminal)).get("state") == "live" and time.time() < deadline:
+        time.sleep(END_POLL)
+    if as_dict(hc_get(terminal)).get("state") == "live":
+        with open(os.path.join(directory, "session.log"), "a") as log:
+            log.write("{} end-terminal not-ended terminal={}\n".format(now(), terminal))
+        return end_result(args, "not-ended", 1, terminal, addresses, why=error or "still live",
+                          err="hc kill did not end terminal {} ({}); nothing new was started. Its tab may still run: run "
+                              "pa-restart --end-terminal again, or close it by hand.".format(terminal, error or "it is still live"))
+    print("Terminal {} ended{}.".format(terminal, " (hc kill said: {})".format(error) if error else ""), flush=True)
+    deadline = time.time() + KEEPER_WAIT
+    while True:
+        current = as_text(as_dict(read_json_safe(os.path.join(directory, "agent.json"))).get("terminal"))
+        if current and current != terminal and launcher_alive(directory, current):
+            print("Restored by the keeper in terminal {}.".format(current))
+            return end_result(args, "ended", 0, terminal, addresses, restored="keeper")
+        if time.time() >= deadline:
+            break
+        time.sleep(max(0.01, min(1.0, KEEPER_WAIT / 10.0)))
+    if not herdr_app():
+        print("Terminal {} is ended. Open the Project Agent again with the panel's Open Project Agent (this machine "
+              "has no herdr-app).".format(terminal))
+        return end_result(args, "ended", 0, terminal, addresses)
+    print("No restore within {:.0f} s: pa-start --space {}.".format(KEEPER_WAIT, space), flush=True)
+    try:
+        cmd_start(argparse.Namespace(space=space, folder=agent.get("project"), profile=agent.get("profile"),
+                                     dry_run=False, app_space=None))
+    except Problem as e:
+        return end_result(args, "ended", 1, terminal, addresses, why=str(e),
+                          err="pa-start failed: {}. The state folder is intact: the keeper or the panel's Open Project "
+                              "Agent restores it (the same session).".format(e))
+    return end_result(args, "ended", 0, terminal, addresses, restored="pa-start")
+
+
+def end_terminal_on(args):
+    """--end-terminal --on M (plan.md J3.5): M runs every check (a dry run); the person answers here; then M runs it
+    bound to the terminal and the workers that were confirmed, and refuses if either changed."""
+    if not args.space:
+        raise Problem("--on needs --space <id> (the space's id on that machine)")
+    base = ["--space", args.space, "--end-terminal"] + (["--anyway"] if getattr(args, "anyway", False) else [])
+    if args.why:
+        base += ["--why", args.why]
+
+    def remote(flags, timeout):
+        script = '"$HOME/.config/herdr-pa/tools/pa.py" restart ' + " ".join(shlex.quote(a) for a in flags)
+        return ["hc", "exec", "--on", args.on, "--timeout", str(timeout), "--", "sh", "-c", script]
+
+    code, out = relay_output(remote(base + ["--dry-run", "--json"], 60))
+    if code == 127:
+        print("pa-restart is not installed on {}: run pa-sync --on {} first".format(args.on, args.on), file=sys.stderr)
+        sys.exit(127)
+    lines = (out or "").splitlines()
+    data = None
+    if lines:
+        try:
+            data = json.loads(lines[-1])
+        except ValueError:
+            data = None
+    for line in (lines[:-1] if isinstance(data, dict) else lines):
+        print(line)
+    if code or not isinstance(data, dict) or data.get("outcome") != "dry-run" or not as_text(data.get("terminal")):
+        print("The checks on {} did not pass (exit {}); nothing ended.".format(args.on, code), file=sys.stderr)
+        sys.exit(code or 1)
+    terminal = as_text(data.get("terminal"))
+    workers = sorted(w for w in data.get("workers") or [] if isinstance(w, str))
+    if workers and not getattr(args, "anyway", False):
+        print("refused: {} worker(s) running on {} (listed above). Run it again when they are done, or add --anyway to "
+              "end them too.".format(len(workers), args.on), file=sys.stderr)
+        sys.exit(1)
+    if not interactive():
+        print("refused: --end-terminal asks you to type yes; run it in a terminal", file=sys.stderr)
+        sys.exit(1)
+    answer = ask_yes("Type yes to end terminal {} on {} and {} worker(s): ".format(terminal, args.on, len(workers)))
+    if (answer or "").strip().lower() != "yes":
+        print("Not ended.")
+        sys.exit(1)
+    flags = base + ["--confirmed-terminal", terminal, "--confirmed-workers", ",".join(workers) or "-"]
+    code = relay(remote(flags + (["--json"] if args.json else []), 120))
+    if code:
+        sys.exit(code)
 
 
 def cmd_cleanup(args):
@@ -3547,6 +3867,12 @@ def main():
         parser.add_argument("--wait", type=float, help="seconds to wait for the result (default 180, at most 540)")
         parser.add_argument("--dry-run", action="store_true", help="run the checks and show the summary only")
         parser.add_argument("--json", action="store_true")
+        parser.add_argument("--end-terminal", action="store_true",
+                            help="only for a launcher from before restart support: end its terminal and its workers "
+                                 "(asks for yes), then the keeper or pa-start opens a new launcher")
+        parser.add_argument("--anyway", action="store_true", help="with --end-terminal: also while workers run (they end)")
+        parser.add_argument("--confirmed-terminal", help=argparse.SUPPRESS)  # the --on relay's bound answer (J3.5)
+        parser.add_argument("--confirmed-workers", help=argparse.SUPPRESS)
         return cmd_restart(parser.parse_args())
     if kind == "pa-context":
         parser.description = ("set: the Project Agent's context settings (context.json; the person's command, applied at "
