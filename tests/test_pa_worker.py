@@ -2456,7 +2456,7 @@ class JobCards(Base):
         self.assertIsNone(self.card())
         # a done task's main worktree with the default job: today's question, no Job line
         self.ledger({"version": 1, "tasks": []})
-        shutil.rmtree(os.path.join(self.dir, "decisions"))
+        shutil.rmtree(os.path.join(self.dir, "decisions"), ignore_errors=True)
         self.add_task("t-005", "done", self.wt, [])
         self.check("--open-cards")
         card = self.card("d-wt-t-005")
