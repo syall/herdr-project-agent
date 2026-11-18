@@ -901,6 +901,195 @@ class R4cGitEnvironment(Base):
         self.assertEqual("/bin", env["PATH"])
 
 
+class R4dSpaceEntrySymlinks(Base):
+    """t-047 W1 (Verify L9): a project folder is refused when any symlink under a space folder's real path
+    (evidence/, ledger.json, evidence/<id>, a file deeper down) lands inside it, as one holding a space folder is;
+    this space's or another's; no key sent. A symlink elsewhere leaves the project folder allowed."""
+
+    def link_into(self, space_id, rel, make_dir=True):
+        space = os.path.join(self.pa_home, "spaces", space_id)
+        link = os.path.join(space, rel)
+        kept = os.path.join(self.P, "kept-" + space_id + "-" + rel.replace(os.sep, "-"))
+        if os.path.lexists(link):
+            shutil.move(link, kept)
+        elif make_dir:
+            os.makedirs(os.path.join(kept, "t-1") if rel == "evidence" else kept)
+        else:
+            write(kept, "x\n")
+        os.makedirs(os.path.dirname(link), exist_ok=True)
+        os.symlink(kept, link)
+        return kept
+
+    def refused(self, space_id, rel, make_dir=True):
+        self.link_into(space_id, rel, make_dir)
+        project, why = pa_hooks.trust_project(self.P, self.home, self.pa_home)
+        self.assertIsNone(project)
+        self.assertIn("Project Agent's home", why)
+        self.terminal(self.tree)
+        self.screens(fx.new_screen(self.tree), fx.new_screen(self.tree))
+        self.expect("refused", "Project Agent's home")
+
+    def test_evidence_symlinked_into_the_project_folder(self):
+        self.refused("sp1", "evidence")
+
+    def test_ledger_symlinked_into_the_project_folder(self):
+        self.refused("sp1", "ledger.json")
+
+    def test_task_evidence_symlinked_into_the_project_folder(self):
+        self.refused("sp1", os.path.join("evidence", "t-1"))
+
+    def test_deeper_file_symlinked_into_the_project_folder(self):
+        os.makedirs(os.path.join(self.space, "evidence", "t-1", "sub"))
+        self.refused("sp1", os.path.join("evidence", "t-1", "sub", "notes.md"), make_dir=False)
+
+    def test_another_space_evidence_symlinked_into_the_project_folder(self):
+        dump({"version": 1, "tasks": []}, os.path.join(self.pa_home, "spaces", "sp2", "ledger.json"))
+        self.refused("sp2", "evidence")
+
+    def test_symlink_elsewhere_leaves_the_project_folder_allowed(self):
+        elsewhere = os.path.join(self.root, "elsewhere", "ev")
+        os.makedirs(os.path.join(elsewhere, "t-1"))
+        os.symlink(elsewhere, os.path.join(self.space, "evidence"))
+        self.assertIsNone(pa_hooks.trust_project(self.P, self.home, self.pa_home)[1])
+        self.accepts(self.tree)
+
+
+class R4eGitDotEntries(Base):
+    """t-047 W2a (Review L-R4a, L-R3b): git sees no repository, but a `.git` entry in the folder or an ancestor (an
+    empty or broken .git folder) would name another folder to a lookup that walks up for `.git`: uncertain."""
+
+    def run_on(self, project, folder):
+        self.agent({"space": "sp1", "terminal": "t0", "profile": "test", "project": project})
+        self.terminal(folder)
+        self.screens(fx.new_screen(folder), fx.new_screen(folder))
+        out = self.expect("uncertain", ".git")
+        key, why = pa_hooks.trust_key_why(folder)
+        self.assertIsNone(key)
+        self.assertIn(".git", why)
+        return out
+
+    def test_empty_git_folder_in_an_ancestor(self):
+        big = os.path.join(self.root, "big3")
+        os.makedirs(os.path.join(big, ".git"))
+        notes = os.path.join(big, "proj", "n")
+        os.makedirs(notes)
+        out = self.run_on(os.path.join(big, "proj"), notes)
+        self.assertIn(os.path.realpath(big), out["why"])
+
+    def test_broken_git_folder_in_an_ancestor(self):
+        big = os.path.join(self.root, "big4")
+        write(os.path.join(big, ".git", "HEAD"), "garbage\n")
+        notes = os.path.join(big, "proj", "n")
+        os.makedirs(notes)
+        self.run_on(os.path.join(big, "proj"), notes)
+
+    def test_empty_git_folder_in_the_folder_itself(self):
+        n = os.path.join(self.P, "n")
+        os.makedirs(os.path.join(n, ".git"))
+        self.run_on(self.P, n)
+
+    def test_no_git_entry_anywhere_still_outside_git(self):
+        notes = os.path.join(self.P, "notes")
+        os.makedirs(notes)
+        self.assertEqual((os.path.realpath(notes), None), pa_hooks.trust_key_why(notes))
+        self.accepts(notes, cwd=notes)
+
+
+class R4fCoreWorktree(Base):
+    """t-047 W2b (Review L-R4b): a repository inside the project folder whose own config sets core.worktree
+    elsewhere: git's top level is not the folder pa-trust would key on: uncertain, no key sent."""
+
+    def setUp(self):
+        super().setUp()
+        self.outer = os.path.join(self.root, "elsewhere", "outer")
+        os.makedirs(self.outer)
+        self.cw = make_repo(os.path.join(self.P, "cw"))
+        git(self.cw, "config", "core.worktree", self.outer)
+        self.sub = os.path.join(self.cw, "sub")
+        os.makedirs(self.sub)
+
+    def test_core_worktree_outside(self):
+        for folder in (self.cw, self.sub):
+            with self.subTest(folder):
+                shutil.rmtree(self.hc)
+                os.makedirs(self.hc)
+                self.terminal(folder)
+                self.screens(fx.new_screen(folder), fx.new_screen(folder))
+                self.expect("uncertain", "core.worktree")
+                key, why = pa_hooks.trust_key_why(folder)
+                self.assertIsNone(key)
+                self.assertIn(os.path.realpath(self.outer), why)
+
+    def test_plain_repository_still_keyed(self):
+        self.assertEqual((os.path.realpath(self.repo), None), pa_hooks.trust_key_why(self.repo))
+        self.assertEqual((os.path.realpath(self.repo), None), pa_hooks.trust_key_why(self.tree))
+
+
+class R4gGitConfigEnvironment(Base):
+    """t-047 W3 (Review N-R4a, Verify L10): pa-trust's git runs without GIT_CONFIG_* (PARAMETERS, COUNT/KEY_n/
+    VALUE_n, GLOBAL, SYSTEM, NOSYSTEM, plain GIT_CONFIG) and without GIT_INDEX_FILE: config injected through any of
+    them runs nothing (core.fsmonitor) in pa-trust's git, and an index set elsewhere does not hide a tracked file."""
+
+    with_env = R4cGitEnvironment.with_env
+
+    def setUp(self):
+        super().setUp()
+        self.marker = os.path.join(self.root, "fsmonitor-ran")
+        self.command = "touch {}; false #".format(self.marker)
+        dump({"hooks": pa_hooks.hook_settings(), "permissions": {"deny": list(pa_hooks.DENY_RULES)}},
+             os.path.join(self.tree, ".claude", "settings.local.json"))  # untracked: folder_grants runs ls-files
+
+    def config_file(self, name):
+        path = os.path.join(self.root, name)
+        write(path, "[core]\n\tfsmonitor = {}\n".format(self.command))
+        return path
+
+    def routes(self):
+        return {"COUNT": {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "core.fsmonitor",
+                          "GIT_CONFIG_VALUE_0": self.command},
+                "PARAMETERS": {"GIT_CONFIG_PARAMETERS": "'core.fsmonitor={}'".format(self.command)},
+                "GLOBAL": {"GIT_CONFIG_GLOBAL": self.config_file("global.cfg")},
+                "SYSTEM": {"GIT_CONFIG_SYSTEM": self.config_file("system.cfg"), "GIT_CONFIG_NOSYSTEM": "0"}}
+
+    def test_injected_config_runs_nothing(self):
+        for name, extra in self.routes().items():
+            with self.subTest(name):
+                if os.path.exists(self.marker):
+                    os.remove(self.marker)
+                restore = self.with_env(dict(extra, HOME=self.home, XDG_CONFIG_HOME=os.path.join(self.home, ".config")))
+                try:
+                    self.assertEqual([], pa_hooks.folder_grants([self.tree]))
+                    self.assertEqual(os.path.realpath(self.repo), pa_hooks.trust_key(self.tree))
+                finally:
+                    restore()
+                self.assertFalse(os.path.exists(self.marker), "pa-trust's git ran an injected core.fsmonitor")
+
+    def test_end_to_end_with_injected_config(self):
+        self.with_env(self.routes()["COUNT"])
+        self.accepts(self.tree)
+        self.assertFalse(os.path.exists(self.marker), "pa-trust's git ran an injected core.fsmonitor")
+
+    def test_index_file_does_not_hide_a_tracked_file(self):  # Verify L10
+        git(self.tree, "add", "-f", ".claude/settings.local.json")
+        git(self.tree, "commit", "-q", "-m", "settings")
+        self.with_env({"GIT_INDEX_FILE": os.path.join(self.root, "empty-index")})
+        found = pa_hooks.folder_grants([self.tree])
+        self.assertTrue(any("tracks its .claude/settings.local.json" in f for f in found), found)
+        self.terminal(self.tree)
+        self.screens(fx.new_screen(self.tree), fx.new_screen(self.tree))
+        self.expect("grants", "tracks")
+
+    def test_unit_git_environment(self):
+        names = ("GIT_CONFIG", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0",
+                 "GIT_CONFIG_KEY_12", "GIT_CONFIG_VALUE_12", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM",
+                 "GIT_CONFIG_NOSYSTEM", "GIT_INDEX_FILE")
+        env = pa_hooks.trust_git_env(dict({n: "x" for n in names}, PATH="/bin", GIT_AUTHOR_NAME="kept"))
+        for n in names:
+            self.assertNotIn(n, env)
+        self.assertEqual("/bin", env["PATH"])
+        self.assertEqual("kept", env["GIT_AUTHOR_NAME"])
+
+
 # ---- R5 no grants of its own --------------------------------------------------------------------------------
 
 class R5NoGrants(Base):
