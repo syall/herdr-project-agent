@@ -837,7 +837,7 @@ def content_check(directory, task, pins, runner=None, records=None):
     return check, summary
 
 
-def content_onto(directory, task_id, common, branch, run=None, path=None, commit=None):
+def content_onto(directory, task_id, common, branch, run=None, path=None, commit=None, job=None):
     """The branch a pin's change sits on as the merge queue says (t-052 J2): the queue entry of this repository whose
     branch is the pin's, its onto; else, for a task planned on another task's branch (pa-queue plan, dependsOn), that
     entry's branch; else, given git (run, path) and the checked commit (VERIFY.md's), the branch of the last entry (of
@@ -853,9 +853,13 @@ def content_onto(directory, task_id, common, branch, run=None, path=None, commit
         if not isinstance(rec, dict) or rec.get("common") != common:
             continue
         entries = [e for e in rec.get("entries") or [] if isinstance(e, dict)]
-        for e in entries:
-            if branch and e.get("branch") == branch and isinstance(e.get("onto"), str) and e["onto"]:
-                return e["onto"]
+        for i, e in enumerate(entries):
+            if branch and e.get("branch") == branch:
+                # RL-J2-1 (t-052 J3a): the onto counts only when it is main (first entry) or the entry directly ahead;
+                # an onto naming a branch that left the queue (before restack) is not trusted: None, so main.
+                ahead = entries[i - 1].get("branch") if i else rec.get("main")
+                onto = e.get("onto")
+                return onto if isinstance(onto, str) and onto and onto == ahead else None
         for p in rec.get("planned") or []:
             dep = p.get("dependsOn") if isinstance(p, dict) and p.get("task") == task_id else None
             if isinstance(dep, dict):
@@ -863,15 +867,16 @@ def content_onto(directory, task_id, common, branch, run=None, path=None, commit
                 if ahead and isinstance(ahead.get("branch"), str) and ahead["branch"]:
                     return ahead["branch"]
         if run is not None and path and commit:
-            below = entry_below(run, path, rec, entries, task_id, commit)
+            below = entry_below(run, path, rec, entries, task_id, commit, job)
             if below:
                 return below
     return None
 
 
-def entry_below(run, path, rec, entries, task_id, commit):
-    """The branch of the last entry, in queue order, of another task whose tip is a proper ancestor of commit and not
-    in main; None on any doubt (main unreadable, a git error): the caller then compares against main, as in J1."""
+def entry_below(run, path, rec, entries, task_id, commit, job=None):
+    """The branch of the last entry, in queue order, of another task (or another job of this task: Nit-J2-R2-1, t-052
+    J3a) whose tip is a proper ancestor of commit and not in main; None on any doubt (main unreadable, a git error):
+    the caller then compares against main, as in J1."""
     def tip(name):
         if not isinstance(name, str) or not name:
             return None
@@ -886,7 +891,8 @@ def entry_below(run, path, rec, entries, task_id, commit):
         if not main_tip:
             return None
         for e in reversed(entries):
-            at = tip(e.get("branch")) if e.get("task") != task_id else None
+            mine = e.get("task") == task_id and (e.get("job") or None) == (job or None)
+            at = tip(e.get("branch")) if not mine else None
             if at and at != commit and below(at, commit) and not below(at, main_tip):
                 return e["branch"]
     except Exception:  # a refused call (grafts, shallow) or an unexpected answer: doubt, so main (J1)
@@ -1006,7 +1012,8 @@ def suite_runs(directory):
     (written at the end) and `seconds`; t-056's (pa_suite.full_suite) add `start`, `end`, `parts` ({name, ok, seconds}),
     `untracked`, and `moved: true` when the worktree changed during the run. reusable is False for a moved run or one
     with untracked files (t-056 never reuses those: pa_suite.clean): such a run is no pass or failure for its tree.
-    A J1 line has no untracked count (None) and stays reusable, as before t-056. This is the one reader of both shapes."""
+    A J1 line has no untracked count (None) and is not reusable either, as pa_suite.clean decides (t-052 J3a A6,
+    D-J2-15 dropped): its tree needs a run of its own. This is the one reader of both shapes."""
     runs = []
     for l in read_lines(os.path.join(content_dir(directory), "suites.jsonl")):
         seconds = l.get("seconds") if isinstance(l.get("seconds"), (int, float)) else None
@@ -1020,7 +1027,7 @@ def suite_runs(directory):
         runs.append({"kind": l.get("kind") or "suite", "task": l.get("task"), "worker": l.get("worker"), "repo": l.get("repo"),
                      "commit": l.get("commit"), "tree": l.get("tree"), "uncommitted": l.get("uncommitted"),
                      "untracked": untracked, "moved": moved,
-                     "reusable": not moved and ("untracked" not in l or untracked == 0), "exit": l.get("exit"),
+                     "reusable": not moved and untracked == 0, "exit": l.get("exit"),
                      "started": started, "ended": ended, "seconds": seconds,
                      "parts": l.get("parts") if isinstance(l.get("parts"), list) else None})
     return runs

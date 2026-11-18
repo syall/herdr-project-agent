@@ -4,7 +4,7 @@
   pa-queue plan <task> [--job J] --repo <main checkout> --files F...   record the plan's files; say where to start
   pa-queue add <task> [--job J] --repo R        join the queue at the end, already stacked on the last entry
   pa-queue show [--repo R] [--json]             the queue with every state read from git now (writes nothing)
-  pa-queue out <task> [--job J] --repo R --why T  take an entry out; those behind it are invalidated
+  pa-queue out <task> [--job J] --repo R --why T  take an entry out (with its dependents); those behind it are invalidated
   pa-queue restack --repo R [--dry-run]         rebase the invalidated entries as a chain, in merge order
   pa-queue verify <task> [--job J] --repo R     decide whether the branch is clean against the content checked
   pa-queue refresh --repo R                     record short reviews, set passed or failed, restack after a failure
@@ -484,7 +484,9 @@ def derive(ctx, rec):
                 n["suite"] = s
                 r = None
                 if d["result"] == "moved":
-                    r = latest(reviews, lambda x: x.get("task") == e["task"] and x.get("tip") == n["tip"])
+                    # RL-J2-V1, Nit-J2-1 (t-052 J3a): the keys short_review_passed checks, so show matches the gate
+                    r = latest(reviews, lambda x: x.get("task") == e["task"] and (x.get("job") or None) == (e.get("job") or None)
+                               and x.get("common") == rec["common"] and x.get("tip") == n["tip"] and tree and x.get("tree") == tree)
                     n["review"] = r
                 task = ctx.task(e["task"])
                 if task is None:
@@ -804,6 +806,10 @@ def add(ctx, data, rec, tid, job):
     if any(same(e, tid, job) for e in rec["entries"]):
         raise Refused("{} is already in the queue".format(tid))
     tree = task_tree(task, job)
+    if job and tree and os.path.realpath(tree) != os.path.realpath(os.path.expanduser(str(task.get("worktree") or ""))):
+        # t-052 J3a A5 (Q-J3-7): pa-gate pins task.worktree only, so a job elsewhere could never pass in the queue
+        raise Refused("the gate reads {}'s worktree only ({}), not job {}'s ({}); set the task's worktree to the job's "
+                      "worktree, run pa-gate {} again, then add".format(tid, task.get("worktree"), job, tree, tid))
     pin = pin_in(ctx, rec, tree) if tree else None
     if not pin or not pin.get("commit") or not pin.get("branch"):
         raise Refused("{} has no worktree on a branch of {}".format(tid, ctx.repo))
@@ -827,7 +833,7 @@ def add(ctx, data, rec, tid, job):
     onto_tip = ctx.tip(onto)
     checked = checked_at_add(ctx, rec, task, branch)
     entry = {"task": tid, "job": job, "branch": branch, "worktree": tree, "onto": onto, "dependsOn": dep, "state": "checking",
-             "added": now(), "base": ctx.merge_base(tip, onto_tip), "tip": tip, "checked": checked,
+             "added": now(), "base": upstream(ctx, rec, tip, onto_tip), "tip": tip, "checked": checked,
              "files": sorted(set((planned or {}).get("files") or []) | touched(ctx, checked["base"], checked["commit"])),
              "needs": None, "suite": None, "review": None, "rebases": [], "approval": None}
     lines = []
@@ -870,6 +876,38 @@ def add(ctx, data, rec, tid, job):
     return lines
 
 
+def upstream(ctx, rec, tip, onto_tip):
+    """Where the branch's own commits begin, for the tool rebase (RL-J2-3, t-052 J3a A2): the newest old tip an entry
+    had before a restack (rebases[].from) that the branch holds and the onto tip no longer does: a task started on an
+    entry's branch that was restacked before it joined. Else the merge base, as in J2. The rebase then replays only
+    the task's own commits; a wrong choice replays too much (a conflict) or drops one (changed): both fail safe."""
+    base = ctx.merge_base(tip, onto_tip)
+    best = None
+    for e in rec["entries"]:
+        for r in e.get("rebases") or []:
+            old = r.get("from")
+            if not old or old in (base, tip) or not ctx.is_ancestor(old, tip) or ctx.is_ancestor(old, onto_tip):
+                continue
+            if base and not ctx.is_ancestor(base, old):
+                continue
+            if best is None or ctx.is_ancestor(best, old):
+                best = old
+    return best or base
+
+
+def with_dependents(rec, entry):
+    """entry and every entry whose dependsOn (pa-queue plan) leads to it: they leave together (Q-B, Q-J3-8)."""
+    out, changed = [entry], True
+    while changed:
+        changed = False
+        for other in rec["entries"]:
+            dep = other.get("dependsOn") or {}
+            if other not in out and any(same(x, dep.get("task"), dep.get("job")) for x in out):
+                out.append(other)
+                changed = True
+    return out
+
+
 def cmd_show(args):
     directory = space(args)
     data = load_queue(directory)
@@ -902,13 +940,16 @@ def cmd_out(args):
         if not entry:
             raise Refused("{} is not in the queue".format(args.task))
         i = rec["entries"].index(entry)
-        behind = rec["entries"][i + 1:]
-        leave(ctx, rec, entry, "taken out: " + args.why)
-        rec["planned"] = [p for p in rec["planned"] if not same(p, args.task, args.job)]
+        out = with_dependents(rec, entry)  # t-052 J3a A4 (D-J2-7, Q-J3-8): as a failure does
+        for o in out:
+            leave(ctx, rec, o, "taken out: " + args.why if o is entry else "built on {}, which was taken out".format(args.task))
+            rec["planned"] = [p for p in rec["planned"] if not same(p, o["task"], o.get("job"))]
+        behind = rec["entries"][i:]
         for e in behind:
             set_state(ctx, e, "invalidated", "{} was taken out".format(args.task))
         save(ctx, data, rec)
-    print("{} left the queue; {} behind it invalidated: run pa-queue restack".format(args.task, len(behind)))
+    print("{} left the queue{}; {} behind it invalidated: run pa-queue restack".format(
+        args.task, "" if len(out) == 1 else " with " + ", ".join(o["task"] for o in out[1:]), len(behind)))
     return 0
 
 
@@ -995,15 +1036,7 @@ def cmd_refresh(args):
         if first:
             e, n = first
             set_state(ctx, e, "failed", n["why"])
-            out = [e]
-            changed = True
-            while changed:
-                changed = False
-                for other in rec["entries"]:
-                    dep = other.get("dependsOn") or {}
-                    if other not in out and any(same(x, dep.get("task"), dep.get("job")) for x in out):
-                        out.append(other)
-                        changed = True
+            out = with_dependents(rec, e)
             i = rec["entries"].index(e)
             for o in out:
                 leave(ctx, rec, o, n["why"] if o is e else "built on {}, which failed".format(e["task"]))
