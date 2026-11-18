@@ -2097,5 +2097,112 @@ class TaskWorktrees(Base):
         self.assertRefused(self.worker("close", "t32", "--evidence", "FINDINGS.md"),
                            "{} has 1 uncommitted file(s) (unsaved.txt)".format(second))
 
+    # ---- J1 round 3 (VERIFY round 2 F2, REVIEW round 2 L5): a worktree another unfinished task records is never removed with a worker ----
+    def shared_with_t009(self, state, name, field=True):
+        """t-009 (state) has its own main worktree; t-003 (done) lists it as job "shared"; t-003's worker t31 (live) carries it as its field."""
+        self.ledger({"version": 1, "tasks": []})
+        self.terms.clear()
+        self.calls = []
+        other = self.worktree(self.proj, name)
+        self.add_task("t-009", state, other, [{"address": "t91", "role": "build", "name": "t-009-other", "finished": True}])
+        self.add_task("t-003", "done", self.wt, [dict({"address": "t31", "role": "build", "name": "a"}, **({"worktree": other} if field else {}))],
+                      worktrees=[{"path": other, "job": "shared"}])
+        self.term("t31", "a", cwd=self.tmp)
+        return other
+
+    def test_tw15_delete_keeps_a_worktree_another_unfinished_task_records(self):
+        for state in ("in-progress", "review"):
+            with self.subTest(state=state):
+                other = self.shared_with_t009(state, "t-009-" + state)
+                before = self.ledger()
+                facts, _row = pa_hooks.worker_facts(self.dir, {"terminal": "t0"}, None, "t31")
+                self.assertEqual(facts["worktree"]["path"], os.path.realpath(other))
+                code, out, err = self.worker("delete", "t31")
+                self.assertEqual(code, 0, err)
+                self.assertIn("Ended and removed worker t31 (a).", out)
+                self.assertTrue(os.path.isdir(other), "another unfinished task's worktree is never removed")
+                self.assertIn("Kept the worktree: still used by task t-009 ({}).".format(state), out)
+                self.assertNotIn("Removed the worktree", out)
+                self.assertEqual(facts["worktree"]["heldBy"], ["t-009"])
+                self.assertIn(["hc", "rm", "t31"], self.calls, "the worker itself is still ended")
+                led = self.ledger()
+                self.assertEqual(json.dumps(led["tasks"][0], sort_keys=True), json.dumps(before["tasks"][0], sort_keys=True))
+                t003 = led["tasks"][1]
+                self.assertEqual(t003["workers"], [])
+                self.assertEqual((t003["worktree"], t003["worktrees"]), (self.wt, [{"path": other, "job": "shared"}]))
+
+    def test_tw15b_delete_removes_it_once_the_other_task_is_done_or_parked(self):
+        for state in ("done", "parked"):
+            with self.subTest(state=state):
+                other = self.shared_with_t009(state, "t-009-" + state)
+                code, out, err = self.worker("delete", "t31")
+                self.assertEqual(code, 0, err)
+                self.assertIn("Removed the worktree {}".format(os.path.realpath(other)), out)
+                self.assertFalse(os.path.exists(other))
+                led = self.ledger()
+                for task in led["tasks"]:
+                    self.assertNotIn(os.path.realpath(other), [w["path"] for w in pa.task_worktrees(task)],
+                                     "no ledger entry names the removed folder ({})".format(task["id"]))
+                self.assertIsNone(led["tasks"][0]["worktree"])
+                self.assertTrue(led["tasks"][0]["worktrees"][0]["removed"])
+                self.assertEqual(led["tasks"][1]["worktree"], self.wt)
+                self.assertTrue(led["tasks"][1]["worktrees"][0]["removed"])
+
+    def test_tw15c_no_field_main_listed_by_another_task_is_not_the_old_shape(self):
+        other = self.worktree(self.proj, "t-009-other")
+        self.add_task("t-009", "in-progress", other, [], worktrees=[{"path": self.wt, "job": "shared"}])
+        self.add_task("t-003", "done", self.wt, [{"address": "t31", "role": "build", "name": "a"}])
+        before = json.dumps(self.ledger()["tasks"][0], sort_keys=True)
+        code, out, err = self.worker("delete", "t31")
+        self.assertEqual(code, 0, err)
+        self.assertIn("Kept the worktree: still used by task t-009 (in-progress).", out)
+        self.assertTrue(os.path.isdir(self.wt))
+        led = self.ledger()
+        self.assertEqual(json.dumps(led["tasks"][0], sort_keys=True), before)
+        self.assertEqual(led["tasks"][1]["worktree"], self.wt)
+
+    def test_tw16_old_shape_shared_main_no_field_unchanged(self):
+        for state in ("in-progress", "done"):
+            with self.subTest(state=state):
+                self.ledger({"version": 1, "tasks": []})
+                self.terms.clear()
+                shared = self.worktree(self.proj, "t-003-g-" + state)
+                self.add_task("t-009", state, shared, [{"address": "t91", "role": "build", "name": "o", "finished": True}])
+                self.add_task("t-003", "done", shared, [{"address": "t31", "role": "build", "name": "a"}])
+                self.term("t31", "a", cwd=self.tmp)
+                t009 = json.dumps(self.ledger()["tasks"][0], sort_keys=True)
+                code, out, err = self.worker("delete", "t31")
+                self.assertEqual(code, 0, err)
+                self.assertEqual(out, "Ended and removed worker t31 (a).\nRemoved the worktree {}. Branch t-003-g-{} is kept.\n"
+                                 "(The Project Agent is not running; it reads the ledger when it starts.)\n".format(os.path.realpath(shared), state))
+                self.assertFalse(os.path.exists(shared))
+                led = self.ledger()
+                self.assertEqual(json.dumps(led["tasks"][0], sort_keys=True), t009, "as at 4c52361, the other task's entry is not written")
+                self.assertIsNone(led["tasks"][1]["worktree"])
+
+    def test_tw17_close_never_removes_a_shared_worktree(self):
+        other = self.shared_with_t009("in-progress", "t-009-other")
+        before = json.dumps(self.ledger()["tasks"][0], sort_keys=True)
+        pa_hooks.by_an_agent = lambda: True
+        code, out, err = self.worker("close", "t31", "--evidence", "FINDINGS.md")
+        self.assertEqual(code, 0, err)
+        self.assertIn("its worktree and branch are untouched", out)
+        self.assertTrue(os.path.isdir(other))
+        self.assertTrue(os.path.isdir(self.wt))
+        self.assertEqual(json.dumps(self.ledger()["tasks"][0], sort_keys=True), before)
+
+    def test_tw18_worktree_remove_refuses_while_a_task_listing_it_is_unfinished(self):
+        other = self.worktree(self.proj, "t-009-other")
+        self.add_task("t-009", "in-progress", other, [], worktrees=[{"path": self.wt, "job": "shared"}])
+        self.add_task("t-003", "done", self.wt, [])
+        dump({"id": "d-wt-t-003", "task": "t-003", "worktree": self.wt, "status": "answered", "answer": "Delete", "snapshot": {}},
+             os.path.join(self.dir, "decisions", "d-wt-t-003.json"))
+        pa_hooks.by_an_agent = lambda: False
+        code, _out, err = self.run_cmd("pa-worktree", "remove", "t-003", "--space", "sp1")
+        self.assertEqual(code, 2)
+        self.assertIn("tasks still t-009 in-progress; a worktree is removed only once every task using it is done or parked. Nothing was removed", err)
+        self.assertTrue(os.path.isdir(self.wt))
+
+
 if __name__ == "__main__":
     unittest.main()
