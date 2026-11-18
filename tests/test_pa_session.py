@@ -571,6 +571,90 @@ class Round4(Round3):
         self.assertIn("already has a Project Agent", str(e.exception))
 
 
+class ProfileReload(Base):
+    """t-033: each restart in run_agent's loop uses the profile as it is now, not as it was when the launcher began;
+    a profile that cannot be read at that moment keeps the one in hand."""
+
+    def setUp(self):
+        super().setUp()
+        self.prof = os.path.join(pa.ROOT, "profiles", "test")
+        os.makedirs(self.prof, exist_ok=True)
+        dump({"version": 1, "space": "sp1", "project": self.project, "profile": "test", "name": "proj",
+              "terminal": "t1"}, os.path.join(self.dir, "agent.json"))
+
+    def write_profile(self, status_line):
+        value = {"name": "test", "claude": ["true"], "codex": ["true"]}
+        if status_line:
+            value["statusLine"] = {"command": ["true", "statusline"], "refreshInterval": 30}
+        dump(value, os.path.join(self.prof, "profile.json"))
+
+    def two_launches(self, between):
+        """Two launches of run_agent's loop; between(): what happens to the profile after the first."""
+        calls = []
+
+        class Stop(Exception):
+            pass
+
+        def fake_call(argv, cwd=None):
+            calls.append(list(argv))
+            if len(calls) == 1:
+                between()
+                return 0
+            raise Stop()
+        saved = (pa.subprocess.call, pa.time.sleep, os.environ.pop("PA_NO_CC_STATUSLINE", None))
+        pa.subprocess.call, pa.time.sleep = fake_call, (lambda s: None)
+        p = pa.load_profile("test")
+        try:
+            with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(Stop):
+                pa.run_agent(types.SimpleNamespace(fresh=True), "t1", self.project, p, self.dir,
+                             load(os.path.join(self.dir, "agent.json")), {"beat": True, "previous": None}, time.time())
+        finally:
+            pa.subprocess.call, pa.time.sleep = saved[0], saved[1]
+            if saved[2] is not None:
+                os.environ["PA_NO_CC_STATUSLINE"] = saved[2]
+        self.assertEqual(len(calls), 2)
+        return calls
+
+    def ours(self, argv):
+        n = sum(1 for a in argv if a == "--settings" or a.startswith("--settings="))
+        if not n:
+            return None
+        self.assertEqual(n, 1)
+        self.assertEqual(argv[-2], "--settings")
+        return json.loads(argv[-1])["statusLine"]
+
+    def masked(self, argv):
+        out = list(argv)
+        for flag in ("--session-id", "--resume"):
+            if flag in out:
+                out[out.index(flag) + 1] = "<session>"
+        return out
+
+    def test_r1_key_added_after_the_first_launch_reaches_the_second(self):
+        self.write_profile(False)
+        first, second = self.two_launches(lambda: self.write_profile(True))
+        self.assertIsNone(self.ours(first))
+        sl = self.ours(second)
+        self.assertIsNotNone(sl, "the restart did not pick up the profile's new statusLine: {}".format(second))
+        self.assertIn("statusline --space sp1 --then", sl["command"])
+
+    def test_r2_malformed_profile_keeps_the_one_in_hand(self):
+        self.write_profile(True)
+
+        def mangle():
+            with open(os.path.join(self.prof, "profile.json"), "w") as f:
+                f.write("{not json")
+        first, second = self.two_launches(mangle)
+        self.assertIsNotNone(self.ours(first))
+        self.assertEqual(self.masked(first), self.masked(second))
+
+    def test_r3_unchanged_profile_gives_the_same_command_line(self):
+        self.write_profile(True)
+        first, second = self.two_launches(lambda: None)
+        self.assertIsNotNone(self.ours(first))
+        self.assertEqual(self.masked(first), self.masked(second))
+
+
 def tearDownModule():
     shutil.rmtree(TMP, ignore_errors=True)
 
