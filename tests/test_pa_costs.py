@@ -4495,6 +4495,179 @@ class J1B_Doctor(Base):
         self.assertFalse([x for x in out.splitlines() if "PROBLEM" in x and ("cost" in x or "J1_" in x)], out)  # notes, never problems
 
 
+# ---- t-032 J1c: summary, report, prices, billed compare and account-wide by facts and scope (R-P4, R-A3, R-A5, A-V1, A-V2) ----
+
+class J1C_Summary(Collecting):
+    """Two sessions under two scopes (global and regional, two accounts); one old session without facts."""
+
+    def two_scopes(self, pricing=None):
+        self.prices(scoped_fixture())
+        prof = {"name": "test", "claude": ["true"], "codex": ["true"]}
+        if pricing is not None:
+            prof["pricing"] = pricing
+        dump(prof, os.path.join(self.profile_dir, "profile.json"))
+        self.ledger({"version": 1, "tasks": [{"id": "t-001", "state": "in-progress", "workers": []}]})
+        self.record(session=SID, task="t-001", terminal="t5", name="t-001-build", model="global.model-a", provider="provider-a",
+                    providerBy="launch", endpoint="global", endpointBy="rule", region="region-a", regionBy="machine",
+                    account="acct-a", accountBy="env")
+        self.add(self.prompt(T0 + 10), self.call(T0 + 12, "g1", lines=1, out=1000000))
+        self.record(session=SID2, task="t-001", terminal="t6", name="t-001-check", model="model-a", provider="provider-a",
+                    providerBy="launch", endpoint="regional", endpointBy="rule", region="region-a", regionBy="machine",
+                    account="acct-b", accountBy="env")
+        self.add(self.prompt(T0 + 20, sid=SID2), self.call(T0 + 22, "r1", sid=SID2, lines=1, out=1000000), sid=SID2)
+        self.collect(T0 + 5000)
+        return load(self.costs("summary.json"))
+
+    def test_j1c1_scopes_and_facts_in_the_summary(self):
+        s = self.two_scopes()
+        self.assertAlmostEqual(s["totals"]["money"], 10.0 + 11.0, places=4)
+        self.assertEqual(s["scopes"], 2)
+        scopes = {e["key"]: e for e in s["byScope"]}
+        self.assertEqual(set(scopes), {"provider-a · global · region-a · acct-a", "provider-a · regional · region-a · acct-b"})
+        g = scopes["provider-a · global · region-a · acct-a"]
+        self.assertAlmostEqual(g["money"], 10.0, places=4)
+        self.assertEqual(g["scope"], ["provider-a", "global", "region-a", "acct-a"])
+        self.assertEqual(g["pricedAs"], [{"scope": ["provider-a", "global", "*", "*"], "validFrom": "2026-01-01"}])
+        r = scopes["provider-a · regional · region-a · acct-b"]
+        self.assertEqual(r["pricedAs"], [{"scope": ["provider-a", "regional", "region-a", "*"], "validFrom": "2026-01-01"}])
+        self.assertAlmostEqual(money_of(s["byScope"]), s["totals"]["money"], places=4)
+        for key in ("byProvider", "byEndpoint", "byRegion", "byAccount"):
+            self.assertAlmostEqual(money_of(s[key]), s["totals"]["money"], places=4, msg=key)
+        self.assertEqual({e["key"] for e in s["byAccount"]}, {"acct-a", "acct-b"})
+        self.assertEqual({e["key"] for e in s["byEndpoint"]}, {"global", "regional"})
+        dm = {(e["endpoint"], e["account"]): e for e in s["byDayModel"]}
+        self.assertEqual(set(dm), {("global", "acct-a"), ("regional", "acct-b")})
+        self.assertEqual(dm[("regional", "acct-b")]["pricedAs"]["scope"], ["provider-a", "regional", "region-a", "*"])
+        self.assertEqual(dm[("regional", "acct-b")]["region"], "region-a")
+        sess = {e["key"]: e for e in s["sessions"]}
+        self.assertEqual((sess[SID[:8]]["endpoint"], sess[SID2[:8]]["account"]), ("global", "acct-b"))
+
+    def test_j1c2_unknown_region_and_unpriced_scope(self):
+        self.prices(scoped_fixture())
+        self.record(session=SID, model="model-a", provider="provider-a", providerBy="launch", endpoint="regional",
+                    endpointBy="rule", region=None, regionBy="unknown", account="acct-a", accountBy="env")
+        self.add(self.prompt(T0 + 10), self.call(T0 + 12, "u1", lines=1, out=1000))
+        self.collect(T0 + 5000)
+        s = load(self.costs("summary.json"))
+        self.assertIsNone(s["totals"]["money"])
+        e = s["byScope"][0]
+        self.assertEqual((e["key"], e["scope"], e["pricedAs"], e["money"]), ("provider-a · regional · ? · acct-a", ["provider-a", "regional", None, "acct-a"], [], None))
+        self.assertEqual(e["by"]["regionBy"], "unknown")
+        self.assertIsNone(s["byDayModel"][0]["pricedAs"])
+
+    def test_j1c3_old_rows_priced_by_profile_rules(self):
+        pricing = {"defaultProvider": "provider-a", "providers": [{"program": "claude", "provider": "provider-a"}],
+                   "endpoints": [{"model": "^global\\.", "endpoint": "global"}, {"model": "^model-", "endpoint": "regional"}]}
+        self.prices(scoped_fixture())
+        dump({"name": "test", "claude": ["true"], "codex": ["true"], "pricing": pricing}, os.path.join(self.profile_dir, "profile.json"))
+        self.record(session=SID, model="global.model-a")  # a record from before J1: no facts
+        self.add(self.prompt(T0 + 10), self.call(T0 + 12, "o1", lines=1, out=1000000))
+        self.collect(T0 + 5000)
+        s = load(self.costs("summary.json"))
+        e = s["byScope"][0]
+        self.assertEqual(e["scope"], ["provider-a", "global", None, "default"])
+        self.assertEqual(e["by"], {"providerBy": "rule", "endpointBy": "rule", "regionBy": "unknown", "accountBy": "default"})
+        self.assertAlmostEqual(s["totals"]["money"], 10.0, places=4)
+
+    def test_j1c4_default_provider_rows_take_the_files_default_scope(self):
+        # the profile names another default provider than the file: rows with providerBy default still price from the file's
+        self.prices(scoped_fixture())
+        dump({"name": "test", "claude": ["true"], "codex": ["true"], "pricing": {"defaultProvider": "provider-z"}},
+             os.path.join(self.profile_dir, "profile.json"))
+        self.record(session=SID, model="model-a")
+        self.add(self.prompt(T0 + 10), self.call(T0 + 12, "d1", lines=1, out=1000000))
+        self.collect(T0 + 5000)
+        s = load(self.costs("summary.json"))
+        self.assertAlmostEqual(s["totals"]["money"], 10.0, places=4)
+
+
+class J1C_Report(J1C_Summary):
+    def report(self, *args, **kw):
+        _r, out, _e = self.run_cmd(pa_costs.report, self.dir, *args, now=T0 + 5000, **kw)
+        return out
+
+    def test_j1c5_report_by_each_fact_and_scope(self):
+        self.two_scopes()
+        for by, want in (("provider", "provider-a"), ("endpoint", "regional"), ("region", "region-a"), ("account", "acct-b"),
+                         ("scope", "provider-a · regional · region-a · acct-b")):
+            out = self.report(by=by)
+            self.assertIn(want[:26], out, by)
+        out = self.report(by="scope")
+        self.assertIn("priced as provider-a · global · * · *", out)
+        out = self.report()
+        self.assertIn("By scope", out)  # more than one scope: shown in the default report
+
+    def test_j1c6_one_scope_report_has_no_scope_section(self):
+        self.prices()
+        self.record(session=SID)
+        self.add(self.prompt(T0 + 10), self.call(T0 + 12, "m1", lines=1, out=100))
+        self.collect(T0 + 5000)
+        self.assertNotIn("By scope", self.report())
+
+    def test_j1c7_account_wide_per_entry_label(self):
+        self.two_scopes()
+        other = os.path.join(pa.ROOT, "spaces", "sp2", "costs", "summary.json")
+        dump({"account": "acct-b", "updated": "2026-11-17T09:00:00Z",
+              "byDayModel": [{"day": "2026-11-17", "model": "model-a", "tokens": toks(out=5), "money": 2.0}]}, other)
+        here = pa_costs.account_wide_summary("acct-b", T0)
+        self.assertEqual(here["spaces"], ["sp1", "sp2"])
+        self.assertAlmostEqual(sum(e["money"] for e in here["byDayModel"]), 11.0 + 2.0, places=4)
+        here = pa_costs.account_wide_summary("acct-a", T0)
+        self.assertEqual(here["spaces"], ["sp1"])
+        self.assertAlmostEqual(sum(e["money"] for e in here["byDayModel"]), 10.0, places=4)
+        _r, out, _e = self.run_cmd(pa_costs.main, ["report", "--account-wide", "--account", "acct-b"])
+        self.assertEqual(json.loads(out)["account"], "acct-b")
+        _r, _out, err = self.run_cmd(pa_costs.main, ["report", "--account-wide", "--account", "12345" + "6789012"])
+        self.assertNotEqual(_r, 0)
+
+
+class J1C_Billed(J1C_Summary):
+    def test_j1c8_billed_compare_per_account(self):
+        s = self.two_scopes()
+        table, _p = pa_costs.load_prices(pa.load_profile("test"))
+        billed = [{"account": "acct-b", "from": "2026-11-17", "to": "2026-11-17", "model": "model-a", "amount": 12.0,
+                   "currency": "USD", "final": True, "source": "q"}]
+        here = pa_costs.account_wide_summary("acct-b", T0)
+        c = pa_costs.billing_comparison(billed, dict(s, account="acct-b"), here, table)
+        self.assertAlmostEqual(c["total"]["thisSpace"], 11.0, places=4)
+        self.assertAlmostEqual(c["total"]["allSpaces"], 11.0, places=4)
+
+
+class J1C_Prices(Collecting):
+    def test_j1c9_prices_shows_scopes_notes_and_unpriced_per_facts(self):
+        self.prices(scoped_fixture())
+        self.record(session=SID, model="model-a", provider="provider-a", providerBy="launch", endpoint="regional",
+                    endpointBy="rule", region="region-c", regionBy="machine", account="acct-a", accountBy="env")
+        self.add(self.prompt(T0 + 10), self.call(T0 + 12, "p1", lines=1, out=10))
+        self.collect(T0 + 5000)
+        _r, out, _e = self.run_cmd(pa_costs.cmd_prices, self.dir)
+        self.assertIn("default scope: provider provider-a · endpoint global · region * · account *", out)
+        self.assertIn("provider provider-a · endpoint regional · region region-a · account *", out)
+        self.assertIn("provider provider-b · endpoint * · region * · account *", out)
+        self.assertIn("ignored by pa-costs from before t-032", out)
+        self.assertIn("source made up", out)
+        self.assertIn("Models seen without a price: model-a", out)
+        self.assertIn("under provider-a · regional · region-c · acct-a: model-a", out)
+
+    def test_j1c10_prices_of_a_file_without_scopes(self):
+        self.prices()
+        _r, out, _e = self.run_cmd(pa_costs.cmd_prices, self.dir)
+        self.assertIn("default scope: provider ? · any endpoint, any region, any account (the file has no defaultScope)", out)
+        self.assertNotIn("t-032", out)
+        self.assertIn("Models seen without a price: (none)", out)
+
+
+class J1C_Docs(unittest.TestCase):
+    def test_j1c11_readme_names_the_scope_format_and_facts(self):
+        with open(os.path.join(HERE, "..", "README.md")) as f:
+            readme = f.read()
+        for want in ("defaultScope", "scoped", "scopedAliases", "PA_COST_ACCOUNT", "PA_COST_REGION", "costs.accountRules",
+                     "costs.region", "pricing.providers", "pricing.endpoints", "--by scope", "--account", "billing.account"):
+            self.assertIn(want, readme)
+
+
+
+
 class ZZ_V1_Privacy(unittest.TestCase):
     """Run last: the canary of every fixture reached no file under costs/ or billing/ and no captured output."""
 
