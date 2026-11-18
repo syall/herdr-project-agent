@@ -721,6 +721,22 @@ class Q23Rejoin(QBase):
         self.assertEqual(e["rebases"][0]["result"], "clean")
         self.assertEqual(self.base_of("t-B", "t-C-x"), self.tip("t-C"))
 
+    def test_q23e_a_gate_run_before_the_r8_check_does_not_pin_main(self):
+        """pa-gate runs between the refusal and the R8 check (VERIFY.md still names the old tip, on main): it stores
+        the kept-rebased tip's record against main; after the check add still joins (the record on t-A-x counts)."""
+        self.task("t-A", [("a.txt", (100, "hundred"))])
+        self.add("t-A")
+        self.task("t-B", [("a.txt", (100, "hundred")), ("c.txt", "c\n")])
+        self.add("t-B", ok=False)
+        self.assertEqual(self.gate("t-B")[0], 1)
+        self.assertIn("main", self.stored_onto("t-B"))
+        self.recheck("t-B")
+        tip = self.tip("t-B")
+        self.add("t-B")
+        e = self.entry("t-B")
+        self.assertEqual((e["state"], e["onto"], e["tip"]), ("checking", "t-A-x", tip))
+        self.assertEqual(e["checked"]["base"], self.tip("t-A"))
+
     def test_q23d_task_on_main_still_checked_against_main(self):
         """A task not queued that does not sit on an entry's branch: the record stays against main (J1)."""
         self.task("t-A", [("fa.txt", "a\n")])
