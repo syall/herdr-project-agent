@@ -737,6 +737,27 @@ class Q23Rejoin(QBase):
         self.assertEqual((e["state"], e["onto"], e["tip"]), ("checking", "t-A-x", tip))
         self.assertEqual(e["checked"]["base"], self.tip("t-A"))
 
+    def test_q23f_gate_after_a_restack_uses_the_record_the_check_made(self):
+        """As Q23e, then t-A leaves and t-B is restacked onto main, clean: the gate compares the checked commit on the
+        record the R8 check made (against t-A-x), not the earlier gate run's record against main."""
+        self.task("t-A", [("a.txt", (100, "hundred"))])
+        self.add("t-A")
+        self.task("t-B", [("a.txt", (100, "hundred")), ("c.txt", "c\n")])
+        self.add("t-B", ok=False)
+        self.gate("t-B")
+        self.recheck("t-B")
+        checked = self.tip("t-B")
+        self.add("t-B")
+        code, out, err = self.queue("out", "t-A", "--repo", self.proj, "--why", "pulled")
+        self.assertEqual(code, 0, out + err)
+        code, out, err = self.queue("restack", "--repo", self.proj)
+        self.assertEqual(code, 0, out + err)
+        e = self.entry("t-B")
+        self.assertEqual((e["onto"], e["rebases"][-1]["result"]), ("main", "clean"))
+        self.assertNotEqual(self.tip("t-B"), checked)
+        code, out, _err = self.gate("t-B")
+        self.assertEqual(code, 0, out)
+
     def test_q23d_task_on_main_still_checked_against_main(self):
         """A task not queued that does not sit on an entry's branch: the record stays against main (J1)."""
         self.task("t-A", [("fa.txt", "a\n")])
