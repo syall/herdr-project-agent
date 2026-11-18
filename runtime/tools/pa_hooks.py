@@ -16,6 +16,9 @@ Selected by the name it is invoked as (symlinks in ~/.local/bin):
   pa-worker close --leftovers [--dry-run]        list the workers from before one-worker-per-job on one decision card
   pa-worker close [<address>] --card ID          close the workers the person approved on that card (same guards)
   pa-worker keep <address> --quote TEXT [--off]  record that the person wants a worker kept open
+  pa-trust <address> [--space ID]               a blocked worker's Claude Code folder trust prompt: accept it only for
+                                                the project folder or a task's evidence folder (see cmd_trust); one
+                                                JSON line, exit 0 accepted, 1 not, 2 usage or hc error
   pa-hook <name>                                one hook, called by the agent harness (reads its JSON on stdin):
       lint-after-edit   after each edit: lint the changed file
       affected-tests    when a task is marked complete, and (--stop) before the session ends
@@ -1882,6 +1885,359 @@ def cmd_worker(args):
             print("(The Project Agent is not running; it reads the ledger when it starts.)")
 
 
+# ---- pa-trust: Claude Code's folder trust prompt (t-035) ---------------------------------------------------
+#
+# The marker table is built from a real screen (evidence/t-035/trust-screen.txt, kept as
+# tests/trust_screens/claude-real.txt) and, as a second set, the older wording the spec remembers. Anything else
+# is not recognised and goes to the person (fail closed). Nothing here writes a file or opens Claude Code's or
+# Codex's own state.
+
+BOX = "│╭╮╰╯─┃┏┓┗┛━"
+CURSOR = "❯"
+TRUST_WORDINGS = [
+    {"name": "saved 2026-11-18", "markers": ["Accessing workspace:", "Is this a project you created or one you trust?"],
+     "yes": "Yes, I trust this folder", "no": "No, exit",
+     "text": "Accessing workspace: Quick safety check: Is this a project you created or one you trust? (Like your own "
+             "code, a well-known open source project, or work from your team). If not, take a moment to review what's "
+             "in this folder first. Claude Code'll be able to read, edit, and execute files here. Security guide",
+     "footer": ["Enter to confirm · Esc to cancel"]},
+    {"name": "older, remembered", "markers": ["Do you trust the files in this folder?"],
+     "yes": "1. Yes, proceed", "no": "2. No, exit",
+     "text": "Do you trust the files in this folder? Claude Code may read files in this folder. Reading untrusted files "
+             "may lead Claude Code to behave in unexpected ways. With your permission Claude Code may execute files in "
+             "this folder. Executing untrusted code is unsafe. Learn more",
+     "footer": ["Enter to confirm · Esc to exit", "Enter to confirm · Esc to cancel"]},
+]
+# Another dialog anywhere on the screen: a tool permission prompt, an MCP server approval, the bypass-permissions
+# confirmation, an auto-mode notice, Codex.
+OTHER_DIALOG_MARKERS = ["Do you want to", "don't ask again", "MCP server", ".mcp.json", "Bypass Permissions",
+                        "bypass permissions", "Auto mode", "auto mode", "Codex", "Yes, I accept", "esc to interrupt"]
+GRANT_WORDS = ("allow", "permission", "director", "mcp", "server", "env", "helper", "apikey")
+PERMISSION_RULE = re.compile(r"\b(Bash|Read|Edit|Write|MultiEdit|NotebookEdit|WebFetch|WebSearch|Glob|Grep|Task|Agent|Skill)\(|\bmcp__")
+PA_HOOK_COMMAND = re.compile(r"^(\$HOME/\.local/bin/|~/\.local/bin/|/[^\s;&|`$<>()]*/)?pa-hook [a-z][a-z-]*( --[a-z][a-z-]*)*$")
+PA_HOOK_LISTED = re.compile(r"(^|\s)(\S*/)?pa-hook [a-z][a-z-]*( --[a-z][a-z-]*)*$")
+TASK_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+CONFIRM_TRIES, CONFIRM_DELAY = 10, 0.5
+
+
+def screen_line(line):
+    return re.sub(r"\s+", " ", line.strip().strip(BOX).strip())
+
+
+def trust_marks(text):
+    """The wording whose markers are all on the screen, or None (none, or more than one)."""
+    flat = re.sub(r"\s+", " ", " ".join(screen_line(l) for l in text.split("\n")))
+    found = [w for w in TRUST_WORDINGS if all(m in flat for m in w["markers"])]
+    return found[0] if len(found) == 1 else None
+
+
+def pa_hook_line(text):
+    """A listed hook that is a pa-hook command and nothing more."""
+    if any(ch in text.replace("$HOME", "") for ch in ";&|`$<>()"):
+        return False
+    return bool(PA_HOOK_LISTED.search(text))
+
+
+def trust_read(text, width=None):
+    """Read a screen: (result or None, why, facts). facts: wording, shown (the folder as shown), grants (what the
+    dialog lists that would be granted), cursor ("yes", "no" or None) and move (the key from No to Yes, or None)."""
+    lines = [l.rstrip("\r") for l in (text or "").split("\n")]
+    for m in OTHER_DIALOG_MARKERS:
+        if m in (text or ""):
+            return "not-this-prompt", "the screen shows another dialog ({!r})".format(m), {}
+    wording = trust_marks(text or "")
+    if not wording:
+        return "not-this-prompt", "no folder trust prompt this tool knows is on the screen", {}
+    known = re.sub(r"\s+", " ", wording["text"])
+    options = {}
+    for i, line in enumerate(lines):
+        c = screen_line(line)
+        mark = c.startswith(CURSOR)
+        bare = c[len(CURSOR):].strip() if mark else c
+        for key in ("yes", "no"):
+            if bare == wording[key]:
+                options.setdefault(key, []).append((i, mark))
+    if len(options.get("yes", [])) != 1 or len(options.get("no", [])) != 1:
+        return "not-this-prompt", "the yes and no choices are not each on the screen once", {}
+    (yes_i, on_yes), (no_i, on_no) = options["yes"][0], options["no"][0]
+    first = next(i for i, l in enumerate(lines) if wording["markers"][0] in screen_line(l))
+    if first > min(yes_i, no_i):
+        return "not-this-prompt", "the choices come before the dialog's text", {}
+    end = max(yes_i, no_i)
+    for line in lines[end + 1:]:
+        c = screen_line(line)
+        if c and c not in wording["footer"]:
+            return "not-this-prompt", "text after the dialog it does not know: {!r}".format(c[:80]), {}
+    paths, grants, unknown, section = [], [], [], None
+    for i in range(first, end + 1):
+        if i in (yes_i, no_i):
+            continue
+        c = screen_line(lines[i])
+        if not c:
+            section = None
+            continue
+        if c in wording["footer"] or (len(c) >= 3 and c in known):
+            continue
+        if section == "grant":
+            grants.append(c)
+            continue
+        if section == "hooks":
+            if not pa_hook_line(c):
+                grants.append("a hook that is not the Project Agent's: " + c)
+            continue
+        low = c.lower()
+        if c.endswith(":"):
+            if "hook" in low:
+                section = "hooks"
+            elif any(w in low for w in GRANT_WORDS):
+                section = "grant"
+                grants.append(c)
+            else:
+                unknown.append(c)
+            continue
+        if c.startswith(("/", "~", "…", "...")):
+            paths.append(i)
+        elif PERMISSION_RULE.search(c) or any(w in low for w in GRANT_WORDS):
+            grants.append(c)
+        elif not pa_hook_line(c):
+            unknown.append(c)
+    if len(paths) != 1:
+        return "uncertain", "{} folder lines on the dialog, not exactly one".format(len(paths)), {}
+    i = paths[0]
+    shown = screen_line(lines[i])
+    raw = lines[i].rstrip()
+    width = width or max(len(l.rstrip()) for l in lines)
+    if "…" in shown or "..." in shown:
+        return "uncertain", "the folder is shown cut: " + shown, {}
+    if i + 1 >= len(lines) or screen_line(lines[i + 1]):
+        return "uncertain", "the line under the folder is not blank: the path may go on", {}
+    if raw and raw[-1] in BOX:
+        if not raw[:-1].endswith("  "):
+            return "uncertain", "the folder reaches the dialog's right edge: it may be wrapped", {}
+    elif len(raw) >= width:
+        return "uncertain", "the folder reaches the screen's right edge: it may be wrapped", {}
+    if shown.startswith("~") and not shown.startswith("~/"):
+        return "uncertain", "the folder starts with ~ but not ~/: " + shown, {}
+    if unknown:
+        return "not-this-prompt", "text on the dialog it does not know: {!r}".format(unknown[0][:80]), {}
+    cursor = "yes" if on_yes and not on_no else ("no" if on_no and not on_yes else None)
+    # The saved screen has Yes on the line right under No: one `down`. Any other layout is not one seen; no key.
+    move = "down" if cursor == "no" and yes_i == no_i + 1 else None
+    return None, "", {"wording": wording["name"], "shown": shown, "grants": grants, "cursor": cursor, "move": move}
+
+
+def trust_project(project, home):
+    """(real project folder, None), or (None, why) when it cannot be the base of a trust."""
+    if not isinstance(project, str) or not project.strip():
+        return None, "agent.json names no project folder"
+    if not os.path.isabs(project):
+        return None, "the project folder is not an absolute path: " + project
+    real = os.path.realpath(project)
+    if not os.path.isdir(real):
+        return None, "the project folder is not a folder: " + project
+    if real == os.path.realpath(os.sep) or real == os.path.realpath(home):
+        return None, "the project folder is / or the home folder: every folder would be inside it"
+    return real, None
+
+
+def trust_inside(folder, base):
+    """folder is base or inside it, on real paths (symlinks and '..' resolved, separator checked)."""
+    f, b = os.path.realpath(folder), os.path.realpath(base)
+    return f == b or f.startswith(b.rstrip(os.sep) + os.sep)
+
+
+def trust_evidence(folder, state_dir, task_ids):
+    """folder is <state_dir>/evidence/<id>/ or inside it, for one of task_ids (plain names only), on real paths;
+    never the state folder, evidence/ itself or the rest of the state folder."""
+    base = os.path.realpath(os.path.join(state_dir, "evidence"))
+    for task_id in task_ids:
+        if not isinstance(task_id, str) or not TASK_ID.match(task_id) or task_id in (".", ".."):
+            continue
+        own = os.path.realpath(os.path.join(base, task_id))
+        if os.path.dirname(own) != base or not os.path.isdir(own):
+            continue  # a task folder that is a symlink elsewhere counts for nothing
+        if trust_inside(folder, own):
+            return True
+    return False
+
+
+def git_top(folder):
+    code, out, _ = git(folder, "rev-parse", "--show-toplevel")
+    return os.path.realpath(out) if code == 0 and out else None
+
+
+def worker_dirs(folder):
+    """The worker's folder, its git top level and its main checkout root, as real paths."""
+    if not isinstance(folder, str) or not folder or not os.path.isdir(folder):
+        return []
+    real = os.path.realpath(folder)
+    out = [real]
+    top = git_top(real)
+    if top:
+        out.append(top)
+        code, common, _ = git(real, "rev-parse", "--git-common-dir")
+        if code == 0 and common:
+            common = os.path.realpath(os.path.join(real, common))
+            if os.path.basename(common) == ".git":
+                out.append(os.path.dirname(common))
+    return list(dict.fromkeys(out))
+
+
+def trust_own(folder, dirs):
+    return os.path.realpath(folder) in dirs
+
+
+def local_settings_grants(path):
+    """What an untracked .claude/settings.local.json grants beyond the Project Agent's own (pa-hooks)."""
+    try:
+        data = json.loads(pa.read_text(path))
+    except ValueError:
+        return ["{} is not valid JSON".format(path)]
+    if not isinstance(data, dict):
+        return ["{} is not a settings object".format(path)]
+    found = ["{} sets {}".format(path, k) for k in sorted(set(data) - {"hooks", "permissions"})]
+    perms = data.get("permissions", {})
+    if not isinstance(perms, dict) or set(perms) - {"deny"} or not isinstance(perms.get("deny", []), list):
+        found.append("{} has permissions other than deny rules".format(path))
+    hooks = data.get("hooks", {})
+    if not isinstance(hooks, dict):
+        return found + ["{} has hooks it cannot read".format(path)]
+    for event, entries in hooks.items():
+        for entry in entries if isinstance(entries, list) else [None]:
+            inner = entry.get("hooks") if isinstance(entry, dict) and not set(entry) - {"matcher", "hooks"} else None
+            for h in inner if isinstance(inner, list) else [None]:
+                ok = (isinstance(h, dict) and not set(h) - {"type", "command", "timeout"} and h.get("type") == "command"
+                      and isinstance(h.get("command"), str) and PA_HOOK_COMMAND.match(h["command"]))
+                if not ok:
+                    found.append("{} has a {} hook that is not a pa-hook command".format(path, event))
+    return found
+
+
+def folder_grants(dirs):
+    """What the folders' own files would grant once trusted (spec R5). Repository files only."""
+    found = []
+    for d in dict.fromkeys(os.path.realpath(x) for x in dirs if x):
+        claude = os.path.join(d, ".claude")
+        if os.path.lexists(os.path.join(d, ".mcp.json")):
+            found.append("{} has a .mcp.json".format(d))
+        if os.path.lexists(os.path.join(claude, "settings.json")):
+            found.append("{} has a .claude/settings.json".format(d))
+        local = os.path.join(claude, "settings.local.json")
+        if not os.path.lexists(local):
+            continue
+        if os.path.islink(claude) or os.path.islink(local):
+            found.append("{} reaches its settings.local.json through a symlink".format(d))
+            continue
+        code, _, _ = git(d, "ls-files", "--error-unmatch", "--", os.path.join(".claude", "settings.local.json"))
+        if code == 0:
+            found.append("{} tracks its .claude/settings.local.json in git".format(d))
+            continue
+        found += local_settings_grants(local)
+    return found
+
+
+def cmd_trust(args):
+    if not args.address:
+        raise pa.Problem("pa-trust needs a terminal address")
+    address = args.address
+    space = pa.local_id(args.space or space_from_terminal() or "")
+    if not space:
+        raise pa.Problem("pass --space <id>")
+    directory, agent, _profile = load_context(space)
+    home = os.path.expanduser("~")
+    out = {"worker": address, "folder": None, "real": None, "project": None, "result": None, "why": ""}
+
+    def done(result, why):
+        out.update(result=result, why=why)
+        print(json.dumps(out))
+        sys.exit(0 if result == "accepted" else 1)
+
+    project, why = trust_project(agent.get("project"), home)
+    if why:
+        done("refused", why)
+    out["project"] = project
+    if address == agent.get("terminal") or address in (agent.get("terminals") or []):
+        done("refused", "that is the Project Agent's own terminal: its trust prompt is the person's")
+    ledger = read_ledger(directory)
+    _task, entry = recorded(ledger, address)
+    if not entry:
+        done("refused", "not a worker this space's ledger records: its prompts are the person's")
+
+    def get():
+        info = pa.hc_get(address)
+        if not info:
+            raise pa.Problem("hc gave no record for " + address)
+        return info
+
+    def read():
+        return pa.call(["hc", "read", address, "--lines", "0"])
+
+    info = get()
+    status = info.get("status") if isinstance(info.get("status"), dict) else {}
+    if "codex" in str(status.get("app") or "").lower():
+        done("not-this-prompt", "a Codex worker: its trust prompt goes to the person")
+    if pa.status_word(info) != "blocked":
+        done("not-this-prompt", "its status is {!r}, not blocked".format(pa.status_word(info)))
+    size = info.get("size") if isinstance(info.get("size"), dict) else {}
+    width = size.get("cols") if isinstance(size.get("cols"), int) and size.get("cols") > 0 else None
+    screen = read()
+    result, why, facts = trust_read(screen, width)
+    if result:
+        done(result, why)
+    shown = facts["shown"]
+    out["folder"] = shown
+    path = os.path.join(home, shown[2:]) if shown.startswith("~/") else shown
+    if not os.path.isdir(path):
+        done("uncertain", "the folder on the screen is not a folder here (it may be cut): " + shown)
+    real = os.path.realpath(path)
+    out["real"] = real
+    ids = [t.get("id") for t in ledger.get("tasks", []) if isinstance(t, dict)]
+    if trust_inside(real, project):
+        area = "inside the project folder"
+    elif trust_evidence(real, directory, ids):
+        area = "a task's evidence folder in the state folder"
+    else:
+        done("outside", "on real paths the folder is neither the project folder or inside it, nor a task's evidence folder")
+    cwd = (info.get("foreground") or {}).get("cwd") or info.get("cwd")
+    dirs = worker_dirs(cwd)
+    if not dirs:
+        done("uncertain", "hc does not say which folder the worker runs in")
+    if not trust_own(real, dirs):
+        done("uncertain", "the folder is not the worker's own folder or its repository's")
+    if facts["grants"]:
+        done("grants", "the dialog lists what the folder would grant: " + "; ".join(facts["grants"])[:300])
+    found = folder_grants([real, dirs[0], git_top(real), git_top(dirs[0])])
+    if found:
+        done("grants", "; ".join(found)[:300])
+    if facts["cursor"] is None:
+        done("uncertain", "the cursor is not on one choice")
+    if facts["cursor"] == "no" and not facts["move"]:
+        done("uncertain", "the cursor is on the no choice and the yes choice is not the line right under it")
+    if read() != screen:
+        done("uncertain", "the screen changed before any key was pressed")
+    if pa.status_word(get()) != "blocked":
+        done("uncertain", "the worker is no longer blocked")
+    if facts["cursor"] == "no":
+        pa.call(["hc", "keys", address, facts["move"]])
+        moved = read()
+        r2, _w2, f2 = trust_read(moved, width)
+        if r2 or f2.get("cursor") != "yes" or moved.replace(CURSOR, " ") != screen.replace(CURSOR, " ") \
+                or pa.status_word(get()) != "blocked":
+            done("uncertain", "pressed {} once; the screen then did not show the cursor on the yes choice with nothing "
+                 "else changed, so Enter was not pressed (the dialog is left as it is now)".format(facts["move"]))
+    pa.call(["hc", "keys", address, "enter"])
+    for n in range(CONFIRM_TRIES):
+        if n:
+            time.sleep(CONFIRM_DELAY)
+        try:
+            after, text = pa.hc_get(address), read()
+        except pa.Problem:
+            continue
+        if after and pa.status_word(after) != "blocked" and not trust_marks(text):
+            done("accepted", "the folder is {}, the worker's own, with no grants of its own; the prompt moved on".format(area))
+    done("unconfirmed", "pressed Enter once; the screen still shows the trust prompt or the worker is still blocked")
+
+
 def cmd_full_suite(_args):
     record = find_task(os.getcwd())
     if not record:
@@ -1955,9 +2311,13 @@ def main():
         if args.action != "close" and not args.address:
             raise pa.Problem("pa-worker {} needs an address".format(args.action))
         return cmd_worker(args)
+    if kind == "pa-trust":
+        parser.add_argument("address")
+        parser.add_argument("--space")
+        return cmd_trust(parser.parse_args())
     if kind == "pa-full-suite":
         return cmd_full_suite(parser.parse_args())
-    raise pa.Problem("invoke as pa-gate, pa-hooks, pa-hook, pa-worktree, pa-worker or pa-full-suite")
+    raise pa.Problem("invoke as pa-gate, pa-hooks, pa-hook, pa-worktree, pa-worker, pa-trust or pa-full-suite")
 
 
 if __name__ == "__main__":
