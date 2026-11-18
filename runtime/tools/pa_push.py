@@ -7,7 +7,7 @@ Selected by the name it is invoked as (symlinks in ~/.local/bin):
                                                  open a push card for a task that passed its full gate
   pa-push-main check <card> [--space ID] [--json]
                                                  the card's facts read now, the first failing check, the seen token
-  pa-push-main run <card> --answer Push|"Not now" --space ID [--seen TOKEN] [--note T] [--json]
+  pa-push-main run <card> --answer Push|"Not now"|Other --space ID [--seen TOKEN] [--note T] [--json]
                                                  the person's answer, run by the Project panel on their click:
                                                  every check again under a lock, then a fast-forward push of
                                                  exactly the gated commit to the allowlist URL (never a force)
@@ -1028,7 +1028,7 @@ def cmd_check(args):
 
 RUN_MSG = ("pa-push-main run is the person's command; it runs when they answer a push card in the Project panel. "
            "An agent opens the card with pa-push-main plan and stops. ({})")
-ANSWERS = ("Push", "Not now")
+ANSWERS = ("Push", "Not now", "Other")  # Other: the person's own words, in --note; it pushes nothing
 BUDGET = 540  # seconds for one run (the panel's exec allows 600)
 PUSH_RESERVE = 150  # seconds that must be left before the push starts
 ATTEMPTS_KEPT = 20
@@ -1080,6 +1080,10 @@ def run_locked(directory, space, card_id, answer, note, seen, deadline):
         raise Refused("C5", "--answer must be one of: " + ", ".join(ANSWERS))
     if answer == "Not now":
         return answer_not_now(directory, card, note)
+    if answer == "Other":
+        return answer_other(directory, card, note)
+    if answer != "Push":  # only Push reaches the push path
+        raise Refused("C5", "--answer must be one of: " + ", ".join(ANSWERS))
     s = Session(deadline)
     facts = blank_facts()
     try:
@@ -1148,6 +1152,23 @@ def answer_not_now(directory, card, note):
     pa_hooks.append_journal(directory, {"by": "person", "trigger": "panel", "task": card.get("task"), "decision": card["id"],
                                         "why": "answered Not now", "push": journal_push(push, push.get("remoteBefore"), False)})
     return 0, outcome(True, False, "Not now", message="{} answered Not now; nothing was pushed.".format(card["id"]))
+
+
+def answer_other(directory, card, note):
+    """C5 Other: the person's own words close the card as Not now does; nothing is read or pushed, --seen is not looked at."""
+    words = (note or "").strip()
+    if not words:
+        raise Refused("C5", "an Other answer needs --note with the person's own words")
+    if len(words) > pa.OTHER_MAX:
+        raise Refused("C5", pa.OTHER_TOO_LONG)
+    push = card["push"]
+    answered(card, pa.OTHER, words)
+    card["other"] = True
+    save_card(directory, card)
+    pa_hooks.append_journal(directory, {"by": "person", "trigger": "panel", "task": card.get("task"), "decision": card["id"],
+                                        "why": "answered Other: " + pa_hooks.cut(pa_hooks.clean(words), 200),
+                                        "push": journal_push(push, push.get("remoteBefore"), False)})
+    return 0, outcome(True, False, pa.OTHER, message="{} answered Other; nothing was pushed.".format(card["id"]))
 
 
 def local_fast_forward(s, facts):

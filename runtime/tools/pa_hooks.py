@@ -1194,6 +1194,10 @@ def cmd_worktree(args):
                 print("{}: kept (keepWorktree is set)".format(task))
             elif not main and not in_worktrees_folder(row["path"]):
                 print("{}: {} is not under a worktrees folder; not offered".format(task, row["path"]))
+            elif card and card.get("status") == "answered" and pa.is_other(card):
+                # The person's own words: never read as Delete or Keep, and nothing is opened.
+                print("{}: card {} answered Other (\"{}\"): nothing is removed; not asked again unless the card is withdrawn".format(
+                      task, card["id"], cut(clean(card.get("note")), 200)))
             elif card and card.get("status") == "answered":
                 delete = str(card.get("answer", "")).lower().startswith("delete")
                 if delete and under_rule_b(row, card) and not mismatch:
@@ -1257,6 +1261,11 @@ def cmd_worktree(args):
     task, job, main = owner
     path = card_path(directory, task, job, main)
     card = pa.read_json(path) or {}
+    if card.get("status") == "answered" and pa.is_other(card):
+        raise pa.Problem('card {id} was answered Other, in the person\'s own words: "{words}". pa-worktree removes nothing on it. '
+                         'Act on their words; if they ask for the worktree to go, withdraw the card (pa-decide {id} --withdraw '
+                         '--why "<reason>") and the next pa-worktree check --open-cards asks again.'.format(
+                             id=card.get("id"), words=cut(clean(card.get("note")), 200)))
     if card.get("status") != "answered" or not str(card.get("answer", "")).lower().startswith("delete"):
         raise pa.Problem("no answered \"Delete\" decision card for this worktree (run `pa-worktree check --open-cards`; the person answers it)")
     if os.path.realpath(card.get("worktree") or "") != row["path"]:
@@ -2063,6 +2072,18 @@ def leftovers_card(directory, card_id):
         raise pa.Problem("card {} is {}; nothing was closed".format(card_id, card.get("status")))
     if "in conversation" in str(card.get("answeredBy") or ""):
         raise pa.Problem("card {} is answered in the panel only; nothing was closed".format(card_id))
+    if pa.is_other(card):
+        # The person's own words are never parsed, as a note: close nothing, withdraw, and the next sweep asks again.
+        words = cut(clean(card.get("note")), 200)
+        card.update(status="withdrawn", previousAnswer=pa.OTHER, previousNote=card.get("note"), answer=None,
+                    answeredBy="pa-worker close: withdrawn", withdrawnAt=pa.now())
+        card.pop("other", None)
+        pa.write_json(os.path.join(directory, "decisions", card_id + ".json"), card)
+        append_journal(directory, {"by": "agent" if by_an_agent() else "person", "trigger": "leftovers",
+                                   "why": "withdrew card {}: it was answered Other ({}); nothing was closed".format(card_id, words)})
+        raise pa.Problem('card {} was answered Other, in the person\'s own words: "{}". Nothing was closed; the words are not read by '
+                         'this tool. Act on them (ask the person to say "keep tNN" for each worker to keep), then run pa-worker close '
+                         '--leftovers to ask again on a new card.'.format(card_id, words))
     if card.get("answer") != CLOSE_ALL:
         raise pa.Problem("card {} was answered {!r}; nothing was closed".format(card_id, card.get("answer")))
     if str(card.get("note") or "").strip():

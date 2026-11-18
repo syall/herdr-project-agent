@@ -14,8 +14,8 @@ One file, selected by the name it is invoked as (symlinks in ~/.local/bin):
   pa-cleanup [--kill] [--dry-run] [--space ID]   remove finished workers whose evidence is recorded
   pa-doctor [--space ID]                         check a space's state files; exit 1 if any is broken
   pa-task list|done|reopen|park|delete|restore|purge   the person's own changes to tasks (see pa-task --help)
-  pa-decide <card> --answer LABEL --quote TEXT   record a decision the person made in conversation
-  pa-decide <card> --withdraw --why TEXT         close a card the conversation made moot
+  pa-decide <card> --answer LABEL|Other --quote TEXT   record a decision the person made in conversation
+  pa-decide <card> --withdraw --why TEXT         close a card the conversation made moot (or answered Other)
   pa-sync --on MACHINE [--dry-run]               copy core/, tools/ and profiles/ to another Herdr machine
   pa-core-check                                  fail if the generic core names a profile's tools
   pa-stamp [--commit C] [--dirty]                write installed.json: hashes of the installed tools, core, mods
@@ -1700,21 +1700,69 @@ def cmd_task(args):
             print("(The Project Agent could not be told right now; it reads the ledger on its next pass.)")
 
 
+OTHER = "Other"  # the answer in the person's own words (t-046): the words are in the card's note
+OTHER_MAX = 2000
+OTHER_TOO_LONG = "Your answer is longer than {} characters; shorten it, or write it in a file and give the path.".format(OTHER_MAX)
+PUSH_LOCK_WAIT = 5  # seconds pa-decide waits for the space's push lock
+
+
+def is_other(card):
+    """An answer in the person's own words: the marker, or the label Other in any case, even on a card that has an
+    option of that name. Every tool that acts on an answer checks this first and does nothing on it."""
+    return isinstance(card, dict) and (card.get("other") is True or str(card.get("answer") or "").strip().lower() == "other")
+
+
+def push_card_lock(directory):
+    """The space's push lock (<space>/.push.lock, as pa_push.push_lock takes it): every write of a push card holds
+    it, so pa-decide never writes one while pa-push-main runs. Returns the open file; close it to unlock."""
+    f = open(os.path.join(directory, ".push.lock"), "a")
+    end = time.monotonic() + PUSH_LOCK_WAIT
+    while True:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return f
+        except OSError:
+            if time.monotonic() > end:
+                f.close()
+                raise Problem("another push for this space is running; try again in a minute. Nothing was written")
+            time.sleep(0.1)
+
+
 def cmd_decide(args):
     """Closes an open decision card from the conversation: with the person's answer in their own
-    words, or as withdrawn. For the orchestrator; every use is journaled and shown on the card."""
+    words, or as withdrawn. For the orchestrator; every use is journaled and shown on the card.
+    A push card is read and written under the space's push lock."""
     directory, agent = space_for_command(args.space)
     ident(args.card, "card id")
     path = os.path.join(directory, "decisions", args.card + ".json")
     card = read_json(path)
     if not card:
         raise Problem("no decision card {}".format(args.card))
-    if card.get("status") != "open":
+    if not (card.get("push") or card.get("kind") == "push"):
+        return decide_card(directory, path, args)
+    lock = push_card_lock(directory)
+    try:
+        return decide_card(directory, path, args)
+    finally:
+        lock.close()
+
+
+def decide_card(directory, path, args):
+    card = read_json(path)  # again: a push card is read under its lock
+    if not card:
+        raise Problem("no decision card {}".format(args.card))
+    withdraw_other = args.withdraw and card.get("status") == "answered" and is_other(card)
+    if card.get("status") != "open" and not withdraw_other:
         raise Problem("{} is already {}".format(args.card, card.get("status")))
     stamp = now()
+    after = None
     if args.withdraw:
         if not (args.why or "").strip():
             raise Problem("--withdraw needs --why \"<reason>\"")
+        if withdraw_other:
+            # Their words asked for the question again: the tool that owns the card asks again; the words are kept.
+            card.update(previousAnswer=OTHER, previousNote=card.get("note"))
+            card.pop("other", None)
         card.update(status="withdrawn", answer=None, note=args.why.strip(), answered=stamp, answeredBy="orchestrator: withdrawn")
         what = "withdrawn"
     else:
@@ -1725,16 +1773,27 @@ def cmd_decide(args):
         if card.get("kind") == "leftovers":
             raise Problem("a card that closes workers is answered in the panel, not in conversation")
         labels = [o.get("label") for o in card.get("options") or []]
-        match = next((l for l in labels if str(l).lower() == str(args.answer or "").strip().lower()), None)
+        wanted = str(args.answer or "").strip().lower()
+        match = OTHER if wanted == OTHER.lower() else next((l for l in labels if str(l).lower() == wanted), None)
         if match is None:
-            raise Problem("--answer must be one of this card's options: {}".format(", ".join(map(str, labels))))
+            listed = [str(l) for l in labels if str(l).strip().lower() != OTHER.lower()] + [OTHER]
+            raise Problem("--answer must be one of this card's options: {}".format(", ".join(listed)))
         quote = (args.quote or "").strip()
         if len(quote) < 2:
             raise Problem("--quote needs the person's own words that decide it")
-        card.update(status="answered", answer=match, note=quote, answered=stamp, answeredBy="person, in conversation")
-        what = "answered {}".format(match)
-        # A rule proposal's card decides the rule too, as it does in the panel.
-        decided = "active" if str(match).lower().startswith("approve") else "declined" if str(match).lower().startswith("decline") else None
+        if match == OTHER:
+            if len(quote) > OTHER_MAX:
+                raise Problem(OTHER_TOO_LONG)
+            card.update(status="answered", answer=OTHER, other=True, note=quote, answered=stamp, answeredBy="person, in conversation")
+            what = "answered Other"
+            if card.get("rule"):
+                after = "Rule {} stays proposed: an Other answer is not Approve or Decline.".format(card["rule"])
+        else:
+            card.update(status="answered", answer=match, note=quote, answered=stamp, answeredBy="person, in conversation")
+            what = "answered {}".format(match)
+        # A rule proposal's card decides the rule too, as it does in the panel; an Other answer decides nothing.
+        lower = "" if match == OTHER else str(match).lower()
+        decided = "active" if lower.startswith("approve") else "declined" if lower.startswith("decline") else None
         if card.get("rule") and decided:
             rules_path = os.path.join(directory, "rules.json")
             rules = read_json(rules_path) or {}
@@ -1749,6 +1808,8 @@ def cmd_decide(args):
         journal.write(json.dumps({"at": stamp, "by": "orchestrator", "trigger": "conversation", "task": card.get("task"), "decision": args.card,
                                   "why": "{}: {}".format(what, card["note"])}) + "\n")
     print("{} {} ({}).".format(args.card, what, card["answeredBy"]))
+    if after:
+        print(after)
 
 
 def stamp_script():
@@ -1891,7 +1952,7 @@ def main():
         return cmd_task(parser.parse_args())
     if kind == "pa-decide":
         parser.add_argument("card")
-        parser.add_argument("--answer", help="one of the card's option labels")
+        parser.add_argument("--answer", help="one of the card's option labels, or Other for the person's own answer")
         parser.add_argument("--quote", help="the person's own words that decide it")
         parser.add_argument("--withdraw", action="store_true", help="close the card without an answer")
         parser.add_argument("--why", help="why it no longer applies (with --withdraw)")
