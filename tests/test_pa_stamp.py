@@ -515,5 +515,19 @@ class NoEnding(unittest.TestCase):
         self.assertEqual(text.count('"kill"'), 2, "hc kill only in cmd_cleanup (today's) and end_terminal (t-037 J3, R10)")
 
 
+class J4_CodeStateParity(unittest.TestCase):
+    """t-037 J4 (R14): tests/samples/code-state-cases.json is the one table the panel's store.codeState and
+    pa.code_state are both checked against (tests/store/run.mjs S37-code-parity reads the same file)."""
+
+    def test_every_row(self):
+        with open(os.path.join(HERE, "samples", "code-state-cases.json")) as f:
+            rows = json.load(f)
+        self.assertGreaterEqual(len(rows), 15)
+        for row in rows:
+            word, _detail = pa.code_state(row["launcher"], row["installed"], row["terminal"])
+            self.assertEqual(word, row["word"], row["name"])
+            self.assertEqual(pa.restart_capable(row["launcher"]), row["capable"], row["name"])
+
+
 if __name__ == "__main__":
     unittest.main()

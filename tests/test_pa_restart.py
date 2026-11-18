@@ -2630,5 +2630,74 @@ class J3Main(Base):
                          (True, True, "t1", "-"))
 
 
+# ---- t-037 J4: the panel's two pa-restart flags (card d-171, Q-J4-1 A) -----------------------------------------
+
+class J4Command(Command):
+    def answer(self, fn):
+        a = Answering(self, fn)
+        a.start()
+        return a
+
+
+class J4_ExpectInstance(J4Command):
+    """--expect-instance binds a run to the launcher the panel showed: another instance refuses, writes nothing."""
+
+    def test_the_same_instance_writes_the_request(self):
+        seen = {}
+        self.answer(lambda req: seen.update(req))
+        self.run_cmd(wait=0.5, expect_instance=INSTANCE)
+        self.assertEqual(seen.get("instance"), INSTANCE)
+
+    def test_another_instance_refuses_and_writes_nothing(self):
+        for dry in (False, True):
+            code, _out, err = self.run_cmd(expect_instance="older-instance", dry_run=dry)
+            self.assertEqual(code, 2, err)
+            self.assertIn("restarted since you looked", err)
+            self.assertIn(INSTANCE, err)
+            self.assertIsNone(self.request_file())
+        self.no_ending_calls()
+
+    def test_relayed_by_on(self):
+        calls = []
+        pa.relay = lambda argv: calls.append(list(argv)) or 0
+        code, _o, err = self.run_cmd(on="m2", expect_instance=INSTANCE, by="panel")
+        self.assertEqual(code, 0, err)
+        import shlex
+        words = shlex.split(calls[0][9])
+        self.assertEqual(words[words.index("--expect-instance") + 1], INSTANCE)
+        self.assertEqual(words[words.index("--by") + 1], "panel")
+
+
+class J4_ByPanel(J4Command):
+    def test_by_panel_is_written(self):
+        seen = {}
+        self.answer(lambda req: seen.update(req))
+        self.run_cmd(wait=0.5, by="panel", why="the Restart button in the Project Agent panel")
+        self.assertEqual((seen.get("by"), seen.get("why")), ("panel", "the Restart button in the Project Agent panel"))
+
+    def test_by_panel_refused_inside_claude(self):
+        os.environ["CLAUDECODE"] = "1"
+        code, _o, err = self.run_cmd(by="panel", why="x")
+        self.assertEqual(code, 2)
+        self.assertIn("--by panel", err)
+        self.assertIsNone(self.request_file())
+
+    def test_main_takes_both_flags_and_only_panel(self):
+        seen = {}
+        saved = (sys.argv, pa.cmd_restart)
+        pa.cmd_restart = lambda args: seen.update(vars(args))
+        try:
+            sys.argv = ["pa-restart", "--space", SP, "--expect-instance", "abc", "--by", "panel"]
+            pa.main()
+            self.assertEqual((seen["expect_instance"], seen["by"]), ("abc", "panel"))
+            sys.argv = ["pa-restart", "--space", SP, "--by", "orchestrator"]
+            with contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as e:
+                    pa.main()
+            self.assertEqual(e.exception.code, 2)
+        finally:
+            sys.argv, pa.cmd_restart = saved
+
+
 if __name__ == "__main__":
     unittest.main()

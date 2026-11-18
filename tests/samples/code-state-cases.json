@@ -1,0 +1,453 @@
+[
+ {
+  "name": "current",
+  "launcher": {
+   "version": 2,
+   "accepts": [
+    "restart"
+   ],
+   "instance": "i1",
+   "terminal": "t1",
+   "code": {
+    "tools": "TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT"
+   },
+   "session": {
+    "id": "s1",
+    "resume": true,
+    "core": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+   }
+  },
+  "installed": {
+   "version": 1,
+   "tools": "TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT",
+   "core": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+  },
+  "terminal": "t1",
+  "word": "current",
+  "capable": true
+ },
+ {
+  "name": "older tools",
+  "launcher": {
+   "version": 2,
+   "accepts": [
+    "restart"
+   ],
+   "instance": "i1",
+   "terminal": "t1",
+   "code": {
+    "tools": "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+   },
+   "session": {
+    "id": "s1",
+    "resume": true,
+    "core": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+   }
+  },
+  "installed": {
+   "version": 1,
+   "tools": "TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT",
+   "core": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+  },
+  "terminal": "t1",
+  "word": "older (tools)",
+  "capable": true
+ },
+ {
+  "name": "older core",
+  "launcher": {
+   "version": 2,
+   "accepts": [
+    "restart"
+   ],
+   "instance": "i1",
+   "terminal": "t1",
+   "code": {
+    "tools": "TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT"
+   },
+   "session": {
+    "id": "s1",
+    "resume": true,
+    "core": "YYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYY"
+   }
+  },
+  "installed": {
+   "version": 1,
+   "tools": "TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT",
+   "core": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+  },
+  "terminal": "t1",
+  "word": "older (core)",
+  "capable": true
+ },
+ {
+  "name": "older both",
+  "launcher": {
+   "version": 2,
+   "accepts": [
+    "restart"
+   ],
+   "instance": "i1",
+   "terminal": "t1",
+   "code": {
+    "tools": "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+   },
+   "session": {
+    "id": "s1",
+    "resume": true,
+    "core": "YYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYY"
+   }
+  },
+  "installed": {
+   "version": 1,
+   "tools": "TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT",
+   "core": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+  },
+  "terminal": "t1",
+  "word": "older (tools, core)",
+  "capable": true
+ },
+ {
+  "name": "no installed.json",
+  "launcher": {
+   "version": 2,
+   "accepts": [
+    "restart"
+   ],
+   "instance": "i1",
+   "terminal": "t1",
+   "code": {
+    "tools": "TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT"
+   },
+   "session": {
+    "id": "s1",
+    "resume": true,
+    "core": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+   }
+  },
+  "installed": null,
+  "terminal": "t1",
+  "word": "unknown",
+  "capable": true
+ },
+ {
+  "name": "installed without tools",
+  "launcher": {
+   "version": 2,
+   "accepts": [
+    "restart"
+   ],
+   "instance": "i1",
+   "terminal": "t1",
+   "code": {
+    "tools": "TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT"
+   },
+   "session": {
+    "id": "s1",
+    "resume": true,
+    "core": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+   }
+  },
+  "installed": {
+   "version": 1,
+   "core": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+  },
+  "terminal": "t1",
+  "word": "unknown",
+  "capable": true
+ },
+ {
+  "name": "no launcher.json",
+  "launcher": null,
+  "installed": {
+   "version": 1,
+   "tools": "TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT",
+   "core": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+  },
+  "terminal": "t1",
+  "word": "unknown",
+  "capable": false
+ },
+ {
+  "name": "launcher.json a list",
+  "launcher": [
+   1
+  ],
+  "installed": {
+   "version": 1,
+   "tools": "TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT",
+   "core": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+  },
+  "terminal": "t1",
+  "word": "unknown",
+  "capable": false
+ },
+ {
+  "name": "another terminal",
+  "launcher": {
+   "version": 2,
+   "accepts": [
+    "restart"
+   ],
+   "instance": "i1",
+   "terminal": "t9",
+   "code": {
+    "tools": "TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT"
+   },
+   "session": {
+    "id": "s1",
+    "resume": true,
+    "core": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+   }
+  },
+  "installed": {
+   "version": 1,
+   "tools": "TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT",
+   "core": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+  },
+  "terminal": "t1",
+  "word": "unknown",
+  "capable": true
+ },
+ {
+  "name": "no terminal given",
+  "launcher": {
+   "version": 2,
+   "accepts": [
+    "restart"
+   ],
+   "instance": "i1",
+   "terminal": "t9",
+   "code": {
+    "tools": "TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT"
+   },
+   "session": {
+    "id": "s1",
+    "resume": true,
+    "core": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+   }
+  },
+  "installed": {
+   "version": 1,
+   "tools": "TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT",
+   "core": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+  },
+  "terminal": null,
+  "word": "current",
+  "capable": true
+ },
+ {
+  "name": "promptCore wins over core",
+  "launcher": {
+   "version": 2,
+   "accepts": [
+    "restart"
+   ],
+   "instance": "i1",
+   "terminal": "t1",
+   "code": {
+    "tools": "TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT"
+   },
+   "session": {
+    "id": "s1",
+    "resume": true,
+    "core": "YYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYY",
+    "prompt": "recorded",
+    "promptCore": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+   }
+  },
+  "installed": {
+   "version": 1,
+   "tools": "TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT",
+   "core": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+  },
+  "terminal": "t1",
+  "word": "current",
+  "capable": true
+ },
+ {
+  "name": "recorded promptCore older",
+  "launcher": {
+   "version": 2,
+   "accepts": [
+    "restart"
+   ],
+   "instance": "i1",
+   "terminal": "t1",
+   "code": {
+    "tools": "TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT"
+   },
+   "session": {
+    "id": "s1",
+    "resume": true,
+    "core": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+    "prompt": "recorded",
+    "promptCore": "YYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYY"
+   }
+  },
+  "installed": {
+   "version": 1,
+   "tools": "TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT",
+   "core": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+  },
+  "terminal": "t1",
+  "word": "older (core)",
+  "capable": true
+ },
+ {
+  "name": "recorded without core",
+  "launcher": {
+   "version": 2,
+   "accepts": [
+    "restart"
+   ],
+   "instance": "i1",
+   "terminal": "t1",
+   "code": {
+    "tools": "TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT"
+   },
+   "session": {
+    "id": "s1",
+    "resume": true,
+    "core": null,
+    "prompt": "recorded"
+   }
+  },
+  "installed": {
+   "version": 1,
+   "tools": "TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT",
+   "core": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+  },
+  "terminal": "t1",
+  "word": "unknown",
+  "capable": true
+ },
+ {
+  "name": "promptCore null",
+  "launcher": {
+   "version": 2,
+   "accepts": [
+    "restart"
+   ],
+   "instance": "i1",
+   "terminal": "t1",
+   "code": {
+    "tools": "TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT"
+   },
+   "session": {
+    "id": "s1",
+    "resume": true,
+    "core": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+    "promptCore": null
+   }
+  },
+  "installed": {
+   "version": 1,
+   "tools": "TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT",
+   "core": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+  },
+  "terminal": "t1",
+  "word": "unknown",
+  "capable": true
+ },
+ {
+  "name": "code not an object",
+  "launcher": {
+   "version": 2,
+   "accepts": [
+    "restart"
+   ],
+   "instance": "i1",
+   "terminal": "t1",
+   "code": "x",
+   "session": {
+    "id": "s1",
+    "resume": true,
+    "core": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+   }
+  },
+  "installed": {
+   "version": 1,
+   "tools": "TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT",
+   "core": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+  },
+  "terminal": "t1",
+  "word": "unknown",
+  "capable": true
+ },
+ {
+  "name": "session a list",
+  "launcher": {
+   "version": 2,
+   "accepts": [
+    "restart"
+   ],
+   "instance": "i1",
+   "terminal": "t1",
+   "code": {
+    "tools": "TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT"
+   },
+   "session": []
+  },
+  "installed": {
+   "version": 1,
+   "tools": "TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT",
+   "core": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+  },
+  "terminal": "t1",
+  "word": "unknown",
+  "capable": true
+ },
+ {
+  "name": "tools a number",
+  "launcher": {
+   "version": 2,
+   "accepts": [
+    "restart"
+   ],
+   "instance": "i1",
+   "terminal": "t1",
+   "code": {
+    "tools": 3
+   },
+   "session": {
+    "id": "s1",
+    "resume": true,
+    "core": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+   }
+  },
+  "installed": {
+   "version": 1,
+   "tools": "TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT",
+   "core": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+  },
+  "terminal": "t1",
+  "word": "unknown",
+  "capable": true
+ },
+ {
+  "name": "version 1 record, same hashes",
+  "launcher": {
+   "version": 1,
+   "accepts": null,
+   "instance": "i1",
+   "terminal": "t1",
+   "code": {
+    "tools": "TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT"
+   },
+   "session": {
+    "id": "s1",
+    "resume": true,
+    "core": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+   }
+  },
+  "installed": {
+   "version": 1,
+   "tools": "TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT",
+   "core": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+  },
+  "terminal": "t1",
+  "word": "current",
+  "capable": false
+ }
+]

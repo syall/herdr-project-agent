@@ -988,6 +988,76 @@ cases["K53-beats-single-flight"] = async () => { // R5: a heartbeat read that ha
   check(beats === 1, `one heartbeat read in flight (got ${beats})`);
 };
 
+// ---- t-037 J4 (R15, AC15.1): a launcher restarting in place (herdr.pa.restarting) is a launcher at work ----
+// pa.py labels its terminal herdr.pa.restarting=<request id> while it ends its Claude and execs, and clears it by
+// setting it empty. The keeper never restores it, never opens a second one, and does not mark it alive (no notice is
+// typed into the gap), for at most RESTART_HOLD (120 s) from when it first saw the label; an idle shell never holds.
+function restartingWorld({ program = launcher, status = null, beatAge = 25 } = {}) {
+  const w = world({ program, status, argv: ARGV() });
+  g.__terminals.find((t) => t.address === "t1").labels["herdr.pa.restarting"] = "r1";
+  g.__files[w.f("heartbeat")] = `${T0 / 1000 - beatAge} t1\n`;
+  return w;
+}
+const lifeRuns = () => runsOf("pane.split", "pane.close", "tab.new", "tab.close");
+
+cases["K37-restarting-not-restored"] = async () => { // AC15.1: label on, heartbeat 25 s old and not moving: left alone
+  restartingWorld();
+  const k = await start();
+  let alive = false, marked = 0;
+  await sim(k, 100000, () => { if (records().tb1?.alive) alive = true; if (records().tb1?.restarting) marked++; });
+  check(lifeRuns().length === 0, `no restore (got ${JSON.stringify(g.__runs)})`);
+  check(g.__notes.length === 0, `no notice (got ${JSON.stringify(noteText())})`);
+  check(!alive, "never marked alive while restarting (no notice is sent into the gap)");
+  check(marked > 50 && Boolean(records().tb1), `the record says restarting (marked on ${marked} ticks)`);
+};
+
+cases["K37-restarting-no-open"] = async () => { // AC15.1: an Open request meanwhile is refused: it is restarting
+  restartingWorld();
+  const k = await start();
+  await sim(k, 3000);
+  request(S);
+  await sim(k, 5000);
+  check(tabNews().length === 0, `no tab.new (got ${JSON.stringify(g.__runs)})`);
+  check(!requests()[S], "the request was handled");
+  check(noteText().some((n) => /restarting/i.test(n)), `told it is restarting (got ${JSON.stringify(noteText())})`);
+};
+
+cases["K37-alive-again"] = async () => { // AC15.1: label cleared ("") and a fresh heartbeat naming the same address: alive
+  const w = restartingWorld({ program: claude, status: "idle" });
+  const k = await start();
+  await sim(k, 20000);
+  check(!records().tb1.alive && records().tb1.restarting, "restarting first");
+  g.__terminals.find((t) => t.address === "t1").labels["herdr.pa.restarting"] = "";
+  await sim(k, 40000, () => { g.__files[w.f("heartbeat")] = `${Math.floor(g.__now / 10000) * 10} t1\n`; });
+  check(records().tb1.alive === true && !records().tb1.restarting, `alive again (got ${JSON.stringify(records().tb1)})`);
+  check(records().tb1.terminal === "t1" && lifeRuns().length === 0, `same terminal, nothing restored (got ${JSON.stringify(g.__runs)})`);
+};
+
+cases["K37-hold-ends"] = async () => { // the hold is bounded: a label kept past 120 s on a stale launcher is judged as today
+  restartingWorld();
+  const k = await start();
+  await sim(k, 110000);
+  check(g.__notes.length === 0 && records().tb1.restarting, "held for the first 110 s");
+  await sim(k, 90000);
+  check(!records().tb1.restarting, "no longer held after the hold");
+  check(lifeRuns().length === 0, `a non-shell is still never restored (got ${JSON.stringify(g.__runs)})`);
+  check(noteText().some((n) => /runs something else/i.test(n)), `judged as today: the foreign notice (got ${JSON.stringify(noteText())})`);
+};
+
+cases["K37-shell-label-ignored"] = async () => { // a label left on an idle shell does not hold: restored as today
+  restartingWorld({ program: shell, beatAge: 5 });
+  const k = await start();
+  check(await waitSplit(k, 1, 60000), `restored (runs ${JSON.stringify(g.__runs)}, notes ${JSON.stringify(noteText())})`);
+};
+
+cases["K37-ended-not-held"] = async () => { // an ended terminal (the exec failed and the launcher died) is restored as today
+  restartingWorld();
+  const k = await start();
+  await sim(k, 3000);
+  g.__terminals.find((t) => t.address === "t1").state = "finished";
+  check(await waitSplit(k, 1, 30000), `restored (runs ${JSON.stringify(g.__runs)})`);
+};
+
 const pick = process.argv.slice(2);
 let failed = 0;
 for (const [name, fn] of Object.entries(cases)) {

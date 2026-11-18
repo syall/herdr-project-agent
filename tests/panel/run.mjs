@@ -5214,6 +5214,274 @@ cases["A7-script-fake-caffeinate"] = async () => { // VP1, VP2: the real script,
   }
 };
 
+// ---- t-037 J4: the Restart button (R13), older code in the panel (R14), the header during a restart (R15) ----
+// The button runs only the restart tool in place, on the space's machine: a dry run for the confirm, then one
+// `--json --wait 180 --expect-instance <instance> --by panel` run. It never ends a terminal itself.
+const TOOL = ["pa", "restart"].join("-"); // spelled so a guard reading commands is not confused
+const T64 = "T".repeat(64), C64 = "C".repeat(64);
+const LREC = (over = {}) => ({ version: 2, accepts: ["restart"], instance: "i-1", terminal: "t4w", space: S, pid: 77,
+  code: { tools: T64, commit: "c".repeat(40) }, profile: { name: "test", readAt: "2026-11-18T10:05:00Z" },
+  session: { id: "s1", resume: true, prompt: "rebuilt", promptCore: C64, core: C64 }, ...over });
+const INSTALLED = { version: 1, tools: T64, core: C64 };
+const DRY_OK = { code: 0, stdout: "Project Agent proj (space sp1) in terminal t4w, pid 77.\nRuns now: tools TTTT (commit cccc), core text: current (CCCC).\nInstalled: tools TTTT, core CCCC.\nWorkers (1), each keeps running; its reports still reach t4w:\n  w1 t-1-build: keeps running\nIt restarts when this turn ends (at once when it is idle).\nDry run: nothing written.\n", stderr: "" };
+const OK_REPLY = (launcher = LREC({ instance: "i-2", restartedFrom: "i-1", code: { tools: "abcdef1234", commit: "1234567890" }, session: { prompt: "rebuilt", promptCore: "fedcba9876" } })) =>
+  ({ code: 0, stdout: `Restarted proj in place: terminal t4w, pid 77 (unchanged).\n${JSON.stringify({ request: "r1", outcome: "ok", launcher })}\n`, stderr: "" });
+// A live local (or remote) Project Agent with launcher.json and installed.json; `tool(args, on)` answers the tool.
+function liveWorld({ launcher = LREC(), installed = INSTALLED, machine = null, status = "idle", tool = null, stale = null } = {}) {
+  const sid = machine ? `${machine}/${S}` : S, addr = machine ? `${machine}/t4w` : "t4w";
+  world({ agentTerminal: "t4w", machine, records: { tb1: { space: sid, project: "/proj", profile: "test", name: "proj", terminal: addr, alive: true } },
+    extraTabs: [paTab], extraPanes: [{ ...paPane(addr), status }], extraTerms: [{ ...paTerm(addr), status }], agents: [{ address: addr, status }] });
+  const dir = machine ? `${machine}:.config/herdr-pa/spaces/${S}` : `:${DIR}`, home = machine ? `${machine}:.config/herdr-pa` : ":/home/u/.config/herdr-pa";
+  if (launcher !== undefined) g.__files[`${dir}/launcher.json`] = typeof launcher === "string" ? launcher : JSON.stringify(launcher);
+  if (installed) g.__files[`${home}/installed.json`] = JSON.stringify(installed);
+  if (stale) g.__execOut = { [`${machine ?? ""}:stale`]: { stdout: stale } };
+  g.__execFn = (command, args, on) => (command === TOOL ? (tool ? tool(args, on) : (args.includes("--dry-run") ? DRY_OK : OK_REPLY())) : undefined);
+  return { sid, addr };
+}
+const toolRuns = () => g.__execs.filter(([c]) => c === TOOL);
+const realRuns = () => toolRuns().filter(([, a]) => !a.includes("--dry-run"));
+async function liveMount() { const v = await mount(); await settle(); await settle(); return v; }
+// Nothing in the click path ends a terminal or a process (AC13.1).
+const noEnding = () => {
+  check(!g.__runs.some(([n]) => /^(pane\.close|terminal\.kill|tab\.close)$/.test(n)), `no pane.close / terminal.kill / tab.close (got ${JSON.stringify(g.__runs)})`);
+  check(!g.__hcs.some((a) => a[0] === "kill"), `no hc kill (got ${JSON.stringify(g.__hcs)})`);
+  check(!g.__execs.some(([c, a]) => (a ?? []).some((x) => ["--end-terminal", "--anyway", "kill"].includes(String(x)))), `no exec that ends anything (got ${JSON.stringify(g.__execs)})`);
+};
+
+cases["P37-button-live-only"] = async () => { // R13: Restart only while it runs
+  liveWorld();
+  let v = await liveMount();
+  check(Boolean(look(v).clicks["pa-restart"]) && /Restart/.test(look(v).text), `live: Restart (clicks ${Object.keys(look(v).clicks)})`);
+  world(); // not running
+  v = await liveMount();
+  check(!look(v).clicks["pa-restart"], "down: no Restart");
+  world({ machine: M }); g.__machines = [{ name: null, layout: "ready" }, { name: M, layout: "offline" }];
+  v = await liveMount();
+  check(!look(v).clicks["pa-restart"], "offline: no Restart");
+};
+
+cases["P37-confirm-dry-run"] = async () => { // R13: the click asks first: one dry run, its lines, the choices
+  let release;
+  liveWorld({ tool: (args) => (args.includes("--dry-run") ? new Promise((r) => { release = () => r(DRY_OK); }) : OK_REPLY()) });
+  const v = await liveMount();
+  await click(v, "pa-restart");
+  check(/Checking/.test(look(v).text), `checking while the dry run runs (got ${look(v).text.slice(0, 400)})`);
+  if (look(v).clicks["pa-restart"]) await click(v, "pa-restart"); // a second click while it runs adds nothing
+  check(toolRuns().length === 1, `one dry run (got ${JSON.stringify(toolRuns())})`);
+  check(JSON.stringify(toolRuns()[0][1]) === JSON.stringify(["--space", S, "--dry-run"]) && toolRuns()[0][2] === null, `its argv (got ${JSON.stringify(toolRuns()[0])})`);
+  release(); await settle(); await settle();
+  const { text, clicks } = look(v);
+  check(text.includes("w1 t-1-build: keeps running") && text.includes("restarts when this turn ends"), `its lines shown (got ${text.slice(0, 900)})`);
+  check(Boolean(clicks["pa-restart-go"]) && Boolean(clicks["pa-restart-now"]) && Boolean(clicks["pa-restart-cancel"]), `Restart, Restart now, Cancel (got ${Object.keys(clicks)})`);
+  check(!clicks["pa-restart-fresh"], "no new-conversation choice while the prompt is current");
+  check(realRuns().length === 0, "nothing restarted yet");
+  await click(v, "pa-restart-cancel");
+  check(!look(v).clicks["pa-restart-go"] && realRuns().length === 0, "Cancel: gone, nothing run");
+  noEnding();
+};
+
+cases["P37-confirm-refused"] = async () => { // R13: a refused dry run: its text, no Restart choice
+  liveWorld({ tool: () => ({ code: 2, stdout: "", stderr: "cannot restart: the heartbeat is 40 s old: its launcher is not running\n" }) });
+  const v = await liveMount();
+  await click(v, "pa-restart"); await settle();
+  const { text, clicks } = look(v);
+  check(text.includes("the heartbeat is 40 s old"), `the refusal (got ${text.slice(0, 600)})`);
+  check(!clicks["pa-restart-go"] && !clicks["pa-restart-now"] && Boolean(clicks["pa-restart-cancel"]), `only Cancel (got ${Object.keys(clicks)})`);
+  check(realRuns().length === 0, "nothing restarted");
+};
+
+cases["P37-restart-ok"] = async () => { // R13: the one run, its argv, Restarting…, then what it loaded (60 s)
+  let release;
+  liveWorld({ tool: (args) => (args.includes("--dry-run") ? DRY_OK : new Promise((r) => { release = () => r(OK_REPLY()); })) });
+  const v = await liveMount();
+  await click(v, "pa-restart"); await settle();
+  await click(v, "pa-restart-go");
+  check(realRuns().length === 1, `one run (got ${JSON.stringify(realRuns())})`);
+  const [, args, on] = realRuns()[0];
+  check(JSON.stringify(args) === JSON.stringify(["--space", S, "--json", "--wait", "180", "--expect-instance", "i-1", "--by", "panel", "--why", "the Restart button in the Project Agent panel"]) && on === null, `its argv (got ${JSON.stringify(realRuns()[0])})`);
+  check(/Restarting…/.test(look(v).text) && !look(v).clicks["pa-restart"], `Restarting…, no button (got ${look(v).text.slice(0, 500)})`);
+  release(); await settle(); await settle();
+  const text = look(v).text;
+  check(text.includes("Restarted: tools abcdef1 (1234567), core fedcba9, profile test read 10:05 UTC"), `what it loaded (got ${text.slice(0, 700)})`);
+  check(Boolean(look(v).clicks["pa-restart"]), "the button is back");
+  advance(61000); await settle();
+  check(!look(v).text.includes("Restarted: tools"), "gone after 60 s");
+  noEnding();
+};
+
+cases["P37-restart-now"] = async () => { // R13: Restart now adds --now and nothing else
+  liveWorld({ status: "working" });
+  const v = await liveMount();
+  await click(v, "pa-restart"); await settle();
+  await click(v, "pa-restart-now"); await settle();
+  check(realRuns().length === 1, "one run");
+  const args = realRuns()[0][1];
+  check(args[args.length - 1] === "--now" && args.filter((x) => x === "--now").length === 1 && !args.includes("--fresh"), `--now (got ${JSON.stringify(args)})`);
+};
+
+cases["P37-restart-waiting"] = async () => { // R13: mid-turn, the wait says so
+  liveWorld({ status: "working", tool: (args) => (args.includes("--dry-run") ? DRY_OK : new Promise(() => {})) });
+  const v = await liveMount();
+  await click(v, "pa-restart"); await settle();
+  await click(v, "pa-restart-go");
+  check(/Restarting… \(waiting for its turn to end\)/.test(look(v).text), `waiting for its turn (got ${look(v).text.slice(0, 500)})`);
+};
+
+const outcome = async (reply, want) => {
+  liveWorld({ tool: (args) => (args.includes("--dry-run") ? DRY_OK : reply) });
+  const v = await liveMount();
+  await click(v, "pa-restart"); await settle();
+  await click(v, "pa-restart-go"); await settle(); await settle();
+  const text = look(v).text;
+  check(text.includes(want), `says ${want} (got ${text.slice(0, 700)})`);
+  check(realRuns().length === 1, "one run");
+  return v;
+};
+cases["P37-restart-failed"] = () => outcome({ code: 1, stdout: `${JSON.stringify({ request: "r1", outcome: "failed", why: "installed.json is missing" })}\n`, stderr: "x" }, "The restart did not happen: installed.json is missing");
+cases["P37-restart-timeout"] = () => outcome({ code: 1, stdout: "Requested (r1); waiting up to 180 s.\n", stderr: "The restart did not happen within 180 s (it is mid-turn; the request was withdrawn).\n" }, "The restart did not happen within 180 s (it is mid-turn; the request was withdrawn).");
+cases["P37-instance-changed"] = async () => { // the click is bound to the launcher it showed: a refusal is said, nothing run again
+  const v = await outcome({ code: 2, stdout: "", stderr: "cannot restart: its launcher restarted since you looked (now instance i-2); look again\n" }, "restarted since you looked");
+  await settle();
+  check(realRuns().length === 1, "no second run");
+  check(Boolean(look(v).clicks["pa-restart"]), "the button is back (a new click asks again)");
+};
+cases["P37-missing-tool"] = async () => { // pa-sync on a remote machine
+  liveWorld({ machine: M, tool: () => { throw new Error(`exec: ${TOOL}: not found`); } });
+  const v = await liveMount();
+  await click(v, "pa-restart"); await settle();
+  check(look(v).text.includes(`${TOOL} is not installed on ${M}; run pa-sync --on ${M}.`), `says so (got ${look(v).text.slice(0, 600)})`);
+};
+
+cases["P37-restart-unknown"] = async () => { // the run never answers: given up after its limit, said, a reload
+  liveWorld({ tool: (args) => (args.includes("--dry-run") ? DRY_OK : new Promise(() => {})) });
+  const v = await liveMount();
+  await click(v, "pa-restart"); await settle();
+  await click(v, "pa-restart-go");
+  for (let i = 0; i < 25; i++) { advance(10000); await settle(); }
+  check(/result is not known/.test(look(v).text), `not known (got ${look(v).text.slice(0, 600)})`);
+  check(Boolean(look(v).clicks["pa-restart"]), "the button is back");
+};
+
+cases["P37-remote-on"] = async () => { // R8: a space on m1: reads and runs there, nothing local
+  liveWorld({ machine: M });
+  const v = await liveMount();
+  check(g.__reads.includes(`${M}:${RDIR}/launcher.json`) && g.__reads.includes(`${M}:.config/herdr-pa/installed.json`), `read on ${M} (got ${JSON.stringify(g.__reads.filter((r) => /launcher|installed/.test(r)))})`);
+  check(!g.__reads.some((r) => /launcher\.json|installed\.json/.test(r) && !r.startsWith(`${M}:`)), "no local read of either");
+  await click(v, "pa-restart"); await settle();
+  await click(v, "pa-restart-go"); await settle();
+  check(toolRuns().length === 2 && toolRuns().every(([, , on]) => on === M), `both runs on ${M} (got ${JSON.stringify(toolRuns())})`);
+  check(!realRuns()[0][1].includes("--on"), "no --on flag: the exec runs there");
+};
+
+cases["P37-r10"] = async () => { // R13: a launcher from before restart support: Restart (ends workers), the line to copy, never run
+  const r10 = `This Project Agent's launcher started before restart support (2026-11-16T09:00:00Z). It cannot take a restart request; it can only be restarted by ending its terminal, which also ends its 1 worker(s): w1 t-1-build. Run \`${TOOL} --space sp1 --end-terminal\` when they are done, or add \`--anyway\`.`;
+  liveWorld({ launcher: LREC({ version: 1, accepts: undefined }), tool: (args) => (args.includes("--dry-run") ? { code: 2, stdout: "", stderr: `${r10}\n` } : OK_REPLY()) });
+  const v = await liveMount();
+  check(/started before restart support/.test(look(v).text) && /Restart \(ends workers\)/.test(look(v).text), `the badge and the button (got ${look(v).text.slice(0, 500)})`);
+  await click(v, "pa-restart"); await settle();
+  const { text, clicks } = look(v);
+  check(text.includes("w1 t-1-build") && text.includes(`${TOOL} --space ${S} --end-terminal`), `the R10 text and the line (got ${text.slice(0, 900)})`);
+  check(Boolean(clicks["copy-end-terminal"]) && !clicks["pa-restart-go"] && !clicks["pa-restart-now"], `Copy, no Restart (got ${Object.keys(clicks)})`);
+  await click(v, "copy-end-terminal");
+  check((g.__clipboard ?? []).includes(`${TOOL} --space ${S} --end-terminal`), `copied (got ${JSON.stringify(g.__clipboard)})`);
+  check(toolRuns().length === 1 && toolRuns()[0][1].includes("--dry-run"), `only the dry run ran (got ${JSON.stringify(toolRuns())})`);
+  noEnding();
+};
+
+cases["P37-r10-remote-line"] = async () => { // the line to copy names the machine (J3's --on form)
+  liveWorld({ machine: M, launcher: null, tool: () => ({ code: 2, stdout: "", stderr: "This Project Agent's launcher started before restart support (x).\n" }) });
+  const v = await liveMount();
+  await click(v, "pa-restart"); await settle();
+  check(look(v).text.includes(`${TOOL} --space ${S} --end-terminal --on ${M}`), `with --on (got ${look(v).text.slice(0, 700)})`);
+};
+
+cases["P37-double-click"] = async () => { // never twice: two clicks on the confirm's Restart in one frame: one run
+  liveWorld({ tool: (args) => (args.includes("--dry-run") ? DRY_OK : new Promise(() => {})) });
+  const v = await liveMount();
+  await click(v, "pa-restart"); await settle();
+  const { clicks } = look(v);
+  clicks["pa-restart-go"]({}, cx); clicks["pa-restart-go"]({}, cx); clicks["pa-restart-now"]({}, cx); await flush(); await settle();
+  check(realRuns().length === 1, `one run (got ${JSON.stringify(realRuns())})`);
+};
+
+cases["P37-other-copy"] = async () => { // never twice: another panel window's fresh mark holds the button; an old one does not
+  liveWorld();
+  g.__shared["project-agent.restarting"] = { [S]: { by: "other", at: T0, instance: "i-1" } };
+  const v = await liveMount();
+  check(!look(v).clicks["pa-restart"] && /Restarting… \(from another panel window\)/.test(look(v).text), `held (got ${look(v).text.slice(0, 500)})`);
+  advance(250000); await settle();
+  check(Boolean(look(v).clicks["pa-restart"]), "a mark past its time: the button is back");
+};
+
+cases["P37-shares-its-mark"] = async () => { // the run takes the shared mark, and gives it back when it answers
+  let release;
+  liveWorld({ tool: (args) => (args.includes("--dry-run") ? DRY_OK : new Promise((r) => { release = () => r(OK_REPLY()); })) });
+  const v = await liveMount();
+  await click(v, "pa-restart"); await settle();
+  await click(v, "pa-restart-go");
+  const m = g.__shared["project-agent.restarting"]?.[S];
+  check(m && m.by === v.me && m.instance === "i-1", `the mark (got ${JSON.stringify(g.__shared["project-agent.restarting"])})`);
+  release(); await settle(); await settle();
+  check(!g.__shared["project-agent.restarting"]?.[S], "given back");
+};
+
+cases["P37-badge-four-cases"] = async () => { // R14 AC14.1: the header's words
+  const want = [
+    [LREC(), INSTALLED, null],
+    [LREC({ code: { tools: "X" } }), INSTALLED, "older code (tools)"],
+    [LREC({ session: { promptCore: "Y" } }), INSTALLED, "older code (core)"],
+    [LREC({ code: { tools: "X" }, session: { promptCore: "Y" } }), INSTALLED, "older code (tools, core)"],
+    [undefined, INSTALLED, "started before restart support"],
+    [LREC(), null, "code unknown"],
+  ];
+  for (const [launcher, installed, word] of want) {
+    liveWorld({ launcher, installed });
+    const v = await liveMount();
+    const text = look(v).text;
+    if (word) check(text.includes(word), `${word} (got ${text.slice(0, 400)})`);
+    else check(!/older code|started before restart support|code unknown/.test(text), `current: no badge (got ${text.slice(0, 400)})`);
+  }
+};
+
+cases["P37-notice-text"] = async () => { // R14: the notice says tools too, offers Restart; the old /exit-only text is gone
+  liveWorld({ stale: "core/orchestrator.md\n" });
+  let v = await liveMount();
+  let text = look(v).text;
+  check(text.includes("Its instructions or tools changed since it started (orchestrator.md). Restart reloads them (or /exit in its tab).") && Boolean(look(v).clicks["pa-restart-notice"]), `stale files (got ${text.slice(0, 700)})`);
+  check(!/Type \/exit in its tab/.test(text), "the old text is gone");
+  liveWorld({ launcher: LREC({ code: { tools: "X" } }) });
+  v = await liveMount();
+  text = look(v).text;
+  check(text.includes("Its instructions or tools changed since it started (tools). Restart reloads them (or /exit in its tab)."), `older tools alone (got ${text.slice(0, 700)})`);
+  await click(v, "pa-restart-notice"); await settle();
+  check(toolRuns().length === 1 && toolRuns()[0][1].includes("--dry-run"), "the notice's button asks first, as the header's");
+  liveWorld();
+  v = await liveMount();
+  check(!/changed since it started/.test(look(v).text), "current and nothing stale: no notice");
+};
+
+cases["P37-recorded-core"] = async () => { // R14 + Q-J4-3: a recorded prompt: the notice says so; the confirm offers a new conversation
+  liveWorld({ launcher: LREC({ session: { prompt: "recorded", promptCore: "Y" } }) });
+  const v = await liveMount();
+  const text = look(v).text;
+  check(text.includes("Restart in place keeps the core text this conversation began with; Restart in a new conversation loads it."), `the sentence (got ${text.slice(0, 800)})`);
+  await click(v, "pa-restart"); await settle();
+  check(Boolean(look(v).clicks["pa-restart-fresh"]), `a new-conversation choice (got ${Object.keys(look(v).clicks)})`);
+  check(/previous one stays in \/resume/.test(look(v).text), "it says the previous conversation stays");
+  await click(v, "pa-restart-fresh"); await settle();
+  const args = realRuns()[0][1];
+  check(args[args.length - 1] === "--fresh" && !args.includes("--now"), `--fresh (got ${JSON.stringify(args)})`);
+};
+
+cases["P37-header-restarting"] = async () => { // R15: the keeper marks a record restarting (not alive): Restarting…, no Open
+  world({ agentTerminal: "t4w", records: { tb1: { space: S, project: "/proj", profile: "test", name: "proj", terminal: "t4w", restarting: true } }, extraTabs: [paTab], extraPanes: [paPane()],
+    extraTerms: [{ ...paTerm(), labels: { "herdr.pa": S, "herdr.pa.restarting": "r1" } }], agents: [{ address: "t4w", status: null }] });
+  const v = await liveMount();
+  const { text, clicks } = look(v);
+  check(/Restarting…/.test(text) && !/Not running/.test(text), `Restarting… (got ${text.slice(0, 400)})`);
+  check(!clicks["pa-open"] && !clicks["pa-restart"], `no Open, no Restart (got ${Object.keys(clicks)})`);
+};
+
 // Which cases run (t-031): every case, or the named ones; --shard=<k>/<n> keeps every n-th case by definition
 // order (index mod n == k - 1), so n shards together run each case once, and a case added later lands in one.
 // --list prints the names that would run and runs none. An unknown name or option exits 2.

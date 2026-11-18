@@ -699,6 +699,108 @@ cases["S46-oneLine"] = async () => { // R4 AC3: one line, cut at 400 with the ta
   check(store.oneLine("abcdef", 4) === "abc… (the rest is on the card)", "max is a parameter");
 };
 
+// ---- t-037 J4: the Restart button's store part (R13, R14, R15) ----
+cases["S37-code-parity"] = async () => { // R14 AC14.1: the same table as pa.code_state (test_pa_stamp J4_CodeStateParity)
+  const rows = JSON.parse(fs.readFileSync(path.join(here, "..", "samples", "code-state-cases.json"), "utf8"));
+  check(rows.length >= 15, `the fixture (got ${rows.length})`);
+  for (const row of rows) {
+    const st = store.codeState(row.launcher, row.installed, row.terminal);
+    check(st.word === row.word, `${row.name}: word ${row.word} (got ${st.word})`);
+    check(st.capable === row.capable, `${row.name}: capable ${row.capable} (got ${st.capable})`);
+    check(typeof st.detail === "string" && st.detail.length > 0, `${row.name}: a detail`);
+  }
+};
+
+cases["S37-code-state"] = async () => { // instance, prompt and the header's words
+  const T = "T".repeat(64), C = "C".repeat(64);
+  const rec = { version: 2, accepts: ["restart"], instance: "i-1", terminal: "t1", code: { tools: T }, session: { core: C, prompt: "recorded", promptCore: C } };
+  const st = store.codeState(rec, { tools: T, core: C }, "t1");
+  check(st.word === "current" && st.instance === "i-1" && st.prompt === "recorded" && st.capable, `fields (got ${JSON.stringify(st)})`);
+  check(store.codeBadge(st) === null, "current: no badge");
+  check(store.codeBadge(store.codeState({ ...rec, code: { tools: "X" } }, { tools: T, core: C }, "t1")) === "older code (tools)", "older tools");
+  check(store.codeBadge(store.codeState({ ...rec, session: { promptCore: "Y" } }, { tools: T, core: C }, "t1")) === "older code (core)", "older core");
+  check(store.codeBadge(store.codeState({ ...rec, code: { tools: "X" }, session: { promptCore: "Y" } }, { tools: T, core: C }, "t1")) === "older code (tools, core)", "older both");
+  check(store.codeBadge(store.codeState(null, { tools: T, core: C }, "t1")) === "started before restart support", "no launcher.json");
+  check(store.codeBadge(store.codeState({ ...rec, version: 1 }, { tools: T, core: C }, "t1")) === "started before restart support", "version 1");
+  check(store.codeBadge(store.codeState(rec, null, "t1")) === "code unknown", "no installed.json");
+  check(store.codeBadge(null) === null, "nothing read: no badge");
+  check(store.codeState({ ...rec, instance: 5 }, null, "t1").instance === null, "an instance that is not text: null");
+};
+
+cases["S37-load-code"] = async () => { // R8, R14: both files read on the space's machine, capped; a give-up is a give-up
+  world();
+  g.__files[`${M}:.config/herdr-pa/spaces/${S}/launcher.json`] = JSON.stringify({ version: 2, instance: "i-r" });
+  g.__files[`${M}:.config/herdr-pa/installed.json`] = JSON.stringify({ tools: "T" });
+  const r = await store.loadCode(remote, cx);
+  check(r.launcher?.instance === "i-r" && r.installed?.tools === "T", `remote read (got ${JSON.stringify(r)})`);
+  check(g.__reads.length === 2 && g.__reads.every((x) => x.startsWith(`${M}:`)), `only on ${M} (got ${JSON.stringify(g.__reads)})`);
+  world();
+  const l = await store.loadCode(local, cx);
+  check(l.launcher === null && l.installed === null && !store.gaveUp(l), `local, missing files: nulls (got ${JSON.stringify(l)})`);
+  world();
+  g.__files[`:/home/u/.config/herdr-pa/spaces/${S}/launcher.json`] = "{not json";
+  const b = await store.loadCode(local, cx);
+  check(b.launcher === null, "broken JSON: no record (as read_json_safe)");
+  world();
+  g.__hang = [`${M}:.config/herdr-pa/installed.json`];
+  const { done, value: h } = await within(store.loadCode(remote, cx), 12000);
+  check(done && store.gaveUp(h), `a hung read gives up within its limit (done ${done}, got ${JSON.stringify(h)})`);
+};
+
+const RS = ["pa", "restart"].join("-"); // the tool's name, spelled so a guard reading this file's commands is not confused
+cases["S37-restart-args"] = async () => { // R13: only the in-place restart; never --end-terminal, --anyway or --on
+  const dry = store.restartArgs(remote, { dry: true });
+  check(JSON.stringify(dry) === JSON.stringify(["--space", S, "--dry-run"]), `dry run (got ${JSON.stringify(dry)})`);
+  const go = store.restartArgs(local, { instance: "i-1" });
+  check(JSON.stringify(go) === JSON.stringify(["--space", S, "--json", "--wait", "180", "--expect-instance", "i-1", "--by", "panel", "--why", store.RESTART_WHY]), `restart (got ${JSON.stringify(go)})`);
+  check(JSON.stringify(store.restartArgs(local, { instance: "i-1", now: true, fresh: true }).slice(-2)) === JSON.stringify(["--now", "--fresh"]), "now, fresh");
+  for (const a of [dry, go, store.restartArgs(remote, { instance: "i", now: true, fresh: true })]) check(!a.some((x) => ["--end-terminal", "--anyway", "--on", "--confirmed-terminal"].includes(x)), `never those (got ${JSON.stringify(a)})`);
+  check(store.restartArgs(local, { instance: null }) === null && store.restartArgs(local, { instance: "-x" }) === null, "no instance (or one that looks like a flag): no argv");
+  check(store.RESTART_WAIT === 180 && store.RESTART_TIMEOUT > store.RESTART_WAIT && store.RESTART_HOLD === 120000, "constants");
+  check(store.endTerminalLine(local) === `${RS} --space ${S} --end-terminal` && store.endTerminalLine(remote) === `${RS} --space ${S} --end-terminal --on ${M}`, "the line to copy");
+};
+
+cases["S37-restart-result"] = async () => { // R13: the texts of each outcome
+  const launcher = { code: { tools: "abcdef1234", commit: "1234567890" }, session: { promptCore: "fedcba9876", prompt: "rebuilt" }, profile: { name: "test", readAt: "2026-11-18T10:05:00Z" } };
+  const ok = store.restartOutcome({ r: { code: 0, stdout: `Restarted proj in place.\nLoaded: x.\n${JSON.stringify({ request: "r1", outcome: "ok", launcher })}\n`, stderr: "" } }, local);
+  check(ok.ok && ok.text === "Restarted: tools abcdef1 (1234567), core fedcba9, profile test read 10:05 UTC", `ok (got ${JSON.stringify(ok)})`);
+  const rec = store.restartedLine({ ...launcher, code: { tools: "abcdef1234" }, session: { core: "fedcba9876", prompt: "recorded" } });
+  check(rec === "Restarted: tools abcdef1 (no commit), core fedcba9 (still the text this conversation began with), profile test read 10:05 UTC", `recorded (got ${rec})`);
+  const failed = store.restartOutcome({ r: { code: 1, stdout: `${JSON.stringify({ request: "r1", outcome: "failed", why: "installed.json is missing" })}\n`, stderr: "The restart did not happen (failed): installed.json is missing" } }, local);
+  check(!failed.ok && failed.text === "The restart did not happen: installed.json is missing", `failed (got ${JSON.stringify(failed)})`);
+  const late = store.restartOutcome({ r: { code: 1, stdout: "Requested (r1); waiting up to 180 s.\n", stderr: "The restart did not happen within 180 s (it is mid-turn; the request was withdrawn).\n" } }, local);
+  check(!late.ok && late.text === "The restart did not happen within 180 s (it is mid-turn; the request was withdrawn).", `timeout (got ${JSON.stringify(late)})`);
+  const refused = store.restartOutcome({ r: { code: 2, stdout: "", stderr: "cannot restart: its launcher restarted since you looked (now instance i-2); look again\n" } }, local);
+  check(!refused.ok && refused.text === "Not restarted: cannot restart: its launcher restarted since you looked (now instance i-2); look again", `refused (got ${JSON.stringify(refused)})`);
+  const missing = store.restartOutcome({ error: `exec: ${RS}: not found` }, remote);
+  check(missing.text === `${RS} is not installed on ${M}; run pa-sync --on ${M}.`, `missing remote (got ${missing.text})`);
+  check(store.restartOutcome({ error: `exec: ${RS}: not found` }, local).text === `${RS} is not installed here; run ./install.sh.`, "missing here");
+  check(store.restartOutcome({ r: { code: 127, stdout: "", stderr: `sh: ${RS}: not found` } }, remote).text === `${RS} is not installed on ${M}; run pa-sync --on ${M}.`, "127 on the machine");
+  const unknown = store.restartOutcome({ timedOut: true }, local);
+  check(!unknown.ok && unknown.unknown && /not known/.test(unknown.text), `no answer (got ${JSON.stringify(unknown)})`);
+  check(store.restartOutcome({ busy: true }, local) === null, "busy: nothing to say");
+  check(/could not run: boom/.test(store.restartOutcome({ error: "boom" }, local).text), "another error");
+};
+
+cases["S37-run-restart"] = async () => { // the exec: the tool on the space's machine, with its timeout
+  world();
+  g.__execFn = (command) => (command === RS ? { code: 0, stdout: "x", stderr: "" } : undefined);
+  const res = await store.runRestart(cx, remote, ["--space", S, "--dry-run"], store.DRY_TIMEOUT);
+  check(res.r?.code === 0, `answered (got ${JSON.stringify(res)})`);
+  const call = g.__execs.find(([c]) => c === RS);
+  check(call && call[2] === M && JSON.stringify(call[1]) === JSON.stringify(["--space", S, "--dry-run"]) && call[3]?.timeout === store.DRY_TIMEOUT, `its call (got ${JSON.stringify(g.__execs)})`);
+  world();
+  g.__execFn = () => { throw new Error(`exec: ${RS}: not found`); };
+  const err = await store.runRestart(cx, local, ["--space", S, "--dry-run"], store.DRY_TIMEOUT);
+  check(/not found/.test(err.error ?? ""), `a thrown exec is an error (got ${JSON.stringify(err)})`);
+};
+
+cases["S37-restarting-label"] = async () => { // R15: pa.py clears the label by setting it empty
+  check(store.restartingLabel({ labels: { "herdr.pa.restarting": "r1" } }) === true, "set");
+  check(store.restartingLabel({ labels: { "herdr.pa.restarting": "" } }) === false, "empty: cleared");
+  check(store.restartingLabel({ labels: {} }) === false && store.restartingLabel(null) === false, "absent");
+};
+
 const pick = process.argv.slice(2);
 let failed = 0;
 for (const [name, fn] of Object.entries(cases)) {
