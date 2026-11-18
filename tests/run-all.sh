@@ -9,7 +9,7 @@
 #                                change are skipped; without it, the whole fast set runs.
 # The parts run at the same time (they share no temp folder, home, port or hc core); PA_SERIAL=1 runs them
 # one after another, each streamed as it runs. Each part's whole output is kept in its own file in one temp
-# folder and printed in the order above, then a summary: every part with ok or FAILED, for a failed part its
+# folder and printed in the order above, then a summary: every part with ok or FAILED and its seconds, for a failed part its
 # failing tests (lines starting FAIL or ERROR), else its last 40 lines. The last line names the folder.
 # Each part's TMPDIR is its own folder in there (<n>.tmp), so no part sees another's temp files, nor another
 # suite's running beside it.
@@ -93,7 +93,17 @@ log() { eval "echo \"\$out/\$1-\$part_$1\${arg_$1:+-\$arg_$1}.log\""; }
 show() { cat "$1"; [ -s "$1" ] && [ -n "$(tail -c 1 "$1")" ] && echo; return 0; }
 # Run part $1 (function $2) with its own TMPDIR in the run folder: a test that looks for its own leftovers in
 # the temp folder then sees no other part's, nor those of another suite running beside this one.
-inpart() { TMPDIR="$out/$1.tmp"; export TMPDIR; mkdir "$TMPDIR" || return 1; "$2" "$3"; }
+# Its start and end (whole seconds) go beside its log, for its time in the summary (t-056; parts run at once, so
+# a part's own time, not how long it was waited on).
+inpart() {
+  date +%s > "$out/$1.start"
+  TMPDIR="$out/$1.tmp"; export TMPDIR; mkdir "$TMPDIR" || { date +%s > "$out/$1.end"; return 1; }
+  "$2" "$3"; c=$?
+  date +%s > "$out/$1.end"
+  return $c
+}
+# A part's seconds, from those files (0 when either is missing).
+took() { s=$(cat "$out/$1.start" 2>/dev/null) e=$(cat "$out/$1.end" 2>/dev/null); echo $(( ${e:-0} - ${s:-${e:-0}} )); }
 
 # Ctrl-C, TERM or a hangup (the pane is closed): stop every part still running (each is its own process group,
 # in PA_SERIAL=1 mode too), then exit 130, 143 or 129.
@@ -174,7 +184,7 @@ done
 i=1
 while [ "$i" -le "$count" ]; do
   eval "name=\$name_$i; code=\$code_$i"
-  [ "$code" = 0 ] && echo "  $name: ok" || echo "  $name: FAILED"
+  [ "$code" = 0 ] && echo "  $name: ok ($(took "$i")s)" || echo "  $name: FAILED ($(took "$i")s)"
   i=$((i + 1))
 done
 [ "$failed" = 0 ] && echo "=== all passed (outputs: $out)" || echo "=== $failed part(s) failed: $names (outputs: $out)"

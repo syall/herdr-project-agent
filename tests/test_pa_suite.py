@@ -305,6 +305,18 @@ class W3Cap(Base):
         self.assertEqual(pa_suite.slot_dir(), os.path.join(pa.ROOT, "suite-slots"))
         self.assertEqual(pa_suite.CAP, 1)
 
+    def test_w3a2_the_cap_is_configurable(self):
+        saved = os.environ.get("PA_SUITE_CAP")
+        try:
+            for value, want in (("2", 2), ("0", 1), ("x", 1), ("", 1)):
+                os.environ["PA_SUITE_CAP"] = value
+                self.assertEqual(pa_suite.cap(), want, value)
+        finally:
+            if saved is None:
+                os.environ.pop("PA_SUITE_CAP", None)
+            else:
+                os.environ["PA_SUITE_CAP"] = saved
+
     def test_w3b_a_run_past_the_cap_waits_names_the_holder_and_starts_when_it_frees(self):
         p = self.holder(0)
         said, got = [], {}

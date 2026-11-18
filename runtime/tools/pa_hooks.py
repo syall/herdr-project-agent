@@ -6,7 +6,10 @@ Selected by the name it is invoked as (symlinks in ~/.local/bin):
   pa-gate <task-id> [--phase P] [--space ID]    deterministic evidence check (exit 0 pass, 1 fail)
   pa-hooks install <worktree> --task ID [--fix] install the hooks below into a worktree's local settings
   pa-hooks remove <worktree>                    take them out again
-  pa-full-suite                                 run the full test suite once, output into build.log
+  pa-full-suite [--again]                       run the full test suite once, output into build.log, one line per
+                                                repo in content/suites.jsonl; a passing clean tree is not run again;
+                                                at most pa_suite.CAP at once per machine (see pa_suite.py)
+  pa-full-suite --last [--commit C|--tree T]    the last recorded run; --report: its parts by time
   pa-worktree check [--open-cards]              worktrees whose tasks are all done or parked: list them, open decision cards
   pa-worktree remove <task-id>                  delete a task's worktree, only with an answered "Delete" card
   pa-worker info <address>                      what deleting a worker would remove, as JSON
@@ -3135,41 +3138,32 @@ def cmd_trust(args):
     done("unconfirmed", "pressed Enter once; the screen still shows the trust prompt or the worker is still blocked")
 
 
-def cmd_full_suite(_args):
-    record = find_task(os.getcwd())
-    if not record:
-        raise pa.Problem("run pa-full-suite inside a task's worktree (pa-hooks install marks it)")
-    directory, agent, profile = load_context(record["space"])
-    command = command_for("full", agent, profile)
-    if not command:
-        raise pa.Problem("no full-suite command: set tests.full in the profile, or commands.full in the space's agent.json")
-    began = time.time()
-    code, out = run_shell(command, record["root"], [], 3600)
-    evidence = os.path.join(directory, "evidence", record["task"])
-    os.makedirs(evidence, exist_ok=True)
-    with open(os.path.join(evidence, "build.log"), "a") as f:
-        f.write("=== {} full suite: `{}` in {} -> exit {} after {:.0f}s ===\n{}\n".format(pa.now(), command, record["root"], code, time.time() - began, tail(out, 200)))
-    seconds = round(time.time() - began, 1)
-    try:
-        suite_record(directory, record, command, code, seconds)
-    except OSError as e:
-        print("pa-full-suite: could not record the run in {} ({})".format(os.path.join(content_dir(directory), "suites.jsonl"), e))
-    print(tail(out, 40))
-    print("full suite exit {} (appended to {})".format(code, os.path.join(evidence, "build.log")))
-    sys.exit(code)
+def cmd_full_suite(args):
+    """The run, its machine slot, reuse of a passing tree, --last and --report: pa_suite.py (t-056)."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("pa_suite", os.path.join(os.path.dirname(os.path.realpath(__file__)), "pa_suite.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    module.pa = pa
+    import types
+    return module.full_suite(types.SimpleNamespace(**globals()), args)  # this module's helpers (also when a test loaded it)
 
 
-def suite_record(directory, record, command, code, seconds):
-    """One line per repository of the worktree in content/suites.jsonl: what the full suite ran on (t-052 AC7.1)."""
+def suite_record(directory, record, command, code, seconds, pins=None, extra=None):
+    """One line per repository of the worktree in content/suites.jsonl: what the full suite ran on (t-052 AC7.1).
+    pins: the repos as taken before the run (each with its tree; t-056), else read now. extra: more keys per line."""
     lines = []
-    for pin in gate_commits(record["root"]) or [{"repo": os.path.realpath(record["root"]), "commit": None, "uncommitted": None}]:
-        tree = None
-        if pin.get("commit"):
+    for pin in pins or gate_commits(record["root"]) or [{"repo": os.path.realpath(record["root"]), "commit": None, "uncommitted": None}]:
+        tree = pin.get("tree")
+        if pin.get("commit") and "tree" not in pin:
             c, out, _ = git(pin["repo"], "rev-parse", "--verify", "-q", pin["commit"] + "^{tree}")
             tree = out if not c and out else None
-        lines.append({"at": pa.now(), "task": record.get("task"), "worker": os.environ.get("HC_TERMINAL_ID") or None,
-                      "repo": pin["repo"], "commit": pin.get("commit"), "tree": tree, "uncommitted": pin.get("uncommitted"),
-                      "exit": code, "seconds": seconds, "command": command})
+        line = {"at": pa.now(), "task": record.get("task"), "worker": os.environ.get("HC_TERMINAL_ID") or None,
+                "repo": pin["repo"], "commit": pin.get("commit"), "tree": tree, "uncommitted": pin.get("uncommitted"),
+                "exit": code, "seconds": seconds, "command": command}
+        if "untracked" in pin:
+            line["untracked"] = pin["untracked"]
+        lines.append(dict(line, **(extra or {})))
     os.makedirs(content_dir(directory), exist_ok=True)
     with open(os.path.join(content_dir(directory), "suites.jsonl"), "a") as f:
         f.write("".join(json.dumps(l) + "\n" for l in lines))
@@ -3235,6 +3229,12 @@ def main():
         parser.add_argument("--space")
         return cmd_trust(parser.parse_args())
     if kind == "pa-full-suite":
+        parser.add_argument("--again", action="store_true", help="run even when this clean tree already passed")
+        parser.add_argument("--last", action="store_true", help="print the last recorded run (default: this worktree's tree)")
+        parser.add_argument("--commit", help="--last: the run for this commit (a prefix is enough)")
+        parser.add_argument("--tree", help="--last: the run for this tree")
+        parser.add_argument("--report", action="store_true", help="the suite's parts by time over the recorded runs")
+        parser.add_argument("--space")
         return cmd_full_suite(parser.parse_args())
     raise pa.Problem("invoke as pa-gate, pa-hooks, pa-hook, pa-worktree, pa-worker, pa-trust or pa-full-suite")
 
