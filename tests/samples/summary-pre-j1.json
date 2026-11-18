@@ -1,0 +1,409 @@
+{
+ "account": "default",
+ "byActivity": [
+  {
+   "calls": 4,
+   "key": "build",
+   "money": 0.242008,
+   "reconstructed": 0.080004,
+   "tasks": [
+    {
+     "key": "t-001",
+     "money": 0.162004,
+     "tokens": 143283,
+     "unpricedTokens": 79
+    },
+    {
+     "key": "t-002",
+     "money": 0.080004,
+     "tokens": 4002
+    }
+   ],
+   "tokens": 147285,
+   "unpricedTokens": 79
+  },
+  {
+   "calls": 0,
+   "key": "cache-rebuild",
+   "money": 0.12,
+   "tasks": [
+    {
+     "key": "t-001",
+     "money": 0.12,
+     "tokens": 60000
+    }
+   ],
+   "tokens": 60000
+  },
+  {
+   "calls": 1,
+   "key": "pass:report",
+   "money": 0.035002,
+   "tasks": [
+    {
+     "key": "t-001",
+     "money": 0.017501,
+     "tokens": 25501
+    },
+    {
+     "key": "t-002",
+     "money": 0.017501,
+     "tokens": 25501
+    }
+   ],
+   "tokens": 51002
+  },
+  {
+   "calls": 1,
+   "key": "unattributed",
+   "money": 0.007002,
+   "reasons": [
+    {
+     "key": "pa-no-journal",
+     "money": 0.007002,
+     "tokens": 1502
+    }
+   ],
+   "tasks": [
+    {
+     "key": "(no task)",
+     "money": 0.007002,
+     "tokens": 1502
+    }
+   ],
+   "tokens": 1502
+  }
+ ],
+ "byDay": [
+  {
+   "byActivity": {
+    "build": 0.162004,
+    "cache-rebuild": 0.12,
+    "pass:report": 0.035002,
+    "unattributed": 0.007002
+   },
+   "calls": 5,
+   "key": "2026-11-17",
+   "money": 0.324008,
+   "tokens": 255787,
+   "unpricedTokens": 79
+  },
+  {
+   "byActivity": {
+    "build": 0.080004
+   },
+   "calls": 1,
+   "key": "2026-11-16",
+   "money": 0.080004,
+   "reconstructed": 0.080004,
+   "tokens": 4002
+  }
+ ],
+ "byDayModel": [
+  {
+   "day": "2026-11-17",
+   "model": "model-z",
+   "money": null,
+   "tokens": {
+    "cr": 0,
+    "cw1h": 0,
+    "cw5m": 0,
+    "in": 2,
+    "out": 77
+   }
+  },
+  {
+   "day": "2026-11-17",
+   "model": "model-a",
+   "money": 0.324008,
+   "tokens": {
+    "cr": 150000,
+    "cw1h": 0,
+    "cw5m": 101000,
+    "in": 8,
+    "out": 4700
+   }
+  },
+  {
+   "day": "2026-11-16",
+   "model": "model-b",
+   "money": 0.080004,
+   "tokens": {
+    "cr": 0,
+    "cw1h": 0,
+    "cw5m": 0,
+    "in": 2,
+    "out": 4000
+   }
+  }
+ ],
+ "byKind": {
+  "kind": [
+   {
+    "calls": 4,
+    "key": "worker",
+    "money": 0.362008,
+    "reconstructed": 0.080004,
+    "tokens": 207285,
+    "unpricedTokens": 79
+   },
+   {
+    "calls": 2,
+    "key": "pa",
+    "money": 0.042004,
+    "tokens": 52504
+   }
+  ],
+  "machine": [
+   {
+    "calls": 3,
+    "key": "h2",
+    "money": 0.282004,
+    "tokens": 203283,
+    "unpricedTokens": 79
+   },
+   {
+    "calls": 1,
+    "key": "unknown",
+    "money": 0.080004,
+    "reconstructed": 0.080004,
+    "tokens": 4002
+   },
+   {
+    "calls": 2,
+    "key": "h1",
+    "money": 0.042004,
+    "tokens": 52504
+   }
+  ],
+  "model": [
+   {
+    "calls": 4,
+    "key": "model-a",
+    "money": 0.324008,
+    "tokens": 255708
+   },
+   {
+    "calls": 1,
+    "key": "model-b",
+    "money": 0.080004,
+    "reconstructed": 0.080004,
+    "tokens": 4002
+   },
+   {
+    "calls": 1,
+    "key": "model-z",
+    "money": null,
+    "tokens": 79
+   }
+  ],
+  "program": [
+   {
+    "calls": 6,
+    "key": "claude",
+    "money": 0.404012,
+    "reconstructed": 0.080004,
+    "tokens": 259789,
+    "unpricedTokens": 79
+   }
+  ],
+  "role": [
+   {
+    "calls": 4,
+    "key": "build",
+    "money": 0.362008,
+    "reconstructed": 0.080004,
+    "tokens": 207285,
+    "unpricedTokens": 79
+   },
+   {
+    "calls": 2,
+    "key": "(none)",
+    "money": 0.042004,
+    "tokens": 52504
+   }
+  ]
+ },
+ "byPhase": [
+  {
+   "calls": 6,
+   "key": "(none)",
+   "money": 0.404012,
+   "reconstructed": 0.080004,
+   "tokens": 259789,
+   "unpricedTokens": 79
+  }
+ ],
+ "byTask": [
+  {
+   "calls": 4,
+   "key": "t-001",
+   "money": 0.299505,
+   "phases": [
+    {
+     "key": "(none)",
+     "money": 0.299505,
+     "tokens": 228784,
+     "unpricedTokens": 79
+    }
+   ],
+   "sessions": [
+    "11111111",
+    "66666666"
+   ],
+   "split": true,
+   "state": "in-progress",
+   "title": "One",
+   "tokens": 228784,
+   "unpricedTokens": 79
+  },
+  {
+   "calls": 2,
+   "key": "t-002",
+   "money": 0.097505,
+   "phases": [
+    {
+     "key": "(none)",
+     "money": 0.097505,
+     "reconstructed": 0.080004,
+     "tokens": 29503
+    }
+   ],
+   "reconstructed": 0.080004,
+   "sessions": [
+    "11111111",
+    "77777777"
+   ],
+   "split": true,
+   "state": "done",
+   "title": "Two",
+   "tokens": 29503
+  },
+  {
+   "calls": 1,
+   "key": "(no task)",
+   "money": 0.007002,
+   "phases": [
+    {
+     "key": "(none)",
+     "money": 0.007002,
+     "tokens": 1502
+    }
+   ],
+   "sessions": [
+    "11111111"
+   ],
+   "state": null,
+   "tokens": 1502
+  }
+ ],
+ "hours": [
+  [
+   "2026-11-16T23",
+   {
+    "money": 0.080004,
+    "tokens": 4002
+   }
+  ],
+  [
+   "2026-11-17T00",
+   {
+    "money": 0.324008,
+    "tokens": 255787,
+    "unpricedTokens": 79
+   }
+  ]
+ ],
+ "passes": [
+  {
+   "from": "2026-11-17T00:00:12.000Z",
+   "money": 0.035002,
+   "pass": 1,
+   "rebuild": false,
+   "tokens": 51002,
+   "trigger": "report"
+  }
+ ],
+ "prices": {
+  "asOf": "2026-11-01",
+  "currency": "USD",
+  "missing": [
+   "model-z"
+  ],
+  "profile": "test",
+  "source": "test table"
+ },
+ "problems": [],
+ "sessions": [
+  {
+   "calls": 3,
+   "from": "2026-11-17T00:00:31.000Z",
+   "key": "66666666",
+   "kind": "worker",
+   "match": "launch-record",
+   "model": "model-a",
+   "money": 0.282004,
+   "program": "claude",
+   "role": "build",
+   "source": "recorded",
+   "state": "open",
+   "task": "t-001",
+   "to": "2026-11-17T00:11:41.000Z",
+   "tokens": 203283,
+   "unpricedTokens": 79
+  },
+  {
+   "calls": 2,
+   "from": "2026-11-17T00:00:12.000Z",
+   "key": "11111111",
+   "kind": "pa",
+   "match": "launch-record",
+   "model": "model-a",
+   "money": 0.042004,
+   "program": "claude",
+   "role": null,
+   "source": "recorded",
+   "state": "open",
+   "task": null,
+   "to": "2026-11-17T00:01:42.000Z",
+   "tokens": 52504
+  },
+  {
+   "calls": 1,
+   "from": "2026-11-16T23:00:10.000Z",
+   "key": "77777777",
+   "kind": "worker",
+   "match": "cwd+start",
+   "model": "model-b",
+   "money": 0.080004,
+   "program": "claude",
+   "reconstructed": 0.080004,
+   "role": "build",
+   "source": "reconstructed",
+   "state": "open",
+   "task": "t-002",
+   "to": "2026-11-16T23:00:10.000Z",
+   "tokens": 4002
+  }
+ ],
+ "space": "sp1",
+ "totals": {
+  "calls": 6,
+  "money": 0.404012,
+  "reconstructedMoney": 0.080004,
+  "tokens": {
+   "all": 259789,
+   "cr": 150000,
+   "cw": 101000,
+   "in": 12,
+   "out": 8777
+  },
+  "unpricedTokens": 79
+ },
+ "unmatched": {
+  "sessions": 0,
+  "tokens": 0
+ },
+ "updated": "2026-11-17T01:23:20Z",
+ "v": 1
+}

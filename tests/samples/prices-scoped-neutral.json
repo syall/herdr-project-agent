@@ -1,0 +1,28 @@
+{
+ "v": 1, "currency": "USD", "unit": "per-1M-tokens", "source": "neutral scoped test table", "asOf": "2026-11-01",
+ "note": "t-032 J1 test fixture: neutral names only; every key of the scoped format",
+ "defaultScope": {"provider": "provider-a", "endpoint": "global", "region": null, "account": null},
+ "models": {
+  "model-a": [{"validFrom": "2026-01-01", "in": 1.0, "out": 10.0, "cw5m": 2.0, "cw1h": 4.0, "cr": 0.5, "endpoint": "global",
+               "region": null, "source": "made up", "refs": {"in": {"sku": "SKU-A", "usagetype": "ut-a", "rateCode": "rc-a", "raw": "1.0"}}}],
+  "model-b": [{"validFrom": "2026-01-01", "in": 2.0, "out": 20.0, "cw5m": 4.0, "cw1h": 8.0, "cr": 1.0}]
+ },
+ "aliases": [{"match": "^model-a-.*", "model": "model-a"}],
+ "scoped": [
+  {"provider": "provider-a", "endpoint": "regional", "region": "region-a", "account": null,
+   "models": {"model-a": [{"validFrom": "2026-01-01", "in": 1.1, "out": 11.0, "cw5m": 2.2, "cw1h": 4.4, "cr": 0.55, "endpoint": "regional", "region": "region-a"}]}},
+  {"provider": "provider-a", "endpoint": "regional", "region": "region-b", "account": null,
+   "models": {"model-a": [{"validFrom": "2026-01-01", "in": 1.2, "out": 12.0, "cw5m": 2.4, "cw1h": 4.8, "cr": 0.6}]}},
+  {"provider": "provider-a", "endpoint": "global", "region": "region-b", "account": null,
+   "models": {"model-a": [{"validFrom": "2026-01-01", "in": 0.9, "out": 9.0, "cw5m": 1.8, "cw1h": 3.6, "cr": 0.45}]}},
+  {"provider": "provider-a", "endpoint": null, "region": "region-a", "account": null,
+   "models": {"model-a": [{"validFrom": "2026-01-01", "in": 2.0, "out": 20.0, "cw5m": 4.0, "cw1h": 8.0, "cr": 1.0}]}},
+  {"provider": "provider-a", "endpoint": "geo", "region": null, "account": null,
+   "models": {"model-a": [{"validFrom": "2026-01-01", "in": 3.0, "out": 30.0, "cw5m": 6.0, "cw1h": 12.0, "cr": 1.5}]}},
+  {"provider": "provider-a", "endpoint": null, "region": null, "account": "acct-b",
+   "models": {"model-a": [{"validFrom": "2026-06-01", "in": 0.5, "out": 5.0, "cw5m": 1.0, "cw1h": 2.0, "cr": 0.25}]}},
+  {"provider": "provider-b", "endpoint": null, "region": null, "account": null,
+   "models": {"model-c": [{"validFrom": "2026-01-01", "in": 7.0, "out": 70.0, "cw5m": null, "cw1h": null, "cr": 0.7}]}}
+ ],
+ "scopedAliases": [{"match": "^model-c-.*", "model": "model-c"}]
+}

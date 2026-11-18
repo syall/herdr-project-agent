@@ -4007,6 +4007,220 @@ class T36_LocalDays(Collecting):
             self.assertEqual(pa_costs.zone_of({"days": z}), z)  # it round-trips through the summary
 
 
+# ---- t-032 J1a: price scopes and the lookup (R-P1, R-P2, R-A4, A-P1, A-P2, A-P3) ---------------------------------
+
+SAMPLES = os.path.join(HERE, "samples")
+sys.path.insert(0, SAMPLES)
+import old_pricing  # noqa: E402  (frozen copy of the 99e7d8b price code: the reference for unchanged figures)
+
+
+def scoped_fixture():
+    return load(os.path.join(SAMPLES, "prices-scoped-neutral.json"))
+
+
+class J1A_Scopes(CostsBase):
+    """A-P2 precedence, fall-through and refusals, on tests/samples/prices-scoped-neutral.json (neutral names)."""
+
+    def table(self, value=None, pricing=None):
+        self.prices(scoped_fixture() if value is None else value)
+        if pricing is not None:
+            prof = load(os.path.join(self.profile_dir, "profile.json"))
+            prof["pricing"] = pricing
+            dump(prof, os.path.join(self.profile_dir, "profile.json"))
+        table, problem = pa_costs.load_prices(pa.load_profile("test"))
+        self.assertIsNone(problem)
+        return table
+
+    def refused(self, value):
+        self.prices(value)
+        table, problem = pa_costs.load_prices(pa.load_profile("test"))
+        self.assertIsNone(table)
+        self.assertIn("not usable", problem)
+        return problem
+
+    def look(self, table, model, facts, day="2026-11-17"):
+        entry, priced = pa_costs.lookup(table, model, day + "T01:00:00Z", facts)
+        return (entry or {}).get("in"), (priced or {}).get("scope")
+
+    def test_j1a1_no_facts_is_the_default_scope(self):
+        t = self.table()
+        self.assertEqual(t["defaultScope"], ("provider-a", "global", None, None))
+        self.assertEqual(self.look(t, "model-a", None), (1.0, ["provider-a", "global", "*", "*"]))
+        self.assertEqual(self.look(t, "model-a", (None, None, None, None)), (1.0, ["provider-a", "global", "*", "*"]))
+        self.assertEqual(pa_costs.price_for(t, "model-a", "2026-11-17T01:00:00Z")["in"], 1.0)
+        self.assertEqual(self.look(t, "model-a-2026", None)[0], 1.0)  # aliases shared by every scope
+
+    def test_j1a2_regional_row_from_its_region_never_from_global(self):
+        t = self.table()
+        self.assertEqual(self.look(t, "model-a", ("provider-a", "regional", "region-a", None)),
+                         (1.1, ["provider-a", "regional", "region-a", "*"]))
+        self.assertEqual(self.look(t, "model-a", ("provider-a", "regional", "region-b", "acct-a"))[0], 1.2)
+        self.assertEqual(self.look(t, "model-a", ("provider-a", "regional", "region-c", None)), (None, None))
+        self.assertEqual(self.look(t, "model-a", ("provider-a", "regional", None, None)), (None, None))  # unknown region
+        self.assertEqual(self.look(t, "model-b", ("provider-a", "regional", "region-a", None)), (None, None))
+
+    def test_j1a3_unknown_endpoint_takes_the_default_endpoint(self):
+        t = self.table()
+        self.assertEqual(self.look(t, "model-a", ("provider-a", None, None, None))[0], 1.0)
+        self.assertEqual(self.look(t, "model-a", ("provider-a", None, "region-b", None)), (0.9, ["provider-a", "global", "region-b", "*"]))
+        self.assertEqual(self.look(t, "model-a", ("provider-a", "global", "region-c", None))[0], 1.0)  # unknown region: region-null scopes
+
+    def test_j1a4_account_beats_region_region_beats_endpoint(self):
+        t = self.table()
+        self.assertEqual(self.look(t, "model-a", ("provider-a", "global", "region-b", "acct-b"), "2026-07-01"),
+                         (0.5, ["provider-a", "*", "*", "acct-b"]))
+        # before the account row's validFrom: the next matching scope (region-b global), not nothing
+        self.assertEqual(self.look(t, "model-a", ("provider-a", "global", "region-b", "acct-b"), "2026-03-01")[0], 0.9)
+        self.assertEqual(self.look(t, "model-a", ("provider-a", "geo", "region-a", None)), (2.0, ["provider-a", "*", "region-a", "*"]))
+        self.assertEqual(self.look(t, "model-a", ("provider-a", "geo", "region-c", None))[0], 3.0)
+        # a model the account scope lacks falls through to the default
+        self.assertEqual(self.look(t, "model-b", ("provider-a", "global", None, "acct-b"), "2026-07-01")[0], 2.0)
+
+    def test_j1a5_no_crossing_of_providers(self):
+        t = self.table()
+        self.assertEqual(self.look(t, "model-a", ("provider-b", None, None, None)), (None, None))
+        self.assertEqual(self.look(t, "model-a", ("provider-z", "global", None, None)), (None, None))
+        self.assertEqual(self.look(t, "model-c", ("provider-b", None, None, None)), (7.0, ["provider-b", "*", "*", "*"]))
+        self.assertEqual(self.look(t, "model-c-2026", ("provider-b", "global", "region-a", "acct-a"))[0], 7.0)  # scopedAliases
+        self.assertEqual(self.look(t, "model-c", ("provider-a", None, None, None)), (None, None))
+        self.assertEqual(self.look(t, "model-c", None), (None, None))
+
+    def test_j1a6_endpoint_price_as(self):
+        t = self.table(pricing={"endpointPriceAs": {"geo": "regional"}})
+        self.assertEqual(self.look(t, "model-a", ("provider-a", "geo", "region-a", None)), (1.1, ["provider-a", "regional", "region-a", "*"]))
+        self.assertEqual(self.look(t, "model-a", ("provider-a", "geo", "region-c", None)), (None, None))
+
+    def test_j1a7_no_default_provider_known_provider_is_unpriced(self):
+        t = self.table(dict(PRICES))  # A-P3: no defaultScope, no pricing.defaultProvider
+        self.assertEqual(t["defaultScope"], (None, None, None, None))
+        self.assertEqual(self.look(t, "model-a", None)[0], 1.0)
+        self.assertEqual(self.look(t, "model-a", (None, "regional", "region-a", "acct-a"))[0], 1.0)
+        self.assertEqual(self.look(t, "model-a", ("provider-a", None, None, None)), (None, None))
+
+    def test_j1a8_default_provider_forms(self):
+        legacy = dict(PRICES, defaultProvider="provider-a")
+        self.assertEqual(self.table(legacy)["defaultScope"], ("provider-a", None, None, None))
+        t = self.table(dict(PRICES), pricing={"defaultProvider": "provider-a"})
+        self.assertEqual(t["defaultScope"], ("provider-a", None, None, None))
+        self.assertEqual(self.look(t, "model-a", ("provider-a", "regional", "region-q", None))[0], 1.0)
+        self.assertEqual(self.look(t, "model-a", ("provider-b", None, None, None)), (None, None))
+        t = self.table(scoped_fixture(), pricing={"defaultProvider": "provider-z"})
+        self.assertEqual(t["defaultScope"][0], "provider-a")  # the file wins
+        self.assertTrue(any("provider-z" in w and "provider-a" in w for w in t["warnings"]), t["warnings"])
+
+    def test_j1a9_row_money_uses_the_row_facts(self):
+        t = self.table()
+        row = {"model": "model-a", "from": "2026-11-17T01:00:00Z", "tokens": toks(**{"in": 1000000}), "long": dict(ZERO)}
+        self.assertAlmostEqual(pa_costs.row_money(row, t), 1.0)
+        self.assertAlmostEqual(pa_costs.row_money(dict(row, provider="provider-a", endpoint="regional", region="region-a"), t), 1.1)
+        self.assertIsNone(pa_costs.row_money(dict(row, provider="provider-b"), t))
+        c = dict(row, model="model-c", provider="provider-b", tokens=toks(cw5m=5))
+        self.assertIsNone(pa_costs.row_money(c, t))  # a null price with tokens: no price, never 0
+
+    def test_j1a10_refusals(self):
+        base = scoped_fixture()
+
+        def with_scoped(*entries):
+            return dict(base, scoped=list(entries))
+        m = {"model-a": [{"validFrom": "2026-01-01", "in": 1.0}]}
+        self.refused(with_scoped({"provider": None, "endpoint": None, "region": None, "account": None, "models": m}))
+        self.refused(with_scoped({"provider": "provider-a", "account": "acct-b", "models": m},
+                                 {"provider": "provider-a", "account": "acct-b", "endpoint": None, "models": m}))
+        self.refused(with_scoped({"provider": "provider-a", "endpoint": "global", "models": m}))  # equals defaultScope
+        self.refused(with_scoped({"provider": "provider-a", "account": "12345" + "6789012", "models": m}))
+        self.refused(with_scoped({"provider": "provider-a", "region": "Region A", "models": m}))
+        self.refused(with_scoped({"provider": "provider-a", "endpoint": "Global!", "models": m}))
+        self.refused(with_scoped({"provider": "provider-a", "region": "region-a", "models": {"model-a": [{"validFrom": "x"}]}}))
+        self.refused(with_scoped({"provider": "provider-a", "region": "region-a"}))
+        self.refused(dict(base, scoped={"provider": "provider-a"}))
+        self.refused(dict(base, scopedAliases=[{"match": "^x", "model": "model-q"}]))
+        self.refused(dict(base, defaultScope={"provider": "provider-a", "endpoint": "glo bal"}))
+        self.refused(dict(base, defaultScope="provider-a"))
+
+    def test_j1a11_row_scope_mismatch_is_a_warning(self):
+        f = scoped_fixture()
+        f["models"]["model-b"][0]["endpoint"] = "regional"
+        t = self.table(f)
+        self.assertTrue(any("model-b" in w and "endpoint" in w for w in t["warnings"]), t["warnings"])
+        legacy = json.loads(json.dumps(PRICES))
+        legacy["models"]["model-a"][0]["provider"] = "provider-q"  # files without defaultScope are not checked
+        self.assertEqual(self.table(legacy)["warnings"], [])
+
+
+class J1A_Parity(CostsBase):
+    """R-P1/A-P1: the 99e7d8b code (tests/samples/old_pricing.py) reads the scoped file as its top-level models,
+    and the new code prices rows without facts exactly as the old one."""
+
+    DAYS = ("2025-12-31", "2026-01-01", "2026-06-01", "2026-11-17", "2027-01-01")
+    MODELS = ("model-a", "model-a-2026", "model-b", "model-c", "model-c-2026", "model-z", None)
+
+    def both(self, value):
+        self.prices(value)
+        prof = pa.load_profile("test")
+        return old_pricing.load_prices(prof), pa_costs.load_prices(prof)
+
+    def same_prices(self, old, new):
+        for model in self.MODELS:
+            for day in self.DAYS:
+                when = day + "T10:00:00Z"
+                o, n = old_pricing.price_for(old, model, when), pa_costs.price_for(new, model, when)
+                self.assertEqual(o, n, (model, day))
+                tokens = toks(**{"in": 1234, "out": 5678, "cw5m": 91011, "cw1h": 1213, "cr": 141516})
+                self.assertEqual(old_pricing.money(tokens, {}, o), pa_costs.money(tokens, {}, n), (model, day))
+
+    def test_j1p1_old_code_reads_the_scoped_file_as_its_models(self):
+        (old, old_problem), (new, new_problem) = self.both(scoped_fixture())
+        self.assertIsNone(old_problem)
+        self.assertIsNone(new_problem)
+        self.assertEqual(old["warnings"], [])
+        self.assertEqual(sorted(old["models"]), ["model-a", "model-b"])
+        self.assertEqual(old["models"], new["models"])
+        for model in ("model-a", "model-b", "model-a-2026"):
+            for day in self.DAYS:
+                when = day + "T10:00:00Z"
+                self.assertEqual(old_pricing.price_for(old, model, when), pa_costs.price_for(new, model, when))
+
+    def test_j1p2_files_without_the_new_keys_price_as_before(self):
+        installed = json.loads(json.dumps(PRICES))  # the installed shape: informational keys on rows, no scopes
+        for rows in installed["models"].values():
+            for r in rows:
+                r.update(provider="provider-q", source="made up", refs={"in": {"sku": "S"}})
+        installed["unverified"] = ["a note"]
+        for value in (PRICES, installed):
+            (old, _p1), (new, _p2) = self.both(value)
+            self.assertEqual(new["scoped"], [])
+            self.same_prices(old, new)
+            self.assertEqual(old["warnings"], new["warnings"])
+            for facts in (None, (None, None, None, None), (None, "global", None, "acct-a"), (None, "regional", "region-a", None)):
+                for model in self.MODELS:
+                    self.assertEqual(pa_costs.lookup(new, model, "2026-11-17T10:00:00Z", facts)[0],
+                                     old_pricing.price_for(old, model, "2026-11-17T10:00:00Z"), (facts, model))
+
+
+class J1A_Snapshot(Collecting):
+    """The pre-J1 summary (tests/samples/summary-pre-j1.json, written by the 99e7d8b code for S_Summary.mixed at
+    commit 'J1a tests'): every key it has is unchanged under the J1 code (added keys left out of the compare)."""
+
+    mixed = S_Summary.mixed
+
+    def restrict(self, new, old, path="$"):
+        if isinstance(old, dict):
+            self.assertIsInstance(new, dict, path)
+            for k in old:
+                self.assertIn(k, new, "{}.{}".format(path, k))
+            return {k: self.restrict(new[k], old[k], "{}.{}".format(path, k)) for k in old}
+        if isinstance(old, list):
+            self.assertIsInstance(new, list, path)
+            self.assertEqual(len(new), len(old), path)
+            return [self.restrict(n, o, "{}[{}]".format(path, i)) for i, (n, o) in enumerate(zip(new, old))]
+        return new
+
+    def test_j1s1_pre_j1_summary_keys_unchanged(self):
+        old = load(os.path.join(SAMPLES, "summary-pre-j1.json"))
+        new = json.loads(json.dumps(self.mixed()))
+        self.assertEqual(self.restrict(new, old), old)
+
+
 class ZZ_V1_Privacy(unittest.TestCase):
     """Run last: the canary of every fixture reached no file under costs/ or billing/ and no captured output."""
 
