@@ -884,11 +884,34 @@ def claim(args, address, labels, space, project, p, existing, directory):
 
 def reload_profile(p):
     """The profile as it is now, by the same name, so a restart in run_agent's loop sees an edit made since the
-    launcher began (t-033); the one in hand when it cannot be read now (missing, malformed, wrong shape)."""
+    launcher began (t-033); the one in hand when it cannot be read now (missing, malformed, refused by load_profile).
+    run_agent also keeps the one in hand when no launch can be built from the new one (round 2)."""
     try:
         return load_profile(p["name"])
     except Exception:  # noqa: BLE001 - a restart never fails because of it
         return p
+
+
+def launch_command(p, agent, resume, directory):
+    """(argv, model) for one launch of the Project Agent from profile p; raises when p cannot give one."""
+    argv = list(p["claude"])
+    model = (agent.get("models") or {}).get("orchestrator") or (p.get("models") or {}).get("orchestrator")
+    if model:
+        argv += ["--model", model]
+    argv += mcp_args(p)
+    argv += ["--resume", agent["sessionId"]] if resume else ["--session-id", agent["sessionId"]]
+    argv += ["--name", "PA: " + agent["name"], "--append-system-prompt", layered(p, "orchestrator", directory, agent)]
+    if resume:
+        argv += ["Your session was restarted. Read your state folder (ledger.json, journal.jsonl, decisions/, "
+                 "rules.json), then say in one line where things stand. Continue where you left off without "
+                 "asking, as orchestrator.md defines it under \"After a restart or a compaction\": read the "
+                 "reports that came in, take the next planned step, and start a fresh worker for a job whose "
+                 "worker stopped. Start nothing else until asked: no new task, no move to a phase that needs "
+                 "the person, no worker for a task with an open card. If the last hold or resume line in the "
+                 "journal is a hold, start nothing at all until the person says go. `paused` in "
+                 "`schedule.json` stops timed passes only; it is not a hold."]
+    argv += cc_settings_args(p, agent.get("space") or os.path.basename(directory), [])  # last (t-029 R4)
+    return resolve(argv, p), model
 
 
 def run_agent(args, address, project, p, directory, agent, ctx, started):
@@ -924,7 +947,7 @@ def run_agent(args, address, project, p, directory, agent, ctx, started):
         ctx["beat"] = True
     quick, quick_resume_fails = 0, 0
     while True:
-        p = reload_profile(p)
+        fresh = reload_profile(p)
         agent = read_json(os.path.join(directory, "agent.json"), agent)
         resume, why = should_resume(agent, directory, project, before=started, heartbeat=ctx.get("previous"))
         if args.fresh:
@@ -934,24 +957,16 @@ def run_agent(args, address, project, p, directory, agent, ctx, started):
         args.fresh = False
         agent["updated"] = now()
         write_json(os.path.join(directory, "agent.json"), agent)
-        argv = list(p["claude"])
-        model = (agent.get("models") or {}).get("orchestrator") or (p.get("models") or {}).get("orchestrator")
-        if model:
-            argv += ["--model", model]
-        argv += mcp_args(p)
-        argv += ["--resume", agent["sessionId"]] if resume else ["--session-id", agent["sessionId"]]
-        argv += ["--name", "PA: " + agent["name"], "--append-system-prompt", layered(p, "orchestrator", directory, agent)]
-        if resume:
-            argv += ["Your session was restarted. Read your state folder (ledger.json, journal.jsonl, decisions/, "
-                     "rules.json), then say in one line where things stand. Continue where you left off without "
-                     "asking, as orchestrator.md defines it under \"After a restart or a compaction\": read the "
-                     "reports that came in, take the next planned step, and start a fresh worker for a job whose "
-                     "worker stopped. Start nothing else until asked: no new task, no move to a phase that needs "
-                     "the person, no worker for a task with an open card. If the last hold or resume line in the "
-                     "journal is a hold, start nothing at all until the person says go. `paused` in "
-                     "`schedule.json` stops timed passes only; it is not a hold."]
-        argv += cc_settings_args(p, agent.get("space") or os.path.basename(directory), [])  # last (t-029 R4)
-        argv = resolve(argv, p)
+        if fresh is not p:
+            # The re-read profile is used only when a launch can be built from it (t-033 round 2): a file that
+            # loads but has a wrong shape in a key read here (models a list, path a number, ...) keeps the old one.
+            try:
+                argv, model = launch_command(fresh, agent, resume, directory)
+                p = fresh
+            except Exception:  # noqa: BLE001 - a restart never fails because of the reload
+                fresh = p
+        if fresh is p:
+            argv, model = launch_command(p, agent, resume, directory)
         session_log(directory, "start resume={} session={} reason={}".format(resume, agent["sessionId"], why))
         began = time.time()
         running.update(since=began, session=agent["sessionId"], marked=False)
