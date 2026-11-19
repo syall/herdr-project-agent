@@ -12,6 +12,7 @@ Nothing leaves this Mac: hc is tests/stub-hc (a machine is a temp folder), the m
   x7  only the pinned commit arrives                                 x17 --places
   x8  setup failures -> the Mac in the same call                     x18 docs and help
   x9  every remote argv a fixed form under /tmp/pa-suite-<run>      x19 the profile's hooks/tests.sh full (d-222)
+                                                                     x20 each probed tool is the one that runs
 """
 import json
 import os
@@ -45,6 +46,7 @@ case "${1:-}" in
     echo "refs: $(git for-each-ref --format='%(refname)' | tr '\n' ' ')"
     echo "files: $(ls -A | tr '\n' ' ')"
     echo "status: [$(git status --porcelain | tr '\n' ' ')]"
+    echo "python3 ran: $(python3 -c 'import sys; print(sys.executable)' 2>&1)"
     mkdir -p "$HERDR_PA_HOME/suite-runs"
     printf '{"run": "rr", "parts": {"total": 3, "done": 2, "running": [], "failed": [], "hung": []}}' > "$HERDR_PA_HOME/suite-runs/rr.json"
     if [ -n "${FAKE_GO:-}" ]; then while [ ! -f "$FAKE_GO" ]; do sleep 0.1; done; fi
@@ -780,6 +782,33 @@ class X19ProfileRunner(Remote):
         code, out = self.main()
         self.assertEqual(code, 0, out)
         self.assertEqual(self.lines()[-1].get("machine"), "box-1", out)
+
+
+class X20ProbedTools(Remote):
+    """J2 round 3: a folder that holds git (or another probed tool) and also an older python3 must not shadow the
+    python3 the probe found; the remote run uses each probed path and the record names it."""
+
+    def test_x20_an_older_python3_beside_git_does_not_shadow_the_probed_one(self):
+        good, gitdir = os.path.join(self.tmp, "goodpy"), os.path.join(self.tmp, "gitdir")
+        os.makedirs(good)
+        os.makedirs(gitdir)
+        os.symlink(sys.executable, os.path.join(good, "python3"))
+        os.symlink(shutil.which("git"), os.path.join(gitdir, "git"))
+        write(os.path.join(gitdir, "python3"), "#!/bin/sh\necho old-python3-ran\n")
+        os.chmod(os.path.join(gitdir, "python3"), 0o755)
+        self.setenv(PATH=os.pathsep.join([good, gitdir, os.environ["PATH"]]))
+        code, out = self.main()
+        self.assertEqual(code, 0, out)
+        run = self.run_id(out)
+        text = self.output(run)
+        self.assertNotIn("old-python3-ran", text)
+        ran = re.search(r"python3 ran: (\S+)", text)
+        self.assertTrue(ran, text)
+        self.assertEqual(os.path.realpath(ran.group(1)), os.path.realpath(sys.executable), text)
+        line = self.lines()[-1]
+        self.assertEqual(line.get("machine"), "box-1", out)
+        self.assertEqual(line["tools"]["python3"]["path"], os.path.join(good, "python3"), line)
+        self.assertEqual(line["tools"]["git"]["path"], os.path.join(gitdir, "git"), line)
 
 
 if __name__ == "__main__":
