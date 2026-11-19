@@ -376,7 +376,8 @@ class NextByTaskOrder(Base):  # R9, R10 through the tool
         super().setUp()
         dump({"version": 1, "tasks": [{"id": "t-1", "state": "queued", "created": "2026-11-01T00:00:00Z"},
                                       {"id": "t-2", "state": "queued", "created": "2026-11-02T00:00:00Z"},
-                                      {"id": "t-3", "state": "queued", "created": "2026-11-03T00:00:00Z"}]},
+                                      {"id": "t-3", "state": "queued", "created": "2026-11-03T00:00:00Z"}],
+              "taskOrder": {"order": [], "chat": []}},  # a task order exists (MF-2: else the added order stands)
              self.path("ledger.json"))
         self.add("t-3", "a")
         self.add("t-2", "a")
@@ -386,7 +387,7 @@ class NextByTaskOrder(Base):  # R9, R10 through the tool
     def ids_next(self):
         return [j["id"] for j in json.loads(self.ok("next", "--json"))["jobs"]]
 
-    def test_no_files_created_order(self):  # R27: created order with no file and no taskOrder
+    def test_empty_task_order_created_order(self):  # R27: an empty taskOrder and no file give created order
         self.assertEqual(self.ids_next(), ["t-1/a", "t-2/a", "t-q/check", "t-3/a"])
         self.assertIn("no start order yet; the Project Agent's order is used", self.ok("next"))  # J1-D3
 
@@ -427,6 +428,53 @@ class NextByTaskOrder(Base):  # R9, R10 through the tool
         self.ok("drop", "t-1/a", "--why", "w")
         self.assertEqual(read(self.path("task-order.json")), task_order)
         self.assertEqual(read(self.path("start-order.json")), start_order)
+
+
+class NextWithoutTaskOrder(Base):  # MF-2, R27: until a task order exists, the waiting list keeps today's order
+    def setUp(self):
+        super().setUp()
+        dump({"version": 1, "tasks": [{"id": "t-1", "state": "queued", "created": "2026-11-01T00:00:00Z"},
+                                      {"id": "t-2", "state": "in-progress", "created": "2026-11-02T00:00:00Z"},
+                                      {"id": "t-3", "state": "queued", "created": "2026-11-03T00:00:00Z"}]},
+             self.path("ledger.json"))
+        self.add("t-3", "hotfix")
+        self.add("t-2", "verify")
+        self.add("t-q", "check", "suite", "verifier", "--source", "queue")
+        self.add("t-1", "build")
+
+    def ids_next(self):
+        return [j["id"] for j in json.loads(self.ok("next", "--json"))["jobs"]]
+
+    def test_no_files_keeps_the_added_order(self):
+        self.assertEqual(self.ids_next(), ["t-3/hotfix", "t-2/verify", "t-q/check", "t-1/build"])
+        self.assertIn("no start order yet; the Project Agent's order is used", self.ok("next"))
+
+    def test_the_first_free_place_goes_to_the_first_added(self):
+        dump({"rules": [{"id": "r-w", "text": "x", "status": "active", "order": 10, "places": {"working": 1}}]},
+             self.path("rules.json"))
+        start = [j["id"] for j in json.loads(self.ok("next", "--json"))["jobs"] if j["action"] == "start"]
+        self.assertEqual(start, ["t-3/hotfix"])
+
+    def test_unreadable_task_order_keeps_the_added_order(self):  # not a task order: nothing of it is used (R2)
+        write(self.path("task-order.json"), "{nope")
+        self.assertEqual(self.ids_next(), ["t-3/hotfix", "t-2/verify", "t-q/check", "t-1/build"])
+
+    def test_a_readable_task_order_ranks(self):
+        write(self.path("task-order.json"), json.dumps({"version": 1, "updated": "U1", "order": [], "last": []}))
+        self.assertEqual(self.ids_next(), ["t-1/build", "t-2/verify", "t-q/check", "t-3/hotfix"])
+
+    def test_a_ledger_task_order_ranks(self):
+        doc = json.loads(read(self.path("ledger.json")))
+        doc["taskOrder"] = {"order": ["t-2"], "chat": []}
+        dump(doc, self.path("ledger.json"))
+        self.assertEqual(self.ids_next(), ["t-2/verify", "t-1/build", "t-q/check", "t-3/hotfix"])
+
+    def test_pins_still_move_jobs(self):  # R10: a v1 start order keeps t-083's meaning over the added order
+        write(self.path("start-order.json"), json.dumps({"version": 1, "order": ["t-1/build"]}))
+        self.assertEqual(self.ids_next(), ["t-1/build", "t-3/hotfix", "t-q/check", "t-2/verify"])
+
+    def test_tasks_still_shows_the_ranking(self):  # R24, R27: the ranking is created order; only the sort waits
+        self.assertIn("t-1", json.dumps(json.loads(self.ok("tasks", "--json"))["tasks"][0]))
 
 
 # ---- limits through the tool (AC2.1, AC2.4, AC2.5) ---------------------------------------------------------------
