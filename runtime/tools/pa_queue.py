@@ -397,13 +397,57 @@ def ranges(hunks, side):
     return out
 
 
+def tip_line(line, hunks):
+    """Line `line` of the new base as it lies in the tip, by the -U0 hunks new base -> tip; None when the change
+    rewrote it."""
+    shift = 0
+    for h in hunks:
+        (start, count), (_s, added) = h["old"], h["new"]
+        if count == 0:
+            shift += added if start < line else 0
+        elif start + count - 1 < line:
+            shift += added - count
+        elif start <= line:
+            return None
+    return line + shift
+
+
+def region_of(first, last, regions):
+    """The index of the conflict region holding tip lines first..last whole, else None."""
+    if first is None or last is None:
+        return None
+    return next((i for i, (a, b) in enumerate(regions) if a <= first and last <= b), None)
+
+
+def shared_file(ctx, s, regions=None):
+    """The shared-file item of one file (t-052 J2): main's hunks, the change's, and the pairs within NEAR lines. For a
+    union file (J3c fix round 2) a pair whose two hunks both lie in one conflict region is left out: the doc-only
+    question covers it; every other pair stays."""
+    main_h = pa_hooks.diff_hunks(ctx.run, ctx.repo, s["oldBase"], s["newBase"])
+    change_h = pa_hooks.diff_hunks(ctx.run, ctx.repo, s["newBase"], s["tip"])
+    main, change = ranges(main_h, "new"), ranges(change_h, "old")
+    near = []
+    for mh, m in zip(main_h, main):
+        start, count = mh["new"]
+        mr = region_of(tip_line(start, change_h), tip_line(start + count - 1, change_h), regions or []) if count else None
+        for ch, c in zip(change_h, change):
+            if max(0, max(m[0], c[0]) - min(m[1], c[1])) > NEAR:
+                continue
+            first, added = ch["new"]
+            if mr is not None and added and region_of(first, first + added - 1, regions) == mr:
+                continue
+            near.append([m, c])
+    item = {"path": s["path"], "mainHunks": main, "changeHunks": change, "near": near}
+    if regions is not None:
+        item["union"] = True
+    return item
+
+
 def needs_for(ctx, entry, tip, decision, old_base, new_base, since=None):
-    files = []
-    for s in decision["shared"]:
-        main = ranges(pa_hooks.diff_hunks(ctx.run, ctx.repo, s["oldBase"], s["newBase"]), "new")
-        change = ranges(pa_hooks.diff_hunks(ctx.run, ctx.repo, s["newBase"], s["tip"]), "old")
-        near = [[m, c] for m in main for c in change if max(0, max(m[0], c[0]) - min(m[1], c[1])) <= NEAR]
-        files.append({"path": s["path"], "mainHunks": main, "changeHunks": change, "near": near})
+    files = [shared_file(ctx, s) for s in decision["shared"]]
+    # a union file is a shared file too (REVIEW J3c Must fix 1): main's other hunks near the change are asked about
+    files += [shared_file(ctx, u, u["regions"]) for u in decision.get("unions") or []]
+    files.sort(key=lambda f: f["path"])
     n = max(1, len(entry.get("rebases") or []))
     name = "SHORT-REVIEW-{}{}-{}.md".format(entry["task"], "-" + entry["job"] if entry.get("job") else "", n)
     need = {"tip": tip, "tree": ctx.tree(tip), "file": name, "since": since or now(), "oldBase": old_base, "newBase": new_base,
@@ -428,7 +472,8 @@ def handoff_lines(entry, need):
         near = "; ".join("main {}-{} near change {}-{}".format(m[0], m[1], c[0], c[1]) for m, c in f["near"]) or "none within {} lines".format(NEAR)
         lines.append("  {}: git diff {} {} -- {} (the base's change); git diff {} {} -- {} (the change); {}".format(
             f["path"], need["oldBase"], need["newBase"], f["path"], need["newBase"], need["tip"], f["path"], near))
-    if need["files"] or not doc:
+    # the shared-file question: every moved file; a union file only with a place near the change outside its regions
+    if not doc or any(not f.get("union") or f["near"] for f in need["files"]):
         lines.append("  question: " + QUESTION + "; then 'Verdict: pass' or 'Verdict: must fix (<n>)'.")
     lines.append("  the file has the lines Start: <UTC time>, End: <UTC time>, Reviewer: <its address>, "
                  "Checked: {}, and its Verdict: line".format(need["tip"]))
