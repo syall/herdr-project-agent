@@ -149,6 +149,8 @@ class R1Argv(Run):
     def test_r1a_refusals_are_125_and_no_hc_call(self):
         write(os.path.join(self.wt, "tests", "pa_session_check.sh"), "echo x\n")
         write(os.path.join(self.wt, "plain.txt"), "not executable\n")
+        os.symlink("tests/run-all.sh", os.path.join(self.wt, "ra.sh"))  # round 3: a symlink in the tree counts as its target
+        os.symlink("tests/pa_session_check.sh", os.path.join(self.wt, "psc.sh"))
         sh(self.wt, "git", "add", "-A")
         sh(self.wt, "git", "commit", "-q", "-m", "more")
         cases = [
@@ -195,6 +197,29 @@ class R1Argv(Run):
             (["sh", "tests/../tests/pa_session_check.sh"], "pa_session_check.sh"),
             (["sh", "tests//../tests/pa_session_check.sh", "/tmp/x"], "pa_session_check.sh"),
             (["tests/../tests/pa_session_check.sh"], "pa_session_check.sh"),
+            # round 3 (MF-3): run-all.sh only with a flag that is not a whole run; "" is its no-flag run
+            (["sh", "tests/run-all.sh", ""], "use pa-full-suite"),
+            (["tests/run-all.sh", ""], "use pa-full-suite"),
+            (["sh", "-e", "tests/run-all.sh", ""], "use pa-full-suite"),
+            (["sh", "tests/run-all.sh", "", "--affected"], "use pa-full-suite"),
+            (["sh", "tests/run-all.sh", "--"], "use pa-full-suite"),
+            (["sh", "tests/run-all.sh", "--bogus"], "use pa-full-suite"),
+            # round 3 (MF-4): paths that leave the tree and come back, absolute paths, symlinks in the tree
+            (["sh", "../w/tests/run-all.sh"], "leaves the tree"),
+            (["sh", "../w/tests/run-all.sh", "--only-integration"], "leaves the tree"),
+            (["sh", "../wt/tests/run-all.sh"], "leaves the tree"),
+            (["sh", os.path.join(self.wt, "tests", "run-all.sh")], "absolute"),
+            (["sh", "/proc/self/cwd/tests/run-all.sh"], "absolute"),
+            (["sh", "-e", "--", "../w/tests/run-all.sh"], "leaves the tree"),
+            (["sh", "../w/tests/pa_session_check.sh", "x"], "leaves the tree"),
+            (["sh", "../wt/tests/pa_session_check.sh"], "leaves the tree"),
+            (["sh", os.path.join(self.wt, "tests", "pa_session_check.sh")], "absolute"),
+            (["sh", "/proc/self/cwd/tests/pa_session_check.sh", "x"], "absolute"),
+            (["sh", "ra.sh"], "use pa-full-suite"),
+            (["sh", "ra.sh", "--only-integration"], "use pa-full-suite"),
+            (["./ra.sh"], "use pa-full-suite"),
+            (["sh", "psc.sh"], "pa_session_check.sh"),
+            (["./psc.sh"], "pa_session_check.sh"),
         ]
         for argv, why in cases:
             code, out = self.pa_run("--", *argv)
@@ -208,7 +233,12 @@ class R1Argv(Run):
         for argv, why in ((["sh", "run-all.sh"], "use pa-full-suite"), (["sh", "-e", "./run-all.sh"], "use pa-full-suite"),
                           (["sh", "../tests/run-all.sh"], "use pa-full-suite"),
                           (["sh", "--", "pa_session_check.sh"], "pa_session_check.sh"),
-                          (["sh", "../tests/pa_session_check.sh"], "pa_session_check.sh")):
+                          (["sh", "../tests/pa_session_check.sh"], "pa_session_check.sh"),
+                          # round 3 (MF-4)
+                          (["sh", "../../w/tests/run-all.sh"], "leaves the tree"),
+                          (["sh", "../../wt/tests/pa_session_check.sh"], "leaves the tree"),
+                          (["sh", os.path.join(self.wt, "tests", "run-all.sh")], "absolute"),
+                          (["sh", "run-all.sh", ""], "use pa-full-suite")):
             code, out = self.pa_run("--cwd", "tests", "--", *argv)
             self.assertEqual(code, 125, (argv, out))
             self.assertIn(why, out, argv)
@@ -227,8 +257,16 @@ class R1Argv(Run):
                      ["sh", "tests/run-all.sh", "--affected"], ["sh", "tests/run-all.sh", "--module", "test_x"],
                      ["python3", "-c", "print(1)"], ["sh", "-e", "probe.sh"], ["sh", "-eo", "pipefail", "probe.sh"],
                      ["sh", "-o", "errexit", "+x", "probe.sh"], ["sh", "--", "probe.sh"], ["sh", "-", "probe.sh"],
-                     ["sh", "-x", "tests/run-all.sh", "--affected"], ["sh", "-e", "probe.sh", "-c", "x"]):
+                     ["sh", "-x", "tests/run-all.sh", "--affected"], ["sh", "-e", "probe.sh", "-c", "x"],
+                     ["sh", "sub/../probe.sh"], ["python3", "-m", "unittest", "../w/tests/run-all.sh"]):
             self.assertIsNone(pa_run.check_argv(argv, self.wt, "", None, []), argv)
+
+    def test_r1f_an_allowed_run_all_flag_still_runs(self):
+        """round 3: the allowlist leaves run-all.sh's flags that are not a whole run working (here the fake's part)."""
+        code, out = self.pa_run("--", "sh", "tests/run-all.sh", "--except-integration")
+        self.assertEqual(code, 0, out)
+        self.assertIn("fake remote part in", out)
+        self.assertTrue(self.remote_runs(), out)
 
     def test_r1d_no_argv_is_a_usage_error(self):
         code, out = self.pa_run()
