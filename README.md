@@ -404,11 +404,15 @@ no-test extra place) and `suite` (a job at the full-suite step: a working place 
 Their limits are the rules' `places` (`"places": {"working": 4, "no-test": 1, "suite": 2}` on an active
 rule, the highest one per kind); with none, working 4, no-test 0 and no suite cap. The Project Agent
 keeps the waiting list in `waiting.json` with `pa-places` (`add`, `block`, `unblock`, `drop`, `start`;
-`pa-places next` says which job starts and why the others wait). The waiting list follows the task
+`pa-places next` says which job starts and why the others wait); a job stays blocked until each reason it
+was blocked for is unblocked (`unblock <id> --why <line>` ends one). The waiting list follows the task
 order (below). You move a waiting job with ↑ ↓ ⤒: a one-off override for that job, which the panel
 saves as one of the `pins` in `start-order.json` (version 2: the job and its new place among the
 movable jobs; a version 1 file, a whole list, is read as pins in its order), which no tool writes, and
-tells the agent `start order changed`. Your order only says which ready job goes first: it answers no
+tells the agent `start order changed`. When earlier pins would put the jobs elsewhere than the move
+drew (or the file is version 1), it writes only the pins that order needs, so a task move still
+reorders the others. While `task-order.json` is being read the jobs have no moves (`moves wait for
+the task order to be read`). Your order only says which ready job goes first: it answers no
 card, approves no rule, lifts no hold and raises no limit. Merge-queue checks keep the queue's order
 (Queue tab). A space's
 suite places are not the machine's suite slot: the suite places limit how many of this space's workers
@@ -423,7 +427,8 @@ this Mac's own slot. A holder whose worker's terminal is live opens it in the Ag
 section: Review, In progress, Investigating and Queued list their tasks in rank order, numbered, with
 ↑ ↓ ⤒ ⤓ (⤓ sends a task below everything else). A task keeps its rank when it changes section. Needs
 decision tasks and parked tasks keep a hidden rank (no number, no buttons) and come back at it; a done
-task has none, and reopened it starts at the bottom of Queued. The panel writes your order to
+task has none, and reopened it starts at the bottom of Queued (`pa-task reopen` takes it out of the
+Project Agent's order, and the place your file gave it before is not read). The panel writes your order to
 `task-order.json` in the state folder (`order`: the tasks you placed, top first; `last`: the ones sent
 to the bottom; the last 20 `moves`), compare-and-write, locally or on the space's machine; no tool
 writes it. A ↑ makes every task above it yours, so ↑ is exactly one step. An unreadable file is
@@ -444,8 +449,9 @@ ranked task's jobs. The person's task order never answers a card, approves a rul
 a limit, or starts a task before its `after` tasks. It only says which ready task goes first.
 
 Moving a task between sections goes through `pa-task`, which journals it and tells the agent: **Start
-next** on a Queued task (`pa-task next`: In progress, top of the order; its `after` tasks, cards and
-holds still apply, and no worker is started), **Pause** on an In progress or Investigating task
+next** on a Queued task (the panel puts it at the top of the order, then `pa-task next` puts it In
+progress; `pa-task next` from a terminal changes only the state; its `after` tasks, cards and holds
+still apply, and no worker is started), **Pause** on an In progress or Investigating task
 (`pa-task pause`: back to Queued with a `paused` chip; its running workers finish their job, no new job
 starts, its waiting jobs are blocked), **Unpause** (`pa-task unpause`), and Park, Reopen and Delete… as
 before. **Mark done** takes two clicks; the first says what stays (`Done merges nothing: …`: the change

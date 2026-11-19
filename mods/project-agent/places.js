@@ -16,6 +16,7 @@ export const KINDS = ["working", "no-test", "suite"];
 export const DEFAULTS = { working: 4, "no-test": 0, suite: null }; // suite null: no cap beyond working
 export const NOTICE = "start order changed";
 export const MISSING_WAITING = "No waiting list yet: the Project Agent writes it with pa-places.";
+export const RANK_WAIT = "moves wait for the task order to be read"; // t-120: Places moves while task-order.json is not known
 export const MOVES_KEPT = 20;
 const ORDER_WHY = {
   missing: "no start order yet", empty: "start-order.json is empty", "not-json": "start-order.json is not JSON",
@@ -146,10 +147,12 @@ export function moveOrder(effective, id, move) {
   return null;
 }
 
-// The pins the panel writes after a move (R10): the start order's pins (a version 1 file's waiting ids as pins 0, 1,
-// 2 ...), less the pins of jobs not waiting and the job's own earlier pin, then the job's new pin. When pins interact
-// so that this would put the jobs elsewhere than the move drawn, every movable job is pinned in the drawn order
-// (J2-D5). "reset": no pins (the task order alone). null: a no-op.
+// The pins the panel writes after a move (R10): the start order's pins, less the pins of jobs not waiting and the
+// job's own earlier pin, then the job's new pin. When pins interact so that this would put the jobs elsewhere than
+// the move drawn (J2-D5), or the file is version 1 (a whole list, not moves: its order is what is drawn), only the
+// pins the drawn order needs are written: from none, at each first slot where the order differs from the drawn one,
+// a pin for the job drawn there (t-120, t-097 REVIEW J2 RL-1), so a later task move still reorders the others.
+// "reset": no pins (the task order alone). null: a no-op.
 export function pinsAfter({ jobs, start, rank = null, id, move }) {
   if (move === "reset") return [];
   const effective = effectiveOrder(jobs, start, rank), pin = moveOrder(effective, id, move);
@@ -157,9 +160,15 @@ export function pinsAfter({ jobs, start, rank = null, id, move }) {
   const want = effective.filter((j) => j.source !== "queue").map((j) => j.id);
   want.splice(pin.slot, 0, ...want.splice(want.indexOf(id), 1));
   const waiting = new Set(want);
-  const pins = [...pinsOf(start, waiting).filter((p) => waiting.has(p.id) && p.id !== id).map((p) => ({ id: p.id, slot: p.slot })), pin];
-  const got = effectiveOrder(jobs, { version: 2, pins }, rank).filter((j) => j.source !== "queue").map((j) => j.id);
-  return got.every((x, k) => x === want[k]) ? pins : want.map((x, slot) => ({ id: x, slot }));
+  const drawn = (pins) => { const got = effectiveOrder(jobs, { version: 2, pins }, rank).filter((j) => j.source !== "queue").map((j) => j.id); return got.findIndex((x, k) => x !== want[k]); };
+  if (start?.version !== 1) {
+    const pins = [...pinsOf(start, waiting).filter((p) => waiting.has(p.id) && p.id !== id).map((p) => ({ id: p.id, slot: p.slot })), pin];
+    if (drawn(pins) < 0) return pins;
+  }
+  // each pin, applied last, fixes its slot and leaves the slots above it as they are: at most one pin per job
+  const pins = [];
+  for (let k = drawn(pins); k >= 0 && pins.length < want.length; k = drawn(pins)) pins.push({ id: want[k], slot: k });
+  return pins;
 }
 
 // The start-order.json text the panel writes (R10): version 2, the pins, by the person, the last MOVES_KEPT moves.
@@ -225,7 +234,7 @@ export function machinesRows(m, { isLive = () => false, here = "this Mac" } = {}
 // loadRules's; isLive(address): the worker's terminal is live; rank: the ranked task ids once a task order exists
 // (t-097 R9, J1-D10), else null (the added order); machines, here: machinesRows's (t-119). shown: false with no
 // waiting list, no holder and no suite machine or slot holder (D3, t-119 R6).
-export function placesRows({ waiting, startOrder, rules, ledger, isLive, rank = null, machines = null, here = "this Mac" }) {
+export function placesRows({ waiting, startOrder, rules, ledger, isLive, rank = null, rankKnown = true, machines = null, here = "this Mac" }) {
   const holders = holdersFrom(ledger, isLive);
   const { limits, sources, notes } = limitsOf(rules);
   const w = limits.working, x = limits["no-test"], cap = limits.suite;
@@ -248,6 +257,7 @@ export function placesRows({ waiting, startOrder, rules, ledger, isLive, rank = 
   if (waiting.missing) return { ...out, state: "missing", waitingLine: MISSING_WAITING };
   if (waiting.error) return { ...out, state: "error", waitingLine: waiting.error };
   const orderKnown = Boolean(startOrder && !gaveUp(startOrder));
+  const movesOn = orderKnown && rankKnown; // t-120 (t-097 REVIEW J2 RL-2): a slot counted without the rank could land elsewhere
   const read = readOrder(orderKnown && !startOrder.missing ? startOrder.text : null);
   const jobsIn = waiting.doc.jobs.map((j) => ({ ...j, source: j.source ?? "pa" }));
   const effective = effectiveOrder(jobsIn, read.start, rank);
@@ -262,9 +272,9 @@ export function placesRows({ waiting, startOrder, rules, ledger, isLive, rank = 
       : r.place === "no-test" ? "next to start: the no-test extra place is free" : "next to start";
     badge(j.task, { key: jobKey(j), text: `next #${i + 1} · ${KIND[j.kind] ?? j.kind}` });
     return { key: jobKey(j), id: j.id, label: `${i + 1}. ${j.task ?? "?"} ${j.job ?? ""} · ${j.role ?? "?"} · ${KIND[j.kind] ?? j.kind}`, reason, fixed,
-      note: fixed ? "merge queue order (Queue tab)" : null, up: orderKnown && !fixed && k > 0, top: orderKnown && !fixed && k > 0, down: orderKnown && !fixed && k >= 0 && k < movable.length - 1 };
+      note: fixed ? "merge queue order (Queue tab)" : null, up: movesOn && !fixed && k > 0, top: movesOn && !fixed && k > 0, down: movesOn && !fixed && k >= 0 && k < movable.length - 1 };
   });
-  return { ...out, state: "ok", jobs, effective, jobsIn, start: read.start, rank, orderKnown, head: `${out.head} · ${jobs.length} waiting`,
+  return { ...out, state: "ok", jobs, effective, jobsIn, start: read.start, rank, orderKnown, movesOn, rankLine: rankKnown ? null : RANK_WAIT, head: `${out.head} · ${jobs.length} waiting`,
     orderLine: !orderKnown ? "order: not read yet" : read.error === null && !(read.start.version === 2 && !read.start.pins.length) ? "order: yours"
       : read.error === null || read.error === "missing" ? (rank ? "order: the task order" : "order: the Project Agent's") : read.line, // J2-D6: no pins, the task order alone
     reset: orderKnown && read.error !== null && read.error !== "missing", orderTextRead: orderKnown && !startOrder.missing ? startOrder.text : null };
@@ -325,6 +335,7 @@ export function renderPlaces(t, rows, o) {
       .when(rows.reset, (x) => x.child(h_flex().gap(8).items_center()
         .child(div().flex_1().min_w(0).child(line(rows.orderLine ?? "", t.blocked)))
         .child(btn("places-reset", "Reset order", (_e, cx) => o.onReset(cx)))))
+      .when(Boolean(rows.rankLine) && rows.jobs.length > 1, (x) => x.child(line(rows.rankLine ?? "", t.dim))) // t-120
       .when(!rows.jobs.length, (x) => x.child(line("Nothing waiting.", t.dim)))
       .children(rows.jobs.map((j) => marked(v_flex().gap(1).py(1), j.key)
         .child(h_flex().gap(6).items_center()

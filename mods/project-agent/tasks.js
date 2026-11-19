@@ -70,8 +70,9 @@ function cmpKey(a, b) {
 
 // The task ranking, top first (R3): [{ id, state, source, quote? }]. tasks: the ledger's; taskOrder: its
 // taskOrder; read: readTaskOrder's. Chat entries that apply (over == the file's updated, null for no file), the
-// file's order, the Project Agent's (taskOrder.order, then created oldest first, undated after, then id by number),
-// the file's last.
+// file's order, the Project Agent's (taskOrder.order, then created oldest first, undated after, then id by number;
+// reopened tasks after those, in the order they were reopened), the file's last. A task reopened since the file was
+// written skips its file entries (staleIds), so a reopened done task starts at the bottom of Queued (t-120).
 export function effectiveTasks(tasks, taskOrder, read) {
   const byId = new Map();
   for (const t of Array.isArray(tasks) ? tasks : []) {
@@ -85,17 +86,32 @@ export function effectiveTasks(tasks, taskOrder, read) {
   };
   const doc = read && read.error === null ? read : null;
   const [order, chat] = taskOrderParts(taskOrder);
-  const updated = doc ? doc.updated : null;
+  const updated = doc ? doc.updated : null, stale = staleIds([...byId.values()], read);
   for (const e of chat) if ((e.over ?? null) === updated) put(e.task, "chat", e.quote);
-  for (const id of doc ? doc.order : []) put(id, "person");
-  const last = new Set(doc ? doc.last : []);
+  for (const id of doc ? doc.order : []) if (!stale.has(id)) put(id, "person");
+  const last = new Set((doc ? doc.last : []).filter((id) => !stale.has(id)));
   for (const id of order) if (!last.has(id)) put(id, "agent");
-  const dated = (t) => typeof t.created === "string";
+  const dated = (t) => typeof t.created === "string", reopened = (t) => typeof t.reopened === "string";
   const rest = [...byId.values()].filter((t) => !placed.has(t.id) && !last.has(t.id)).sort((a, b) =>
+    (reopened(a) === reopened(b) ? 0 : reopened(a) ? 1 : -1) || (reopened(a) && a.reopened !== b.reopened ? (a.reopened < b.reopened ? -1 : 1) : 0) ||
     (dated(a) === dated(b) ? 0 : dated(a) ? -1 : 1) || (dated(a) && a.created !== b.created ? (a.created < b.created ? -1 : 1) : 0) || cmpKey(a.id, b.id));
   for (const t of rest) put(t.id, "agent");
-  for (const id of doc ? doc.last : []) put(id, "person");
+  for (const id of doc ? doc.last : []) if (!stale.has(id)) put(id, "person");
   return out;
+}
+
+// t-120 (t-097 R5; pa_places.stale_ids): the tasks reopened at or after task-order.json was written. The file's old
+// place for them is not read (prune on read), and freshOrder leaves them out of the next write. No updated: older.
+export function staleIds(tasks, read) {
+  const updated = read && read.error === null ? read.updated : null;
+  return new Set((Array.isArray(tasks) ? tasks : []).filter((t) => obj(t) && typeof t.id === "string" && typeof t.reopened === "string" && (updated === null || t.reopened >= updated)).map((t) => t.id));
+}
+
+// The readable file's { order, last } without its stale entries (staleIds): what a move or Start next builds on, so
+// it never writes a reopened task's old place back (t-120).
+export function freshOrder(read, tasks) {
+  const stale = staleIds(tasks, read), ok = read && read.error === null;
+  return { order: (ok ? read.order : []).filter((x) => !stale.has(x)), last: (ok ? read.last : []).filter((x) => !stale.has(x)) };
 }
 
 // The new { order, last } after a move of task `id` in the section of state `section`, or null for a no-op (R7;

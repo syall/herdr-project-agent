@@ -20,7 +20,7 @@ import { loadSpace, loadLedger, loadQueue, loadWaiting, loadStartOrder, writeSta
 import { RulesPane, arm, armHolds, fieldState, noticeText as rulesNotice, mergeNotices as mergeRuleNotices } from "./rules.js"; // arm, armHolds: the two-click Delete (ARM_WAIT, 10 s)
 import { queueRows, queueLabel, renderQueue, at as atZone } from "./queue.js"; // t-055: the Queue view (read only)
 import { placesRows, renderPlaces, pinsAfter, orderText, NOTICE as ORDER_NOTICE } from "./places.js"; // t-083 J2: places and the start order (Tasks)
-import { readTaskOrder, effectiveTasks, hasTaskOrder, moveTask, startNextOrder, pruneOrder, taskOrderText, taskSections, foldLine, chipText, afterLine, orderLine as taskOrderLine, doneLine, NOTICE as TASK_ORDER_NOTICE } from "./tasks.js"; // t-097 J2: the person's task order (Tasks)
+import { readTaskOrder, effectiveTasks, hasTaskOrder, moveTask, startNextOrder, pruneOrder, freshOrder, taskOrderText, taskSections, foldLine, chipText, afterLine, orderLine as taskOrderLine, doneLine, NOTICE as TASK_ORDER_NOTICE } from "./tasks.js"; // t-097 J2: the person's task order (Tasks)
 import { SetupPane } from "./setup.js";
 import { Keeper, idleShell } from "./keeper.js";
 import { WorkerPane } from "./worker.js";
@@ -1003,7 +1003,7 @@ export default class ProjectAgent extends View {
   placesOf(space, data) {
     const live = (address) => { const a = space.machine ? `${space.machine}/${address}` : address; return terminals().some((x) => x.address === a && x.state === "live"); };
     const o = this.taskOrderOf(data);
-    return placesRows({ waiting: data?.waiting, startOrder: data?.startOrder, rules: this.rules.data, ledger: data?.ledger, isLive: live, rank: o.has ? o.ranking.map((r) => r.id) : null,
+    return placesRows({ waiting: data?.waiting, startOrder: data?.startOrder, rules: this.rules.data, ledger: data?.ledger, isLive: live, rank: o.has ? o.ranking.map((r) => r.id) : null, rankKnown: o.known,
       machines: this.machines[space.id] ?? null, here: space.machine ? `${space.machine} (the space's machine)` : "this Mac" }); // t-119: the suite machines' slots
   }
 
@@ -1043,7 +1043,8 @@ export default class ProjectAgent extends View {
   moveTaskOrder(space, id, move, section, cx) {
     const o = this.taskOrderOf(this.data);
     if (!o.known || this.taskOrderBusy[space.id]) return;
-    const next = move === "reset" ? { order: [], last: [] } : moveTask(o.ranking, section, id, move, o.read.order, o.read.last);
+    const fresh = freshOrder(o.read, o.tasks); // t-120: a reopened task's old place is not written back
+    const next = move === "reset" ? { order: [], last: [] } : moveTask(o.ranking, section, id, move, fresh.order, fresh.last);
     if (next) this.writeTaskOrderMove(space, next, { task: id, move, section }, cx);
   }
   // R18: Start next: (a) the task to the very top of the ranking, then (b) pa-task next. (a) refused: nothing runs;
@@ -1051,7 +1052,8 @@ export default class ProjectAgent extends View {
   startNext(space, task, cx) {
     const o = this.taskOrderOf(this.data);
     if (!o.known || this.taskOrderBusy[space.id] || this.space !== space.id) return;
-    const next = startNextOrder(o.ranking, task.id, o.read.order, o.read.last);
+    const fresh = freshOrder(o.read, o.tasks);
+    const next = startNextOrder(o.ranking, task.id, fresh.order, fresh.last);
     if (!next) { this.changeTask(space, task, "next", cx); return; }
     this.writeTaskOrderMove(space, next, { task: task.id, move: "next", section: task.state }, cx, (cx) => this.changeTask(space, task, "next", cx));
   }
@@ -1062,7 +1064,7 @@ export default class ProjectAgent extends View {
   moveJob(space, id, move, cx) {
     if (this.placesBusy[space.id] || this.space !== space.id) return;
     const p = this.placesOf(space, this.data);
-    if (p.state !== "ok" || !p.orderKnown) return;
+    if (p.state !== "ok" || !p.orderKnown || (move !== "reset" && !p.movesOn)) return; // t-120: no move while the task order is not known
     const pins = pinsAfter({ jobs: p.jobsIn, start: p.start, rank: p.rank, id, move }); // t-097 R10: one pin for the job; reset: none
     if (!pins) return;
     const expected = p.orderTextRead, text = orderText(expected, pins, { id, move });
@@ -1298,6 +1300,7 @@ export default class ProjectAgent extends View {
     const open = this.open.has(task.id), armed = open && this.armedTask(space.id) === task.id, doneArmed = open && this.armedTask(space.id, "done") === task.id;
     // R17: a needs-decision task with an open card does not leave Needs decision from here (Delete stays).
     const waitsOn = task.state === "needs-decision" ? this.cards.find((c) => c.card?.status === "open" && c.card.task === task.id) : null;
+    const unread = task.state === "needs-decision" && this.cardsFor !== space.id; // t-120 (t-097 REVIEW J2 RL-3): its cards not read yet
     const busy = Boolean(this.taskOrderBusy[space.id]), orderKnown = this.taskOrderOf(this.data).known;
     const mini = (id, label, on, dim = false) => div().id(id).flex_none().px(5).h(20).flex().items_center().rounded(5).border(1).border_color(t.border).text_size(11)
       .text_color(dim ? t.dim : t.foreground).when(!dim, (b) => b.cursor_pointer().hover((x) => x.bg(t.hover)))
@@ -1334,6 +1337,7 @@ export default class ProjectAgent extends View {
         .when(Boolean(task.goal), (e) => e.child(div().child(sel(`sel-goal-${task.id}`, String(task.goal)))))
         .when(row?.source === "chat" && Boolean(row?.quote), (e) => e.child(div().text_size(11.5).text_color(t.muted).child(`You asked in chat: "${row?.quote}"`))) // R13
         .when(Boolean(waitsOn), (e) => e.child(div().text_size(11.5).text_color(t.blocked).child(`Answer ${waitsOn?.id} first, or ask the Project Agent to withdraw it.`))) // R17
+        .when(!waitsOn && unread, (e) => e.child(div().text_size(11.5).text_color(t.dim).child("Checking for open decisions…"))) // t-120: R17 waits for the cards
         .child(div().text_size(11).text_color(t.dim).child(sel(`sel-kind-${task.id}`, [task.type, task.tier && `${task.tier} tier`].filter(Boolean).join(" · "))))
         // Its workers: a live one opens in the Agents view. One closed with pa-worker close (finished,
         // closed set) is not drawn; its ledger entry stays (only the panel leaves it out). None left: no row.
@@ -1369,8 +1373,8 @@ export default class ProjectAgent extends View {
           .child(this.copier.button(t, `copy-task-${task.id}`, () => this.taskText(task, space, crew)))
           .when(task.state === "done" || task.state === "parked", (e) => e.child(this.button(t, `reopen-${task.id}`, "Reopen", (_e, cx) => this.changeTask(space, task, "reopen", cx))))
           // t-097 R20: Mark done takes two clicks; the first says what stays. R17: neither it nor Park while a card waits.
-          .when(task.state !== "done" && !waitsOn && !doneArmed, (e) => e.child(keep(this.button(t, `done-${task.id}`, "Mark done", (_e, cx) => { this.armed = { ...arm(task.id, space.id), what: "done" }; cx.notify(); }))))
-          .when(task.state !== "done" && task.state !== "parked" && !waitsOn, (e) => e.child(this.button(t, `park-${task.id}`, "Park", (_e, cx) => this.changeTask(space, task, "park", cx))))
+          .when(task.state !== "done" && !waitsOn && !unread && !doneArmed, (e) => e.child(keep(this.button(t, `done-${task.id}`, "Mark done", (_e, cx) => { this.armed = { ...arm(task.id, space.id), what: "done" }; cx.notify(); }))))
+          .when(task.state !== "done" && task.state !== "parked" && !waitsOn && !unread, (e) => e.child(this.button(t, `park-${task.id}`, "Park", (_e, cx) => this.changeTask(space, task, "park", cx))))
           // Two clicks on the same button: the first arms it (ARM_WAIT; Cancel, a press elsewhere, collapsing, another view or space disarm).
           .child(keep(div().id(`delete-${task.id}`)).flex_none().px(8).h(24).flex().items_center().rounded(6).border(1).border_color(armed ? t.blocked : t.border)
             .text_size(11.5).text_color(armed ? t.blocked : t.muted).cursor_pointer().hover((s) => s.bg(t.hover))

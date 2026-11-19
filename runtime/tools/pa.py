@@ -4450,8 +4450,9 @@ def open_cards(directory):
 TASK_MOVES = {"next": (("queued",), "in-progress", "only a queued task"),
               "pause": (("in-progress", "investigating"), "queued", "only an in-progress or investigating task")}
 TASK_NOTICES = {
-    "next": "The person asked to start task {id} next: its next job goes first in the waiting list. Its after tasks, "
-            "cards and holds still apply; no worker was started.",
+    "next": "The person asked to start task {id} next: it is in progress now. Its next job goes first in the waiting list "
+            "only while it is at the top of the task order (the panel's Start next puts it there; pa-task next alone "
+            "changes only its state). Its after tasks, cards and holds still apply; no worker was started.",  # t-120
     "pause": "The person paused task {id}: let its running workers finish their job; start no new job for it, and block "
              "its waiting jobs (\"paused by the person\"), until they start it again.",
     "unpause": "The person unpaused task {id}: unblock its waiting jobs paused by the person; its turn comes at its place "
@@ -4578,6 +4579,14 @@ def cmd_task(args):
                 if args.action == "reopen" and before not in ("done", "parked"):
                     raise Problem("{} is {}; only done or parked tasks are reopened".format(args.task, before))
                 task["state"], task["updated"] = after, stamp
+                if args.action == "reopen" and before == "done":  # t-120 (t-097 R5): it starts at the bottom of Queued
+                    task["reopened"] = stamp  # pa-places and the panel do not read task-order.json's older place for it
+                    order = ledger.get("taskOrder")
+                    if isinstance(order, dict):  # and the Project Agent's own place for it goes
+                        if isinstance(order.get("order"), list):
+                            order["order"] = [x for x in order["order"] if x != args.task]
+                        if isinstance(order.get("chat"), list):
+                            order["chat"] = [e for e in order["chat"] if not (isinstance(e, dict) and e.get("task") == args.task)]
         ledger["updated"] = stamp
         write_json(ledger_path, ledger)
         with open(os.path.join(directory, "journal.jsonl"), "a") as journal:

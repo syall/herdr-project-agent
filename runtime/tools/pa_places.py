@@ -7,7 +7,8 @@ Python standard library only (3.7+).
   pa-places limits [--json]                   the limits per kind, the rule each comes from, ignored values
   pa-places tasks [--json]                    the task ranking (the person's task order over the Project Agent's)
   pa-places add <task> --job J --kind K --role R [--source pa|queue] [--blocked-by LINE]   wait at the end
-  pa-places block <id> --why LINE | unblock <id> | drop <id> --why LINE
+  pa-places block <id> --why LINE | unblock <id> [--why LINE] | drop <id> --why LINE   (a job keeps every reason it
+                                              is blocked for; unblock --why ends one, unblock alone all)
   pa-places start <id> --worker ADDR          take it off the list; prints the place to record in the ledger
 
 Kinds of place (their meaning is here, their numbers in the rules' `places`): working (a job that runs tests),
@@ -240,7 +241,9 @@ def effective_tasks(tasks, task_order, doc):
     """The task ranking, top first (t-097 R3): [{id, state, source, quote?}]. tasks: the ledger's; task_order: its
     taskOrder; doc: read_task_order's doc (None: no file or unreadable, J1-D2). Ranked: the ranked and hidden-rank
     states. Chat entries that apply (over == the file's updated, null for no file), the file's order, the Project
-    Agent's (taskOrder.order, then created oldest first, undated after, then id by number), the file's last."""
+    Agent's (taskOrder.order, then created oldest first, undated after, then id by number; reopened tasks after those,
+    in the order they were reopened), the file's last. A task reopened since the file was written skips its file
+    entries (stale_ids), so a reopened done task starts at the bottom of Queued (t-120)."""
     by_id = {}
     for t in tasks or []:
         if isinstance(t, dict) and isinstance(t.get("id"), str) and t.get("state") in RANKED + HIDDEN:
@@ -257,23 +260,36 @@ def effective_tasks(tasks, task_order, doc):
 
     order, chat, _ok = task_order_parts(task_order)
     updated = doc["updated"] if doc else None
+    stale = stale_ids(by_id.values(), doc)
     for e in chat:
         if e.get("over") == updated:
             put(e["task"], "chat", e.get("quote"))
     for tid in (doc or {}).get("order", []):
-        put(tid, "person")
-    last = set((doc or {}).get("last", []))
+        if tid not in stale:
+            put(tid, "person")
+    last = set(x for x in (doc or {}).get("last", []) if x not in stale)
     for tid in order:
         if tid not in last:
             put(tid, "agent")
     dated = lambda t: isinstance(t.get("created"), str)
+    reopened = lambda t: isinstance(t.get("reopened"), str)
     rest = sorted((t for t in by_id.values() if t["id"] not in placed and t["id"] not in last),
-                  key=lambda t: (not dated(t), t["created"] if dated(t) else "", id_key(t["id"])))
+                  key=lambda t: (reopened(t), t["reopened"] if reopened(t) else "", not dated(t),
+                                 t["created"] if dated(t) else "", id_key(t["id"])))
     for t in rest:
         put(t["id"], "agent")
     for tid in (doc or {}).get("last", []):
-        put(tid, "person")
+        if tid not in stale:
+            put(tid, "person")
     return out
+
+
+def stale_ids(tasks, doc):
+    """The tasks reopened at or after the file was written (t-120, t-097 R5): the file's old place for them is not
+    read (prune on read; the panel's next write leaves them out). A file with no `updated` counts as older."""
+    updated = doc["updated"] if doc else None
+    return {t["id"] for t in tasks if isinstance(t, dict) and isinstance(t.get("reopened"), str)
+            and (updated is None or t["reopened"] >= updated)}
 
 
 def move_task(ranking, section, tid, move, order, last):
@@ -639,24 +655,55 @@ def given_why(args):
     return args.why
 
 
+def reasons_of(job):
+    """Every reason a job is blocked for, first first (t-120): blockedBy, then blockedAlso."""
+    also = job.get("blockedAlso") if isinstance(job.get("blockedAlso"), list) else []
+    return [r for r in [job.get("blockedBy")] + also if isinstance(r, str) and r]
+
+
+def set_reasons(job, reasons):
+    job["blockedBy"] = reasons[0] if reasons else None
+    if len(reasons) > 1:
+        job["blockedAlso"] = reasons[1:]
+    else:
+        job.pop("blockedAlso", None)
+
+
 def cmd_block(args):
+    """A job already blocked keeps its earlier reason (t-120, t-097 J3 RL-2): blockedBy stays the first, the others
+    are in blockedAlso, and each is ended by its own unblock --why."""
     given_why(args)
     with writing(args) as (directory, data):
         _i, job = find(data, args.id)
-        job["blockedBy"] = args.why
+        reasons = reasons_of(job)
+        if args.why not in reasons:
+            reasons.append(args.why)
+        set_reasons(job, reasons)
         save_waiting(directory, data)
         journal(directory, "block", job, why=args.why)
     print("{} blocked: {}".format(args.id, args.why))
+    if len(reasons) > 1:
+        print("also blocked: {}".format("; ".join(r for r in reasons if r != args.why)))
     return 0
 
 
 def cmd_unblock(args):
+    """unblock <id>: every reason ends. unblock <id> --why LINE: that reason alone; the job stays blocked by the others."""
+    if args.why is not None:
+        given_why(args)
     with writing(args) as (directory, data):
         _i, job = find(data, args.id)
-        job["blockedBy"] = None
+        reasons = reasons_of(job)
+        if args.why is not None:
+            if args.why not in reasons:
+                raise Refused("{} is not blocked by: {}; nothing was changed".format(args.id, args.why))
+            reasons = [r for r in reasons if r != args.why]
+        else:
+            reasons = []
+        set_reasons(job, reasons)
         save_waiting(directory, data)
-        journal(directory, "unblock", job)
-    print("{} unblocked".format(args.id))
+        journal(directory, "unblock", job, **({"why": args.why} if args.why is not None else {}))
+    print("{} unblocked".format(args.id) if not reasons else "{}: {} ended; still blocked: {}".format(args.id, args.why, "; ".join(reasons)))
     return 0
 
 
@@ -845,6 +892,8 @@ def parser():
         s.add_argument("id", help="<task>/<job>")
         if name in ("block", "drop"):
             s.add_argument("--why", required=True)
+        if name == "unblock":
+            s.add_argument("--why", help="end this reason only; the job stays blocked by any other (t-120)")
         if name == "start":
             s.add_argument("--worker", required=True, help="the address of the worker started for it")
         s.add_argument("--space")

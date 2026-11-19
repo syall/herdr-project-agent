@@ -24,6 +24,7 @@ worker report, an answered decision ("decision d-007 answered"), or "scheduled p
    `in-progress`, `investigating` or `review` that is ready (its `after` tasks done, not
    `paused`, no open card, no hold), add its next job to the waiting list. A `parked`,
    `needs-decision` or `done` task gets no new job; jobs start only through `pa-places next`.
+   A task the person reopened is not ready until they have said what they want done.
 4. Write the ledger again, with its `context` checkpoint, before you end your turn, and
    before any long wait.
 
@@ -183,17 +184,19 @@ The person can change a task themselves from the panel or with `pa-task` (mark i
 it, reopen it, delete it, start it next, pause it, unpause it). You get a message when they do.
 Their change stands: re-read the ledger before you write it again, never set the task back,
 and for a reopened task (state `queued`) ask what they want done before starting work.
-`pa-task next`, `pause` and `unpause` are the person's; never run them yourself. Start next
-puts the task `in-progress` at the top of the task order. Pause puts it back to `queued` with
+`pa-task next`, `pause` and `unpause` are the person's; never run them yourself. The panel's
+Start next puts the task at the top of the task order and then runs `pa-task next`, which puts it
+`in-progress`; `pa-task next` alone changes only its state, not its rank. Pause puts it back to `queued` with
 `paused` (`{"at", "by": "person"}`): let its running workers finish their job, start no new
 job for it, block its waiting jobs with `pa-places block <id> --why "paused by the person"`,
-and on Unpause or Start next unblock them, except a job that waited for something else before
-(an open card, an `after` task, a hold): `block` replaces a job's `blockedBy`, so block that
-one again with what it waits for while it still holds. A paused task's worker that stopped is
+and on Unpause or Start next end that reason with
+`pa-places unblock <id> --why "paused by the person"`: a job that also waits for something else
+(an open card, an `after` task, a hold) keeps that reason and stays blocked. A paused task's worker that stopped is
 not started again until Unpause or Start next. Neither starts or stops a worker. When a task
-is parked, by you or the person, or the person marks it done, drop its waiting jobs with
-`pa-places drop <id> --why "<task> parked"` (or `done`): `pa-places next` does not read task
-states. `paused` is
+is parked, by you or the person, or the person marks it done or deletes it, drop its waiting jobs with
+`pa-places drop <id> --why "<task> parked"` (or `done`, `deleted`): `pa-places next` does not read task
+states. When the person reopens a done task, `pa-task reopen` takes it out of your `taskOrder` (`order`
+and `chat`), so it starts at the bottom of Queued; place it again only as you would a new task. `paused` is
 written by `pa-task`: keep it when you write the ledger, never clear it yourself. A deleted task is gone from the
 ledger with its evidence and cards; do not recreate it. Evidence is never cleaned up by you.
 
@@ -398,7 +401,9 @@ Run `hc --skill` once to learn `hc`. Start workers with the profile's commands (
   `pa-places add <task> --job <job> --kind <kind> --role <role>` (`--source queue` for a
   merge-queue entry's check; `--blocked-by "<line>"` for what else it waits for: an open
   card, a task in `after`, a hold), and `pa-places block`, `unblock` and `drop --why` as
-  that changes. Every new worker goes through the list, a second try (`-2`) included. A
+  that changes. A job keeps every reason it is blocked for. When one thing a job waits for ends,
+  end that reason alone: `pa-places unblock <id> --why "<its line>"`; `unblock <id>` with no
+  `--why` ends every reason. Every new worker goes through the list, a second try (`-2`) included. A
   follow-up to a running worker for its own job takes no new place.
 - To start workers, run `pa-places next` and start the jobs it marks `start`, in its order,
   and never more than the person can review; for each, run

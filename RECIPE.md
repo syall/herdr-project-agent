@@ -62,8 +62,10 @@ A new space opens with a 600 x 440 dialog: a Project Agent card (`Set up for <fo
   ranks hidden (no number, no buttons); Parked and Done stay newest first. A move writes
   `task-order.json` and tells the agent; while it is being written the order buttons dim.
   Start next (Queued), Pause (In progress, Investigating) and Unpause (a paused Queued task) run
-  `pa-task next`, `pause` and `unpause`; none starts or stops a worker. A Needs decision task with
-  an open card shows `Answer d-xxx first, or ask the Project Agent to withdraw it.` and offers
+  `pa-task next`, `pause` and `unpause` (Start next first puts the task at the top of the order);
+  none starts or stops a worker. A reopened done task comes back at the bottom of Queued. Until its
+  cards are read, a Needs decision task shows `Checking for open decisions…` and no Park or Mark done; with
+  an open card it shows `Answer d-xxx first, or ask the Project Agent to withdraw it.` and offers
   only Delete…. Mark done takes two clicks: the first shows `Done merges nothing: …` (what stays:
   the change request, worktrees, merge-queue entries, live workers) with Confirm and Cancel.
   An expanded task shows its goal, tier, a chip per worker (a live one opens in the Agents view), a button per
@@ -79,8 +81,9 @@ A new space opens with a 600 x 440 dialog: a Project Agent card (`Set up for <fo
   since), the limits' rule, then `Waiting · n`, one line per job in the order they will start
   (position, task, job, role, kind, why it waits: `blocked: …`, `waits for a suite place (2 of 2)`,
   `next to start`) with ↑ ↓ ⤒ to move it. A merge-queue check shows `merge queue order (Queue tab)`
-  and no buttons. The jobs follow the task order; a move pins that one job at its new place,
-  writes `start-order.json` and tells the agent; it only says which ready job goes first. A task row shows a badge per waiting or running job (`next #2 · suite step`, `running ·
+  and no buttons. The jobs follow the task order once one exists; a move pins that one job at its new place
+  (and only the jobs that order needs, when earlier pins interact), writes `start-order.json` and tells the agent
+  (no moves while the task order is being read); it only says which ready job goes first. A task row shows a badge per waiting or running job (`next #2 · suite step`, `running ·
   working`); a click unfolds Places and marks that line.
 - **Finished workers are closed by the agent.** The agent starts one fresh worker per job, named
   for the job (`t-010-tests`, `t-010-fix`), and closes it in the pass where it reads its report,
