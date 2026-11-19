@@ -1087,16 +1087,30 @@ REGULAR_MODES = ("100644", "100755")
 UNION_ALGORITHMS = ((), ("--diff-algorithm=histogram",))
 
 
-def conflict_regions(data):
-    """[[first, last]] lines (1-based) of each conflict of a merge-file output with markers, as they lie in the
+def marker_size(*blobs):
+    """A conflict marker size no content line can match (t-086, RL-J3c-3): one more than the longest run of <, = or >
+    that starts a line in any of the blobs, at least git's 7."""
+    longest = 0
+    for data in blobs:
+        for text in data.split(b"\n"):
+            for c in b"<=>":
+                run = len(text) - len(text.lstrip(bytes([c])))
+                longest = max(longest, run)
+    return max(7, longest + 1)
+
+
+def conflict_regions(data, size=7):
+    """[[first, last]] lines (1-based) of each conflict of a merge-file output with markers of `size` characters
+    (merge-file --marker-size: marker_size of its blobs, so no content line starts like one), as they lie in the
     --union result of the same merge (both sides' lines, no markers)."""
     regions, line, start, inside = [], 0, None, 0
+    opening, separator, closing = b"<" * size, b"=" * size, b">" * size
     for text in data.split(b"\n"):
-        if inside == 0 and text.startswith(b"<<<<<<<"):
+        if inside == 0 and text.startswith(opening):
             inside, start = 1, line + 1
-        elif inside == 1 and text.rstrip(b"\r") == b"=======":
+        elif inside == 1 and text.rstrip(b"\r") == separator:
             inside = 2
-        elif inside == 2 and text.startswith(b">>>>>>>"):
+        elif inside == 2 and text.startswith(closing):
             inside = 0
             if line >= start:
                 regions.append([start, line])
@@ -1120,24 +1134,28 @@ def union_of(raw, common, mine, old, new, tip):
             if code or not re.match(r"^\.merge_file_[A-Za-z0-9_]+$", name):
                 raise ContentError("cannot read blob {} ({})".format(str(sha)[:7], clean(err)[-200:]))
             names[key] = name
-        with open(os.path.join(folder, names["tip"]), "rb") as f:
-            want = f.read()
+        blobs = {}
+        for key, name in names.items():
+            with open(os.path.join(folder, name), "rb") as f:
+                blobs[key] = f.read()
+        want = blobs["tip"]
+        size = marker_size(*blobs.values())
         for order, (first, second) in (("checked first", ("mine", "new")), ("base first", ("new", "mine"))):
-            with open(os.path.join(folder, names[first]), "rb") as f:
-                start = f.read()
+            start = blobs[first]
             for algorithm in UNION_ALGORITHMS:
                 merged = {}
                 for out_name, union in (("union", ("--union",)), ("markers", ())):
                     with open(os.path.join(folder, out_name), "wb") as f:
                         f.write(start)
-                    code, _o, _e = raw(folder, *(("-c", "merge.conflictStyle=merge", "merge-file", "-q") + algorithm + union +
+                    code, _o, _e = raw(folder, *(("-c", "merge.conflictStyle=merge", "merge-file", "-q",
+                                                  "--marker-size={}".format(size)) + algorithm + union +
                                                 (out_name, names["old"], names[second])))
                     with open(os.path.join(folder, out_name), "rb") as f:
                         merged[out_name] = (code, f.read())
                 (ucode, udata), (mcode, mdata) = merged["union"], merged["markers"]
                 # merge-file exits with the number of conflicts (at most 127), 255 on an error
                 if ucode == 0 and udata == want and 0 < mcode < 128:
-                    regions = conflict_regions(mdata)
+                    regions = conflict_regions(mdata, size)
                     if regions:
                         return order, regions
         return None, "not both sides kept unchanged"
@@ -1145,12 +1163,24 @@ def union_of(raw, common, mine, old, new, tip):
         shutil.rmtree(folder, ignore_errors=True)
 
 
+def commit_union(raw, common, x, y):
+    """True when file entry y (a commit's) makes x's change (the same commit before the rebase) by keeping both sides
+    of a conflict unchanged: status M on both, the same regular modes, another parent blob, and union_of finds y's
+    blob (t-086, RL-J3c-1)."""
+    if x.get("status") != "M" or y.get("status") != "M" or x.get("baseBlob") == y.get("baseBlob") or \
+            (x.get("baseMode"), x.get("tipMode")) != (y.get("baseMode"), y.get("tipMode")) or \
+            x.get("tipMode") not in REGULAR_MODES or x.get("baseMode") not in REGULAR_MODES:
+        return False
+    return bool(union_of(raw, common, x["tipBlob"], x["baseBlob"], y["baseBlob"], y["tipBlob"])[0])
+
+
 def union_only(run, raw, path, checked, now):
     """(True, "", unions, shared) when now makes checked's change with a rebase conflict resolved by keeping both
     sides unchanged (d-166, t-052 J3c): the same paths; each differing file either moved only (same_lines: in shared)
     or a union: status M on both sides, the same regular modes, another base, and its tip blob exactly the
     merge-file --union of the checked tip and the new base (union_of); at least one union; the same commits (count,
-    messages, paths), each the same, moved, or touching only union files differently. unions: [{path, oldBase,
+    messages, paths), each the same, moved, or touching union files differently only as a union of its own
+    (commit_union, t-086: every commit is checked, not just the tip). unions: [{path, oldBase,
     newBase, checkedTip, tip, order, regions}]. Else (False, why, [], []). Never raises; never clean alone: a short
     reviewer judges that every region is only docstrings or comments."""
     try:
@@ -1195,7 +1225,11 @@ def union_only(run, raw, path, checked, now):
             if set(fx) != set(fy):
                 return False, "the commits changed", [], []
             for p in fx:
-                if fx[p] != fy[p] and p not in union_paths and not same_lines(run, path, fx[p], fy[p]):
+                if fx[p] == fy[p] or same_lines(run, path, fx[p], fy[p]):
+                    continue
+                # t-086 (RL-J3c-1): a union file is checked in every commit that changes it otherwise, the same way
+                # as at the tip: that commit's blob must be the union of its old change on its new parent
+                if p not in union_paths or not commit_union(raw, common, fx[p], fy[p]):
                     return False, "the commits changed ({})".format(clean(p)), [], []
         return True, "", unions, shared
     except ContentError as e:
