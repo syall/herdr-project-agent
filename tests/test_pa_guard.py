@@ -933,6 +933,9 @@ D7_ALLOWED = ["pa-costs prices", "pa-costs prices --space sp1", "pa-costs report
               # t-070 J2 round 4 (REVIEW J2 round 3 M1): a quoted word holding a newline is judged, not an exception
               "git commit -m 't-070: line one\n\nline two'", "hc send t1dr 'done\nsee REVIEW.md'",
               "python3 -c 'import os\nprint(os.getcwd())'", "python3 -c 'import pa_costs\nprint(pa_costs.__file__)'"]
+# t-070 J2 round 5 (VERIFY J2 round 4 M1): a non-python line's -c word naming pa_costs is not python code
+D7_ALLOWED += ["grep -c pa_costs prices fetch", "wc -c pa_costs prices fetch", "grep -cpa_costs prices fetch",
+               "echo -c 'import pa_costs' prices fetch"]
 D7_NEWLINE_FORMS = ["python3 -m pa_costs 'a\nb' prices fetch", "python3 -m tools.pa_costs prices fetch -x 'one\ntwo'",
                     "git commit -m 'a\nb' && python3 -mpa_costs prices fetch",
                     "python3 -c 'import pa_costs\npa_costs.main()' prices fetch"]
