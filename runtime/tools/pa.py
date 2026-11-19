@@ -3607,12 +3607,17 @@ def wrapped_command(value):
 
 
 def wrapper_of(term):
-    """The command Herdr's login-shell wrapper runs in this terminal: from hc's argv, else from ps of hc's pid (the
-    wrapper's login shell after its exec); None when the terminal's program is not the wrapper."""
-    wrapped = wrapped_command(term.get("argv"))
+    """The command Herdr's login-shell wrapper runs in this terminal now; None when the terminal's program is not the
+    wrapper. ps of hc's pid must show a live wrapper form (the wrapper's login shell after its exec): hc's argv is the
+    tab's start argv and stays the wrapper after the wrapped program ends and that shell execs "$0" -li in the same
+    pid, the person's shell (t-077 round 2, R4). When hc's argv is the wrapper too, both must run the same words."""
+    info = proc_info(term.get("pid"))
+    wrapped = wrapped_command(info[1]) if info else None
     if wrapped is None:
-        info = proc_info(term.get("pid"))
-        wrapped = wrapped_command(info[1]) if info else None
+        return None
+    started = wrapped_command(term.get("argv"))
+    if started is not None and " ".join(started).split() != wrapped:
+        return None
     return wrapped
 
 
