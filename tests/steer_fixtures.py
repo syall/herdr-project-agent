@@ -6,6 +6,7 @@ modules' temp homes, no global or system config), only on repositories the tests
 import os
 import struct
 import subprocess
+import unittest
 
 
 def git(repo, *args):
@@ -18,10 +19,15 @@ def git(repo, *args):
 
 def forge_parent(repo, child, parent):
     """Rewrite the repository's commit-graph so that `child`'s first parent reads as `parent` (generation v1, the
-    child's level set one above the parent's). The commit objects are unchanged; plain git believes the graph."""
+    child's level set one above the parent's). The commit objects are unchanged; plain git believes the graph.
+
+    A git that does not read the forged graph (git 2.47.3 on Linux, t-089 TRIAL.md) cannot give the callers their
+    precondition, so the test skips with the reason (R21): a capability probe on what plain git says, no version
+    compare. The gate check the callers guard is unchanged."""
     git(repo, "-c", "commitGraph.generationVersion=1", "commit-graph", "write", "--reachable", "--no-progress")
     graph = os.path.join(git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir"), "objects", "info", "commit-graph")
-    data = bytearray(open(graph, "rb").read())
+    with open(graph, "rb") as f:
+        data = bytearray(f.read())
     chunks = {}
     for i in range(data[6] + 1):
         cid, off = struct.unpack(">4sQ", data[8 + 12 * i:20 + 12 * i])
@@ -36,4 +42,10 @@ def forge_parent(repo, child, parent):
     os.chmod(graph, 0o644)
     with open(graph, "wb") as f:
         f.write(bytes(data))
-
+    r = subprocess.run(["git", "-C", repo, "rev-parse", "--verify", "-q", child + "^"], stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE, universal_newlines=True)
+    if r.stdout.strip() != parent:
+        version = subprocess.run(["git", "--version"], stdout=subprocess.PIPE, universal_newlines=True).stdout.strip()
+        raise unittest.SkipTest("plain git here ({}) does not read a forged commit-graph ({}^ gives {}): the forged-graph "
+                                "precondition cannot be set up".format(version or "git", child[:12],
+                                                                       r.stdout.strip()[:12] or "nothing"))

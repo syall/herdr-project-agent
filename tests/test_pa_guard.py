@@ -326,10 +326,10 @@ class T025Robust(GuardTest):  # AC4.3
                   "python3 " * 1200 + "pa_push.py", "$(echo " * 1400 + "git push" + ")" * 1400]
         lines = (base * 2)[:170] + padded * 2  # 200 lines, 30 of them about 10 kB
         self.assertEqual(len(lines), 200)
-        for line in lines:
-            start = time.perf_counter()
+        for line in lines:  # CPU time, not wall time: no pathological line, even with 40 suite parts at once (t-089 R22)
+            start = time.process_time()
             self.check(line)
-            spent = time.perf_counter() - start
+            spent = time.process_time() - start
             self.assertLess(spent, 0.05, line[:60])
 
 

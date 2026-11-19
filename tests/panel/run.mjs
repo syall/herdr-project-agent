@@ -5246,6 +5246,10 @@ cases["A8-failure"] = awWrap(async () => { // a hold that could not start says s
 });
 
 cases["A7-script-fake-caffeinate"] = async () => { // VP1, VP2: the real script, a fake caffeinate: one hold, idempotent, stop ends it
+  if (process.platform !== "darwin") { // t-089 R23: caffeinate and awake.js serve Herdr on macOS only (node on Linux shows comm= as node-MainThread)
+    console.log(`SKIP A7-script-fake-caffeinate: caffeinate and awake.js serve Herdr on macOS only (here ${process.platform})`);
+    return;
+  }
   const T = fs.mkdtempSync(path.join(os.tmpdir(), "t060-"));
   const fake = path.join(T, "caffeinate");
   fs.writeFileSync(fake, '#!/bin/sh\n# a fake caffeinate: holds nothing, waits for its -w pid\nwhile kill -0 "$5" 2>/dev/null; do sleep 0.2; done\n');
