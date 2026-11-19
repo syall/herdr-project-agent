@@ -142,7 +142,9 @@ def working_used(b, n, w):
 def allocate(jobs, limits, holders, hold):
     """One reason per job, in the given (effective) order: {id, action: start|skip|blocked|hold, place, full}.
     holders: the recorded place of each live unfinished worker (None: not recorded). hold: off|on|unknown|no-terminals.
-    A job marked start counts as a holder for the jobs after it; a full kind is skipped, never waited on."""
+    A working or suite job needs b < working and b + n < working + no-test (the no-test place is only for no-test
+    jobs; a no-test holder in a working place takes it). A job marked start counts as a holder for the jobs after it;
+    a full kind is skipped, never waited on."""
     w, x, cap = limits["working"], limits["no-test"], limits["suite"]
     b, n, s = counts(holders)
     out = []
@@ -167,7 +169,7 @@ def allocate(jobs, limits, holders, hold):
             continue
         if kind == "suite" and cap is not None and s >= cap:
             r["action"], r["full"] = "skip", {"kind": "suite", "used": s, "limit": cap}
-        elif b >= w:
+        elif b >= w or b + n >= w + x:  # working-type holders below working, and the pooled total below both
             r["action"], r["full"] = "skip", {"kind": "working", "used": working_used(b, n, w), "limit": w}
         else:
             r["action"], r["place"] = "start", kind
