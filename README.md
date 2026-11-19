@@ -208,7 +208,9 @@ no passes and no answer notices.
 
 Each worker's `pa-hook guard` refuses a short list of commands that the core Safety rules keep for you:
 `git push` in any form, opening, readying or merging a pull request, deleting a branch or a worktree, and
-`pa-push-main`, `pa-push-allow` and `pa_push.py`. It keeps the older refusals (force pushes, pushes to a main
+`pa-push-main`, `pa-push-allow` and `pa_push.py`; it also refuses a worker the Project Agent's own commands
+`pa-restart`, `pa-context`, a price fetch and the `pa-places` writes (`add`, `block`, `unblock`, `drop`, `start`;
+its read commands run). It keeps the older refusals (force pushes, pushes to a main
 branch, discarding uncommitted work, reading secrets, a profile's `releaseTools`) and refuses editor writes
 into `.git` and the Project Agent's state. It is a fence for workers that follow their rules, not a sandbox: a
 script a worker writes can still do what your user can. When it cannot load, it refuses everything. The rules

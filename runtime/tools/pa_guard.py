@@ -2,7 +2,8 @@
 
 check_command(line) refuses a Bash line only when a simple command in it (also inside $(...), `...`, <(...), >(...),
 sh -c or eval, to depth 4) pushes (D1), publishes or merges a change request (D2), deletes a branch or a worktree
-(D3), runs the person's push tools (D4), pa-restart, pa-context or the person's price fetch (D7, t-070 J2); spec
+(D3), runs the person's push tools (D4), pa-restart, pa-context, the person's price fetch (D7, t-070 J2) or a pa-places
+write (D8, t-133); spec
 t-025. When unsure, it lets the line run. check_edit(path, spaces_dir, cwd, home) refuses editor writes into .git, the Project Agent's files (evidence excepted) and the
 person's git and gh settings. A fence for workers that follow their rules, not a sandbox: scripts, aliases and names
 built at run time are not caught. The rules this replaced are described in docs/worker-guard-history.md.
@@ -32,6 +33,8 @@ DENY_CONTEXT = refusal(". pa-context is the person's command (its other subcomma
                        "and why.", False)
 DENY_PRICES = refusal(". A price fetch (pa-costs prices fetch) is the person's command: it downloads a price list and writes "
                       "the profile's price file. Say in your report that the prices should be fetched.", False)
+DENY_PLACES = refusal(". pa-places add, block, unblock, drop and start are the Project Agent's: a worker never changes the "
+                      "waiting list. Say in your report what is ready or what it waits for.", False)
 EDIT = refusal(" is inside a .git folder, the Project Agent's files or the person's git and gh settings, which workers do "
                "not edit. Write reports, logs and notes in your task's evidence folder (evidence/<task-id>/ in the Project "
                "Agent's state folder). If the edit is needed, stop and report it to the Project Agent with hc send.", False)
@@ -138,6 +141,7 @@ def row_of(words, d7=True):
     removing = max([k for k, w in enumerate(words) if w in ("-d", "--delete")], default=-1)
     tool = next((word(k + 1) for k in range(first, n) if names[k] == "pa.py" and (k == first or PYTHON.match(names[first]))),
                 names[first][3:] if first < n and names[first][:3] == "pa-" else "")  # pa-<tool>, or pa.py <tool>
+    places = next((k for k, x in enumerate(names) if x in ("pa-places", "pa_places.py") and k >= first and (k == first or PYTHON.match(names[first]))), n)  # D8
     if any(word(j) in ("push", "send-pack", "http-push") or word(j) in ("subtree", "lfs") and after(j) == "push"
            for j in subs) or first < n and names[first] in ("git-push", "git-send-pack", "git-http-push"):
         row = DENY_PUSH
@@ -151,6 +155,8 @@ def row_of(words, d7=True):
         row = DENY_TOOLS
     elif tool in ("restart", "context"):  # pa-restart (t-037 J2), pa-context (t-041 J3), or pa.py restart|context
         row = DENY_RESTART if tool == "restart" else DENY_CONTEXT
+    elif places < n and after(places) in ("add", "block", "unblock", "drop", "start"):
+        row = DENY_PLACES
     elif d7 and fetches(words, names, first, n):  # d7: the line names pa-costs or pa_costs (check_command's prefilter)
         row = DENY_PRICES
     else:
