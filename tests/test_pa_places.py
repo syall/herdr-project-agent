@@ -201,10 +201,28 @@ class SharedCases(Base):
     def test_order_cases(self):  # AC8.1, AC8.2
         for case in SHARED["orderCases"]:
             with self.subTest(case=case["name"]):
-                order, error, _why = pa_places.read_order(case["orderText"])
+                start, error, _why = pa_places.read_order(case["orderText"])
                 self.assertEqual(error, case["error"])
                 jobs = [job(j) for j in case["jobs"]]
-                self.assertEqual([j["id"] for j in pa_places.effective_order(jobs, order)], case["effective"])
+                self.assertEqual([j["id"] for j in pa_places.effective_order(jobs, start)], case["effective"])
+
+    def test_rank_cases(self):  # t-097 R9: the waiting list follows the task ranking
+        self.assertTrue(SHARED["rankCases"])
+        for case in SHARED["rankCases"]:
+            with self.subTest(case=case["name"]):
+                jobs = [job(j) for j in case["jobs"]]
+                got = pa_places.effective_order(jobs, None, case["rank"])
+                self.assertEqual([j["id"] for j in got], case["effective"])
+
+    def test_pin_cases(self):  # t-097 R10: version 1 read as pins, version 2 pins, after the rank sort
+        self.assertTrue(SHARED["pinCases"])
+        for case in SHARED["pinCases"]:
+            with self.subTest(case=case["name"]):
+                start, error, _why = pa_places.read_order(case["orderText"])
+                self.assertEqual(error, case["error"])
+                jobs = [job(j) for j in case["jobs"]]
+                got = pa_places.effective_order(jobs, start, case["rank"])
+                self.assertEqual([j["id"] for j in got], case["effective"])
 
     def test_limit_cases(self):  # AC2.1-2.4
         for case in SHARED["limitCases"]:
@@ -220,6 +238,195 @@ class SharedCases(Base):
                 jobs = [job(j) for j in case["jobs"]]
                 got = pa_places.allocate(jobs, case["limits"], case["holders"], case["hold"])
                 self.assertEqual([{k: r[k] for k in ("id", "action", "place", "full")} for r in got], case["expect"])
+
+
+# ---- t-097: the person's task order (the shared cases in tests/samples/task-order-cases.json) ------------------
+
+TASK_CASES = json.loads(read(os.path.join(HERE, "samples", "task-order-cases.json")))
+
+
+class TaskOrderCases(Base):
+    def test_cases_file_is_shared(self):
+        self.assertEqual(TASK_CASES["version"], 1)
+        self.assertTrue(TASK_CASES["readCases"] and TASK_CASES["rankCases"] and TASK_CASES["moveCases"])
+
+    def test_read_cases(self):  # R1, R2
+        for case in TASK_CASES["readCases"]:
+            with self.subTest(case=case["name"]):
+                doc, error, _why = pa_places.read_task_order(case["text"])
+                self.assertEqual(error, case["error"])
+                self.assertEqual(pa_places.task_order_line(error), case["line"])
+                if error is None:
+                    self.assertEqual((doc["order"], doc["last"], doc["updated"]), (case["order"], case["last"], case["updated"]))
+                else:
+                    self.assertIsNone(doc)  # never the readable part of a bad file
+
+    def test_rank_cases(self):  # R3, R5, R12, R27
+        for case in TASK_CASES["rankCases"]:
+            with self.subTest(case=case["name"]):
+                doc, error, _why = pa_places.read_task_order(case["fileText"])
+                self.assertEqual(error, case["error"])
+                got = pa_places.effective_tasks(case["tasks"], case["taskOrder"], doc)
+                self.assertEqual([[r["id"], r["source"]] for r in got], case["expect"])
+                states = {t["id"]: t["state"] for t in case["tasks"]}
+                self.assertEqual([r["state"] for r in got], [states[r["id"]] for r in got])
+
+    def test_chat_quote_is_kept(self):  # R12, R13: the quote goes with a chat rank
+        tasks = [{"id": "t-1", "state": "queued"}, {"id": "t-2", "state": "queued"}]
+        got = pa_places.effective_tasks(tasks, {"order": [], "chat": [{"task": "t-2", "quote": "hotfix now", "over": None}]}, None)
+        self.assertEqual([(r["id"], r["source"], r.get("quote")) for r in got], [("t-2", "chat", "hotfix now"), ("t-1", "agent", None)])
+
+    def test_move_cases(self):  # R7 (the reference for the panel's moveTask), R12
+        for case in TASK_CASES["moveCases"]:
+            with self.subTest(case=case["name"]):
+                ranking = [{"id": i, "state": s, "source": src} for i, s, src in case["ranking"]]
+                before = json.dumps([ranking, case["order"], case["last"]])
+                got = pa_places.move_task(ranking, case["section"], case["task"], case["move"], case["order"], case["last"])
+                self.assertEqual(got, case["expect"])
+                self.assertEqual(json.dumps([ranking, case["order"], case["last"]]), before)  # pure: inputs unchanged
+
+
+class Tasks(Base):  # R24: pa-places tasks
+    def ledger(self, tasks, task_order=None):
+        doc = {"version": 1, "tasks": tasks}
+        if task_order is not None:
+            doc["taskOrder"] = task_order
+        dump(doc, self.path("ledger.json"))
+
+    def card(self, cid, task, status="open"):
+        dump({"id": cid, "task": task, "question": "Q?", "options": [{"label": "A"}], "status": status,
+              "answer": None, "created": "2026-11-19T00:00:00Z", "answered": None},
+             os.path.join(self.dir, "decisions", cid + ".json"))
+
+    def sample(self):
+        self.ledger([{"id": "t-1", "state": "queued", "created": "2026-11-01T00:00:00Z",
+                      "paused": {"at": "2026-11-19T00:00:00Z", "by": "person"}},
+                     {"id": "t-2", "state": "in-progress", "created": "2026-11-02T00:00:00Z", "after": ["t-1", "t-5"]},
+                     {"id": "t-3", "state": "needs-decision", "created": "2026-11-03T00:00:00Z"},
+                     {"id": "t-4", "state": "parked", "created": "2026-11-04T00:00:00Z"},
+                     {"id": "t-5", "state": "done", "created": "2026-11-05T00:00:00Z"},
+                     {"id": "t-6", "state": "review", "created": "2026-11-06T00:00:00Z", "after": ["t-5"]}])
+        self.card("d-1", "t-3")
+        self.card("d-2", "t-6", status="answered")
+
+    def test_text(self):
+        self.sample()
+        lines = self.ok("tasks").splitlines()
+        self.assertEqual(lines[0], "order: the Project Agent's")
+        self.assertEqual(lines[1:], ["1. t-1 queued agent · paused",
+                                     "2. t-2 in-progress agent · waits for t-1 (after)",
+                                     "3. t-3 needs-decision agent · card d-1 · hidden rank",
+                                     "4. t-4 parked agent · hidden rank",
+                                     "5. t-6 review agent"])
+
+    def test_json(self):
+        self.sample()
+        data = json.loads(self.ok("tasks", "--json"))
+        self.assertEqual(data["order"], {"error": "missing", "line": "order: the Project Agent's", "updated": None})
+        self.assertEqual(data["notes"], [])
+        t = {r["id"]: r for r in data["tasks"]}
+        self.assertEqual([r["id"] for r in data["tasks"]], ["t-1", "t-2", "t-3", "t-4", "t-6"])
+        self.assertEqual([r["rank"] for r in data["tasks"]], [1, 2, 3, 4, 5])
+        self.assertEqual((t["t-1"]["paused"], t["t-1"]["after"], t["t-1"]["card"], t["t-1"]["hidden"]), (True, [], None, False))
+        self.assertEqual(t["t-2"]["after"], ["t-1"])
+        self.assertEqual((t["t-3"]["card"], t["t-3"]["hidden"]), ("d-1", True))
+        self.assertTrue(t["t-4"]["hidden"])
+        self.assertEqual((t["t-6"]["card"], t["t-6"]["after"]), (None, []))
+        self.assertEqual({r["source"] for r in data["tasks"]}, {"agent"})
+
+    def test_the_person_and_chat(self):
+        self.ledger([{"id": "t-1", "state": "queued", "created": "2026-11-01T00:00:00Z"},
+                     {"id": "t-2", "state": "queued", "created": "2026-11-02T00:00:00Z"},
+                     {"id": "t-3", "state": "queued", "created": "2026-11-03T00:00:00Z", "after": ["t-gone"]}],
+                    {"order": [], "chat": [{"task": "t-3", "quote": "do t-3 now", "over": "U1"}]})
+        write(self.path("task-order.json"), json.dumps({"version": 1, "updated": "U1", "by": "person", "order": ["t-2"], "last": [], "moves": []}))
+        lines = self.ok("tasks").splitlines()
+        self.assertEqual(lines, ["order: the person's", '1. t-3 queued chat · waits for t-gone (after) · "do t-3 now"',
+                                 "2. t-2 queued person", "3. t-1 queued agent"])
+        self.assertEqual(json.loads(self.ok("tasks", "--json"))["order"]["updated"], "U1")
+
+    def test_unreadable_file_said(self):  # R2: the same words as the panel, the Project Agent's order used
+        self.ledger([{"id": "t-1", "state": "queued", "created": "2026-11-01T00:00:00Z"},
+                     {"id": "t-2", "state": "queued", "created": "2026-11-02T00:00:00Z"}])
+        write(self.path("task-order.json"), '{"version": 1, "order": ["t-2"], "last": 3}')
+        lines = self.ok("tasks").splitlines()
+        self.assertEqual(lines, ["task order unreadable: task-order.json's last is not a list of task ids; the Project Agent's order is used",
+                                 "1. t-1 queued agent", "2. t-2 queued agent"])
+
+    def test_bad_task_order_noted(self):
+        self.ledger([{"id": "t-1", "state": "queued"}], "nope")
+        out = self.ok("tasks")
+        self.assertIn("ledger taskOrder is not {order, chat}; ignored", out)
+        self.assertIn("1. t-1 queued agent", out)
+
+    def test_nothing_ranked(self):
+        self.assertIn("no ranked tasks", self.ok("tasks"))
+        self.assertEqual(json.loads(self.ok("tasks", "--json"))["tasks"], [])
+
+    def test_read_only_and_allowed_in_a_worker(self):  # R1: no tool writes task-order.json
+        self.ledger([{"id": "t-1", "state": "queued", "workers": [{"address": "t77", "role": "build"}]}])
+        os.environ["HC_TERMINAL_ID"] = "t77"
+        self.ok("tasks")
+        self.assertFalse(os.path.exists(self.path("task-order.json")))
+        self.assertEqual(self.journal(), [])
+
+
+class NextByTaskOrder(Base):  # R9, R10 through the tool
+    def setUp(self):
+        super().setUp()
+        dump({"version": 1, "tasks": [{"id": "t-1", "state": "queued", "created": "2026-11-01T00:00:00Z"},
+                                      {"id": "t-2", "state": "queued", "created": "2026-11-02T00:00:00Z"},
+                                      {"id": "t-3", "state": "queued", "created": "2026-11-03T00:00:00Z"}]},
+             self.path("ledger.json"))
+        self.add("t-3", "a")
+        self.add("t-2", "a")
+        self.add("t-q", "check", "suite", "verifier", "--source", "queue")
+        self.add("t-1", "a")
+
+    def ids_next(self):
+        return [j["id"] for j in json.loads(self.ok("next", "--json"))["jobs"]]
+
+    def test_no_files_created_order(self):  # R27: created order with no file and no taskOrder
+        self.assertEqual(self.ids_next(), ["t-1/a", "t-2/a", "t-q/check", "t-3/a"])
+        self.assertIn("no start order yet; the Project Agent's order is used", self.ok("next"))  # J1-D3
+
+    def test_the_person_s_task_order(self):
+        write(self.path("task-order.json"), json.dumps({"version": 1, "updated": "U1", "order": ["t-3"], "last": ["t-1"]}))
+        self.assertEqual(self.ids_next(), ["t-3/a", "t-2/a", "t-q/check", "t-1/a"])
+
+    def test_unreadable_task_order_uses_the_agent_s(self):
+        write(self.path("task-order.json"), "{nope")
+        self.assertEqual(self.ids_next(), ["t-1/a", "t-2/a", "t-q/check", "t-3/a"])
+
+    def test_a_version_2_pin(self):
+        write(self.path("start-order.json"), json.dumps({"version": 2, "updated": "U1", "by": "person",
+                                                         "pins": [{"id": "t-3/a", "slot": 0}], "moves": []}))
+        self.assertEqual(self.ids_next(), ["t-3/a", "t-1/a", "t-q/check", "t-2/a"])
+        self.assertIn("order: the person's", self.ok("next"))
+
+    def test_a_version_1_file_still_read(self):
+        write(self.path("start-order.json"), json.dumps({"version": 1, "order": ["t-2/a", "t-3/a"]}))
+        self.assertEqual(self.ids_next(), ["t-2/a", "t-3/a", "t-q/check", "t-1/a"])
+
+    def test_wrong_version_said(self):
+        write(self.path("start-order.json"), json.dumps({"version": 3, "pins": []}))
+        self.assertIn("start order unreadable: start-order.json is not version 1 or 2; the Project Agent's order is used",
+                      self.ok("next"))
+        self.assertEqual(self.ids_next(), ["t-1/a", "t-2/a", "t-q/check", "t-3/a"])
+
+    def test_start_takes_the_job_and_never_writes_the_orders(self):  # R1, R10: a started job's pin goes with it
+        task_order = json.dumps({"version": 1, "updated": "U1", "order": ["t-3"], "last": []}) + "\n"
+        start_order = json.dumps({"version": 2, "pins": [{"id": "t-2/a", "slot": 0}]}) + "\n"
+        write(self.path("task-order.json"), task_order)
+        write(self.path("start-order.json"), start_order)
+        self.assertEqual(self.ids_next(), ["t-2/a", "t-3/a", "t-q/check", "t-1/a"])
+        self.ok("start", "t-2/a", "--worker", "t60")
+        self.assertEqual(self.ids_next(), ["t-3/a", "t-q/check", "t-1/a"])
+        self.ok("show")
+        self.ok("tasks")
+        self.ok("drop", "t-1/a", "--why", "w")
+        self.assertEqual(read(self.path("task-order.json")), task_order)
+        self.assertEqual(read(self.path("start-order.json")), start_order)
 
 
 # ---- limits through the tool (AC2.1, AC2.4, AC2.5) ---------------------------------------------------------------

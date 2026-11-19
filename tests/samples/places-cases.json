@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "about": "t-083: the shared cases of worker places and the start order. Read by tests/test_pa_places.py (runtime/tools/pa_places.py) and by the store harness (mods/project-agent/places.js), so both implementations agree. Codes and numbers only; each side words its own lines. jobs are in the Project Agent's order (waiting.json); a job given as a string is {id, kind: working, source: pa, blockedBy: null}. holders are the recorded place of each live unfinished worker (null: not recorded, counted as working). hold: off | on | unknown | no-terminals.",
+  "about": "t-083: the shared cases of worker places and the start order. Read by tests/test_pa_places.py (runtime/tools/pa_places.py) and by the store harness (mods/project-agent/places.js), so both implementations agree. Codes and numbers only; each side words its own lines. jobs are in the Project Agent's order (waiting.json); a job given as a string is {id, kind: working, source: pa, blockedBy: null}. holders are the recorded place of each live unfinished worker (null: not recorded, counted as working). hold: off | on | unknown | no-terminals. t-097: rankCases (the waiting list sorted by the task ranking, R9: rank is the ranked task ids, top first) and pinCases (start-order.json version 1 read as pins, version 2 pins, R10; jobs sorted by rank first).",
   "orderCases": [
     {"name": "AC8.1 ordered movable jobs fill the movable slots, the queue job keeps its index",
      "jobs": ["A", {"id": "Q1", "source": "queue"}, "B", "C"],
@@ -26,7 +26,7 @@
     {"name": "AC8.2 blank file", "jobs": ["A", "B"], "orderText": "  \n", "effective": ["A", "B"], "error": "empty"},
     {"name": "AC8.2 not JSON", "jobs": ["A", "B"], "orderText": "{\"version\": 1, \"order\": [\"B\"", "effective": ["A", "B"], "error": "not-json"},
     {"name": "AC8.2 not an object", "jobs": ["A", "B"], "orderText": "[\"B\", \"A\"]", "effective": ["A", "B"], "error": "not-object"},
-    {"name": "AC8.2 wrong version", "jobs": ["A", "B"], "orderText": "{\"version\": 2, \"order\": [\"B\"]}", "effective": ["A", "B"], "error": "version"},
+    {"name": "AC8.2 wrong version (t-097: 1 and 2 are read)", "jobs": ["A", "B"], "orderText": "{\"version\": 3, \"order\": [\"B\"]}", "effective": ["A", "B"], "error": "version"},
     {"name": "AC8.2 no version", "jobs": ["A", "B"], "orderText": "{\"order\": [\"B\"]}", "effective": ["A", "B"], "error": "version"},
     {"name": "AC8.2 order not a list", "jobs": ["A", "B"], "orderText": "{\"version\": 1, \"order\": \"B\"}", "effective": ["A", "B"], "error": "order"},
     {"name": "AC8.2 order not a list of strings", "jobs": ["A", "B"], "orderText": "{\"version\": 1, \"order\": [\"B\", 3]}", "effective": ["A", "B"], "error": "order"},
@@ -172,5 +172,32 @@
      "jobs": [{"id": "A", "kind": "suite"}],
      "limits": {"working": 4, "no-test": 0, "suite": 2}, "holders": ["working", "working", "working", "no-test"], "hold": "off",
      "expect": [{"id": "A", "action": "skip", "place": null, "full": {"kind": "working", "used": 4, "limit": 4}}]}
+  ],
+  "rankCases": [
+    {"name": "R9 movable jobs follow their task's rank; one task's jobs keep their added order", "jobs": ["t-1/a", "t-2/a", "t-1/b", "t-3/a"], "rank": ["t-3", "t-1", "t-2"], "effective": ["t-3/a", "t-1/a", "t-1/b", "t-2/a"]},
+    {"name": "R9 jobs of tasks not in the ranking go after the ranked ones, in added order", "jobs": ["t-9/a", "t-1/a", "t-8/a", "t-2/a"], "rank": ["t-2", "t-1"], "effective": ["t-2/a", "t-1/a", "t-9/a", "t-8/a"]},
+    {"name": "R9 a merge-queue job keeps its index", "jobs": ["t-1/a", {"id": "t-5/q", "source": "queue"}, "t-2/a"], "rank": ["t-2", "t-1"], "effective": ["t-2/a", "t-5/q", "t-1/a"]},
+    {"name": "R9 an empty ranking: the added order", "jobs": ["t-2/a", "t-1/a"], "rank": [], "effective": ["t-2/a", "t-1/a"]}
+  ],
+  "pinCases": [
+    {"name": "R10 a version 1 file is read as pins 0, 1, 2 ...: today's answer, after the rank sort", "jobs": ["t-1/a", "t-2/a", "t-3/a"], "rank": ["t-3", "t-2", "t-1"], "orderText": "{\"version\": 1, \"order\": [\"t-1/a\"]}", "effective": ["t-1/a", "t-3/a", "t-2/a"], "error": null},
+    {"name": "R10 version 1: ids not waiting are ignored, a duplicate counts once", "jobs": ["t-1/a", "t-2/a", "t-3/a"], "rank": [], "orderText": "{\"version\": 1, \"order\": [\"gone\", \"t-2/a\", \"t-2/a\", \"t-1/a\"]}", "effective": ["t-2/a", "t-1/a", "t-3/a"], "error": null},
+    {"name": "R10 version 2: a pin puts one job at its slot", "jobs": ["t-1/a", "t-2/a", "t-3/a", "t-4/a"], "rank": ["t-1", "t-2", "t-3", "t-4"], "orderText": "{\"version\": 2, \"updated\": \"U1\", \"by\": \"person\", \"pins\": [{\"id\": \"t-4/a\", \"slot\": 1}], \"moves\": []}", "effective": ["t-1/a", "t-4/a", "t-2/a", "t-3/a"], "error": null},
+    {"name": "R10 pins apply oldest first", "jobs": ["t-1/a", "t-2/a", "t-3/a", "t-4/a"], "rank": ["t-1", "t-2", "t-3", "t-4"], "orderText": "{\"version\": 2, \"updated\": \"U1\", \"by\": \"person\", \"pins\": [{\"id\": \"t-4/a\", \"slot\": 0}, {\"id\": \"t-1/a\", \"slot\": 3}], \"moves\": []}", "effective": ["t-4/a", "t-2/a", "t-3/a", "t-1/a"], "error": null},
+    {"name": "R10 a slot past the end is clamped to the end", "jobs": ["t-1/a", "t-2/a", "t-3/a"], "rank": ["t-1", "t-2", "t-3"], "orderText": "{\"version\": 2, \"updated\": \"U1\", \"by\": \"person\", \"pins\": [{\"id\": \"t-1/a\", \"slot\": 9}], \"moves\": []}", "effective": ["t-2/a", "t-3/a", "t-1/a"], "error": null},
+    {"name": "R10 a pin whose job is not waiting is ignored", "jobs": ["t-1/a", "t-2/a", "t-3/a"], "rank": ["t-1", "t-2", "t-3"], "orderText": "{\"version\": 2, \"updated\": \"U1\", \"by\": \"person\", \"pins\": [{\"id\": \"gone/a\", \"slot\": 0}, {\"id\": \"t-3/a\", \"slot\": 0}], \"moves\": []}", "effective": ["t-3/a", "t-1/a", "t-2/a"], "error": null},
+    {"name": "R9 R10 pins apply after the rank sort", "jobs": ["t-1/a", "t-2/a", "t-3/a"], "rank": ["t-3", "t-2", "t-1"], "orderText": "{\"version\": 2, \"updated\": \"U1\", \"by\": \"person\", \"pins\": [{\"id\": \"t-1/a\", \"slot\": 1}], \"moves\": []}", "effective": ["t-3/a", "t-1/a", "t-2/a"], "error": null},
+    {"name": "R10 version 2 with no pins (Reset order): the task order alone", "jobs": ["t-1/a", "t-2/a"], "rank": ["t-2", "t-1"], "orderText": "{\"version\": 2, \"updated\": \"U1\", \"by\": \"person\", \"pins\": [], \"moves\": []}", "effective": ["t-2/a", "t-1/a"], "error": null},
+    {"name": "R10 slots count the movable jobs only; a queue job keeps its index", "jobs": [{"id": "t-5/q", "source": "queue"}, "t-1/a", "t-2/a"], "rank": [], "orderText": "{\"version\": 2, \"updated\": \"U1\", \"by\": \"person\", \"pins\": [{\"id\": \"t-2/a\", \"slot\": 0}], \"moves\": []}", "effective": ["t-5/q", "t-2/a", "t-1/a"], "error": null},
+    {"name": "R10 a pin naming a queue job is ignored", "jobs": ["t-1/a", {"id": "t-5/q", "source": "queue"}, "t-2/a"], "rank": [], "orderText": "{\"version\": 2, \"updated\": \"U1\", \"by\": \"person\", \"pins\": [{\"id\": \"t-5/q\", \"slot\": 0}], \"moves\": []}", "effective": ["t-1/a", "t-5/q", "t-2/a"], "error": null},
+    {"name": "R10 version 3 is unreadable: the rank order is kept", "jobs": ["t-1/a", "t-2/a"], "rank": ["t-2", "t-1"], "orderText": "{\"version\": 3, \"pins\": []}", "effective": ["t-2/a", "t-1/a"], "error": "version"},
+    {"name": "R10 version 2 with no pins list is unreadable", "jobs": ["t-1/a", "t-2/a"], "rank": ["t-2", "t-1"], "orderText": "{\"version\": 2, \"order\": [\"t-1/a\"]}", "effective": ["t-2/a", "t-1/a"], "error": "pins"},
+    {"name": "R10 unreadable: pins not a list", "jobs": ["t-1/a", "t-2/a"], "rank": ["t-2", "t-1"], "orderText": "{\"version\": 2, \"pins\": \"x\"}", "effective": ["t-2/a", "t-1/a"], "error": "pins"},
+    {"name": "R10 unreadable: a pin not an object", "jobs": ["t-1/a", "t-2/a"], "rank": ["t-2", "t-1"], "orderText": "{\"version\": 2, \"pins\": [\"t-1/a\"]}", "effective": ["t-2/a", "t-1/a"], "error": "pins"},
+    {"name": "R10 unreadable: a pin's id not a string", "jobs": ["t-1/a", "t-2/a"], "rank": ["t-2", "t-1"], "orderText": "{\"version\": 2, \"pins\": [{\"id\": 3, \"slot\": 0}]}", "effective": ["t-2/a", "t-1/a"], "error": "pins"},
+    {"name": "R10 unreadable: a negative slot", "jobs": ["t-1/a", "t-2/a"], "rank": ["t-2", "t-1"], "orderText": "{\"version\": 2, \"pins\": [{\"id\": \"t-1/a\", \"slot\": -1}]}", "effective": ["t-2/a", "t-1/a"], "error": "pins"},
+    {"name": "R10 unreadable: a slot not whole", "jobs": ["t-1/a", "t-2/a"], "rank": ["t-2", "t-1"], "orderText": "{\"version\": 2, \"pins\": [{\"id\": \"t-1/a\", \"slot\": 1.5}]}", "effective": ["t-2/a", "t-1/a"], "error": "pins"},
+    {"name": "R10 unreadable: a slot true", "jobs": ["t-1/a", "t-2/a"], "rank": ["t-2", "t-1"], "orderText": "{\"version\": 2, \"pins\": [{\"id\": \"t-1/a\", \"slot\": true}]}", "effective": ["t-2/a", "t-1/a"], "error": "pins"},
+    {"name": "R10 unreadable: no slot", "jobs": ["t-1/a", "t-2/a"], "rank": ["t-2", "t-1"], "orderText": "{\"version\": 2, \"pins\": [{\"id\": \"t-1/a\"}]}", "effective": ["t-2/a", "t-1/a"], "error": "pins"}
   ]
 }

@@ -696,6 +696,11 @@ class AC6EditorRule(GuardTest):
             with self.subTest(path=path):
                 self.assertEqual(self.edit(path), EDIT.format(path))
 
+    def test_t097_task_order_is_state(self):  # t-097 J1-D4: task-order.json is the person's (the panel writes it)
+        self.assertIn("task-order.json", guard.STATE_FILES)
+        path = os.path.join(self.state, "task-order.json")
+        self.assertEqual(self.edit(path), EDIT.format(path))
+
     def test_links_are_resolved(self):
         link = os.path.join(self.repo, "src", "innocent.txt")
         if not os.path.lexists(link):
