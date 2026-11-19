@@ -5750,6 +5750,82 @@ cases["Q55-14-titles-skipped"] = async () => { // R2, R7: two repositories with 
   check(/Queue · 2/.test(text), `only readable entries counted (got ${text.slice(0, 400)})`);
 };
 
+// ---- t-032 J3g: the billed block compares every account label in the space (limit 3, R-A5) and, where billed rows carry
+// endpoint/region, each pair (D8, A-V3). A comparison without `others` or `byScope` draws exactly as before (J3G_OLD:
+// captured from the 1ed3c5e code). ----
+const j3gBilled = async (reply) => { const { v } = await costsWorld({ tool: { "billed compare": () => json0(reply) } }); const s = costsSummary(); const text = j1dText(v, s); // the status clocks in the machine's own zone and locale become {clock}
+  const billed = text.slice(text.search(/Billed amounts|Billed \(|No billed rows|Billing query/)).replace(/fetched .*? \(billing days/g, "fetched {clock} (billing days")
+    .replace(/last run .*? \(/g, "last run {clock} (").replace(/next after .*? · cap/g, "next after {clock} · cap");
+  return { v, text, billed }; };
+const j3gStates = () => ({ rows: withRows(), "rows-off": withRows(statusOff), "no-rows-on": noRows(statusOn()), "no-rows-off": noRows() });
+const J3G_OLD = {
+  "rows": "Billed (account-wide: includes use outside this space and outside Herdr) | Copy | Covered 2027-01-10 – 2027-01-14 (5 of 6 days; not billed: 2027-01-15) · source query:q1, fetched {clock} (billing days are UTC days) |  | this space | all spaces here | billed | model-a | {CUR}10.00 est. | {CUR}20.00 est. | {CUR}25.00 billed · account-wide | price factor 1.25 (from quantities) | model-b | — est. (no price) | {CUR}3.00 est. + unpriced | {CUR}2.40 billed · account-wide | scope ratio 0.8 (not applied) below 1.0: the table over-prices (from a partial estimate) (few days) (not final) | other / unmapped labels |  |  | {CUR}1.50 billed · account-wide | total | {CUR}10.00 est. + unpriced | {CUR}23.00 est. + unpriced | {CUR}28.90 billed · account-wide | calibrated (est. × price factor, where one applies): this space {CUR}12.50 + unpriced | No price for model-b: its estimate is the priced part only. | In XXX (not compared): ¤3.00 billed · account-wide, 1 row(s) | Billing query: on · last run {clock} (ok, 1 requests) · next after {clock} · cap 1/day (≤ 3 requests, stated fee ≈ 0.01 XTS each) | Turn off",
+  "rows-off": "Billed (account-wide: includes use outside this space and outside Herdr) | Copy | Covered 2027-01-10 – 2027-01-14 (5 of 6 days; not billed: 2027-01-15) · source query:q1, fetched {clock} (billing days are UTC days) |  | this space | all spaces here | billed | model-a | {CUR}10.00 est. | {CUR}20.00 est. | {CUR}25.00 billed · account-wide | price factor 1.25 (from quantities) | model-b | — est. (no price) | {CUR}3.00 est. + unpriced | {CUR}2.40 billed · account-wide | scope ratio 0.8 (not applied) below 1.0: the table over-prices (from a partial estimate) (few days) (not final) | other / unmapped labels |  |  | {CUR}1.50 billed · account-wide | total | {CUR}10.00 est. + unpriced | {CUR}23.00 est. + unpriced | {CUR}28.90 billed · account-wide | calibrated (est. × price factor, where one applies): this space {CUR}12.50 + unpriced | No price for model-b: its estimate is the priced part only. | In XXX (not compared): ¤3.00 billed · account-wide, 1 row(s)",
+  "no-rows-on": "Billing query: on · not run yet · next after {clock} · cap 1/day (≤ 3 requests, stated fee ≈ 0.01 XTS each) | Turn off | No billed rows for account acct1 yet.",
+  "no-rows-off": "Billed amounts: none. The billing query is off; the person turns it on in their own terminal (pa-costs billed enable, see README).",
+};
+const j3gOther = (over = {}) => ({ ...withRows().comparison, account: "acct-c", models: [], other: 0, separate: [], noPrice: [], calibrated: 4.5, calibratedPartial: false,
+  total: { thisSpace: 4, allSpaces: 6, thisSpacePartial: false, allSpacesPartial: false, billed: 5.5 }, rows: 2, spaceEstimate: { money: 7, partial: false }, ...over });
+const j3gNone = (over = {}) => ({ ...noRows().comparison, account: "acct-d", rows: 0, spaceEstimate: { money: 2, partial: true }, ...over });
+cases["P-costs-j3-old"] = async () => { // guard: a comparison without others/byScope draws the same billed block as before J3g, in each state
+  for (const [k, reply] of Object.entries(j3gStates())) {
+    const { billed } = await j3gBilled(reply);
+    check(billed === J3G_OLD[k], `${k}: the same text as before J3g (got ${billed}\nwant ${J3G_OLD[k]})`);
+    check(!/Account acct|By endpoint|· region/.test(billed), `${k}: nothing of J3g (got ${billed})`);
+  }
+  // one byScope entry only (a bill under one pair): no per-pair lines
+  const one = withRows(); one.comparison.byScope = [{ endpoint: "global", region: "*", billed: 28.9, thisSpace: 10, allSpaces: 23, thisSpacePartial: false, allSpacesPartial: false }];
+  check((await j3gBilled(one)).billed === J3G_OLD.rows, "one pair: drawn as before");
+  const empty = withRows(); empty.others = [];
+  check((await j3gBilled(empty)).billed === J3G_OLD.rows, "an empty others: drawn as before");
+};
+
+cases["P-costs-j3-others"] = async () => { // limit 3: one dim line per other account label, after this account's table; never added to its figures
+  const r = withRows(); r.others = [j3gOther(), j3gNone()];
+  const { v, billed } = await j3gBilled(r);
+  check(billed.startsWith(J3G_OLD.rows.slice(0, J3G_OLD.rows.indexOf("Billing query: on"))), `this account's block first, unchanged (got ${billed})`);
+  check(billed.includes("Account acct-c: this space {CUR}4.00 est. · {CUR}5.50 billed · account-wide"), `acct-c's line (got ${billed})`);
+  check(billed.includes("Account acct-d: this space {CUR}2.00 est. + unpriced; no billed rows for it"), `acct-d's line (got ${billed})`);
+  check(billed.indexOf("Account acct-c") < billed.indexOf("Account acct-d") && billed.indexOf("Account acct-d") < billed.indexOf("Billing query: on"), `in order, before the status (got ${billed})`);
+  check(billed.includes("total | {CUR}10.00 est. + unpriced | {CUR}23.00 est. + unpriced | {CUR}28.90 billed · account-wide"), `this account's total untouched (got ${billed})`);
+  check(moneyLabelled(v).length === 0, `labelled (${JSON.stringify(moneyLabelled(v))})`);
+  const copy = await j1dCopy(v, "costs-copy-billed");
+  check(copy.includes("Account acct-c: this space") && copy.includes("Account acct-d: this space"), `in the billed Copy (got ${copy})`);
+  // this account has no billed rows, another has: its lines still show, after the "no rows" line
+  const n = noRows(statusOn()); n.others = [j3gOther()];
+  const { billed: b2 } = await j3gBilled(n);
+  check(b2.includes("No billed rows for account acct1 yet.") && b2.includes("Account acct-c: this space {CUR}4.00 est. · {CUR}5.50 billed · account-wide"), `no own rows (got ${b2})`);
+  const off = noRows(); off.others = [j3gOther()];
+  const { billed: b3 } = await j3gBilled(off);
+  check(b3.includes("Billed amounts: none.") && b3.includes("Account acct-c: this space {CUR}4.00 est. · {CUR}5.50 billed · account-wide"), `off, no own rows (got ${b3})`);
+  // malformed others draw nothing and throw nothing
+  const bad = withRows(); bad.others = [7, null, { account: {} }, "x"];
+  const { billed: b4 } = await j3gBilled(bad);
+  check(!/Account |\[object/.test(b4), `malformed others draw nothing (got ${b4})`);
+};
+
+cases["P-costs-j3-scopes"] = async () => { // D8: two or more endpoint · region pairs: one line each, est. beside billed
+  const r = withRows(); r.comparison.byScope = [
+    { endpoint: "global", region: "*", billed: 20, thisSpace: 7, allSpaces: 15, thisSpacePartial: false, allSpacesPartial: false },
+    { endpoint: "regional", region: "region-a", billed: 8.9, thisSpace: 3, allSpaces: 8, thisSpacePartial: false, allSpacesPartial: false },
+    { endpoint: "regional", region: "?", billed: 0, thisSpace: null, allSpaces: null, thisSpacePartial: false, allSpacesPartial: false }];
+  const { v, billed } = await j3gBilled(r);
+  for (const want of ["By endpoint · region (billed rows with a usage type):", "global: this space {CUR}7.00 est. · {CUR}20.00 billed · account-wide",
+    "regional · region-a: this space {CUR}3.00 est. · {CUR}8.90 billed · account-wide", "regional · region unknown: this space — est. (no price) · {CUR}0.00 billed · account-wide"])
+    check(billed.includes(want), `shows "${want}" (got ${billed})`);
+  check(billed.indexOf("By endpoint") > billed.indexOf("calibrated") && billed.indexOf("By endpoint") < billed.indexOf("In XXX"), `after this account's table (got ${billed})`);
+  check(moneyLabelled(v).length === 0, `labelled (${JSON.stringify(moneyLabelled(v))})`);
+  const bad = withRows(); bad.comparison.byScope = [7, { endpoint: {} }, null];
+  check(!/By endpoint|\[object/.test((await j3gBilled(bad)).billed), "malformed byScope draws nothing");
+};
+
+cases["P-costs-j3-reads"] = async () => { // the view reads and runs nothing new for others and byScope
+  const count = async (reply) => { const { v } = await costsWorld({ tool: { "billed compare": () => json0(reply) } }); for (let i = 0; i < 3; i++) { advance(61000); v.reload(cx); look(v); await settle(); } return { reads: costsReads().map((x) => x.path), execs: costsExecs().map(([, a]) => a.join(" ")) }; };
+  const r = withRows(); r.others = [j3gOther(), j3gNone()]; r.comparison.byScope = [{ endpoint: "global", region: "*", billed: 1, thisSpace: 1, allSpaces: 1 }, { endpoint: "regional", region: "region-a", billed: 1, thisSpace: 1, allSpaces: 1 }];
+  const old = await count(withRows()), now = await count(r);
+  check(JSON.stringify(old) === JSON.stringify(now), `the same reads and execs (old ${JSON.stringify(old)} new ${JSON.stringify(now)})`);
+};
+
 // --list prints the names that would run and runs none. An unknown name or option exits 2.
 const refuse = (why) => { fs.rmSync(dst, { recursive: true, force: true }); console.error(`run.mjs: ${why}`); process.exit(2); };
 const pick = [];

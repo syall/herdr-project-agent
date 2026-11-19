@@ -6686,6 +6686,275 @@ class J2R2_Fixes(J2Base):
         self.assertTrue(resp.closed)
 
 
+# ---- t-032 J3g: compare every account label in the space (limit 3, R-A5); billed rows keep endpoint/region (D8, A-V3) ----
+
+J3G_DAY = "2026-11-14"
+
+
+def j3g_entry(day, money, account, by, endpoint=None, region=None, model="model-a", **kw):
+    e = {"day": day, "model": model, "tokens": toks(out=1), "money": money, "provider": "provider-a", "endpoint": endpoint,
+         "region": region, "account": account, "accountBy": by, "pricedAs": None}
+    e.update(kw)
+    return e
+
+
+def j3g_space(entries=None, account="acct-a"):
+    """Space sp1 labelled acct-a: acct-a's own entries (one by rule, one following the space), acct-c's by env."""
+    if entries is None:
+        entries = [j3g_entry("2026-11-14", 1.0, "acct-a", "rule"), j3g_entry("2026-11-15", 4.0, "acct-a", "default"),
+                   j3g_entry("2026-11-14", 2.0, "acct-c", "env"), j3g_entry("2026-11-16", 8.0, "acct-c", "env")]
+    return {"v": 1, "space": "sp1", "account": account, "updated": "2026-11-17T09:00:00Z",
+            "prices": {"profile": "test", "source": "test table", "asOf": "2026-11-01", "currency": "USD", "missing": []},
+            "byDayModel": entries}
+
+
+def j3g_billed():
+    """acct-a billed on the 14th and 15th; acct-c billed once over the 14th-16th (so the 15th, an acct-a entry that
+    follows the space, is inside acct-c's covered days)."""
+    return [brow(day="2026-11-14", amount=1.5, account="acct-a"), brow(day="2026-11-15", amount=3.0, account="acct-a"),
+            brow(day="2026-11-14", to="2026-11-16", amount=11.5, account="acct-c")]
+
+
+# billing_comparison at main 1ed3c5e for j3g_space() / j3g_billed() / here = the space (stored: G-A1's guard)
+J3G_MAIN = {"account": "acct-a", "currency": "USD", "accountWide": True,
+            "covered": {"from": "2026-11-14", "to": "2026-11-15", "days": 2, "of": 4, "missing": ["2026-11-16", "2026-11-17"]},
+            "sources": ["query:q1"], "fetchedAt": "2026-11-17T00:00:00Z",
+            "models": [{"model": "model-a", "thisSpace": 5.0, "allSpaces": 5.0, "thisSpacePartial": False, "allSpacesPartial": False,
+                        "billed": 4.5, "factor": {"kind": "scope", "value": 0.9, "applied": False, "few": True,
+                                                  "note": "not applied; below 1.0: the table over-prices"},
+                        "notFinal": False, "days": 2}],
+            "other": 0.0, "total": {"thisSpace": 5.0, "allSpaces": 5.0, "thisSpacePartial": False, "allSpacesPartial": False, "billed": 4.5},
+            "calibrated": 5.0, "calibratedPartial": False, "noPrice": [], "separate": []}
+
+
+class J3G_Accounts(BillingBase):
+    """Limit 3 (RL-3), R-A5: one comparison per account label present in the space; the space's own first, as today."""
+
+    def rows(self, billed=None):
+        return [pa_costs.validate_row(dict(r), "query:q1", "acct1", T0) for r in (j3g_billed() if billed is None else billed)]
+
+    def table(self):
+        return pa_costs.load_prices(pa.load_profile("test"))[0]
+
+    def store(self, space=None, billed=None):
+        s = j3g_space() if space is None else space
+        dump(s, self.costs("summary.json"))
+        pa_costs.append_billed(self.rows(billed))
+        return s
+
+    def compare_json(self):
+        result, out, err = self.run_cmd(pa_costs.main, ["billed", "compare", "--json", "--space", "sp1"])
+        self.assertEqual(result, 0, err)
+        return json.loads(out)
+
+    def test_g_a1_own_comparison_as_main_and_others_per_label(self):
+        s = j3g_space()
+        self.assertEqual(pa_costs.billing_comparison(self.rows(), s, s, self.table()), J3G_MAIN)  # guard: as main
+        self.store()
+        j = self.compare_json()
+        self.assertEqual(j["comparison"], J3G_MAIN)
+        self.assertEqual(j["rows"], 2)
+        self.assertEqual([o["account"] for o in j["others"]], ["acct-c"])
+        o = j["others"][0]
+        self.assertEqual(o["rows"], 1)
+        self.assertEqual(o["covered"]["days"], 3)
+        self.assertAlmostEqual(o["total"]["thisSpace"], 10.0)  # 2.0 + 8.0; never acct-a's 4.0 of the 15th
+        self.assertAlmostEqual(o["total"]["allSpaces"], 10.0)
+        self.assertAlmostEqual(o["total"]["billed"], 11.5)
+        self.assertEqual([(m["model"], m["thisSpace"], m["billed"]) for m in o["models"]], [("model-a", 10.0, 11.5)])
+
+    def test_g_a1b_other_account_direct(self):
+        s = j3g_space()
+        here = {"account": "acct-c", "byDayModel": [j3g_entry("2026-11-14", 2.0, "acct-c", "env"), j3g_entry("2026-11-16", 8.0, "acct-c", "env"),
+                                                    j3g_entry("2026-11-15", 0.5, "acct-c", "default")]}
+        c = pa_costs.billing_comparison(self.rows(), s, here, self.table(), account="acct-c")
+        self.assertEqual(c["account"], "acct-c")
+        self.assertAlmostEqual(c["total"]["thisSpace"], 10.0)
+        self.assertAlmostEqual(c["total"]["allSpaces"], 10.5)  # the here summary's own label for its entries
+        self.assertAlmostEqual(c["total"]["billed"], 11.5)
+
+    def test_g_a2_estimates_without_billed_rows(self):
+        self.store(billed=j3g_billed()[:2])
+        j = self.compare_json()
+        o = j["others"][0]
+        self.assertEqual((o["account"], o["rows"], o["covered"]), ("acct-c", 0, None))
+        self.assertAlmostEqual(o["spaceEstimate"]["money"], 10.0)
+        self.assertFalse(o["spaceEstimate"]["partial"])
+        text = "\n".join(pa_costs.billed_lines(j3g_space(), T0))
+        self.assertIn("account acct-c: est. 10.00 in this space; no billed rows for it", text)
+
+    def test_g_a3_one_accounts_bill_never_in_anothers_figures(self):
+        self.store()
+        j = self.compare_json()
+        own, other = j["comparison"], j["others"][0]
+        self.assertAlmostEqual(own["total"]["billed"], 4.5)  # not + 11.5
+        self.assertAlmostEqual(own["total"]["thisSpace"], 5.0)  # not + 10.0
+        self.assertAlmostEqual(other["total"]["billed"], 11.5)  # not + 4.5
+        self.assertAlmostEqual(other["total"]["thisSpace"], 10.0)  # not + 4.0 (the acct-a entry of the 15th)
+        self.assertNotIn("acct-a", [o["account"] for o in j["others"]])
+
+    def test_g_a4_one_account_space_has_no_others(self):
+        s = j3g_space([j3g_entry("2026-11-14", 1.0, "acct-a", "rule"), j3g_entry("2026-11-15", 4.0, "acct-a", "default")])
+        self.store(s, billed=j3g_billed())  # acct-c has a bill but no estimate in this space: not compared here
+        j = self.compare_json()
+        self.assertNotIn("others", j)
+        self.assertNotIn("byScope", j["comparison"])
+        self.assertEqual(j["comparison"], J3G_MAIN)
+        self.assertNotIn("acct-c", "\n".join(pa_costs.billed_lines(s, T0)))
+
+    def test_g_a5_report_billed_names_every_account(self):
+        self.store()
+        text = "\n".join(pa_costs.billed_lines(j3g_space(), T0))
+        self.assertIn("Billed (account-wide: includes use outside this space and outside Herdr)", text)
+        self.assertIn("Billed, account acct-c (account-wide: includes use outside this space and outside Herdr)", text)
+        head = text.index("Billed, account acct-c")
+        self.assertIn("Covered 2026-11-14 – 2026-11-16 (3 of 4 days", text[head:])
+        self.assertRegex(text[head:], r"total\s+10\.00\s+10\.00\s+11\.50")
+        self.assertRegex(text[:head], r"total\s+5\.00\s+5\.00\s+4\.50")
+        self.assertEqual(text.count("Billing query:"), 1)  # the status line once, at the end
+
+
+class J3G_Billed(BillingBase):
+    """D8 / A-V3: billed rows keep endpoint and region; the comparison splits by them (byScope)."""
+
+    def table(self):
+        return pa_costs.load_prices(pa.load_profile("test"))[0]
+
+    def rows(self, billed):
+        return [pa_costs.validate_row(dict(r), "query:q1", "acct1", T0) for r in billed]
+
+    def scoped(self):
+        billed = [brow(day=J3G_DAY, amount=1.5, account="acct-a", endpoint="global", region="region-a"),
+                  brow(day=J3G_DAY, amount=2.5, account="acct-a", endpoint="regional", region="region-a", label="usage-a-reg")]
+        s = j3g_space([j3g_entry(J3G_DAY, 1.0, "acct-a", "rule", endpoint="global", region="region-a"),
+                       j3g_entry(J3G_DAY, 2.0, "acct-a", "rule", endpoint="regional", region="region-a")])
+        return billed, s
+
+    def test_g_d8a_validate_row_keeps_endpoint_and_region(self):
+        base = pa_costs.validate_row(brow(), "query:q1", "acct1", T0)
+        r = pa_costs.validate_row(brow(endpoint="global", region="region-a"), "query:q1", "acct1", T0)
+        self.assertEqual((r["endpoint"], r["region"]), ("global", "region-a"))
+        self.assertEqual(r["id"], base["id"])  # the id is unchanged
+        self.assertNotIn("endpoint", base)
+        self.assertNotIn("region", base)
+        for bad in ({"region": "US WEST"}, {"endpoint": "Global!"}, {"region": "r-" + TWELVE}, {"endpoint": 7}):
+            with self.assertRaises(ValueError, msg=bad):
+                pa_costs.validate_row(brow(**bad), "query:q1", "acct1", T0)
+        r = pa_costs.validate_row(brow(endpoint=None, region=None), "query:q1", "acct1", T0)
+        self.assertEqual(r, base)
+
+    def test_g_d8b_by_scope_each_estimate_beside_its_bill(self):
+        billed, s = self.scoped()
+        c = pa_costs.billing_comparison(self.rows(billed), s, s, self.table())
+        self.assertEqual([(x["endpoint"], x["region"], x["billed"], x["thisSpace"], x["allSpaces"]) for x in c["byScope"]],
+                         [("global", "region-a", 1.5, 1.0, 1.0), ("regional", "region-a", 2.5, 2.0, 2.0)])
+        self.assertAlmostEqual(c["total"]["billed"], 4.0)
+        self.assertAlmostEqual(c["total"]["thisSpace"], 3.0)
+        plain = pa_costs.billing_comparison(self.rows([brow(day=J3G_DAY, amount=1.5, account="acct-a")]), s, s, self.table())
+        self.assertNotIn("byScope", plain)  # guard: rows without the fields
+
+    def test_g_d8b2_region_is_compared_too(self):
+        billed = [brow(day=J3G_DAY, amount=1.5, account="acct-a", endpoint="regional", region="region-a"),
+                  brow(day=J3G_DAY, amount=3.5, account="acct-a", endpoint="regional", region="region-b", label="usage-b")]
+        s = j3g_space([j3g_entry(J3G_DAY, 1.0, "acct-a", "rule", endpoint="regional", region="region-a"),
+                       j3g_entry(J3G_DAY, 3.0, "acct-a", "rule", endpoint="regional", region="region-b")])
+        c = pa_costs.billing_comparison(self.rows(billed), s, s, self.table())
+        self.assertEqual([(x["region"], x["billed"], x["thisSpace"]) for x in c["byScope"]], [("region-a", 1.5, 1.0), ("region-b", 3.5, 3.0)])
+
+    def test_g_d8c_unknown_region_goes_under_question_mark(self):
+        billed = [brow(day=J3G_DAY, amount=2.5, account="acct-a", endpoint="regional", region="region-a")]
+        s = j3g_space([j3g_entry(J3G_DAY, 2.0, "acct-a", "rule", endpoint="regional", region="region-a"),
+                       j3g_entry(J3G_DAY, 0.75, "acct-a", "rule", endpoint="regional", region=None)])
+        c = pa_costs.billing_comparison(self.rows(billed), s, s, self.table())
+        by = {(x["endpoint"], x["region"]): x for x in c["byScope"]}
+        self.assertEqual(set(by), {("regional", "region-a"), ("regional", "?")})
+        self.assertEqual((by[("regional", "region-a")]["thisSpace"], by[("regional", "region-a")]["billed"]), (2.0, 2.5))
+        self.assertEqual((by[("regional", "?")]["thisSpace"], by[("regional", "?")]["billed"]), (0.75, 0.0))
+
+    def test_g_d8c2_a_bill_without_the_fields_is_star(self):
+        billed = [brow(day=J3G_DAY, amount=2.5, account="acct-a", endpoint="regional", region="region-a"),
+                  brow(day=J3G_DAY, amount=0.25, account="acct-a", label="requests", model=None)]
+        s = j3g_space([j3g_entry(J3G_DAY, 2.0, "acct-a", "rule", endpoint="regional", region="region-a")])
+        c = pa_costs.billing_comparison(self.rows(billed), s, s, self.table())
+        by = {(x["endpoint"], x["region"]): x for x in c["byScope"]}
+        self.assertEqual(by[("*", "*")]["billed"], 0.25)
+        self.assertEqual(by[("*", "*")]["thisSpace"], 0.0)
+
+    def test_g_d8c3_unpriced_estimate_is_no_price_never_zero(self):
+        billed = [brow(day=J3G_DAY, amount=2.5, account="acct-a", endpoint="regional", region="region-a")]
+        s = j3g_space([j3g_entry(J3G_DAY, None, "acct-a", "rule", endpoint="regional", region="region-a")])
+        c = pa_costs.billing_comparison(self.rows(billed), s, s, self.table())
+        self.assertIsNone(c["byScope"][0]["thisSpace"])
+
+    def test_g_d8e_region_free_endpoint_is_grouped_by_endpoint(self):
+        # REVIEW J3p round 2 RL 2/3: a global bill carries its prefix region; a global session's region is env or unknown
+        billed = [brow(day=J3G_DAY, amount=1.5, account="acct-a", endpoint="global", region="region-b"),
+                  brow(day=J3G_DAY, amount=2.5, account="acct-a", endpoint="regional", region="region-a", label="usage-a-reg")]
+        s = j3g_space([j3g_entry(J3G_DAY, 1.0, "acct-a", "rule", endpoint="global", region=None),
+                       j3g_entry(J3G_DAY, 0.5, "acct-a", "rule", endpoint="global", region="region-a"),
+                       j3g_entry(J3G_DAY, 2.0, "acct-a", "rule", endpoint="regional", region="region-a")])
+        c = pa_costs.billing_comparison(self.rows(billed), s, s, self.table(), region_free=("global",))
+        self.assertEqual([(x["endpoint"], x["region"], x["billed"], x["thisSpace"]) for x in c["byScope"]],
+                         [("global", "*", 1.5, 1.5), ("regional", "region-a", 2.5, 2.0)])
+        c = pa_costs.billing_comparison(self.rows(billed), s, s, self.table())  # no region-free endpoints declared
+        self.assertIn(("global", "region-b", 1.5, 0.0), [(x["endpoint"], x["region"], x["billed"], x["thisSpace"]) for x in c["byScope"]])
+
+    def test_g_d8e2_region_free_from_the_profiles_price_sources(self):
+        os.makedirs(os.path.join(self.profile_dir, "prices"), exist_ok=True)
+        stub = os.path.join(self.profile_dir, "prices", "reader_stub.py")
+        shutil.copy(os.path.join(FETCH_SAMPLES, "reader_stub.py"), stub)
+        os.chmod(stub, 0o755)
+        prof = load(os.path.join(self.profile_dir, "profile.json"))
+        prof["prices"] = {"sources": {"src-a": source_decl()}}
+        dump(prof, os.path.join(self.profile_dir, "profile.json"))
+        self.assertEqual(pa_costs.region_free_endpoints(pa.load_profile("test")), ("global",))
+        billed = [brow(day=J3G_DAY, amount=1.5, account="acct-a", endpoint="global", region="region-b")]
+        dump(j3g_space([j3g_entry(J3G_DAY, 1.0, "acct-a", "rule", endpoint="global", region=None)]), self.costs("summary.json"))
+        pa_costs.append_billed(self.rows(billed))
+        _r, out, err = self.run_cmd(pa_costs.main, ["billed", "compare", "--json", "--space", "sp1"])
+        self.assertEqual([(x["endpoint"], x["region"], x["thisSpace"]) for x in json.loads(out)["comparison"]["byScope"]],
+                         [("global", "*", 1.0)], err)
+
+    def test_g_d8d_billed_compare_json_carries_others_and_by_scope(self):
+        billed, s = self.scoped()
+        s["byDayModel"].append(j3g_entry(J3G_DAY, 6.0, "acct-c", "env", endpoint="global", region=None))
+        billed.append(brow(day=J3G_DAY, amount=7.0, account="acct-c", endpoint="global", region="region-a"))
+        dump(s, self.costs("summary.json"))
+        pa_costs.append_billed(self.rows(billed))
+        _r, out, err = self.run_cmd(pa_costs.main, ["billed", "compare", "--json", "--space", "sp1"])
+        j = json.loads(out)
+        self.assertEqual([(x["endpoint"], x["region"], x["billed"], x["thisSpace"], x["allSpaces"]) for x in j["comparison"]["byScope"]],
+                         [("global", "region-a", 1.5, 1.0, 1.0), ("regional", "region-a", 2.5, 2.0, 2.0)])
+        o = j["others"][0]
+        self.assertEqual(o["account"], "acct-c")
+        self.assertEqual([(x["endpoint"], x["region"], x["billed"], x["thisSpace"]) for x in o["byScope"]],
+                         [("global", "?", 0.0, 6.0), ("global", "region-a", 7.0, 0.0)])
+        text = "\n".join(pa_costs.billed_lines(s, T0))
+        self.assertIn("By endpoint · region", text)
+        self.assertRegex(text, r"global · region-a\s+1\.00\s+1\.00\s+1\.50")
+
+    def test_g_d8f_remote_here_others_all_spaces_unknown(self):
+        billed, s = self.scoped()
+        s["byDayModel"].append(j3g_entry(J3G_DAY, 6.0, "acct-c", "env"))
+        pa_costs.append_billed(self.rows(billed + [brow(day=J3G_DAY, amount=7.0, account="acct-c")]))
+        here = {"v": 1, "account": "acct-a", "spaces": ["sp1"], "byDayModel": s["byDayModel"][:2]}
+        _r, out, err = self.run_cmd(pa_costs.main, ["billed", "compare", "--json", "--summary-json", json.dumps(s), "--here-json", json.dumps(here)])
+        o = json.loads(out)["others"][0]
+        self.assertAlmostEqual(o["total"]["thisSpace"], 6.0)
+        self.assertIsNone(o["total"]["allSpaces"])  # the remote's other accounts were not read: not 0
+        self.assertIsNone(o["models"][0]["allSpaces"])
+        self.assertTrue(o["allSpacesUnknown"])
+
+    def test_g_d8g_account_wide_keeps_endpoint_and_region(self):
+        _billed, s = self.scoped()
+        dump(s, self.costs("summary.json"))
+        here = pa_costs.account_wide_summary("acct-a", T0)
+        self.assertEqual(sorted((e["endpoint"], e["region"], e["money"]) for e in here["byDayModel"]),
+                         [("global", "region-a", 1.0), ("regional", "region-a", 2.0)])
+        dump(j3g_space([j3g_entry(J3G_DAY, 1.0, "acct-a", "rule")]), self.costs("summary.json"))
+        self.assertEqual(sorted(pa_costs.account_wide_summary("acct-a", T0)["byDayModel"][0]), ["day", "model", "money", "tokens"])
+
+
 class ZZ_V1_Privacy(unittest.TestCase):
     """Run last: the canary of every fixture reached no file under costs/ or billing/ and no captured output."""
 
