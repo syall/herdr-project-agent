@@ -108,7 +108,17 @@ def program_position(words):
     return k
 
 
-def row_of(words):
+def fetches(words, names, first, n):  # D7: pa-costs, pa_costs.py, a module whose last dotted part is pa_costs
+    py, module = first < n and PYTHON.match(names[first]), lambda k: (re.fullmatch(r"-[a-z]*?m([\w.]+)", names[k]) or (0, names[k]))[1]
+    costs = next((k for k in range(first, n if py else min(first + 1, n)) if names[k] in ("pa-costs", "pa_costs.py") or "pa_costs"
+                  in names[k] and module(k).rsplit(".", 1)[-1] == "pa_costs"), n)  # -m [a.b.]pa_costs, -um x, -mx, runpy, pdb
+    code = next((k for k in range(first + 1, n if py else 0) if re.fullmatch(r"-[A-Za-z]*?c.*", words[k], re.S)
+                 and "pa_costs" in " ".join(words[k:k + 2]).lower()), n)  # python -c '<code naming pa_costs>' [args]
+    rest = re.findall(r"[\w-]+", " ".join(words[code:])) if code < costs else words[costs + 1:]
+    return "prices" in rest and "fetch" in rest[rest.index("prices") + 1:]  # t-070 J2 R12: read as words, after quotes and escapes
+
+
+def row_of(words, d7=True):
     """The message of the first row (D1, D2, D3, D4) that this simple command matches, or None."""
     n, names, first = len(words), [program(w) for w in words], program_position(words)
     word = lambda j: words[j] if j < n else ""
@@ -128,13 +138,6 @@ def row_of(words):
     removing = max([k for k, w in enumerate(words) if w in ("-d", "--delete")], default=-1)
     tool = next((word(k + 1) for k in range(first, n) if names[k] == "pa.py" and (k == first or PYTHON.match(names[first]))),
                 names[first][3:] if first < n and names[first][:3] == "pa-" else "")  # pa-<tool>, or pa.py <tool>
-    py = first < n and PYTHON.match(names[first])  # D7: pa-costs, pa_costs.py, a module whose last dotted part is pa_costs
-    module = lambda k: (re.fullmatch(r"-[a-z]*?m([\w.]+)", names[k]) or (0, names[k]))[1]  # total: the word itself
-    costs = next((k for k in range(first, n if py else min(first + 1, n)) if names[k] in ("pa-costs", "pa_costs.py") or "pa_costs"
-                  in names[k] and module(k).rsplit(".", 1)[-1] == "pa_costs"), n)  # -m [a.b.]pa_costs, -um x, -mx, runpy, pdb
-    code = next((k for k in range(first + 1, n if py else 0) if re.fullmatch(r"-[A-Za-z]*?c.*", words[k], re.S)
-                 and "pa_costs" in " ".join(words[k:k + 2]).lower()), n)  # python -c '<code naming pa_costs>' [args]
-    rest = re.findall(r"[\w-]+", " ".join(words[code:])) if code < costs else words[costs + 1:]
     if any(word(j) in ("push", "send-pack", "http-push") or word(j) in ("subtree", "lfs") and after(j) == "push"
            for j in subs) or first < n and names[first] in ("git-push", "git-send-pack", "git-http-push"):
         row = DENY_PUSH
@@ -148,30 +151,30 @@ def row_of(words):
         row = DENY_TOOLS
     elif tool in ("restart", "context"):  # pa-restart (t-037 J2), pa-context (t-041 J3), or pa.py restart|context
         row = DENY_RESTART if tool == "restart" else DENY_CONTEXT
-    elif "prices" in rest and "fetch" in rest[rest.index("prices") + 1:]:  # t-070 J2 R12: read as words, after quotes and escapes
+    elif d7 and fetches(words, names, first, n):  # d7: the line names pa-costs or pa_costs (check_command's prefilter)
         row = DENY_PRICES
     else:
         return None
     return row.format(shown(" ".join(shlex.quote(w) for w in words)))
 
 
-def judge(line, depth):
+def judge(line, depth, d7):
     """The verdict on a line met at this depth of nesting (wrappers and substitutions); deeper than 4 is not judged."""
     found = None
     for _ in range(8 if depth <= 4 else 0):  # substitutions, innermost first: each body is a line of its own
         bodies = []
         line = SUBSTITUTION.sub(lambda m: bodies.append(next(g for g in m.groups() if g is not None)) or " ", line)
-        found = next((f for f in (judge(body, depth + 1) for body in bodies) if f), None)
+        found = next((f for f in (judge(body, depth + 1, d7) for body in bodies) if f), None)
         if found or not bodies:
             break
     for words in [] if found or depth > 4 else simple_commands(line):
-        found, shell = row_of(words), False
+        found, shell = row_of(words, d7), False
         for k, w in enumerate([] if found else words):
             if program(w) == "eval":  # the words after it are a line of their own
-                found = judge(" ".join(words[k + 1:]), depth + 1)
+                found = judge(" ".join(words[k + 1:]), depth + 1, d7)
                 break
             if shell and SHELL_C.match(w) and k + 1 < len(words):  # sh -c '...': the word after -c
-                found, shell = judge(words[k + 1], depth + 1), False
+                found, shell = judge(words[k + 1], depth + 1, d7), False
                 if found:
                     break
             shell = shell or program(w) in SHELLS
@@ -182,7 +185,7 @@ def judge(line, depth):
 
 def check_command(line):
     """None when the Bash line may run; else the refusal of the first row its simple commands match (spec 3)."""
-    return judge(line if isinstance(line, str) else "", 0)
+    return judge(line, 0, re.search("pa[_-]costs", re.sub(r"[\\'\"$\n]", "", line).lower())) if isinstance(line, str) else None
 
 
 # ---- The editor rule (t-007 R8, kept by t-025) --------------------------------------------------------------------
