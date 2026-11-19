@@ -56,6 +56,18 @@ the folder removed (`rm -rf -- /tmp/pa-suite-<run>`, the run id checked); TERM, 
 143, 130 or 129, with no record. A setup failure runs on this Mac in the same call (exit 2 with --on). Part medians
 and limits use only times of the same place. Every hc call is an argv list built from fixed text, the checked
 machine name, run id and pins, and the probe's tool paths.
+
+A profile's step run (t-106): a profile's tests.remoteFull {"command": <tests.full>, "marker": <file name>, "facts":
+"hooks/<x>", "step": "hooks/<y>"} (checked: each a string, no other key, the scripts executable regular files inside
+the profile's hooks/, at most 64 KB; else named and ignored) makes a run of that command a step run when fullIsRunAll
+does not apply, the space has no command of its own, the marker is in a folder above the clean one-repo worktree and
+the facts hook (run here as [facts, root], 30 s) answers {"ok": true, "repoSubdir", "key", "show"} with checked
+values. Sent with the bundle: the step (step.b64, made <run>/step, mode 700) and facts.json (key and repoSubdir only).
+There `<run>/step probe <run>` (its tool lines go into the record's tools as step:<name>), `<run>/step prepare <run>`
+(prints `cwd <rel>` once, maybe `keep <abs>` first, `kept created|reused`, `home <command>` lines: checked, the cwd
+inside the run folder) and, in the terminal from that cwd, `<run>/step run <run>`, each with the run's environment
+plus PA_STEP_FACTS, PA_STEP_REAL_HOME (the probe's HOME) and PA_STEP_RUN. No local part: the exit is the step run's;
+the record adds step {sha256, facts, keep, homeExceptions}. A kept folder is never removed here.
 """
 import argparse
 import base64
@@ -63,12 +75,14 @@ import calendar
 import datetime
 import fcntl
 import glob
+import hashlib
 import json
 import os
 import platform
 import re
 import shutil
 import signal
+import stat
 import statistics
 import subprocess
 import sys
@@ -113,6 +127,20 @@ FILE_NAME = re.compile(r"^[^/\x00]+$")
 TOOLS = ("git", "python3", "node", "sh")
 FAST_POLL, FAST_SPAN = 1.0, 60  # t-107 R17: a pa-run's watcher polls every second for its first minute
 FALLBACKS = ("mac", "none")  # t-107 R11: config.json's suiteFallback
+# t-106: a profile's remote full command run by its step (tests.remoteFull)
+STEP_KEYS = ("command", "marker", "facts", "step")
+HOOK_PATH = re.compile(r"hooks/[A-Za-z0-9._-]+")
+STEP_MAX = 64 * 1024  # the facts hook's and the step's size at most (the step is sent)
+FACTS_TIMEOUT = 30  # PA_SUITE_FACTS_TIMEOUT: the facts hook is stopped after this
+FACTS_MAX = 16 * 1024  # the facts hook's answer at most
+FACTS_KEYS = 8
+KEY_NAME = re.compile(r"[a-z][A-Za-z0-9]{0,31}")
+KEY_VALUE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._@/+-]{0,127}")
+SEGMENT = re.compile(r"[A-Za-z0-9._-]+")
+TOOL_NAME = re.compile(r"[A-Za-z0-9._+-]{1,64}")
+CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+PREPARE_TIMEOUT = 300
+HOME_LINE = "printf 'home %s\\n' \"$HOME\"\n"  # a step run's probe only: the machine user's HOME (PA_STEP_REAL_HOME)
 SIGNAL_EXIT = {signal.SIGTERM: 143, signal.SIGINT: 130, signal.SIGHUP: 129}
 
 
@@ -1058,10 +1086,13 @@ done
 """
 
 
-def probe(machine):
-    """R2: is machine reachable, with the four tools? {ok, reason, os, arch, tools, seconds}. Writes nothing there."""
+def probe(machine, home=False):
+    """R2: is machine reachable, with the four tools? {ok, reason, os, arch, tools, seconds}. Writes nothing there.
+    home (t-106, a step run only): the probe prints the machine user's HOME too, as found["home"] (TOOL_PATH or
+    None); without it the probe's argv is t-089's exactly."""
     began = time.time()
-    code, out, err = hc(["exec", "--on", machine, "--timeout", "30", "--", "sh", "-c", PROBE], timeout=60)
+    code, out, err = hc(["exec", "--on", machine, "--timeout", "30", "--", "sh", "-c",
+                         PROBE + HOME_LINE if home else PROBE], timeout=60)
     found = {"ok": False, "seconds": round(time.time() - began, 1), "os": None, "arch": None, "tools": {}}
     if code:
         found["reason"] = first_line(err, "hc exec exited {}".format(code))
@@ -1075,6 +1106,9 @@ def probe(machine):
         elif line.startswith("missing "):
             missing.append(line[len("missing "):])
     missing += [t for t in TOOLS if t not in found["tools"] and not any(m.startswith(t) for m in missing)]
+    if home:
+        said = [l[len("home "):] for l in lines[2:] if l.startswith("home ")]
+        found["home"] = said[-1] if said and TOOL_PATH.fullmatch(said[-1]) else None
     found["os"], found["arch"] = (lines[0].strip() if lines else None), (lines[1].strip() if len(lines) > 1 else None)
     if missing or not found["os"]:
         found["reason"] = "missing " + ", ".join(missing) if missing else "no answer from uname"
@@ -1120,11 +1154,177 @@ def as_run_all(h, command, profile, root):
         d = up
 
 
-def remote_ok(command, found, module, why_not=None):
-    """R6: None when this run may go to a machine, else why it stays on this Mac. command is as_run_all's."""
+def remote_full(profile):
+    """t-106 R2: (the profile's tests.remoteFull checked, or None; a note when it is there but ignored, or None).
+      "remoteFull": {"command": "<tests.full, as written>", "marker": "<file name>", "facts": "hooks/<script>",
+                     "step": "hooks/<script>"}
+    The entry: {command, marker, facts (its realpath), step (its realpath), bytes (the step's, read once), sha256}."""
+    tests = (profile or {}).get("tests") or {}
+    said = tests.get("remoteFull") if isinstance(tests, dict) else None
+    if said is None:
+        return None, None
+
+    def bad(why):
+        return None, "profile {}: tests.remoteFull ignored: {}".format((profile or {}).get("name"), why)
+    if not isinstance(said, dict):
+        return bad('not an object {"command", "marker", "facts", "step"}')
+    unknown = sorted(str(k) for k in said if k not in STEP_KEYS)
+    if unknown:
+        return bad("unknown key(s) {}".format(", ".join(repr(k) for k in unknown)))
+    for key in STEP_KEYS:
+        if not isinstance(said.get(key), str):
+            return bad("{} must be a string".format(key))
+    if said["command"] != tests.get("full"):
+        return bad("command {!r} is not tests.full {!r}".format(said["command"], tests.get("full")))
+    marker = said["marker"]
+    if not FILE_NAME.fullmatch(marker) or CONTROL.search(marker) or marker in (".", ".."):
+        return bad("marker {!r} is not a file name".format(marker))
+    if not profile.get("_folder"):
+        return bad("the profile has no folder")
+    hooks = os.path.join(os.path.realpath(profile["_folder"]), "hooks")
+    entry = {"command": said["command"], "marker": marker}
+    for key in ("facts", "step"):
+        given = said[key]
+        if not HOOK_PATH.fullmatch(given):
+            return bad("{} {!r} is not hooks/<file name>".format(key, given))
+        real = os.path.realpath(os.path.join(os.path.dirname(hooks), given))
+        if not real.startswith(hooks + os.sep):
+            return bad("{} {!r} is not inside the profile's hooks folder".format(key, given))
+        try:
+            st = os.stat(real)
+        except OSError as e:
+            return bad("{} {!r}: {}".format(key, given, e.strerror))
+        if not stat.S_ISREG(st.st_mode) or not os.access(real, os.X_OK):
+            return bad("{} {!r} is not an executable regular file".format(key, given))
+        if st.st_size > STEP_MAX:
+            return bad("{} {!r} is over {} bytes".format(key, given, STEP_MAX))
+        entry[key] = real
+    try:
+        with open(entry["step"], "rb") as f:
+            data = f.read(STEP_MAX + 1)
+    except OSError as e:
+        return bad("step: {}".format(e.strerror))
+    if len(data) > STEP_MAX:
+        return bad("step is over {} bytes".format(STEP_MAX))
+    entry["bytes"], entry["sha256"] = data, hashlib.sha256(data).hexdigest()
+    return entry, None
+
+
+def plain_path(value, segments):
+    """A relative path of SEGMENT parts: no `.`, `..` or empty part, none starting with `-`, at most segments."""
+    parts = value.split("/") if isinstance(value, str) else []
+    return (0 < len(parts) <= segments and all(SEGMENT.fullmatch(p) and p not in (".", "..") and not p.startswith("-")
+                                               for p in parts))
+
+
+def check_facts(out):
+    """t-106 R3: the facts hook's stdout (bytes) -> ({key, repoSubdir, show}, None) or (None, why)."""
+    said = "the profile's facts hook"
+    if len(out) > FACTS_MAX:
+        return None, "{} answered over {} bytes".format(said, FACTS_MAX)
+    try:
+        value = json.loads(out.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None, "{} answered no JSON object".format(said)
+    if not isinstance(value, dict):
+        return None, "{} answered no JSON object".format(said)
+    if value.get("ok") is False:
+        reason = value.get("reason")
+        reason = CONTROL.sub(" ", reason).strip()[:200] if isinstance(reason, str) else ""
+        return None, "{}: {}".format(said, reason or "not this worktree (no reason given)")
+    if value.get("ok") is not True:
+        return None, "{}: ok is not true or false".format(said)
+    key = value.get("key")
+    if not isinstance(key, dict) or len(key) > FACTS_KEYS:
+        return None, "{}: key is not an object of at most {} names".format(said, FACTS_KEYS)
+    for name, v in key.items():
+        if not KEY_NAME.fullmatch(name):
+            return None, "{}: key name {!r} is not [a-z][A-Za-z0-9]{{0,31}}".format(said, name)
+        if not isinstance(v, str) or not KEY_VALUE.fullmatch(v) or any(p in ("", "..") for p in v.split("/")):
+            return None, "{}: key {} has the value {!r}, not a plain word or path".format(said, name, v)
+    sub = value.get("repoSubdir")
+    if not plain_path(sub, 4):
+        return None, "{}: repoSubdir {!r} is not a relative path of at most 4 plain parts".format(said, sub)
+    show = value.get("show")
+    if not isinstance(show, str) or CONTROL.search(show) or len(show) > 200:
+        return None, "{}: show is not one line of at most 200 characters".format(said)
+    return {"key": dict(key), "repoSubdir": sub, "show": show}, None
+
+
+def run_facts(path, root):
+    """t-106 R3: the facts hook run here as [path, root], cwd root, PA_CHANGED_FILES unset, stopped (its process
+    group) after PA_SUITE_FACTS_TIMEOUT (30) s. (facts, None) or (None, why)."""
+    env = dict(os.environ)
+    env.pop("PA_CHANGED_FILES", None)
+    limit = env_seconds("PA_SUITE_FACTS_TIMEOUT", FACTS_TIMEOUT)
+    try:
+        child = subprocess.Popen([path, root], cwd=root, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE, start_new_session=True)
+    except OSError as e:
+        return None, "the profile's facts hook did not start ({})".format(e)
+    try:
+        out, err = child.communicate(timeout=limit)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(child.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        child.communicate()
+        return None, "the profile's facts hook ran past {:g} s and was stopped".format(limit)
+    if child.returncode:
+        return None, "the profile's facts hook exited {}: {}".format(
+            child.returncode, first_line(err.decode("utf-8", "replace"), "no message"))
+    return check_facts(out)
+
+
+def step_full(h, command, agent, profile, root, entry):
+    """t-106 R1, R3: (the step run's facts, None) when this run is a step run, else (None, why it is not).
+    entry is remote_full's. The tree checks (clean, one repo) are the caller's, before this runs the facts hook."""
+    if ((agent or {}).get("commands") or {}).get("full"):
+        return None, "the space has a full command of its own (agent.json commands.full), not the profile's"
+    if command != h.command_for("full", {}, profile):
+        return None, "the full command `{}` is not the profile's".format(command)
+    top = os.path.realpath(root)
+    d = os.path.dirname(top)
+    while not os.path.lexists(os.path.join(d, entry["marker"])):
+        up = os.path.dirname(d)
+        if up == d:
+            return None, "no {} above {} (the profile's remoteFull marker)".format(entry["marker"], top)
+        d = up
+    facts, why = run_facts(entry["facts"], top)
+    if why:
+        return None, why
+    secrets = list(h.DENY_PATHS) + [(p, "a secret ({} profile)".format(profile.get("name")))
+                                    for p in profile.get("secretPaths") or [] if isinstance(p, str)]
+    return dict(facts, entry=entry, secrets=secrets), None
+
+
+def never_sent(h, root, secrets):
+    """t-106 R5 (t-107 R8's list): why the HEAD tree may not be sent (a path under .claude/ or matching a secret
+    pattern), or None."""
+    code, out, err = h.git(root, "ls-tree", "-r", "-z", "--name-only", "HEAD")
+    if code:
+        return "git ls-tree: " + first_line(err, "exit {}".format(code))
+    for p in out.split("\0"):
+        if not p:
+            continue
+        if p.startswith(".claude/") or "/.claude/" in "/" + p:
+            return "{} is under .claude/ (the worker's own settings): never sent".format(p)
+        for pattern, what in secrets:
+            try:
+                if re.search(pattern, p):
+                    return "{} is {}: never sent".format(p, what)
+            except re.error:
+                continue
+    return None
+
+
+def remote_ok(command, found, module, why_not=None, step=False):
+    """R6: None when this run may go to a machine, else why it stays on this Mac. command is as_run_all's;
+    step (t-106): the run is a profile's step run, so the command need not be run-all.sh."""
     if module:
         return "--module runs on this Mac"
-    if command != REMOTE_COMMAND:
+    if command != REMOTE_COMMAND and not step:
         return "the full command is `{}`, not `{}`{}".format(command, REMOTE_COMMAND,
                                                               " ({})".format(why_not) if why_not else "")
     if len(found) != 1 or not found[0].get("commit") or not found[0].get("tree"):
@@ -1144,11 +1344,14 @@ def folder_of(run):
     return "/tmp/pa-suite-" + run
 
 
-def ship(h, machine, run, pin, tools, root, patch=None, head=None):
+def ship(h, machine, run, pin, tools, root, patch=None, head=None, step=None):
     """R7, R8: the run folder there, the bundle of the pinned commit, the clone checked out and its ids checked.
     t-107 (pa-run): head, the commit the bundle holds when the commit to check out is an ancestor of it; patch, the
     `git diff --binary` from the commit to pin["tree"], sent as p.b64 and applied with `git apply --index` there,
-    then the clone's index tree (write-tree) must be that tree. Without a patch the script is t-089's."""
+    then the clone's index tree (write-tree) must be that tree. Without a patch the script is t-089's.
+    t-106: step, a step run's facts (step_full): the step's bytes are sent as step.b64 (made <run>/step, mode 700,
+    by the setup exec) and facts.json (its key and repoSubdir, written here from the checked values), both counted
+    in BUNDLE_MAX."""
     folder = folder_of(run)
     commit, tree = pin.get("commit") or "", pin.get("tree") or ""
     head = head or commit
@@ -1175,13 +1378,18 @@ def ship(h, machine, run, pin, tools, root, patch=None, head=None):
             data = base64.b64encode(f.read()).decode("ascii")
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
-    if len(data) + len(extra) > BUNDLE_MAX:
-        raise SetupFailed("bundle too large ({} bytes base64, at most {})".format(len(data) + len(extra), BUNDLE_MAX))
-    code, _, err = hc(["file", "write", "--on", machine, folder + "/b.b64"], stdin=data)
-    if code:
-        raise SetupFailed("hc file write: " + first_line(err, "exit {}".format(code)))
+    sends = [("b.b64", data)]
     if extra:
-        code, _, err = hc(["file", "write", "--on", machine, folder + "/p.b64"], stdin=extra)
+        sends.append(("p.b64", extra))
+    if step:
+        sends.append(("step.b64", base64.b64encode(step["entry"]["bytes"]).decode("ascii")))
+        sends.append(("facts.json", json.dumps({"key": step["key"], "repoSubdir": step["repoSubdir"]},
+                                               sort_keys=True) + "\n"))
+    size = sum(len(text) for _, text in sends)
+    if size > BUNDLE_MAX:
+        raise SetupFailed("bundle too large ({} bytes base64, at most {})".format(size, BUNDLE_MAX))
+    for name, text in sends:
+        code, _, err = hc(["file", "write", "--on", machine, folder + "/" + name], stdin=text)
         if code:
             raise SetupFailed("hc file write: " + first_line(err, "exit {}".format(code)))
     py, git, sh_path = tools["python3"]["path"], tools["git"]["path"], tools["sh"]["path"]
@@ -1196,6 +1404,9 @@ def ship(h, machine, run, pin, tools, root, patch=None, head=None):
         "printf '%s\\n' '#!{}' 'echo \"hc is not available in a remote suite run\" >&2' 'exit 2' > bin/hc".format(sh_path),
         "chmod 755 bin/hc",
     ] + ["ln -s {} bin/{}".format(tools[t]["path"], t) for t in TOOLS] + ([
+        "{} -c 'import base64, sys; open(sys.argv[2], \"wb\").write(base64.b64decode(open(sys.argv[1]).read()))' step.b64 step".format(py),
+        "rm -f step.b64",
+        "chmod 700 step"] if step else []) + ([
         "{} -c 'import base64, sys; open(sys.argv[2], \"wb\").write(base64.b64decode(open(sys.argv[1]).read()))' p.b64 p.patch".format(py),
         "rm -f p.b64",
         "{} -C w apply --index --binary {}/p.patch".format(git, folder),
@@ -1212,26 +1423,142 @@ def ship(h, machine, run, pin, tools, root, patch=None, head=None):
     return folder
 
 
-def run_script(folder, tools):
-    """R10, R11: the remote terminal's fixed script. {folder}/bin holds hc's refusing shim and a link to each probed
-    tool (made at setup), and only it goes ahead of the machine's PATH: a probed tool's folder is never put first, so
-    another tool in it (an older python3 beside git) cannot shadow the probed one, and the record names what ran."""
-    return "\n".join([
-        "date +%s > ../t0",
+def env_lines(folder, tools):
+    """R11: the remote environment: its own home, temp and caches under the run folder, hc refused."""
+    return [
         "unset HC_TERMINAL_ID HC_SOCKET HC_TERMINAL_SOCKET HC_SCOPE CLAUDECODE",
         "export HERDR_PA_HOME={0}/home TMPDIR={0}/tmp XDG_CACHE_HOME={0}/xdg/cache XDG_CONFIG_HOME={0}/xdg/config "
         "XDG_DATA_HOME={0}/xdg/data XDG_STATE_HOME={0}/xdg/state PYTHONDONTWRITEBYTECODE=1 npm_config_cache={0}/npm "
         "PA_CHANGED_FILES= NODE={1} HOME={0}/u".format(folder, tools["node"]["path"]),
-        "export PATH={}/bin:$PATH".format(folder),
-        "sh tests/run-all.sh --except-integration > ../out 2>&1",
-        "echo $? > ../code.new && mv ../code.new ../code",
-        "date +%s > ../t1", ""])
+        "export PATH={}/bin:$PATH".format(folder)]
 
 
-def start_remote(machine, run, folder, tools, script=None):
-    """The run's hc terminal there; script: t-107's pa-run script in place of run_script's."""
+def step_env(folder, real_home):
+    """t-106 R6: the step's own variables (real_home checked TOOL_PATH by the caller)."""
+    return "export PA_STEP_FACTS={0}/facts.json PA_STEP_REAL_HOME={1} PA_STEP_RUN={0}".format(folder, real_home)
+
+
+def run_script(folder, tools, command=None, cwd=None, extra=None):
+    """R10, R11: the remote terminal's fixed script. {folder}/bin holds hc's refusing shim and a link to each probed
+    tool (made at setup), and only it goes ahead of the machine's PATH: a probed tool's folder is never put first, so
+    another tool in it (an older python3 beside git) cannot shadow the probed one, and the record names what ran.
+    t-106: command (a step run's `<run>/step run <run>`) in place of run-all.sh, started in <folder>/<cwd> (checked
+    by prepare_step), with the extra export line (step_env); t0, t1, out and code at the run folder's top."""
+    if command is None:
+        lines = env_lines(folder, tools)
+        return "\n".join(["date +%s > ../t0"] + lines + [
+            "sh tests/run-all.sh --except-integration > ../out 2>&1",
+            "echo $? > ../code.new && mv ../code.new ../code",
+            "date +%s > ../t1", ""])
+    return "\n".join([
+        "cd {}/{} || exit 3".format(folder, cwd),
+        "date +%s > {}/t0".format(folder)] + env_lines(folder, tools) + ([extra] if extra else []) + [
+        "{} > {}/out 2>&1".format(command, folder),
+        "echo $? > {0}/code.new && mv {0}/code.new {0}/code".format(folder),
+        "date +%s > {}/t1".format(folder), ""])
+
+
+def step_action(machine, folder, tools, real_home, action, timeout):
+    """t-106 R6: one step action (probe or prepare) by hc exec: cwd the run folder, the remote environment, the
+    step's argv only fixed words. (exit, stdout, stderr)."""
+    script = "\n".join(["cd {} || exit 3".format(folder)] + env_lines(folder, tools) + [
+        step_env(folder, real_home), "exec {0}/step {1} {0}".format(folder, action), ""])
+    return hc(["exec", "--on", machine, "--timeout", str(timeout), "--", "sh", "-c", script], timeout=timeout + 60)
+
+
+def probe_step(machine, folder, tools, real_home):
+    """t-106 R6: the step's probe there: {"step:<name>": {path, version}}. A missing tool, a bad line or a non-zero
+    exit is a setup failure (not "unreachable": the step is not on the machine before ship)."""
+    code, out, err = step_action(machine, folder, tools, real_home, "probe", 60)
+    if code:
+        raise SetupFailed("the step's probe exited {}: {}".format(code, first_line(err or out, "no message")))
+    found, missing = {}, []
+    for line in out.split("\n"):
+        if line.startswith("missing "):
+            missing.append(CONTROL.sub(" ", line[len("missing "):])[:64])
+        elif line.startswith("tool "):
+            bits = line.split(" ", 3)
+            if (len(bits) != 4 or not TOOL_NAME.fullmatch(bits[1]) or not (bits[2] == "-" or TOOL_PATH.fullmatch(bits[2]))
+                    or CONTROL.search(bits[3]) or len(bits[3]) > 200):
+                raise SetupFailed("the step's probe printed a bad tool line {!r}".format(line[:200]))
+            found["step:" + bits[1]] = {"path": bits[2], "version": bits[3].strip()}
+    if missing:
+        raise SetupFailed("the step's probe: missing " + ", ".join(missing))
+    return found
+
+
+def check_keep(value, folder, base, real_home):
+    """t-106 R6: why the keep line's path is refused, or None."""
+    parts = value.split("/")
+    if not TOOL_PATH.fullmatch(value) or any(p in ("", ".", "..") for p in parts[1:]) or len(parts) < 3:
+        return "keep {!r} is not an absolute path of at least two plain parts".format(value)
+    if value == real_home or real_home.startswith(value + "/"):
+        return "keep {!r} is the machine user's HOME or a folder above it".format(value)
+    for run_folder in (folder, base):
+        if value == run_folder or value.startswith(run_folder + "/") or run_folder.startswith(value + "/"):
+            return "keep {!r} is the run folder, in it or above it".format(value)
+    return None
+
+
+def prepare_step(machine, folder, tools, real_home):
+    """t-106 R6: the step's prepare there and its output checked: {cwd, keep, kept, homes, seconds}. Lines: `keep
+    <absolute path>` (the first line only), `kept created|reused`, `cwd <relative path>` (exactly one), `home
+    <name>`; others are its progress. Then one exec checks the cwd is a folder inside the run folder (symlinks
+    resolved there). Anything else is a setup failure."""
+    began = time.time()
+    code, out, err = step_action(machine, folder, tools, real_home, "prepare", PREPARE_TIMEOUT)
+    seconds = round(time.time() - began, 1)
+
+    def fail(why):
+        raise SetupFailed("the step's prepare: " + why)
+    if code:
+        fail("exited {}: {}".format(code, first_line(err or out, "no message")))
+    got = {"cwd": None, "keep": None, "kept": None, "homes": [], "seconds": seconds}
+    for i, line in enumerate(out.split("\n")):
+        word, _, value = line.partition(" ")
+        if word == "keep":
+            if i or got["keep"] is not None:
+                fail("a keep line that is not its first line")
+            got["keep"] = value
+        elif word == "kept":
+            if value not in ("created", "reused") or got["kept"] is not None:
+                fail("a kept line {!r} (one, created or reused)".format(line[:200]))
+            got["kept"] = value
+        elif word == "cwd":
+            if got["cwd"] is not None:
+                fail("two cwd lines")
+            if not plain_path(value, 32):
+                fail("cwd {!r} is not a relative path of plain parts".format(value[:200]))
+            got["cwd"] = value
+        elif word == "home":
+            if not TOOL_NAME.fullmatch(value):
+                fail("a home line {!r} (one command name)".format(line[:200]))
+            if value not in got["homes"]:
+                got["homes"].append(value)
+    if got["cwd"] is None:
+        fail("no cwd line")
+    if got["kept"] and got["keep"] is None:
+        fail("a kept line with no keep line")
+    script = ('cd {0} && b=$(pwd -P) && cd -P -- {0}/{1} && r=$(pwd -P) && printf "base %s\\ninside %s\\n" "$b" "$r"'
+              .format(folder, got["cwd"]))
+    code, out, err = hc(["exec", "--on", machine, "--timeout", "30", "--", "sh", "-c", script], timeout=60)
+    lines = dict(l.split(" ", 1) for l in out.splitlines() if " " in l)
+    base, inside = lines.get("base", ""), lines.get("inside", "")
+    if code or not base or not inside.startswith(base + "/"):
+        fail("cwd {} is not a folder inside the run folder ({})".format(
+            got["cwd"], first_line(err, inside or "exit {}".format(code))))
+    if got["keep"] is not None:
+        why = check_keep(got["keep"], folder, base, real_home)
+        if why:
+            fail(why)
+    return got
+
+
+def start_remote(machine, run, folder, tools, script=None, cwd=None):
+    """The run's hc terminal there; script: t-107's pa-run script in place of run_script's; cwd (t-106): the
+    terminal's folder in place of <folder>/w."""
     code, out, err = hc(["run", "--bg", "--rm", "--no-notify", "--json", "--on", machine, "--name", "pa-suite-" + run,
-                         "--label", "pa.suite=" + run, "--cwd", folder + "/w", "--", "sh", "-c",
+                         "--label", "pa.suite=" + run, "--cwd", cwd or folder + "/w", "--", "sh", "-c",
                          script or run_script(folder, tools)])
     if code:
         raise SetupFailed("hc run: " + first_line(err, "exit {}".format(code)))
@@ -1524,8 +1851,17 @@ def full_suite(h, args):
     for b in bad:  # named once, even when no entry is left (then the run is today's)
         log("pa-full-suite: suiteMachines in {}: {}".format(config_path, b))
     eligible, why_not = (command, None) if module else as_run_all(h, command, profile, record["root"])
+    step, step_why = None, None  # t-106: a profile's remote full command run by its step (fullIsRunAll first)
+    if remote_mode and not module and eligible != REMOTE_COMMAND:
+        entry, ignored = remote_full(profile)
+        if ignored:
+            log("pa-full-suite: " + ignored)
+        elif entry:
+            step_why = remote_ok(REMOTE_COMMAND, found, None)  # the tree first: the facts hook runs only for a clean one
+            if not step_why:
+                step, step_why = step_full(h, command, agent, profile, record["root"], entry)
     if remote_mode:
-        why = remote_ok(eligible, found, module, why_not)
+        why = step_why or remote_ok(eligible, found, module, why_not, step=step is not None)
         if on and not [m for m in good if m["machine"] == on]:
             print("pa-full-suite: --on {}: not a machine of suiteMachines in {}".format(on, config_path))
             return sys.exit(2)
@@ -1538,7 +1874,7 @@ def full_suite(h, args):
             for m in good:
                 if on and m["machine"] != on:
                     continue
-                probes[m["machine"]] = probe(m["machine"])
+                probes[m["machine"]] = probe(m["machine"], home=step is not None)
                 if probes[m["machine"]]["ok"]:
                     reachable.append(m)
                 else:
@@ -1563,8 +1899,9 @@ def full_suite(h, args):
     elif reachable:
         m = chosen or reachable[0]
         p = probes[m["machine"]]
-        log("pa-full-suite: run {} on {} ({}; reachable in {:g}s{}): {}".format(
-            run, m["machine"], p["os"], p["seconds"], "" if chosen else "; waiting for a slot", tail_text))
+        log("pa-full-suite: run {} on {} ({}; {}reachable in {:g}s{}): {}".format(
+            run, m["machine"], p["os"], step["show"] + "; " if step else "", p["seconds"],
+            "" if chosen else "; waiting for a slot", tail_text))
     else:
         log("pa-full-suite: run {} on this Mac ({}): {}".format(run, note, tail_text))
     rows = read_lines(where)
@@ -1603,7 +1940,7 @@ def full_suite(h, args):
         m = chosen["machine"]
         try:
             code = run_remote(h, args, record, directory, command, evidence, build_log, where, run, output, progress,
-                              slot, m, probes[m], queued, pulse, reuse, log, eligible)
+                              slot, m, probes[m], queued, pulse, reuse, log, eligible, step=step)
         except SetupFailed as e:  # before anything ran there: this Mac in the same call (exit 2 with --on)
             release(slot)
             note = "setup on {} failed: {}".format(m, e)
@@ -1702,16 +2039,20 @@ def run_on_mac(h, record, directory, command, module, build_log, where, run, out
 
 
 def run_remote(h, args, record, directory, command, evidence, build_log, where, run, output, progress, slot, machine,
-               found_probe, queued, pulse, reuse, log, eligible=None):
+               found_probe, queued, pulse, reuse, log, eligible=None, step=None):
     """R7-R18 on machine under its slot: ship, run there, the integration part here, copy back, record, clean.
-    Its exit code; SetupFailed before anything ran there (the slot is then still held, for the caller to release)."""
+    Its exit code; SetupFailed before anything ran there (the slot is then still held, for the caller to release).
+    step (t-106, step_full's): a step run: the step's probe and prepare there after the clone, its run in the
+    terminal, no local part (R13): the exit is the step run's."""
     root = record["root"]
     found = pins(h, root)  # MF-1
     if reuse():
         release(slot)
         update_progress(progress, state="done", exit=0, end=pa.now(), note="not run: this tree passed while it waited")
         return 0
-    why = remote_ok(eligible or command, found, None)
+    why = remote_ok(eligible or command, found, None, step=step is not None)
+    if not why and step:
+        why = never_sent(h, root, step["secrets"])
     if why:
         raise SetupFailed(why)
     waited = round(time.time() - queued, 1)
@@ -1724,7 +2065,7 @@ def run_remote(h, args, record, directory, command, evidence, build_log, where, 
                     median_total=total, median_runs=runs)
     start, load, began = pa.now(), load_now(), time.time()
     terminal, child, watcher, side, notes = None, None, None, None, []
-    saved = {}
+    saved, prep, step_tools, ran_from = {}, None, {}, None
 
     def on_signal(sig, frame):
         raise Interrupted(SIGNAL_EXIT.get(sig, 1))
@@ -1732,8 +2073,19 @@ def run_remote(h, args, record, directory, command, evidence, build_log, where, 
         saved[sig] = signal.signal(sig, on_signal)
     try:
         try:
-            ship(h, machine, run, found[0], tools, root)
-            terminal = start_remote(machine, run, folder, tools)
+            ship(h, machine, run, found[0], tools, root, step=step)
+            if step:
+                real_home = found_probe.get("home")
+                if not real_home:
+                    raise SetupFailed("the probe found no absolute HOME for the machine user (PA_STEP_REAL_HOME)")
+                step_tools = probe_step(machine, folder, tools, real_home)
+                prep = prepare_step(machine, folder, tools, real_home)
+                terminal = start_remote(machine, run, folder, tools, cwd=folder, script=run_script(
+                    folder, tools, command="{0}/step run {0}".format(folder), cwd=prep["cwd"],
+                    extra=step_env(folder, real_home)))
+                ran_from = time.time()  # R14: a step run's place seconds count from its terminal's start
+            else:
+                terminal = start_remote(machine, run, folder, tools)
         except SetupFailed:
             for n in cleanup(machine, run, terminal):
                 log("pa-full-suite: cleanup on {}: {}".format(machine, n))
@@ -1741,17 +2093,24 @@ def run_remote(h, args, record, directory, command, evidence, build_log, where, 
             raise
         update_progress(progress, state="running", start=start, commit=found[0].get("commit"), tree=found[0].get("tree"),
                         remote={"folder": folder, "terminal": terminal})
-        side = (progress or os.path.join(runs_dir(), run + ".json")) + ".local"
-        write_progress(side, {"run": run + "-local", "kind": "local part"})
+        if not step:
+            side = (progress or os.path.join(runs_dir(), run + ".json")) + ".local"
+            write_progress(side, {"run": run + "-local", "kind": "local part"})
         watcher = RemoteWatcher(machine, folder, output, progress, side)
         watcher.start()
         local_out = output[:-len(".out")] + "-local.out"
-        env = dict(os.environ, PA_CHANGED_FILES="", PA_SUITE_SLOT=slot.name, PA_SUITE_PROGRESS=side)
-        with open(local_out, "w") as f:
-            child = subprocess.Popen(["sh", "-c", REMOTE_COMMAND + " --only-integration"], cwd=root, env=env,
-                                     stdin=subprocess.DEVNULL, stdout=f, stderr=subprocess.STDOUT, start_new_session=True)
         local_code, local_began, local_seconds, local_stopped = None, time.time(), None, False
-        while True:
+        if step:  # R13: no local part
+            while not watcher.ended.is_set():
+                pulse()
+                time.sleep(0.2)
+        else:
+            env = dict(os.environ, PA_CHANGED_FILES="", PA_SUITE_SLOT=slot.name, PA_SUITE_PROGRESS=side)
+            with open(local_out, "w") as f:
+                child = subprocess.Popen(["sh", "-c", REMOTE_COMMAND + " --only-integration"], cwd=root, env=env,
+                                         stdin=subprocess.DEVNULL, stdout=f, stderr=subprocess.STDOUT,
+                                         start_new_session=True)
+        while child is not None:
             pulse()
             if local_code is None and child.poll() is not None:
                 local_code = 128 - child.returncode if child.returncode < 0 else child.returncode
@@ -1766,7 +2125,7 @@ def run_remote(h, args, record, directory, command, evidence, build_log, where, 
                 local_code, local_stopped = stop_group(child), True
                 local_seconds = round(time.time() - local_began, 1)
             time.sleep(0.2)
-        remote_seconds = round(time.time() - began, 1)
+        remote_seconds = round(time.time() - (ran_from or began), 1)
         if watcher.lost is not None:
             remote_code = 124
             notes.append("machine {} lost after {:.0f} s".format(machine, watcher.lost))
@@ -1780,24 +2139,32 @@ def run_remote(h, args, record, directory, command, evidence, build_log, where, 
                 notes.append(n)
         if local_stopped:
             notes.append("the local part was stopped")
-        code = remote_code if remote_code else local_code
+        code = remote_code if remote_code or step else local_code
         seconds, end = round(time.time() - began, 1), pa.now()
         change = moved(found, pins(h, root))
         remote_text = pa.read_text(output) or ""
-        local_text = pa.read_text(local_out) or ""
+        local_text = "" if step else pa.read_text(local_out) or ""
         mac = mac_os()
         with open(output, "w") as f:
             f.write(remote_text if not remote_text or remote_text.endswith("\n") else remote_text + "\n")
-            f.write("=== local part on this Mac\n")
-            f.write(local_text if not local_text or local_text.endswith("\n") else local_text + "\n")
+            if not step:
+                f.write("=== local part on this Mac\n")
+                f.write(local_text if not local_text or local_text.endswith("\n") else local_text + "\n")
             for n in notes:
                 f.write("=== {}\n".format(n))
-            f.write("=== places: {} ({}) exit {}; local exit {} -> exit {}\n".format(machine, os_name, remote_code, local_code, code))
+            if step:
+                f.write("=== places: {} ({}) exit {} -> exit {}\n".format(machine, os_name, remote_code, code))
+                f.write("=== step: {}; workspace {}\n".format(step["show"], {
+                    "created": "created in {:g}s".format(prep["seconds"]), "reused": "reused"}.get(prep["kept"], "none")))
+            else:
+                f.write("=== places: {} ({}) exit {}; local exit {} -> exit {}\n".format(
+                    machine, os_name, remote_code, local_code, code))
         out = pa.read_text(output) or ""
-        try:
-            os.remove(local_out)
-        except OSError:
-            pass
+        if not step:
+            try:
+                os.remove(local_out)
+            except OSError:
+                pass
         update_progress(progress, state="done", exit=code, end=end, note="; ".join(notes) or None)
         with open(build_log, "a") as f:
             f.write("=== {} full suite: `{}` in {} on {} ({}) -> exit {} after {:.0f}s ===\n{}\n".format(
@@ -1805,9 +2172,12 @@ def run_remote(h, args, record, directory, command, evidence, build_log, where, 
         parts = [dict(p, place=machine) for p in parse_parts(remote_text)] + \
                 [dict(p, place="local") for p in parse_parts(local_text)]
         extra = {"run": run, "start": start, "end": end, "waited": waited, "load": load, "parts": parts, "output": output,
-                 "machine": machine, "os": os_name, "tools": tools,
-                 "places": [{"place": machine, "os": os_name, "exit": remote_code, "seconds": remote_seconds},
-                            {"place": "local", "os": mac, "exit": local_code, "seconds": local_seconds}]}
+                 "machine": machine, "os": os_name, "tools": dict(tools, **step_tools),
+                 "places": [{"place": machine, "os": os_name, "exit": remote_code, "seconds": remote_seconds}] + (
+                     [] if step else [{"place": "local", "os": mac, "exit": local_code, "seconds": local_seconds}])}
+        if step:
+            extra["step"] = {"sha256": step["entry"]["sha256"], "facts": step["key"], "keep": prep["kept"],
+                             "homeExceptions": prep["homes"]}
         if notes:
             extra["note"] = "; ".join(notes)
         if change:
@@ -1827,7 +2197,8 @@ def run_remote(h, args, record, directory, command, evidence, build_log, where, 
         if change:
             print("pa-full-suite: the worktree changed during the run ({}); the run is recorded under the tree it started "
                   "on with moved: true and is never reused; run pa-full-suite again for the new tree".format(change))
-        print("full suite exit {} on {} ({}) and this Mac (appended to {}; {})".format(code, machine, os_name, build_log, recorded))
+        print("full suite exit {} on {} ({}){} (appended to {}; {})".format(
+            code, machine, os_name, "" if step else " and this Mac", build_log, recorded))
         return code
     except Interrupted as e:
         print("pa-full-suite: interrupted: ending the run on {} and cleaning up".format(machine), flush=True)

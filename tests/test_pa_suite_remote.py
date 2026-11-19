@@ -955,7 +955,7 @@ class StepBase(Remote):
     def check_refused_on(self, word):
         """With --on: exit 2, the word in the output, no record."""
         before = len(self.lines())
-        code, out = self.main("--on", "box-1")
+        code, out = self.main("--again", "--on", "box-1")
         self.assertEqual(code, 2, out)
         self.assertIn(word, out)
         self.assertEqual(len(self.lines()), before, out)
@@ -1284,13 +1284,28 @@ class X25Sent(StepBase):
         self.assertFalse([c for c in self.calls() if c[0] == "file"], self.calls())
 
     def test_x25e_the_step_counts_in_the_size_bound(self):
+        """ship() itself (pa-full-suite loads its own copy of pa_suite, so BUNDLE_MAX is set on this one)."""
         import base64
-        saved = pa_suite.BUNDLE_MAX
-        self.addCleanup(setattr, pa_suite, "BUNDLE_MAX", saved)
-        with open(os.path.join(self.folder, "hooks", "step.sh"), "rb") as f:
-            step_b64 = len(base64.b64encode(f.read()))
-        pa_suite.BUNDLE_MAX = step_b64 + 10  # the bundle alone is more than 10 bytes
-        self.check_refused_on("too large")
+        pa_suite.pa = pa
+        entry, note = pa_suite.remote_full(pa.load_profile("test"))
+        self.assertIsNone(note)
+        step = {"entry": entry, "key": {"flavour": "x1"}, "repoSubdir": "src/pkg"}
+        tools = pa_suite.probe("box-1")["tools"]
+        pin = pa_suite.pins(pa_hooks, self.wt)[0]
+        size = {}
+        for limit, run in ((None, "a" * 12), (len(base64.b64encode(entry["bytes"])) + 10, "b" * 12)):
+            saved = pa_suite.BUNDLE_MAX
+            self.addCleanup(setattr, pa_suite, "BUNDLE_MAX", saved)
+            if limit:
+                pa_suite.BUNDLE_MAX = limit  # the bundle alone is more than 10 bytes
+                with self.assertRaises(pa_suite.SetupFailed) as e:
+                    pa_suite.ship(pa_hooks, "box-1", run, pin, tools, self.wt, step=step)
+                self.assertIn("too large", str(e.exception))
+                self.assertFalse([c for c in self.calls() if c[:2] == ["file", "write"] and run in c[-1]])
+            else:
+                pa_suite.ship(pa_hooks, "box-1", run, pin, tools, self.wt, step=step)
+                self.assertTrue(os.path.isfile(os.path.join(self.remote_folder(run), "step")))
+            pa_suite.cleanup("box-1", run)
 
 
 class X26Prepare(StepBase):
@@ -1321,11 +1336,11 @@ class X26Prepare(StepBase):
             "keep above HOME": "echo \"keep $(dirname \"$PA_STEP_REAL_HOME\")\"\n" + lay + cwd,
             "keep ..": "echo \"keep $PA_STEP_REAL_HOME/a/../b\"\n" + lay + cwd,
             "keep space": "echo \"keep $PA_STEP_REAL_HOME/a b\"\n" + lay + cwd,
-            "keep cr": "printf 'keep %s/a\\rb\\n' \"$PA_STEP_REAL_HOME\"\n" + lay + cwd,
+            "keep tab": "printf 'keep %s/a\\tb\\n' \"$PA_STEP_REAL_HOME\"\n" + lay + cwd,
             "keep under run": "echo \"keep $PA_STEP_RUN/k\"\n" + lay + cwd,
             "keep the run": "echo \"keep $PA_STEP_RUN\"\n" + lay + cwd,
             "two keep": "echo \"keep $PA_STEP_REAL_HOME/k\"; echo \"keep $PA_STEP_REAL_HOME/k2\"\n" + lay + cwd,
-            "keep not first": lay + "echo \"keep $PA_STEP_REAL_HOME/k\"\n" + cwd,
+            "keep not first": "echo progress\n" + lay + "echo \"keep $PA_STEP_REAL_HOME/k\"\n" + cwd,
             "bad kept": "echo \"keep $PA_STEP_REAL_HOME/k\"; echo 'kept maybe'\n" + lay + cwd,
             "bad home": lay + "echo 'home a b'\n" + cwd,
         }
@@ -1383,11 +1398,10 @@ class X26Prepare(StepBase):
         code, out = self.main("--on", "box-1")
         self.assertEqual(code, 0, out)
 
-    def test_x26f_a_missing_home_line_in_the_probe_is_a_setup_failure(self):
-        saved = pa_suite.HOME_LINE
-        self.addCleanup(setattr, pa_suite, "HOME_LINE", saved)
-        pa_suite.HOME_LINE = "printf 'home %s\\n' relative\n"
+    def test_x26f_a_relative_home_from_the_probe_is_a_setup_failure(self):
+        self.setenv(HOME="relative/home")  # the stub machine's user HOME is this process's
         self.check_refused_on("HOME")
+        self.assertEqual(self.step_calls(), [])
 
 
 class X27Record(StepBase):

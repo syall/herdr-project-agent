@@ -646,6 +646,20 @@ clean worktree whose full command is `sh tests/run-all.sh` goes, or a profile's 
 declares runs it in a plain git repo (`"tests": {"full": "hooks/tests.sh full", "fullIsRunAll": {"command":
 "hooks/tests.sh full", "unlessFound": ["<a file that marks a workspace>"]}}`): that counts while the worktree root
 is its git top level with an executable `tests/run-all.sh` and no listed file is in it or a folder above it.
+A profile whose full command needs more than the repository (a workspace around it) can name a step that sets it
+up there: `"tests": {"full": "hooks/tests.sh full", "remoteFull": {"command": "hooks/tests.sh full", "marker":
+"<a file above the worktree that marks the workspace>", "facts": "hooks/<facts script>", "step": "hooks/<step
+script>"}}` (both scripts executable files in the profile's `hooks/`, at most 64 KB; a bad entry is named and
+ignored). The facts script runs here first, as `<facts> <worktree root>` (30 s at most), and prints one JSON object:
+`{"ok": true, "repoSubdir": "<where the clone goes>", "key": {"<name>": "<value>"}, "show": "<one line>"}` or
+`{"ok": false, "reason": "..."}` (then the run is on this Mac, or exit 2 with `--on`). Only the bundle, the step
+script and a `facts.json` (key and repoSubdir) are sent. There the step is run as `<run>/step <action> <run>`
+with the run's own HOME and `PA_STEP_FACTS`, `PA_STEP_REAL_HOME` (the machine user's HOME) and `PA_STEP_RUN`:
+`probe` prints `tool <name> <path or -> <version>` or `missing <name>` lines; `prepare` lays the clone out and
+prints `cwd <folder in the run folder>` (once), and may print `keep <absolute folder>` as its first line (a folder
+it keeps across runs, never removed by pa-full-suite), `kept created` or `kept reused`, and `home <command>` for
+each command it runs with the real HOME; `run` runs the suite from that folder. Its exit is the run's (no part
+runs on this Mac), and the record keeps the step's sha256, the facts key and the keep state.
 Then: a `git bundle` of the pinned commit is sent,
 and its commit and tree are checked there. If every machine is busy for `PA_SUITE_PREFER_WAIT` (300) s, or
 none is reachable, or the setup there fails, the run is on this Mac and says why. The output, `--status`,
