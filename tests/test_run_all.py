@@ -57,6 +57,7 @@ try:
 except OSError:
     sys.exit(0)
 print('FAIL slot: free during the run'); sys.exit(1)" "$HERDR_PA_HOME/suite-slots/slot-0" || exit 1 ;;
+  envs) env | grep -E '^(HC_|PA_SUITE_HC_)' | sort > "$STUB_DIR/$k.env" ;;
   git) { echo "git=$(command -v git)"; echo "python3=$(command -v python3)"; echo "path=$PATH"; } > "$STUB_DIR/$k.git" ;;
   wait:*) other=${m#wait:}; n=0
     until grep -q "start $other" "$STUB_DIR/events"; do
@@ -1024,6 +1025,104 @@ def table_problems(text):
         if at != sorted(at):
             problems.append("part {} is not in the whole run's order: {}".format(k, names))
     return problems
+
+
+# A pa_suite.py in front of the real one (t-107 R13): it writes the PA_SUITE_HC_* and HC_* names it got, then runs the
+# real one with the same arguments.
+SLOT_SPY = """import os, sys
+with open(os.path.join(os.environ["STUB_DIR"], "slot.env"), "a") as f:
+    f.write("".join("%s=%s\\n" % kv for kv in sorted(os.environ.items()) if kv[0].startswith(("HC_", "PA_SUITE_HC_"))))
+os.execv(sys.executable, [sys.executable, {real!r}] + sys.argv[1:])
+"""
+HC_GIVEN = {"HC_TERMINAL_ID": "w9", "HC_SOCKET": "/x/sock", "HC_TERMINAL_SOCKET": "/x/t", "HC_SCOPE": "s1"}
+
+
+class Fixture(unittest.TestCase):
+    """RunAll's fixture and helpers without its tests (a subclass of RunAll would run them all again)."""
+    setUp, tearDown, env_for, summary = RunAll.setUp, RunAll.tearDown, RunAll.env_for, RunAll.summary
+
+    def run_with(self, env, *args):
+        r = subprocess.run(["sh", os.path.join(self.repo, "tests", "run-all.sh")] + list(args), cwd=self.tmp, env=env,
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, timeout=120)
+        return r.returncode, r.stdout
+
+
+class HcForTheSlotStep(Fixture):
+    """t-107 R13: run-all.sh keeps the hc variables for its slot step only (as PA_SUITE_HC_*); no part sees them."""
+
+    def test_h1_the_slot_step_gets_them_and_no_part_does(self):
+        write(os.path.join(self.repo, "runtime", "tools", "pa_suite.py"),
+              SLOT_SPY.format(real=os.path.join(HERE, "..", "runtime", "tools", "pa_suite.py")))
+        env = self.env_for(keeper="envs", PA_SUITE_HC_SCOPE="inherited")
+        env.update(HC_GIVEN)
+        code, out = self.run_with(env, "--affected")
+        self.assertEqual(code, 0, out)
+        self.assertIn("  keeper harness: ok", self.summary(out))
+        self.assertEqual(pa_text(os.path.join(self.tmp, "keeper.env")), "", "a part saw hc variables")
+        got = dict(l.split("=", 1) for l in pa_text(os.path.join(self.tmp, "slot.env")).splitlines() if l)
+        self.assertEqual(got, {"PA_SUITE_" + k: v for k, v in HC_GIVEN.items()})
+
+    def test_h2_without_them_the_slot_step_gets_none(self):
+        write(os.path.join(self.repo, "runtime", "tools", "pa_suite.py"),
+              SLOT_SPY.format(real=os.path.join(HERE, "..", "runtime", "tools", "pa_suite.py")))
+        env = {k: v for k, v in self.env_for().items() if not k.startswith(("HC_", "PA_SUITE_HC_"))}
+        code, out = self.run_with(env, "--affected")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(pa_text(os.path.join(self.tmp, "slot.env")), "")
+
+
+class RemoteAffected(Fixture):
+    """t-107 R12 end to end: the real run-all.sh and slot step in a git fixture with box-1 configured (hc is
+    tests/stub-hc: the machine is a folder here). --affected runs there, its output keeps run-all.sh's shape, the
+    run there does not ship again, the slot step's hc calls carry the hc variables and its parts do not."""
+
+    def setUp(self):
+        super().setUp()
+        for name in ("pa_run", "pa_hooks"):
+            shutil.copy(os.path.join(HERE, "..", "runtime", "tools", name + ".py"), os.path.join(self.repo, "runtime", "tools"))
+        for argv in (["init", "-q", "-b", "main"], ["config", "user.email", "t@example.com"], ["config", "user.name", "T"],
+                     ["add", "-A"], ["commit", "-q", "-m", "fixture"]):
+            subprocess.run(["git", "-C", self.repo] + argv, check=True, stdout=subprocess.DEVNULL)
+        self.bin = os.path.join(self.tmp, "bin")
+        os.makedirs(self.bin)
+        os.symlink(os.path.join(HERE, "stub-hc"), os.path.join(self.bin, "hc"))
+        os.symlink(self.node, os.path.join(self.bin, "node"))
+        write(os.path.join(self.home, "config.json"), json.dumps({"suiteMachines": [{"machine": "box-1"}]}))
+        self.stub = os.path.join(self.tmp, "stub")
+        self.hclog = os.path.join(self.tmp, "hc.log")
+        self.envlog = os.path.join(self.tmp, "hc-env.log")
+
+    def remote_env(self, **stubs):
+        env = {k: v for k, v in self.env_for(**stubs).items() if not k.startswith(("HC_", "PA_SUITE_HC_"))}
+        env.update(HC_GIVEN, PATH=self.bin + os.pathsep + env.get("PATH", ""), STUB_HC_ROOT=self.stub,
+                   STUB_HC_LOG=self.hclog, STUB_HC_ENVLOG=self.envlog, STUB_HC_MACHINES="box-1",
+                   PA_SUITE_REMOTE_POLL="0.2")
+        return env
+
+    def test_e1_affected_runs_there_in_run_all_shape(self):
+        code, out = self.run_with(self.remote_env(keeper="envs"), "--affected")
+        self.assertEqual(code, 0, out)
+        lines = out.rstrip().splitlines()
+        self.assertRegex(lines[0], r"^run-all\.sh: on box-1 \(\S+\)$", out)
+        self.assertRegex(lines[-1], r"^=== all passed \(outputs: ", out)
+        summary = self.summary(out)
+        for name in ("python 3.7 parse", "unit tests: test_stub", "keeper harness", "store harness"):
+            self.assertIn("  {}: ok".format(name), summary)
+        self.assertNotIn("pa-session integration", out)
+        calls = [json.loads(l) for l in pa_text(self.hclog).splitlines() if l.strip()]
+        self.assertEqual(len([c for c in calls if c[0] == "run"]), 1, calls)  # PA_SUITE_REMOTE=1 there: no second ship
+        envs = [json.loads(l)["env"] for l in pa_text(self.envlog).splitlines() if l.strip()]
+        self.assertTrue(envs)
+        for e in envs:
+            self.assertEqual(e, HC_GIVEN)
+        self.assertEqual(pa_text(os.path.join(self.tmp, "keeper.env")), "", "a part there saw hc variables")
+        self.assertEqual(os.listdir(os.path.join(self.stub, "box-1", "tmp")), [], "the run folder there is removed")
+
+    def test_e2_a_full_run_by_hand_stays_here(self):
+        code, out = self.run_with(self.remote_env(), "--except-integration")
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("run-all.sh: on box-1", out)
+        self.assertFalse(os.path.exists(self.hclog) and pa_text(self.hclog), "no hc call")
 
 
 class PartTable(unittest.TestCase):
