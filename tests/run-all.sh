@@ -137,6 +137,18 @@ hold=${PA_SUITE_HOLD:-unknown}
 tmp=${TMPDIR:-/tmp}
 out=$(mktemp -d "${tmp%/}/run-all.XXXXXX") || { echo "run-all.sh: cannot make a temp folder under $tmp" >&2; exit 2; }
 printf '%s\n' "$hold" > "$out/slot"
+# The real git (t-093, t-062 F1): on a Mac /usr/bin/git is xcrun's front end, ~4x the CPU of the git it finds on
+# each of the suite's many git calls. Asked once here, xcrun's <prefix>/bin/git goes first on PATH for the parts
+# as $out/git/bin/git, a link named git in a folder of its own (its prefix's bin also holds a python3, make, cc ...
+# that must not shadow the caller's), beside links to the prefix's other folders (git finds its helpers and
+# templates beside the path it was started by). Without xcrun, or when it names no <prefix>/bin/git, PATH is as it was.
+real=
+command -v xcrun >/dev/null 2>&1 && real=$(xcrun --find git 2>/dev/null)
+pre=${real%/bin/git}
+if [ -n "$pre" ] && [ "$pre/bin/git" = "$real" ] && [ -x "$real" ] && mkdir -p "$out/git/bin"; then
+  for d in "$pre"/*; do [ "${d##*/}" = bin ] || ln -s "$d" "$out/git/${d##*/}"; done
+  ln -s "$real" "$out/git/bin/git" && PATH="$out/git/bin:$PATH" && export PATH
+fi
 log() { eval "echo \"\$out/\$1-\$part_$1\${arg_$1:+-\$arg_$1}.log\""; }
 # The parts for pa_suite.py's watcher (t-076): one line each, <i> TAB <name> TAB <log>; then the run folder is
 # named in the file PA_SUITE_WATCH (made whole, then moved), and the watcher's variables are not the parts'.
