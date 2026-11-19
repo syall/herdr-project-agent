@@ -8,13 +8,19 @@
   pa-queue restack --repo R [--dry-run]         rebase the invalidated entries as a chain, in merge order
   pa-queue verify <task> [--job J] --repo R     decide whether the branch is clean against the content checked
                                                 (clean, moved or union: a short review; changed; stale)
-  pa-queue refresh --repo R                     record short reviews, set passed or failed, restack after a failure
+  pa-queue refresh --repo R [--no-merge]        record short reviews and answered queue cards, set passed or failed,
+                                                restack after a failure, then merge what is approved and passed
+  pa-queue card --repo R --limits T             one queue card for the ready entries at the front (at most 4)
+  pa-queue merge --repo R                       fast-forward local main, entry by entry, through R9's tests
+  pa-queue brief <task> [--job J] --repo R      the carry-over handoff for one worker per entry (reads only)
 
 queue.json, in the space's state folder, is written by this tool only, under <state>/.queue.lock; each state change
 appends one journal line ("trigger": "queue"). Workers' shells are refused. Clean is decided here and nowhere else:
 from git, never from a worker's report. The tool rebases only branches of queue entries, in their own clean worktrees
-with no open worker, with the old tip journalled first; on a conflict it aborts. It never pushes, fetches, merges, or
-touches main or a remote. The queue card and the merge are J3's.
+with no open worker, with the old tip journalled first; on a conflict it aborts. It never pushes, fetches or touches
+a remote. The one command that moves main is `merge` (J3b): `git merge --ff-only` of an approved, passed entry's tip
+in the main checkout (hooks off, no GIT_*), under the queue lock and the push lock, each of R9's tests read from git
+and the files at that moment; after a merge it opens (or replaces) the push card through pa-push-main's plan.
 
 d-166 (t-052 J3c): a rebase conflict a rebase worker resolved by keeping both sides unchanged is `union` (the tool
 proves it with git merge-file --union on the blobs) and needs a doc-only short review (only docstrings or comments?),
@@ -52,6 +58,14 @@ START_LINE = re.compile(r"^Start: (\S+)[ \t]*$", re.M)
 END_LINE = re.compile(r"^End: (\S+)[ \t]*$", re.M)
 REVIEWER_LINE = re.compile(r"^Reviewer: (\S+)", re.M)
 VERDICT_LINE = re.compile(r"^Verdict: (pass|must fix(?: \(\d+\))?)[ \t]*$", re.M)
+INDEPENDENT_LINE = re.compile(r"^Independent: (yes|no)\b", re.M | re.I)
+CARD_MAX = 4  # entries on one queue card (R10, Q7)
+ALL = "Merge all in order"
+NOT_NOW = "Not now"
+MERGE_TIMEOUT = 120
+IND_QUESTION = ("do the change and what moved under it since its passing suite behave independently: does either one change, "
+                "call, define or shadow anything the other uses (names, imports, constants, files it reads, tests)? Write "
+                "'Independent: yes' or 'Independent: no' with one line of reason")
 DOC_QUESTION = ("is every conflict region only docstrings or comments, both sides kept word for word? 'yes' or 'no' per "
                 "region with one line of reason")
 QUESTION = ("for each place where the base's change lies within about 30 lines of the change, or where one calls, defines "
@@ -548,7 +562,7 @@ def derive(ctx, rec):
     out, ahead, prev = [], None, rec["main"]
     for e in rec["entries"]:
         n = {"tip": ctx.tip(e.get("branch")), "ontoTip": ctx.tip(e.get("onto")), "content": None, "files": [], "suite": None,
-             "review": None, "gate": None, "why": "", "state": "checking", "timing": None}
+             "review": None, "gate": None, "why": "", "state": "checking", "timing": None, "carry": None}
         if not n["tip"] or not n["ontoTip"]:
             n.update(state="invalidated", why="its branch or its onto branch is missing")
         elif ahead == "invalidated":
@@ -575,6 +589,11 @@ def derive(ctx, rec):
                                and (d["result"] != "union" or x.get("about") == "doc-only"))
                     n["review"] = r
                 task = ctx.task(e["task"])
+                if not s and d["result"] == "clean" and task is not None:
+                    # r-disjoint-carry (d-202): the earlier pass counts once its independence review says yes
+                    n["carry"] = carry(ctx, rec, e, n["tip"], tree, task, d, suites, reviews)
+                    if n["carry"]["ok"]:
+                        s = n["suite"] = carried_run(n["carry"])
                 if task is None:
                     n.update(state="failed", why="the task is not in the ledger")
                 elif not (s and s.get("exit") == 0):
@@ -585,6 +604,8 @@ def derive(ctx, rec):
                         n.update(state="failed", why="the full suite exited {} on its tree ({}, {})".format(s.get("exit"), s.get("worker"), s.get("ended")))
                     elif r and r.get("verdict") != "pass":
                         n.update(state="failed", why="short review: {}".format(r.get("verdict")))
+                    elif (n["carry"] or {}).get("eligible") and ((e.get("needs") or {}).get("independence") or {}).get("tip") == n["tip"]:
+                        n["why"] = "waiting for its independence review (r-disjoint-carry), or its suite"
                     else:
                         n["why"] = "waiting for its suite"
                 else:
@@ -609,6 +630,11 @@ def derive(ctx, rec):
         out.append((e, n))
         ahead, prev = n["state"], e.get("branch")
     return out
+
+
+def carried_run(c):
+    """The earlier suite run, marked as carried to the tip (r-disjoint-carry)."""
+    return dict(c["suite"], carried={"from": c["from"], "review": (c.get("review") or {}).get("file")})
 
 
 def set_state(ctx, entry, state, why=""):
@@ -729,7 +755,10 @@ def restack(ctx, data, rec, dry=False):
                 e["needs"] = {"shortReview": needs_for(ctx, e, new, d, e["checked"]["base"], prev_tip)}
                 lines += handoff_lines(e, e["needs"]["shortReview"])
             else:
-                e["needs"] = None
+                ind = independence_need(ctx, rec, e, new, task, d)
+                e["needs"] = {"independence": ind} if ind else None
+                if ind:
+                    lines += independence_lines(e, ind)
             lines.append("{}: rebased onto {} at {}: {} (run pa-gate {} again; its suite runs on the new tree)".format(
                 e["task"], prev, short(prev_tip), d["result"], e["task"]))
             prev, prev_tip = e["branch"], new
@@ -745,10 +774,11 @@ def restack(ctx, data, rec, dry=False):
 def record_reviews(ctx, rec):
     """refresh (a): a short review file the tool named, valid, becomes one line of content/reviews.jsonl."""
     have = pa_hooks.review_runs(ctx.directory)
-    for e in rec["entries"]:
-        need = (e.get("needs") or {}).get("shortReview")
+    for e, need in [(e, (e.get("needs") or {}).get(k)) for e in rec["entries"] for k in ("shortReview", "independence")]:
         tip = ctx.tip(e["branch"])
-        if not need or need.get("tip") != tip or any(r.get("task") == e["task"] and r.get("tip") == tip for r in have):
+        ind = bool(need) and need.get("kind") == "independent"  # r-disjoint-carry's review is recorded apart (d-202)
+        if not need or need.get("tip") != tip or any(r.get("task") == e["task"] and r.get("tip") == tip and
+                                                     (r.get("about") == "independent") == ind for r in have):
             continue
         path = os.path.join(ctx.directory, "evidence", e["task"], need["file"])
         if not os.path.isfile(path):
@@ -766,6 +796,9 @@ def record_reviews(ctx, rec):
         verdict = VERDICT_LINE.findall(text)
         if not verdict:
             problems.append("it has no Verdict: line")
+        independent = INDEPENDENT_LINE.findall(text) if ind else None
+        if ind and not independent:
+            problems.append("it has no Independent: yes or Independent: no line")
         who = REVIEWER_LINE.search(text)
         address = pa.local_id(who.group(1)) if who else None
         task = ctx.task(e["task"]) or {}
@@ -789,6 +822,8 @@ def record_reviews(ctx, rec):
                 "branch": e["branch"], "tip": tip, "tree": ctx.tree(tip), "file": need["file"], "fileSha256": sha, "worker": address,
                 "started": start.group(1), "ended": end.group(1), "seconds": round(t1 - t0, 1),
                 "verdict": "pass" if verdict[-1] == "pass" else "must fix", "about": need.get("kind") or "moved"}
+        if ind:
+            line["independent"] = independent[-1].lower() == "yes"
         os.makedirs(pa_hooks.content_dir(ctx.directory), exist_ok=True)
         with open(os.path.join(pa_hooks.content_dir(ctx.directory), REVIEWS_FILE), "a") as f:
             f.write(json.dumps(line) + "\n")
@@ -806,6 +841,36 @@ def run_text(r):
     return "{} ({} to {}, {} s)".format(word, r.get("started"), r.get("ended"), r.get("seconds"))
 
 
+def valid_approval(e):
+    a = e.get("approval")
+    return isinstance(a, dict) and not a.get("void")
+
+
+def card_approval(e):
+    """A valid approval that a queue card recorded: it names the content approved (both digests). Only such an
+    approval can merge, or start refresh's merge; one naming no content approves nothing and is never voided."""
+    a = e.get("approval")
+    return valid_approval(e) and all(isinstance(a.get(k), str) and a[k] for k in ("change", "sequence"))
+
+
+def carry_over(e, n):
+    """What the entry's carry-over check still needs (J3b brief and show): none, suite, short review, both, or the
+    independence review of r-disjoint-carry; '-' for an entry that is not checking or passed."""
+    if n["state"] not in ("checking", "passed"):
+        return "-"
+    ind = ((e.get("needs") or {}).get("independence") or {}).get("tip") == n["tip"]
+    if not n["suite"] and (n.get("carry") or {}).get("eligible") and ind:
+        return "independence review"
+    suite = not (n["suite"] and n["suite"].get("exit") == 0)
+    review = n["content"] in ("moved", "union") and not (n["review"] and n["review"].get("verdict") == "pass")
+    return "suite + short review" if suite and review else "suite" if suite else "short review" if review else "none"
+
+
+def approval_text(a):
+    return "{} ({}){}{}".format(a.get("card"), a.get("option") or "?", ", void: " + str(a["void"]) if a.get("void") else "",
+                               ", carried: " + str(a["carried"]) if a.get("carried") else "")
+
+
 def show_lines(ctx, rec, pairs):
     lines = ["Queue of {} (main {} at {}):".format(rec_repo_name(ctx), rec["main"], short(ctx.tip(rec["main"])))]
     if not pairs:
@@ -821,14 +886,19 @@ def show_lines(ctx, rec, pairs):
             run_text(n["review"]) if n["review"] else ("needed: " + need["file"] if n["content"] in ("moved", "union") and need else "not needed")))
         if n["timing"]:
             lines.append("   bottleneck: {} by {} s".format(n["timing"]["bottleneck"], n["timing"]["by"]))
+        lines.append("   carry-over: {}".format(carry_over(e, n)))
+        front = front and n["state"] == "passed"
         if e.get("approval"):
-            lines.append("   approval: {}".format(json.dumps(e["approval"])))
+            lines.append("   approval: {}{}".format(approval_text(e["approval"]), "; approved and mergeable"
+                                                   if front and valid_approval(e) else ""))
         elif e.get("heldApproval"):
             lines.append("   approval held until its doc-only short review passes: {}".format(json.dumps(e["heldApproval"])))
-        front = front and n["state"] == "passed"
         if front:
             mergeable.append(e["task"])
     lines.append("mergeable: {}".format(", ".join(mergeable) or "none"))
+    cards = queue_cards(ctx.directory, rec["common"], "open")
+    lines.append("open queue cards: {}".format("; ".join("{} ({})".format(i, ", ".join(x.get("task") for x in c["queue"].get(
+        "entries") or [] if isinstance(x, dict))) for i, c in cards) or "none"))
     for l in rec["left"][-5:]:
         lines.append("left: {} ({}, {})".format(l["task"], l.get("why"), l.get("at")))
     for m in rec["merged"][-5:]:
@@ -962,6 +1032,11 @@ def add(ctx, data, rec, tid, job):
         if d["result"] in ("moved", "union"):
             entry["needs"] = {"shortReview": needs_for(ctx, entry, new, d, checked["base"], onto_tip)}
             lines += handoff_lines(entry, entry["needs"]["shortReview"])
+        else:
+            ind = independence_need(ctx, rec, entry, new, task, d)
+            if ind:
+                entry["needs"] = {"independence": ind}
+                lines += independence_lines(entry, ind)
         lines.append("{}: rebased onto {} at {}: {} (run pa-gate {} again)".format(tid, onto, short(onto_tip), d["result"], tid))
     else:
         d = decide(ctx, checked, tip, onto, onto_tip)
@@ -1054,6 +1129,87 @@ def upstream(ctx, rec, tip, onto_tip):
             if best is None or ctx.is_ancestor(best, old):
                 best = old
     return best or base
+
+
+# ---- r-disjoint-carry (d-202): a clean disjoint rebase keeps the suite pass ---------------------------------
+
+def earlier_pass(ctx, e, tip, suites):
+    """(run, sha, base): the newest passing reusable suite run on the tree of an earlier tip of the entry with the
+    checked content: the checked commit (on the checked base), or a tip an earlier clean rebase made (on that rebase's
+    onto tip). The latest reusable run on a tree decides for it (a later failure there is no pass). None if none."""
+    c = e.get("checked") or {}
+    tips = [(c.get("commit"), c.get("base"))] + [(r.get("to"), r.get("ontoTip")) for r in (e.get("rebases") or [])[:-1]
+                                                 if isinstance(r, dict) and r.get("result") == "clean"]
+    for sha, base in reversed(tips):
+        if not sha or sha == tip or not base:
+            continue
+        tree = ctx.tree(sha)
+        run = latest(suites, lambda r: tree and r.get("tree") == tree and r.get("reusable") and r.get("uncommitted") == 0)
+        if run and run.get("exit") == 0:
+            return run, sha, base
+    return None
+
+
+def carry(ctx, rec, e, tip, tree, task, d, suites, reviews):
+    """Whether the entry's earlier suite pass counts for its tip (rule r-disjoint-carry, approved d-202): its last
+    rebase was clean (every +/- line identical: the same change and sequence digests) and made this tip; the task is
+    not high tier; an earlier passing suite of the same content exists; no file the change touches differs between
+    its checked base (and that suite's base) and its base now; and a short review recorded for this tip and tree says
+    'Independent: yes' with Verdict pass. {ok, eligible (all but the review hold), why, suite, from, fromBase,
+    review}."""
+    def no(why):
+        return {"ok": False, "eligible": False, "why": why, "suite": None, "review": None}
+    if str((task or {}).get("tier") or "normal").lower() == "high":
+        return no("a high-tier change always gets the suite")
+    if d.get("result") != "clean":
+        return no("its rebase was not clean")
+    rebases = [r for r in e.get("rebases") or [] if isinstance(r, dict)]
+    if not rebases or rebases[-1].get("to") != tip or rebases[-1].get("result") != "clean":
+        return no("no clean rebase made its tip")
+    found = earlier_pass(ctx, e, tip, suites)
+    if not found:
+        return no("no earlier passing suite of the same content")
+    run, at, at_base = found
+    c, new_base = e.get("checked") or {}, e.get("base")
+    files = touched(ctx, c.get("base"), c.get("commit")) if c.get("base") and c.get("commit") else set()
+    if not files or not new_base or not ctx.tree(new_base) or not ctx.tree(at_base):
+        return no("the files of the change, or of what moved under it, cannot be read")
+    shared = sorted(files & (touched(ctx, c["base"], new_base) | touched(ctx, at_base, new_base)))
+    if shared:
+        return no("a file of the change changed under it since its check: " + ", ".join(shared[:5]))
+    r = latest(reviews, lambda x: x.get("task") == e["task"] and (x.get("job") or None) == (e.get("job") or None)
+               and x.get("common") == rec["common"] and x.get("tip") == tip and tree and x.get("tree") == tree
+               and x.get("about") == "independent")
+    out = {"ok": False, "eligible": True, "suite": run, "from": at, "fromBase": at_base, "review": r}
+    if not r:
+        return dict(out, why="waiting for its independence review (r-disjoint-carry)")
+    if r.get("verdict") != "pass" or r.get("independent") is not True:
+        return dict(out, eligible=False, why="its independence review did not say 'Independent: yes' with Verdict pass")
+    return dict(out, ok=True, why="")
+
+
+def independence_need(ctx, rec, e, tip, task, d):
+    """After a tool rebase that was clean: the independence review's need when every other condition of
+    r-disjoint-carry holds (else None: the suite runs as before)."""
+    c = carry(ctx, rec, e, tip, ctx.tree(tip), task, d, pa_hooks.suite_runs(ctx.directory), [])
+    if not c.get("eligible"):
+        return None
+    n = max(1, len(e.get("rebases") or []))
+    return {"tip": tip, "tree": ctx.tree(tip), "file": "SHORT-REVIEW-{}{}-{}.md".format(e["task"], "-" + e["job"] if e.get("job") else "", n),
+            "since": now(), "kind": "independent", "suiteTip": c["from"], "suiteTree": c["suite"].get("tree"),
+            "oldBase": c["fromBase"], "newBase": e.get("base")}
+
+
+def independence_lines(entry, need):
+    t = entry["task"]
+    return ["{}: a short review of independence is needed (r-disjoint-carry: its suite passed on tree {} before this clean "
+            "rebase; no second suite run when the review says 'Independent: yes'): a fresh reviewer writes evidence/{}/{}".format(
+                t, short(need.get("suiteTree")), t, need["file"]),
+            "  the change: git diff {} {}; what moved under it since that suite: git diff {} {}".format(
+                need.get("newBase"), need["tip"], need.get("oldBase"), need.get("newBase")),
+            "  question: " + IND_QUESTION + "; then 'Verdict: pass' or 'Verdict: must fix (<n>)'.",
+            "  the file has the lines Start: <UTC time>, End: <UTC time>, Reviewer: <its address>, Independent: yes|no, "
+            "Checked: {}, and its Verdict: line".format(need["tip"])]
 
 
 def with_dependents(rec, entry):
@@ -1180,6 +1336,7 @@ def cmd_refresh(args):
         sync_main(ctx, rec)
         record_reviews(ctx, rec)
         restored = restore_approvals(ctx, rec)
+        restored += apply_cards(ctx, rec)  # approvals are recorded even with --no-merge; merging is what it skips
         pairs = derive(ctx, rec)
         first = None
         for e, n in pairs:
@@ -1188,7 +1345,8 @@ def cmd_refresh(args):
                 continue
             if first is None:
                 set_state(ctx, e, n["state"], n["why"])
-                e["suite"] = dict(span(n["suite"]), tree=n["suite"].get("tree"), exit=n["suite"].get("exit"), worker=n["suite"].get("worker")) if n["suite"] else None
+                e["suite"] = dict(span(n["suite"]), tree=n["suite"].get("tree"), exit=n["suite"].get("exit"), worker=n["suite"].get("worker"),
+                                  **({"carried": n["suite"]["carried"]} if n["suite"].get("carried") else {})) if n["suite"] else None
                 e["review"] = dict(span(n["review"]), tip=n["review"].get("tip"), verdict=n["review"].get("verdict"),
                                    worker=n["review"].get("worker"), file=n["review"].get("file")) if n["review"] else None
                 if n["timing"] and e.get("timed") != n["tip"]:
@@ -1209,6 +1367,9 @@ def cmd_refresh(args):
         more, stop = restack(ctx, data, rec)
         lines += more
         save(ctx, data, rec)
+        if not args.no_merge and any(card_approval(e) for e in rec["entries"]):
+            # Wanted 1 (Q-J3-3): an approved entry merges the moment it passed and every entry ahead merged
+            lines += merge_run(ctx, data, rec)
         lines += ["{}. {}: {}".format(i, e["task"], e.get("state")) for i, e in enumerate(rec["entries"], 1)] + ctx.notes
         lines.append("pa-queue show --repo {} reads every state now".format(ctx.repo))
     print("\n".join(lines))
@@ -1218,14 +1379,382 @@ def cmd_refresh(args):
     return 0
 
 
+# ---- the queue card (R10) ------------------------------------------------------------------------
+
+def card_number(name):
+    m = re.match(r"^d-queue-(\d+)\.json$", name)
+    return int(m.group(1)) if m else None
+
+
+def queue_cards(directory, common, status=None):
+    """[(id, card)] of the queue cards in decisions/ for the repository whose common dir is common, in number order."""
+    folder = os.path.join(directory, "decisions")
+    out = []
+    for name in sorted(os.listdir(folder), key=lambda x: (card_number(x) or 0, x)) if os.path.isdir(folder) else []:
+        if card_number(name) is None:
+            continue
+        card = pa.read_json_safe(os.path.join(folder, name))
+        if not isinstance(card, dict) or card.get("kind") != "queue":
+            continue
+        q = card.get("queue")
+        if not isinstance(q, dict) or q.get("common") != common or (status and card.get("status") != status):
+            continue
+        out.append((name[:-5], card))
+    return out
+
+
+def next_card_id(directory):
+    n = 1
+    while any(os.path.lexists(os.path.join(directory, sub, "d-queue-{}.json".format(n))) for sub in ("decisions", pa.ARCHIVE)):
+        n += 1
+    return "d-queue-{}".format(n)
+
+
+def names(text, tid):
+    return re.search(r"(?<![A-Za-z0-9_-])" + re.escape(tid) + r"(?![A-Za-z0-9_-])", text or "") is not None
+
+
+def label(e):
+    return e["task"] + (" " + e["job"] if e.get("job") else "")
+
+
+def ready_for_card(ctx, rec, e, n):
+    """AC10.1 (with spec-amendment's note): on its onto tip, its content the checked one (clean, moved or union), the
+    gate passing now and GATE.json pinning its tip; `passed` is not needed (the person answers while suites run)."""
+    if n["state"] not in ("checking", "passed") or n["content"] not in ("clean", "moved", "union"):
+        return False
+    task = ctx.task(e["task"])
+    return bool(task) and gate_now(ctx, task)[0] and gate_pin(ctx, rec, e["task"], n["tip"])
+
+
+def cmd_card(args):
+    with writing(args) as (ctx, data, rec):
+        sync_main(ctx, rec)
+        pairs = derive(ctx, rec)
+        listed = {(x.get("task"), x.get("job") or None) for _i, c in queue_cards(ctx.directory, rec["common"], "open")
+                  for x in c["queue"].get("entries") or [] if isinstance(x, dict)}
+        chosen = []
+        for e, n in pairs:
+            held = valid_approval(e) or e.get("heldApproval") or (e["task"], e.get("job") or None) in listed
+            if held and not chosen:
+                continue  # ahead: approved, or on an open card (Q-J3-2)
+            if held or len(chosen) == CARD_MAX or not ready_for_card(ctx, rec, e, n):
+                break
+            chosen.append((e, n))
+        if not chosen:
+            raise Refused("no entry is ready for a queue card: the front of the queue is approved, on an open card, or not "
+                          "ready (pa-queue show says why)")
+        missing = [e["task"] for e, _n in chosen if not names(args.limits, e["task"])]
+        if missing:
+            raise Refused("--limits must name each listed task, with its Recorded limits or 'none' (AC10.3): {} {} not named".format(
+                ", ".join(missing), "is" if len(missing) == 1 else "are"))
+        cid = next_card_id(ctx.directory)
+        main_tip = ctx.tip(rec["main"])
+        entries = []
+        context = ["Main {} of {} is at {}. In merge order, each stacked on the one ahead; an entry merges only after every "
+                   "entry ahead of it merged:".format(rec["main"], ctx.repo, short(main_tip))]
+        for i, (e, n) in enumerate(chosen, 1):
+            c = e["checked"]
+            entries.append({"task": e["task"], "job": e.get("job"), "branch": e["branch"], "tip": n["tip"], "onto": e["onto"],
+                            "base": e["base"], "change": c["change"], "sequence": c["sequence"], "commit": c["commit"],
+                            "verify": c.get("verify"), "review": c.get("review"), "state": n["state"], "added": e.get("added")})
+            context.append("{}. {} {} on {}: tip {}, content {} (as checked at {}: VERIFY.md {}, REVIEW.md {}), state {}{}; "
+                           "evidence/{}/".format(i, label(e), e["branch"], e["onto"], short(n["tip"]), n["content"], short(c["commit"]),
+                                                 short(c.get("verify")), short(c.get("review")), n["state"],
+                                                 " ({})".format(n["why"]) if n["why"] else "", e["task"]))
+        context.append("At merge time pa-queue merge reads again, for each: the content is the one checked, every rebase "
+                       "since was clean (or moved or union with its short review), the gate passes at its tip, and its own "
+                       "suite passed on its tree. Nothing is pushed: the push card follows.")
+        context.append(args.limits.strip())
+        tasks = [label(e) for e, _n in chosen]
+        options = [{"label": ALL, "detail": ", ".join(tasks), "count": len(tasks)}]
+        options += [{"label": "Merge up to " + tasks[k - 1], "detail": ", ".join(tasks[:k]), "count": k} for k in range(len(tasks) - 1, 0, -1)]
+        options.append({"label": NOT_NOW, "detail": "Nothing merges.", "count": 0})
+        card = {"id": cid, "task": chosen[0][0]["task"], "kind": "queue",
+                "question": "Merge {} queued change{} into {} of {}, in order?".format(len(tasks), "" if len(tasks) == 1 else "s",
+                                                                                   rec["main"], os.path.basename(ctx.repo)),
+                "context": pa_hooks.cut("\n".join(context), pa_hooks.CONTEXT_MAX), "options": options,
+                "evidence": ["REVIEW.md"], "recommendation": ALL, "status": "open", "answer": None, "note": None,
+                "created": now(), "answered": None,
+                "queue": {"version": 1, "repo": ctx.repo, "common": rec["common"], "mainBefore": main_tip, "entries": entries}}
+        pa.write_json(pa.card_for_write(ctx.directory, cid), card)
+        ctx.event("card", chosen[0][0], card=cid, entries=[{"task": e["task"], "job": e.get("job")} for e, _n in chosen])
+        save(ctx, data, rec)
+    print("{} opened: {} ({})".format(cid, card["question"], ", ".join(tasks)))
+    return 0
+
+
+def apply_cards(ctx, rec):
+    """R9 (1), AC9.2, AC10.5: every answered queue card of this repository not applied yet records its approvals, once.
+    Merge all in order / Merge up to X approve that prefix of the card's entries, each only while it is the same entry
+    the card asked about (task, job, when it joined, the checked digests); the first that is not ends the prefix.
+    Not now approves nothing; Other is left alone (no tool acts on the person's own words)."""
+    lines, applied = [], rec.setdefault("applied", [])
+    for cid, card in queue_cards(ctx.directory, rec["common"]):
+        q = card["queue"]
+        if cid in applied or q.get("applied") or card.get("status") != "answered" or pa.is_other(card):
+            continue
+        option = next((o for o in card.get("options") or [] if isinstance(o, dict) and o.get("label") == card.get("answer")), None)
+        listed = [x for x in q.get("entries") or [] if isinstance(x, dict)]
+        k = option.get("count") if option and isinstance(option.get("count"), int) and option.get("label") != NOT_NOW else 0
+        approved, skipped = [], []
+        for x in listed[:max(0, min(k, len(listed)))]:
+            e = next((e for e in rec["entries"] if same(e, x.get("task"), x.get("job"))), None)
+            c = (e or {}).get("checked") or {}
+            if e is None or (x.get("added"), x.get("commit"), x.get("change"), x.get("sequence")) != (
+                    e.get("added"), c.get("commit"), c.get("change"), c.get("sequence")):
+                skipped.append("{}: {}".format(x.get("task"), "no longer queued" if e is None else
+                                               "not the entry the card asked about (it left and joined again, or its check changed)"))
+                break
+            e["approval"] = {"card": cid, "answeredAt": card.get("answered"), "answeredBy": card.get("answeredBy") or "person, in the panel",
+                             "option": card.get("answer"), "commit": c["commit"], "change": c["change"], "sequence": c["sequence"],
+                             "added": e.get("added"), "void": None}
+            approved.append({"task": e["task"], "job": e.get("job")})
+            ctx.event("approve", e, card=cid, option=card.get("answer"))
+        q["applied"] = {"at": now(), "approved": approved, "skipped": skipped}
+        applied.append(cid)
+        pa.write_json(pa.card_for_write(ctx.directory, cid), card)
+        lines.append("{} ({}): approved {}{}".format(cid, card.get("answer"), ", ".join(a["task"] for a in approved) or "nothing",
+                                                     "; not approved: " + "; ".join(skipped) if skipped else ""))
+    return lines
+
+
+# ---- the merge (R9, R11, R20) ---------------------------------------------------------------------
+
+def after(record_at, approval):
+    a, r = pa.parse_time(str(approval.get("answeredAt") or "")), pa.parse_time(str(record_at or ""))
+    return a is None or r is None or r >= a
+
+
+def main_checkout(ctx, rec, expected):
+    """R9 (6): the main checkout is on main with no tracked change, local main is where the run expects, and no local
+    setting can run a program (pa_push.main_settings_refusal, C7b's keys)."""
+    code, head, _ = ctx.s.git(ctx.repo, ["symbolic-ref", "-q", "HEAD"])
+    head = head.strip() if not code else ""
+    if head != "refs/heads/" + rec["main"]:
+        return "the main checkout {} is not on {} (it is on {})".format(ctx.repo, rec["main"], head[len("refs/heads/"):] or "a detached HEAD")
+    changed = pa_push.tracked_changes(ctx.s, ctx.repo)
+    if changed is None or changed:
+        return "the main checkout {} has uncommitted tracked changes ({})".format(
+            ctx.repo, "cannot be read" if changed is None else pa_hooks.clean(changed[0])[:80])
+    if ctx.tip(rec["main"]) != expected:
+        return "local {} moved during the run (at {}, expected {})".format(rec["main"], short(ctx.tip(rec["main"])), short(expected))
+    why = pa_push.main_settings_refusal(ctx.s, ctx.repo)
+    return "the main checkout: " + why if why else None
+
+
+def merge_check(ctx, rec, e, main_tip, suites, reviews):
+    """R9 (1)-(6) for the entry at the front, read from git and the files now: (why it may not merge or None, whether
+    the approval is void for it, the suite run that passed)."""
+    a = e.get("approval")
+    if not isinstance(a, dict):
+        return "not approved: no answered queue card approves it", False, None
+    if a.get("void"):
+        return "its approval is void ({}): open a new card".format(a["void"]), False, None
+    if not card_approval(e):
+        return "not approved: its approval names no content (only a queue card's answer approves)", False, None
+    c = e.get("checked") or {}
+    # (1) the approval is for the record the queue holds
+    if (a.get("change"), a.get("sequence")) != (c.get("change"), c.get("sequence")):
+        return "content changed: the approval was for other content than the record the queue holds", True, None
+    # (3) no commit after the check, and every rebase since the approval clean (or moved/union, with its review)
+    tip = ctx.tip(e["branch"])
+    if not tip or tip != e.get("tip"):
+        return "a commit after the check: {} is at {}, the queue recorded {}".format(e["branch"], short(tip), short(e.get("tip"))), True, None
+    bad = [r for r in e.get("rebases") or [] if isinstance(r, dict) and after(r.get("at"), a)
+           and r.get("result") not in ("clean", "moved", "union")]
+    if bad:
+        return "a rebase that was not clean ({}, at {})".format(bad[-1].get("result"), bad[-1].get("at")), True, None
+    # (3) its onto is main (the entries ahead merged) and it sits on the commit main is at
+    if e.get("onto") != rec["main"]:
+        return "not on {} yet: it is stacked on {}, which merges first".format(rec["main"], e.get("onto")), False, None
+    if ctx.merge_base(tip, main_tip) != main_tip:
+        return "it does not sit on {} at {}: pa-queue restack".format(rec["main"], short(main_tip)), False, None
+    # (1)-(2) its content now is the one checked, and the checks saw it
+    d = decide(ctx, c, tip, rec["main"], main_tip)
+    if d["result"] not in ("clean", "moved", "union"):
+        return "content changed: " + (d["why"] or ", ".join(d["files"])), True, None
+    task = ctx.task(e["task"])
+    if not task:
+        return "the task is not in the ledger", False, None
+    gate = pa_hooks.evaluate_gate(ctx.directory, task, "review", runner=ctx.s.gate_git)
+    content = [x for x in gate.get("content") or [] if isinstance(x, dict) and x.get("common") == rec["common"]]
+    seen = content[0] if len(content) == 1 else {}
+    if seen.get("checked") != c.get("commit") or seen.get("error"):
+        return "the checks did not see this content: the gate compares {} (the queue holds the checked {})".format(
+            short(seen.get("checked")), short(c.get("commit"))), True, None
+    if not seen.get("same") and not seen.get("shortReview"):
+        if d["result"] in ("moved", "union"):
+            return "its short review has not passed yet", False, None
+        return "the checks did not see this content: the gate says it differs from the checked {}".format(short(c.get("commit"))), True, None
+    # (4) the worktree at the tip and clean, the gate passing on every pin now (RL-J3c-2), GATE.json pinning the tip
+    pin = pin_in(ctx, rec, e.get("worktree")) if e.get("worktree") else None
+    if not pin or pin.get("commit") != tip:
+        return "its worktree is not at its tip {}".format(short(tip)), False, None
+    if pin.get("uncommitted"):
+        return "its worktree has uncommitted tracked changes ({})".format(pin["uncommitted"]), False, None
+    if not gate["passed"]:
+        return "the gate fails now: " + "; ".join("{} ({})".format(x["check"], x.get("why")) for x in gate["checks"] if not x["ok"]), False, None
+    if not gate_pin(ctx, rec, e["task"], tip):
+        return "GATE.json does not pin its tip {}: pa-gate {} again".format(short(tip), e["task"]), False, None
+    # (5) passed: its own suite on its tip tree, or the carried pass of r-disjoint-carry (d-202)
+    tree = ctx.tree(tip)
+    s = latest(suites, lambda r: tree and r.get("tree") == tree and r.get("uncommitted") == 0 and r.get("reusable"))
+    if s and s.get("exit") != 0:
+        return "not passed: the full suite exited {} on its tree".format(s.get("exit")), False, None
+    if not s:
+        k = carry(ctx, rec, e, tip, tree, task, d, suites, reviews) if d["result"] == "clean" else {"ok": False, "why": ""}
+        if not k["ok"]:
+            return "not passed: no passing suite on its tree {} yet{}".format(short(tree), " ({})".format(k["why"]) if k.get("why") else ""), False, None
+        s = carried_run(k)
+    # (6) the main checkout
+    why = main_checkout(ctx, rec, main_tip)
+    if why:
+        return why, False, None
+    return None, False, s
+
+
+def ff_merge(ctx, rec, e, tip):
+    """R11: git merge --ff-only of tip in the main checkout, through the push tool's runner (an empty hooks folder,
+    fsmonitor off, no GIT_*); local main must then be tip. None, or why it did not."""
+    code, out, err = ctx.s.git(ctx.repo, ["merge", "--ff-only", "--no-edit", "--no-autostash", tip], MERGE_TIMEOUT)
+    if code or ctx.tip(rec["main"]) != tip:
+        return "git merge --ff-only {} did not fast-forward {} ({})".format(short(tip), rec["main"], pa_hooks.clean(err or out).strip()[-200:] or "exit {}".format(code))
+    return None
+
+
+def push_card(ctx, rec, task_id):
+    """R20 (Q-J3-4): the push card for the last merged task, through pa-push-main's plan (J5: it replaces an open card
+    of this repository whose commits it lists), in the caller's hold of the push lock; or why there is none."""
+    data, problem, _sha, _mtime = pa_push.load_allow()
+    agent = pa.read_json_safe(os.path.join(ctx.directory, "agent.json")) or {}
+    space = pa.local_id(agent.get("space") or os.path.basename(ctx.directory))
+    entries = [x for x in (data or {}).get("repos") or [] if isinstance(x, dict) and os.path.realpath(str(x.get("path"))) == ctx.repo
+               and x.get("space") == space and x.get("enabled") is True]
+    if problem or not data or data.get("enabled") is not True or not entries:
+        return ["pushing is the person's step: no enabled push allowlist entry for {} in this space (with one, "
+                "pa-push-main plan {} --repo {} opens the push card)".format(ctx.repo, task_id, ctx.repo)]
+    try:
+        card, replaced = pa_push.plan_card(ctx.directory, space, task_id, ctx.repo)
+    except pa_push.Refused as r:
+        return ["push card not opened: {} (the merges stand; pushing is the person's step)".format(r.message)]
+    return ["push card {} opened: {}{}".format(card["id"], card["question"], " It replaces {}, now withdrawn.".format(replaced) if replaced else "")]
+
+
+def merge_run(ctx, data, rec):
+    """R9, R11, R20 (plan JJ.5): apply the answered cards, then front to back while the entry holds R9 now, one
+    fast-forward each, under the push lock from the first merge to the push card's write. The first entry that fails
+    stops the run (AC9.1); a failure of (1)-(3) voids its approval. It never pushes, fetches, rebases or resets."""
+    lines = apply_cards(ctx, rec)
+    save(ctx, data, rec)  # the approvals stand even when the push lock is busy
+    if not rec["entries"] or not any(card_approval(e) for e in rec["entries"]):
+        return lines + ["nothing approved to merge"]
+    with contextlib.ExitStack() as stack:
+        try:  # V-M5: held from the first merge to the push card's write; a push run holds it while it pushes
+            stack.enter_context(pa_push.push_lock(ctx.directory))
+        except pa_push.Refused as r:
+            raise Refused("{}: nothing was merged (the approvals are recorded); merge again after it".format(r.message))
+        merged = []
+        suites, reviews = pa_hooks.suite_runs(ctx.directory), pa_hooks.review_runs(ctx.directory)
+        while rec["entries"]:
+            e = rec["entries"][0]
+            main_tip = ctx.tip(rec["main"])
+            why, void, suite = merge_check(ctx, rec, e, main_tip, suites, reviews)
+            if not why:
+                why = ff_merge(ctx, rec, e, e["tip"])
+            if why:
+                if void and valid_approval(e):
+                    e["approval"]["void"] = why
+                    ctx.event("void", e, why=why, card=e["approval"].get("card"))
+                ctx.event("merge-stopped", e, why=why, main=main_tip)
+                lines.append("stopped at {}: {}{}".format(label(e), why, "; its approval is void: open a new card for it" if void else ""))
+                break
+            tip = e["tip"]
+            count = ctx.out("rev-list", "--count", main_tip + ".." + tip)
+            record = {"task": e["task"], "job": e.get("job"), "tip": tip, "from": main_tip, "to": tip, "at": now(), "by": "queue",
+                      "card": e["approval"].get("card"), "commits": int(count) if count and count.isdigit() else None,
+                      "suite": dict({k: suite.get(k) for k in ("tree", "worker", "started", "ended")},
+                                    **({"carried": suite["carried"]} if suite.get("carried") else {}))}
+            rec["merged"].append(record)
+            rec["entries"].remove(e)
+            for other in rec["entries"]:
+                if other.get("onto") == e["branch"]:
+                    other["onto"] = rec["main"]
+            ctx.event("merge", e, tip=tip, **{"from": main_tip, "card": record["card"], "commits": record["commits"]})
+            save(ctx, data, rec)
+            merged.append(e)
+            lines.append("merged {} into {}: {} -> {} ({} commit{})".format(label(e), rec["main"], short(main_tip), short(tip),
+                                                                          record["commits"], "" if record["commits"] == 1 else "s"))
+        if merged:
+            lines += push_card(ctx, rec, merged[-1]["task"])
+    save(ctx, data, rec)
+    return lines
+
+
+def cmd_merge(args):
+    with writing(args) as (ctx, data, rec):
+        sync_main(ctx, rec)
+        lines = merge_run(ctx, data, rec)
+    print("\n".join(lines))
+    return 0
+
+
+# ---- brief (one worker per entry, Wanted 2) ----------------------------------------------------------
+
+def cmd_brief(args):
+    """The carry-over handoff for one entry (reads only): its worktree, what to run, the short review (when moved or
+    union) or the independence review (r-disjoint-carry), the role and how to report."""
+    directory = space(args)
+    data = load_queue(directory)
+    ctx = Ctx(directory, args.repo)
+    try:
+        rec = data["repos"].get(ctx.repo)
+        pairs = derive(ctx, rec) if isinstance(rec, dict) else []
+        found = next(((i, e, n) for i, (e, n) in enumerate(pairs, 1) if same(e, args.task, args.job)), None)
+        if not found:
+            raise Refused("{} is not in the queue of {}".format(args.task, ctx.repo))
+        i, e, n = found
+        agent = pa.read_json_safe(os.path.join(directory, "agent.json")) or {}
+        what = carry_over(e, n)
+        lines = ["{} (position {} of {}, on {} at {}, tip {}, state {}{})".format(
+                     label(e), i, len(pairs), e.get("onto"), short(n["ontoTip"]), short(n["tip"]), n["state"],
+                     ": " + n["why"] if n["why"] else ""),
+                 "worktree: {}".format(e.get("worktree")),
+                 "role: reviewer (a fresh worker that is not an author; its review is recorded only from a ledger reviewer)",
+                 "carry-over: {}".format(what)]
+        suite = n["suite"]
+        if suite and suite.get("exit") == 0 and suite.get("carried"):
+            lines.append("nothing to run: its earlier suite pass on tree {} is carried (r-disjoint-carry, independence "
+                         "review {})".format(short(suite.get("tree")), suite["carried"].get("review")))
+        elif suite and suite.get("exit") == 0:
+            lines.append("nothing to run: its suite passed on this tree ({}, {}, {})".format(short(suite.get("tree")), suite.get("worker"), suite.get("ended")))
+        elif what == "independence review":
+            need = e["needs"]["independence"]
+            lines.append("no suite to run: its earlier pass on tree {} carries (r-disjoint-carry) once the independence review "
+                         "says 'Independent: yes'".format(short(need.get("suiteTree"))))
+            lines += independence_lines(e, need)
+        elif what != "-":
+            lines.append("run pa-full-suite in {} (its tip tree {}; it records the run for that tree)".format(e.get("worktree"), short(ctx.tree(n["tip"]))))
+        need = (e.get("needs") or {}).get("shortReview")
+        if n["content"] in ("moved", "union") and need and not (n["review"] and n["review"].get("verdict") == "pass"):
+            lines += handoff_lines(e, need)
+        if what not in ("none", "-"):
+            lines.append("report with hc send {} when done: what ran, its result, and the review file's path".format(
+                agent.get("terminal") or "<the orchestrator>"))
+    finally:
+        ctx.close()
+    print("\n".join(lines))
+    return 0
+
+
 COMMANDS = {"plan": cmd_plan, "add": cmd_add, "show": cmd_show, "out": cmd_out, "restack": cmd_restack,
-            "verify": cmd_verify, "refresh": cmd_refresh}
+            "verify": cmd_verify, "refresh": cmd_refresh, "card": cmd_card, "merge": cmd_merge, "brief": cmd_brief}
 
 
 def parser():
     p = argparse.ArgumentParser(prog="pa-queue", description="The merge queue of a space (t-052).")
     sub = p.add_subparsers(dest="command")
-    for name in ("plan", "add", "out", "verify"):
+    for name in ("plan", "add", "out", "verify", "brief"):
         s = sub.add_parser(name)
         s.add_argument("task")
         s.add_argument("--job")
@@ -1239,12 +1768,16 @@ def parser():
     s.add_argument("--repo")
     s.add_argument("--json", action="store_true")
     s.add_argument("--space")
-    for name in ("restack", "refresh"):
+    for name in ("restack", "refresh", "card", "merge"):
         s = sub.add_parser(name)
         s.add_argument("--repo", required=True)
         s.add_argument("--space")
         if name == "restack":
             s.add_argument("--dry-run", action="store_true", help="print the commands and the predictions; write nothing")
+        if name == "refresh":
+            s.add_argument("--no-merge", action="store_true", help="record and restack only; merge nothing (Q-J3-3)")
+        if name == "card":
+            s.add_argument("--limits", required=True, help="the Recorded limits of each listed task ('none' for none)")
     return p
 
 
