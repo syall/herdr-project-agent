@@ -184,7 +184,8 @@ def starts_of(cwd):
     return tuple(dict.fromkeys(os.path.normpath(os.path.abspath(c)) for c in folders)) or (os.getcwd(),)
 
 
-STATE_FILES = ("ledger.json", "journal.jsonl", "rules.json", "agent.json", "content/", "queue.json")  # content/, queue.json: t-052, tool-written only
+STATE_FILES = ("ledger.json", "journal.jsonl", "rules.json", "agent.json", "content/", "queue.json",
+               "waiting.json", "start-order.json")  # content/, queue.json: t-052, tool-written only; waiting.json (pa-places), start-order.json (the panel): t-083
 # The worktree's task record and its hook settings, wherever they are.
 GUARDED = ((".claude", "pa-task.json"), (".claude", "settings.local.json"))
 

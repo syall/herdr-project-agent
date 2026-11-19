@@ -542,7 +542,7 @@ class Next(Base):
             f.write("{broken\n")
         out = self.ok("next")
         self.assertIn("hold unknown", out)
-        self.assertNotIn(" start", out)
+        self.assertNotIn("record place", out)
 
     def test_terminal_list_unavailable(self):
         self.add("t-1", "build")
