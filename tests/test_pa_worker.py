@@ -3795,6 +3795,20 @@ class T133CloseWhenIdleLimits(Base):
         self.assertIn("cancelled", self.journal()[-1]["why"])
         self.assertFalse(os.path.exists(os.path.join(self.dir, ".close-when-idle-t31.cancel")))
 
+    def test_rl1_cancel_after_the_waiter_closed_says_it_is_closed(self):
+        # fix round 2 (M3): the waiter closed the worker and still holds its own lock when the cancel gets the ledger lock
+        self.hold_waiter_lock()
+        led = self.ledger()
+        led["tasks"][0]["workers"][0]["finished"] = "2026-01-01T00:00:00Z"
+        self.ledger(led)
+        code, out, err = self.cancel()
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("stays open", out)
+        self.assertIn("already closed", out)
+        self.assertFalse(os.path.exists(os.path.join(self.dir, ".close-when-idle-t31.cancel")))
+        lines = self.journal() if os.path.exists(os.path.join(self.dir, "journal.jsonl")) else []
+        self.assertFalse(any("stays open" in l.get("why", "") for l in lines), lines)
+
     def test_rl1_cancel_checked_under_the_lock_before_the_kill(self):
         # the cancel lands after the first status read of a close but before its recheck under the ledger lock
         self.terms["t31"]["status"] = "idle"
@@ -3970,6 +3984,31 @@ class T133ReportOnlyStop(Base):
         sh(self.wt, "git", "add", "a.txt")
         sh(self.wt, "git", "commit", "-q", "-m", "a")
         write(os.path.join(self.wt, "a.txt"), "1\n2\n")
+        self.assertEqual(self.stop(), 0)
+        self.assertTrue(self.ran())
+
+    def test_g1_a_commit_with_earlier_changes_left_as_they_were_counts(self):
+        # fix round 2 (M2): the worker commits a file; the earlier worker's dirty file is left as it was
+        write(os.path.join(self.wt, "README"), "the builder's edit\n")
+        self.start()
+        write(os.path.join(self.wt, "b.txt"), "the worker's file\n")
+        sh(self.wt, "git", "add", "b.txt")
+        sh(self.wt, "git", "commit", "-q", "-m", "b")
+        self.assertEqual(self.stop(), 0)
+        self.assertTrue(self.ran(), "a new commit counts even when the uncommitted files are as they were")
+
+    def test_g1_an_edit_inside_an_untracked_folder_counts(self):
+        # fix round 2 (M1): git status shows only scratch/ for a folder nothing in it is tracked
+        write(os.path.join(self.wt, "scratch", "a.txt"), "1\n")
+        self.start()
+        write(os.path.join(self.wt, "scratch", "a.txt"), "2\n")
+        self.assertEqual(self.stop(), 0)
+        self.assertTrue(self.ran())
+
+    def test_g1_a_new_file_in_a_nested_untracked_folder_counts(self):
+        write(os.path.join(self.wt, "scratch", "sub", "a.txt"), "1\n")
+        self.start()
+        write(os.path.join(self.wt, "scratch", "sub", "b.py"), "x = 1\n")
         self.assertEqual(self.stop(), 0)
         self.assertTrue(self.ran())
 
