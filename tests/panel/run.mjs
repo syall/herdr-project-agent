@@ -4312,6 +4312,63 @@ cases["P45-push-in-flight"] = async () => { // W1 (t124): while pa-push-main run
   check(Boolean(look(v).clicks[`opt-${PID}-1`]), "a refusal: the card is open again");
 };
 
+
+// ---- t-100: a push card keeps the person's chosen answer selected and locked while its tool runs. The stub theme gives
+// every colour one value, so these draw the card with a theme whose colours are their own names. ----
+const named = new Proxy({}, { get: (_t, k) => String(k) });
+const byKey = (x, key) => { if (!x || typeof x !== "object") return null; if (x.key === key) return x; for (const k of x.kids ?? []) { const f = byKey(k, key); if (f) return f; } return null; };
+// Each option row of the push card: drawn chosen (bg selected, border accent) or not, and clickable or not.
+const pushRows = (v) => {
+  const tree = v.card(named, v.cards.find((c) => c.id === PID), g.__spaces[0]);
+  return Object.fromEntries(["0", "1", "other"].map((i) => { const r = byKey(tree, `opt-${PID}-${i}`); return [i, { chosen: r?.style?.bg?.[0] === "selected" && r?.style?.border_color?.[0] === "accent", click: Boolean(r?.click) }]; }));
+};
+
+cases["P100-push-keeps-choice"] = async () => { // t-100: while pa-push-main run runs, Push stays chosen and every option is locked; after it, still Push
+  const gate = deferred();
+  let file;
+  const { v, file: f } = await pushWorld({ tool: { run: () => gate.promise.then((reply) => { g.__files[file] = answeredByTool(); return reply; }) } });
+  file = f;
+  await click(v, `opt-${PID}-0`); await settle();
+  check(pushRows(v)["0"].chosen, "Push chosen before Submit");
+  await click(v, `submit-${PID}`); await settle();
+  const rows = pushRows(v), { text, clicks } = look(v);
+  check(text.includes("Pushing…") && !clicks[`submit-${PID}`], `Pushing…, Submit off (got ${Object.keys(clicks)})`);
+  check(rows["0"].chosen, `Push still chosen while it runs (got ${JSON.stringify(rows)})`);
+  check(!rows["1"].chosen && !rows.other.chosen, `Not now and Other not chosen (got ${JSON.stringify(rows)})`);
+  check(!rows["0"].click && !rows["1"].click && !rows.other.click, `every option locked (got ${JSON.stringify(rows)})`);
+  gate.resolve(json(0, toolPushed)); await settle();
+  const after = pushRows(v);
+  check(after["0"].chosen && !after["1"].chosen && !after["0"].click && !after["1"].click, `after the push: Push chosen, locked (got ${JSON.stringify(after)})`);
+  await settle();
+  check(pushRows(v)["0"].chosen, "after the reload: Push chosen (the card file's answer)");
+};
+
+cases["P100-push-refused-clears"] = async () => { // t-100: a refused push leaves no option chosen and every option open, so the person chooses again
+  const gate = deferred();
+  const { v } = await pushWorld({ tool: { run: () => gate.promise } });
+  await click(v, `opt-${PID}-0`); await settle();
+  await click(v, `submit-${PID}`); await settle();
+  check(pushRows(v)["0"].chosen, "Push chosen while it runs");
+  gate.resolve(json(1, { ok: false, refusal: { check: "C9", message: "remote moved" } })); await settle(); await settle();
+  const rows = pushRows(v);
+  check(!rows["0"].chosen && !rows["1"].chosen && !rows.other.chosen, `refused: nothing chosen (got ${JSON.stringify(rows)})`);
+  check(rows["0"].click && rows["1"].click && rows.other.click, `refused: every option open again (got ${JSON.stringify(rows)})`);
+  await click(v, `opt-${PID}-1`); await settle();
+  check(pushRows(v)["1"].chosen, "the person can choose again");
+};
+
+cases["P100-other-keeps-words"] = async () => { // t-100: Other on a push card stays chosen, with its words as they are, while its run runs
+  const gate = deferred();
+  const { v } = await pushWorld({ tool: { run: () => gate.promise } });
+  await click(v, `opt-${PID}-other`); typeInto(v, PID, "do X first");
+  await click(v, `submit-${PID}`); await settle();
+  const rows = pushRows(v);
+  check(rows.other.chosen && !rows["0"].chosen && !rows["1"].chosen, `Other chosen while it runs (got ${JSON.stringify(rows)})`);
+  check(!rows.other.click && !rows["0"].click, "locked");
+  check(v.notes[PKEY].value() === "do X first", `its words as they are (got ${JSON.stringify(v.notes[PKEY].value())})`);
+  gate.resolve(json(1, { ok: false, refusal: { check: "C9", message: "remote moved" } })); await settle(); await settle();
+};
+
 cases["P45-push-no-second-run"] = async () => { // W1/W4: after a Push from here, while the reload is slow: no option, no Submit, one run
   let file;
   const { v, file: f } = await pushWorld({ tool: { run: () => { g.__files[file] = answeredByTool(); return json(0, toolPushed); } } });
