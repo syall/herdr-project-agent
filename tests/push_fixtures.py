@@ -26,6 +26,9 @@ import threading
 import time
 import unittest
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import repo_template  # noqa: E402 (t-095)
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.realpath(os.path.join(HERE, ".."))
 TOOLS = os.path.join(REPO, "runtime", "tools")
@@ -141,6 +144,23 @@ REVIEW_FILES = ["intent.md", "spec.md", "plan.md", "FINDINGS.md", "DECISIONS.md"
 WORKERS = [{"address": "t31", "role": "build"}, {"address": "t32", "role": "reviewer"}]
 
 
+def build_repos(path):
+    """The repositories every Repo test starts from (copied per test, tests/repo_template.py): origin.git (bare),
+    main (its clone, a.txt on main, pushed) and wt (a linked worktree of main on t-1-x with one commit, b.txt)."""
+    origin, main, wt = (os.path.join(path, n) for n in ("origin.git", "main", "wt"))
+    sh(path, "git", "-c", "init.defaultBranch=main", "init", "-q", "--bare", origin)
+    sh(path, "git", "clone", "-q", "file://" + origin, main)
+    sh(main, "git", "checkout", "-q", "-b", "main")
+    write(os.path.join(main, "a.txt"), "one\n")
+    sh(main, "git", "add", "a.txt")
+    sh(main, "git", "commit", "-q", "-m", "first")
+    sh(main, "git", "push", "-q", "origin", "main")
+    sh(main, "git", "worktree", "add", "-q", "-b", "t-1-x", wt, "main")
+    write(os.path.join(wt, "b.txt"), "task work\n")
+    sh(wt, "git", "add", "b.txt")
+    sh(wt, "git", "commit", "-q", "-m", "task work")
+
+
 class Repo(unittest.TestCase):
     """origin.git (bare, the only remote), main (its clone: the main checkout), wt (a linked worktree on t-1-x
     with one commit), a space sp1 with task t-1 whose full gate passes, and an allowlist entry for main."""
@@ -156,15 +176,12 @@ class Repo(unittest.TestCase):
         self.wt = os.path.join(self.tmp, "wt")
         self.url = "file://" + self.origin
         self.assertTrue(self.url.startswith("file://" + TMP))
-        sh(self.tmp, "git", "-c", "init.defaultBranch=main", "init", "-q", "--bare", self.origin)
-        sh(self.tmp, "git", "clone", "-q", self.url, self.main)
-        sh(self.main, "git", "checkout", "-q", "-b", "main")
-        write(os.path.join(self.main, "a.txt"), "one\n")
-        sh(self.main, "git", "add", "a.txt")
-        sh(self.main, "git", "commit", "-q", "-m", "first")
-        sh(self.main, "git", "push", "-q", "origin", "main")
-        sh(self.main, "git", "worktree", "add", "-q", "-b", "t-1-x", self.wt, "main")
-        self.commit_on(self.wt, "b.txt", "task work")
+        # t-095: origin.git, main and wt are built once (build_repos) and copied into this test's folder; then main
+        # gets this test's remote url and the worktree links are repaired, and nothing may still name the template.
+        repo_template.copy(TMP, "repos", self.tmp, build_repos)
+        sh(self.main, "git", "config", "remote.origin.url", self.url)
+        sh(self.main, "git", "worktree", "repair", self.wt)
+        self.assertEqual([], repo_template.references(self.tmp, repo_template.template(TMP, "repos")))
         self.dir = os.path.join(pa.ROOT, "spaces", SPACE)
         dump({"space": SPACE, "terminal": "t0", "terminals": ["t0"], "profile": "test", "name": "S"}, os.path.join(self.dir, "agent.json"))
         dump({"name": "test", "claude": ["true"], "codex": ["true"]}, os.path.join(pa.ROOT, "profiles", "test", "profile.json"))

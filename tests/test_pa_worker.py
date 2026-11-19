@@ -24,6 +24,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 TOOLS = os.path.join(HERE, "..", "runtime", "tools")
 sys.path.insert(0, HERE)
 from unit_shards import load_tests  # noqa: E402,F401 (tests/run-all.sh runs this module in shards, t-078)
+import repo_template  # noqa: E402 (fixture repos built once and copied, t-095)
 TMP = tempfile.mkdtemp(prefix="t008-unit-")
 
 # Load pa.py and pa_hooks.py with the temp homes, then give the environment back, so the other test
@@ -107,6 +108,14 @@ def sh(cwd, *argv):
     if r.returncode:
         raise AssertionError("{} failed in {}: {}".format(" ".join(argv), cwd, r.stderr))
     return r.stdout.strip()
+
+
+def build_repo(path):
+    """The repo Base.repo() copies (tests/repo_template.py): main, README "base", one commit "base"."""
+    sh(path, "git", "init", "-q", "-b", "main")
+    write(os.path.join(path, "README"), "base\n")
+    sh(path, "git", "add", "README")
+    sh(path, "git", "commit", "-q", "-m", "base")
 
 
 class Base(unittest.TestCase):
@@ -193,13 +202,8 @@ class Base(unittest.TestCase):
 
     # ---- git ----
     def repo(self, name="proj"):
-        path = os.path.join(self.tmp, name)
-        os.makedirs(path)
-        sh(path, "git", "init", "-q", "-b", "main")
-        write(os.path.join(path, "README"), "base\n")
-        sh(path, "git", "add", "README")
-        sh(path, "git", "commit", "-q", "-m", "base")
-        return path
+        """A repo of its own at <tmp>/<name>: main, README "base", one commit (a copy of build_repo's, t-095)."""
+        return repo_template.copy(TMP, "repo", os.path.join(self.tmp, name), build_repo)
 
     def worktree(self, repo, name):
         path = os.path.join(self.tmp, "wt-" + name)

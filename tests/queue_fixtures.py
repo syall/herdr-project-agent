@@ -17,6 +17,9 @@ import tempfile
 import types
 import unittest
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import repo_template  # noqa: E402 (t-095)
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.realpath(os.path.join(HERE, ".."))
 TOOLS = os.path.join(REPO, "runtime", "tools")
@@ -145,6 +148,18 @@ def snapshot(*paths):
     return out
 
 
+def build_proj(path):
+    """The main checkout every QBase test starts from (copied per test, tests/repo_template.py)."""
+    sh(path, "git", "init", "-q", "-b", "main")
+    sh(path, "git", "config", "user.name", "t")
+    sh(path, "git", "config", "user.email", "t@example.invalid")
+    write(os.path.join(path, "a.txt"), LINES)
+    write(os.path.join(path, "b.txt"), "b\n")
+    write(os.path.join(path, "README"), "readme\n")
+    sh(path, "git", "add", "a.txt", "b.txt", "README")
+    sh(path, "git", "commit", "-q", "-m", "base")
+
+
 class QBase(unittest.TestCase):
     """A main checkout `proj` (main: a.txt of 200 lines, b.txt, README) and a fake space sp1."""
 
@@ -163,16 +178,7 @@ class QBase(unittest.TestCase):
         self.saved_wait = pa_queue.LOCK_WAIT
         self.cwd = os.getcwd()
         os.chdir(self.tmp)  # no task record above this folder
-        self.proj = os.path.join(self.tmp, "proj")
-        os.makedirs(self.proj)
-        sh(self.proj, "git", "init", "-q", "-b", "main")
-        sh(self.proj, "git", "config", "user.name", "t")
-        sh(self.proj, "git", "config", "user.email", "t@example.invalid")
-        write(os.path.join(self.proj, "a.txt"), LINES)
-        write(os.path.join(self.proj, "b.txt"), "b\n")
-        write(os.path.join(self.proj, "README"), "readme\n")
-        sh(self.proj, "git", "add", "a.txt", "b.txt", "README")
-        sh(self.proj, "git", "commit", "-q", "-m", "base")
+        self.proj = repo_template.copy(TMP, "proj", os.path.join(self.tmp, "proj"), build_proj)  # t-095: built once
         self.trees = {}
 
     def tearDown(self):

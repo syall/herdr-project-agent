@@ -21,6 +21,7 @@ import unittest
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import trust_fixtures as fx  # noqa: E402
+import repo_template  # noqa: E402 (fixture repos built once and copied, t-095)
 
 TOOLS = os.path.realpath(os.path.join(HERE, "..", "runtime", "tools"))
 TMP = os.path.realpath(tempfile.mkdtemp(prefix="t035-unit-"))
@@ -139,13 +140,17 @@ def git(cwd, *args):
     return r.stdout.strip()
 
 
-def make_repo(path):
-    os.makedirs(path)
+def build_repo(path):
+    """The repo make_repo copies (tests/repo_template.py, t-095): main, README.md "x", one commit "init"."""
     git(path, "init", "-q", "-b", "main")
     write(os.path.join(path, "README.md"), "x\n")
     git(path, "add", "README.md")
     git(path, "commit", "-q", "-m", "init")
-    return path
+
+
+def make_repo(path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    return repo_template.copy(TMP, "repo", path, build_repo)
 
 
 def move_cursor(screen):
