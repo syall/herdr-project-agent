@@ -17,6 +17,10 @@ folder; the pa_hooks module is passed in (`h`) for its helpers, so nothing here 
                                                    or its setup fails (no fallback)
   pa-full-suite --places                           each configured machine (reachable or why not, cap, holders) and
                                                    this Mac's slot
+  pa-full-suite --places --json                    the same as one JSON object (t-119; the panel's Places section):
+                                                   {version 1, notes, machines [{machine, cap, reachable, reason, os,
+                                                   arch, seconds, holders}], local {cap, holders}}; a holder is
+                                                   {task, worker, pid, start, what, dir}
 
 A run (t-076) names its output file first (evidence/<task>/full-suite-<run>.out, the whole output) and keeps a
 progress file, HERDR_PA_HOME/suite-runs/<run>.json, which its tests/run-all.sh fills in with its parts; every
@@ -1760,9 +1764,35 @@ def mac_os():
     return platform.system() or "local"
 
 
+HOLDER_KEYS = ("task", "worker", "pid", "start", "what", "dir")
+
+
+def holder_json(holder):
+    """t-119 R1: one slot holder as --places --json prints it: the known keys, each a string, a number or null."""
+    return {k: (holder.get(k) if isinstance(holder.get(k), (str, int, float)) and not isinstance(holder.get(k), bool)
+                else None) for k in HOLDER_KEYS}
+
+
+def places_json(good, bad):
+    """t-119 R1: --places as one JSON object: the same probe and peek as the text, taking no slot, writing nothing."""
+    out = {"version": 1, "notes": list(bad), "machines": [], "local": None}
+    for m in good:
+        found = probe(m["machine"])
+        out["machines"].append({"machine": m["machine"], "cap": m["cap"], "reachable": bool(found["ok"]),
+                                "reason": None if found["ok"] else found.get("reason"), "os": found.get("os"),
+                                "arch": found.get("arch"), "seconds": found.get("seconds"),
+                                "holders": [holder_json(x) for x in peek(machine_dir(m["machine"]), m["cap"])]})
+    out["local"] = {"cap": cap(), "holders": [holder_json(x) for x in peek(slot_dir(), cap())]}
+    return out
+
+
 def cmd_places(h, args):
-    """R25: each configured machine (reachable or why not, cap, holders) and this Mac's slot."""
+    """R25: each configured machine (reachable or why not, cap, holders) and this Mac's slot. --json (t-119): the
+    same as one JSON object (places_json), for the panel's Places section."""
     good, bad = machines(pa.config())
+    if getattr(args, "json", False):
+        print(json.dumps(places_json(good, bad)))
+        return 0
     where = os.path.join(home(), "config.json")
     for note in bad:
         print("pa-full-suite: suiteMachines in {}: {}".format(where, note))
@@ -1791,6 +1821,9 @@ def full_suite(h, args):
         return sys.exit(cmd_wait(h, args))
     if getattr(args, "places", False):
         return sys.exit(cmd_places(h, args))
+    if getattr(args, "json", False):
+        print("pa-full-suite: --json goes with --places (pa-full-suite --places --json)")
+        return sys.exit(2)
     on, local = getattr(args, "on", None), getattr(args, "local", False)
     if on and local:
         print("pa-full-suite: --on and --local name two places; give one")

@@ -11,7 +11,8 @@ Selected by the name it is invoked as (symlinks in ~/.local/bin):
                                                 at most pa_suite.CAP at once per machine (see pa_suite.py)
   pa-full-suite --last [--commit C|--tree T]    the last recorded run; --report: its parts by time
   pa-full-suite --local | --on M | --places     on this Mac only, on machine M only, or where runs can go: the
-                                                machines of config.json's suiteMachines (t-089, see pa_suite.py)
+                                                machines of config.json's suiteMachines (t-089, see pa_suite.py);
+                                                --places --json: the same as JSON (t-119, the panel reads it)
   pa-run [--on M|--local] [--commit C --overlay P] -- <argv...>
                                                 a test command in the tree to run (HEAD plus the worktree's changes)
                                                 on a configured machine or this Mac (t-107, see pa_run.py)
@@ -4334,6 +4335,7 @@ def main():
                                                       "it is not reachable or its setup fails (no fallback)")
         parser.add_argument("--places", action="store_true", help="each configured machine (reachable or why not, "
                                                                   "cap, holders) and this Mac's slot")
+        parser.add_argument("--json", action="store_true", help="--places: the same as one JSON object (t-119)")
         parser.add_argument("--space")
         return cmd_full_suite(parser.parse_args())
     if kind == "pa-run":

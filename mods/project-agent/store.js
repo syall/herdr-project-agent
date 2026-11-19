@@ -151,6 +151,28 @@ export async function loadStartOrder(space, cx) {
   if (r.timedOut) return TIMED_OUT;
   return { text: r.text, missing: r.text === null };
 }
+// The suite machines' slots (t-119, places.js machinesRows): `pa-full-suite --places --json` on the space's machine,
+// the same probe and peek as `pa-full-suite --places` (one hc exec per configured machine: slow, so main.js asks at
+// most every MACHINES_EVERY). One keyed, capped call. { doc, error }: error (doc null) on a non-zero exit (its first
+// line), output that is not JSON, not version 1 or without machines and local; a give-up returns TIMED_OUT (never "no
+// machines"). Read only: the tool takes no slot and writes nothing.
+export const MACHINES_TOOL = "pa-full-suite";
+export const MACHINES_TIMEOUT = 150000; // each machine's probe has 60 s
+const firstLine = (text) => String(text ?? "").split("\n").map((l) => l.trim()).find(Boolean) ?? "";
+export async function loadMachines(space, cx) {
+  const on = space.machine ?? null;
+  let r;
+  try { r = await capped(cx, () => run(MACHINES_TOOL, ["--places", "--json"], { on, timeout: MACHINES_TIMEOUT }), { key: `machines:${on ?? ""}`, limit: MACHINES_TIMEOUT + GRACE, what: `${MACHINES_TOOL} --places` }); }
+  catch (e) { return { doc: null, error: firstLine(e?.message ?? e) || "the call failed" }; }
+  if (gaveUp(r)) return r;
+  if (r.code !== 0) return { doc: null, error: firstLine(r.stderr) || firstLine(r.stdout) || `exit ${r.code}` };
+  let v;
+  try { v = JSON.parse(String(r.stdout ?? "")); } catch { return { doc: null, error: `${MACHINES_TOOL} --places --json: its output is not JSON` }; }
+  if (!v || typeof v !== "object" || Array.isArray(v)) return { doc: null, error: `${MACHINES_TOOL} --places --json: not a JSON object` };
+  if (v.version !== 1) return { doc: null, error: `${MACHINES_TOOL} --places --json: version ${JSON.stringify(v.version ?? null)}; this panel reads version 1` };
+  if (!Array.isArray(v.machines) || !v.local || typeof v.local !== "object") return { doc: null, error: `${MACHINES_TOOL} --places --json: no machines list or local slot` };
+  return { doc: v, error: null };
+}
 // The person's task order (t-097 J2, tasks.js): task-order.json, this panel its only writer (writeTaskOrder). One
 // keyed, capped read: { text, missing } (the raw text, for the compare-and-write; tasks.js readTaskOrder parses it),
 // or TIMED_OUT on a give-up (never "missing").

@@ -16,7 +16,7 @@ import { View, div } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, ScrollHandle } from "gpui-base";
 import { spaces, panes, agents, terminals, machines, theme, run, props, home, notify, shared, setShared, closeOverlay, openOverlay, window, layout } from "herdr";
 import { Host, gaveUp, read as hostRead, run as hostRun, watch, refusalLine } from "./host.js";
-import { loadSpace, loadLedger, loadQueue, loadWaiting, loadStartOrder, writeStartOrder, loadTaskOrder, writeTaskOrder, loadProfile, loadDecisions, loadRules, TIMED_OUT, READ_LIMIT, answerDecision, notifyOrchestrator, changeRules, touched, localId, paHome, stateDir, taskActions, taskLinks, evidenceTasks, cardEvidence, staleInstructions, liveTarget, lookAlike, OPEN_REQUESTS, keeperJudging, startingLabels, OTHER, OTHER_MAX, OTHER_TOO_LONG, isOther, oneLine, codeState, codeBadge, loadCode, restartArgs, runRestart, restartOutcome, endTerminalLine, RESTART_MARK, RESTART_MARK_TTL, RESTARTED_FOR, RESTART_TIMEOUT, DRY_TIMEOUT, contextCapable, contextSettings, loadContext, contextLine, contextAt, contextArgs, runContext, contextOutcome, contextDry, resetLine, lastRequestLine, CONTEXT_FOR } from "./store.js";
+import { loadSpace, loadLedger, loadQueue, loadWaiting, loadStartOrder, writeStartOrder, loadMachines, loadTaskOrder, writeTaskOrder, loadProfile, loadDecisions, loadRules, TIMED_OUT, READ_LIMIT, answerDecision, notifyOrchestrator, changeRules, touched, localId, paHome, stateDir, taskActions, taskLinks, evidenceTasks, cardEvidence, staleInstructions, liveTarget, lookAlike, OPEN_REQUESTS, keeperJudging, startingLabels, OTHER, OTHER_MAX, OTHER_TOO_LONG, isOther, oneLine, codeState, codeBadge, loadCode, restartArgs, runRestart, restartOutcome, endTerminalLine, RESTART_MARK, RESTART_MARK_TTL, RESTARTED_FOR, RESTART_TIMEOUT, DRY_TIMEOUT, contextCapable, contextSettings, loadContext, contextLine, contextAt, contextArgs, runContext, contextOutcome, contextDry, resetLine, lastRequestLine, CONTEXT_FOR } from "./store.js";
 import { RulesPane, arm, armHolds, fieldState } from "./rules.js"; // arm, armHolds: the two-click Delete (ARM_WAIT, 10 s)
 import { queueRows, queueLabel, renderQueue, at as atZone } from "./queue.js"; // t-055: the Queue view (read only)
 import { placesRows, renderPlaces, pinsAfter, orderText, NOTICE as ORDER_NOTICE } from "./places.js"; // t-083 J2: places and the start order (Tasks)
@@ -37,6 +37,7 @@ const paRecords = (spaceId) => Object.values(shared("project-agent.tabs") ?? {})
 const LOAD_LIMIT = READ_LIMIT + 1000; // a load with no read settled or timed out for this long is given up: a new one may start
 const CACHE_MAX = 8; // spaces whose last load is kept (in memory), the least recently shown dropped first
 const CACHE_OLD = 60000; // a kept load older than this says "updating…" while its refresh runs
+const MACHINES_EVERY = 60000; // t-119: the suite machines (pa-full-suite --places --json, a probe per machine) are read at most this often
 const COSTS_MARK = 20000; // while Costs is shown: shared "project-agent.costsShown" is stamped at most this often (the timer collects faster then)
 const COUNT_EVERY = 10000; // while hidden: at most one card read and one ledger read per space this often
 const PROFILE_RETRY = 60000; // while hidden: a profile read that failed is tried again no sooner than this
@@ -188,6 +189,7 @@ export default class ProjectAgent extends View {
     // t-083 J2: the Places section of the Tasks view (open unless folded), a start-order write in flight per space, its
     // refusal line, and the line a task-row badge marks for 3 s ({ space, key, until }).
     this.placesFolded = false; this.placesBusy = {}; this.placesError = {}; this.placeMark = null;
+    this.machines = {}; // t-119: space id -> { doc, error, at, asked, busy }: the suite machines' slots as last read
     // t-097 J2: a task-order.json write in flight per space, its refusal, and the follow-up folds the person opened.
     this.taskOrderBusy = {}; this.taskOrderError = {}; this.foldOpen = new Set();
     this.unsent = []; // [{ spaceId, message, why? }] notices the orchestrator hasn't had yet (its terminal is looked up when sending)
@@ -404,6 +406,7 @@ export default class ProjectAgent extends View {
     if (!onScreen()) { this.asleep = true; this.hiddenRead(cx, space); return; }
     this.asleep = false;
     if (this.view === "costs") this.costsShown(space, cx); // its own read, outside the load (costs.js); never while hidden
+    this.machinesWant(space, cx); // t-119: its own read, outside the load; only while Places is seen
     if (this.inFlight(space.id)) { this.again[space.id] = true; return; }
     const at0 = Date.now();
     if (background && at0 - (this.started[space.id] ?? -Infinity) < COALESCE) { this.deferred[space.id] = true; return; }
@@ -468,6 +471,24 @@ export default class ProjectAgent extends View {
       if (wasCurrent && this.again[space.id]) { delete this.again[space.id]; if (shown()) this.reload(cx); }
     }, { what: "the panel's load", background });
     if (!started) { if (current()) delete this.loads[space.id]; this.showRefusal(space, cx); }
+  }
+
+  // t-119 R3: the suite machines' slots (store.js loadMachines), read only while the Tasks view shows Places unfolded on
+  // screen, at most every MACHINES_EVERY and one at a time per space. A give-up keeps what is shown; an error keeps the
+  // last good answer with the error.
+  machinesWant(space, cx) {
+    if (this.view !== "tasks" || this.placesFolded || !onScreen()) return;
+    const m = (this.machines[space.id] ??= { doc: null, error: null, at: 0, asked: 0, busy: false }), now = Date.now();
+    if (m.busy || (m.asked && now - m.asked < MACHINES_EVERY)) return;
+    m.busy = true; m.asked = now;
+    const started = this.host.spawn(cx, async (cx) => {
+      try {
+        const r = await loadMachines(space, this.host.ctx(cx, { origin: "machines", background: true }));
+        if (!gaveUp(r)) { if (r.error) m.error = r.error; else { m.doc = r.doc; m.error = null; m.at = Date.now(); } }
+      } catch (e) { m.error = String(e?.message ?? e); }
+      finally { m.busy = false; cx.notify(); }
+    }, { what: "the suite machines read" });
+    if (!started) m.busy = false;
   }
 
   // The Costs view chosen: a reread or a billed compare asked for while it was left starts once it is shown (costs.js due()).
@@ -980,7 +1001,8 @@ export default class ProjectAgent extends View {
   placesOf(space, data) {
     const live = (address) => { const a = space.machine ? `${space.machine}/${address}` : address; return terminals().some((x) => x.address === a && x.state === "live"); };
     const o = this.taskOrderOf(data);
-    return placesRows({ waiting: data?.waiting, startOrder: data?.startOrder, rules: this.rules.data, ledger: data?.ledger, isLive: live, rank: o.has ? o.ranking.map((r) => r.id) : null });
+    return placesRows({ waiting: data?.waiting, startOrder: data?.startOrder, rules: this.rules.data, ledger: data?.ledger, isLive: live, rank: o.has ? o.ranking.map((r) => r.id) : null,
+      machines: this.machines[space.id] ?? null, here: space.machine ? `${space.machine} (the space's machine)` : "this Mac" }); // t-119: the suite machines' slots
   }
 
   // t-097 J2: the task order as loaded (R2, R3). known: task-order.json was read (its text, or no file); read:
@@ -1573,7 +1595,7 @@ export default class ProjectAgent extends View {
     this.viewShown = view;
     const tab = (id, label) => div().id(`view-${id}`).px(9).h(24).flex().items_center().rounded(6).text_size(12).cursor_pointer()
       .bg(view === id ? t.selected : t.chrome).text_color(view === id ? t.foreground : t.muted).hover((s) => s.bg(t.hover))
-      .on_click((_e, cx) => { this.view = id; this.disarm(); if (id !== "decisions") this.push.leave(space.id); if (id === "rules") this.rules.wantAllow(space, cx); if (id === "costs") this.costsShown(space, cx, true); cx.notify(); }).child(label);
+      .on_click((_e, cx) => { this.view = id; this.disarm(); if (id !== "decisions") this.push.leave(space.id); if (id === "rules") this.rules.wantAllow(space, cx); if (id === "costs") this.costsShown(space, cx, true); if (id === "tasks") this.machinesWant(space, cx); cx.notify(); }).child(label);
     const unsent = this.unsent.filter((u) => u.spaceId === space.id);
     // t-037 J4 (R14): what the launcher runs against what is installed; the Restart button (R13) while it is live.
     const code = this.codeOf(space, data), badge = codeBadge(code), restartable = known === "live" && !this.restartBusy(space);
@@ -1623,7 +1645,7 @@ export default class ProjectAgent extends View {
       .when(view === "tasks", (el) => el.child(v_flex().id("pa-tasks").flex_1().min_h(0).p(8).gap(6).overflow_y_scrollbar()
         .when(places.shown, (e) => e.child(renderPlaces(t, places, { folded: this.placesFolded, busy: Boolean(this.placesBusy[space.id]), error: this.placesError[space.id] ?? null,
           mark: this.placeMark?.space === space.id && Date.now() < this.placeMark.until ? this.placeMark.key : null, asOf: atZone(new Date(this.dataAt ?? Date.now()).toISOString()).slice(6),
-          onFold: (_e, cx) => { this.placesFolded = !this.placesFolded; cx.notify(); }, onMove: (id, move, cx) => this.moveJob(space, id, move, cx), onReset: (cx) => this.moveJob(space, null, "reset", cx),
+          onFold: (_e, cx) => { this.placesFolded = !this.placesFolded; this.machinesWant(space, cx); cx.notify(); }, onMove: (id, move, cx) => this.moveJob(space, id, move, cx), onReset: (cx) => this.moveJob(space, null, "reset", cx),
           onWorker: (address) => this.showAgent(onMachine(address)) })))
         .when(!tasks.length, (e) => e.child(note("No tasks yet. Give the Project Agent a goal in its tab.")))
         // t-097 J2 (R2, R15): the order line once, above the sections; Reset order over an unreadable file; a refused write.

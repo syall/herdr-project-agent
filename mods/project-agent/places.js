@@ -185,10 +185,42 @@ function limitsOf(rules) {
   return limitsFrom(rules.doc ?? { rules: rules.rules });
 }
 
+// The suite machines' slots (t-119 R4-R6), from loadMachines's answers as main.js keeps them: m = { doc, error, at }
+// (doc: the last good answer, error: the last read's, at: when doc was read) or null (not answered yet). isLive(address):
+// the worker's terminal is live; here: the label of the tool's own machine ("this Mac", or the space's machine). Each
+// holder line: { key, id, worker, text }; id and worker only when its worker's terminal is live (a link, R5). shown:
+// a configured machine or a slot holder (R6).
+const SLOT_ID = (place, i) => `places-slot-${place}-${i}`;
+function slotLines(place, holders, isLive) {
+  return (Array.isArray(holders) ? holders : []).filter(obj).map((h, i) => {
+    const worker = typeof h.worker === "string" && h.worker ? h.worker : null, live = Boolean(worker && isLive(worker));
+    const text = [h.task ?? "?", worker ? `worker ${worker}` : "no worker recorded", `since ${h.start ? at(h.start) : "?"}`, ...(h.what ? [h.what] : [])].join(" · ");
+    return { key: `slot:${place}:${i}`, id: live ? SLOT_ID(place, i) : null, worker: live ? worker : null, text: live ? `${text} ↗` : text };
+  });
+}
+const slotHead = (name, cap, n) => `${name} · ${n} of ${cap ?? "?"} slots held`;
+export function machinesRows(m, { isLive = () => false, here = "this Mac" } = {}) {
+  const out = { state: "checking", line: null, error: m?.error ?? null, asOf: null, notes: [], places: [], shown: false };
+  const doc = m?.doc;
+  if (!doc) return { ...out, state: m?.error ? "error" : "checking" };
+  out.state = "ok"; out.asOf = m.at ? at(new Date(m.at).toISOString()).slice(6) : null;
+  out.notes = (Array.isArray(doc.notes) ? doc.notes : []).map(String);
+  for (const x of doc.machines.filter(obj)) {
+    const name = String(x.machine ?? "?"), holders = slotLines(name, x.holders, isLive);
+    const state = x.reachable ? "reachable" : `not reachable${x.reason ? ` (${x.reason})` : ""}`;
+    out.places.push({ name, head: `${name} · ${state} · ${holders.length} of ${x.cap ?? "?"} slots held`, over: !x.reachable, holders });
+  }
+  const local = slotLines("local", doc.local?.holders, isLive);
+  out.places.push({ name: "local", head: slotHead(here, doc.local?.cap, local.length), over: false, holders: local });
+  out.shown = doc.machines.length > 0 || out.places.some((p) => p.holders.length > 0);
+  return out;
+}
+
 // What the section draws (pure). waiting, startOrder: the load's results (null or a give-up: not known yet); rules:
 // loadRules's; isLive(address): the worker's terminal is live; rank: the ranked task ids once a task order exists
-// (t-097 R9, J1-D10), else null (the added order). shown: false with no waiting list and no holder (D3).
-export function placesRows({ waiting, startOrder, rules, ledger, isLive, rank = null }) {
+// (t-097 R9, J1-D10), else null (the added order); machines, here: machinesRows's (t-119). shown: false with no
+// waiting list, no holder and no suite machine or slot holder (D3, t-119 R6).
+export function placesRows({ waiting, startOrder, rules, ledger, isLive, rank = null, machines = null, here = "this Mac" }) {
   const holders = holdersFrom(ledger, isLive);
   const { limits, sources, notes } = limitsOf(rules);
   const w = limits.working, x = limits["no-test"], cap = limits.suite;
@@ -200,12 +232,13 @@ export function placesRows({ waiting, startOrder, rules, ledger, isLive, rank = 
   if (x || extra.length) kinds.push({ kind: "no-test", head: `No-test extra · ${extra.length} of ${x}`, over: extra.length > x, holders: extra.map((h) => line(h)) });
   if (cap !== null) kinds.push({ kind: "suite", head: `Suite step · ${s} of ${cap}  (held within Working)`, over: s > cap, holders: holders.filter((h) => h.place === "suite").map((h) => line(h, true)) });
   const named = [...new Set(KINDS.map((k) => sources[k]).filter((v) => v !== "default"))];
-  const out = { shown: false, state: "loading", kinds, notes, limitsLine: `limits: ${named.length ? named.join(", ") : "default"}`, jobs: [], badges: {}, effective: [], orderKnown: false,
+  const slots = machinesRows(machines, { isLive, here }); // t-119: the suite machines' slots
+  const out = { shown: false, state: "loading", kinds, slots, notes, limitsLine: `limits: ${named.length ? named.join(", ") : "default"}`, jobs: [], badges: {}, effective: [], orderKnown: false,
     orderLine: null, reset: false, orderTextRead: null, waitingLine: null, head: `Places · ${used} of ${w} working` };
   const badge = (task, b) => { (out.badges[task] ??= []).push(b); };
   for (const h of holders) badge(h.task, { key: holderKey(h), text: `running · ${h.recorded ? KIND[h.place] : "working"}` });
   const known = waiting && !gaveUp(waiting);
-  out.shown = holders.length > 0 || Boolean(known && !waiting.missing);
+  out.shown = holders.length > 0 || Boolean(known && !waiting.missing) || slots.shown;
   if (!known) return out;
   if (waiting.missing) return { ...out, state: "missing", waitingLine: MISSING_WAITING };
   if (waiting.error) return { ...out, state: "error", waitingLine: waiting.error };
@@ -232,6 +265,28 @@ export function placesRows({ waiting, startOrder, rules, ledger, isLive, rank = 
     reset: orderKnown && read.error !== null && read.error !== "missing", orderTextRead: orderKnown && !startOrder.missing ? startOrder.text : null };
 }
 
+// t-119 R4, R5: the Suite machines block's elements (read only: a holder with a live worker opens it, nothing else).
+function slotsBlock(t, s, o, line, marked) {
+  if (!s) return [];
+  const head = div().pt(6).text_size(12).font_semibold().text_color(t.foreground);
+  if (s.state === "checking") return [head.child("Suite machines: checking…")];
+  const failed = s.error ? [line(`Suite machines: could not read them (${s.error})`, t.blocked)] : [];
+  if (s.state === "error") return failed;
+  return [
+    h_flex().pt(6).gap(8).items_center()
+      .child(div().flex_1().text_size(12).font_semibold().text_color(t.foreground).child("Suite machines"))
+      .child(div().flex_none().text_size(11).text_color(t.dim).child(`${s.asOf ? `as of ${s.asOf} · ` : ""}pa-full-suite --places`)),
+    ...failed,
+    ...s.notes.map((x) => line(x, t.blocked)),
+    ...s.places.flatMap((p) => [
+      div().pl(4).text_size(12).text_color(p.over ? t.blocked : t.foreground).child(p.head),
+      ...(p.holders.length ? p.holders.map((h) => (h.id
+        ? marked(div().id(h.id).pl(12).cursor_pointer().hover((x) => x.bg(t.hover)).on_click(() => o.onWorker?.(h.worker)), h.key).child(line(h.text))
+        : div().pl(12).child(line(h.text)))) : [div().pl(12).child(line("free", t.dim))]),
+    ]),
+  ];
+}
+
 // Draws the section (R1, R9). o: { folded, mark (a line key or null), busy, error, asOf, onFold, onMove(id, move, cx), onReset(cx),
 // onWorker(address) } (each handler gets its click's cx: a cx is valid only for the call that gave it). t-084 R5: a
 // holder line opens its worker in the Agents view (a holder's terminal is live: holdersFrom).
@@ -254,6 +309,7 @@ export function renderPlaces(t, rows, o) {
       ...(k.holders.length ? k.holders.map((h) => marked(div().id(`places-holder-${h.address}`).pl(12).cursor_pointer().hover((s) => s.bg(t.hover)).on_click(() => o.onWorker?.(h.address)), h.key)
         .child(line(`${h.text} ↗`))) : [div().pl(12).child(line("free", t.dim))]),
     ]))
+    .children(slotsBlock(t, rows.slots, o, line, marked))
     .when(Boolean(o.error), (el) => el.child(line(o.error ?? "", t.blocked)))
     .when(rows.state === "loading", (el) => el.child(line("Loading waiting list…", t.dim)))
     .when(rows.state === "missing" || rows.state === "error", (el) => el.child(line(rows.waitingLine ?? "", rows.state === "error" ? t.blocked : t.dim)))
