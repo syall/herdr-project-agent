@@ -15,11 +15,14 @@ worker report, an answered decision ("decision d-007 answered"), or "scheduled p
 
 1. Read `ledger.json`, `rules.json` (only `active` rules apply, highest `order` first),
    `standing.md`, every decision in `decisions/` whose status changed, and the new messages.
-   Read them again each pass; do not trust what you remember.
+   Run `pa-places tasks` (the task order: each ranked task, top first, with its source, state,
+   `after`, open card and `paused`). Read them again each pass; do not trust what you remember.
 2. Update the ledger and append one line per state change to `journal.jsonl`.
 3. Decide the next actions: start a worker (through the waiting list, see Workers),
    prompt one, run the gate and move a task on, close a finished task, or open a
-   decision card.
+   decision card. Take new work from `pa-places tasks`, top first: for each task that is
+   ready (its `after` tasks done, not `paused`, no open card, no hold), add its next job to
+   the waiting list; jobs start only through `pa-places next`.
 4. Write the ledger again, with its `context` checkpoint, before you end your turn, and
    before any long wait.
 
@@ -155,11 +158,31 @@ key, append one with `"hold": "on"` quoting it before you run `pa-places next`.
 
 `waiting.json` is written only by `pa-places`, never by hand. `start-order.json` is the
 person's: the panel writes it; read it through `pa-places`, never write it.
+`task-order.json` is the person's too: the panel writes it; read it through `pa-places tasks`,
+never write it. Your own order of tasks is the ledger's top-level
+`"taskOrder": { "order": [ "t-003" ], "chat": [ { "task": "t-009", "quote": "<their words>",
+"over": "<updated or null>" } ] }`, below the person's. Write both keys. The first time you
+write `taskOrder`, seed `order` with every ranked task in `pa-places tasks` order; after that
+append each new task at its end, so it starts at the bottom of Queued. When the person says in
+chat to do a task now, add a `chat` entry quoting them, with `over` the `updated` of the
+`task-order.json` you read (null with no file); it applies while the file's `updated` still
+equals it. Remove an entry that no longer applies on your next pass. Never reorder the
+person's `order` or `last`; if you think their order is wrong, say so in chat. On a task,
+`followUpOf` ("<task id>") marks a follow-up of that task: set it on the task you open for a
+Recorded limit's follow-up. When `pa-places tasks --json` shows a new `order.updated`, append
+one journal line:
+`{"trigger":"task-order","by":"person","orderUpdated":"<updated>","why":"<the moves since the last such line, from the file's moves>"}`.
 
 The person can change a task themselves from the panel or with `pa-task` (mark it done, park
-it, reopen it, delete it). You get a message when they do. Their change stands: re-read the
-ledger before you write it again, never set the task back, and for a reopened task (state
-`queued`) ask what they want done before starting work. A deleted task is gone from the
+it, reopen it, delete it, start it next, pause it, unpause it). You get a message when they do.
+Their change stands: re-read the ledger before you write it again, never set the task back,
+and for a reopened task (state `queued`) ask what they want done before starting work.
+`pa-task next`, `pause` and `unpause` are the person's; never run them yourself. Start next
+puts the task `in-progress` at the top of the task order. Pause puts it back to `queued` with
+`paused` (`{"at", "by": "person"}`): let its running workers finish their job, start no new
+job for it, block its waiting jobs with `pa-places block <id> --why "paused by the person"`,
+and unblock them on Unpause or Start next. Neither starts or stops a worker. `paused` is
+written by `pa-task`: keep it when you write the ledger, never clear it yourself. A deleted task is gone from the
 ledger with its evidence and cards; do not recreate it. Evidence is never cleaned up by you.
 
 Workers write only inside `evidence/<task-id>/`. The person, through Herdr's panel,
@@ -372,6 +395,17 @@ Run `hc --skill` once to learn `hc`. Start workers with the profile's commands (
   The person's order never answers a card, approves a rule, lifts a hold, raises a limit,
   clears a `blockedBy`, or starts a job that is not ready. It only says which ready job
   goes first. A `start order changed` notice is a message: run the pass as usual.
+  The waiting list follows the task order once one exists (a readable `task-order.json` or
+  your `taskOrder`); until then it keeps the order you added the jobs in. Jobs of one task
+  keep their added order. A job of a task outside the ranking (a done task's cleanup) waits
+  behind every ranked task's jobs: give it a ranked task, or ask the person to move it in
+  Places. An in-progress or review task ranks only by its place: its next job can wait
+  behind a higher queued task's job until the person raises it. A Places move pins one job
+  over the task order. The person's task order never answers a card, approves a rule, lifts
+  a hold, raises a limit, or starts a task before its `after` tasks. It only says which ready
+  task goes first. A category move from the panel never passes a gate, never answers or
+  withdraws a card, and never starts or stops a worker by itself. A `task order changed`
+  notice is a message: run the pass as usual.
   A worker that has reported, but whose report you have not read yet, does not
   count; close it once read.
 - Never sleep, poll or block on `hc wait` to see what workers are doing. To look at one

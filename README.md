@@ -398,13 +398,48 @@ no-test extra place) and `suite` (a job at the full-suite step: a working place 
 Their limits are the rules' `places` (`"places": {"working": 4, "no-test": 1, "suite": 2}` on an active
 rule, the highest one per kind); with none, working 4, no-test 0 and no suite cap. The Project Agent
 keeps the waiting list in `waiting.json` with `pa-places` (`add`, `block`, `unblock`, `drop`, `start`;
-`pa-places next` says which job starts and why the others wait). You move a waiting job with ↑ ↓ ⤒;
-the panel writes your order to `start-order.json`, which no tool writes, and tells the agent `start
-order changed`. Your order only says which ready job goes first: it answers no card, approves no rule,
-lifts no hold and raises no limit. Merge-queue checks keep the queue's order (Queue tab). A space's
+`pa-places next` says which job starts and why the others wait). The waiting list follows the task
+order (below). You move a waiting job with ↑ ↓ ⤒: a one-off override for that job, which the panel
+saves as one of the `pins` in `start-order.json` (version 2: the job and its new place among the
+movable jobs; a version 1 file, a whole list, is read as pins in its order), which no tool writes, and
+tells the agent `start order changed`. Your order only says which ready job goes first: it answers no
+card, approves no rule, lifts no hold and raises no limit. Merge-queue checks keep the queue's order
+(Queue tab). A space's
 suite places are not the machine's suite slot: the suite places limit how many of this space's workers
 are at the full-suite step, while the slot (`PA_SUITE_CAP`, default 1, see Checks) lets that many suite
 runs at once on the machine, across every space.
+
+**Task order** (the Tasks tab's ranked sections). One ranking of the space's tasks, shown within each
+section: Review, In progress, Investigating and Queued list their tasks in rank order, numbered, with
+↑ ↓ ⤒ ⤓ (⤓ sends a task below everything else). A task keeps its rank when it changes section. Needs
+decision tasks and parked tasks keep a hidden rank (no number, no buttons) and come back at it; a done
+task has none, and reopened it starts at the bottom of Queued. The panel writes your order to
+`task-order.json` in the state folder (`order`: the tasks you placed, top first; `last`: the ones sent
+to the bottom; the last 20 `moves`), compare-and-write, locally or on the space's machine; no tool
+writes it. A ↑ makes every task above it yours, so ↑ is exactly one step. An unreadable file is
+ignored as a whole, with the line `task order unreadable: <why>; the Project Agent's order is used` and
+a **Reset order** button. Tasks you have not placed keep the Project Agent's order (`taskOrder` in its
+ledger; a new task lands at the bottom of Queued, above the ones you sent to the bottom) and show a dim
+`PA` chip; a task it raised because you asked in chat ("do it now") shows `PA · your words` until your
+next move. Follow-ups of one task (`followUpOf` in the ledger) fold into one Queued line, `▸ 3
+follow-ups of t-083 · first #4`. The Project Agent reads it every pass with `pa-places tasks` and takes
+the next ready task from the top; the waiting list follows it, until a task order exists (a readable
+`task-order.json` or the ledger's `taskOrder`) the jobs keep the order the agent added them in. A task
+in progress or in review ranks only by its place, so its next job can wait behind a higher queued
+task's job until you raise it; a job of a task outside the ranking (a done task's cleanup) waits behind every
+ranked task's jobs. The person's task order never answers a card, approves a rule, lifts a hold, raises
+a limit, or starts a task before its `after` tasks. It only says which ready task goes first.
+
+Moving a task between sections goes through `pa-task`, which journals it and tells the agent: **Start
+next** on a Queued task (`pa-task next`: In progress, top of the order; its `after` tasks, cards and
+holds still apply, and no worker is started), **Pause** on an In progress or Investigating task
+(`pa-task pause`: back to Queued with a `paused` chip; its running workers finish their job, no new job
+starts, its waiting jobs are blocked), **Unpause** (`pa-task unpause`), and Park, Reopen and Delete… as
+before. **Mark done** takes two clicks; the first says what stays (`Done merges nothing: …`: the change
+request, worktrees, merge-queue entries and live workers). Nothing moves a task into Review (only the
+gate) or into Needs decision, and a Needs decision task with an open card offers only Delete…: `Answer
+d-xxx first, or ask the Project Agent to withdraw it.` A category move from the panel never passes a
+gate, never answers or withdraws a card, and never starts or stops a worker by itself.
 
 **The Costs view** (Project panel, fifth tab) reads only `costs/summary.json` on the space's machine,
 only while it is shown, at most every 10 s. It shows Total, Today and Last 7 days, then the spend by

@@ -53,8 +53,20 @@ A new space opens with a 600 x 440 dialog: a Project Agent card (`Set up for <fo
   A worktree's Delete/Keep card comes only once every task using it is done or parked, and lists
   its tasks, branch, commits (merged or pushed), files changed and uncommitted files;
   WORKTREE.md in the task's evidence has the full list.
-- **Tasks:** one section per state (finished ones start folded), newest first. An expanded task
-  shows its goal, tier, a chip per worker (a live one opens in the Agents view), a button per
+- **Tasks:** one section per state (finished ones start folded). The line `order: yours`, `order:
+  the Project Agent's` or `task order unreadable: …` (with Reset order) sits above the first
+  ranked section. Review, In progress, Investigating and Queued show their tasks in rank order,
+  numbered within the section, with ↑ ↓ ⤒ ⤓; a task the Project Agent placed shows a dim `PA`
+  chip (`PA · your words` when it raised it at your word in chat); the follow-ups of one task fold
+  into one Queued line (`▸ 3 follow-ups of t-083 · first #4`). Needs decision keeps its tasks'
+  ranks hidden (no number, no buttons); Parked and Done stay newest first. A move writes
+  `task-order.json` and tells the agent; while it is being written the order buttons dim.
+  Start next (Queued), Pause (In progress, Investigating) and Unpause (a paused Queued task) run
+  `pa-task next`, `pause` and `unpause`; none starts or stops a worker. A Needs decision task with
+  an open card shows `Answer d-xxx first, or ask the Project Agent to withdraw it.` and offers
+  only Delete…. Mark done takes two clicks: the first shows `Done merges nothing: …` (what stays:
+  the change request, worktrees, merge-queue entries, live workers) with Confirm and Cancel.
+  An expanded task shows its goal, tier, a chip per worker (a live one opens in the Agents view), a button per
   open decision, a button per artifact link, Evidence (only when there is some), the profile's
   declared actions, and your own controls: Reopen, Mark done, Park, Delete… (two clicks on the
   same button; the task, its evidence and its cards go to a trash folder). After the first click
@@ -67,8 +79,8 @@ A new space opens with a 600 x 440 dialog: a Project Agent card (`Set up for <fo
   since), the limits' rule, then `Waiting · n`, one line per job in the order they will start
   (position, task, job, role, kind, why it waits: `blocked: …`, `waits for a suite place (2 of 2)`,
   `next to start`) with ↑ ↓ ⤒ to move it. A merge-queue check shows `merge queue order (Queue tab)`
-  and no buttons. A move writes your order and tells the agent; it only says which ready job goes
-  first. A task row shows a badge per waiting or running job (`next #2 · suite step`, `running ·
+  and no buttons. The jobs follow the task order; a move pins that one job at its new place,
+  writes `start-order.json` and tells the agent; it only says which ready job goes first. A task row shows a badge per waiting or running job (`next #2 · suite step`, `running ·
   working`); a click unfolds Places and marks that line.
 - **Finished workers are closed by the agent.** The agent starts one fresh worker per job, named
   for the job (`t-010-tests`, `t-010-fix`), and closes it in the pass where it reads its report,
