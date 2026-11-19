@@ -155,7 +155,7 @@ class Ctx:
         self.directory = directory
         self.repo = os.path.realpath(repo) if repo else None
         self.s = pa_push.Session()
-        self.run = pa_hooks.content_git(self.s.gate_git)
+        self.run = pa_hooks.content_git(self.s.gate_git, self.s.cache)  # the command's one cache (t-094 R7)
         self.ledger = pa_hooks.read_ledger(directory)
         self.events = []
         self.notes = []
@@ -544,7 +544,7 @@ def content_only(checks):
 
 
 def gate_now(ctx, task, detail=False):
-    result = pa_hooks.evaluate_gate(ctx.directory, task, "review", runner=ctx.s.gate_git)
+    result = pa_hooks.evaluate_gate(ctx.directory, task, "review", runner=ctx.s.gate_git, cache=ctx.s.cache)
     fails = [c for c in result["checks"] if not c["ok"]]
     pending = bool(fails) and all(c["check"] == pa_hooks.CONTENT_CHECK and "a short review is needed" in str(c.get("why")) for c in fails)
     why = "; ".join("{} ({})".format(c["check"], c.get("why")) for c in fails)
@@ -1596,7 +1596,7 @@ def merge_check(ctx, rec, e, main_tip, suites, reviews):
     task = ctx.task(e["task"])
     if not task:
         return "the task is not in the ledger", False, None
-    gate = pa_hooks.evaluate_gate(ctx.directory, task, "review", runner=ctx.s.gate_git)
+    gate = pa_hooks.evaluate_gate(ctx.directory, task, "review", runner=ctx.s.gate_git, cache=ctx.s.cache)
     content = [x for x in gate.get("content") or [] if isinstance(x, dict) and x.get("common") == rec["common"]]
     seen = content[0] if len(content) == 1 else {}
     if seen.get("checked") != c.get("commit") or seen.get("error"):

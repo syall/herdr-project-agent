@@ -478,11 +478,12 @@ def gate_commits(worktree, runner=None):
     return found
 
 
-def evaluate_gate(directory, task, phase, rules=None, runner=None, records=None):
+def evaluate_gate(directory, task, phase, rules=None, runner=None, records=None, cache=None):
     """The gate's verdict for one ledger task, as GATE.json holds it. Reads only: writes and prints nothing.
     rules: the space's rules list (default: read from rules.json in directory). runner: how gate_commits and the
     content check run git (default: git()). records: a list the content check appends the content records it
-    computed to (cmd_gate stores them; t-052)."""
+    computed to (cmd_gate stores them; t-052). cache: the run's ContentCache (t-094 R3: pa-queue's command,
+    pa-push-main's Session); given none, this call is its own run and makes its own, shared with no other call."""
     tier = str(task.get("tier") or "normal").lower()
     code = bool(task.get("worktree")) or str(task.get("type", "")).lower() in ("feature", "bug", "chore", "code")
     # Leaving `review` (the default) needs every earlier phase's artifact too.
@@ -532,7 +533,7 @@ def evaluate_gate(directory, task, phase, rules=None, runner=None, records=None)
     pins = gate_commits(task.get("worktree"), runner)
     content = []
     if phase == "review" and pins:
-        check, content = content_check(directory, task, pins, runner, records)
+        check, content = content_check(directory, task, pins, runner, records, ContentCache() if cache is None else cache)
         checks.append(check)
     ok = all(c["ok"] for c in checks)
     return {"task": task.get("id"), "phase": phase, "tier": tier, "passed": ok, "at": pa.now(), "checks": checks,
@@ -604,19 +605,32 @@ def is_commit(run, path, sha):
     return run(path, "cat-file", "-e", sha + "^{commit}")[0] == 0
 
 
-def repo_paths(run, path):
-    """(common dir, [(absolute path, what)]): the repository's common directory and the files that would change what
-    git says a commit's parents are, as git itself resolves them (`--git-path`: the common directory's info/grafts
-    or GIT_GRAFT_FILE, and its shallow file), in one call (t-094 R2). Raises ContentError when git cannot say."""
+OBJECT_HEX = {"sha1": 40, "sha256": 64}  # the length of a full object id, per object format
+
+
+def repo_facts(run, path):
+    """(common dir, [(absolute path, what)], id length or None): the repository's common directory, the files that
+    would change what git says a commit's parents are, as git itself resolves them (`--git-path`: the common
+    directory's info/grafts or GIT_GRAFT_FILE, and its shallow file), and the length of its full object ids (t-094
+    J2-D1: the cache takes a value as an id only at that length), in one call (t-094 R2). Raises ContentError when
+    git cannot say where the files are."""
     names = ()
     for name, _what in STEERING_FILES:
         names += ("--git-path", name)
-    code, out, err = run(path, *(CONTENT_GIT + ("rev-parse", "--path-format=absolute", "--git-common-dir") + names))
+    code, out, err = run(path, *(CONTENT_GIT + ("rev-parse", "--show-object-format", "--path-format=absolute",
+                                                "--git-common-dir") + names))
     lines = out.split("\n") if not code and out else []
+    hexlen = OBJECT_HEX.get(lines[0]) if lines else None
+    lines = lines[1:]
     for i, (_name, what) in enumerate(STEERING_FILES):
         if len(lines) != 1 + len(STEERING_FILES) or not os.path.isabs(lines[0]) or not os.path.isabs(lines[1 + i]):
             raise ContentError("cannot tell where {} would be ({})".format(what, clean(err)[-200:] or "no answer"))
-    return lines[0], [(lines[1 + i], what) for i, (_name, what) in enumerate(STEERING_FILES)]
+    return lines[0], [(lines[1 + i], what) for i, (_name, what) in enumerate(STEERING_FILES)], hexlen
+
+
+def repo_paths(run, path):
+    """(common dir, [(absolute path, what)]) of repo_facts."""
+    return repo_facts(run, path)[:2]
 
 
 def steering_files(run, path):
@@ -632,12 +646,66 @@ def steering_refusal(path, name, what):
     return why
 
 
-def content_git(run):
+class ContentCache:
+    """One run's answers to object-addressed content calls (t-094 R3): {(common dir, argv): (code, out, err)} as the
+    runner gave them. A run is one pa-gate, one pa-queue command, one pa-push-main plan, check or run (its Session),
+    or one evaluate_gate call given none. It belongs to the run, is never module-global and never written to disk.
+    Objects never change, so an answer stays true across a rebase or a fast-forward of the same run; nothing that
+    reads a ref, HEAD, the index or the worktree is ever stored (cacheable)."""
+
+    def __init__(self):
+        self.answers = {}
+        self.hits = 0
+
+    def clear(self):
+        self.answers.clear()
+
+
+def cacheable(args, hexlen):
+    """The exit codes under which the answer of content call args (CONTENT_GIT not included) may be stored, or None
+    for a call that is never stored (t-094 R3). Only these exact shapes, every value a full object id of the
+    repository's own length hexlen (J2-D1: in a SHA-1 repository 64 hex is a ref name to git, and in a SHA-256 one
+    40 hex is an abbreviation, which git tries as a ref first; an unknown format caches nothing):
+    cat-file commit <id>; cat-file -e <id>^{commit}; RAW_DIFF <id>[^] <id>; rev-list [--reverse] [--parents]
+    [--count] <id>..<id>; rev-parse --verify -q <id>^{tree}; merge-base <id> <id>; merge-base --is-ancestor <id>
+    <id> (exit 0 or 1). Everything else, a ref, HEAD, a short id, status, config, a write, is never stored."""
+    if hexlen not in OBJECT_HEX.values():
+        return None
+    args = tuple(args)
+
+    def oid(v):
+        return isinstance(v, str) and len(v) == hexlen and all(c in "0123456789abcdef" for c in v)
+    n = len(RAW_DIFF)
+    if len(args) == 3 and args[:2] == ("cat-file", "commit") and oid(args[2]):
+        return {0}
+    if len(args) == 3 and args[:2] == ("cat-file", "-e") and args[2].endswith("^{commit}") and oid(args[2][:-9]):
+        return {0}
+    if len(args) == n + 2 and args[:n] == RAW_DIFF and (oid(args[n]) or (args[n].endswith("^") and oid(args[n][:-1]))) \
+            and oid(args[n + 1]):
+        return {0}
+    if len(args) >= 2 and args[0] == "rev-list":
+        opts, value = args[1:-1], args[-1]
+        a, sep, b = value.partition("..")
+        if set(opts) <= {"--reverse", "--parents", "--count"} and len(set(opts)) == len(opts) and sep and oid(a) and oid(b):
+            return {0}
+        return None
+    if len(args) == 4 and args[:3] == ("rev-parse", "--verify", "-q") and args[3].endswith("^{tree}") and oid(args[3][:-7]):
+        return {0}
+    if len(args) == 3 and args[0] == "merge-base" and oid(args[1]) and oid(args[2]):
+        return {0}
+    if len(args) == 4 and args[:2] == ("merge-base", "--is-ancestor") and oid(args[2]) and oid(args[3]):
+        return {0, 1}
+    return None
+
+
+def content_git(run, cache=None):
     """run for the content path (t-052 J1 rounds 2 and 3, verify MF-1 and MF-R2-1): CONTENT_GIT before every
     subcommand, and ContentError instead of any call while a grafts or shallow file exists, checked before and
     after each call (t-094 R10: a file made during the call discards its answer). gate_git drops GIT_*, so options
     and this check, not variables, are what hold in pa-push-main too. call.common(path): the common directory, from
-    the same one paths call per folder (t-094 R2)."""
+    the same one paths call per folder (t-094 R2). cache: the run's ContentCache (t-094 R3), looked up and filled
+    here, in this order: before-check, lookup (a hit returns), git, after-check, store; so the steering check runs
+    on every call, hits included, and only an answer that passed both checks is stored."""
     known = {}
 
     def check(path, files):
@@ -647,16 +715,23 @@ def content_git(run):
 
     def paths(path):
         if path not in known:
-            common, files = repo_paths(run, path)
+            common, files, hexlen = repo_facts(run, path)
             check(path, files)  # after the paths call itself (R10)
-            known[path] = (common, files)
+            known[path] = (common, files, hexlen)
         return known[path]
 
     def call(path, *args, **kw):
-        files = paths(path)[1]
+        common, files, hexlen = paths(path)
         check(path, files)
+        codes = cacheable(args, hexlen) if cache is not None else None
+        key = (os.path.realpath(common), tuple(args)) if codes else None
+        if key is not None and key in cache.answers:
+            cache.hits += 1
+            return cache.answers[key]
         answer = run(path, *(CONTENT_GIT + args), **kw)
         check(path, files)
+        if key is not None and answer[0] in codes:
+            cache.answers[key] = answer
         return answer
     call.common = lambda path: paths(path)[0]
     return call
@@ -770,11 +845,11 @@ def compare_records(checked, now):
     return "; ".join(parts)
 
 
-def content_check(directory, task, pins, runner=None, records=None):
+def content_check(directory, task, pins, runner=None, records=None, cache=None):
     """(check, GATE.json content) for the review gate: the commit on VERIFY.md's last Checked: line makes the same
     change as HEAD, per pin (t-052 R5). records: computed records are appended here (with source verify or head)."""
     raw = globals()["git"] if runner is None else runner
-    run = content_git(raw)
+    run = content_git(raw, cache)
     evidence = os.path.join(directory, "evidence", str(task.get("id")))
     verify = checked_commits(pa.read_text(os.path.join(evidence, "VERIFY.md")))
     review = checked_commits(pa.read_text(os.path.join(evidence, "REVIEW.md")))

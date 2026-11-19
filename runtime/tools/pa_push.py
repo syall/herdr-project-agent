@@ -453,11 +453,14 @@ def short(sha):
 
 
 class Session:
-    """The git context of one plan, check or run: an empty hooks folder (removed by close) and a deadline."""
+    """The git context of one plan, check or run: an empty hooks folder (removed by close), a deadline, and the run's
+    cache of object-addressed content answers (t-094 R3, R6: the gate it evaluates; dropped by close). Its own
+    push-time reads (self.git) never go through it."""
 
     def __init__(self, deadline=None):
         self.deadline = deadline
         self.hooks = tempfile.mkdtemp(prefix="pa-push-hooks-")
+        self.cache = pa_hooks.ContentCache()
 
     def left(self):
         return float("inf") if self.deadline is None else self.deadline - time.monotonic()
@@ -487,6 +490,9 @@ class Session:
 
     def close(self):
         shutil.rmtree(self.hooks, ignore_errors=True)
+        if self.cache is not None:
+            self.cache.clear()
+        self.cache = None
 
 
 def tracked_changes(s, path):
@@ -664,7 +670,7 @@ def gather(s, directory, space, push, facts, plan=False):
     why = task_settings_refusal(s, task.get("worktree"))
     if why:
         raise Refused("C8a", why)
-    now_gate = pa_hooks.evaluate_gate(directory, task, "review", runner=s.gate_git)
+    now_gate = pa_hooks.evaluate_gate(directory, task, "review", runner=s.gate_git, cache=s.cache)
     if not now_gate["passed"]:
         failed = ["{} ({})".format(c["check"], c.get("why")) for c in now_gate["checks"] if not c["ok"]]
         raise Refused("C8a", "the full gate for {} does not pass now: {}".format(task_id, "; ".join(failed)))
