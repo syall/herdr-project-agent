@@ -1045,6 +1045,41 @@ cases["S83-rows"] = async () => { // R1 AC1.1-1.4, R9, R11 without rendering: pl
   check(placesMod.placesRows({ waiting: { doc: null, error: null, missing: true }, startOrder: null, rules: null, ledger: { tasks: [] }, isLive: () => true }).shown === false, "D3: no list, no holder: not shown");
 };
 
+cases["S133-rows-over"] = async () => { // t-083 J2 verify RL1: `over` at the limit is false; a suite kind over its cap is true
+  const zoneMod = await import(path.join(dst, "zone.js"));
+  zoneMod.zone.offsetAt = () => 0;
+  const rules = { rules: [], error: null, doc: { rules: [{ id: "r-places", text: "x", status: "active", order: 50, places: { working: 4, "no-test": 1, suite: 2 } }] } };
+  const w = (address, place) => ({ address, name: `t-1-${address}`, role: "build", started: "2026-11-19T10:02:00Z", place });
+  const rows = (places) => placesMod.placesRows({ waiting: { doc: null, error: null, missing: true }, startOrder: null, rules,
+    ledger: { tasks: [{ id: "t-1", workers: places.map((p, i) => w(`a${i}`, p)) }] }, isLive: () => true });
+  const at = rows(["working", "working", "working", "working"]);
+  check(at.kinds[0].head === "Working · 4 of 4" && at.kinds[0].over === false, `Working 4 of 4: over false (got ${JSON.stringify(at.kinds[0])})`);
+  const suite = rows(["suite", "suite", "suite"]).kinds.find((k) => k.kind === "suite");
+  check(suite.head === "Suite step · 3 of 2  (held within Working)" && suite.over === true, `suite 3 of 2: over true (got ${JSON.stringify(suite)})`);
+  const atCap = rows(["suite", "suite"]).kinds.find((k) => k.kind === "suite");
+  check(atCap.over === false, `suite 2 of 2: over false (got ${JSON.stringify(atCap)})`);
+  const extra = rows(["working", "working", "working", "working", "no-test", "no-test"]).kinds.find((k) => k.kind === "no-test");
+  check(extra.head === "No-test extra · 2 of 1" && extra.over === true, `no-test extra 2 of 1: over true (got ${JSON.stringify(extra)})`);
+};
+
+cases["S133-limits-raw-rules"] = async () => { // t-083 J2 RL1: a rule-check error still gives pa-places' limits, not the defaults
+  world();
+  const doc = { version: 1, rules: [{ id: "r-places", status: "active", order: 50, places: { working: 2 } }, { id: "r-two", text: "y", status: "active", order: 1 }] }; // r-places has no text
+  g.__files[keyOf(local, "/rules.json")] = JSON.stringify(doc);
+  const r = await store.loadRules(local, cx);
+  check(/^rules\.json: r-places has no text/.test(r.error ?? "") && same(r.doc, doc), `the rule checks fail, the parsed file is kept (got ${JSON.stringify(r)})`);
+  const rows = placesMod.placesRows({ waiting: { doc: null, error: null, missing: true }, startOrder: null, rules: r, ledger: { tasks: [] }, isLive: () => true });
+  check(rows.kinds[0].head === "Working · 0 of 2", `pa-places' limit, from r-places (got ${JSON.stringify(rows.kinds.map((k) => k.head))})`);
+  check(rows.notes.some((n) => n === "rules.json: r-places has no text; the limits are read as pa-places reads them"), `the note (got ${JSON.stringify(rows.notes)})`);
+  check(rows.limitsLine === "limits: r-places", `limits line (got ${rows.limitsLine})`);
+  for (const body of ["{x", "[]"]) { // not JSON, or no rules list: the defaults, as pa-places
+    g.__files[keyOf(local, "/rules.json")] = body;
+    const bad = await store.loadRules(local, cx);
+    const r2 = placesMod.placesRows({ waiting: { doc: null, error: null, missing: true }, startOrder: null, rules: bad, ledger: { tasks: [] }, isLive: () => true });
+    check(r2.kinds[0].head === "Working · 0 of 4 (default)" && r2.notes.some((n) => n.endsWith("; the default limits are used")), `${body}: defaults (got ${JSON.stringify([r2.kinds[0].head, r2.notes])})`);
+  }
+};
+
 // ---- t-097 J2: the person's task order (tasks.js, store.js) and the start order's version 2 pins (places.js) ----
 const tasksMod = await import(path.join(dst, "tasks.js")).catch(() => null);
 const TSHARED = JSON.parse(fs.readFileSync(path.join(here, "..", "samples", "task-order-cases.json"), "utf8"));

@@ -3671,6 +3671,355 @@ class CloseWhenIdle(Base):
         self.assertEqual(kw.get("cwd"), self.dir)
 
 
+class T133CloseWhenIdleLimits(Base):
+    """t-133 (t-042 Recorded limits 1-3): a follow-up after --when-idle is not cut off (a new turn stops the waiter;
+    the Project Agent can cancel it), and the waiter's bound holds when hc hangs or the Mac sleeps."""
+
+    def setUp(self):
+        Base.setUp(self)
+        self.proj = self.repo()
+        self.wt = self.worktree(self.proj, "t-003-x")
+        self.add_task("t-003", "in-progress", self.wt, [{"address": "t31", "role": "build", "name": "t-003-tests"}])
+        self.term("t31", "t-003-tests")
+        self.evidence("t-003")
+        pa_hooks.by_an_agent = lambda: True
+        self.spawned = []
+        self.saved_idle = {k: getattr(pa_hooks, k) for k in ("spawn_idle_closer", "WHEN_IDLE_POLL", "WHEN_IDLE_LIMIT")}
+        pa_hooks.spawn_idle_closer = lambda *a, **k: self.spawned.append((a, k))
+        pa_hooks.WHEN_IDLE_POLL = 0.01
+        pa_hooks.WHEN_IDLE_LIMIT = 3
+
+    def tearDown(self):
+        for k, v in self.saved_idle.items():
+            setattr(pa_hooks, k, v)
+        Base.tearDown(self)
+
+    when_idle, waiter, flip_after = CloseWhenIdle.when_idle, CloseWhenIdle.waiter, CloseWhenIdle.flip_after
+    no_send, assertNotClosed = CloseWhenIdle.no_send, CloseWhenIdle.assertNotClosed
+
+    def waiter_turn(self, ms):
+        return self.worker("close", "t31", "--evidence", "FINDINGS.md", "--idle-waiter", "--turn-ms", str(ms))
+
+    def cancel(self):
+        return self.worker("close", "t31", "--cancel-when-idle")
+
+    # RL1 (a): the waiter knows the turn it was left for
+    def test_rl1_spawn_passes_the_turn_it_saw(self):
+        self.terms["t31"].update(status="working", status_ms=1700000000000)
+        code, out, err = self.when_idle()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(self.spawned), 1)
+        self.assertEqual(self.spawned[0][1].get("turn_ms"), 1700000000000)
+
+    def test_rl1_spawn_argv_carries_the_turn(self):
+        got = []
+
+        class FakePopen(object):
+            def __init__(self, argv, **kw):
+                got.append(argv)
+        fake = type("S", (), {"Popen": FakePopen, "DEVNULL": subprocess.DEVNULL})
+        saved_sub, saved_argv = pa_hooks.subprocess, sys.argv
+        pa_hooks.subprocess, sys.argv = fake, ["/opt/bin/pa-worker"]
+        try:
+            self.saved_idle["spawn_idle_closer"](self.dir, "sp1", "t31", "FINDINGS.md", turn_ms=1700000000000)
+        finally:
+            pa_hooks.subprocess, sys.argv = saved_sub, saved_argv
+        self.assertEqual(got[0][-2:], ["--turn-ms", "1700000000000"])
+
+    def test_rl1_a_new_turn_stops_the_waiter(self):
+        self.terms["t31"].update(status="working", status_ms=1000)
+        real, seen = self.fake_get, []
+
+        def get(address):
+            seen.append(address)
+            if len(seen) == 3:  # the turn ended and a follow-up began between two checks
+                self.terms["t31"]["status_ms"] = 2000
+            if len(seen) == 8:
+                self.terms["t31"]["status"] = "idle"  # the follow-up's turn ends later
+            return real(address)
+        pa.hc_get = get
+        code, _, err = self.waiter_turn(1000)
+        self.assertEqual(code, 0, err)
+        self.assertNotClosed()
+        lines = self.journal()
+        self.assertEqual(len(lines), 1, lines)
+        self.assertEqual(lines[0]["trigger"], "close-when-idle")
+        self.assertIn("a new turn began", lines[0]["why"])
+        self.assertIn("not closed", lines[0]["why"])
+        self.no_send()
+
+    def test_rl1_the_same_turn_ending_is_closed(self):
+        self.terms["t31"].update(status="working", status_ms=1000)
+        real, seen = self.fake_get, []
+
+        def get(address):
+            seen.append(address)
+            if len(seen) == 4:
+                self.terms["t31"].update(status="idle", status_ms=3000)
+            return real(address)
+        pa.hc_get = get
+        self.assertEqual(self.waiter_turn(1000)[0], 0)
+        self.assertTrue(self.entry("t-003", "t31")["finished"])
+
+    # RL1 (b): --cancel-when-idle
+    def hold_waiter_lock(self):
+        import fcntl
+        lock = open(os.path.join(self.dir, ".close-when-idle-t31.lock"), "a")
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        self.addCleanup(lock.close)
+        return lock
+
+    def test_rl1_cancel_with_no_waiter_says_so_and_writes_nothing(self):
+        code, out, err = self.cancel()
+        self.assertEqual(code, 0, err)
+        self.assertIn("no pa-worker close --when-idle is waiting for t31", out)
+        self.assertFalse(os.path.exists(os.path.join(self.dir, ".close-when-idle-t31.cancel")))
+        self.assertNotClosed()
+
+    def test_rl1_cancel_with_a_waiter_marks_it_and_journals(self):
+        self.hold_waiter_lock()
+        code, out, err = self.cancel()
+        self.assertEqual(code, 0, err)
+        self.assertIn("cancelled", out)
+        self.assertTrue(os.path.exists(os.path.join(self.dir, ".close-when-idle-t31.cancel")))
+        lines = self.journal()
+        self.assertEqual(lines[-1]["trigger"], "close-when-idle")
+        self.assertIn("cancel", lines[-1]["why"])
+        self.assertNotClosed()
+
+    def test_rl1_a_cancelled_waiter_closes_nothing_and_cleans_up(self):
+        self.flip_after(3, "idle", then=lambda: write(os.path.join(self.dir, ".close-when-idle-t31.cancel"), "x\n"))
+        code, _, err = self.waiter()
+        self.assertEqual(code, 0, err)
+        self.assertNotClosed()
+        self.assertIn("cancelled", self.journal()[-1]["why"])
+        self.assertFalse(os.path.exists(os.path.join(self.dir, ".close-when-idle-t31.cancel")))
+
+    def test_rl1_cancel_checked_under_the_lock_before_the_kill(self):
+        # the cancel lands after the first status read of a close but before its recheck under the ledger lock
+        self.terms["t31"]["status"] = "idle"
+        real, seen = self.fake_get, []
+
+        def get(address):
+            seen.append(address)
+            if len(seen) == 2:
+                write(os.path.join(self.dir, ".close-when-idle-t31.cancel"), "x\n")
+            return real(address)
+        pa.hc_get = get
+        self.assertEqual(self.waiter()[0], 0)
+        self.assertNotClosed()
+
+    def test_rl1_a_new_when_idle_clears_an_old_cancel(self):
+        write(os.path.join(self.dir, ".close-when-idle-t31.cancel"), "x\n")
+        self.terms["t31"]["status"] = "working"
+        self.assertEqual(self.when_idle()[0], 0)
+        self.assertFalse(os.path.exists(os.path.join(self.dir, ".close-when-idle-t31.cancel")))
+
+    def test_rl1_plain_close_ignores_a_cancel_file(self):
+        write(os.path.join(self.dir, ".close-when-idle-t31.cancel"), "x\n")
+        code, _, err = self.worker("close", "t31", "--evidence", "FINDINGS.md")
+        self.assertEqual(code, 0, err)
+        self.assertTrue(self.entry("t-003", "t31")["finished"])
+
+    def test_rl1_cancel_usage(self):
+        for argv in (("close", "--cancel-when-idle"), ("close", "t31", "--cancel-when-idle", "--when-idle", "--evidence", "FINDINGS.md"),
+                     ("keep", "t31", "--cancel-when-idle")):
+            self.assertEqual(self.worker(*argv)[0], 2, argv)
+
+    # RL2: a worker the waiter closed but whose entry a later rewrite lost is recorded by a second close
+    def test_rl2_close_again_records_a_closed_worker(self):
+        del self.terms["t31"]  # the waiter ended it; a stale rewrite dropped `finished`
+        code, out, err = self.worker("close", "t31", "--evidence", "FINDINGS.md", "--when-idle")
+        self.assertEqual(code, 0, err)
+        self.assertTrue(self.entry("t-003", "t31")["finished"])
+        self.assertEqual(self.ended(), [])
+
+    # RL3: the bound
+    def test_rl3_pa_call_gives_up_after_call_timeout(self):
+        pa.call = self.saved["call"]
+        saved = getattr(pa, "CALL_TIMEOUT", "missing")
+        self.assertIsNone(saved, "the default is no timeout")
+        pa.CALL_TIMEOUT = 0.3
+        try:
+            start = time.monotonic()
+            with self.assertRaises(pa.Problem) as e:
+                pa.call([sys.executable, "-c", "import time; time.sleep(5)"])
+            self.assertLess(time.monotonic() - start, 4)
+            self.assertIn("did not answer", str(e.exception))
+        finally:
+            pa.CALL_TIMEOUT = None
+
+    def test_rl3_the_waiter_sets_an_hc_timeout_and_restores_it(self):
+        during = []
+        real = self.fake_call
+
+        def call(argv, check=True):
+            during.append(pa.CALL_TIMEOUT)
+            return real(argv, check)
+        pa.call = call
+        self.terms["t31"]["status"] = "idle"
+        self.assertEqual(self.waiter()[0], 0)
+        self.assertTrue(during and all(t == pa_hooks.WHEN_IDLE_HC_TIMEOUT for t in during), during)
+        self.assertIsNone(pa.CALL_TIMEOUT)
+
+    def test_rl3_wall_clock_deadline(self):
+        self.terms["t31"]["status"] = "working"
+        pa_hooks.WHEN_IDLE_LIMIT = 50
+        real_time, clock = pa_hooks.time, [1000.0]
+
+        class Frozen(object):  # monotonic stands still (the Mac asleep); the wall clock moves
+            monotonic = staticmethod(lambda: 5.0)
+            strftime, gmtime = staticmethod(real_time.strftime), staticmethod(real_time.gmtime)
+
+            @staticmethod
+            def time():
+                return clock[0]
+
+            @staticmethod
+            def sleep(_s):
+                clock[0] += 20
+                if clock[0] > 2000:  # the old monotonic-only deadline never ends: fail, do not hang
+                    raise RuntimeError("the waiter kept waiting past its wall-clock limit")
+        pa_hooks.time = Frozen
+        try:
+            code, _, err = self.waiter()
+        finally:
+            pa_hooks.time = real_time
+        self.assertEqual(code, 0, err)
+        self.assertNotClosed()
+        self.assertIn("still working after", self.journal()[-1]["why"])
+
+
+class T133ReportOnlyStop(Base):
+    """t-133 G1: the affected-tests hook (Stop, TaskCompleted) runs nothing for a worker whose worktree has not changed
+    since it started (a reviewer, verifier, check or design worker); the session-start hook records that state once."""
+
+    def setUp(self):
+        super().setUp()
+        self.proj = self.repo()
+        self.wt = self.worktree(self.proj, "t-003-x")
+        self.marker = os.path.join(self.tmp, "ran")
+        agent = load(os.path.join(self.dir, "agent.json"))
+        agent["commands"] = {"affected": "echo ran >> {}".format(self.marker)}
+        dump(agent, os.path.join(self.dir, "agent.json"))
+        dump({"task": "t-003", "space": "sp1", "fix": False}, os.path.join(self.wt, ".claude", "pa-task.json"))
+        self.saved_start = pa_hooks.START_DIR
+        pa_hooks.START_DIR = os.path.join(self.tmp, "starts")
+        os.environ["HC_TERMINAL_ID"] = "t41"
+
+    def tearDown(self):
+        pa_hooks.START_DIR = self.saved_start
+        os.environ.pop("HC_TERMINAL_ID", None)
+        super().tearDown()
+
+    def data(self, sid="s-1"):
+        return {"cwd": self.wt, "session_id": sid}
+
+    def start(self, sid="s-1"):
+        self.assertEqual(pa_hooks.hook_session_start(self.data(sid), []) or 0, 0)
+
+    def stop(self, sid="s-1", args=("--stop",)):
+        try:
+            return pa_hooks.hook_affected(self.data(sid), list(args)) or 0
+        except SystemExit as e:
+            return e.code
+
+    def ran(self):
+        return os.path.exists(self.marker)
+
+    def test_g1_report_only_worker_runs_nothing(self):
+        self.start()
+        write(os.path.join(self.wt, "notes.txt"), "x\n")  # a scratch file made and removed again: no change left
+        os.unlink(os.path.join(self.wt, "notes.txt"))
+        self.assertEqual(self.stop(), 0)
+        self.assertFalse(self.ran())
+
+    def test_g1_uncommitted_files_from_before_the_start_do_not_count(self):
+        write(os.path.join(self.wt, "README"), "the builder's edit\n")
+        write(os.path.join(self.wt, "new.txt"), "the builder's file\n")
+        self.start()
+        self.assertEqual(self.stop(), 0)
+        self.assertFalse(self.ran(), "a reviewer in a worktree the builder left dirty runs no tests")
+        self.assertEqual(self.stop(args=()), 0)  # TaskCompleted too
+        self.assertFalse(self.ran())
+
+    def test_g1_an_edit_to_an_already_changed_file_counts(self):
+        write(os.path.join(self.wt, "README"), "the builder's edit\n")
+        self.start()
+        write(os.path.join(self.wt, "README"), "the reviewer's edit\n")
+        self.assertEqual(self.stop(), 0)
+        self.assertTrue(self.ran())
+
+    def test_g1_a_new_file_counts(self):
+        self.start()
+        write(os.path.join(self.wt, "new.txt"), "x\n")
+        self.assertEqual(self.stop(), 0)
+        self.assertTrue(self.ran())
+
+    def test_g1_a_file_put_back_after_the_start_counts(self):
+        write(os.path.join(self.wt, "README"), "dirty\n")
+        self.start()
+        write(os.path.join(self.wt, "README"), "base\n")  # back to HEAD: no longer changed
+        write(os.path.join(self.wt, "other.txt"), "y\n")
+        self.assertEqual(self.stop(), 0)
+        self.assertTrue(self.ran())
+
+    def test_g1_a_new_commit_with_changes_left_counts(self):
+        write(os.path.join(self.wt, "a.txt"), "1\n")
+        self.start()
+        sh(self.wt, "git", "add", "a.txt")
+        sh(self.wt, "git", "commit", "-q", "-m", "a")
+        write(os.path.join(self.wt, "a.txt"), "1\n2\n")
+        self.assertEqual(self.stop(), 0)
+        self.assertTrue(self.ran())
+
+    def test_g1_no_start_record_runs_as_before(self):
+        write(os.path.join(self.wt, "new.txt"), "x\n")
+        self.assertEqual(self.stop(), 0)
+        self.assertTrue(self.ran(), "hooks installed before t-133: today's behaviour")
+
+    def test_g1_a_restart_keeps_the_first_start(self):
+        self.start("s-1")
+        write(os.path.join(self.wt, "new.txt"), "x\n")
+        self.start("s-2")  # resumed or compacted in the same terminal: a new session id
+        self.assertEqual(self.stop("s-2"), 0)
+        self.assertTrue(self.ran(), "work done before the restart still counts")
+
+    def test_g1_each_worker_has_its_own_start(self):
+        self.start()
+        write(os.path.join(self.wt, "new.txt"), "x\n")  # the first worker's change
+        os.environ["HC_TERMINAL_ID"] = "t42"  # the next worker in the same worktree
+        self.start()
+        self.assertEqual(self.stop(), 0)
+        self.assertFalse(self.ran())
+
+    def test_g1_no_terminal_keys_by_session(self):
+        os.environ.pop("HC_TERMINAL_ID", None)
+        self.start("s-9")
+        self.assertEqual(self.stop("s-9"), 0)
+        self.assertFalse(self.ran())
+        write(os.path.join(self.wt, "new.txt"), "x\n")
+        self.assertEqual(self.stop("s-other"), 0)
+        self.assertTrue(self.ran(), "another session has no start record of its own")
+
+    def test_g1_start_writes_nothing_in_the_worktree(self):
+        before = sh(self.wt, "git", "status", "--porcelain", "--untracked-files=all", "--ignored")
+        self.start()
+        self.assertEqual(sh(self.wt, "git", "status", "--porcelain", "--untracked-files=all", "--ignored"), before)
+
+    def test_g1_outside_a_task_worktree_nothing(self):
+        data = {"cwd": self.tmp, "session_id": "s-1"}
+        self.assertEqual(pa_hooks.hook_session_start(data, []) or 0, 0)
+        self.assertEqual(os.listdir(pa_hooks.START_DIR) if os.path.isdir(pa_hooks.START_DIR) else [], [])
+
+    def test_g1_registered_as_a_session_start_hook(self):
+        settings = pa_hooks.hook_settings()
+        cmds = [h["command"] for e in settings["SessionStart"] for h in e["hooks"]]
+        self.assertEqual(cmds, [os.path.join("$HOME", ".local", "bin", "pa-hook") + " session-start"])
+        self.assertIn("session-start", pa_hooks.HOOKS)
+        self.assertTrue(pa_hooks.PA_HOOK_COMMAND.match(cmds[0]), "pa-trust accepts it as a pa-hook command")
+
+
 class Unrecorded(Base):
     """t-020 J4 (R4, R5): pa-worktree check finds worktrees under the scanned `worktrees` folders that no task of any space
     on the same project records, lists them once on a card d-wt-unrecorded-<n> (never a Delete), counts the person's own

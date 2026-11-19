@@ -894,6 +894,139 @@ class Next(Base):
         self.ok("limits")
 
 
+# ---- t-133: t-083 RL2 (unreadable files) and Nits 4-7 ------------------------------------------------------------
+
+BAD_BYTES = b"\xff\xfe not utf-8 \xfa\n"
+
+
+class T133Places(Base):
+    """t-133 (t-083 RL2): a file that cannot be read is read as unknown or named, never a traceback; Nits 4-7."""
+
+    mockup = Next.mockup
+
+    def unreadable(self, name, how):
+        path = self.path(name)
+        if os.path.isdir(path):
+            shutil.rmtree(path)
+        elif os.path.exists(path):
+            os.unlink(path)
+        if how == "dir":
+            os.makedirs(path)
+        else:
+            with open(path, "wb") as f:
+                f.write(BAD_BYTES)
+
+    # RL2
+    def test_rl2_unreadable_journal_is_hold_unknown(self):
+        self.add("t-1", "build")
+        for how in ("bytes", "dir"):
+            with self.subTest(how=how):
+                self.unreadable("journal.jsonl", how)
+                code, out, err = self.run_main("next")
+                self.assertEqual(code, 0, out + err)
+                self.assertIn("hold unknown", out)
+                self.assertNotIn("record place", out)
+                self.assertNotIn("Traceback", err)
+                data = json.loads(self.ok("next", "--json"))
+                self.assertEqual(data["hold"], "unknown")
+        # and a start is refused, not a crash
+        code, out, err = self.run_main("start", "t-1/build", "--worker", "t60")
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("hold unknown", err)
+
+    def test_rl2_unreadable_rules_defaults_and_a_note(self):
+        for how in ("bytes", "dir"):
+            with self.subTest(how=how):
+                self.unreadable("rules.json", how)
+                code, out, err = self.run_main("limits")
+                self.assertEqual(code, 0, out + err)
+                self.assertIn("working 4 (default)", out)
+                self.assertIn("rules.json cannot be read", out)
+                self.assertIn("the default limits are used", out)
+                self.assertEqual(self.run_main("next")[0], 0)
+
+    def test_rl2_unreadable_start_order_said(self):
+        self.add("t-1", "a")
+        self.add("t-2", "b")
+        for how in ("bytes", "dir"):
+            with self.subTest(how=how):
+                self.unreadable("start-order.json", how)
+                code, out, err = self.run_main("next")
+                self.assertEqual(code, 0, out + err)
+                self.assertIn("start order unreadable: start-order.json cannot be read; the Project Agent's order is used", out)
+                self.assertEqual(json.loads(self.ok("next", "--json"))["order"]["error"], "unreadable")
+
+    def test_rl2_unreadable_task_order_said(self):
+        self.unreadable("task-order.json", "bytes")
+        code, out, err = self.run_main("tasks")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("task order unreadable: task-order.json cannot be read; the Project Agent's order is used", out)
+
+    def test_rl2_unreadable_waiting_list_refused_with_its_line(self):
+        for how in ("bytes", "dir"):
+            with self.subTest(how=how):
+                self.unreadable("waiting.json", how)
+                for argv in (("next",), ("show",), ("add", "t-1", "--job", "b", "--kind", "working", "--role", "r")):
+                    code, out, err = self.run_main(*argv)
+                    self.assertEqual(code, 1, (argv, out + err))
+                    self.assertIn("not a valid waiting list (it cannot be read", err)
+                    self.assertNotIn("Traceback", err)
+
+    def test_rl2_read_text_missing_is_still_none(self):
+        self.assertIsNone(pa_places.read_text(self.path("nope.json")))
+        with self.assertRaises(pa_places.Unreadable):
+            self.unreadable("x.json", "bytes")
+            pa_places.read_text(self.path("x.json"))
+
+    # Nit 4
+    def test_nit4_hold_numbers_are_unknown(self):
+        H = pa_places.hold_state
+        for v in (0, 0.0, 1, 1.0):
+            with self.subTest(v=v):
+                self.assertEqual(H(json.dumps({"hold": v}) + "\n"), "unknown")
+        self.assertEqual(H('{"hold": true}\n'), "on")
+        self.assertEqual(H('{"hold": false}\n'), "off")
+
+    # Nit 5
+    def test_nit5_duplicate_ids_refused(self):
+        j = {"id": "t-1/a", "task": "t-1", "job": "a", "kind": "working", "role": "build", "source": "pa"}
+        text = json.dumps({"version": 1, "jobs": [j, dict(j)]})
+        write(self.path("waiting.json"), text)
+        code, out, err = self.run_main("next")
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("not a valid waiting list", err)
+        self.assertIn("t-1/a is listed twice", err)
+        self.assertEqual(read(self.path("waiting.json")), text)
+
+    # Nit 6
+    def test_nit6_blank_why_refused(self):
+        self.add("t-1", "a")
+        for why in ("", "   "):
+            with self.subTest(why=why):
+                code, out, err = self.run_main("block", "t-1/a", "--why", why)
+                self.assertEqual(code, 1, out + err)
+                self.assertIn("--why needs the reason", err)
+                self.assertIsNone(self.waiting()["jobs"][0]["blockedBy"])
+                code, out, err = self.run_main("drop", "t-1/a", "--why", why)
+                self.assertEqual(code, 1, out + err)
+                self.assertEqual(self.ids(), ["t-1/a"])
+
+    # Nit 7
+    def test_nit7_start_line_says_why(self):
+        self.mockup()
+        body = [l for l in self.ok("next").splitlines() if l[:2] == "3."]
+        self.assertIn("start: no-test extra 1 free (working 4 of 4)   record place: no-test", body[0])
+
+    def test_nit7_working_start_line(self):
+        self.add("t-1", "build")
+        out = self.ok("next")
+        self.assertIn("start: working 4 free   record place: working", out)
+
+    def test_nit7_suite_start_line(self):
+        self.add("t-1", "verify", "suite", "verifier")
+        self.assertIn("start: suite 2 free (working 4 free)   record place: suite", self.ok("next"))
+
+
 # ---- wiring: install, parse check, guard (AC5.3, AC5.4) ----------------------------------------------------------
 
 class Wiring(unittest.TestCase):

@@ -6095,6 +6095,19 @@ cases["P83-10-limits"] = async () => { // AC2.3, AC2.4, AC1.3, AC1.4: defaults, 
   check(text.includes("One"), "the tab is still drawn");
 };
 
+cases["P133-places-hung"] = async () => { // t-083 J2 RL2: both places reads hang on the second load: the last known Waiting view stays
+  const { v, dir } = await placesWorld({ order: JSON.stringify({ version: 1, order: [] }) });
+  let { text, clicks } = look(v);
+  check(text.includes("Waiting · 3") && Boolean(clicks["place-down-t-020/verify-2"]), `first load (got ${text.slice(0, 600)})`);
+  g.__hang = [`${dir}/waiting.json`, `${dir}/start-order.json`];
+  advance(3000); v.reload(cx); await settle(); await step(11000);
+  ({ text, clicks } = look(v));
+  check(text.includes("Waiting · 3") && text.includes("1. t-020 verify-2") && text.includes("3. t-083 design"), `the Waiting lines stay (got ${text.slice(0, 900)})`);
+  check(Boolean(clicks["place-down-t-020/verify-2"]) && Boolean(clicks["place-up-t-083/design"]), "the buttons stay");
+  check(!text.includes("No waiting list yet") && !text.includes("Loading waiting list"), `never missing or loading again (got ${text.slice(0, 900)})`);
+  g.__hang = [];
+};
+
 cases["P83-11-badges"] = async () => { // R11: badges on task rows; a click unfolds Places and marks the line for 3 s
   const { v } = await placesWorld();
   const { text, clicks } = look(v);

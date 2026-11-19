@@ -50,7 +50,7 @@ class Orchestrator(unittest.TestCase):
         self.assertIn("Committed work that is not pushed or merged does not stop a close", self.text)
         self.assertNotIn("Workers stay until the person closes them", self.text)
         # review round 1, M7: the old sentence could be read as "working workers do not count"
-        self.assertIn("A worker that has reported, but whose report you have not read yet, does not count; close it once read.", self.text)
+        self.assertIn("A worker that has reported, but whose report you have not read yet, still holds its place until it is closed; close it once read.", self.text)  # t-133 (t-083 J3 RL1)
         self.assertNotIn("A worker whose report you have not read yet does not count", self.text)
         self.assertNotIn("A worker that has finished and sits idle does not count", self.text)
 
@@ -1044,8 +1044,8 @@ class T083Places(unittest.TestCase):
         self.assertNotIn("At most 4 workers working at once", self.text)
         # the pinned sentences next to it stay
         self.assertIn("never more than the person can review", self.workers)
-        self.assertIn("A worker that has reported, but whose report you have not read yet, does not count; close it "
-                      "once read.", self.workers)
+        self.assertIn("A worker that has reported, but whose report you have not read yet, still holds its place until "
+                      "it is closed; close it once read.", self.workers)  # t-133 (t-083 J3 RL1)
 
     def test_kinds_and_commands(self):  # R5, R7 text side; OQ-J3-2, OQ-J3-3 (d-205)
         for words in ("`working` (a job that runs tests: build, fix, verifier, check)",
@@ -1082,8 +1082,8 @@ class T083Places(unittest.TestCase):
         self.assertIn('"hold":"on"', self.files)
         self.assertIn("`pa-places` reads that key alone: a hold journalled without it does not stop `pa-places next`.",
                       self.files)
-        self.assertIn("If `standing.md` `# Hold` names a hold in force and the journal's last hold line has no `hold` "
-                      'key, append one with `"hold": "on"` quoting it before you run `pa-places next`.', self.files)
+        self.assertIn("If `standing.md` `# Hold` names a hold in force and the journal's last line about a hold or "
+                      'resume has no `hold` key, append one with `"hold": "on"` quoting it before you run `pa-places next`.', self.files)
         self.assertIn("Give each hold or resume line the `hold` key (see Files).", self.restart)
         # the pinned hold sentence is unchanged and the pointer follows the pinned run
         self.assertLess(self.restart.index("it is not a hold."), self.restart.index("Give each hold or resume line"))
@@ -1267,6 +1267,46 @@ class T101RulesNotice(unittest.TestCase):  # t-101 R6: what the Project Agent do
     def test_r6_readme_names_it(self):
         self.assertIn("The panel's \"decision … answered\", \"rule …\" and \"rules changed: …\" notices are sent to the "
                       "record whose `alive` is true", self.readme)
+
+
+class T133WorkerLifecycle(unittest.TestCase):  # t-133: report-only workers, close-when-idle limits, places wording
+    def setUp(self):
+        self.raw = read("runtime", "core", "orchestrator.md")
+        self.files = part(self.raw, "## Files", "## Decision cards")
+        self.workers = part(self.raw, "## Workers", "## Phases and gates")
+        self.closing = flat(self.raw[self.raw.index("- Close each worker once its job is over"):self.raw.index("- When the person says to keep a worker open")])
+
+    def test_g1_report_only_workers_run_no_tests_at_the_end(self):
+        self.assertIn("run the affected tests when a task is marked complete and before a session ends (not for a "
+                      "worker that changed nothing in its worktree since it started, so a report-only worker closes "
+                      "at once)", self.workers)
+
+    def test_rl1_follow_up_after_when_idle(self):
+        self.assertIn("To send a follow-up to a worker after `--when-idle`, run `pa-worker close <t> --cancel-when-idle` "
+                      "first; a new turn that begins before the close also stops it (journaled, not closed).", self.closing)
+
+    def test_rl2_reread_the_ledger(self):
+        self.assertIn("The waiter writes the worker's `finished`, `closed`, `closedBy` and `report` itself: re-read "
+                      "`ledger.json` before you next write it. If a `close-when-idle` line says it closed a worker whose "
+                      "entry is not `finished`, run `pa-worker close` for it again; that records it.", self.closing)
+
+    def test_j3_rl1_a_reported_worker_holds_its_place(self):
+        self.assertIn("A worker that has reported, but whose report you have not read yet, still holds its place until "
+                      "it is closed; close it once read.", self.workers)
+        self.assertNotIn("whose report you have not read yet, does not count", self.workers)
+
+    def test_j3_rl2_verifier_kind(self):
+        self.assertIn("Add a verifier or check with `--kind suite`.", self.workers)
+
+    def test_j3_nit3_order_wording(self):
+        self.assertIn("The order is the person's `start-order.json` over your list (merge-queue jobs keep theirs), as "
+                      "`pa-places next` prints it.", self.workers)
+        self.assertNotIn("The order comes from the person's `start-order.json`.", self.workers)
+
+    def test_j3_nit4_keyless_hold_wording(self):
+        self.assertIn("If `standing.md` `# Hold` names a hold in force and the journal's last line about a hold or "
+                      "resume has no `hold` key, append one with `\"hold\": \"on\"` quoting it before you run "
+                      "`pa-places next`.", self.files)
 
 
 if __name__ == "__main__":
