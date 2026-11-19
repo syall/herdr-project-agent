@@ -11,7 +11,11 @@
                       write        every `file write` fails
                       match:<text> an exec whose joined argv holds <text> fails (exit 1) without running
                       kill         every `kill` fails
+                      garble:<n>   a `file write` of a file named <n> (p.b64: the patch, t-107) writes the base64 of a
+                                   text that is no patch, so the apply there fails
   STUB_HC_SUB       old=new: replaced in every exec's output (a remote that answers with another id)
+  STUB_HC_KEEP      a folder: each `file write` also keeps a copy there under the file's name (t-107: the bundle
+                    and the patch that arrived, for the tests to compare)
 --on <m> maps the literal prefix /tmp/pa-suite- in every argument (a script's text too) to
 <root>/<m>/tmp/pa-suite-, so the product's fixed remote paths land under the stub's folder. One exception: a
 /tmp/pa-suite-<12 hex> folder that really exists on this machine is an outer run's (the suite itself running on a
@@ -19,6 +23,7 @@ suite machine, its PATH starting with that run's bin/ tool links, which the prob
 machine's; it is left as it is (J2-D17).
 Commands: exec, run --bg, file read|write, kill, rm, ls. Anything else: exit 2.
 """
+import base64
 import json
 import os
 import re
@@ -271,6 +276,13 @@ def cmd_file(args):
         if "write" in FAILS:
             fail("stub write failure")
         data = sys.stdin.buffer.read()
+        if "garble:" + os.path.basename(path) in FAILS:
+            data = base64.b64encode(b"this is not a patch\n")
+        keep = os.environ.get("STUB_HC_KEEP")
+        if keep:
+            os.makedirs(keep, exist_ok=True)
+            with open(os.path.join(keep, os.path.basename(path)), "wb") as f:
+                f.write(data)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "wb") as f:
             f.write(data)
