@@ -382,9 +382,8 @@ class X7Ship(Remote):
         self.assertEqual(code, 0, out)
         text = self.output(self.run_id(out))
         self.assertIn("heads: {} HEAD\n".format(head), text)
-        self.assertIn("refs: refs/heads/", text)
-        self.assertNotIn("other", text.split("refs:", 1)[1].splitlines()[0])
-        self.assertNotIn("v1", text.split("refs:", 1)[1].splitlines()[0])
+        # A clone of a bundle holding HEAD alone has no ref at all (a detached HEAD): no branch, no tag travels.
+        self.assertEqual(text.split("refs:", 1)[1].splitlines()[0].strip(), "")
         files = text.split("files: ", 1)[1].splitlines()[0].split()
         self.assertEqual(sorted(files), [".git", ".gitignore", "a.txt", "tests"])
         self.assertIn("status: []", text)
