@@ -171,10 +171,14 @@ show() { cat "$1"; [ -s "$1" ] && [ -n "$(tail -c 1 "$1")" ] && echo; return 0; 
 # the temp folder then sees no other part's, nor those of another suite running beside this one.
 # Its start and end (whole seconds) go beside its log, for its time in the summary (t-056; parts run at once, so
 # a part's own time, not how long it was waited on).
+# Its exit code goes there too, as <i>.code, before <i>.end (pa_suite.py's watcher reads .code once .end is there),
+# and the run reads it from that file, not from `wait` (t-113): on a Linux machine whose sh is bash, `wait <pid>`
+# answered "pid N is not a child of this shell" (127) for parts that had passed, and they were marked FAILED.
 inpart() {
   date +%s > "$out/$1.start"
-  TMPDIR="$out/$1.tmp"; export TMPDIR; mkdir "$TMPDIR" || { date +%s > "$out/$1.end"; return 1; }
+  TMPDIR="$out/$1.tmp"; export TMPDIR; mkdir "$TMPDIR" || { echo 1 > "$out/$1.code"; date +%s > "$out/$1.end"; return 1; }
   "$2" "$3"; c=$?
+  echo "$c" > "$out/$1.code"
   date +%s > "$out/$1.end"
   return $c
 }
@@ -229,8 +233,11 @@ else
   i=1
   while [ "$i" -le "$count" ]; do
     eval "pid=\$pid_$i; name=\$name_$i"
+    # wait only reaps the part and waits for it to end; its code is the one it wrote. No file: it was stopped
+    # (hung, or a signal) before it wrote one, so wait's status when that is not 0, else 1.
     wait "$pid"
     code=$?
+    w=$(cat "$out/$i.code" 2>/dev/null) && [ -n "$w" ] && code=$w || { [ "$code" = 0 ] && code=1; }
     [ -f "$out/$i.end" ] || date +%s > "$out/$i.end"
     echo "$code" > "$out/$i.code"
     eval "code_$i=\$code"
