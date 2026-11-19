@@ -157,9 +157,10 @@ def command_for(kind, agent, profile):
     return value or None
 
 
-def changed_files(root):
+def changed_files(root, every=False):
+    """The worktree's uncommitted files; every=True lists each file under an untracked folder, not the folder."""
     try:
-        out = subprocess.run(["git", "status", "--porcelain"], cwd=root, stdout=subprocess.PIPE,
+        out = subprocess.run(["git", "status", "--porcelain"] + (["--untracked-files=all"] if every else []), cwd=root, stdout=subprocess.PIPE,
                              stderr=subprocess.DEVNULL, universal_newlines=True, timeout=30).stdout
     except (OSError, subprocess.TimeoutExpired):
         return []
@@ -239,17 +240,18 @@ def start_path(root, data):
 
 
 def tree_state(root):
-    """{head, files: {path: sha1 of its bytes, or "gone"}} of the worktree's changed files (changed_files), or None."""
+    """{head, files: {path: sha1 of its bytes, or "gone"}} of the worktree's changed files, each file under an untracked
+    folder listed on its own (changed_files every=True), or None."""
     try:
         head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                               universal_newlines=True, timeout=30).stdout.strip()
     except (OSError, subprocess.TimeoutExpired):
         return None
     files = {}
-    for rel in changed_files(root):
+    for rel in changed_files(root, every=True):
         path = os.path.join(root, rel)
         try:
-            if os.path.isdir(path):
+            if os.path.isdir(path):  # a nested repository or a symlink to a folder: git lists no files under it
                 files[rel] = "dir:" + ",".join(sorted(os.listdir(path)))
             else:
                 with open(path, "rb") as f:
@@ -3383,8 +3385,10 @@ def cancel_when_idle(directory, address):
             except OSError:
                 running = True
         task, entry = recorded(read_ledger(directory), address)
+        done = entry and entry.get("finished")
+        if running and done:  # the waiter closed it and has not yet left its lock: nothing is left to cancel
+            return ["{}: close --when-idle already closed {}; nothing to cancel.".format(address, address)]
         if not running:
-            done = entry and entry.get("finished")
             return ["{}: no pa-worker close --when-idle is waiting for {}; nothing to cancel{}.".format(
                 address, address, " (it is already closed)" if done else "")]
         with open(idle_file(directory, address, "cancel"), "w") as f:
