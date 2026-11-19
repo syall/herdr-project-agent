@@ -422,14 +422,16 @@ def region_of(first, last, regions):
 def shared_file(ctx, s, regions=None):
     """The shared-file item of one file (t-052 J2): main's hunks, the change's, and the pairs within NEAR lines. For a
     union file (J3c fix round 2) a pair whose two hunks both lie in one conflict region is left out: the doc-only
-    question covers it; every other pair stays."""
+    question covers it; every other pair stays. `outside` (J3c fix round 3, Q-J2-1): main has a hunk that does not lie
+    whole in a conflict region (one the mapping cannot place counts), near the change or not."""
     main_h = pa_hooks.diff_hunks(ctx.run, ctx.repo, s["oldBase"], s["newBase"])
     change_h = pa_hooks.diff_hunks(ctx.run, ctx.repo, s["newBase"], s["tip"])
     main, change = ranges(main_h, "new"), ranges(change_h, "old")
-    near = []
+    near, outside = [], False
     for mh, m in zip(main_h, main):
         start, count = mh["new"]
         mr = region_of(tip_line(start, change_h), tip_line(start + count - 1, change_h), regions or []) if count else None
+        outside = outside or mr is None
         for ch, c in zip(change_h, change):
             if max(0, max(m[0], c[0]) - min(m[1], c[1])) > NEAR:
                 continue
@@ -439,13 +441,13 @@ def shared_file(ctx, s, regions=None):
             near.append([m, c])
     item = {"path": s["path"], "mainHunks": main, "changeHunks": change, "near": near}
     if regions is not None:
-        item["union"] = True
+        item.update(union=True, outside=outside)
     return item
 
 
 def needs_for(ctx, entry, tip, decision, old_base, new_base, since=None):
     files = [shared_file(ctx, s) for s in decision["shared"]]
-    # a union file is a shared file too (REVIEW J3c Must fix 1): main's other hunks near the change are asked about
+    # a union file is a shared file too (REVIEW J3c Must fix 1, Q-J2-1): main's hunks outside its regions are asked about
     files += [shared_file(ctx, u, u["regions"]) for u in decision.get("unions") or []]
     files.sort(key=lambda f: f["path"])
     n = max(1, len(entry.get("rebases") or []))
@@ -472,8 +474,9 @@ def handoff_lines(entry, need):
         near = "; ".join("main {}-{} near change {}-{}".format(m[0], m[1], c[0], c[1]) for m, c in f["near"]) or "none within {} lines".format(NEAR)
         lines.append("  {}: git diff {} {} -- {} (the base's change); git diff {} {} -- {} (the change); {}".format(
             f["path"], need["oldBase"], need["newBase"], f["path"], need["newBase"], need["tip"], f["path"], near))
-    # the shared-file question: every moved file; a union file only with a place near the change outside its regions
-    if not doc or any(not f.get("union") or f["near"] for f in need["files"]):
+    # the shared-file question (Q-J2-1): every moved file; a union file when main changed it outside the conflict
+    # regions (near the change or far from it) or a near pair is listed; not when the conflict is main's only change
+    if not doc or any(not f.get("union") or f["near"] or f.get("outside", True) for f in need["files"]):
         lines.append("  question: " + QUESTION + "; then 'Verdict: pass' or 'Verdict: must fix (<n>)'.")
     lines.append("  the file has the lines Start: <UTC time>, End: <UTC time>, Reviewer: <its address>, "
                  "Checked: {}, and its Verdict: line".format(need["tip"]))
