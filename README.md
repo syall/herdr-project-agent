@@ -495,7 +495,9 @@ that names none; an endpoint the price sources call region-free is compared by e
 price, in USD, and hands it to its status line. When the profile declares `statusLine` (below),
 `pa-claude` (for a Project Agent's workers) and `pa-session` (for the Project Agent) add one
 `--settings` that makes the session's status line `pa-costs statusline --space <id> --then <your
-status line command>`. It records the session id, that figure, its durations, the requested model,
+status line command>` (run as `tools/pa_statusline.py statusline ...`, which loads `pa.py` and
+`pa_costs.py` from compiled code it keeps in `cache/pycache/`, checked against the source's content,
+instead of compiling them on every update). It records the session id, that figure, its durations, the requested model,
 Claude Code's version and the terminal in `spaces/<id>/costs/cc/<session>.json` (ids and numbers
 only, never text), then prints exactly what your own command prints. It never slows the line by more
 than its 2 s limit (a slower command shows nothing that update), and never fails. `collect` and

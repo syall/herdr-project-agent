@@ -776,10 +776,12 @@ def cc_statusline_setting(p, space):
             return None
         space = local_id(space or "")
         cfg, _problem = cc_statusline(p)
-        if not cfg or not ID.match(space) or not sys.executable or not os.path.isfile(COSTS_FILE):
+        if (not cfg or not ID.match(space) or not sys.executable or not os.path.isfile(COSTS_FILE)
+                or not os.path.isfile(STATUSLINE_FILE)):
             return None
         inner = resolve(cfg["command"], p)  # as the profile's own commands are found; not found: no status line of ours
-        command = " ".join([shlex.quote(sys.executable), shlex.quote(COSTS_FILE), "statusline", "--space", space, "--then"]
+        # t-111: pa_statusline.py, which runs `pa-costs statusline` from compiled code it caches outside tools/
+        command = " ".join([shlex.quote(sys.executable), shlex.quote(STATUSLINE_FILE), "statusline", "--space", space, "--then"]
                            + [shlex.quote(a) for a in inner])
         return {"type": "command", "command": command, "refreshInterval": cfg["refreshInterval"]}
     except Exception:  # noqa: BLE001 - the launch goes on without it
@@ -3064,6 +3066,7 @@ def cmd_start(args):
 
 
 COSTS_FILE = os.path.join(os.path.dirname(os.path.realpath(__file__)), "pa_costs.py")
+STATUSLINE_FILE = os.path.join(os.path.dirname(COSTS_FILE), "pa_statusline.py")  # the status line's launcher (t-111)
 _COSTS = {}
 
 
