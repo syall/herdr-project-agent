@@ -30,8 +30,10 @@
 # On a machine (t-107 J2): with machines in HERDR_PA_HOME/config.json's suiteMachines, a --affected or --module run
 # by hand or by a hook (no caller's slot, not on a machine, not placed here by pa-run) is run there by the slot
 # step, through pa-run's code: its first line `run-all.sh: on <machine> (<os>)`, then this script's output from
-# there (parts, summary); 124/125 end with `run-all.sh: not run on <machine>: <why>`. PA_SUITE_DEADLINE (an epoch
-# second, the affected-tests hook's) ends the wait and the run before it.
+# there (parts, summary); 124/125 end with `run-all.sh: not run on <machine>: <why>`, or, for a run that started and
+# did not end (the deadline or the machine's limit during it), `run-all.sh: did not finish on <machine>: <why>` (the
+# hook reads that as a failure to fix). PA_SUITE_DEADLINE (an epoch second, the affected-tests hook's) ends the wait
+# and the run before it.
 # Progress and the part limit (t-076): pa_suite.py, holding the slot, watches the run folder (the files `parts`,
 # <i>.pid, <i>.start, <i>.end, <i>.code): it keeps the run's progress file under HERDR_PA_HOME/suite-runs
 # (pa-full-suite --status reads it) and stops a part past max(PA_PART_LIMIT or 900 s, 3x its recorded median),

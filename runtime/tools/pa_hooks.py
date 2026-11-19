@@ -174,6 +174,9 @@ def changed_files(root, every=False):
     return files
 
 
+TIMED_OUT = "(timed out after {} s)"  # run_shell's last line when the command outlived its limit
+
+
 def run_shell(command, cwd, files, timeout, extra_env=None):
     """Runs a configured command. {file}/{files} are filled in; PA_CHANGED_FILES lists them, one per line."""
     quoted = " ".join(shlex.quote(f) for f in files)
@@ -184,7 +187,10 @@ def run_shell(command, cwd, files, timeout, extra_env=None):
                            universal_newlines=True, timeout=timeout)
         return r.returncode, r.stdout
     except subprocess.TimeoutExpired as e:
-        return 124, (e.stdout or "") + "\n(timed out after {} s)".format(timeout)
+        out = e.stdout or ""  # bytes here even with universal_newlines (subprocess.run's TimeoutExpired)
+        if isinstance(out, bytes):
+            out = out.decode("utf-8", "replace")
+        return 124, out + "\n" + TIMED_OUT.format(timeout)
 
 
 def tail(text, lines=40):
@@ -303,6 +309,17 @@ def not_run_line(out):
     return lines[-1].rstrip(".") if lines else "(no output)"
 
 
+def did_not_finish(out):
+    """MF-J2-1: the line that says the tests started and did not end, else None: run_shell's own timeout (its last
+    line) or the slot step's `run-all.sh: did not finish on <M>: ...` (the deadline or the machine's limit during the
+    run). A test the change makes hang ends this way; it is a failure to fix, never "could not run"."""
+    lines = [l.strip() for l in (out or "").splitlines() if l.strip()]
+    if lines and (re.fullmatch(re.escape(TIMED_OUT).replace(r"\{\}", r"\d+"), lines[-1])
+                  or lines[-1].startswith("run-all.sh: did not finish on ")):
+        return lines[-1].rstrip(".")
+    return None
+
+
 def hook_affected(data, args):
     record, agent, profile = hook_context(data)
     if not record:
@@ -318,14 +335,20 @@ def hook_affected(data, args):
                           {"PA_SUITE_DEADLINE": str(int(time.time()) + AFFECTED_LIMIT - DEADLINE_SPARE)})
     if not code:
         return 0
-    if code in (124, 125):  # R15: could not run (no slot, not reachable, refused, the deadline), not a test failure
+    unfinished = did_not_finish(out) if code == 124 else None
+    if code in (124, 125) and not unfinished:  # R15: could not run (no slot, not reachable, refused, the wait's
+        # deadline), not a test failure
         message = "The affected tests could not run (task {}): {}. Do not change code for this; report it " \
                   "(r-cloud-runs).\n{}".format(record["task"], not_run_line(out), tail(out, 20))
         if "--stop" in args:  # let the session stop, saying so
             print(message, file=sys.stderr)
             return 1
         block(message)
-    message = "The tests affected by this session's changes fail (task {}). Fix the code and run them again.\n{}".format(record["task"], tail(out))
+    if unfinished:  # MF-J2-1: started and did not end: a test may hang; fix it like a failure
+        message = "The affected tests did not finish (task {}): {}. A test may hang: fix the code and run them " \
+                  "again.\n{}".format(record["task"], unfinished, tail(out))
+    else:
+        message = "The tests affected by this session's changes fail (task {}). Fix the code and run them again.\n{}".format(record["task"], tail(out))
     if "--stop" in args:
         # Hold the session open a few times, then let it end and say so, rather than loop forever.
         counter = os.path.join(tempfile.gettempdir(), "pa-hook-stop-{}".format(re.sub(r"[^A-Za-z0-9_-]", "", str(data.get("session_id", "none")))))

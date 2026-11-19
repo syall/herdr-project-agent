@@ -664,14 +664,14 @@ def run_remote(r, machine, found, slot):
         if late:
             watcher.stop()
             code = NO_SLOT
-            r.notes.append("not run on {}: the deadline (PA_SUITE_DEADLINE) came after {:.0f} s; the run there was "
-                           "ended".format(machine, time.time() - r.began))
+            r.notes.append("did not finish on {}: the deadline (PA_SUITE_DEADLINE) came after {:.0f} s; the run "
+                           "there was ended".format(machine, time.time() - r.began))
         elif watcher.lost is not None:
             code = NO_SLOT
             r.notes.append("machine {} lost after {:.0f} s".format(machine, watcher.lost))
         elif watcher.timed_out:
             code = NO_SLOT
-            r.notes.append("timed out after {} s there".format(S.REMOTE_TIMEOUT))
+            r.notes.append("did not finish on {}: timed out after {} s there".format(machine, S.REMOTE_TIMEOUT))
         else:
             code = watcher.code
             n = watcher.final()
@@ -698,9 +698,10 @@ def run_remote(r, machine, found, slot):
         if not r.slot:
             say("exit {} on {} ({}) after {:.0f}s; output in {}".format(code, machine, os_name, time.time() - r.began,
                                                                        r.output))
-        elif code == NO_SLOT and r.notes:  # the slot step's not-run line comes last (R15 reads it)
+        elif code == NO_SLOT and r.notes:  # the slot step's not-run / did-not-finish line comes last (R15 reads it)
             line = r.notes[-1]
-            say(line if line.startswith("not run on ") else "not run on {}: {}".format(machine, line))
+            say(line if line.startswith(("not run on ", "did not finish on ")) else
+                "not run on {}: {}".format(machine, line))
         return r.finish(code, machine, machine, os_name, ran)
     except S.Interrupted as e:
         say("interrupted: ending the run on {} and cleaning up".format(machine))
@@ -848,7 +849,8 @@ def check_changed(value, secrets):
 def slot_run(h, command, flags, kind, step_args, progress, at):
     """R12: the slot step's `sh tests/run-all.sh <flags>` on a machine, through pa-run's code (tree to run, place,
     ship, terminal, watcher, cleanup, records). Lines say `run-all.sh: ...` on stdout, the first `on <M> (<os>)`,
-    then the run's output as it comes; 124/125 end with `run-all.sh: not run on <M>: <reason>`. Its exit code, or
+    then the run's output as it comes; 124/125 end with `run-all.sh: not run on <M>: <reason>` (124 for a run that
+    started and did not end: `run-all.sh: did not finish on <M>: <reason>`, MF-J2-1). Its exit code, or
     LOCAL (not reachable or setup failed with suiteFallback "mac": the step runs it here and has said why)."""
     import types
     global PREFIX, TO_STDOUT, _h
