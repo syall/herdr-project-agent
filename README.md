@@ -454,6 +454,13 @@ gate) or into Needs decision, and a Needs decision task with an open card offers
 d-xxx first, or ask the Project Agent to withdraw it.` A category move from the panel never passes a
 gate, never answers or withdraws a card, and never starts or stops a worker by itself.
 
+**Old cards: the archive.** `pa-task archive` (yours; an agent may only run `pa-task archive --dry-run`, which
+lists and moves nothing) moves answered and withdrawn decision cards older than 14 days (`--days N`) from
+`decisions/` to `decisions-archive/`. Open cards and the cards of a task that is not done or parked stay, and
+nothing is deleted. Every tool still reads an archived card (an answered Keep is never asked again), and a
+tool that changes one puts it back in `decisions/`. The panel shows the archive under the answered cards,
+read only when you open it. `pa-task unarchive <card-id>` moves one card back by hand.
+
 **The Costs view** (Project panel, fifth tab) reads only `costs/summary.json` on the space's machine,
 only while it is shown, at most every 10 s. It shows Total, Today and Last 7 days, then the spend by
 activity, task, session type and day, each with its drill-down, and `Refresh` (runs `pa-costs

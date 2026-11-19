@@ -164,7 +164,7 @@ export default class ProjectAgent extends View {
     this.rules.changed = (space, ids, cx) => this.rulesChanged(space, ids, cx); // t-101: the person's rule changes
     this.copier = new Copier(); // the Copy controls of cards and tasks (copy.js, t-026)
     // push cards: the last pa-push-main check and run of each (push.js); its runs take the shared mark (t-045 round 2)
-    this.push = new PushCards((spaceId, id, label, running, unknown) => this.sharePush(spaceId, id, label, running, unknown), (spaceId, id, asked) => this.openedPush(spaceId, id, asked), this.host);
+    this.push = new PushCards((spaceId, id, label, running, unknown, note) => this.sharePush(spaceId, id, label, running, unknown, note), (spaceId, id, asked) => this.openedPush(spaceId, id, asked), this.host);
     // The Costs view: each space's last summary and billed comparison (costs.js); it reads and runs only while
     // this check holds (asked live: `asleep` is updated only by the next reload).
     this.costs = new CostsPane((id) => this.view === "costs" && spaces().find((s) => s.active)?.id === id && onScreen(), this.host);
@@ -915,10 +915,10 @@ export default class ProjectAgent extends View {
   // never runs pa-push-main. While the run is in flight the mark lasts as long as the run may (RUN_TIMEOUT); once it ended
   // answered ANSWERING_TTL from then; unknown (round 3): no expiry, see openedPush; label null (refused, or a check read it
   // open): this copy's mark goes.
-  sharePush(spaceId, id, label, running, unknown = false) {
+  sharePush(spaceId, id, label, running, unknown = false, note = null) {
     const k = noteKey(spaceId, id);
     if (label === null) { if ((shared(ANSWERING) ?? {})[k]?.by === this.me) this.shareMark(k, null); return; }
-    this.shareMark(k, { label, note: null, at: Date.now(), by: this.me, ...(running ? { ttl: RUN_TIMEOUT + GRACE + ANSWERING_TTL } : {}), ...(unknown ? { unknown: true } : {}) });
+    this.shareMark(k, { label, note: label === OTHER ? note || null : null, at: Date.now(), by: this.me, ...(running ? { ttl: RUN_TIMEOUT + GRACE + ANSWERING_TTL } : {}), ...(unknown ? { unknown: true } : {}) });
   }
 
   // A check from this copy, asked at `asked`, read the push card open (push.js opened, t-045 round 3): an unknown result's
@@ -986,6 +986,7 @@ export default class ProjectAgent extends View {
   answerPush(space, entry, label, cx) {
     if (this.mark(space, entry)) return; // answered in another panel window: never a run from here (t-045 round 2)
     const note = (this.notes[noteKey(space.id, entry.id)]?.value() ?? "").trim();
+    if (label === OTHER && (!note || note.length > OTHER_MAX)) { this.failed[entry.id] = !note ? OTHER_EMPTY : OTHER_TOO_LONG; cx.notify(); return; } // t-131: never an empty run
     // told() runs when the tool's run has ended, long after this click: it gets the run task's cx
     // (a cx is valid only for the call that gave it; this click's would throw "stale context").
     const started = this.push.run(space, entry, label, note, cx, (message, cx) => {
@@ -1449,6 +1450,7 @@ export default class ProjectAgent extends View {
       : m?.state === "elsewhere" && m.unknown ? "A push from another panel window has an unknown result: locked until a check from here reads the card open (Check again)."
       : m?.state === "elsewhere" ? "Answered in another panel window." : null;
     const pushAnswered = push && c.status === "open" ? this.push.answeredHere(space.id, entry.id) ?? (m?.unknown ? null : m?.label) ?? null : null; // a run from here (or another window) answered it
+    const pushWords = push && c.status === "open" ? this.push.noteHere(space.id, entry.id) ?? m?.note ?? null : null; // t-131: an Other run's words
     const open = c.status === "open", busy = Boolean(this.busy[entry.id]) || Boolean(running) || (push && (this.push.locked(space.id, entry.id) || Boolean(m)));
     const task = c.task && (this.data?.ledger?.tasks ?? []).find((x) => x.id === c.task);
     // t-100: a push card's run keeps its answer chosen: the label in flight, then the one a run from here answered.
@@ -1456,7 +1458,10 @@ export default class ProjectAgent extends View {
     const picked = !open ? null : (push && (running ?? this.push.answeredHere(space.id, entry.id))) || (this.choice[entry.id] ?? null);
     // Other (t-046): the field is the answer; Submit needs words, at most OTHER_MAX.
     const words = picked === OTHER ? (this.notes[noteKey(space.id, entry.id)]?.value() ?? "").trim() : "";
-    const wordsOk = picked !== OTHER || (words.length > 0 && words.length <= OTHER_MAX);
+    // t-131: a field with no change event (the host's InputState without `on`) cannot turn Submit on as the person types:
+    // Submit stays on for Other and an empty click is refused with the hint (answer(), answerPush()).
+    const live = typeof this.notes[noteKey(space.id, entry.id)]?.on === "function";
+    const wordsOk = picked !== OTHER || (live ? words.length > 0 && words.length <= OTHER_MAX : true);
     const ready = Boolean(picked) && wordsOk && !busy && !(push && shownOnly(entry)) && (!push || picked !== PUSH || this.push.canSubmit(space.id, entry.id)); // Push: a fresh check that passed; a shown-only card: never
     // The rows: the card's options but its own Other (each keeps its index in the id), then the panel's Other row.
     const listed = (push ? PUSH_OPTIONS : c.options ?? []).map((o, i) => [o, i]).filter(([o]) => !ownOther(o));
@@ -1512,6 +1517,8 @@ export default class ProjectAgent extends View {
       // Closed from the conversation: say so, with the words that decided it (or why it was withdrawn).
       .when(!open && Boolean(c.answeredBy), (el) => el.child(div().text_size(11).text_color(t.dim).child(sel(`sel-by-${entry.id}`, c.status === "withdrawn" ? "Closed by the Project Agent as no longer needed" : `Answered by the ${c.answeredBy}`))))
       .when(!open && Boolean(c.note), (el) => el.child(div().text_size(12).text_color(t.muted).child(sel(`sel-note-${entry.id}`, noteLine(c)))))
+      // t-131: a push card answered Other here or in another window, before this copy reads it answered: the person's words.
+      .when(pushAnswered === OTHER && Boolean(pushWords), (el) => el.child(div().text_size(12).text_color(t.muted).child(sel(`sel-note-${entry.id}`, `Your answer: “${pushWords}”`))))
       .when(Boolean(earlier), (el) => el.child(div().text_size(11.5).text_color(t.dim).child(sel(`sel-earlier-${entry.id}`, earlier))))
       .when(!open && c.status === "answered" && Boolean(c.rule) && isOther(c), (el) => el.child(div().text_size(11.5).text_color(t.dim).child(RULE_STAYS)))
       .when(Boolean(markLine), (el) => el.child(div().text_size(11.5).text_color(m?.state === "unsure" ? t.blocked : t.dim).child(markLine)))
@@ -1691,10 +1698,11 @@ export default class ProjectAgent extends View {
         .when(!listed.length && this.cardsFor !== space.id, (e) => e.child(note("Loading decisions…")))
         .when(!listed.length && this.cardsFor === space.id, (e) => e.child(note("No open decisions. The Project Agent opens a card here when it needs you.")))
         .children(listed.map((c) => this.card(t, c, space)))
+        .when(this.cards.missing > 0, (e) => e.child(note(`${this.cards.missing} card${this.cards.missing === 1 ? "" : "s"} could not be read now; the next load reads ${this.cards.missing === 1 ? "it" : "them"} again.`))) // t-131: never silently missing
         .when(answered.length > 0 || this.cards.omitted > 0, (e) => e.child(div().id("pa-older").px(4).py(4).text_size(11.5).text_color(t.dim).cursor_pointer().hover((s) => s.text_color(t.foreground))
           .on_click((_e, cx) => { this.older = !this.older; cx.notify(); }).child(`${this.older ? "▾" : "▸"} ${answered.length} answered${this.cards.omitted > 0 ? ` · ${this.cards.omitted} older not shown` : ""}`)))
         .when(this.older, (e) => e.children(answered.slice(0, 50).map((c) => this.card(t, c, space))))
         .when(this.older, (e) => e.child(this.archiveLine(t, space)))
-        .when(this.older && Boolean(this.archive[space.id]?.open), (e) => e.children((this.archive[space.id]?.cards ?? []).slice(0, 50).map((c) => this.card(t, c, space))))));
+        .when(this.older && Boolean(this.archive[space.id]?.open), (e) => e.children((this.archive[space.id]?.cards ?? []).filter((c) => !this.cards.some((x) => x.id === c.id)).slice(0, 50).map((c) => this.card(t, c, space))))));
   }
 }

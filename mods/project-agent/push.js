@@ -75,7 +75,7 @@ export async function readAllow(space, cx, host = null, click = false) {
 export const readOpen = (c) => Boolean(c && c.status === "open" && c.done !== true && c.refusal?.check !== "C4");
 
 export class PushCards {
-  // share(spaceId, id, label | null, running, unknown): main.js's shared mark for the other panel windows (t-045 round 2):
+  // share(spaceId, id, label | null, running, unknown, note): main.js's shared mark (note: an Other answer's words, t-131) for the other panel windows (t-045 round 2):
   // set when a run starts (running) and when it ends answered or unknown, removed when the card is known open again.
   // opened(spaceId, id, asked): a check from this copy, asked at `asked`, read the card open (t-045 round 3): an unknown
   // result's shared mark from any window, written before then, goes; nothing else unlocks it, not its age.
@@ -92,6 +92,8 @@ export class PushCards {
   running(spaceId, id) { return this.cards[`${spaceId}\0${id}`]?.running ?? null; }
   // The answer a run from this copy ended with (t-045), or null.
   answeredHere(spaceId, id) { return this.cards[`${spaceId}\0${id}`]?.result?.label ?? null; }
+  // The words of an Other run from this copy, in flight or answered (t-131), or null.
+  noteHere(spaceId, id) { const st = this.cards[`${spaceId}\0${id}`]; return (st?.running ?? st?.result?.label) === OTHER ? st.note ?? null : null; }
   // Whether this copy may not answer the card again (t-045): a run is in flight, a run from here ended answered, or its
   // result is unknown and no check since read the card open (readOpen: a refusal with the card open counts as open).
   // The card then has no option or Submit to click.
@@ -156,7 +158,8 @@ export class PushCards {
     if (label === PUSH && !this.canSubmit(space.id, entry.id)) { st.stale = true; cx.notify(); return false; }
     const args = ["run", entry.id, "--answer", label, "--space", localId(space.id), ...(label === PUSH ? ["--seen", st.check.seen] : []), "--json", ...(note ? ["--note", note] : [])];
     st.running = label; st.result = null; st.error = null; st.errorFor = label; st.unknown = null; st.stale = false; st.notNowWait = false;
-    this.share(space.id, entry.id, label, true);
+    st.note = label === OTHER ? note : null;
+    this.share(space.id, entry.id, label, true, false, st.note);
     cx.spawn(async (cx) => {
       const { r, error } = await call(ctxOf(this.host, cx, true), space, "pa-push-main", args, RUN_TIMEOUT, `run:${space.id}:${entry.id}`);
       st.running = null;
@@ -171,12 +174,12 @@ export class PushCards {
         st.unknown = error ?? `pa-push-main run exited with ${r?.code}${r?.code === 0 ? " without a result that says it pushed" : ""}${said(r) ? `: ${said(r)}` : ""}`;
         st.check = null;
         st.kept = true; // the tool may have saved the card answered before it failed: keep it shown with the check's verdict
-        this.share(space.id, entry.id, label, false, true); // every window stays locked until a check of its own reads it open
+        this.share(space.id, entry.id, label, false, true, st.note); // every window stays locked until a check of its own reads it open
         notice = `decision ${entry.id} answered ${label}; result unknown (${st.unknown}); the panel checks the card again`;
       } else {
         if (r.code === 0) {
           st.result = { ...(out ?? {}), label: answer }; st.kept = answer === PUSH;
-          this.share(space.id, entry.id, answer, false);
+          this.share(space.id, entry.id, answer, false, false, answer === OTHER ? st.note : null);
           let what = String(out?.message || resultLine(out?.result) || "pushed");
           if (what.startsWith(`${entry.id}: `)) what = what.slice(entry.id.length + 2); // the tool's message starts with the card id
           notice = answer !== label ? `decision ${entry.id} was already answered ${answer}; ${what}`

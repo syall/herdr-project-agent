@@ -13,7 +13,7 @@ One file, selected by the name it is invoked as (symlinks in ~/.local/bin):
   pa-pass --pause | --resume                     pause or resume scheduled passes for the space
   pa-cleanup [--kill] [--dry-run] [--space ID]   remove finished workers whose evidence is recorded
   pa-doctor [--space ID]                         check a space's state files; exit 1 if any is broken
-  pa-task list|done|reopen|park|next|pause|unpause|delete|restore|purge|archive   the person's own changes to tasks
+  pa-task list|done|reopen|park|next|pause|unpause|delete|restore|purge|archive|unarchive   the person's own changes to tasks
   pa-decide <card> --answer LABEL|Other --quote TEXT   record a decision the person made in conversation
   pa-decide <card> --withdraw --why TEXT         close a card the conversation made moot (or answered Other)
   pa-sync --on MACHINE [--dry-run]               copy core/, tools/ and profiles/ to another Herdr machine
@@ -104,7 +104,9 @@ def write_json(path, value):
 # Old answered and withdrawn cards are moved by the person (pa-task archive) from decisions/ to decisions-archive/, a
 # sibling the panel reads only on request. Open cards never move. Every tool that reads a card by id reads it through
 # card_file, so an archived card still counts (an answered Keep is never asked again); every tool that writes one
-# writes through card_for_write, so a card a tool changes is in decisions/ again and an open card is never archived.
+# writes through put_card (card_for_write under .archive.lock), so a card a tool changes is in decisions/ again, an open
+# card is never archived, and a write never lands beside a copy pa-task archive moved meanwhile (t-131: one copy).
+# Lock order: the push lock (when taken), then .archive.lock; pa-task archive takes them in that order too.
 ARCHIVE = "decisions-archive"
 ARCHIVE_DAYS = 14
 
@@ -146,9 +148,24 @@ def card_for_write(directory, card_id):
     return live
 
 
+def put_card(directory, card_id, card):
+    """Writes card `card_id` to decisions/ under .archive.lock (t-131): pa-task archive moves cards only under that lock,
+    so it never moves the card between this write's path and the write itself (which would leave two copies)."""
+    lock = archive_lock(directory)
+    try:
+        live = os.path.join(directory, "decisions", card_id + ".json")
+        old = os.path.join(directory, ARCHIVE, card_id + ".json")
+        if not os.path.lexists(live) and os.path.lexists(old):
+            move_card(old, live)
+        write_json(live, card)
+    finally:
+        lock.close()
+    return live
+
+
 def write_card(directory, path, card):
-    """Writes a card read from `path` (in decisions/ or the archive) to decisions/ (card_for_write)."""
-    write_json(card_for_write(directory, os.path.basename(path)[:-len(".json")]), card)
+    """Writes a card read from `path` (in decisions/ or the archive) to decisions/ (put_card)."""
+    put_card(directory, os.path.basename(path)[:-len(".json")], card)
 
 
 def backup(path, change):
@@ -4310,15 +4327,17 @@ def task_worktrees(task):
 
 
 def card_stamp(card):
-    """When a closed card was answered or withdrawn, as a UTC datetime, or None when it cannot be read."""
+    """When a closed card was answered or withdrawn, as a UTC datetime: the later of `answered` and `withdrawnAt` (t-131:
+    a card answered long ago and withdrawn today is today's); None when neither can be read."""
+    found = []
     for key in ("answered", "withdrawnAt"):
         m = re.match(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)", str(card.get(key) or ""))
         if m:
             try:
-                return datetime.datetime.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S").replace(tzinfo=datetime.timezone.utc)
+                found.append(datetime.datetime.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S").replace(tzinfo=datetime.timezone.utc))
             except ValueError:
-                return None
-    return None
+                pass
+    return max(found) if found else None
 
 
 def archive_cards(directory, args):
@@ -4337,7 +4356,13 @@ def archive_cards(directory, args):
     cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=args.days)
     folder, archive = os.path.join(directory, "decisions"), os.path.join(directory, ARCHIVE)
     moved, taken, back = [], [], []
-    locks = [] if args.dry_run else [archive_lock(directory), push_card_lock(directory)]
+    locks = [] if args.dry_run else [push_card_lock(directory)]  # the push lock first, as every card writer (t-131)
+    if not args.dry_run:
+        try:
+            locks.append(archive_lock(directory))
+        except BaseException:
+            locks[0].close()
+            raise
     try:
         for name in sorted(os.listdir(folder)) if os.path.isdir(folder) else []:
             if not name.endswith(".json") or not ID.match(name[:-5]):
@@ -4381,6 +4406,31 @@ def archive_cards(directory, args):
         print("Left in decisions/, a card of the same name is already in {}: {}".format(ARCHIVE, ", ".join(taken)))
     if back:
         print("Left in decisions/, changed while it was moved: {}".format(", ".join(back)))
+
+
+def unarchive_card(directory, args):
+    """pa-task unarchive <card-id> (t-131): the person's command. Moves decisions-archive/<id>.json back to decisions/ as
+    is, under .archive.lock; never over a card of that id in decisions/. Journaled."""
+    if in_agent():
+        raise Problem("pa-task unarchive is the person's command; an agent asks them instead")
+    if not args.task:
+        raise Problem("pa-task unarchive needs a card id")
+    card_id = ident(args.task, "card id")
+    lock = archive_lock(directory)
+    try:
+        live = os.path.join(directory, "decisions", card_id + ".json")
+        old = os.path.join(directory, ARCHIVE, card_id + ".json")
+        if os.path.lexists(live):
+            raise Problem("{} is already in decisions/; nothing was moved".format(card_id))
+        if not os.path.lexists(old):
+            raise Problem("{} is not in {}/".format(card_id, ARCHIVE))
+        move_card(old, live)
+        with open(os.path.join(directory, "journal.jsonl"), "a") as journal:
+            journal.write(json.dumps({"at": now(), "by": "person", "trigger": "archive",
+                                      "why": "moved decision card {} back from {}/ to decisions/".format(card_id, ARCHIVE)}) + "\n")
+    finally:
+        lock.close()
+    print("Moved {} back to decisions/.".format(card_id))
 
 
 def open_cards(directory):
@@ -4432,6 +4482,8 @@ def cmd_task(args):
         raise Problem("pa-task {} is the person's command; an agent asks them instead".format(args.action))
     if args.action == "archive":
         return archive_cards(directory, args)
+    if args.action == "unarchive":
+        return unarchive_card(directory, args)
     if args.action == "purge":
         gone = 0
         for name in sorted(os.listdir(trash)) if os.path.isdir(trash) else []:
@@ -4824,8 +4876,8 @@ def main():
                               "delete <id>: move the task, its evidence and its decision cards to the trash. restore <id>: bring it back. "
                               "purge [<id>]: permanently delete what is in the trash. archive [--days N] [--dry-run]: move answered and withdrawn "
                               "decision cards older than N days (default 14) to decisions-archive/; open cards and the cards of a task that is not "
-                              "done or parked stay; nothing is deleted.")
-        parser.add_argument("action", choices=("list", "done", "reopen", "park", "next", "pause", "unpause", "delete", "restore", "purge", "archive"))
+                              "done or parked stay; nothing is deleted. unarchive <card-id>: move one card back from decisions-archive/ to decisions/.")
+        parser.add_argument("action", choices=("list", "done", "reopen", "park", "next", "pause", "unpause", "delete", "restore", "purge", "archive", "unarchive"))
         parser.add_argument("task", nargs="?")
         parser.add_argument("--space")
         parser.add_argument("--days", type=float, default=ARCHIVE_DAYS, help="archive: cards answered more than this many days ago (default {})".format(ARCHIVE_DAYS))

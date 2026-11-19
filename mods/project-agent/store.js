@@ -613,7 +613,7 @@ const byteOrder = (a, b) => (a < b ? -1 : a > b ? 1 : 0); // names are ASCII: co
 // fails), live() (false: the caller no longer wants the result; the fallback is skipped and the
 // result is null, which the caller must not take for "no cards"), known (the last known cards,
 // [{ path, text }]: a card whose own read times out or fails on the fallback path is that copy, else
-// left out; such a card has fallback: true, and the list's `unread` (a Set of paths) names every card not read now,
+// left out (counted in the list's `missing`, t-131); such a card has fallback: true, and the list's `unread` (a Set of paths) names every card not read now,
 // t-045), out (an object: out.busy is set when the null came from a call of its kind still pending: say nothing).
 // Only exit 0 is a whole batch (exit 3 with no output: no folder); a call killed part way
 // can print whole-looking pairs. null also when the listing never answered (the batch gave no whole
@@ -628,7 +628,7 @@ export async function loadDecisions(space, { cx, batchOnly = false, live, known 
   if (r?.busy) { out.busy = true; return null; } // the last batch is still pending: skipped, quietly
   if (r && !gaveUp(r) && r.code === 3 && !r.stdout) return []; // no decisions folder: no cards (as a failing ls)
   const files = r && !gaveUp(r) && r.code === 0 ? splitBatch(r.stdout) : null;
-  if (files) return capCards(parseCards(files.sort((a, b) => byteOrder(a.name, b.name)).map((f) => ({ ...f, path: `${dir}/${f.name}` }))));
+  if (files) return Object.assign(capCards(parseCards(files.sort((a, b) => byteOrder(a.name, b.name)).map((f) => ({ ...f, path: `${dir}/${f.name}` })))), { missing: 0 });
   if (batchOnly || (live && !live())) return null;
   let names = [];
   try {
@@ -656,6 +656,7 @@ export async function loadDecisions(space, { cx, batchOnly = false, live, known 
   await Promise.all(Array.from({ length: Math.min(CARD_READS, picked.length) }, worker));
   const list = capCards(parseCards(picked.map((name, i) => ({ name, path: `${dir}/${name}`, text: texts[i], fallback: unread.has(`${dir}/${name}`) && texts[i] !== null }))));
   list.unread = unread; // t-045: a card's mark is resolved only by a read made now (main.js resolveMarks)
+  list.missing = texts.filter((x, i) => x === null && unread.has(`${dir}/${picked[i]}`)).length; // t-131: not read now, no known copy: said, never silent
   return list;
 }
 

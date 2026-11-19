@@ -159,7 +159,9 @@ push card can be made and nothing about pushing changes. Agents never push a mai
   for a link you click, and a profile's declared action when its button is clicked.
 - Shared state it sets: `project-agent.tabs` (tab id -> `{ space, project, profile, name,
   terminal, alive? }`), `project-agent.open` (open cards per space), `project-agent.openAgent`
-  (Open Project Agent requests; the panel writes, the keeper deletes), `project-agent.worktrees`, `project-agent.workers`,
+  (Open Project Agent requests; the panel writes, the keeper deletes), `project-agent.worktrees` (space id -> a list:
+  per task its main worktree first, exactly `{ task, path, title }`, then each other worktree it records,
+  `{ task, path, title, job }`; a reader that wants one path per task takes the entry without `job`), `project-agent.workers`,
   `project-agent.timer`, `my-files.root` and `my-files.places` (for a Files view that honours
   them). It reads `project-agent.show` (`{ space, task, at }`) to open a task on request.
 - Agents are recognised by the label `herdr.pa=<space-id>` that the launcher sets on its own

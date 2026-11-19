@@ -1492,7 +1492,7 @@ def cmd_card(args):
                 "evidence": ["REVIEW.md"], "recommendation": ALL, "status": "open", "answer": None, "note": None,
                 "created": now(), "answered": None,
                 "queue": {"version": 1, "repo": ctx.repo, "common": rec["common"], "mainBefore": main_tip, "entries": entries}}
-        pa.write_json(pa.card_for_write(ctx.directory, cid), card)
+        pa.put_card(ctx.directory, cid, card)
         ctx.event("card", chosen[0][0], card=cid, entries=[{"task": e["task"], "job": e.get("job")} for e, _n in chosen])
         save(ctx, data, rec)
     print("{} opened: {} ({})".format(cid, card["question"], ", ".join(tasks)))
@@ -1532,7 +1532,7 @@ def apply_cards(ctx, rec):
             ctx.event("approve", e, card=cid, option=card.get("answer"))
         q["applied"] = {"at": now(), "approved": approved, "skipped": skipped}
         applied.append(cid)
-        pa.write_json(pa.card_for_write(ctx.directory, cid), card)
+        pa.put_card(ctx.directory, cid, card)
         lines.append("{} ({}): approved {}{}".format(cid, card.get("answer"), ", ".join(a["task"] for a in approved) or "nothing",
                                                      "; not approved: " + "; ".join(skipped) if skipped else ""))
     return lines

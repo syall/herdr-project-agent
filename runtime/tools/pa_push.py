@@ -909,7 +909,7 @@ def seen_token(card_id, facts):
 # ---- cards ----------------------------------------------------------------------------------------
 
 def card_file(directory, card_id):
-    """Where the card is: decisions/, or decisions-archive/ when only there (t-054). Writes go through pa.card_for_write."""
+    """Where the card is: decisions/, or decisions-archive/ when only there (t-054). Writes go through pa.put_card (under the archive lock, t-131)."""
     return pa.card_file(directory, card_id)
 
 
@@ -1123,7 +1123,7 @@ def plan_card(directory, space, task_id, path):
                             {"label": "Not now", "detail": "Nothing is pushed. The card closes."}],
                 "evidence": ["GATE.json", "REVIEW.md"], "recommendation": "Push", "status": "open", "answer": None, "note": None,
                 "created": pa.now(), "answered": None, "push": push}
-        pa.write_json(pa.card_for_write(directory, card_id), card)
+        pa.put_card(directory, card_id, card)
         by = "agent" if pa_hooks.by_an_agent() else "person"
         pa_hooks.append_journal(directory, {"by": by, "trigger": "push-plan", "task": task_id,
                                             "decision": card_id, "why": "push card opened: {} {} {}..{} ({} commits){}".format(
@@ -1269,7 +1269,7 @@ def pre_push(s, entry, facts):
 
 
 def save_card(directory, card):
-    pa.write_json(pa.card_for_write(directory, card["id"]), card)
+    pa.put_card(directory, card["id"], card)
 
 
 def record_attempt(directory, card, r, facts):
