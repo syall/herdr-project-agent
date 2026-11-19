@@ -5923,15 +5923,15 @@ class J2S_Net(J2Base):
 
     def test_j2n2_the_real_opener_has_only_the_handlers_it_needs(self):
         import urllib.request
-        os.environ["HTTPS_PROXY"] = "https://proxy.example.test"  # ProxyHandler registers only when a proxy is set (Q5)
-        self.addCleanup(os.environ.pop, "HTTPS_PROXY", None)
-        opener = pa_costs.http_opener()
+        # t-070 J2 R9: the proxy handler (only from HTTPS_PROXY, http://host:port) registers only when it is set
+        with mock.patch.dict(os.environ, {"HTTPS_PROXY": "http://proxy.example.test:3128"}):
+            opener = pa_costs.http_opener()
         names = sorted(type(h).__name__ for h in opener.handlers)
         self.assertIn("HTTPSHandler", names)
         self.assertIn("NoRedirect", names)
-        self.assertIn("ProxyHandler", names)
+        self.assertIn("ProxyOnlyHttps", names)
         for forbidden in ("HTTPHandler", "FileHandler", "FTPHandler", "DataHandler", "HTTPCookieProcessor", "HTTPRedirectHandler",
-                          "HTTPBasicAuthHandler", "ProxyBasicAuthHandler", "HTTPDigestAuthHandler", "UnknownHandler"):
+                          "HTTPBasicAuthHandler", "ProxyBasicAuthHandler", "HTTPDigestAuthHandler", "UnknownHandler", "ProxyHandler"):
             self.assertNotIn(forbidden, names)
         https = [h for h in opener.handlers if isinstance(h, urllib.request.HTTPSHandler)][0]
         ctx = getattr(https, "_context", None)
@@ -6034,7 +6034,7 @@ class J2S_Net(J2Base):
         top = [n for n in tree.body if isinstance(n, (ast.Import, ast.ImportFrom))]
         self.assertEqual(top, [])
         names = {a.name.split(".")[0] for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names}
-        self.assertLessEqual(names, {"hashlib", "os", "ssl", "urllib"})
+        self.assertLessEqual(names, {"hashlib", "http", "os", "socket", "ssl", "urllib"})  # t-070 J2 R8: socket, http.client
         self.assertNotIn("netrc", text)
         self.assertNotIn("Cookie", text)
         self.assertNotIn("Authorization", text)
@@ -7126,6 +7126,282 @@ class J3G_Billed(BillingBase):
                          [("global", "region-a", 1.0), ("regional", "region-a", 2.0)])
         dump(j3g_space([j3g_entry(J3G_DAY, 1.0, "acct-a", "rule")]), self.costs("summary.json"))
         self.assertEqual(sorted(pa_costs.account_wide_summary("acct-a", T0)["byDayModel"][0]), ["day", "model", "money", "tokens"])
+
+
+# ---- t-070 J2: the fetch's network limits (spec R8-R11) and the guard row (R12) --------------------------------------
+
+import socket as _t070_socket  # noqa: E402
+T070_SOCKET = _t070_socket.socket  # the real class, saved before J2Base patches socket.socket
+
+
+class T070_Net(J2Base):
+    """R8 connect, a proxy's CONNECT and the TLS handshake waits at most the budget left; R9 only HTTPS_PROXY, no proxy
+    credential; R10 http.client exceptions are a plain failure; R11 a body shorter than its Content-Length is refused.
+    No socket is opened: resolvers and sockets are fakes, socket classes are used through fd-less instances."""
+
+    def net(self):
+        return pa_costs.net()
+
+    def test_t070_n1_each_connect_waits_at_most_the_budget_left(self):
+        now, tried = [0.0], []
+
+        class FakeSock:
+            def __init__(self, family, kind, proto):
+                self.timeout, self.closed = None, False
+
+            def settimeout(self, t):
+                self.timeout = t
+
+            def bind(self, address):
+                pass
+
+            def connect(self, where):
+                tried.append((where, self.timeout))
+                now[0] += 50.0
+                raise OSError("timed out")
+
+            def close(self):
+                self.closed = True
+        addresses = [(2, 1, 6, "", ("192.0.2.{}".format(i), 443)) for i in range(1, 5)]
+        resolved = []
+
+        def resolve(*args):
+            resolved.append(args)
+            return addresses
+        connect = self.net().connector(110.0, lambda: now[0], pa_costs.FetchFailed, 120, resolve=resolve, make=FakeSock)
+        with self.assertRaises(pa_costs.FetchFailed) as e:
+            connect(("origin.example.test", 443), 20, None)
+        self.assertEqual(e.exception.code, 3)
+        self.assertIn("120", e.exception.why)
+        self.assertEqual([t for _w, t in tried], [20, 20, 10.0])  # the 4th address is not tried
+        self.assertEqual(resolved[0][:2], ("origin.example.test", 443))
+        self.assertEqual(resolved[0][3], _t070_socket.SOCK_STREAM)
+        now[0], tried[:] = 200.0, []
+        with self.assertRaises(pa_costs.FetchFailed) as e:  # already past the deadline: nothing resolved or tried
+            self.net().connector(110.0, lambda: now[0], pa_costs.FetchFailed, 120, resolve=lambda *a: self.fail("resolved"),
+                                 make=FakeSock)(("origin.example.test", 443), 20, None)
+        self.assertEqual((e.exception.code, tried), (3, []))
+
+    def test_t070_n1b_connect_returns_the_first_socket_that_connects_and_keeps_the_last_error(self):
+        now, made = [0.0], []
+
+        class FakeSock:
+            def __init__(self, family, kind, proto):
+                self.family, self.timeout, self.closed, self.bound = family, None, False, None
+                made.append(self)
+
+            def settimeout(self, t):
+                self.timeout = t
+
+            def bind(self, address):
+                self.bound = address
+
+            def connect(self, where):
+                if where[0] != "192.0.2.2":
+                    raise OSError("refused " + where[0])
+
+            def close(self):
+                self.closed = True
+        addresses = [(2, 1, 6, "", ("192.0.2.{}".format(i), 443)) for i in range(1, 4)]
+        connect = self.net().connector(110.0, lambda: now[0], pa_costs.FetchFailed, 120, resolve=lambda *a: addresses, make=FakeSock)
+        sock = connect(("origin.example.test", 443), 5, ("198.51.100.1", 0))
+        self.assertIs(sock, made[1])
+        self.assertEqual((made[0].closed, made[1].closed, len(made)), (True, False, 2))
+        self.assertEqual(sock.timeout, 5)  # the connection's own timeout when it is the smaller
+        self.assertEqual(sock.bound, ("198.51.100.1", 0))
+        bad = [(2, 1, 6, "", ("192.0.2.9", 443)), (2, 1, 6, "", ("192.0.2.8", 443))]
+        connect = self.net().connector(110.0, lambda: now[0], pa_costs.FetchFailed, 120, resolve=lambda *a: bad, make=FakeSock)
+        with self.assertRaises(OSError) as e:
+            connect(("origin.example.test", 443), 20, None)
+        self.assertIn("192.0.2.8", str(e.exception))
+
+    def test_t070_n2_the_socket_before_tls_waits_at_most_the_budget_left(self):
+        ticks = {"t": 0.0}
+        cls = self.net().bounded_socket(T070_SOCKET, 100.0, lambda: ticks["t"], pa_costs.FetchFailed, 120)
+        self.assertTrue(issubclass(cls, T070_SOCKET))
+        sock = cls.__new__(cls)  # no connection: nothing is opened
+        with mock.patch.object(T070_SOCKET, "recv_into", create=True, return_value=3) as recv_into, \
+                mock.patch.object(T070_SOCKET, "recv", create=True, return_value=b"abc") as recv, \
+                mock.patch.object(T070_SOCKET, "send", create=True, return_value=3) as send, \
+                mock.patch.object(T070_SOCKET, "sendall", create=True, return_value=None) as sendall, \
+                mock.patch.object(T070_SOCKET, "settimeout", create=True) as settimeout:
+            ticks["t"] = 10.0
+            self.assertEqual(sock.recv_into(bytearray(8)), 3)
+            self.assertEqual(settimeout.call_args[0][-1], 20)
+            ticks["t"] = 95.0
+            self.assertEqual(sock.recv(8), b"abc")
+            self.assertEqual(settimeout.call_args[0][-1], 5.0)
+            ticks["t"] = 99.0
+            self.assertEqual(sock.send(b"abc"), 3)
+            self.assertEqual(settimeout.call_args[0][-1], 1.0)
+            ticks["t"] = 99.5
+            self.assertIsNone(sock.sendall(b"CONNECT"))
+            self.assertEqual(settimeout.call_args[0][-1], 0.5)
+            ticks["t"] = 100.5
+            for call in (lambda: sock.recv_into(bytearray(8)), lambda: sock.recv(8), lambda: sock.send(b"x"),
+                         lambda: sock.sendall(b"x")):
+                with self.assertRaises(pa_costs.FetchFailed) as e:
+                    call()
+                self.assertEqual(e.exception.code, 3)
+            self.assertEqual([m.call_count for m in (recv_into, recv, send, sendall)], [1, 1, 1, 1])
+
+    def test_t070_n3_the_tls_handshake_and_writes_wait_at_most_the_budget_left(self):
+        import ssl
+        import urllib.request
+        ticks = {"t": 0.0}
+        opener = pa_costs.http_opener(100.0, lambda: ticks["t"])
+        https = [h for h in opener.handlers if isinstance(h, urllib.request.HTTPSHandler)][0]
+        cls = https._context.sslsocket_class
+        self.assertEqual(https._context.verify_mode, ssl.CERT_REQUIRED)
+        self.assertTrue(https._context.check_hostname)
+        sock = cls.__new__(cls)
+        with mock.patch.object(ssl.SSLSocket, "do_handshake", return_value=None) as handshake, \
+                mock.patch.object(ssl.SSLSocket, "send", return_value=3) as send, \
+                mock.patch.object(ssl.SSLSocket, "sendall", return_value=None) as sendall, \
+                mock.patch.object(ssl.SSLSocket, "settimeout") as settimeout:
+            ticks["t"] = 10.0
+            sock.do_handshake()
+            self.assertEqual(settimeout.call_args[0][-1], 20)
+            ticks["t"] = 95.0
+            self.assertEqual(sock.send(b"abc"), 3)
+            self.assertEqual(settimeout.call_args[0][-1], 5.0)
+            ticks["t"] = 99.5
+            sock.sendall(b"GET")
+            self.assertEqual(settimeout.call_args[0][-1], 0.5)
+            ticks["t"] = 100.5
+            for call in (lambda: sock.do_handshake(), lambda: sock.send(b"x"), lambda: sock.sendall(b"x")):
+                with self.assertRaises(pa_costs.FetchFailed) as e:
+                    call()
+                self.assertEqual(e.exception.code, 3)
+            self.assertEqual([m.call_count for m in (handshake, send, sendall)], [1, 1, 1])
+
+    def test_t070_n4_with_a_deadline_the_connection_is_made_by_the_bounded_connect(self):
+        import http.client
+        import urllib.request
+        ticks = {"t": 0.0}
+        opener = pa_costs.http_opener(100.0, lambda: ticks["t"])
+        https = [h for h in opener.handlers if isinstance(h, urllib.request.HTTPSHandler)][0]
+        conn_class = https.connection_class
+        self.assertTrue(issubclass(conn_class, http.client.HTTPSConnection))
+        conn = conn_class("origin.example.test", 443, timeout=5, context=https._context)  # nothing connects yet
+        self.assertTrue(hasattr(http.client.HTTPSConnection("origin.example.test"), "_create_connection"))
+        self.assertEqual(conn._create_connection.__name__, "bounded_connect")
+        ticks["t"] = 100.5
+        with self.assertRaises(pa_costs.FetchFailed) as e:  # past the deadline: refused before any lookup
+            conn._create_connection(("origin.example.test", 443), 5, None)
+        self.assertEqual(e.exception.code, 3)
+        with mock.patch.object(urllib.request.AbstractHTTPHandler, "do_open", return_value="r") as do_open:
+            self.assertEqual(https.https_open(urllib.request.Request(URL_A)), "r")
+        self.assertIs(do_open.call_args[0][0], conn_class)
+        plain = [h for h in pa_costs.http_opener().handlers if isinstance(h, urllib.request.HTTPSHandler)][0]
+        self.assertIs(type(plain), urllib.request.HTTPSHandler)
+
+    def proxy_env(self, **values):
+        env = {k: v for k, v in os.environ.items() if not k.lower().endswith("_proxy")}
+        env.update(values)
+        return mock.patch.dict(os.environ, env, clear=True)
+
+    def test_t070_n5_only_https_proxy_is_read(self):
+        with self.proxy_env(https_proxy="http://lower.example.test:3128", HTTP_PROXY="http://h.example.test:3128",
+                            ALL_PROXY="http://all.example.test:3128", NO_PROXY="*"), \
+                mock.patch("urllib.request.getproxies", side_effect=AssertionError("the system proxy settings were read")):
+            for opener in (pa_costs.http_opener(), pa_costs.http_opener(100.0, lambda: 0.0)):
+                names = [type(h).__name__ for h in opener.handlers]
+                self.assertNotIn("ProxyHandler", names)
+                self.assertNotIn("ProxyOnlyHttps", names)
+
+    def test_t070_n6_https_proxy_tunnels_with_no_credential(self):
+        import urllib.request
+        for value, hostport in (("http://proxy.example.test:3128", "proxy.example.test:3128"),
+                                ("http://proxy.example.test:3128/", "proxy.example.test:3128"),
+                                ("proxy.example.test:8080", "proxy.example.test:8080")):
+            with self.proxy_env(HTTPS_PROXY=value):
+                opener = pa_costs.http_opener(100.0, lambda: 0.0)
+            proxies = [h for h in opener.handlers if type(h).__name__ == "ProxyOnlyHttps"]
+            self.assertEqual(len(proxies), 1, value)
+            req = urllib.request.Request(URL_A, headers={"User-Agent": "herdr-pa-costs"})
+            self.assertIsNone(proxies[0].https_open(req))
+            self.assertEqual(req.host, hostport)
+            self.assertEqual(req._tunnel_host, "prices.example.test")
+            self.assertEqual(req.type, "https")
+            self.assertFalse([k for k, _v in req.header_items() if "proxy" in k.lower()])
+
+    def test_t070_n7_a_bad_https_proxy_is_refused_before_any_download(self):
+        for value in ("http://user:secret@proxy.example.test:3128", "secret@proxy.example.test:3128",
+                      "socks5://proxy.example.test:1080", "https://proxy.example.test:3128",
+                      "http://proxy.example.test:3128/path", "http://proxy.example.test:3128?x=1",
+                      "http://proxy.example.test", "http://proxy.example.test:99999"):
+            before = self.snapshot()
+            with self.proxy_env(HTTPS_PROXY=value):
+                code, _out, err = self.fetch(source="src-a", opener=None)
+            self.assertEqual(code, 1, (value, err))
+            self.assertIn("HTTPS_PROXY", err, value)
+            self.assertNotIn("secret", err, value)
+            self.assertNotIn("Traceback", err)
+            self.assertEqual(self.requests, [])
+            self.assert_untouched(before)
+
+    def test_t070_n8_an_http_client_error_is_a_plain_failure(self):
+        import http.client
+
+        def bad():
+            raise http.client.BadStatusLine("garbage")
+        self.responses[URL_A] = bad
+        before = self.snapshot()
+        code, _out, err = self.fetch(source="src-a")
+        self.assertEqual(code, 1, err)
+        self.assertIn("BadStatusLine", err)
+        self.assertNotIn("Traceback", err)
+        self.assert_untouched(before)
+
+    def test_t070_n9_an_incomplete_read_is_a_plain_failure(self):
+        import http.client
+
+        class Cut(FakeResponse):
+            def read(self, n=-1):
+                raise http.client.IncompleteRead(b"ab", 6)
+        self.responses[URL_A] = Cut(200, FakeHeaders({"Content-Length": "8"}), b"abcdefgh")
+        before = self.snapshot()
+        code, _out, err = self.fetch(source="src-a")
+        self.assertEqual(code, 1, err)
+        self.assertIn("IncompleteRead", err)
+        self.assert_untouched(before)
+
+    def test_t070_n10_an_opener_error_past_the_deadline_is_the_budget(self):  # REVIEW N4 (t-032)
+        now = [0.0]
+
+        def opener(req, timeout):
+            now[0] = 121.0
+            raise OSError("timed out")
+        dest = os.path.join(tempfile.mkdtemp(dir=TMP), "late.download")
+        with self.assertRaises(pa_costs.FetchFailed) as e:
+            pa_costs.download(URL_A, 5000, dest, pa_costs.FETCH_BUDGET, opener, lambda: now[0])
+        self.assertEqual(e.exception.code, 3)
+
+    def test_t070_n11_a_body_shorter_than_its_content_length_is_refused(self):
+        self.responses[URL_A] = FakeResponse(200, FakeHeaders({"Content-Length": "1000"}), b"x" * 500)
+        before = self.snapshot()
+        code, _out, err = self.fetch(source="src-a")
+        self.assertEqual(code, 1, err)
+        self.assertIn("500 of its 1000", err)
+        self.assert_untouched(before)
+
+    def test_t070_n13_no_length_check_without_a_usable_content_length(self):
+        folder = tempfile.mkdtemp(dir=TMP)
+        for i, headers in enumerate(({}, {"Content-Length": "1000", "Transfer-Encoding": "chunked"}, {"Content-Length": "x"})):
+            resp = FakeResponse(200, FakeHeaders(headers), b"x" * 500)
+            got = pa_costs.download(URL_A, 5000, os.path.join(folder, "{}.download".format(i)), pa_costs.FETCH_BUDGET,
+                                    lambda req, t: resp, lambda: 0.0)
+            self.assertEqual(got["bytes"], 500, headers)
+
+    def test_t070_n14_the_guard_refuses_the_review_forms(self):
+        tool, script = "pa-" + "costs", "pa_" + "costs.py"
+        for command in (tool + " prices fe''tch", tool + " prices f\\etch", "python3 runtime/tools/" + script + " prices fetch"):
+            code, err = W_CloseAndGuard.guard(self, command)
+            self.assertEqual(code, 2, command)
+            self.assertIn("price fetch", err, command)
+        for command in (tool + " prices", "python3 runtime/tools/" + script + " prices --space sp1"):
+            self.assertEqual(W_CloseAndGuard.guard(self, command)[0], 0, command)
 
 
 class ZZ_V1_Privacy(unittest.TestCase):

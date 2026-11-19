@@ -377,8 +377,9 @@ class T025Removed(unittest.TestCase):  # AC1.1, AC2.1, AC3.1, AC4.4, R10
     def test_one_argument(self):
         self.assertEqual(list(inspect.signature(guard.check_command).parameters), ["line"])
 
-    def test_size(self):  # R10: about 230 lines (the build came to 245: DECISIONS.md, t-025 D4; t-041 J3's pa-context row: 254)
-        self.assertLessEqual(len(source("pa_guard.py").splitlines()), 255)
+    def test_size(self):  # R10: about 230 lines (the build came to 245: DECISIONS.md, t-025 D4; t-041 J3's pa-context row: 254;
+        # t-070 J2's price fetch row: 262)
+        self.assertLessEqual(len(source("pa_guard.py").splitlines()), 262)
 
 
 class HookGuard(unittest.TestCase):
@@ -885,6 +886,39 @@ class T041Context(GuardTest):  # t-041 J3: workers never run pa-context
 
     def test_d6_allowed(self):
         for line in D6_ALLOWED:
+            with self.subTest(line=line):
+                self.assertIsNone(self.check(line))
+
+
+# t-070 J2 R12 (t-032 RL-J2-4): the person's price fetch, read as shell words, so quotes, escapes and the script's path
+# do not hide it (pa_hooks' text row stays first for the plain forms)
+D7 = ("Refused by the Project Agent's guard: {}. A price fetch (pa-costs prices fetch) is the person's command: it "
+      "downloads a price list and writes the profile's price file. Say in your report that the prices should be fetched. "
+      "There is no override.")
+D7_FORMS = [
+    ("pa-costs prices fe''tch", "pa-costs prices fetch"), ("pa-costs prices f\\etch", "pa-costs prices fetch"),
+    ("python3 runtime/tools/pa_costs.py prices fetch",), ("python3 -I runtime/tools/pa_costs.py prices fetch --dry-run",),
+    ("runtime/tools/pa_costs.py prices --space s1 fetch --dry-run",), ("python3 -m pa_costs prices fetch",),
+    ("env X=1 /x/bin/PA-COSTS 'prices' fetch", "env X=1 /x/bin/PA-COSTS prices fetch"),
+    ("sh -c 'pa-costs prices fetch --yes'", "pa-costs prices fetch --yes"), ("echo $(pa-costs prices fetch)", "pa-costs prices fetch"),
+    ('cd /tmp && pa-costs "prices" "fetch"', "pa-costs prices fetch"), ("eval pa-costs prices fetch", "pa-costs prices fetch"),
+    ("nohup pa-costs prices fetch --source s", "nohup pa-costs prices fetch --source s"),
+]
+D7_ALLOWED = ["pa-costs prices", "pa-costs prices --space sp1", "pa-costs report", "pa-costs fetch prices",
+              "echo pa-costs prices fetch", "grep -n fetch runtime/tools/pa_costs.py", "python3 -m unittest tests/test_pa_costs.py",
+              'git commit -m "pa-costs prices fetch"', "python3 runtime/tools/pa_costs.py prices --space sp1",
+              "cat runtime/tools/pa_costs.py | grep prices"]
+
+
+class T070Prices(GuardTest):
+    def test_d7_forms(self):
+        for form in D7_FORMS:
+            line, inner = form[0], form[-1]
+            with self.subTest(line=line):
+                self.assertEqual(self.check(line), msg(D7, inner))
+
+    def test_d7_allowed(self):
+        for line in D7_ALLOWED:
             with self.subTest(line=line):
                 self.assertIsNone(self.check(line))
 
