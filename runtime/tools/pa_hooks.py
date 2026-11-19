@@ -10,6 +10,8 @@ Selected by the name it is invoked as (symlinks in ~/.local/bin):
                                                 repo in content/suites.jsonl; a passing clean tree is not run again;
                                                 at most pa_suite.CAP at once per machine (see pa_suite.py)
   pa-full-suite --last [--commit C|--tree T]    the last recorded run; --report: its parts by time
+  pa-full-suite --local | --on M | --places     on this Mac only, on machine M only, or where runs can go: the
+                                                machines of config.json's suiteMachines (t-089, see pa_suite.py)
   pa-worktree check [--open-cards]              worktrees whose tasks are all done or parked: list them, open decision cards
   pa-worktree remove <task-id>                  delete a task's worktree, only with an answered "Delete" card
   pa-worker info <address>                      what deleting a worker would remove, as JSON
@@ -1168,7 +1170,12 @@ def suite_runs(directory):
                      "untracked": untracked, "moved": moved,
                      "reusable": not moved and untracked == 0, "exit": l.get("exit"),
                      "started": started, "ended": ended, "seconds": seconds,
-                     "parts": l.get("parts") if isinstance(l.get("parts"), list) else None})
+                     "parts": l.get("parts") if isinstance(l.get("parts"), list) else None,
+                     # t-089: where it ran (no machine: this Mac), and why a run that could go remote did not
+                     "machine": l.get("machine") if isinstance(l.get("machine"), str) else None,
+                     "os": l.get("os") if isinstance(l.get("os"), str) else None,
+                     "places": l.get("places") if isinstance(l.get("places"), list) else None,
+                     "note": l.get("note") if isinstance(l.get("note"), str) else None})
     return runs
 
 
@@ -4119,6 +4126,11 @@ def main():
         parser.add_argument("--wait", action="store_true", help="wait for that run; a heartbeat every minute; its exit")
         parser.add_argument("--timeout", type=float, help="--wait: give up after this many seconds (default 540; exit 75)")
         parser.add_argument("--module", help="run one unit module (tests/run-all.sh --module test_x) the same way")
+        parser.add_argument("--local", action="store_true", help="run on this Mac, never on a configured machine (t-089)")
+        parser.add_argument("--on", metavar="M", help="run on machine M of config.json's suiteMachines only; exit 2 when "
+                                                      "it is not reachable or its setup fails (no fallback)")
+        parser.add_argument("--places", action="store_true", help="each configured machine (reachable or why not, "
+                                                                  "cap, holders) and this Mac's slot")
         parser.add_argument("--space")
         return cmd_full_suite(parser.parse_args())
     raise pa.Problem("invoke as pa-gate, pa-hooks, pa-hook, pa-worktree, pa-worker, pa-trust or pa-full-suite")

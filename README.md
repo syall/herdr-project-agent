@@ -590,7 +590,24 @@ task's evidence folder first, and prints a heartbeat line every minute), `pa-ful
 [--commit C]` (any run of this worktree, `run-all.sh` ones too) and `pa-full-suite --wait` (up to
 540 s a call, `--timeout`; exit 75 while it still runs). `pa-full-suite --module test_x` runs one unit
 test module (`tests/run-all.sh --module test_x`) with the same slot, limit and record. A few tests run
-on their own (`python3 -m unittest tests.test_x.T.test_y`) take no slot. After updating, run `pa-sync --on <machine>` before installing the mod, so remote launchers
+on their own (`python3 -m unittest tests.test_x.T.test_y`) take no slot.
+
+Full suites on another machine: list hc machines (`hc machine ls`) in this Mac's
+`~/.config/herdr-pa/config.json`, in order of preference, each with its own cap (a whole number 1..32, default 1):
+
+```json
+"suiteMachines": [{"machine": "box-1", "cap": 2}]
+```
+
+`pa-full-suite` then runs every part but the integration check on the first reachable machine with a free
+slot (`tests/run-all.sh --except-integration`, in an hc terminal under `/tmp/pa-suite-<run>` with its own home
+and temp folders), and the integration check on this Mac at the same time (`--only-integration`). Only a
+clean worktree whose full command is `sh tests/run-all.sh` goes: a `git bundle` of the pinned commit is sent,
+and its commit and tree are checked there. If every machine is busy for `PA_SUITE_PREFER_WAIT` (300) s, or
+none is reachable, or the setup there fails, the run is on this Mac and says why. The output, `--status`,
+`--wait`, `build.log` and the record name the place; a pass there counts for the tree. `pa-full-suite --local`
+runs on this Mac, `--on <machine>` only there (exit 2 if it cannot), and `--places` shows each machine,
+whether it is reachable, its cap and who holds its slots. After updating, run `pa-sync --on <machine>` before installing the mod, so remote launchers
 get the new `pa-session` (see the install order above).
 
 ## Licence

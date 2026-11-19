@@ -12,6 +12,11 @@ folder; the pa_hooks module is passed in (`h`) for its helpers, so nothing here 
                                                    not done): waiting, running (parts done, the parts running now) or done
   pa-full-suite --wait [--commit C] [--timeout S]  waits for that run (a heartbeat line every minute) and exits with its
                                                    code; 75 when it still runs after S (default 540) s: --wait again
+  pa-full-suite --local                            on this Mac, never on a configured machine
+  pa-full-suite --on M                             on machine M only: exit 2 when M is not configured, not reachable,
+                                                   or its setup fails (no fallback)
+  pa-full-suite --places                           each configured machine (reachable or why not, cap, holders) and
+                                                   this Mac's slot
 
 A run (t-076) names its output file first (evidence/<task>/full-suite-<run>.out, the whole output) and keeps a
 progress file, HERDR_PA_HOME/suite-runs/<run>.json, which its tests/run-all.sh fills in with its parts; every
@@ -30,19 +35,43 @@ no trusted marker, any locked slot of this home whose holder is an ancestor coun
 none). A wait ends after SLOT_WAIT_LIMIT s (PA_SUITE_WAIT_LIMIT) or once this process's caller is gone, never later.
 The command gets PA_SUITE_SLOT, PA_SUITE_SLOT_PID (this process) and PA_SUITE_HOLD (the seconds waited, or held
 by the caller). Script mode never loads pa.py (run-all.sh's test fixture stubs it): HERDR_PA_HOME and a UTC clock.
+
+The remote mode (t-089): HERDR_PA_HOME/config.json (this Mac's, never synced) may list machines,
+  "suiteMachines": [{"machine": "<hc machine name>", "cap": <1..32, default 1>}, ...]
+in order of preference (a bad entry is named and skipped; a cap over 32 is used as 32). Then a run of the command
+`sh tests/run-all.sh` from a clean one-repo worktree (not --module) goes to the first reachable machine (one
+`hc exec` probe: uname and the paths and versions of git, python3 >= 3.7, node and sh) with a free slot: a local flock
+under suite-slots/<machine>/ (its cap), held by this pa-full-suite for the whole run. All busy: it waits, and after
+PA_SUITE_PREFER_WAIT (300) s this Mac's slot counts too; none reachable: this Mac at once. There: mkdir -m 700
+/tmp/pa-suite-<run>, a `git bundle` of HEAD (exactly the pinned commit; at most 6 MB base64) by `hc file write`, one
+`hc exec` that clones it, checks out the commit and prints its commit and tree (both must equal the pins), then an hc
+terminal (`hc run --bg --rm`) running `tests/run-all.sh --except-integration` with its own HERDR_PA_HOME, TMPDIR,
+XDG folders, HOME and an `hc` that refuses (no test there reaches an hc core). Here, at the same time, under the
+machine's slot (not this Mac's): `tests/run-all.sh --only-integration`. Every PA_SUITE_REMOTE_POLL (5) s the output
+and the remote progress are copied back (--status says `on <machine>`); PA_SUITE_LOST_GRACE (300) s without a good
+read ends the run with 124. The exit is the remote one if it failed, else the local one; the output, build.log and
+the record (machine, os, tools, places, note; each part with its place) say where. Then the terminal is ended and
+the folder removed (`rm -rf -- /tmp/pa-suite-<run>`, the run id checked); TERM, INT or HUP does the same and exits
+143, 130 or 129, with no record. A setup failure runs on this Mac in the same call (exit 2 with --on). Part medians
+and limits use only times of the same place. Every hc call is an argv list built from fixed text, the checked
+machine name, run id and pins, and the probe's tool paths.
 """
 import argparse
+import base64
 import calendar
 import datetime
 import fcntl
 import glob
 import json
 import os
+import platform
 import re
+import shutil
 import signal
 import statistics
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -67,6 +96,20 @@ WAIT_CALL = 540  # --wait's default: under a 600 s tool-call limit, so a worker'
 STILL_RUNNING = 75  # --wait's exit when the run goes on past its timeout
 KEEP_DONE = 7 * 86400  # progress files of runs that ended are pruned after this
 MODULE = re.compile(r"^test_[A-Za-z0-9_]+$")
+# t-089: the remote mode (see the top)
+MACHINE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+RUN_ID = re.compile(r"^[0-9a-f]{12}$")
+SHA = re.compile(r"^[0-9a-f]{40}$")
+TOOL_PATH = re.compile(r"^/[A-Za-z0-9._/+-]+$")
+MACHINE_CAP = 32  # a machine's cap at most (a 32-core machine); more is used as this
+PREFER_WAIT = 300  # PA_SUITE_PREFER_WAIT: waiting this long for a busy machine, this Mac's slot is taken too
+REMOTE_POLL = 5  # PA_SUITE_REMOTE_POLL: how often a remote run's output and progress are copied back
+LOST_GRACE = 300  # PA_SUITE_LOST_GRACE: no good read from the machine for this long ends the run (124)
+REMOTE_TIMEOUT = 3600  # as a local run's own timeout
+BUNDLE_MAX = 6 * 1024 * 1024  # base64 bytes; hc reads at most 8 MB
+REMOTE_COMMAND = "sh tests/run-all.sh"  # the only command that goes to a machine (R6)
+TOOLS = ("git", "python3", "node", "sh")
+SIGNAL_EXIT = {signal.SIGTERM: 143, signal.SIGINT: 130, signal.SIGHUP: 129}
 
 
 class Waited(Exception):
@@ -127,23 +170,10 @@ def acquire(limit_slots, info, poll=POLL, limit=WAIT_LIMIT, say=print, who="pa-f
     waits and for whom, and again when the holders change. Raises Waited after `limit` seconds, or as soon as
     gone() (when given) says the caller it waits for has gone. beat(holders text), when given, on every poll."""
     folder = slot_dir()
-    os.makedirs(folder, exist_ok=True)
     began, shown = time.time(), None
     while True:
-        holders = []
-        for i in range(limit_slots):
-            path = os.path.join(folder, "slot-{}".format(i))
-            f = open(path, "a+")
-            try:
-                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except OSError:
-                f.close()
-                holders.append(holder_of(path))
-                continue
-            f.seek(0)
-            f.truncate()
-            f.write(json.dumps(dict(info, pid=os.getpid(), start=stamp())))
-            f.flush()
+        f, holders = try_slot(folder, limit_slots, info)
+        if f:
             return f
         text = describe(holders)
         if text != shown:
@@ -157,6 +187,49 @@ def acquire(limit_slots, info, poll=POLL, limit=WAIT_LIMIT, say=print, who="pa-f
         if reason:
             raise Waited("{}: stopped waiting for the suite slot after {:.0f} s: {}".format(who, time.time() - began, reason))
         time.sleep(poll)
+
+
+def try_slot(folder, limit_slots, info):
+    """One pass over the slots of folder: (an open file holding a free slot's flock, []) or (None, its holders)."""
+    os.makedirs(folder, exist_ok=True)
+    holders = []
+    for i in range(limit_slots):
+        path = os.path.join(folder, "slot-{}".format(i))
+        f = open(path, "a+")
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            f.close()
+            holders.append(holder_of(path))
+            continue
+        f.seek(0)
+        f.truncate()
+        f.write(json.dumps(dict(info, pid=os.getpid(), start=stamp())))
+        f.flush()
+        return f, []
+    return None, holders
+
+
+def peek(folder, limit_slots):
+    """The holders of folder's slots now, taking none."""
+    holders = []
+    for i in range(limit_slots):
+        path = os.path.join(folder, "slot-{}".format(i))
+        if not os.path.exists(path):
+            continue
+        with open(path, "a+") as f:
+            try:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                holders.append(holder_of(path))
+                continue
+            fcntl.flock(f, fcntl.LOCK_UN)
+    return holders
+
+
+def machine_dir(machine):
+    """A machine's slots (t-089): local flocks under suite-slots/<machine>/, held by the local pa-full-suite."""
+    return os.path.join(slot_dir(), machine)
 
 
 def release(f):
@@ -188,7 +261,10 @@ def held_by_caller(path, chain=None):
     chain: ancestors(), when the caller has it already."""
     if not path or not os.path.basename(path).startswith("slot-"):
         return None
-    if os.path.dirname(os.path.realpath(path)) != os.path.realpath(slot_dir()) or not os.path.isfile(path):
+    folder, base = os.path.dirname(os.path.realpath(path)), os.path.realpath(slot_dir())
+    if folder != base and not (os.path.dirname(folder) == base and MACHINE.match(os.path.basename(folder))):
+        return None  # a machine's slots (t-089) are this home's too: suite-slots/<machine>/slot-<i>
+    if not os.path.isfile(path):
         return None
     try:
         f = open(path, "a+")
@@ -383,13 +459,16 @@ def record_rows(start):
     return rows
 
 
-def median_total(rows, command=None, full=False):
+def median_total(rows, command=None, full=False, place=None):
     """The median seconds of the recorded runs (each run once): those of command, or (full) every run with parts
-    that ran no single module. (median, runs), or (None, 0)."""
+    that ran no single module. place (t-089): only runs of that place (a record without `machine` is `local`).
+    (median, runs), or (None, 0)."""
     seen, times = set(), []
     for i, r in enumerate(rows):
         key = r.get("run") or i
         if key in seen or not isinstance(r.get("seconds"), (int, float)):
+            continue
+        if place is not None and (r.get("machine") or "local") != place:
             continue
         if (command is not None and r.get("command") == command) or (full and r.get("parts") and not r.get("module")):
             seen.add(key)
@@ -515,7 +594,7 @@ def run_under_slot(argv):
     run = uuid.uuid4().hex[:12]
     if own:
         rows = record_rows(args.dir)
-        total, runs = median_total(rows, full=True) if args.what == "tests/run-all.sh" else (None, 0)
+        total, runs = median_total(rows, full=True, place="local") if args.what == "tests/run-all.sh" else (None, 0)
         progress = new_progress({"run": run, "kind": "run-all.sh", "what": args.what, "task": task_of(args.dir),
                                  "worker": args.worker or None, "dir": os.path.realpath(args.dir),
                                  "commit": head_commit(args.dir), "pid": os.getpid(), "state": "waiting",
@@ -549,7 +628,7 @@ def run_under_slot(argv):
     env = dict(os.environ, PA_SUITE_SLOT=path, PA_SUITE_SLOT_PID=str(os.getpid()), PA_SUITE_HOLD=hold,
                PA_SUITE_WATCH=watch)
     env.pop("PA_SUITE_PROGRESS", None)
-    medians = {p["name"]: p["median"] for p in report(record_rows(args.dir))}
+    medians = {p["name"]: p["median"] for p in report(record_rows(args.dir), place="local")}
     watcher = Watcher(progress, watch, medians, floor_limit()) if progress else None
     if watcher:
         watcher.start()
@@ -653,8 +732,9 @@ def last(rows, commit=None, tree=None):
     return None
 
 
-def report(rows):
-    """Each part seen over the recorded runs (a run's several repo lines count once): last and median seconds."""
+def report(rows, place=None):
+    """Each part seen over the recorded runs (a run's several repo lines count once): last and median seconds.
+    place (t-089): only parts that ran there (a part's `place`, else its record's `machine`, else `local`)."""
     seen, times = set(), {}
     for i, r in enumerate(rows):
         if not r.get("parts"):
@@ -664,6 +744,8 @@ def report(rows):
             continue
         seen.add(key)
         for p in r["parts"]:
+            if place is not None and (p.get("place") or r.get("machine") or "local") != place:
+                continue
             times.setdefault(p["name"], []).append(p["seconds"])
     out = [{"name": n, "last": t[-1], "median": statistics.median(t), "runs": len(t)} for n, t in times.items()]
     return sorted(out, key=lambda p: (-p["median"], p["name"]))
@@ -738,7 +820,9 @@ def gone(row):
 def status_line(row, rows=None, now=None):
     """One line on a run, from its progress file: waiting, running or done (or gone without a result)."""
     now = time.time() if now is None else now
-    who = "[run {}: {}, task {}, {}]".format(row.get("run"), row.get("kind") or "run", row.get("task"), row.get("dir"))
+    place = row.get("place")  # t-089: only rows of a run that had machines to choose from carry it
+    who = "[run {}: {}, task {}, {}{}]".format(row.get("run"), row.get("kind") or "run", row.get("task"), row.get("dir"),
+                                            "" if not place else ", local" if place == "local" else ", on " + place)
     state = row.get("state")
     if gone(row):
         return "pa-full-suite: ended without a result (pid {} gone; it was {} since {}) {}".format(
@@ -879,6 +963,426 @@ def run_to_file(command, cwd, output, timeout, env, beat):
         return code, ""
 
 
+# ---- t-089: the remote mode (see the top). Every hc call is an argv list; no local shell. ----
+
+class SetupFailed(Exception):
+    pass
+
+
+class Interrupted(Exception):
+    def __init__(self, code):
+        Exception.__init__(self, code)
+        self.code = code
+
+
+def env_seconds(name, default):
+    try:
+        value = float(os.environ.get(name, ""))
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+def machines(cfg):
+    """The configured machines of config.json's suiteMachines, in order: ([{machine, cap}], notes on bad entries)."""
+    value = (cfg or {}).get("suiteMachines")
+    if value is None or value == []:
+        return [], []
+    if not isinstance(value, list):
+        return [], ["suiteMachines ignored: not a list of {\"machine\": <hc machine name>, \"cap\": <1..32>}"]
+    good, bad, seen = [], [], set()
+    for i, entry in enumerate(value, 1):
+        if not isinstance(entry, dict):
+            bad.append("entry {} ignored: {!r} is not an object {{\"machine\": ..., \"cap\": ...}}".format(i, entry))
+            continue
+        name, cap_value = entry.get("machine"), entry.get("cap", 1)
+        if not isinstance(name, str) or not MACHINE.match(name):
+            bad.append("entry {} ignored: machine {!r} is not a machine name (A-Z a-z 0-9 . _ -, 1-64)".format(i, name))
+            continue
+        if isinstance(cap_value, bool) or not isinstance(cap_value, int) or cap_value < 1:
+            bad.append("entry {} ({}) ignored: cap {!r} is not a whole number 1..{}".format(i, name, cap_value, MACHINE_CAP))
+            continue
+        if name in seen:
+            bad.append("entry {} ({}) ignored: named twice".format(i, name))
+            continue
+        if cap_value > MACHINE_CAP:
+            bad.append("entry {} ({}): cap {} used as {} (at most {})".format(i, name, cap_value, MACHINE_CAP, MACHINE_CAP))
+            cap_value = MACHINE_CAP
+        seen.add(name)
+        good.append({"machine": name, "cap": cap_value})
+    return good, bad
+
+
+def hc(argv, timeout=120, stdin=None):
+    """(exit, stdout, stderr) of one hc call."""
+    feed = {"input": stdin} if stdin is not None else {"stdin": subprocess.DEVNULL}
+    try:
+        r = subprocess.run(["hc"] + argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True,
+                           timeout=timeout, **feed)
+    except subprocess.TimeoutExpired:
+        return 124, "", "hc {} timed out after {} s".format(argv[0] if argv else "", timeout)
+    except OSError as e:
+        return 127, "", "hc not found ({})".format(e)
+    return r.returncode, r.stdout, r.stderr
+
+
+def first_line(text, default=""):
+    lines = [l.strip() for l in (text or "").splitlines() if l.strip()]
+    return lines[0][:200] if lines else default
+
+
+PROBE = r"""uname -s; uname -m
+for t in git python3 node sh; do
+  p=$(command -v "$t") || { echo "missing $t"; continue; }
+  case $t in
+    git) v=$("$p" --version 2>&1) ;;
+    python3) v=$("$p" -c 'import sys; print("%d.%d.%d" % sys.version_info[:3]); sys.exit(0 if sys.version_info >= (3, 7) else 3)' 2>&1) || { echo "missing python3 (3.7 or later; $p is $v)"; continue; } ;;
+    node) v=$("$p" --version 2>&1) ;;
+    sh) v=- ;;
+  esac
+  echo "tool $t $p $v"
+done
+"""
+
+
+def probe(machine):
+    """R2: is machine reachable, with the four tools? {ok, reason, os, arch, tools, seconds}. Writes nothing there."""
+    began = time.time()
+    code, out, err = hc(["exec", "--on", machine, "--timeout", "30", "--", "sh", "-c", PROBE], timeout=60)
+    found = {"ok": False, "seconds": round(time.time() - began, 1), "os": None, "arch": None, "tools": {}}
+    if code:
+        found["reason"] = first_line(err, "hc exec exited {}".format(code))
+        return found
+    lines = out.splitlines()
+    missing = []
+    for line in lines[2:]:
+        bits = line.split(" ", 3)
+        if bits[0] == "tool" and len(bits) == 4 and bits[1] in TOOLS and TOOL_PATH.match(bits[2]):
+            found["tools"][bits[1]] = {"path": bits[2], "version": bits[3].strip()}
+        elif line.startswith("missing "):
+            missing.append(line[len("missing "):])
+    missing += [t for t in TOOLS if t not in found["tools"] and not any(m.startswith(t) for m in missing)]
+    found["os"], found["arch"] = (lines[0].strip() if lines else None), (lines[1].strip() if len(lines) > 1 else None)
+    if missing or not found["os"]:
+        found["reason"] = "missing " + ", ".join(missing) if missing else "no answer from uname"
+        return found
+    found["ok"] = True
+    return found
+
+
+def remote_ok(command, found, module):
+    """R6: None when this run may go to a machine, else why it stays on this Mac."""
+    if module:
+        return "--module runs on this Mac"
+    if command != REMOTE_COMMAND:
+        return "the full command is `{}`, not `{}`".format(command, REMOTE_COMMAND)
+    if len(found) != 1 or not found[0].get("commit") or not found[0].get("tree"):
+        return "the worktree is not one git repository with a commit"
+    if found[0].get("untracked"):
+        return "the worktree has {} untracked file(s); only committed state travels".format(found[0]["untracked"])
+    if found[0].get("uncommitted"):
+        return "the worktree has {} uncommitted file(s); only committed state travels".format(found[0]["uncommitted"])
+    if not clean(found[0]):
+        return "the worktree's state could not be read"
+    return None
+
+
+def folder_of(run):
+    if not RUN_ID.match(run or ""):
+        raise SetupFailed("bad run id {!r}".format(run))
+    return "/tmp/pa-suite-" + run
+
+
+def ship(h, machine, run, pin, tools, root):
+    """R7, R8: the run folder there, the bundle of the pinned commit, the clone checked out and its ids checked."""
+    folder = folder_of(run)
+    commit, tree = pin.get("commit") or "", pin.get("tree") or ""
+    if not SHA.match(commit) or not SHA.match(tree):
+        raise SetupFailed("bad pins {!r} {!r}".format(commit, tree))
+    for t in TOOLS:
+        if not TOOL_PATH.match((tools.get(t) or {}).get("path") or ""):
+            raise SetupFailed("bad {} path from the probe".format(t))
+    code, _, err = hc(["exec", "--on", machine, "--timeout", "60", "--", "mkdir", "-m", "700", folder])
+    if code:
+        raise SetupFailed("mkdir {}: {}".format(folder, first_line(err, "exit {}".format(code))))
+    scratch = tempfile.mkdtemp(prefix="pa-suite-bundle-")
+    try:
+        bundle = os.path.join(scratch, "b.bundle")
+        code, _, err = h.git(root, "bundle", "create", "-q", bundle, "HEAD")
+        if code:
+            raise SetupFailed("git bundle create: " + first_line(err, "exit {}".format(code)))
+        code, heads, err = h.git(root, "bundle", "list-heads", bundle)
+        if code or heads.split() != [commit, "HEAD"]:
+            raise SetupFailed("the bundle's heads are {!r}, not the pinned commit {} (HEAD moved?)".format(heads, commit))
+        with open(bundle, "rb") as f:
+            data = base64.b64encode(f.read()).decode("ascii")
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    if len(data) > BUNDLE_MAX:
+        raise SetupFailed("bundle too large ({} bytes base64, at most {})".format(len(data), BUNDLE_MAX))
+    code, _, err = hc(["file", "write", "--on", machine, folder + "/b.b64"], stdin=data)
+    if code:
+        raise SetupFailed("hc file write: " + first_line(err, "exit {}".format(code)))
+    py, git, sh_path = tools["python3"]["path"], tools["git"]["path"], tools["sh"]["path"]
+    script = "\n".join([
+        "set -e",
+        "cd {}".format(folder),
+        "{} -c 'import base64, sys; open(sys.argv[2], \"wb\").write(base64.b64decode(open(sys.argv[1]).read()))' b.b64 b.bundle".format(py),
+        "rm -f b.b64",
+        "{} clone -q --no-checkout b.bundle w".format(git),
+        "{} -C w checkout -q --detach {}".format(git, commit),
+        "mkdir -m 700 bin home tmp xdg npm u",
+        "printf '%s\\n' '#!{}' 'echo \"hc is not available in a remote suite run\" >&2' 'exit 2' > bin/hc".format(sh_path),
+        "chmod 755 bin/hc",
+        "{} -C w rev-parse HEAD 'HEAD^{{tree}}'".format(git), ""])
+    code, out, err = hc(["exec", "--on", machine, "--timeout", "300", "--", "sh", "-c", script], timeout=360)
+    if code:
+        raise SetupFailed("setup: " + first_line(err or out, "exit {}".format(code)))
+    got = out.split()[-2:]
+    if got != [commit, tree]:
+        raise SetupFailed("the checkout there is commit/tree {}, not {} {}".format(" ".join(got) or "nothing", commit, tree))
+    return folder
+
+
+def run_script(folder, tools):
+    """R10, R11: the remote terminal's fixed script."""
+    dirs = []
+    for t in TOOLS:
+        d = os.path.dirname(tools[t]["path"])
+        if d not in dirs:
+            dirs.append(d)
+    return "\n".join([
+        "date +%s > ../t0",
+        "unset HC_TERMINAL_ID HC_SOCKET HC_TERMINAL_SOCKET HC_SCOPE CLAUDECODE",
+        "export HERDR_PA_HOME={0}/home TMPDIR={0}/tmp XDG_CACHE_HOME={0}/xdg/cache XDG_CONFIG_HOME={0}/xdg/config "
+        "XDG_DATA_HOME={0}/xdg/data XDG_STATE_HOME={0}/xdg/state PYTHONDONTWRITEBYTECODE=1 npm_config_cache={0}/npm "
+        "PA_CHANGED_FILES= NODE={1} HOME={0}/u".format(folder, tools["node"]["path"]),
+        "export PATH={}/bin:{}:$PATH".format(folder, ":".join(dirs)),
+        "sh tests/run-all.sh --except-integration > ../out 2>&1",
+        "echo $? > ../code.new && mv ../code.new ../code",
+        "date +%s > ../t1", ""])
+
+
+def start_remote(machine, run, folder, tools):
+    code, out, err = hc(["run", "--bg", "--rm", "--no-notify", "--json", "--on", machine, "--name", "pa-suite-" + run,
+                         "--label", "pa.suite=" + run, "--cwd", folder + "/w", "--", "sh", "-c", run_script(folder, tools)])
+    if code:
+        raise SetupFailed("hc run: " + first_line(err, "exit {}".format(code)))
+    try:
+        answer = json.loads(out)
+    except ValueError:
+        answer = {}
+    address = (answer.get("address") or answer.get("id")) if isinstance(answer, dict) else None
+    return address if isinstance(address, str) and address else "{}/pa-suite-{}".format(machine, run)
+
+
+STATUS = """cd {0} || exit 3
+if [ -f code ]; then printf 'code %s\\n' "$(cat code)"; fi
+if [ -f out ]; then printf 'lines %s\\n' "$(wc -l < out)"; fi
+for f in home/suite-runs/*.json; do if [ -f "$f" ]; then printf 'progress '; cat "$f"; echo; fi; done
+"""
+
+
+def remote_status(machine, folder):
+    """One exec: (ok, code or None, remote line count or None, the remote run-all's progress row or {})."""
+    code, out, _ = hc(["exec", "--on", machine, "--timeout", "30", "--", "sh", "-c", STATUS.format(folder)], timeout=60)
+    if code:
+        return False, None, None, {}
+    rc = lines = None
+    progress = {}
+    for line in out.splitlines():
+        if line.startswith("code ") and line[5:].strip().lstrip("-").isdigit():
+            rc = int(line[5:].strip())
+        elif line.startswith("lines ") and line[6:].strip().isdigit():
+            lines = int(line[6:].strip())
+        elif line.startswith("progress "):
+            try:
+                row = json.loads(line[len("progress "):])
+            except ValueError:
+                continue
+            if isinstance(row, dict) and isinstance(row.get("parts"), dict):
+                progress = row
+    return True, rc, lines, progress
+
+
+def merge_parts(*rows):
+    total = {"total": 0, "done": 0, "running": [], "failed": [], "hung": []}
+    for parts in rows:
+        parts = parts or {}
+        for key in ("total", "done"):
+            total[key] += parts.get(key) or 0
+        for key in ("running", "failed", "hung"):
+            total[key] += parts.get(key) or []
+    return total
+
+
+class RemoteWatcher(threading.Thread):
+    """R15, R17: copies a remote run's output (whole lines) and progress back while it runs; ends when its code
+    is there, after REMOTE_TIMEOUT, or after LOST_GRACE s with no good read."""
+
+    def __init__(self, machine, folder, output, progress, side):
+        threading.Thread.__init__(self, daemon=True)
+        self.machine, self.folder, self.output, self.progress, self.side = machine, folder, output, progress, side
+        self.poll, self.grace = env_seconds("PA_SUITE_REMOTE_POLL", REMOTE_POLL), env_seconds("PA_SUITE_LOST_GRACE", LOST_GRACE)
+        self.lines, self.code, self.remote_lines, self.lost, self.timed_out = 0, None, None, None, False
+        self.began = self.last_ok = time.time()
+        self.stopping, self.ended = threading.Event(), threading.Event()
+        open(output, "w").close()
+
+    def run(self):
+        try:
+            while not self.stopping.is_set():
+                try:
+                    self.tick()
+                except Exception:  # a view: a bad read counts as no read
+                    pass
+                now = time.time()
+                if self.code is not None:
+                    break
+                if now - self.last_ok > self.grace:
+                    self.lost = now - self.last_ok
+                    break
+                if now - self.began > REMOTE_TIMEOUT:
+                    self.timed_out = True
+                    break
+                self.stopping.wait(self.poll)
+        finally:
+            self.ended.set()
+
+    def tick(self):
+        code, out, _ = hc(["file", "read", "--on", self.machine, self.folder + "/out", "--offset", str(self.lines + 1)])
+        if not code and out:
+            whole = out[:out.rfind("\n") + 1]
+            if whole:
+                with open(self.output, "a") as f:
+                    f.write(whole)
+                self.lines += whole.count("\n")
+        ok, rc, lines, row = remote_status(self.machine, self.folder)
+        if not ok:
+            return
+        self.last_ok = time.time()
+        self.remote_lines = lines
+        local = read_progress(self.side).get("parts") if self.side else None
+        update_progress(self.progress, parts=merge_parts(row.get("parts"), local))
+        if rc is not None:
+            self.code = rc
+
+    def stop(self):
+        self.stopping.set()
+        self.join(30)
+
+    def final(self):
+        """The remote output whole, replacing the copy (checked against the remote line count): a note, or None."""
+        code, out, err = hc(["file", "read", "--on", self.machine, self.folder + "/out"])
+        if code:
+            return "the last read of the remote output failed ({}); the output has the {} lines copied before".format(
+                first_line(err, "exit {}".format(code)), self.lines)
+        with open(self.output, "w") as f:
+            f.write(out if not out or out.endswith("\n") else out + "\n")
+        got = out.count("\n") + (1 if out and not out.endswith("\n") else 0)
+        if self.remote_lines is not None and got < self.remote_lines:
+            return "copied {} lines of the remote output, the machine counted {}".format(got, self.remote_lines)
+        return None
+
+
+def terminals_of(run):
+    """The hc terminals labelled pa.suite=<run>: ([rows], error or None)."""
+    code, out, err = hc(["ls", "--all", "--json", "--label", "pa.suite=" + run])
+    if code:
+        return [], first_line(err, "exit {}".format(code))
+    try:
+        rows = json.loads(out).get("terminals") or []
+    except (ValueError, AttributeError):
+        return [], "hc ls answered no JSON"
+    return [r for r in rows if isinstance(r, dict) and (r.get("labels") or {}).get("pa.suite") == run], None
+
+
+def cleanup(machine, run, terminal=None):
+    """R16: the run's terminal ended and removed, its folder there removed (a literal path). Notes on failures."""
+    if not RUN_ID.match(run or "") or not MACHINE.match(machine or ""):
+        return ["not cleaned: bad machine or run id"]
+    notes = []
+    rows, error = terminals_of(run)
+    if error:
+        notes.append("hc ls: " + error)
+        if terminal:
+            rows = [{"address": terminal, "state": "running"}]
+    for row in rows:
+        address = row.get("address") or row.get("id") or terminal
+        if not isinstance(address, str):
+            continue
+        if row.get("state") in ("finished", "exited", "done", "lost"):
+            code, _, err = hc(["rm", address])
+            if code:
+                notes.append("hc rm {}: {}".format(address, first_line(err, "exit {}".format(code))))
+        else:
+            code, _, err = hc(["kill", address])
+            if code:
+                notes.append("hc kill {}: {}".format(address, first_line(err, "exit {}".format(code))))
+    code, _, err = hc(["exec", "--on", machine, "--timeout", "60", "--", "rm", "-rf", "--", "/tmp/pa-suite-" + run])
+    if code:
+        notes.append("rm -rf /tmp/pa-suite-{} on {}: {}".format(run, machine, first_line(err, "exit {}".format(code))))
+    return notes
+
+
+def sweep(machine, current):
+    """R18: the leftovers of this Mac's earlier remote runs on machine (done or gone, not cleaned): cleaned."""
+    notes = []
+    for row in all_progress():
+        run = row.get("run")
+        if run == current or row.get("machine") != machine or not isinstance(row.get("remote"), dict) or row.get("cleaned"):
+            continue
+        if not RUN_ID.match(run or "") or not (row.get("state") == "done" or gone(row)):
+            continue
+        left = cleanup(machine, run, (row.get("remote") or {}).get("terminal"))
+        if not [n for n in left if n.startswith("rm -rf")]:
+            update_progress(os.path.join(runs_dir(), run + ".json"), cleaned=True)
+        notes += left
+    return notes
+
+
+def stop_group(child):
+    """TERM to a child's process group, KILL after STOP_GRACE; its exit code."""
+    if child.poll() is None:
+        try:
+            os.killpg(child.pid, signal.SIGTERM)
+        except OSError:
+            pass
+        try:
+            child.wait(STOP_GRACE)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(child.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            child.wait()
+    return 128 - child.returncode if child.returncode < 0 else child.returncode
+
+
+def mac_os():
+    return platform.system() or "local"
+
+
+def cmd_places(h, args):
+    """R25: each configured machine (reachable or why not, cap, holders) and this Mac's slot."""
+    good, bad = machines(pa.config())
+    where = os.path.join(home(), "config.json")
+    for note in bad:
+        print("pa-full-suite: suiteMachines in {}: {}".format(where, note))
+    if not good:
+        print("pa-full-suite: no suiteMachines in {}: every run is on this Mac".format(where))
+    for m in good:
+        found = probe(m["machine"])
+        state = ("reachable ({} {}, in {:g}s; {})".format(found["os"], found["arch"], found["seconds"], ", ".join(
+            "{} {}".format(t, found["tools"][t]["version"]) for t in ("git", "python3", "node")))
+                 if found["ok"] else "not reachable ({})".format(found.get("reason")))
+        holders = peek(machine_dir(m["machine"]), m["cap"])
+        print("{}: {}, cap {}, holders: {}".format(m["machine"], state, m["cap"], describe(holders) if holders else "none"))
+    holders = peek(slot_dir(), cap())
+    print("this Mac: cap {}, holders: {}".format(cap(), describe(holders) if holders else "none"))
+    return 0
+
+
 def full_suite(h, args):
     if getattr(args, "last", False):
         return sys.exit(cmd_last(h, args))
@@ -888,6 +1392,12 @@ def full_suite(h, args):
         return sys.exit(cmd_status(h, args))
     if getattr(args, "wait", False):
         return sys.exit(cmd_wait(h, args))
+    if getattr(args, "places", False):
+        return sys.exit(cmd_places(h, args))
+    on, local = getattr(args, "on", None), getattr(args, "local", False)
+    if on and local:
+        print("pa-full-suite: --on and --local name two places; give one")
+        return sys.exit(2)
     record = h.find_task(os.getcwd())
     if not record:
         raise pa.Problem("run pa-full-suite inside a task's worktree (pa-hooks install marks it)")
@@ -909,6 +1419,11 @@ def full_suite(h, args):
     where = suites_path(h, directory)
     found = pins(h, record["root"])  # for the check before queueing only: pinned again once the slot is taken
 
+    def log(line):  # a line to the output and build.log (the place lines, t-089)
+        print(line, flush=True)
+        with open(build_log, "a") as f:
+            f.write("=== {} full suite: {}\n".format(pa.now(), line))
+
     def reuse():
         if getattr(args, "again", False):
             return False
@@ -925,18 +1440,68 @@ def full_suite(h, args):
 
     if reuse():
         return sys.exit(0)
-    # t-076: the output file, named first, and the progress file that --status and --wait read.
     run = uuid.uuid4().hex[:12]
     output = os.path.join(evidence, "full-suite-{}.out".format(run))
-    print("pa-full-suite: run {}: output in {} (pa-full-suite --status shows it; pa-full-suite --wait waits for it)".format(
-        run, output), flush=True)
+    # t-089: the places. No suiteMachines (or --local): this Mac, today's path and lines exactly.
+    good, bad = ([], []) if local else machines(pa.config())
+    config_path = os.path.join(home(), "config.json")
+    remote_mode = bool(on or good)
+    note, chosen, probes, reachable = None, None, {}, []
+    for b in bad:  # named once, even when no entry is left (then the run is today's)
+        log("pa-full-suite: suiteMachines in {}: {}".format(config_path, b))
+    if remote_mode:
+        why = remote_ok(command, found, module)
+        if on and not [m for m in good if m["machine"] == on]:
+            print("pa-full-suite: --on {}: not a machine of suiteMachines in {}".format(on, config_path))
+            return sys.exit(2)
+        if why:
+            if on:
+                print("pa-full-suite: --on {}: {}".format(on, why))
+                return sys.exit(2)
+            note = why
+        else:
+            for m in good:
+                if on and m["machine"] != on:
+                    continue
+                probes[m["machine"]] = probe(m["machine"])
+                if probes[m["machine"]]["ok"]:
+                    reachable.append(m)
+                else:
+                    log("pa-full-suite: {} is not reachable: {}".format(m["machine"], probes[m["machine"]].get("reason")))
+            if not reachable:
+                why = "; ".join("{}: {}".format(k, v.get("reason")) for k, v in probes.items())
+                if on:
+                    print("pa-full-suite: --on {}: not reachable ({})".format(on, why))
+                    return sys.exit(2)
+                note = "no machine reachable: " + why
+    info = {"task": record.get("task"), "worker": os.environ.get("HC_TERMINAL_ID") or None,
+            "tree": found[0].get("tree") if found else None}
+    slot = None
+    for m in reachable:  # a free slot at once: the first configured machine that has one
+        slot, _ = try_slot(machine_dir(m["machine"]), m["cap"], info)
+        if slot:
+            chosen = m
+            break
+    tail_text = "output in {} (pa-full-suite --status shows it; pa-full-suite --wait waits for it)".format(output)
+    if not remote_mode:
+        print("pa-full-suite: run {}: {}".format(run, tail_text), flush=True)
+    elif reachable:
+        m = chosen or reachable[0]
+        p = probes[m["machine"]]
+        log("pa-full-suite: run {} on {} ({}; reachable in {:g}s{}): {}".format(
+            run, m["machine"], p["os"], p["seconds"], "" if chosen else "; waiting for a slot", tail_text))
+    else:
+        log("pa-full-suite: run {} on this Mac ({}): {}".format(run, note, tail_text))
     rows = read_lines(where)
-    total, runs = median_total(rows, command=command)
-    progress = new_progress({"run": run, "kind": "pa-full-suite", "what": command, "task": record.get("task"),
-                             "worker": os.environ.get("HC_TERMINAL_ID") or None, "dir": os.path.realpath(record["root"]),
-                             "commit": found[0].get("commit") if found else None, "tree": found[0].get("tree") if found else None,
-                             "pid": os.getpid(), "state": "waiting", "queued": pa.now(), "output": output, "record": where,
-                             "median_total": total, "median_runs": runs, "module": module})
+    total, runs = median_total(rows, command=command, place="local" if remote_mode else None)
+    first = {"run": run, "kind": "pa-full-suite", "what": command, "task": record.get("task"),
+             "worker": os.environ.get("HC_TERMINAL_ID") or None, "dir": os.path.realpath(record["root"]),
+             "commit": found[0].get("commit") if found else None, "tree": found[0].get("tree") if found else None,
+             "pid": os.getpid(), "state": "waiting", "queued": pa.now(), "output": output, "record": where,
+             "median_total": total, "median_runs": runs, "module": module}
+    if remote_mode:
+        first["place"] = "local"
+    progress = new_progress(first)
     beaten = {"at": time.time()}
 
     def pulse(text=None):  # the heartbeat: the status line every HEARTBEAT seconds, the holders when they change
@@ -949,14 +1514,73 @@ def full_suite(h, args):
             if row:
                 print(status_line(row), flush=True)
     queued = time.time()
-    try:
-        slot = acquire(cap(), {"task": record.get("task"), "worker": os.environ.get("HC_TERMINAL_ID") or None,
-                               "tree": found[0].get("tree") if found else None},
-                       say=lambda m: print(m, flush=True), beat=pulse)
-    except Waited as e:
-        print(e)
-        update_progress(progress, state="done", exit=124, end=pa.now(), note=str(e))
-        return sys.exit(124)
+    if reachable and not slot:
+        try:
+            chosen, slot, why = wait_for_machine(reachable, info, not on, pulse)
+        except Waited as e:
+            print(e)
+            update_progress(progress, state="done", exit=124, end=pa.now(), note=str(e))
+            return sys.exit(124)
+        if why:
+            note = why
+            log("pa-full-suite: run {} now on this Mac ({})".format(run, why))
+    if chosen:
+        m = chosen["machine"]
+        try:
+            code = run_remote(h, args, record, directory, command, evidence, build_log, where, run, output, progress,
+                              slot, m, probes[m], queued, pulse, reuse, log)
+        except SetupFailed as e:  # before anything ran there: this Mac in the same call (exit 2 with --on)
+            release(slot)
+            note = "setup on {} failed: {}".format(m, e)
+            if on:
+                print("pa-full-suite: --on {}: {}".format(on, note))
+                update_progress(progress, state="done", exit=2, end=pa.now(), note=note)
+                return sys.exit(2)
+            log("pa-full-suite: run {} now on this Mac ({})".format(run, note))
+            update_progress(progress, place="local", machine=None, remote=None)
+            slot = None
+        else:
+            return sys.exit(code)
+    if slot is None:
+        try:
+            slot = acquire(cap(), info, say=lambda m: print(m, flush=True), beat=pulse)
+        except Waited as e:
+            print(e)
+            update_progress(progress, state="done", exit=124, end=pa.now(), note=str(e))
+            return sys.exit(124)
+    return sys.exit(run_on_mac(h, record, directory, command, module, build_log, where, run, output, progress, slot,
+                               queued, pulse, reuse, note))
+
+
+def wait_for_machine(reachable, info, mac_too, pulse):
+    """R3: waits for a slot on any reachable machine; after PREFER_WAIT s (when mac_too) this Mac's slot counts too,
+    whichever frees first. (machine or None, slot, why this Mac or None)."""
+    began, shown = time.time(), None
+    prefer = env_seconds("PA_SUITE_PREFER_WAIT", PREFER_WAIT)
+    while True:
+        texts = []
+        for m in reachable:
+            f, holders = try_slot(machine_dir(m["machine"]), m["cap"], info)
+            if f:
+                return m, f, None
+            texts.append("{} (cap {}): {}".format(m["machine"], m["cap"], describe(holders)))
+        text = "; ".join(texts)
+        if mac_too and time.time() - began >= prefer:
+            f, _ = try_slot(slot_dir(), cap(), info)
+            if f:
+                return None, f, "every machine busy for {:.0f} s: {}".format(time.time() - began, text)
+        if text != shown:
+            print("pa-full-suite: waiting for a slot on {}".format(text), flush=True)
+            shown = text
+        if time.time() - began >= WAIT_LIMIT:
+            raise Waited("pa-full-suite: no slot came free in {:.0f} s (running: {})".format(time.time() - began, text))
+        pulse(text)
+        time.sleep(POLL)
+
+
+def run_on_mac(h, record, directory, command, module, build_log, where, run, output, progress, slot, queued, pulse,
+               reuse, note=None):
+    """The run on this Mac under slot (today's path); its exit code. note: why it is here (t-089), for the record."""
     marker = os.environ.get("PA_SUITE_SLOT")
     os.environ["PA_SUITE_SLOT"] = slot.name  # tests/run-all.sh under this run sees its caller holds the slot (t-072)
     try:
@@ -964,7 +1588,7 @@ def full_suite(h, args):
         found = pins(h, record["root"])  # MF-1: what runs is the tree at this point, not the one before the wait
         if reuse():  # a run of the same tree may have passed while this one waited
             update_progress(progress, state="done", exit=0, end=pa.now(), note="not run: this tree passed while it waited")
-            return sys.exit(0)
+            return 0
         start, load, began = pa.now(), load_now(), time.time()
         update_progress(progress, state="running", start=start, commit=found[0].get("commit") if found else None,
                         tree=found[0].get("tree") if found else None)
@@ -985,6 +1609,8 @@ def full_suite(h, args):
              "output": output}
     if module:
         extra["module"] = module
+    if note:
+        extra["note"] = note
     if change:  # recorded under the tree the run started on, marked so it is never reused
         extra["moved"] = True
     try:
@@ -997,7 +1623,164 @@ def full_suite(h, args):
         print("pa-full-suite: the worktree changed during the run ({}); the run is recorded under the tree it started "
               "on with moved: true and is never reused; run pa-full-suite again for the new tree".format(change))
     print("full suite exit {} (appended to {}; {})".format(code, build_log, recorded))
-    return sys.exit(code)
+    return code
+
+
+def run_remote(h, args, record, directory, command, evidence, build_log, where, run, output, progress, slot, machine,
+               found_probe, queued, pulse, reuse, log):
+    """R7-R18 on machine under its slot: ship, run there, the integration part here, copy back, record, clean.
+    Its exit code; SetupFailed before anything ran there (the slot is then still held, for the caller to release)."""
+    root = record["root"]
+    found = pins(h, root)  # MF-1
+    if reuse():
+        release(slot)
+        update_progress(progress, state="done", exit=0, end=pa.now(), note="not run: this tree passed while it waited")
+        return 0
+    why = remote_ok(command, found, None)
+    if why:
+        raise SetupFailed(why)
+    waited = round(time.time() - queued, 1)
+    os_name, tools = found_probe.get("os"), found_probe.get("tools") or {}
+    folder = folder_of(run)
+    for n in sweep(machine, run):
+        log("pa-full-suite: leftovers of an earlier run on {}: {}".format(machine, n))
+    total, runs = median_total(read_lines(where), command=command, place=machine)
+    update_progress(progress, place=machine, machine=machine, os=os_name, remote={"folder": folder, "terminal": None},
+                    median_total=total, median_runs=runs)
+    start, load, began = pa.now(), load_now(), time.time()
+    terminal, child, watcher, side, notes = None, None, None, None, []
+    saved = {}
+
+    def on_signal(sig, frame):
+        raise Interrupted(SIGNAL_EXIT.get(sig, 1))
+    for sig in SIGNAL_EXIT:
+        saved[sig] = signal.signal(sig, on_signal)
+    try:
+        try:
+            ship(h, machine, run, found[0], tools, root)
+            terminal = start_remote(machine, run, folder, tools)
+        except SetupFailed:
+            for n in cleanup(machine, run, terminal):
+                log("pa-full-suite: cleanup on {}: {}".format(machine, n))
+            update_progress(progress, cleaned=True)
+            raise
+        update_progress(progress, state="running", start=start, commit=found[0].get("commit"), tree=found[0].get("tree"),
+                        remote={"folder": folder, "terminal": terminal})
+        side = (progress or os.path.join(runs_dir(), run + ".json")) + ".local"
+        write_progress(side, {"run": run + "-local", "kind": "local part"})
+        watcher = RemoteWatcher(machine, folder, output, progress, side)
+        watcher.start()
+        local_out = output[:-len(".out")] + "-local.out"
+        env = dict(os.environ, PA_CHANGED_FILES="", PA_SUITE_SLOT=slot.name, PA_SUITE_PROGRESS=side)
+        with open(local_out, "w") as f:
+            child = subprocess.Popen(["sh", "-c", REMOTE_COMMAND + " --only-integration"], cwd=root, env=env,
+                                     stdin=subprocess.DEVNULL, stdout=f, stderr=subprocess.STDOUT, start_new_session=True)
+        local_code, local_began, local_seconds, local_stopped = None, time.time(), None, False
+        while True:
+            pulse()
+            if local_code is None and child.poll() is not None:
+                local_code = 128 - child.returncode if child.returncode < 0 else child.returncode
+                local_seconds = round(time.time() - local_began, 1)
+            if watcher.ended.is_set():
+                if (watcher.lost is not None or watcher.timed_out) and local_code is None:
+                    local_code, local_stopped = stop_group(child), True
+                    local_seconds = round(time.time() - local_began, 1)
+                if local_code is not None:
+                    break
+            if local_code is None and time.time() - local_began > REMOTE_TIMEOUT:
+                local_code, local_stopped = stop_group(child), True
+                local_seconds = round(time.time() - local_began, 1)
+            time.sleep(0.2)
+        remote_seconds = round(time.time() - began, 1)
+        if watcher.lost is not None:
+            remote_code = 124
+            notes.append("machine {} lost after {:.0f} s".format(machine, watcher.lost))
+        elif watcher.timed_out:
+            remote_code = 124
+            notes.append("the remote part timed out after {} s".format(REMOTE_TIMEOUT))
+        else:
+            remote_code = watcher.code
+            n = watcher.final()
+            if n:
+                notes.append(n)
+        if local_stopped:
+            notes.append("the local part was stopped")
+        code = remote_code if remote_code else local_code
+        seconds, end = round(time.time() - began, 1), pa.now()
+        change = moved(found, pins(h, root))
+        remote_text = pa.read_text(output) or ""
+        local_text = pa.read_text(local_out) or ""
+        mac = mac_os()
+        with open(output, "w") as f:
+            f.write(remote_text if not remote_text or remote_text.endswith("\n") else remote_text + "\n")
+            f.write("=== local part on this Mac\n")
+            f.write(local_text if not local_text or local_text.endswith("\n") else local_text + "\n")
+            for n in notes:
+                f.write("=== {}\n".format(n))
+            f.write("=== places: {} ({}) exit {}; local exit {} -> exit {}\n".format(machine, os_name, remote_code, local_code, code))
+        out = pa.read_text(output) or ""
+        try:
+            os.remove(local_out)
+        except OSError:
+            pass
+        update_progress(progress, state="done", exit=code, end=end, note="; ".join(notes) or None)
+        with open(build_log, "a") as f:
+            f.write("=== {} full suite: `{}` in {} on {} ({}) -> exit {} after {:.0f}s ===\n{}\n".format(
+                end, command, root, machine, os_name, code, seconds, h.tail(out, 200)))
+        parts = [dict(p, place=machine) for p in parse_parts(remote_text)] + \
+                [dict(p, place="local") for p in parse_parts(local_text)]
+        extra = {"run": run, "start": start, "end": end, "waited": waited, "load": load, "parts": parts, "output": output,
+                 "machine": machine, "os": os_name, "tools": tools,
+                 "places": [{"place": machine, "os": os_name, "exit": remote_code, "seconds": remote_seconds},
+                            {"place": "local", "os": mac, "exit": local_code, "seconds": local_seconds}]}
+        if notes:
+            extra["note"] = "; ".join(notes)
+        if change:
+            extra["moved"] = True
+        try:
+            h.suite_record(directory, record, command, code, seconds, found, extra)
+            recorded = "recorded in " + where
+        except OSError as e:
+            recorded = "could not record the run in {} ({})".format(where, e)
+        left = cleanup(machine, run, terminal)
+        for n in left:
+            log("pa-full-suite: cleanup on {}: {} (the exit stays {})".format(machine, n, code))
+        if not [n for n in left if n.startswith("rm -rf")]:
+            update_progress(progress, cleaned=True)
+        terminal = None  # cleaned
+        print(h.tail(out, 40))
+        if change:
+            print("pa-full-suite: the worktree changed during the run ({}); the run is recorded under the tree it started "
+                  "on with moved: true and is never reused; run pa-full-suite again for the new tree".format(change))
+        print("full suite exit {} on {} ({}) and this Mac (appended to {}; {})".format(code, machine, os_name, build_log, recorded))
+        return code
+    except Interrupted as e:
+        print("pa-full-suite: interrupted: ending the run on {} and cleaning up".format(machine), flush=True)
+        if child is not None:
+            stop_group(child)
+        if watcher is not None:
+            watcher.stop()
+        left = cleanup(machine, run, terminal)
+        for n in left:
+            log("pa-full-suite: cleanup on {}: {}".format(machine, n))
+        update_progress(progress, state="done", exit=e.code, end=pa.now(), note="interrupted",
+                        cleaned=not [n for n in left if n.startswith("rm -rf")])
+        return e.code
+    finally:
+        for sig, old in saved.items():
+            signal.signal(sig, old)
+        if child is not None and child.poll() is None:
+            stop_group(child)
+        if watcher is not None:
+            watcher.stop()
+        if side:
+            try:
+                os.remove(side)
+            except OSError:
+                pass
+        if not isinstance(sys.exc_info()[1], SetupFailed):
+            release(slot)  # on a setup failure the caller releases it (and takes this Mac's slot)
+
 
 
 if __name__ == "__main__":

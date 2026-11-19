@@ -10,6 +10,11 @@
 #                                change are skipped; without it, the whole fast set runs.
 #   tests/run-all.sh --module test_x  one unit test module (tests/test_x.py) as one part: the same slot, limit,
 #                                progress file and summary as in a full run (pa-full-suite --module runs it)
+#   tests/run-all.sh --except-integration  every part of the full run but the integration check (same order, names,
+#                                shards, slot, progress); PA_CHANGED_FILES is not read. pa-full-suite runs it on a
+#                                configured machine (t-089)
+#   tests/run-all.sh --only-integration  the integration check alone as one part (same slot, progress, summary):
+#                                the part pa-full-suite keeps on this Mac while the rest runs on a machine
 # The parts run at the same time (they share no temp folder, home, port or hc core); PA_SERIAL=1 runs them
 # one after another, each streamed as it runs. Each part's whole output is kept in its own file in one temp
 # folder and printed in the order above, then a summary: every part with ok or FAILED and its seconds, for a failed part its
@@ -36,10 +41,11 @@ unset PA_UNIT_SHARD  # set below for one shard part only (t-078), never inherite
 here=$(cd "$(dirname "$0")" && pwd)
 repo=$(cd "$here/.." && pwd)
 cd "$repo" || exit 2
-affected=0 module=
-usage() { echo "usage: tests/run-all.sh [--affected | --module test_x]" >&2; exit 2; }
+affected=0 module= place=
+usage() { echo "usage: tests/run-all.sh [--affected | --module test_x | --except-integration | --only-integration]" >&2; exit 2; }
 case "${1:-}" in
   --affected) [ $# = 1 ] || usage; affected=1 ;;
+  --except-integration|--only-integration) [ $# = 1 ] || usage; place=${1#--} ;;
   --module) [ $# = 2 ] || usage; module=$2
     case "$module" in test_*/*|test_*.*) usage ;; test_?*) [ -f "tests/$module.py" ] || usage ;; *) usage ;; esac ;;
   "") ;;
@@ -103,6 +109,7 @@ if [ -n "$module" ]; then
   want_py=0 want_keeper=0 want_panel=0 want_store=0 affected=1
   add units "unit tests: $module" "$module"
 fi
+if [ "$place" = only-integration ]; then want_py=0 want_keeper=0 want_panel=0 want_store=0; fi
 if [ "$want_py" = 1 ]; then
   add parse37 "python 3.7 parse"
   for f in tests/test_*.py; do
@@ -120,7 +127,7 @@ if [ "$want_panel" = 1 ]; then
   while [ "$k" -le "$panel_parts" ]; do add panel "panel harness $k/$panel_parts" "$k"; k=$((k + 1)); done
 fi
 [ "$want_store" = 1 ] && add store "store harness"
-[ "$affected" = 0 ] && add integration "pa-session integration (private hc core)"
+[ "$affected" = 0 ] && [ "$place" != except-integration ] && add integration "pa-session integration (private hc core)"
 
 # Take the slot: pa_suite.py runs this script again under it, with PA_SUITE_SLOT_PID set to its own pid (this
 # script's parent then) and PA_SUITE_HOLD saying how it got the slot.
