@@ -903,6 +903,8 @@ D7_FORMS = [
     ("sh -c 'pa-costs prices fetch --yes'", "pa-costs prices fetch --yes"), ("echo $(pa-costs prices fetch)", "pa-costs prices fetch"),
     ('cd /tmp && pa-costs "prices" "fetch"', "pa-costs prices fetch"), ("eval pa-costs prices fetch", "pa-costs prices fetch"),
     ("nohup pa-costs prices fetch --source s", "nohup pa-costs prices fetch --source s"),
+    ("python3 -mpa_costs prices fetch",), ("python3 -um pa_costs prices fetch",), ("python3 -Bm pa_costs prices fetch",),
+    ("python3 -Em pa_costs prices fetch",), ("python3 -u -Bmpa_costs prices fetch --dry-run",),
 ]
 D7_ALLOWED = ["pa-costs prices", "pa-costs prices --space sp1", "pa-costs report", "pa-costs fetch prices",
               "echo pa-costs prices fetch", "grep -n fetch runtime/tools/pa_costs.py", "python3 -m unittest tests/test_pa_costs.py",
