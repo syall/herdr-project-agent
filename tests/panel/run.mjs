@@ -5810,7 +5810,7 @@ cases["P-costs-j3-scopes"] = async () => { // D8: two or more endpoint · region
     { endpoint: "regional", region: "region-a", billed: 8.9, thisSpace: 3, allSpaces: 8, thisSpacePartial: false, allSpacesPartial: false },
     { endpoint: "regional", region: "?", billed: 0, thisSpace: null, allSpaces: null, thisSpacePartial: false, allSpacesPartial: false }];
   const { v, billed } = await j3gBilled(r);
-  for (const want of ["By endpoint · region (billed rows with a usage type):", "global: this space {CUR}7.00 est. · {CUR}20.00 billed · account-wide",
+  for (const want of ["By endpoint · region (billed rows that name an endpoint):", "global: this space {CUR}7.00 est. · {CUR}20.00 billed · account-wide",
     "regional · region-a: this space {CUR}3.00 est. · {CUR}8.90 billed · account-wide", "regional · region unknown: this space — est. (no price) · {CUR}0.00 billed · account-wide"])
     check(billed.includes(want), `shows "${want}" (got ${billed})`);
   check(billed.indexOf("By endpoint") > billed.indexOf("calibrated") && billed.indexOf("By endpoint") < billed.indexOf("In XXX"), `after this account's table (got ${billed})`);
