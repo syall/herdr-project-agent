@@ -378,8 +378,9 @@ class T025Removed(unittest.TestCase):  # AC1.1, AC2.1, AC3.1, AC4.4, R10
         self.assertEqual(list(inspect.signature(guard.check_command).parameters), ["line"])
 
     def test_size(self):  # R10: about 230 lines (the build came to 245: DECISIONS.md, t-025 D4; t-041 J3's pa-context row: 254;
-        # t-070 J2's price fetch row: 262; its round 3, a dotted module, runpy and python -c naming the module: 266)
-        self.assertLessEqual(len(source("pa_guard.py").splitlines()), 266)
+        # t-070 J2's price fetch row: 262; its round 3, a dotted module, runpy and python -c naming the module: 266;
+        # its round 6, the D7 scan in its own function, run only on a line that names pa-costs: 269)
+        self.assertLessEqual(len(source("pa_guard.py").splitlines()), 269)
 
 
 class HookGuard(unittest.TestCase):
