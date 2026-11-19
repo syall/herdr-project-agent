@@ -766,8 +766,11 @@ export default class ProjectAgent extends View {
     if (!c || typeof c !== "object" || known === "offline") return null;
     const s = c.settings ?? contextSettings(null), launcher = data.code?.launcher ?? null, busy = this.contextBusy[space.id];
     const clock = (iso) => this.contextClock(iso), costs = this.costs.peek(space.id); // the Costs view's last read (J5-D1)
-    const read = costs && costs.readAt ? contextLine(costs.summary?.paContext) : null;
-    const line = !costs || !costs.readAt ? "PA context: open the Costs tab to read it." : read ? `${read} (as of ${clock(new Date(costs.readAt).toISOString())})` : null;
+    // The day of the read, not today's (MF-J5-1); an earlier day is named, and so is the date in its "as of".
+    const now = Date.now(), read = costs && costs.readAt ? contextLine(costs.summary?.paContext, costs.readAt, now) : null;
+    const readIso = costs && costs.readAt ? new Date(costs.readAt).toISOString() : null;
+    const asOf = readIso && readIso.slice(0, 10) !== new Date(now).toISOString().slice(0, 10) ? atZone(readIso) : clock(readIso);
+    const line = !costs || !costs.readAt ? "PA context: open the Costs tab to read it." : read ? `${read} (as of ${asOf})` : null;
     const button = known === "live" && contextCapable(launcher) && s.mode === "fresh" && !busy;
     const other = s.mode === "fresh" ? "off" : "fresh";
     const reset = resetLine(launcher, data.agent?.sessionId, clock);

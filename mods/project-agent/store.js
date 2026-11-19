@@ -399,10 +399,12 @@ export function contextDay(paContext, now = Date.now()) {
   if (!e || !isNum(e.calls) || !isNum(e.peak) || !(e.mean === null || isNum(e.mean)) || !isObj(e.resets) || !isNum(e.resets.fresh) || !isNum(e.resets.compact)) return null;
   return e;
 }
-// The R15 line (as pa-costs report's), or null when there is no paContext.
-export function contextLine(paContext, now = Date.now()) {
+// The R15 line (as pa-costs report's), or null when there is no paContext. `at` is when paContext was read: its UTC
+// day is the one shown, named when it is not `today`'s (MF-J5-1: a read from yesterday is not today's "no calls").
+export function contextLine(paContext, at = Date.now(), today = at) {
   if (!Array.isArray(paContext)) return null;
-  const head = "PA context today (UTC):", e = contextDay(paContext, now);
+  const day = new Date(at).toISOString().slice(0, 10), e = contextDay(paContext, at);
+  const head = `PA context ${day === new Date(today).toISOString().slice(0, 10) ? "today" : day} (UTC):`;
   const resets = e ? `resets ${e.resets.fresh + e.resets.compact} (fresh ${e.resets.fresh}, compact ${e.resets.compact})` : null;
   if (!e || !e.calls) return e && e.resets.fresh + e.resets.compact ? `${head} no Project Agent calls · ${resets}` : `${head} no Project Agent calls yet`;
   return `${head} mean ${kTokens(e.mean)} · peak ${e.peakExact === false ? "≥" : ""}${kTokens(e.peak)} · ${resets}`;
