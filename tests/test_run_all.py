@@ -236,6 +236,40 @@ class RunAll(unittest.TestCase):
             self.assertIn("{}: ok".format(name), tail)
         self.outputs(out)
 
+    def test_r2c_a_part_wait_cannot_find_keeps_its_own_code(self):
+        # t-113: on a Linux machine (sh is bash there) `wait <pid>` said "pid N is not a child of this shell"
+        # (127) for parts that had passed, and run-all.sh marked them FAILED. Here run-all.sh runs under a `sh` that
+        # is bash with a `wait` that, in run-all.sh only, reaps the pid and then answers 127 the same way: each part's
+        # code must still be its own (passing parts ok, a failing one FAILED with its code), in parallel and serial.
+        bin_dir = os.path.join(self.tmp, "bin")
+        lose = os.path.join(self.tmp, "lose.sh")
+        write(lose, 'wait() {\n'
+                    '  builtin wait "$@"; c=$?\n'
+                    '  [ "${0##*/}" = run-all.sh ] && [ $# = 1 ] || return $c\n'
+                    '  echo "wait: pid $1 is not a child of this shell" >&2; return 127\n'
+                    '}\n')
+        write(os.path.join(bin_dir, "sh"), '#!/bin/bash\nBASH_ENV="{}" exec /bin/bash "$@"\n'.format(lose), 0o755)
+        path = bin_dir + os.pathsep + os.environ.get("PATH", "")
+        for serial in ("", "1"):
+            with self.subTest(serial=serial):
+                write(self.events, "")
+                env = dict(self.env_for(PA_SERIAL=serial, store="crash"), PATH=path)
+                r = subprocess.run(["sh", os.path.join(self.repo, "tests", "run-all.sh")], cwd=self.tmp, env=env,
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True,
+                                   timeout=120)
+                out = r.stdout
+                self.assertIn("is not a child of this shell", out)  # the stand-in wait did answer 127
+                self.assertEqual(r.returncode, 1, out)
+                tail = self.summary(out)
+                for name in NAMES:
+                    self.assertIn("  {}: {}".format(name, "FAILED" if name == "store harness" else "ok"), tail)
+                self.assertTrue(out.rstrip().splitlines()[-1].startswith("=== 1 part(s) failed: store harness (outputs: "), out)
+                folder = self.outputs(out)
+                with open(os.path.join(folder, "parts")) as f:
+                    store = [line.split("\t")[0] for line in f if line.split("\t")[1] == "store harness"][0]
+                with open(os.path.join(folder, store + ".code")) as f:
+                    self.assertEqual(f.read().strip(), "3")  # the part's own code, not wait's 127
+
     def test_r2b_quiet_failure(self):
         code, out = self.run_all(store="quiet")
         self.assertEqual(code, 1, out)
