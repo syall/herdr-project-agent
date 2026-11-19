@@ -1038,6 +1038,14 @@ cases["S41-8-context-line-day"] = async () => { // MF-J5-1: the day of the read,
   check(store.contextLine([], AT, NEXT) === `PA context ${TODAY} (UTC): no Project Agent calls yet`, "read yesterday, no entry: that day named");
 };
 
+cases["S41-9-context-at"] = async () => { // MF-J5r2-1: the summary's own time (updated), else the read's
+  const READ = T0 + 60000, UP = `${TODAY}T07:59:00Z`;
+  check(store.contextAt({ updated: UP }, READ) === Date.parse(UP), `updated (got ${store.contextAt({ updated: UP }, READ)})`);
+  for (const [summary, what] of [[{}, "no updated"], [{ updated: "not a time" }, "unreadable"], [{ updated: 1800000000 }, "a number"], [{ updated: null }, "null"], [null, "no summary"], [undefined, "undefined"]]) {
+    check(store.contextAt(summary, READ) === READ, `${what}: the read's time (got ${store.contextAt(summary, READ)})`);
+  }
+};
+
 cases["S41-2-context-args"] = async () => { // R6, R13: the tool's argv; never --on (the exec runs on the space's machine)
   const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
   check(eq(store.contextArgs(remote, { dry: true }), ["fresh", "--space", S, "--dry-run", "--json"]), `dry (got ${JSON.stringify(store.contextArgs(remote, { dry: true }))})`);
