@@ -5484,6 +5484,213 @@ cases["P37-header-restarting"] = async () => { // R15: the keeper marks a record
 
 // Which cases run (t-031): every case, or the named ones; --shard=<k>/<n> keeps every n-th case by definition
 // order (index mod n == k - 1), so n shards together run each case once, and a case added later lands in one.
+// ---- t-055: the Queue tab (queue.json, read only) ----
+const QA = "/w/herdr-project-agent", QB = "/w/other";
+const sha = (c) => c.repeat(40);
+const qEntry = (task, extra = {}) => ({ task, job: null, branch: `${task}-b`, worktree: `/wt/${task}`, onto: "main", dependsOn: null, state: "checking",
+  added: "2026-11-18T10:00:00Z", base: sha("a"), tip: sha("b"), checked: {}, needs: null, suite: null, review: null, rebases: [], approval: null, ...extra });
+const qRepo = (entries, extra = {}) => ({ common: "/x/.git", main: "main", mainAt: sha("c"), planned: [], entries, left: [], merged: [], ...extra });
+const qDoc = (repos) => JSON.stringify({ version: 1, repos });
+const QPATH = `:${DIR}/queue.json`;
+const qCard = (id, status, entries, extra = {}) => JSON.stringify({ id, status, kind: "queue", question: "Merge these?", options: [{ label: "Merge all in order" }, { label: "Not now" }],
+  created: "2026-11-18T10:00:00Z", queue: { version: 1, repo: QA, entries }, ...extra });
+// A world with queue.json (text, or undefined: none), a ledger, and cards { id: text }; the view opened on Queue.
+async function queueWorld(text, { ledger = null, cards = {}, open = true, opts = {} } = {}) {
+  world(opts);
+  if (text !== undefined) g.__files[QPATH] = text;
+  if (ledger) g.__files[`:${DIR}/ledger.json`] = JSON.stringify(ledger);
+  for (const [id, c] of Object.entries(cards)) g.__files[`:${DIR}/decisions/${id}.json`] = c;
+  g.__ls[`:${DIR}/decisions`] = Object.keys(cards).map((id) => `${id}.json`);
+  const v = await mount(); await settle();
+  if (open) await click(v, "view-queue");
+  return v;
+}
+const twoRepos = () => qDoc({
+  [QA]: qRepo([
+    qEntry("t-A", { state: "passed", suite: { exit: 0, ended: "2026-11-18T10:05:00Z", worker: "t40", tree: sha("d") } }),
+    qEntry("t-B", { onto: "t-A-b", dependsOn: { task: "t-A", job: null } }),
+    qEntry("t-C", { onto: "t-B-b", needs: { shortReview: { tip: sha("b"), file: "SHORT-REVIEW-t-C-1.md", since: "2026-11-18T10:01:00Z", files: [] } },
+      suite: { exit: 0, ended: "2026-11-18T10:07:00Z", worker: "t42", tree: sha("e") } }),
+  ]),
+  [QB]: qRepo([]),
+});
+
+cases["Q55-1-tab-order"] = async () => { // R1: Decisions, Tasks, Queue, Rules, Costs; the count over every repository
+  const v = await queueWorld(qDoc({ [QA]: qRepo([qEntry("t-A"), qEntry("t-B", { onto: "t-A-b" })]), [QB]: qRepo([qEntry("t-X")]) }), { open: false });
+  const { text, clicks } = look(v);
+  const at = (s) => text.indexOf(s);
+  check(Boolean(clicks["view-queue"]), `a Queue tab (clicks ${Object.keys(clicks).join(", ")})`);
+  check(at("Queue · 3") > at("Tasks · ") && at("Rules · ") > at("Queue · 3") && at("Tasks · ") > at("Decisions") && at("Decisions") >= 0, `order and count (got ${text.slice(0, 600)})`);
+};
+
+cases["Q55-2-entries"] = async () => { // R2: entries in merge order, state, stack, depends on, waiting, suite
+  const v = await queueWorld(twoRepos());
+  const { text } = look(v);
+  const order = ["1. t-A", "2. t-B", "3. t-C"].map((s) => text.indexOf(s));
+  check(order.every((i) => i >= 0) && order[0] < order[1] && order[1] < order[2], `entries in order (got ${text})`);
+  check(/herdr-project-agent/.test(text) && /\bother\b/.test(text), `each repository by its folder name (got ${text})`);
+  check(/passed/.test(text) && /checking/.test(text), "states");
+  check(/on main/.test(text) && /on t-A-b \(t-A\)/.test(text) && /on t-B-b \(t-B\)/.test(text), `stack lines (got ${text})`);
+  check(/depends on t-A/.test(text), "depends on");
+  check(/waits for its suite/.test(text), `t-B waits for its suite (got ${text})`);
+  check(/waits for its short review \(SHORT-REVIEW-t-C-1\.md\)/.test(text), `t-C waits for its short review (got ${text})`);
+  check(/suite passed 11-18 10:05 by t40/.test(text), `t-A's suite line (got ${text})`);
+  check(/As pa-queue last wrote it; pa-queue show reads each state now\./.test(text), "the stored-state line");
+  check(/Queue empty\./.test(text), "the empty repository says so");
+};
+
+cases["Q55-3-restack"] = async () => { // R2: an onto that is not the entry ahead; invalidated waits for a restack; a failed suite
+  const v = await queueWorld(qDoc({ [QA]: qRepo([
+    qEntry("t-A"),
+    qEntry("t-B", { onto: "t-gone-b", state: "invalidated" }),
+    qEntry("t-C", { onto: "t-B-b", state: "failed", suite: { exit: 1, ended: "2026-11-18T10:09:00Z", worker: "t43" } }),
+  ]) }));
+  const { text } = look(v);
+  check(/on t-gone-b · restack pending/.test(text), `restack pending (got ${text})`);
+  check(/invalidated/.test(text) && /waits for pa-queue restack/.test(text), `invalidated waits for a restack (got ${text})`);
+  check(/failed/.test(text) && /suite failed \(exit 1\) 11-18 10:09 by t43/.test(text), `the failed suite (got ${text})`);
+  check(/waits for pa-gate at its tip, or the next pa-queue refresh/.test(text), `t-A: nothing stored to wait for (got ${text})`);
+};
+
+cases["Q55-4-approval"] = async () => { // R2, R6: J3b's approval shapes and queue cards
+  const v = await queueWorld(qDoc({ [QA]: qRepo([
+    qEntry("t-A", { approval: { card: "d-queue-1", option: "Merge all in order", answeredAt: "2026-11-18T10:10:00Z" } }),
+    qEntry("t-B", { onto: "t-A-b", approval: { card: "d-queue-1", option: "Merge all in order", answeredAt: "2026-11-18T10:10:00Z", void: "content changed" } }),
+    qEntry("t-C", { onto: "t-B-b", approval: { card: "d-queue-0", option: "Merge all in order", carried: "doc-only, short review SHORT-REVIEW-t-C-1.md" } }),
+    qEntry("t-D", { onto: "t-C-b" }),
+    qEntry("t-E", { onto: "t-D-b" }),
+    qEntry("t-F", { onto: "t-E-b" }),
+  ]) }), { cards: {
+    "d-queue-2": qCard("d-queue-2", "open", [{ task: "t-D", job: null }]),
+    "d-queue-3": qCard("d-queue-3", "answered", [{ task: "t-E", job: null }], { answer: "Merge all in order" }),
+  } });
+  const { text } = look(v);
+  check(/approval: approved: Merge all in order \(d-queue-1, 11-18 10:10\)/.test(text), `approved (got ${text})`);
+  check(/approval: voided \(content changed\)/.test(text), `voided (got ${text})`);
+  check(/approval: approved, carried over \(doc-only, short review SHORT-REVIEW-t-C-1\.md\)/.test(text), `carried over (got ${text})`);
+  check(/approval: card asked \(d-queue-2\)/.test(text), `card asked (got ${text})`);
+  check(/approval: answered on d-queue-3, applied at the next pa-queue merge/.test(text), `answered, not applied (got ${text})`);
+  check(/approval: not asked yet/.test(text), `not asked yet (got ${text})`);
+};
+
+cases["Q55-5-left"] = async () => { // R3: left newest first, why, void, the fix round it went to
+  const left = Array.from({ length: 12 }, (_, i) => ({ task: `t-L${i + 1}`, job: null, branch: `t-L${i + 1}-b`, state: "failed", why: `why ${i + 1}`,
+    at: `2026-11-18T09:${String(10 + i).padStart(2, "0")}:00Z`, tip: sha("f"), approval: null }));
+  left[11] = { ...left[11], task: "t-B", why: "the full suite exited 1 on its tree", at: "2026-11-18T10:20:00Z", approval: { card: "d-queue-1", void: "the full suite exited 1 on its tree" } };
+  left[10] = { ...left[10], task: "t-C", why: "conflict", at: "2026-11-18T10:15:00Z" };
+  const ledger = { tasks: [
+    { id: "t-B", state: "in-progress", workers: [{ address: "t14", role: "build", round: 1, started: "2026-11-18T09:00:00Z" }, { address: "t15", role: "fix", round: 2, started: "2026-11-18T10:25:00Z" }] },
+    { id: "t-C", state: "in-progress", workers: [{ address: "t16", role: "build", round: 1, started: "2026-11-18T09:00:00Z" }] },
+  ] };
+  const v = await queueWorld(qDoc({ [QA]: qRepo([], { left }) }), { ledger });
+  const { text } = look(v);
+  check(/Left · 12/.test(text), `the left count (got ${text})`);
+  check(text.indexOf("t-B left 11-18 10:20: the full suite exited 1 on its tree") >= 0 && text.indexOf("t-B left") < text.indexOf("t-C left"), `newest first, with why (got ${text})`);
+  check(/went to fix round 2 \(t15, fix\)/.test(text), `t-B's fix round (got ${text})`);
+  check(/t-C left 11-18 10:15: conflict/.test(text) && /no fix round yet/.test(text), `t-C: no fix round yet (got ${text})`);
+  check(/approval voided: the full suite exited 1 on its tree/.test(text), "the void");
+  check(/and 2 earlier/.test(text) && !/t-L1 left/.test(text) && !/t-L2 left/.test(text) && /t-L3 left/.test(text), `10 shown (got ${text})`);
+};
+
+cases["Q55-6-merged"] = async () => { // R3: the last 5 merged, newest first, by hand or by the queue with its card
+  const merged = Array.from({ length: 6 }, (_, i) => ({ task: `t-M${i + 1}`, job: null, tip: `${i + 1}`.repeat(40), from: sha("a"), to: sha("b"), at: `2026-11-18T08:0${i}:00Z`, by: "hand" }));
+  merged[5] = { ...merged[5], by: "queue", card: "d-queue-1" };
+  const v = await queueWorld(qDoc({ [QA]: qRepo([], { merged }) }));
+  const { text } = look(v);
+  check(/t-M6 merged 11-18 08:05 at 6666666 \(queue, d-queue-1\)/.test(text), `by the queue (got ${text})`);
+  check(/t-M2 merged 11-18 08:01 at 2222222 \(hand\)/.test(text) && !/t-M1 merged/.test(text), `the last 5 (got ${text})`);
+  check(text.indexOf("t-M6 merged") < text.indexOf("t-M2 merged"), "newest first");
+};
+
+cases["Q55-7-missing"] = async () => { // R7: no queue.json
+  const v = await queueWorld(undefined);
+  const { text } = look(v);
+  check(/No merge queue in this space yet\. pa-queue add starts one\./.test(text), `the empty sentence (got ${text})`);
+  check(/(^| )Queue( |$)/.test(text) && !/Queue · /.test(text), `the tab has no count (got ${text.slice(0, 400)})`);
+};
+
+cases["Q55-8-invalid"] = async () => { // R7: an invalid file is said, flagged on the tab, never written
+  for (const [body, why] of [["{not json", /queue\.json is not valid JSON/], [JSON.stringify({ version: 1, repos: [] }), /queue\.json needs a "repos" object/],
+    [JSON.stringify({ version: 2, repos: {} }), /queue\.json is version 2; this panel reads version 1/]]) {
+    const v = await queueWorld(body);
+    const { text, clicks } = look(v);
+    check(why.test(text) && /Queue · !/.test(text), `error and the tab flag for ${body} (got ${text})`);
+    for (const id of Object.keys(clicks).filter((k) => /^queue-/.test(k))) { clicks[id]({}, cx); await flush(); }
+    check(g.__files[QPATH] === body && !g.__writes.includes(QPATH), "never written");
+  }
+};
+
+cases["Q55-9-hung"] = async () => { // R5: a hung read is never "no queue"; after a good read, a hung one keeps the last known
+  world(); g.__files[QPATH] = twoRepos(); g.__hang = [QPATH];
+  const v = await mount(); await settle(); await click(v, "view-queue");
+  let { text } = look(v);
+  check(/Loading queue…/.test(text) && !/No merge queue/.test(text), `loading, not none (got ${text})`);
+  await step(11000);
+  ({ text } = look(v));
+  check(!/No merge queue/.test(text), `a timeout is not "no queue" (got ${text})`);
+  g.__hang = [];
+  advance(3000); v.reload(cx); await settle();
+  ({ text } = look(v));
+  check(/1\. t-A/.test(text), `read once it answers (got ${text})`);
+  g.__hang = [QPATH];
+  advance(3000); v.reload(cx); await settle(); await step(11000);
+  ({ text } = look(v));
+  check(/1\. t-A/.test(text) && /Queue · 3/.test(text), `the last known stays (got ${text})`);
+};
+
+cases["Q55-10-read-only"] = async () => { // R4: the view writes nothing and runs nothing
+  const v = await queueWorld(twoRepos(), { open: false });
+  const writes = g.__writes.length, execs = g.__execs.length, hcs = g.__hcs.length;
+  await click(v, "view-queue");
+  for (const id of Object.keys(look(v).clicks).filter((k) => /^queue-/.test(k))) { look(v).clicks[id]?.({}, cx); await flush(); }
+  check(g.__writes.length === writes && g.__execs.length === execs && g.__hcs.length === hcs, `no write, exec or hc (got ${JSON.stringify([g.__writes.slice(writes), g.__execs.slice(execs), g.__hcs.slice(hcs)])})`);
+  check(g.__writes.every((w) => !/queue\.json/.test(w)), "queue.json never written");
+};
+
+cases["Q55-11-one-read"] = async () => { // R5: one queue.json read per load; a background load while it is pending starts no second one
+  const v = await queueWorld(twoRepos());
+  const reads = () => g.__issued.filter((x) => x.kind === "read" && x.path === `${DIR}/queue.json`).length;
+  const before = reads();
+  check(before >= 1, `read by the load (got ${before})`);
+  g.__hang = [QPATH];
+  advance(3000); v.reload(cx); await settle();
+  const mid = reads();
+  check(mid === before + 1, `one read for that load (got ${mid - before})`);
+  advance(3000); v.reload(cx, { background: true }); await settle();
+  advance(3000); v.reload(cx, { background: true }); await settle();
+  check(reads() === mid, `no second read while one is pending (got ${reads() - mid})`);
+  g.__hang = [];
+};
+
+cases["Q55-12-remote"] = async () => { // R5: a remote space's queue.json is read on its machine
+  world({ machine: M });
+  g.__files[`${M}:${RDIR}/queue.json`] = twoRepos();
+  const v = await mount(); await settle();
+  await click(v, "view-queue");
+  check(g.__issued.some((x) => x.kind === "read" && x.on === M && x.path === `${RDIR}/queue.json`), `read on ${M} (got ${JSON.stringify(g.__issued.filter((x) => /queue/.test(x.path ?? "")))})`);
+  check(/1\. t-A/.test(look(v).text), "shown");
+};
+
+cases["Q55-13-watch"] = async () => { // R5: a watch batch naming queue.json reloads; the queue's lock reloads nothing
+  world(); g.__files[QPATH] = twoRepos(); g.__watchers = [];
+  await mount(); await settle();
+  const fireOnly1s = () => { for (const tm of g.__timers.filter((x) => x.ms === 1000)) tm.fn(cx); };
+  const batch = async (paths) => { advance(3000); const w = g.__watchers.shift(); if (w) w.resolve(paths); await turn(2); advance(3000); fireOnly1s(); await settle(); };
+  const before = loadsLocal();
+  await batch([`${DIR}/.queue.lock`]);
+  check(loadsLocal() === before, `the lock reloads nothing (got ${loadsLocal() - before})`);
+  await batch([`${DIR}/queue.json`]);
+  check(loadsLocal() > before, "queue.json reloads");
+};
+
+cases["Q55-14-titles-skipped"] = async () => { // R2, R7: two repositories with one folder name; an item that cannot be read
+  const v = await queueWorld(qDoc({ "/w/a/proj": qRepo([qEntry("t-A"), 7, { branch: "x" }]), "/w/b/proj": qRepo([qEntry("t-B")]) }));
+  const { text } = look(v);
+  check(/\/w\/a\/proj/.test(text) && /\/w\/b\/proj/.test(text), `full paths when the names clash (got ${text})`);
+  check(/2 entries could not be read/.test(text) && /1\. t-A/.test(text), `the rest shown, the skipped counted (got ${text})`);
+  check(/Queue · 2/.test(text), `only readable entries counted (got ${text.slice(0, 400)})`);
+};
+
 // --list prints the names that would run and runs none. An unknown name or option exits 2.
 const refuse = (why) => { fs.rmSync(dst, { recursive: true, force: true }); console.error(`run.mjs: ${why}`); process.exit(2); };
 const pick = [];

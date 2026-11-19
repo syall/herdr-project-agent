@@ -801,6 +801,62 @@ cases["S37-restarting-label"] = async () => { // R15: pa.py clears the label by 
   check(store.restartingLabel({ labels: {} }) === false && store.restartingLabel(null) === false, "absent");
 };
 
+// ---- t-055: queue.json for the Queue tab ----
+const queueMod = await import(path.join(dst, "queue.js")).catch(() => null);
+const QK = (space) => keyOf(space, "/queue.json");
+
+cases["S55-load-queue"] = async () => { // loadQueue: missing, valid, each invalid form, on the space's machine
+  check(typeof store.loadQueue === "function", "store.loadQueue exists");
+  world();
+  let r = await store.loadQueue(remote, cx);
+  check(r.missing === true && r.doc === null && r.error === null, `missing (got ${JSON.stringify(r)})`);
+  check(g.__issued.some((x) => x.on === M && x.kind === "read" && x.path === `${rdir}/queue.json`), "read on the space's machine");
+  const doc = { version: 1, repos: { "/w/p": { main: "main", entries: [], left: [], merged: [] } } };
+  g.__files[QK(local)] = JSON.stringify(doc);
+  r = await store.loadQueue(local, cx);
+  check(r.missing === false && r.error === null && JSON.stringify(r.doc) === JSON.stringify(doc), `valid (got ${JSON.stringify(r)})`);
+  for (const [body, why] of [["{x", /^queue\.json is not valid JSON/], ["[]", /needs a "repos" object/], [JSON.stringify({ version: 1, repos: [] }), /needs a "repos" object/],
+    [JSON.stringify({ version: 3, repos: {} }), /is version 3; this panel reads version 1/]]) {
+    g.__files[QK(local)] = body;
+    r = await store.loadQueue(local, cx);
+    check(r.doc === null && why.test(r.error ?? ""), `${body}: ${why} (got ${JSON.stringify(r)})`);
+  }
+};
+
+cases["S55-load-queue-hung"] = async () => { // a hung read gives up as TIMED_OUT, never "missing"
+  world();
+  g.__hang = [QK(remote)];
+  const { done, value } = await within(store.loadQueue(remote, cx), 12000, 12);
+  check(done && store.gaveUp(value) && !value.missing, `gave up (got ${JSON.stringify(value)})`);
+  g.__hang = [];
+};
+
+cases["S55-queue-rows"] = async () => { // queueRows: the waiting and approval rules, without rendering
+  check(typeof queueMod?.queueRows === "function", "queue.js exports queueRows");
+  const e = (task, x = {}) => ({ task, job: null, branch: `${task}-b`, onto: "main", state: "checking", tip: "b".repeat(40), needs: null, suite: null, review: null, approval: null, ...x });
+  const doc = { version: 1, repos: { "/w/p": { main: "main", entries: [
+    e("t-A", { suite: { exit: 0, ended: "2026-11-18T10:05:00Z", worker: "t40" } }),
+    e("t-B", { onto: "t-A-b", needs: { shortReview: { file: "S.md", kind: "doc-only" } }, suite: { exit: 0 } }),
+    e("t-C", { onto: "t-B-b", needs: { shortReview: { file: "R.md" } }, review: { tip: "b".repeat(40), verdict: "pass" }, suite: { exit: 0 } }),
+    e("t-D", { onto: "t-C-b", state: "invalidated" }),
+    e("t-E", { onto: "t-D-b", job: "J2", approval: { card: "d-queue-1", option: "Merge up to t-E", answeredAt: "2026-11-18T10:10:00Z" } }),
+  ], left: [], merged: [] } } };
+  const cards = [{ id: "d-queue-9", card: { id: "d-queue-9", status: "open", kind: "queue", queue: { entries: [{ task: "t-A", job: null }] } } }];
+  const q = queueMod.queueRows({ doc, error: null, missing: false }, { tasks: [] }, cards);
+  const rows = q.repos[0].entries;
+  check(q.count === 5 && rows.length === 5, `5 rows (got ${JSON.stringify(q.count)})`);
+  check(rows[0].waits === "waits for pa-gate at its tip, or the next pa-queue refresh", `t-A (got ${rows[0].waits})`);
+  check(rows[1].waits === "waits for its doc-only short review (S.md)", `t-B (got ${rows[1].waits})`);
+  check(rows[2].waits === "waits for pa-gate at its tip, or the next pa-queue refresh", `t-C: its review is recorded for its tip (got ${rows[2].waits})`);
+  check(rows[3].waits === "waits for pa-queue restack", `t-D (got ${rows[3].waits})`);
+  check(rows[4].label === "5. t-E J2" && rows[4].waits === "waits for its suite", `t-E (got ${JSON.stringify(rows[4])})`);
+  check(rows[0].approval === "approval: card asked (d-queue-9)" && rows[1].approval === "approval: not asked yet", `approvals (got ${rows[0].approval}; ${rows[1].approval})`);
+  check(rows[4].approval === "approval: approved: Merge up to t-E (d-queue-1, 11-18 10:10)", `approved (got ${rows[4].approval})`);
+  check(queueMod.queueRows(null, null, []).state === "loading" && queueMod.queueRows(store.TIMED_OUT, null, []).state === "loading", "unknown: loading");
+  check(queueMod.queueRows({ doc: null, error: null, missing: true }, null, []).state === "missing", "missing");
+  check(queueMod.queueRows({ doc: null, error: "queue.json is version 2; this panel reads version 1", missing: false }, null, []).state === "error", "error");
+};
+
 const pick = process.argv.slice(2);
 let failed = 0;
 for (const [name, fn] of Object.entries(cases)) {
