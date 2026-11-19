@@ -875,7 +875,7 @@ cases["S83-shared-cases"] = async () => { // AC8.3: the JS side agrees with pa_p
   for (const c of SHARED.orderCases) {
     const r = placesMod.readOrder(c.orderText);
     check(r.error === c.error, `${c.name}: error ${JSON.stringify(c.error)} (got ${JSON.stringify(r.error)})`);
-    const ids = placesMod.effectiveOrder(c.jobs.map(sJob), r.order).map((j) => j.id);
+    const ids = placesMod.effectiveOrder(c.jobs.map(sJob), r.start).map((j) => j.id); // t-097: readOrder's start (v1 or v2), no rank
     check(same(ids, c.effective), `${c.name}: ${JSON.stringify(c.effective)} (got ${JSON.stringify(ids)})`);
   }
   for (const c of SHARED.limitCases) {
@@ -893,6 +893,9 @@ cases["S83-order-lines"] = async () => { // AC8.2, J1-D2: the lines the panel an
   check(placesMod.readOrder(null).line === "no start order yet; the Project Agent's order is used", "missing");
   check(placesMod.readOrder("{x").line === "start order unreadable: start-order.json is not JSON; the Project Agent's order is used", `not JSON (got ${placesMod.readOrder("{x").line})`);
   check(placesMod.readOrder('{"version": 1, "order": ["a"]}').line === null, "valid: no line");
+  check(placesMod.readOrder('{"version": 3}').line === "start order unreadable: start-order.json is not version 1 or 2; the Project Agent's order is used", `t-097 J1-D3: version (got ${placesMod.readOrder('{"version": 3}').line})`);
+  check(placesMod.readOrder('{"version": 2, "pins": 1}').line === "start order unreadable: start-order.json's pins are not a list of {id, slot}; the Project Agent's order is used", "t-097 J1-D3: pins");
+  check(placesMod.readOrder('{"version": 2, "pins": []}').line === null, "version 2: no line");
 };
 
 cases["S83-load-waiting"] = async () => { // loadWaiting: missing, valid, each invalid form, read on the space's machine
@@ -951,25 +954,25 @@ cases["S83-write-order"] = async () => { // AC6.1, AC6.2: compare-and-write, loc
   check(/changed on disk/.test(err ?? "") && g.__files[OK(remote)] === "R\n", `remote: a changed file is refused (got ${err})`);
 };
 
-cases["S83-move-order"] = async () => { // R9: ↑/↓ swap with the nearest movable job (fixed queue jobs skipped), ⤒, the ends
+cases["S83-move-order"] = async () => { // R9, t-097 R10: ↑/↓ swap with the nearest movable job (fixed queue jobs skipped), ⤒, the ends: one pin
   check(typeof placesMod?.moveOrder === "function", "places.js exports moveOrder");
   const eff = ["A", { id: "Q", source: "queue" }, "B", "C"].map(sJob);
   const mv = (id, m) => placesMod.moveOrder(eff, id, m);
-  check(same(mv("B", "up"), ["B", "A", "C"]), `B up skips Q (got ${JSON.stringify(mv("B", "up"))})`);
-  check(same(mv("A", "down"), ["B", "A", "C"]), `A down skips Q (got ${JSON.stringify(mv("A", "down"))})`);
-  check(same(mv("C", "top"), ["C", "A", "B"]), `C to the top (got ${JSON.stringify(mv("C", "top"))})`);
+  check(same(mv("B", "up"), { id: "B", slot: 0 }), `B up skips Q: slot 0 among the movable jobs (got ${JSON.stringify(mv("B", "up"))})`);
+  check(same(mv("A", "down"), { id: "A", slot: 1 }), `A down skips Q (got ${JSON.stringify(mv("A", "down"))})`);
+  check(same(mv("C", "top"), { id: "C", slot: 0 }), `C to the top (got ${JSON.stringify(mv("C", "top"))})`);
   check(mv("A", "up") === null && mv("A", "top") === null && mv("C", "down") === null, "off an end: null");
   check(mv("Q", "up") === null && mv("gone", "top") === null, "a fixed or unknown job: null");
 };
 
-cases["S83-order-text"] = async () => { // R6: the file the panel writes: version 1, by person, moves (last 20)
+cases["S83-order-text"] = async () => { // R6, t-097 R10: the file the panel writes: version 2 pins, by person, moves (last 20)
   check(typeof placesMod?.orderText === "function", "places.js exports orderText");
   const prev = JSON.stringify({ version: 1, order: ["x"], moves: Array.from({ length: 20 }, (_, i) => ({ at: "t", id: `j${i}`, move: "up" })) });
-  const doc = JSON.parse(placesMod.orderText(prev, ["B", "A"], { id: "B", move: "top" }));
-  check(doc.version === 1 && doc.by === "person" && same(doc.order, ["B", "A"]) && typeof doc.updated === "string", `the head (got ${JSON.stringify(doc)})`);
+  const doc = JSON.parse(placesMod.orderText(prev, [{ id: "B", slot: 0 }], { id: "B", move: "top" }));
+  check(doc.version === 2 && doc.by === "person" && same(doc.pins, [{ id: "B", slot: 0 }]) && !("order" in doc) && typeof doc.updated === "string", `the head (got ${JSON.stringify(doc)})`);
   check(doc.moves.length === 20 && doc.moves[0].id === "j1" && doc.moves[19].id === "B" && doc.moves[19].move === "top", `the last 20 moves (got ${JSON.stringify(doc.moves.slice(-2))})`);
-  const fresh = JSON.parse(placesMod.orderText("{bad", ["A"], { id: null, move: "reset" }));
-  check(same(fresh.order, ["A"]) && fresh.moves.length === 1 && fresh.moves[0].move === "reset", `over an unreadable file (got ${JSON.stringify(fresh)})`);
+  const fresh = JSON.parse(placesMod.orderText("{bad", [], { id: null, move: "reset" }));
+  check(same(fresh.pins, []) && fresh.moves.length === 1 && fresh.moves[0].move === "reset", `over an unreadable file (got ${JSON.stringify(fresh)})`);
   check(placesMod.orderText(null, [], { id: "A", move: "up" }).endsWith("}\n"), "a trailing newline");
 };
 
@@ -1011,6 +1014,182 @@ cases["S83-rows"] = async () => { // R1 AC1.1-1.4, R9, R11 without rendering: pl
   const r3 = placesMod.placesRows({ waiting: { doc: { version: 1, jobs: [] }, error: null, missing: false }, startOrder: null, rules: { rules: [], error: null, doc: { rules: [] } }, ledger: { tasks: [] }, isLive: () => true });
   check(same(r3.kinds.map((k) => k.head), ["Working · 0 of 4 (default)"]), `AC2.4 (got ${JSON.stringify(r3.kinds.map((k) => k.head))})`);
   check(placesMod.placesRows({ waiting: { doc: null, error: null, missing: true }, startOrder: null, rules: null, ledger: { tasks: [] }, isLive: () => true }).shown === false, "D3: no list, no holder: not shown");
+};
+
+// ---- t-097 J2: the person's task order (tasks.js, store.js) and the start order's version 2 pins (places.js) ----
+const tasksMod = await import(path.join(dst, "tasks.js")).catch(() => null);
+const TSHARED = JSON.parse(fs.readFileSync(path.join(here, "..", "samples", "task-order-cases.json"), "utf8"));
+const TK = (space) => keyOf(space, "/task-order.json");
+const rk = (list) => list.map(([id, state, source]) => ({ id, state, source }));
+
+cases["S97-task-order-shared"] = async () => { // R1-R3, R7, R12: tasks.js agrees with pa_places.py on every shared case
+  check(typeof tasksMod?.readTaskOrder === "function" && typeof tasksMod?.effectiveTasks === "function" && typeof tasksMod?.moveTask === "function", "tasks.js exports readTaskOrder, effectiveTasks, moveTask");
+  check(TSHARED.version === 1 && TSHARED.readCases.length && TSHARED.rankCases.length && TSHARED.moveCases.length, "the shared file has its three lists");
+  for (const c of TSHARED.readCases) {
+    const r = tasksMod.readTaskOrder(c.text);
+    const got = { error: r.error, line: r.line, order: r.order, last: r.last, updated: r.updated };
+    check(same(got, { error: c.error, line: c.line, order: c.order, last: c.last, updated: c.updated }), `${c.name} (got ${JSON.stringify(got)})`);
+  }
+  for (const c of TSHARED.rankCases) {
+    const read = tasksMod.readTaskOrder(c.fileText);
+    check(read.error === c.error, `${c.name}: error ${c.error} (got ${read.error})`);
+    const got = tasksMod.effectiveTasks(c.tasks, c.taskOrder, read).map((r) => [r.id, r.source]);
+    check(same(got, c.expect), `${c.name}: ${JSON.stringify(c.expect)} (got ${JSON.stringify(got)})`);
+  }
+  for (const c of TSHARED.moveCases) {
+    const ranking = rk(c.ranking), order = [...c.order], last = [...c.last];
+    const got = tasksMod.moveTask(ranking, c.section, c.task, c.move, order, last);
+    check(same(got, c.expect), `${c.name}: ${JSON.stringify(c.expect)} (got ${JSON.stringify(got)})`);
+    check(same(order, c.order) && same(last, c.last) && same(ranking, rk(c.ranking)), `${c.name}: the inputs are not changed`);
+  }
+};
+
+cases["S97-chat-quote"] = async () => { // R12, R13: a chat entry carries its quote
+  const read = tasksMod.readTaskOrder(null);
+  const r = tasksMod.effectiveTasks([{ id: "t-1", state: "queued" }, { id: "t-2", state: "queued" }], { order: [], chat: [{ task: "t-2", quote: "do t-2 now", over: null }] }, read);
+  check(same(r, [{ id: "t-2", state: "queued", source: "chat", quote: "do t-2 now" }, { id: "t-1", state: "queued", source: "agent" }]), `the quote (got ${JSON.stringify(r)})`);
+};
+
+cases["S97-has-order"] = async () => { // J1-D10: the Places sort by rank waits until a task order exists (R27)
+  check(typeof tasksMod?.hasTaskOrder === "function", "tasks.js exports hasTaskOrder");
+  const R = tasksMod.readTaskOrder, ok = '{"version": 1, "order": [], "last": []}';
+  const cases97 = [[R(null), undefined, false], [R(null), null, false], [R(ok), null, true], [R("{bad"), null, false], [R(null), { order: [], chat: [] }, true],
+    [R(null), "x", false], [R(null), { order: 5 }, false], [R(null), {}, true], [R("{bad"), { order: [], chat: [] }, true]];
+  for (const [read, to, want] of cases97) check(tasksMod.hasTaskOrder(read, to) === want, `${read.error} ${JSON.stringify(to)}: ${want}`);
+};
+
+cases["S97-places-shared"] = async () => { // R9, R10: places.js agrees with pa_places.py on the rank and pin cases
+  check(Array.isArray(SHARED.rankCases) && SHARED.rankCases.length && Array.isArray(SHARED.pinCases) && SHARED.pinCases.length, "the shared file has rankCases and pinCases");
+  for (const c of SHARED.rankCases) {
+    const ids = placesMod.effectiveOrder(c.jobs.map(sJob), null, c.rank).map((j) => j.id);
+    check(same(ids, c.effective), `${c.name}: ${JSON.stringify(c.effective)} (got ${JSON.stringify(ids)})`);
+  }
+  for (const c of SHARED.pinCases) {
+    const r = placesMod.readOrder(c.orderText);
+    check(r.error === c.error, `${c.name}: error ${JSON.stringify(c.error)} (got ${JSON.stringify(r.error)})`);
+    const ids = placesMod.effectiveOrder(c.jobs.map(sJob), r.start, c.rank).map((j) => j.id);
+    check(same(ids, c.effective), `${c.name}: ${JSON.stringify(c.effective)} (got ${JSON.stringify(ids)})`);
+  }
+};
+
+cases["S97-pins-after"] = async () => { // R10: a Places move writes one pin for that job (its earlier pin replaced, pins of jobs not waiting dropped)
+  check(typeof placesMod?.pinsAfter === "function", "places.js exports pinsAfter");
+  const jobs = ["A", "B", "C", "D"].map(sJob), v2 = (pins) => placesMod.readOrder(JSON.stringify({ version: 2, pins })).start;
+  const pa = (start, id, move, rank = null, js = jobs) => placesMod.pinsAfter({ jobs: js, start, rank, id, move });
+  check(same(pa(null, "D", "top"), [{ id: "D", slot: 0 }]), `no file: one pin (got ${JSON.stringify(pa(null, "D", "top"))})`);
+  check(same(pa(v2([{ id: "A", slot: 2 }]), "D", "up"), [{ id: "A", slot: 2 }, { id: "D", slot: 2 }]), `other pins stay (got ${JSON.stringify(pa(v2([{ id: "A", slot: 2 }]), "D", "up"))})`);
+  check(same(pa(v2([{ id: "D", slot: 0 }]), "D", "down"), [{ id: "D", slot: 1 }]), "the job's earlier pin is replaced");
+  check(same(pa(v2([{ id: "gone", slot: 0 }, { id: "B", slot: 0 }]), "C", "top"), [{ id: "B", slot: 0 }, { id: "C", slot: 0 }]), "a pin of a job not waiting is dropped");
+  const v1 = placesMod.readOrder(JSON.stringify({ version: 1, order: ["C", "gone"] })).start;
+  check(same(pa(v1, "D", "up"), [{ id: "C", slot: 0 }, { id: "D", slot: 2 }]), `a version 1 file's waiting ids carry over as pins (got ${JSON.stringify(pa(v1, "D", "up"))})`);
+  check(same(pa(null, "A", "down", ["B", "A"]), [{ id: "A", slot: 1 }]) && same(pa(null, "B", "down", ["B", "A"]), [{ id: "B", slot: 1 }]), "the slot counts in the ranked order");
+  // pins that interact: the replaced pin would land elsewhere than drawn; every movable job is pinned in the drawn order
+  const x3 = ["A", "B", "X"].map(sJob), start = v2([{ id: "X", slot: 0 }, { id: "B", slot: 1 }]);
+  check(same(placesMod.effectiveOrder(x3, start).map((j) => j.id), ["X", "B", "A"]), "the case's effective order");
+  const got = pa(start, "X", "down", null, x3);
+  check(same(placesMod.effectiveOrder(x3, v2(got)).map((j) => j.id), ["B", "X", "A"]), `the written pins give the order drawn (got ${JSON.stringify(got)})`);
+  check(same(pa(start, "X", "reset", null, x3), []), "Reset order: no pins");
+  check(pa(null, "A", "up") === null && pa(null, "D", "down") === null && pa(null, "gone", "top") === null, "no-ops: null");
+  const q = ["A", { id: "Q", source: "queue" }, "B"].map(sJob);
+  check(pa(null, "Q", "up", null, q) === null && same(pa(null, "B", "up", null, q), [{ id: "B", slot: 0 }]), "a queue job has no pin; slots count the movable jobs");
+};
+
+cases["S97-prune-text"] = async () => { // R4, R1, R8: prune, then the file the panel writes
+  check(typeof tasksMod?.pruneOrder === "function" && typeof tasksMod?.taskOrderText === "function", "tasks.js exports pruneOrder, taskOrderText");
+  const tasks = [{ id: "t-1", state: "queued" }, { id: "t-2", state: "done" }, { id: "t-3", state: "parked" }, { id: "t-4", state: "needs-decision" }, { id: "t-5", state: "done" }, { id: "t-6", state: "review" }];
+  const p = tasksMod.pruneOrder({ order: ["t-1", "gone", "t-2", "t-3"], last: ["t-4", "t-5", "t-6"] }, tasks);
+  check(same(p, { order: ["t-1", "t-3"], last: ["t-4", "t-6"] }), `R4 (got ${JSON.stringify(p)})`);
+  const prev = JSON.stringify({ version: 1, order: [], last: [], moves: Array.from({ length: 20 }, (_, i) => ({ at: "t", task: `t-${i}`, move: "up", section: "queued" })) });
+  const doc = JSON.parse(tasksMod.taskOrderText(prev, { order: ["t-1"], last: ["t-4"] }, { task: "t-1", move: "top", section: "queued" }));
+  check(doc.version === 1 && doc.by === "person" && typeof doc.updated === "string" && /Z$/.test(doc.updated) && same(doc.order, ["t-1"]) && same(doc.last, ["t-4"]), `the head (got ${JSON.stringify(doc)})`);
+  check(doc.moves.length === 20 && doc.moves[0].task === "t-1" && same(Object.keys(doc.moves[19]).sort(), ["at", "move", "section", "task"]) && doc.moves[19].task === "t-1" && doc.moves[19].move === "top" && doc.moves[19].section === "queued", `the last 20 moves (got ${JSON.stringify(doc.moves.slice(-2))})`);
+  const fresh = JSON.parse(tasksMod.taskOrderText("{bad", { order: [], last: [] }, { task: null, move: "reset", section: null }));
+  check(same(fresh.order, []) && same(fresh.last, []) && fresh.moves.length === 1 && fresh.moves[0].move === "reset" && !("task" in fresh.moves[0]), `Reset order over an unreadable file (got ${JSON.stringify(fresh)})`);
+  check(tasksMod.taskOrderText(null, { order: [], last: [] }, { task: "t-1", move: "up", section: "queued" }).endsWith("}\n"), "a trailing newline");
+  check(tasksMod.NOTICE === "task order changed", "the notice");
+};
+
+cases["S97-start-next"] = async () => { // R18 (a): the task to the very top of the ranking; out of last; the chat tasks into order (R12)
+  check(typeof tasksMod?.startNextOrder === "function", "tasks.js exports startNextOrder");
+  const ranking = rk([["t-9", "queued", "chat"], ["t-1", "in-progress", "person"], ["t-2", "queued", "agent"], ["t-3", "queued", "person"]]);
+  check(same(tasksMod.startNextOrder(ranking, "t-2", ["t-1"], ["t-3"]), { order: ["t-2", "t-9", "t-1"], last: ["t-3"] }), `from the agent block (got ${JSON.stringify(tasksMod.startNextOrder(ranking, "t-2", ["t-1"], ["t-3"]))})`);
+  check(same(tasksMod.startNextOrder(ranking, "t-3", ["t-1"], ["t-3"]), { order: ["t-3", "t-9", "t-1"], last: [] }), "from last");
+  check(tasksMod.startNextOrder(rk([["t-1", "queued", "person"], ["t-2", "queued", "agent"]]), "t-1", ["t-1"], []) === null, "already first and the person's: nothing to write");
+  check(tasksMod.startNextOrder(ranking, "gone", [], []) === null, "not in the ranking: null");
+};
+
+cases["S97-done-line"] = async () => { // R20: what stays when the person marks a task done
+  check(typeof tasksMod?.doneLine === "function", "tasks.js exports doneLine");
+  check(tasksMod.doneLine({}) === "Done merges nothing: nothing is left open.", `none (got ${tasksMod.doneLine({})})`);
+  const l = tasksMod.doneLine({ changeRequest: { id: "CR-123" }, worktrees: 2, queueEntries: 1, live: ["t14"] });
+  check(l === "Done merges nothing: change request CR-123 stays unmerged · 2 worktrees stay · 1 merge-queue entry stays · t14 keeps running until you close it.", `all (got ${l})`);
+  const l2 = tasksMod.doneLine({ changeRequest: { url: "https://x" }, worktrees: 1, queueEntries: 2, live: ["t1", "t2"] });
+  check(l2 === "Done merges nothing: its change request stays unmerged · 1 worktree stays · 2 merge-queue entries stay · t1 keeps running until you close it · t2 keeps running until you close it.", `no id (got ${l2})`);
+};
+
+cases["S97-sections"] = async () => { // R5, R13, R14, R15: the sections drawn from the ranking (pure)
+  check(typeof tasksMod?.taskSections === "function", "tasks.js exports taskSections");
+  const tasks = [
+    { id: "t-1", state: "queued" }, { id: "t-2", state: "queued", followUpOf: "t-8" }, { id: "t-3", state: "queued", followUpOf: "t-8" }, { id: "t-4", state: "queued" },
+    { id: "t-5", state: "queued", followUpOf: "t-7" }, { id: "t-6", state: "in-progress" }, { id: "t-10", state: "needs-decision" }, { id: "t-11", state: "done" }, { id: "t-12", state: "parked" }, { id: "t-13", state: "review" }];
+  const ranking = rk([["t-4", "queued", "person"], ["t-6", "in-progress", "person"], ["t-3", "queued", "person"], ["t-10", "needs-decision", "agent"], ["t-1", "queued", "agent"], ["t-13", "review", "agent"], ["t-2", "queued", "agent"], ["t-5", "queued", "chat"], ["t-12", "parked", "agent"]]);
+  ranking[7].quote = "now";
+  const secs = tasksMod.taskSections(tasks, ranking);
+  check(same(secs.map((x) => x.state), ["needs-decision", "review", "in-progress", "queued", "parked", "done"]), `the section order (got ${JSON.stringify(secs.map((x) => x.state))})`);
+  const q = secs.find((x) => x.state === "queued");
+  check(q.ranked && same(q.items.map((i) => i.kind === "fold" ? `fold:${i.origin}` : i.task.id), ["t-4", "fold:t-8", "t-1", "t-5"]), `R14 the fold at its first member's place (got ${JSON.stringify(q.items.map((i) => i.kind === "fold" ? i.origin : i.task.id))})`);
+  const fold = q.items[1];
+  check(fold.count === 2 && fold.first === 2 && same(fold.rows.map((r) => [r.task.id, r.n]), [["t-3", 2], ["t-2", 4]]), `the fold's members and numbers (got ${JSON.stringify(fold)})`);
+  check(tasksMod.foldLine(fold, false) === "▸ 2 follow-ups of t-8 · first #2" && tasksMod.foldLine(fold, true) === "▾ 2 follow-ups of t-8 · first #2", `the fold line (got ${tasksMod.foldLine(fold, false)})`);
+  const r4 = q.items[0], r5 = q.items[3];
+  check(r4.n === 1 && !r4.up && !r4.top && r4.down && r4.bottom && r4.source === "person", `the first row (got ${JSON.stringify(r4)})`);
+  check(r5.n === 5 && r5.up && r5.top && !r5.down && !r5.bottom && r5.source === "chat" && r5.quote === "now", `the last row (got ${JSON.stringify(r5)})`);
+  check(tasksMod.chipText("agent") === "PA" && tasksMod.chipText("chat") === "PA · your words" && tasksMod.chipText("person") === null, "R13 the marker");
+  const nd = secs.find((x) => x.state === "needs-decision");
+  check(!nd.ranked && nd.items[0].n === null && !nd.items[0].up && !nd.items[0].down && !nd.items[0].top && !nd.items[0].bottom, `R5 hidden rank (got ${JSON.stringify(nd)})`);
+  const ip = secs.find((x) => x.state === "in-progress");
+  check(ip.items[0].n === 1 && !ip.items[0].up && !ip.items[0].down, "one row: no move");
+  check(secs.find((x) => x.state === "parked").items[0].n === null && secs.find((x) => x.state === "done").items[0].n === null, "parked and done: no number");
+  // a single follow-up is a normal row (J2-D); parked and done keep the order given (newest first)
+  check(q.items[3].kind === "task", "a lone follow-up is not folded");
+  const pd = tasksMod.taskSections([{ id: "t-2", state: "done" }, { id: "t-1", state: "done" }], []);
+  check(same(pd[0].items.map((i) => i.task.id), ["t-2", "t-1"]), "done keeps the given order");
+  check(tasksMod.taskSections([{ id: "t-1", state: "odd" }], [])[0].state === "odd", "an unknown state still gets a section");
+};
+
+cases["S97-order-line"] = async () => { // R2, R15: the order line above the sections
+  check(typeof tasksMod?.orderLine === "function", "tasks.js exports orderLine");
+  const R = tasksMod.readTaskOrder;
+  check(tasksMod.orderLine(null) === "order: not read yet", "not read yet");
+  check(tasksMod.orderLine(R(null)) === "order: the Project Agent's", "no file");
+  check(tasksMod.orderLine(R('{"version": 1, "order": []}')) === "order: yours · moves are saved to task-order.json and tell the Project Agent", `readable (got ${tasksMod.orderLine(R('{"version": 1, "order": []}'))})`);
+  check(tasksMod.orderLine(R("{x")) === "task order unreadable: task-order.json is not JSON; the Project Agent's order is used", "unreadable: the shared words");
+};
+
+cases["S97-load-write"] = async () => { // R1, R8: one keyed, capped read; compare-and-write locally and on the space's machine
+  check(typeof store.loadTaskOrder === "function" && typeof store.writeTaskOrder === "function", "store.loadTaskOrder and writeTaskOrder exist");
+  world();
+  let r = await store.loadTaskOrder(remote, cx);
+  check(r.missing === true && r.text === null, `missing (got ${JSON.stringify(r)})`);
+  check(g.__issued.some((x) => x.on === M && x.kind === "read" && x.path === `${rdir}/task-order.json`), "read on the space's machine");
+  g.__files[TK(local)] = "{not json";
+  r = await store.loadTaskOrder(local, cx);
+  check(r.missing === false && r.text === "{not json", `an unreadable file keeps its text (got ${JSON.stringify(r)})`);
+  g.__hang = [TK(remote)];
+  const { done, value } = await within(store.loadTaskOrder(remote, cx), 12000, 12);
+  check(done && store.gaveUp(value) && !value.missing, `a hung read gives up (got ${JSON.stringify(value)})`);
+  g.__hang = [];
+  world();
+  await store.writeTaskOrder(local, "A\n", null);
+  check(g.__files[TK(local)] === "A\n", "a new local file");
+  let err = null;
+  try { await store.writeTaskOrder(local, "B\n", "old\n"); } catch (e) { err = String(e.message ?? e); }
+  check(/changed on disk/.test(err ?? "") && g.__files[TK(local)] === "A\n", `a changed file is refused (got ${err})`);
+  await store.writeTaskOrder(remote, "R\n", null);
+  check(g.__files[TK(remote)] === "R\n" && g.__writes.includes(TK(remote)), "a new remote file through the python write");
+  err = null;
+  try { await store.writeTaskOrder(remote, "S\n", "other\n"); } catch (e) { err = String(e.message ?? e); }
+  check(/changed on disk/.test(err ?? "") && g.__files[TK(remote)] === "R\n", `remote: a changed file is refused (got ${err})`);
 };
 
 // ---- t-041 J5: the context line, the Fresh context button and the mode switch (store part) ----

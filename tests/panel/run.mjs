@@ -5886,13 +5886,15 @@ cases["P83-3-move"] = async () => { // AC6.1, AC6.3: a move writes the whole ord
   const { v, dir } = await placesWorld();
   const path = `${dir}/start-order.json`;
   await click(v, "place-top-t-083/design"); await settle();
-  check(typeof g.__files[path] === "string" && JSON.stringify(orderOf(g.__files[path])) === JSON.stringify(["t-083/design", "t-020/verify-2"]), `the new order (got ${g.__files[path]})`);
+  const pinsOf = (text) => JSON.parse(text).pins; // t-097 R10: a Places move writes one pin for the job (version 2)
+  check(typeof g.__files[path] === "string" && JSON.stringify(pinsOf(g.__files[path])) === JSON.stringify([{ id: "t-083/design", slot: 0 }]), `the new pin (got ${g.__files[path]})`);
   const doc = JSON.parse(g.__files[path]);
-  check(doc.version === 1 && doc.by === "person" && doc.moves.length === 1 && doc.moves[0].id === "t-083/design" && doc.moves[0].move === "top", `the file (got ${g.__files[path]})`);
+  check(doc.version === 2 && doc.by === "person" && doc.moves.length === 1 && doc.moves[0].id === "t-083/design" && doc.moves[0].move === "top", `the file (got ${g.__files[path]})`);
   check(/order: yours/.test(look(v).text) && look(v).text.indexOf("1. t-083 design") >= 0, `drawn in the new order (got ${look(v).text})`);
   await click(v, "place-down-t-083/design"); await settle();
+  check(JSON.stringify(pinsOf(g.__files[path])) === JSON.stringify([{ id: "t-083/design", slot: 1 }]), `down: its pin replaced (got ${g.__files[path]})`);
   await click(v, "place-up-t-083/design"); await settle();
-  check(JSON.stringify(orderOf(g.__files[path])) === JSON.stringify(["t-083/design", "t-020/verify-2"]), `after down and up (got ${g.__files[path]})`);
+  check(JSON.stringify(pinsOf(g.__files[path])) === JSON.stringify([{ id: "t-083/design", slot: 0 }]), `after down and up (got ${g.__files[path]})`);
   check(JSON.parse(g.__files[path]).moves.length === 3, "three moves recorded");
   const n = v.unsent.filter((u) => u.message === "start order changed").length;
   check(n === 1, `one notice for three moves (got ${JSON.stringify(v.unsent)})`);
@@ -5946,7 +5948,7 @@ cases["P83-9-unreadable"] = async () => { // AC8.2: an unreadable order: said, t
   check(text.includes("start order unreadable: start-order.json is not JSON; the Project Agent's order is used"), `the line (got ${text.slice(0, 900)})`);
   await click(v, "places-reset"); await settle();
   const doc = JSON.parse(g.__files[`${dir}/start-order.json`]);
-  check(JSON.stringify(doc.order) === JSON.stringify(["t-020/verify-2", "t-083/design"]) && doc.moves.at(-1).move === "reset", `reset to the effective order (got ${JSON.stringify(doc)})`);
+  check(doc.version === 2 && JSON.stringify(doc.pins) === "[]" && doc.moves.at(-1).move === "reset", `t-097 R10: reset writes no pins (got ${JSON.stringify(doc)})`);
 };
 
 cases["P83-10-limits"] = async () => { // AC2.3, AC2.4, AC1.3, AC1.4: defaults, a bad value named, unrecorded and over the limit
@@ -5972,6 +5974,199 @@ cases["P83-11-badges"] = async () => { // R11: badges on task rows; a click unfo
   check(look(v).text.includes("Working · 3 of 4") && v.placeMark?.key === "job:t-083/design", `unfolded and marked (got ${JSON.stringify(v.placeMark)})`);
   advance(3500); await fire(1000);
   check(!v.placeMark, "the mark ends after 3 s");
+};
+
+// ---- t-097 J2: the person's task order and the category moves in the Tasks tab ----
+const TSH = JSON.parse(fs.readFileSync(path.join(here, "..", "samples", "task-order-cases.json"), "utf8"));
+const PSH = JSON.parse(fs.readFileSync(path.join(here, "..", "samples", "places-cases.json"), "utf8"));
+const tq = (id, state, n, extra = {}) => ({ id, title: `Task ${id}`, state, created: `2026-11-${String(n).padStart(2, "0")}T00:00:00Z`, ...extra });
+const tOrder = (order, last = [], updated = "U1") => JSON.stringify({ version: 1, updated, by: "person", order, last, moves: [] });
+// A world with the ledger's tasks (and its taskOrder), task-order.json's text (undefined: no file), open cards and the Tasks view open.
+async function orderWorld({ tasks, taskOrder, order, machine = null, cards = [], waiting, startOrder, queue, terms = [], unfold = [] } = {}) {
+  world({ machine, extraTerms: terms.map((a) => plTerm(machine ? `${machine}/${a}` : a)) });
+  const dir = machine ? `${machine}:${RDIR}` : `:${DIR}`;
+  g.__files[`${dir}/ledger.json`] = JSON.stringify({ tasks, ...(taskOrder !== undefined ? { taskOrder } : {}) });
+  if (order !== undefined) g.__files[`${dir}/task-order.json`] = order;
+  if (waiting !== undefined) g.__files[`${dir}/waiting.json`] = JSON.stringify(waiting);
+  if (startOrder !== undefined) g.__files[`${dir}/start-order.json`] = startOrder;
+  if (queue !== undefined) g.__files[`${dir}/queue.json`] = JSON.stringify(queue);
+  if (cards.length) { g.__ls[`${dir}/decisions`] = cards.map((c) => `${c.id}.json`); for (const c of cards) g.__files[`${dir}/decisions/${c.id}.json`] = JSON.stringify({ question: "Q?", options: [{ label: "A" }], created: "2026-11-16T10:00:00Z", status: "open", ...c }); }
+  const v = await mount(); await settle();
+  await click(v, "view-tasks"); await settle();
+  for (const s of unfold) v.folded.delete(s);
+  return { v, dir, path: `${dir}/task-order.json` };
+}
+const heads = (v) => Object.keys(look(v).clicks).filter((k) => k.startsWith("task-head-")).map((k) => k.slice(10));
+const paTask = (action) => (g.__execs ?? []).filter(([c, a]) => c === "pa-task" && (!action || a[0] === action));
+
+cases["P97-1-shared-rank"] = async () => { // R3, R5: every shared rank case drawn: each ranked section in its ranking's order
+  for (const c of TSH.rankCases) {
+    const tasks = c.tasks.map((t) => ({ title: `Task ${t.id}`, ...t }));
+    const { v } = await orderWorld({ tasks, taskOrder: c.taskOrder ?? undefined, order: c.fileText ?? undefined, unfold: ["parked"] });
+    const shown = heads(v);
+    for (const state of ["needs-decision", "review", "in-progress", "investigating", "queued"]) {
+      const want = c.expect.map(([id]) => id).filter((id) => tasks.find((t) => t.id === id)?.state === state);
+      const got = shown.filter((id) => tasks.find((t) => t.id === id)?.state === state);
+      check(JSON.stringify(got) === JSON.stringify(want), `${c.name}: ${state} ${JSON.stringify(want)} (got ${JSON.stringify(got)})`);
+    }
+  }
+};
+
+cases["P97-2-line-markers"] = async () => { // R2, R13, R15: the order line, the per-section numbers, the PA marker, the chat quote
+  const tasks = [tq("t-1", "queued", 1), tq("t-2", "queued", 2), tq("t-3", "queued", 3), tq("t-4", "in-progress", 4)];
+  let { v } = await orderWorld({ tasks });
+  let text = look(v).text;
+  check(text.includes("order: the Project Agent's") && (text.match(/ \| PA \| /g) ?? []).length === 4, `no file: every ranked row is PA (got ${text})`);
+  check(/ \| 1 \| t-1 \| /.test(text) && / \| 3 \| t-3 \| /.test(text) && / \| 1 \| t-4 \| /.test(text), `R15 numbers per section (got ${text})`);
+  ({ v } = await orderWorld({ tasks, order: tOrder(["t-2"]), taskOrder: { order: [], chat: [{ task: "t-3", quote: "do t-3 now", over: "U1" }] } }));
+  text = look(v).text;
+  check(text.includes("order: yours · moves are saved to task-order.json and tell the Project Agent"), `readable: yours (got ${text})`);
+  check(/ \| 1 \| t-3 \| /.test(text) && / \| 2 \| t-2 \| /.test(text) && text.includes("PA · your words") && (text.match(/ \| PA \| /g) ?? []).length === 2, `chat first, the person's unmarked (got ${text})`);
+  await click(v, "task-head-t-3");
+  check(look(v).text.includes('You asked in chat: "do t-3 now"'), `the quote when expanded (got ${look(v).text})`);
+};
+
+cases["P97-3-move"] = async () => { // R7, R8: a move writes task-order.json by compare-and-write; drawn in the new order; one notice
+  const tasks = [tq("t-1", "queued", 1), tq("t-2", "queued", 2), tq("t-3", "queued", 3), tq("t-9", "done", 9)];
+  const { v, path } = await orderWorld({ tasks });
+  const c = look(v).clicks;
+  check(!c["tmove-up-t-1"] && !c["tmove-top-t-1"] && c["tmove-down-t-1"] && c["tmove-bottom-t-1"] && c["tmove-up-t-3"] && c["tmove-top-t-3"] && !c["tmove-down-t-3"] && !c["tmove-bottom-t-3"], `buttons only where a move does something (have ${Object.keys(c).filter((k) => k.startsWith("tmove"))})`);
+  await click(v, "tmove-top-t-3"); await settle();
+  const doc = JSON.parse(g.__files[path]);
+  check(doc.version === 1 && doc.by === "person" && JSON.stringify(doc.order) === '["t-3"]' && JSON.stringify(doc.last) === "[]" && doc.moves.length === 1 && doc.moves[0].task === "t-3" && doc.moves[0].move === "top" && doc.moves[0].section === "queued", `the file (got ${g.__files[path]})`);
+  check(JSON.stringify(heads(v).slice(0, 3)) === '["t-3","t-1","t-2"]', `drawn in the new order (got ${JSON.stringify(heads(v))})`);
+  await click(v, "tmove-bottom-t-1"); await settle();
+  const d2 = JSON.parse(g.__files[path]);
+  check(JSON.stringify(d2.order) === '["t-3"]' && JSON.stringify(d2.last) === '["t-1"]' && d2.moves.length === 2, `bottom: to last (got ${g.__files[path]})`);
+  check(JSON.stringify(heads(v).slice(0, 3)) === '["t-3","t-2","t-1"]', `drawn (got ${JSON.stringify(heads(v))})`);
+  check(v.unsent.filter((u) => u.message === "task order changed").length === 1, `one notice for two moves (got ${JSON.stringify(v.unsent)})`);
+  check(paTask().length === 0, "a move runs no pa-task");
+};
+
+cases["P97-4-stale-busy"] = async () => { // R8: a file changed since the read is refused and said; nothing while a write is in flight
+  const tasks = [tq("t-1", "queued", 1), tq("t-2", "queued", 2)];
+  let { v, path } = await orderWorld({ tasks, order: tOrder([]) });
+  const other = tOrder(["t-2"], [], "U9");
+  g.__files[path] = other;
+  await click(v, "tmove-up-t-2"); await settle();
+  check(g.__files[path] === other && /changed on disk/.test(look(v).text), `refused and said (got ${look(v).text.slice(0, 900)})`);
+  check(!v.unsent.some((u) => u.message === "task order changed"), "no notice for a refused write");
+  ({ v, path } = await orderWorld({ tasks }));
+  v.taskOrderBusy[S] = true;
+  await click(v, "tmove-up-t-2"); await settle();
+  check(g.__files[path] === undefined, "busy: nothing written");
+};
+
+cases["P97-5-remote"] = async () => { // R1: read and written on the space's machine
+  const tasks = [tq("t-1", "queued", 1), tq("t-2", "queued", 2)];
+  const { v, path } = await orderWorld({ tasks, machine: M });
+  check(g.__issued.some((x) => x.on === M && x.kind === "read" && x.path === `${RDIR}/task-order.json`), "read on the machine");
+  await click(v, "tmove-up-t-2"); await settle();
+  check(g.__writes.includes(path) && JSON.stringify(JSON.parse(g.__files[path]).order) === '["t-2","t-1"]', `written there (got ${g.__files[path]})`);
+};
+
+cases["P97-6-unreadable"] = async () => { // R2: the line, the Project Agent's order, Reset order writes over that text
+  const tasks = [tq("t-1", "queued", 1), tq("t-2", "queued", 2)];
+  const { v, path } = await orderWorld({ tasks, order: "{bad" });
+  const text = look(v).text;
+  check(text.includes("task order unreadable: task-order.json is not JSON; the Project Agent's order is used") && (text.match(/ \| PA \| /g) ?? []).length === 2, `the line (got ${text})`);
+  await click(v, "task-order-reset"); await settle();
+  const doc = JSON.parse(g.__files[path]);
+  check(doc.version === 1 && JSON.stringify(doc.order) === "[]" && JSON.stringify(doc.last) === "[]" && doc.moves.at(-1).move === "reset", `reset (got ${g.__files[path]})`);
+  check(look(v).text.includes("order: yours"), "readable now");
+};
+
+cases["P97-7-start-next"] = async () => { // R18: the rank first (to the very top), then pa-task next; a refused write runs nothing
+  const tasks = [tq("t-1", "in-progress", 1), tq("t-2", "queued", 2), tq("t-3", "queued", 3)];
+  let { v, path } = await orderWorld({ tasks });
+  check(Boolean(look(v).clicks["next-t-3"]) && !look(v).clicks["next-t-1"] && Boolean(look(v).clicks["pause-t-1"]) && !look(v).clicks["pause-t-3"], "Start next on Queued, Pause on In progress");
+  await click(v, "next-t-3"); await settle();
+  check(JSON.stringify(JSON.parse(g.__files[path]).order) === '["t-3"]' && JSON.parse(g.__files[path]).moves.at(-1).move === "next", `the rank (got ${g.__files[path]})`);
+  const runs = paTask("next");
+  check(runs.length === 1 && JSON.stringify(runs[0][1]) === '["next","t-3","--space","sp1"]', `pa-task next (got ${JSON.stringify(g.__execs)})`);
+  ({ v, path } = await orderWorld({ tasks, order: tOrder([]) }));
+  g.__files[path] = tOrder(["t-2"], [], "U9");
+  await click(v, "next-t-3"); await settle();
+  check(paTask().length === 0 && /changed on disk/.test(look(v).text), `refused: nothing runs (got ${JSON.stringify(g.__execs)})`);
+};
+
+cases["P97-8-pause"] = async () => { // R19: Pause runs pa-task pause, the rank unchanged; a paused row: the chip, Start next and Unpause
+  const tasks = [tq("t-1", "in-progress", 1), tq("t-4", "investigating", 4), tq("t-2", "queued", 2, { paused: { at: "2026-11-19T10:00:00Z", by: "person" } }), tq("t-3", "review", 3)];
+  const { v, path } = await orderWorld({ tasks });
+  check(Boolean(look(v).clicks["pause-t-4"]) && !look(v).clicks["pause-t-3"] && !look(v).clicks["next-t-3"], "Pause on investigating; review: neither (R21)");
+  await click(v, "pause-t-1"); await settle();
+  check(paTask("pause").length === 1 && paTask("pause")[0][1][1] === "t-1" && g.__files[path] === undefined, `pa-task pause, no order write (got ${JSON.stringify(g.__execs)})`);
+  check(look(v).text.includes(" | paused | ") && Boolean(look(v).clicks["unpause-t-2"]) && Boolean(look(v).clicks["next-t-2"]), `the paused row (got ${look(v).text})`);
+  await click(v, "unpause-t-2"); await settle();
+  check(paTask("unpause").length === 1 && paTask("unpause")[0][1][1] === "t-2", "pa-task unpause");
+};
+
+cases["P97-9-open-card"] = async () => { // R17: a needs-decision task with an open card: no moves out, the line; Delete stays
+  const tasks = [tq("t-1", "needs-decision", 1), tq("t-2", "needs-decision", 2)];
+  const { v } = await orderWorld({ tasks, cards: [{ id: "d-231", task: "t-1" }, { id: "d-232", task: "t-2", status: "answered", answer: "A" }] });
+  await click(v, "task-head-t-1"); await click(v, "task-head-t-2");
+  const { text, clicks } = look(v);
+  check(text.includes("Answer d-231 first, or ask the Project Agent to withdraw it."), `the line (got ${text})`);
+  check(!clicks["done-t-1"] && !clicks["park-t-1"] && !clicks["pause-t-1"] && !clicks["next-t-1"] && Boolean(clicks["delete-t-1"]), `no move out, Delete stays (have ${Object.keys(clicks)})`);
+  check(Boolean(clicks["done-t-2"]) && Boolean(clicks["park-t-2"]), "an answered card: Park and Mark done as usual");
+  check(!Object.keys(clicks).some((k) => /^tmove-.*t-[12]$/.test(k)) && !/ \| 1 \| t-1 \| /.test(text), "hidden rank: no number, no moves");
+};
+
+cases["P97-10-done-confirm"] = async () => { // R20: Mark done takes two clicks; the first says what stays
+  const tasks = [tq("t-1", "in-progress", 1, { changeRequest: { id: "CR-123" }, worktree: "/wt/t-1-a", worktrees: [{ path: "/wt/t-1-b", job: "b" }], workers: [{ address: "t14", role: "build", name: "t-1-build" }] }), tq("t-2", "queued", 2)];
+  const queue = { version: 1, repos: { "/r": { main: "main", entries: [{ task: "t-1", branch: "t-1-a", state: "checking" }] } } };
+  const { v } = await orderWorld({ tasks, queue, terms: ["t14"] });
+  await click(v, "task-head-t-1");
+  await click(v, "done-t-1"); await settle();
+  check(paTask("done").length === 0, "one click runs nothing");
+  const text = look(v).text;
+  check(text.includes("Done merges nothing: change request CR-123 stays unmerged · 2 worktrees stay · 1 merge-queue entry stays · t14 keeps running until you close it."), `the line (got ${text})`);
+  await click(v, "done-cancel-t-1");
+  check(!look(v).text.includes("Done merges nothing") && paTask("done").length === 0, "Cancel");
+  await click(v, "done-t-1"); await click(v, "done-confirm-t-1"); await settle();
+  check(paTask("done").length === 1 && paTask("done")[0][1][1] === "t-1", `confirmed: pa-task done (got ${JSON.stringify(g.__execs)})`);
+  await click(v, "task-head-t-2"); await click(v, "done-t-2");
+  check(look(v).text.includes("Done merges nothing: nothing is left open."), "nothing open");
+};
+
+cases["P97-11-fold"] = async () => { // R14: the follow-ups of one origin fold into one line at the first member's place
+  const tasks = [tq("t-1", "queued", 1), tq("t-2", "queued", 2, { followUpOf: "t-8" }), tq("t-3", "queued", 3, { followUpOf: "t-8" }), tq("t-4", "queued", 4, { followUpOf: "t-8" }), tq("t-5", "queued", 5)];
+  const { v } = await orderWorld({ tasks });
+  let text = look(v).text;
+  check(text.includes("▸ 3 follow-ups of t-8 · first #2") && JSON.stringify(heads(v)) === '["t-1","t-5"]', `folded (got ${text}; ${JSON.stringify(heads(v))})`);
+  await click(v, "fold-queued-t-8");
+  text = look(v).text;
+  check(text.includes("▾ 3 follow-ups of t-8 · first #2") && JSON.stringify(heads(v)) === '["t-1","t-2","t-3","t-4","t-5"]' && Boolean(look(v).clicks["tmove-up-t-3"]), `unfolded: normal rows (got ${JSON.stringify(heads(v))})`);
+};
+
+cases["P97-12-places-rank"] = async () => { // R9, R27: the waiting list follows the task order only once one exists
+  const tasks = [tq("t-1", "queued", 1), tq("t-2", "queued", 2)];
+  const waiting = { version: 1, jobs: [P83.job("t-2/build", "working"), P83.job("t-1/build", "working")] };
+  let { v } = await orderWorld({ tasks, waiting });
+  let text = look(v).text;
+  check(text.indexOf("1. t-2 build") >= 0 && text.indexOf("2. t-1 build") >= 0, `no task order: the added order (got ${text})`);
+  ({ v } = await orderWorld({ tasks, waiting, order: tOrder([]) }));
+  text = look(v).text;
+  check(text.indexOf("1. t-1 build") >= 0 && text.indexOf("2. t-2 build") >= 0, `a task order: by rank (got ${text})`);
+  ({ v } = await orderWorld({ tasks, waiting, taskOrder: { order: ["t-2"], chat: [] } }));
+  check(look(v).text.indexOf("1. t-2 build") >= 0, "the ledger's taskOrder counts");
+  ({ v } = await orderWorld({ tasks, waiting: { version: 1, jobs: [P83.job("t-1/build", "working"), P83.job("t-2/build", "working")] } }));
+  check(look(v).text.indexOf("1. t-1 build") >= 0, "before the move");
+  await click(v, "tmove-up-t-2"); await settle();
+  text = look(v).text;
+  check(text.indexOf("1. t-2 build") >= 0, `a task move moves its jobs (got ${text})`);
+};
+
+cases["P97-13-shared-places"] = async () => { // R9, R10: the shared rank and pin cases drawn in the Places list
+  const label = (id) => { const [task, job] = id.split("/"); return `${task} ${job}`; };
+  for (const c of [...PSH.rankCases, ...PSH.pinCases]) {
+    const jobs = c.jobs.map((j) => { const x = typeof j === "string" ? { id: j } : j; return P83.job(x.id, "working", { source: x.source ?? "pa" }); });
+    const tasks = c.rank.map((id, i) => tq(id, "queued", i + 1));
+    const { v } = await orderWorld({ tasks, waiting: { version: 1, jobs }, order: tOrder(c.rank), startOrder: c.orderText ?? undefined });
+    const text = look(v).text;
+    const at = c.effective.map((id, i) => text.indexOf(`${i + 1}. ${label(id)} `));
+    check(at.every((x) => x >= 0), `${c.name}: ${JSON.stringify(c.effective)} (got ${text.slice(text.indexOf("Waiting ·"), text.indexOf("Waiting ·") + 400)})`);
+  }
 };
 
 // ---- t-041 J5: the context line (R15), the Fresh context button (R6), the mode switch (R13), the reset line (C6) ----
