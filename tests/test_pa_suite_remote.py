@@ -650,6 +650,44 @@ class X17Places(Remote):
         self.assertIn("needs_login", box2)
         self.assertTrue([l for l in out.splitlines() if l.startswith("this Mac")], out)
 
+    def test_x17b_places_json(self):
+        """t-119 R1: --places --json: the same machines, probe and holders as one JSON object; takes no slot."""
+        self.setenv(STUB_HC_FAIL="down:box-2")
+        self.hold(self.machine_slot("box-1", 1))
+        self.hold(os.path.join(pa_suite.slot_dir(), "slot-0"))
+        code, out = self.main("--places", "--json")
+        self.assertEqual(code, 0, out)
+        doc = json.loads(out)
+        self.assertEqual(doc["version"], 1)
+        self.assertEqual(doc["notes"], [])
+        self.assertEqual([m["machine"] for m in doc["machines"]], ["box-1", "box-2"])
+        box1, box2 = doc["machines"]
+        self.assertEqual((box1["cap"], box1["reachable"], box1["reason"]), (2, True, None))
+        self.assertTrue(box1["os"])
+        self.assertEqual([(h["task"], h["worker"], h["start"]) for h in box1["holders"]], [("t-holder", "t9", "now")])
+        self.assertEqual(set(box1["holders"][0]), {"task", "worker", "pid", "start", "what", "dir"})
+        self.assertEqual((box2["cap"], box2["reachable"], box2["holders"]), (1, False, []))
+        self.assertIn("needs_login", box2["reason"])
+        self.assertEqual(doc["local"]["cap"], pa_suite.cap())
+        self.assertEqual([h["task"] for h in doc["local"]["holders"]], ["t-holder"])
+        self.assertFalse(os.path.exists(self.machine_slot("box-1", 0)))  # peeked, not taken: no slot file made
+
+    def test_x17c_places_json_bad_entries_and_none(self):
+        """t-119 R1: the bad entries are notes; no machines: an empty list and this Mac."""
+        self.configure([{"machine": "box 1"}])
+        code, out = self.main("--places", "--json")
+        self.assertEqual(code, 0, out)
+        doc = json.loads(out)
+        self.assertEqual(doc["machines"], [])
+        self.assertEqual(len(doc["notes"]), 1)
+        self.assertIn("box 1", doc["notes"][0])
+        self.assertEqual(doc["local"]["holders"], [])
+
+    def test_x17d_json_needs_places(self):
+        code, out = self.main("--json")
+        self.assertEqual(code, 2, out)
+        self.assertIn("--json", out)
+
 
 class X18Docs(unittest.TestCase):
     def read(self, *path):
@@ -670,9 +708,9 @@ class X18Docs(unittest.TestCase):
     def test_x18c_help_and_docstring(self):
         r = subprocess.run([sys.executable, PA_FULL_SUITE, "--help"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                            universal_newlines=True)
-        for flag in ("--local", "--on", "--places"):
+        for flag in ("--local", "--on", "--places", "--json"):
             self.assertIn(flag, r.stdout)
-        for flag in ("--local", "--on", "--places", "suiteMachines"):
+        for flag in ("--local", "--on", "--places", "--places --json", "suiteMachines"):
             self.assertIn(flag, pa_suite.__doc__)
 
     def test_x18d_no_machine_name_outside_tests_and_readme(self):

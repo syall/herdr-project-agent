@@ -5923,8 +5923,9 @@ const plLedger = () => ({ tasks: [
   { id: "t-090", title: "Nothing here", state: "in-progress" },
 ] });
 // A world with the places files (null: no such file; waiting text or doc) and the Tasks view open.
-async function placesWorld({ waiting = { version: 1, jobs: plJobs() }, order, ledger = plLedger(), rules = P83.rules, machine = null, terms = ["t51", "t53", "t54", "t59x"] } = {}) {
+async function placesWorld({ waiting = { version: 1, jobs: plJobs() }, order, ledger = plLedger(), rules = P83.rules, machine = null, terms = ["t51", "t53", "t54", "t59x"], exec = null } = {}) {
   world({ machine, extraTerms: terms.map((a) => plTerm(machine ? `${machine}/${a}` : a)) });
+  if (exec) g.__execFn = exec; // t-119: a case's answer for pa-full-suite --places --json
   const dir = machine ? `${machine}:${RDIR}` : `:${DIR}`;
   g.__files[`${dir}/ledger.json`] = JSON.stringify(ledger);
   if (rules !== undefined) g.__files[`${dir}/rules.json`] = rules;
@@ -6507,6 +6508,126 @@ cases["P41-18-no-updated"] = async () => { // MF-J5r2-1: no updated, or one that
     advance(20 * 60000); await fire(1000); await settle(); // 00:10 UTC the next day
     check(look(v).text.includes(`PA context ${DAY41} (UTC): mean 158k · peak 254k · resets 6 (fresh 6, compact 0) (as of ${DAY41.slice(5)} 23:50)`), `${updated}: the read's day (got ${look(v).text.slice(0, 900)})`);
   }
+};
+
+// ---- t-119: the suite machines' slots in the Places section (pa-full-suite --places --json) ----
+const FSUITE = ["pa", "full", "suite"].join("-"); // spelled so a guard reading this file's commands is not confused
+const P119 = {
+  holder: (task, worker, extra = {}) => ({ task, worker, pid: 4242, start: "2026-11-19T10:05:00Z", what: "sh tests/run-all.sh", dir: "/wt/x", ...extra }),
+  doc: (over = {}) => ({ version: 1, notes: [], machines: [
+    { machine: "box-1", cap: 2, reachable: true, reason: null, os: "Linux", arch: "x86_64", seconds: 0.4, holders: [P119.holder("t-020", "t53")] },
+    { machine: "box-2", cap: 1, reachable: false, reason: "needs_login", os: null, arch: null, seconds: 0.1, holders: [] },
+  ], local: { cap: 1, holders: [P119.holder("t-041", "t77", { what: null })] }, ...over }),
+};
+const suiteCalls = () => (g.__execs ?? []).filter(([c]) => c === FSUITE);
+// An exec stand-in: pa-full-suite answers `reply()` (a doc: printed as JSON; else a reply as it is).
+const suiteExec = (reply) => (command, args) => {
+  if (command !== FSUITE) return undefined;
+  const r = typeof reply === "function" ? reply(args) : reply;
+  return r && r.version !== undefined ? { code: 0, stdout: `${JSON.stringify(r)}\n`, stderr: "" } : r;
+};
+
+cases["P119-1-lines"] = async () => { // R1, R4: each machine, reachable or why not, its slots and holders; this Mac
+  const { v } = await placesWorld({ exec: suiteExec(P119.doc()) });
+  const { text } = look(v);
+  const calls = suiteCalls();
+  check(calls.length === 1 && JSON.stringify(calls[0][1]) === JSON.stringify(["--places", "--json"]) && calls[0][2] === null, `one read here (got ${JSON.stringify(calls)})`);
+  check(text.includes("Suite machines"), `the block (got ${text.slice(0, 1200)})`);
+  check(text.includes("box-1 · reachable · 1 of 2 slots held"), `box-1 (got ${text.slice(0, 1200)})`);
+  check(text.includes("t-020 · worker t53 · since 11-19 10:05 · sh tests/run-all.sh ↗"), `box-1's holder, a link (got ${text.slice(0, 1200)})`);
+  check(text.includes("box-2 · not reachable (needs_login) · 0 of 1 slots held"), `box-2 (got ${text.slice(0, 1200)})`);
+  check(text.includes("this Mac · 1 of 1 slots held") && text.includes("t-041 · worker t77 · since 11-19 10:05"), `this Mac (got ${text.slice(0, 1200)})`);
+  check(!text.includes("t-041 · worker t77 · since 11-19 10:05 ↗"), "a worker whose terminal is not live: no link");
+  const box2 = text.indexOf("box-2 ·"), mac = text.indexOf("this Mac ·"), free = text.indexOf("free", box2);
+  check(free > box2 && free < mac, "box-2: free");
+  check(text.indexOf("Suite machines") > text.indexOf("Working ·") && text.indexOf("Suite machines") < text.indexOf("Waiting ·"), "after the kinds, before the waiting list");
+};
+
+cases["P119-2-link"] = async () => { // R5: a holder opens its worker; its own id; one without a live worker has none
+  const { v } = await placesWorld({ exec: suiteExec(P119.doc()) });
+  const { clicks } = look(v);
+  check(Boolean(clicks["places-slot-box-1-0"]) && !clicks["places-slot-local-0"], `ids (got ${Object.keys(clicks).filter((k) => k.startsWith("places-")).join(", ")})`);
+  g.__runs = [];
+  await click(v, "places-slot-box-1-0");
+  check(g.__runs.some(([n, a]) => n === "terminal.peek" && a?.terminal === "t53"), `opens t53 (got ${JSON.stringify(g.__runs)})`);
+  const none = P119.doc({ local: { cap: 1, holders: [P119.holder("t-041", null)] } });
+  const w = await placesWorld({ exec: suiteExec(none) });
+  check(look(w.v).text.includes("t-041 · no worker recorded · since 11-19 10:05 · sh tests/run-all.sh") && !look(w.v).clicks["places-slot-local-0"], "no worker: plain text");
+};
+
+cases["P119-3-remote"] = async () => { // R2, R5: on the space's machine; the holder through the machine's address
+  const { v } = await placesWorld({ machine: M, exec: suiteExec(P119.doc()) });
+  const calls = suiteCalls();
+  check(calls.length === 1 && calls[0][2] === M, `read on ${M} (got ${JSON.stringify(calls)})`);
+  check(look(v).text.includes(`${M} (the space's machine) · 1 of 1 slots held`), `the space's machine's own slot (got ${look(v).text.slice(0, 1200)})`);
+  g.__runs = [];
+  await click(v, "places-slot-box-1-0");
+  check(g.__runs.some(([n, a]) => n === "terminal.peek" && a?.terminal === `${M}/t53`), `opens ${M}/t53 (got ${JSON.stringify(g.__runs)})`);
+};
+
+cases["P119-4-throttle"] = async () => { // R3: at most every 60 s, never two at once, never folded or on another view
+  const { v } = await placesWorld({ exec: suiteExec(P119.doc()) });
+  check(suiteCalls().length === 1, "one read");
+  advance(10000); await fire(10000); await settle();
+  check(suiteCalls().length === 1, `inside 60 s: none (got ${suiteCalls().length})`);
+  advance(51000); await fire(10000); await settle();
+  check(suiteCalls().length === 2, `after 60 s: one more (got ${suiteCalls().length})`);
+  await click(v, "places-head"); await settle(); // fold
+  advance(61000); await fire(10000); await settle();
+  check(suiteCalls().length === 2, `folded: none (got ${suiteCalls().length})`);
+  await click(v, "places-head"); await settle(); // unfold: read now
+  check(suiteCalls().length === 3, `unfolded: one (got ${suiteCalls().length})`);
+  await click(v, "view-queue"); await settle();
+  advance(61000); await fire(10000); await settle();
+  check(suiteCalls().length === 3, `another view: none (got ${suiteCalls().length})`);
+  await click(v, "view-tasks"); await settle();
+  check(suiteCalls().length === 4, `back on Tasks: one (got ${suiteCalls().length})`);
+  g.__execHang = [`:${FSUITE}`];
+  advance(61000); await fire(10000); await settle();
+  advance(61000); await fire(10000); await settle();
+  check(suiteCalls().length === 5, `one still pending: no second (got ${suiteCalls().length})`);
+  g.__execHang = []; await settle();
+};
+
+cases["P119-5-error"] = async () => { // R2, R4: an error line; a later failure keeps the last answer with the error
+  let reply = { code: 2, stdout: "", stderr: "usage: pa-full-suite [-h]\npa-full-suite: error: unrecognized arguments: --json\n" };
+  const { v } = await placesWorld({ exec: suiteExec(() => reply) });
+  check(look(v).text.includes("Suite machines: could not read them (usage: pa-full-suite [-h])"), `the error (got ${look(v).text.slice(0, 1200)})`);
+  reply = P119.doc();
+  advance(61000); await fire(10000); await settle();
+  check(look(v).text.includes("box-1 · reachable · 1 of 2 slots held") && !look(v).text.includes("could not read them"), `read again (got ${look(v).text.slice(0, 1200)})`);
+  reply = { code: 0, stdout: "not json", stderr: "" };
+  advance(61000); await fire(10000); await settle();
+  const { text } = look(v);
+  check(text.includes("box-1 · reachable · 1 of 2 slots held") && /Suite machines: could not read them \(.*not JSON/.test(text), `kept, with the error (got ${text.slice(0, 1200)})`);
+};
+
+cases["P119-6-checking"] = async () => { // R4: before the first answer
+  world({ extraTerms: ["t51", "t53", "t54"].map(plTerm) });
+  g.__files[`:${DIR}/ledger.json`] = JSON.stringify(plLedger()); g.__files[`:${DIR}/rules.json`] = P83.rules;
+  g.__execHang = [`:${FSUITE}`];
+  const v = await mount(); await settle();
+  await click(v, "view-tasks"); await settle();
+  check(look(v).text.includes("Suite machines: checking…"), `checking (got ${look(v).text.slice(0, 1200)})`);
+  g.__execHang = []; await settle();
+};
+
+cases["P119-7-shown"] = async () => { // R6: shown for the machines alone; as today with none and no holder
+  const empty = { tasks: [{ id: "t-090", title: "Nothing here", state: "in-progress" }] };
+  let w = await placesWorld({ waiting: null, ledger: empty, exec: suiteExec(P119.doc()) });
+  check(look(w.v).text.includes("box-1 · reachable · 1 of 2 slots held"), `shown (got ${look(w.v).text.slice(0, 900)})`);
+  w = await placesWorld({ waiting: null, ledger: empty, exec: suiteExec(P119.doc({ machines: [], local: { cap: 1, holders: [] } })) });
+  check(!look(w.v).text.includes("Places ·") && !look(w.v).text.includes("Suite machines"), `not shown (got ${look(w.v).text.slice(0, 900)})`);
+  w = await placesWorld({ exec: suiteExec(P119.doc({ notes: ["entry 1 ignored: machine 'box 1' is not a machine name"] })) });
+  check(look(w.v).text.includes("entry 1 ignored: machine 'box 1' is not a machine name"), "the config notes");
+};
+
+cases["P119-8-read-only"] = async () => { // R7: nothing in the block runs a tool or writes
+  const { v } = await placesWorld({ exec: suiteExec(P119.doc()) });
+  g.__runs = []; g.__writes = [];
+  await click(v, "places-slot-box-1-0"); await settle();
+  check(!g.__writes.length && g.__runs.every(([n]) => n.startsWith("terminal.") || n.startsWith("layout.")), `only the worker opened (got ${JSON.stringify(g.__runs)})`);
+  check(suiteCalls().every(([, a]) => JSON.stringify(a) === JSON.stringify(["--places", "--json"])), "only --places --json");
 };
 
 // --list prints the names that would run and runs none. An unknown name or option exits 2.

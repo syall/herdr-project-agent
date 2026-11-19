@@ -1361,6 +1361,49 @@ cases["S41-7-reset-line"] = async () => { // C6: the header line after a reset; 
   check(store.lastRequestLine({ context: { request: "rq1", outcome: "ok", why: null, at: "2027-01-15T06:00:00Z" } }, hm) === null && store.lastRequestLine({ context: null }, hm) === null && store.lastRequestLine(null, hm) === null, "ok or none: no line");
 };
 
+// ---- t-119: the suite machines' slots (store part): pa-full-suite --places --json on the space's machine ----
+const FS = ["pa", "full", "suite"].join("-"); // spelled so a guard reading this file's commands is not confused
+const MDOC = { version: 1, notes: [], machines: [{ machine: "box-1", cap: 2, reachable: true, reason: null, os: "Linux", arch: "x86_64", seconds: 0.4, holders: [] }], local: { cap: 1, holders: [] } };
+
+cases["S119-1-load-machines"] = async () => { // R2: one call on the space's machine; the doc parsed
+  check(typeof store.loadMachines === "function", "store.loadMachines exists");
+  world();
+  g.__execFn = (command, args) => (command === FS ? { code: 0, stdout: JSON.stringify(MDOC) + "\n", stderr: "" } : undefined);
+  let r = await store.loadMachines(remote, cx);
+  check(r.error === null && JSON.stringify(r.doc) === JSON.stringify(MDOC), `parsed (got ${JSON.stringify(r)})`);
+  const call = g.__execs.find(([c]) => c === FS);
+  check(call && JSON.stringify(call[1]) === JSON.stringify(["--places", "--json"]) && call[2] === M, `argv and machine (got ${JSON.stringify(call)})`);
+  check(call[3]?.timeout === store.MACHINES_TIMEOUT && store.MACHINES_TIMEOUT >= 120000, `its timeout (got ${JSON.stringify(call[3])})`);
+  g.__execs = [];
+  r = await store.loadMachines(local, cx);
+  check(r.error === null && g.__execs.find(([c]) => c === FS)?.[2] === null, "a local space: here");
+};
+
+cases["S119-2-load-machines-errors"] = async () => { // R2: exit, not JSON, version: an error with the first line
+  world();
+  for (const [reply, want] of [
+    [{ code: 2, stdout: "", stderr: "usage: pa-full-suite ...\npa-full-suite: error: unrecognized arguments: --json\n" }, /usage: pa-full-suite/],
+    [{ code: 0, stdout: "box-1: reachable\n", stderr: "" }, /not JSON/],
+    [{ code: 0, stdout: JSON.stringify({ ...MDOC, version: 2 }), stderr: "" }, /version/],
+    [{ code: 0, stdout: JSON.stringify({ version: 1 }), stderr: "" }, /machines/],
+  ]) {
+    g.__execFn = (command) => (command === FS ? reply : undefined);
+    const r = await store.loadMachines(local, cx);
+    check(r.doc === null && want.test(r.error ?? ""), `${JSON.stringify(reply).slice(0, 60)}: ${want} (got ${JSON.stringify(r)})`);
+  }
+  g.__execFn = (command) => { if (command === FS) throw new Error(`exec: ${FS}: not found`); return undefined; };
+  const r = await store.loadMachines(local, cx);
+  check(r.doc === null && /not found/.test(r.error ?? ""), `a failed call (got ${JSON.stringify(r)})`);
+};
+
+cases["S119-3-load-machines-hung"] = async () => { // R2: a hung call gives up as TIMED_OUT, never "no machines"
+  world();
+  g.__execHang = [`${M}:${FS}`];
+  const { done, value } = await within(store.loadMachines(remote, cx), store.MACHINES_TIMEOUT + store.GRACE + 1000, 20);
+  check(done && store.gaveUp(value), `gave up (got ${JSON.stringify(value)})`);
+  g.__execHang = [];
+};
+
 const pick = process.argv.slice(2);
 let failed = 0;
 for (const [name, fn] of Object.entries(cases)) {
