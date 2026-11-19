@@ -11,6 +11,7 @@ import json
 import os
 import sys
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from queue_fixtures import *  # noqa: F401,F403
@@ -374,6 +375,25 @@ class M5Once(MBase):
         self.assertEqual(self.merged(), [], out + err)
         self.assertIsNone(self.approval("t-A"))
         self.assertIn("t-A", out)
+
+    def test_m5c_a_rejoin_in_the_same_second_is_not_approved_by_the_old_card(self):
+        # AC9.2, R9 (1), D-J3b-10: a fixed clock puts the card, the out and the new add in one second (as a fast
+        # machine does), so 'added' and the checked digests are all the same; the old card still binds only the
+        # entry instance it listed.
+        fixed = "2026-01-02T03:04:05Z"
+        with mock.patch.object(pa, "now", return_value=fixed):
+            self.joined("t-A", "fa.txt")
+            self.assertEqual(self.make_card()[0], 0)
+            code, out, err = self.queue("out", "t-A", "--repo", self.proj, "--why", "held")
+            self.assertEqual(code, 0, out + err)
+            self.add("t-A")
+            self.passed("t-A")
+            self.assertEqual(self.entry("t-A").get("added"), fixed)
+            self.answer("d-queue-1", ALL)
+            code, out, err = self.merge()
+        self.assertEqual(self.merged(), [], out + err)
+        self.assertIsNone(self.approval("t-A"))
+        self.assertIn("not the entry the card asked about", out)
 
 
 # ---- M6, M8: carry-over and refresh's merge (W4, Wanted 1) ------------------------------------------
