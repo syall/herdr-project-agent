@@ -9,12 +9,14 @@
 // read-only `pa-costs billed compare`; its Refresh, Reconstruct and Turn off run `pa-costs` on a click.
 // Restart (t-037 J4) runs `pa-restart --dry-run` on its click and `pa-restart` (in place, once) on its confirm, on the
 // space's machine; never `--end-terminal`: the panel ends no terminal.
+// Fresh context (t-041 J5) runs the context tool's `fresh --dry-run` on its click and one `fresh` request (or its
+// withdrawal) on its confirm; its mode switch runs the tool's `set`; both on the space's machine, with --by panel.
 
 import { View, div } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, ScrollHandle } from "gpui-base";
 import { spaces, panes, agents, terminals, machines, theme, run, props, home, notify, shared, setShared, closeOverlay, openOverlay, window, layout } from "herdr";
 import { Host, gaveUp, read as hostRead, run as hostRun, watch, refusalLine } from "./host.js";
-import { loadSpace, loadLedger, loadQueue, loadWaiting, loadStartOrder, writeStartOrder, loadProfile, loadDecisions, loadRules, TIMED_OUT, READ_LIMIT, answerDecision, notifyOrchestrator, changeRules, touched, localId, paHome, stateDir, taskActions, taskLinks, evidenceTasks, cardEvidence, staleInstructions, liveTarget, lookAlike, OPEN_REQUESTS, keeperJudging, startingLabels, OTHER, OTHER_MAX, OTHER_TOO_LONG, isOther, oneLine, codeState, codeBadge, loadCode, restartArgs, runRestart, restartOutcome, endTerminalLine, RESTART_MARK, RESTART_MARK_TTL, RESTARTED_FOR, RESTART_TIMEOUT, DRY_TIMEOUT } from "./store.js";
+import { loadSpace, loadLedger, loadQueue, loadWaiting, loadStartOrder, writeStartOrder, loadProfile, loadDecisions, loadRules, TIMED_OUT, READ_LIMIT, answerDecision, notifyOrchestrator, changeRules, touched, localId, paHome, stateDir, taskActions, taskLinks, evidenceTasks, cardEvidence, staleInstructions, liveTarget, lookAlike, OPEN_REQUESTS, keeperJudging, startingLabels, OTHER, OTHER_MAX, OTHER_TOO_LONG, isOther, oneLine, codeState, codeBadge, loadCode, restartArgs, runRestart, restartOutcome, endTerminalLine, RESTART_MARK, RESTART_MARK_TTL, RESTARTED_FOR, RESTART_TIMEOUT, DRY_TIMEOUT, contextCapable, contextSettings, loadContext, contextLine, contextArgs, runContext, contextOutcome, contextDry, resetLine, lastRequestLine, CONTEXT_FOR } from "./store.js";
 import { RulesPane, arm, armHolds, fieldState } from "./rules.js"; // arm, armHolds: the two-click Delete (ARM_WAIT, 10 s)
 import { queueRows, queueLabel, renderQueue, at as atZone } from "./queue.js"; // t-055: the Queue view (read only)
 import { placesRows, renderPlaces, moveOrder, orderText, NOTICE as ORDER_NOTICE } from "./places.js"; // t-083 J2: places and the start order (Tasks)
@@ -194,6 +196,10 @@ export default class ProjectAgent extends View {
     this.restartAsk = {}; // space id -> { busy, lines, refused, capable, instance, prompt, older }
     this.restarting = {}; // space id -> { at, instance }: this copy's one run, set before it starts (never twice)
     this.restartMsg = {}; // space id -> { ok, text, at }
+    // t-041 J5, Fresh context and the mode switch: the confirm (its dry run), this copy's run in flight, the result line.
+    this.contextAsk = {}; // space id -> { busy, ok, ctx, source, due, request, expires, reasons, text }
+    this.contextBusy = {}; // space id -> { what: "ask" | "withdraw" | "mode" }
+    this.contextMsg = {}; // space id -> { ok, text, at }
     this.me = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`; // this copy, for the timer lease
     this.schedule = { open: false, error: null, custom: null, quietFrom: null, quietTo: null }; // the schedule bar
     // The 15 s pass: one at a time (t-053: a tick still waiting on a call is not joined by another).
@@ -421,7 +427,7 @@ export default class ProjectAgent extends View {
         }
         if (data.agent && current() && shown()) { // first paint: the header and the tasks
           const same = this.space === space.id;
-          this.data = { ...data, evidence: same ? this.data?.evidence : undefined, stale: same ? this.data?.stale : undefined, code: same ? this.data?.code : undefined, queue: same ? this.data?.queue : undefined, waiting: same ? this.data?.waiting : undefined, startOrder: same ? this.data?.startOrder : undefined };
+          this.data = { ...data, evidence: same ? this.data?.evidence : undefined, stale: same ? this.data?.stale : undefined, code: same ? this.data?.code : undefined, context: same ? this.data?.context : undefined, queue: same ? this.data?.queue : undefined, waiting: same ? this.data?.waiting : undefined, startOrder: same ? this.data?.startOrder : undefined };
           if (this.cardsFor !== space.id) { this.cards = []; this.cardsFor = null; this.rules.data = null; }
           if (!same) this.dataAt = Date.now();
           this.space = space.id;
@@ -431,8 +437,8 @@ export default class ProjectAgent extends View {
           // A read that times out or fails keeps the last known value: the kept load's, else what is shown for the space.
           const cap = (p, fallback) => p.then((v) => (gaveUp(v) ? fallback() : v), () => fallback()); // each read capped in the store
           const known = [...(kept && !kept.cardsUnknown ? kept.cards : []), ...(this.space === space.id && this.cardsFor === space.id ? this.cards : [])];
-          let evidence, stale, code, queue, waiting, startOrder;
-          [cards, rules, evidence, stale, code, queue, waiting, startOrder] = await Promise.all([
+          let evidence, stale, code, queue, waiting, startOrder, context;
+          [cards, rules, evidence, stale, code, queue, waiting, startOrder, context] = await Promise.all([
             loadDecisions(space, { cx: rcx, live: current, known, out: cardsOut }),
             cap(loadRules(space, rcx), () => kept?.rules ?? (this.space === space.id && this.cardsFor === space.id ? this.rules.data : null) ?? null), // null: the Rules view says Loading…
             cap(evidenceTasks(space, rcx), () => kept?.data?.evidence ?? shownNow()?.evidence), // undefined: unknown
@@ -441,8 +447,9 @@ export default class ProjectAgent extends View {
             cap(loadQueue(space, rcx), () => kept?.data?.queue ?? shownNow()?.queue ?? null), // t-055: queue.json; a give-up keeps the last known (null: "Loading queue…")
             cap(loadWaiting(space, rcx), () => kept?.data?.waiting ?? shownNow()?.waiting ?? null), // t-083 J2: waiting.json (pa-places writes it); as loadQueue
             cap(loadStartOrder(space, rcx), () => kept?.data?.startOrder ?? shownNow()?.startOrder ?? null), // t-083 J2: start-order.json's text (the panel writes it)
+            cap(loadContext(space, rcx), () => kept?.data?.context ?? shownNow()?.context ?? null), // t-041 J5: context.json (no costs file: t-009 R11)
           ]);
-          data.evidence = evidence; data.stale = stale; data.code = code; data.queue = queue; data.waiting = waiting; data.startOrder = startOrder;
+          data.evidence = evidence; data.stale = stale; data.code = code; data.queue = queue; data.waiting = waiting; data.startOrder = startOrder; data.context = context;
         }
       }
       catch (e) { data = { agent: null, errors: [String(e.message ?? e)], failed: true }; } // a read in the first round threw
@@ -704,6 +711,101 @@ export default class ProjectAgent extends View {
     const m = this.restartMsg[space.id];
     if (m && (!m.ok || Date.now() - m.at < RESTARTED_FOR)) return box().child(div().text_color(m.ok ? t.foreground : t.blocked).child(sel("pa-restart-result", m.text)));
     return null;
+  }
+
+  // ---- t-041 J5: the context line (R15), Fresh context (R6), the mode switch (R13), the reset line (C6) ----
+  // Only the context tool on the space's machine (store.runContext), with --by panel; the panel writes neither
+  // context-request.json nor context.json. One run per space at a time in this copy (no shared mark: Q3, the tool keeps
+  // one request).
+  contextClock(iso) { const s = atZone(iso); return /^\d\d-\d\d \d\d:\d\d$/.test(s) ? s.slice(6) : "?"; }
+
+  // The click: one dry run, shown as the confirm.
+  askFresh(space, cx) {
+    if (this.contextBusy[space.id] || this.contextAsk[space.id]?.busy) return;
+    const ask = { busy: true };
+    this.contextAsk[space.id] = ask;
+    delete this.contextMsg[space.id];
+    cx.notify();
+    const started = this.host.spawn(cx, async (cx) => {
+      const res = await runContext(this.host.ctx(cx, { origin: "context", background: false }), space, contextArgs(space, { dry: true }));
+      if (this.contextAsk[space.id] !== ask) return; // cancelled meanwhile
+      const d = contextDry(res, space, (iso) => this.contextClock(iso));
+      if (!d) delete this.contextAsk[space.id]; // busy: a run of this space is still pending; nothing to say
+      else Object.assign(ask, d, { busy: false });
+      cx.notify();
+    }, { what: "the fresh context check", background: false });
+    if (!started) { Object.assign(ask, { busy: false, ok: false, text: "Too many calls waiting; try again." }); cx.notify(); }
+  }
+
+  // One run that writes (the request, its withdrawal, or the mode), then its line and a reload.
+  contextRun(space, what, args, cx) {
+    if (this.contextBusy[space.id] || !args) return;
+    delete this.contextAsk[space.id];
+    delete this.contextMsg[space.id];
+    const mark = { what };
+    this.contextBusy[space.id] = mark;
+    cx.notify();
+    const end = (msg, cx) => {
+      if (this.contextBusy[space.id] === mark) delete this.contextBusy[space.id];
+      if (msg) this.contextMsg[space.id] = { ...msg, at: Date.now() };
+      cx.notify();
+    };
+    const started = this.host.spawn(cx, async (cx) => {
+      let msg;
+      try { msg = contextOutcome(await runContext(this.host.ctx(cx, { origin: "context", background: false }), space, args), space, (iso) => this.contextClock(iso)); }
+      catch (e) { msg = { ok: false, text: `${what === "mode" ? "The switch" : "The request"} could not run: ${String(e?.message ?? e)}` }; }
+      end(msg, cx);
+      this.reload(cx);
+    }, { what: what === "mode" ? "the context mode switch" : "the fresh context request", background: false });
+    if (!started) end({ ok: false, text: "Not run: too many calls waiting. Try again." }, cx);
+  }
+
+  // The rows under the profile line: the line and its controls, a settings note, the reset line, the box, the result.
+  contextBar(t, space, data, known) {
+    const c = data?.context;
+    if (!c || typeof c !== "object" || known === "offline") return null;
+    const s = c.settings ?? contextSettings(null), launcher = data.code?.launcher ?? null, busy = this.contextBusy[space.id];
+    const clock = (iso) => this.contextClock(iso), costs = this.costs.peek(space.id); // the Costs view's last read (J5-D1)
+    const read = costs && costs.readAt ? contextLine(costs.summary?.paContext) : null;
+    const line = !costs || !costs.readAt ? "PA context: open the Costs tab to read it." : read ? `${read} (as of ${clock(new Date(costs.readAt).toISOString())})` : null;
+    const button = known === "live" && contextCapable(launcher) && s.mode === "fresh" && !busy;
+    const other = s.mode === "fresh" ? "off" : "fresh";
+    const reset = resetLine(launcher, data.agent?.sessionId, clock);
+    const ask = this.contextAsk[space.id], m = this.contextMsg[space.id];
+    const box = () => v_flex().px(12).py(8).gap(4).flex_none().border_b(1).border_color(t.border).text_size(11.5).text_color(t.foreground);
+    const rows = v_flex().flex_none()
+      .child(h_flex().px(12).py(6).gap(8).items_center().flex_none().border_b(1).border_color(t.border).text_size(11.5).text_color(t.dim)
+        .child(div().id("pa-context-line").flex_1().min_w(0).child(line ? sel("pa-context-text", line) : ""))
+        .child(div().flex_none().child(`mode ${s.mode}`))
+        .child(this.button(t, "pa-context-mode", `Turn fresh contexts ${other === "off" ? "off" : "on"}`, (_e, cx) => this.contextRun(space, "mode", contextArgs(space, { mode: other }), cx)))
+        .when(button, (e) => e.child(this.button(t, "pa-fresh", "Fresh context", (_e, cx) => this.askFresh(space, cx)))))
+      .when(Boolean(s.problem), (e) => e.child(div().px(12).py(4).border_b(1).border_color(t.border).text_size(11.5).text_color(t.blocked)
+        .child(`context.json is not valid (${s.problem}): the launcher uses the defaults.`)))
+      .when(Boolean(reset), (e) => e.child(h_flex().px(12).py(4).gap(8).items_center().border_b(1).border_color(t.border).text_size(11.5).text_color(t.dim)
+        .child(div().flex_1().min_w(0).child(sel("pa-reset-line", reset?.text ?? "")))
+        .child(this.copier.button(t, "copy-previous-session", () => `/resume ${reset?.previous ?? ""}`))));
+    if (busy) return rows.child(box().bg(t.working + "1a").child(div().child(busy.what === "mode" ? "Switching…" : busy.what === "withdraw" ? "Withdrawing…" : "Asking…")));
+    if (ask) {
+      const b = box().bg(t.working + "1a"), cancel = this.button(t, "pa-fresh-cancel", "Cancel", (_e, cx) => { delete this.contextAsk[space.id]; cx.notify(); });
+      if (ask.busy) return rows.child(b.child(div().text_color(t.dim).child("Checking what a fresh context meets now…")));
+      if (!ask.ok) return rows.child(b.child(div().child(sel("pa-fresh-refused", ask.text ?? ""))).child(h_flex().gap(6).child(cancel)));
+      const last = lastRequestLine(launcher, clock);
+      const lines = [
+        ask.ctx !== null ? `Context now ${Math.round(ask.ctx / 1000)}k${ask.source ? ` (${ask.source})` : ""}.` : "Context size unknown (no transcript read).",
+        ask.due ? `A reset is due: ${String(ask.due).replace(/-/g, " ")}.` : "No reset is due by size: a request is taken at the next clean point anyway.",
+        ask.reasons.length ? `Not a clean point now: ${ask.reasons.join("; ")}` : "Clean point now: yes.",
+        ...(ask.request ? [`Pending request ${ask.request.slice(0, 8)}, until ${clock(ask.expires)}.`] : []),
+        ...(last ? [last] : []),
+      ];
+      return rows.child(b.children(lines.map((l, i) => div().child(sel(`pa-fresh-line-${i}`, l))))
+        .child(div().text_color(t.dim).child("It waits for the Project Agent's next clean point (up to 2 h); a pass is never cut short. The conversation in its tab restarts; the previous one stays in /resume."))
+        .child(h_flex().gap(6)
+          .child(this.button(t, "pa-fresh-go", ask.request ? "Ask again (replaces the pending one)" : "Ask for a fresh context", (_e, cx) => this.contextRun(space, "ask", contextArgs(space, {}), cx), true))
+          .when(Boolean(ask.request), (e) => e.child(this.button(t, "pa-fresh-withdraw", "Withdraw the request", (_e, cx) => this.contextRun(space, "withdraw", contextArgs(space, { withdraw: true }), cx))))
+          .child(cancel)));
+    }
+    if (m && (!m.ok || Date.now() - m.at < CONTEXT_FOR)) return rows.child(box().child(div().text_color(m.ok ? t.foreground : t.blocked).child(sel("pa-context-result", m.text))));
+    return rows;
   }
 
   start(space, folder) {
@@ -1381,6 +1483,7 @@ export default class ProjectAgent extends View {
     const code = this.codeOf(space, data), badge = codeBadge(code), restartable = known === "live" && !this.restartBusy(space);
     const older = /^older/.test(code?.word ?? ""), changed = [...(data.stale ?? []).slice(0, 3), ...(/tools/.test(older ? code.word : "") ? ["tools"] : []), ...(/core/.test(older ? code.word : "") && !(data.stale ?? []).length ? ["core text"] : [])];
     const restartBox = this.restartBox(t, space, live);
+    const contextBar = this.contextBar(t, space, data, known);
     return root
       .child(head(`PA: ${a.name ?? space.name}`, h_flex().flex_none().gap(6).items_center()
         .child(div().size(7).rounded(4).bg(live ? t[live.status] ?? t.idle : t.dim))
@@ -1400,6 +1503,7 @@ export default class ProjectAgent extends View {
       .child(v_flex().px(12).py(8).gap(2).flex_none().border_b(1).border_color(t.border).text_size(11.5).text_color(t.dim)
         .child(div().truncate().child(String(a.project ?? "").replace(home(), "~")))
         .child(div().child(`profile ${a.profile ?? "?"} · ${active} active of ${tasks.length} tasks · pass ${data.ledger?.passCount ?? 0}${this.inFlight(space.id) && now - this.dataAt > CACHE_OLD ? " · updating…" : ""}`)))
+      .when(Boolean(contextBar), (el) => el.child(contextBar)) // t-041 J5: the context line, Fresh context, the mode switch
       // Its instructions or its tools changed since its launcher started (R14): Restart reloads them (R7: /exit too).
       .when(changed.length > 0 && Boolean(live), (el) => el.child(h_flex().px(12).py(6).gap(8).items_center().border_b(1).border_color(t.border).bg(t.working + "1a").text_size(11.5).text_color(t.foreground)
         .child(div().flex_1().min_w(0).child(`Its instructions or tools changed since it started (${changed.join(", ")}). Restart reloads them (or /exit in its tab).${code?.prompt === "recorded" ? " Restart in place keeps the core text this conversation began with; Restart in a new conversation loads it." : ""}`))

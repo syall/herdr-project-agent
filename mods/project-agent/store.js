@@ -355,6 +355,117 @@ export function restartOutcome(res, space) {
   return { ok: false, text: toolSaid(r) || `${RESTART_TOOL} exited with ${r.code}` };
 }
 
+// ---- t-041 J5: the context line (R15), the Fresh context button (R6), the mode switch (R13), the reset line (C6) ----
+// context.json is read on the space's machine (the line's numbers come from the Costs view's own summary read); the button and the switch run only the context
+// tool there (its `fresh` and `set` actions, with --by panel), never with --on, and the panel writes neither
+// context-request.json nor context.json itself (the tool checks the mode, the launcher's accepts and the space).
+export const CONTEXT_TOOL = ["pa", "context"].join("-");
+export const CONTEXT_WHY = "the Fresh context button in the Project Agent panel"; // recorded in the request only
+export const CONTEXT_DEFAULTS = Object.freeze({ v: 1, mode: "fresh", taskCap: 150000, passCap: 250000, net: 400000, enabledAt: null, by: null });
+export const CONTEXT_FOR = 60000; // ms a result line stays
+export const CONTEXT_TIMEOUT = 30000; // ms: each run's exec timeout (it is given up GRACE later)
+const isNum = (v) => typeof v === "number" && Number.isFinite(v);
+const kTokens = (n) => (isNum(n) ? `${Math.round(n / 1000)}k` : "—"); // pa_costs fmt_ctx
+const utcHm = (iso) => { const d = new Date(String(iso ?? "")); return Number.isNaN(d.getTime()) ? "?" : d.toISOString().slice(11, 16); };
+// pa.context_capable: a launcher that takes a context request.
+export const contextCapable = (rec) => {
+  const r = asObj(rec), version = r.version;
+  return typeof version === "number" && Number.isInteger(version) && version >= 2 && Array.isArray(r.accepts) && r.accepts.includes("context");
+};
+// context.json over the defaults (missing: the defaults). Only the mode is checked here; the tool and the launcher
+// check the caps. { mode, taskCap, passCap, net, enabledAt, by, problem }.
+export function contextSettings(value, problem = null) {
+  const out = (p) => ({ ...CONTEXT_DEFAULTS, problem: p });
+  if (problem) return out(problem);
+  if (value === null || value === undefined) return out(null);
+  if (!isObj(value)) return out("not an object");
+  if (!["fresh", "off"].includes(value.mode)) return out("mode must be fresh or off");
+  const s = { ...CONTEXT_DEFAULTS, mode: value.mode, enabledAt: asText(value.enabledAt), by: asText(value.by), problem: null };
+  for (const k of ["taskCap", "passCap", "net"]) if (isNum(value[k])) s[k] = value[k];
+  return s;
+}
+// { settings }: context.json on the space's machine; TIMED_OUT when the read gave up (the caller keeps the last known).
+// No costs file is read here: the context line uses the summary the Costs view read (t-009 R11, J5-D1).
+export async function loadContext(space, cx) {
+  const c = await readJson(`${stateDir(space)}/context.json`, space.machine ?? null, cx);
+  if (c.timedOut) return TIMED_OUT;
+  return { settings: contextSettings(c.value, c.error ? `not valid JSON: ${c.error}` : null) };
+}
+// Today's (UTC) paContext entry, checked, or null.
+export function contextDay(paContext, now = Date.now()) {
+  if (!Array.isArray(paContext)) return null;
+  const day = new Date(now).toISOString().slice(0, 10);
+  const e = paContext.find((x) => isObj(x) && x.day === day);
+  if (!e || !isNum(e.calls) || !isNum(e.peak) || !(e.mean === null || isNum(e.mean)) || !isObj(e.resets) || !isNum(e.resets.fresh) || !isNum(e.resets.compact)) return null;
+  return e;
+}
+// The R15 line (as pa-costs report's), or null when there is no paContext.
+export function contextLine(paContext, now = Date.now()) {
+  if (!Array.isArray(paContext)) return null;
+  const head = "PA context today (UTC):", e = contextDay(paContext, now);
+  const resets = e ? `resets ${e.resets.fresh + e.resets.compact} (fresh ${e.resets.fresh}, compact ${e.resets.compact})` : null;
+  if (!e || !e.calls) return e && e.resets.fresh + e.resets.compact ? `${head} no Project Agent calls · ${resets}` : `${head} no Project Agent calls yet`;
+  return `${head} mean ${kTokens(e.mean)} · peak ${e.peakExact === false ? "≥" : ""}${kTokens(e.peak)} · ${resets}`;
+}
+// The argv after the tool's name: the dry run, the request, its withdrawal, or the mode switch (null for another mode).
+export function contextArgs(space, { dry = false, withdraw = false, mode } = {}) {
+  const id = localId(space.id);
+  if (mode !== undefined) return ["fresh", "off"].includes(mode) ? ["set", "--space", id, "--by", "panel", "--mode", mode, "--json"] : null;
+  if (dry) return ["fresh", "--space", id, "--dry-run", "--json"];
+  return ["fresh", "--space", id, ...(withdraw ? ["--withdraw"] : []), "--by", "panel", "--json", "--why", CONTEXT_WHY];
+}
+// One exec of the tool on the space's machine: { r } | { error } | { busy } | { timedOut }, as runRestart.
+export async function runContext(hcx, space, args, timeout = CONTEXT_TIMEOUT) {
+  const on = space.machine ?? null;
+  try {
+    const r = await capped(hcx, () => run(CONTEXT_TOOL, args, { on, timeout }), { key: `context:${on ?? ""}:${localId(space.id)}`, limit: timeout + GRACE, what: `${CONTEXT_TOOL} ${args[0]}${args.includes("--dry-run") ? " --dry-run" : ""}` });
+    if (r === TIMED_OUT) return { timedOut: true };
+    if (gaveUp(r)) return { busy: true };
+    return { r };
+  } catch (e) { return { error: String(e?.message ?? e) }; }
+}
+const missingLine = (space, tool) => (space.machine ? `${tool} is not installed on ${space.machine}; run pa-sync --on ${space.machine}.` : `${tool} is not installed here; run ./install.sh.`);
+// What a run's answer means, as one line: { ok, text }, or null (busy: nothing to say). clock: an ISO time -> "HH:MM".
+export function contextOutcome(res, space, clock = utcHm) {
+  if (!res || res.busy) return null;
+  if (res.timedOut) return { ok: false, text: `${CONTEXT_TOOL} did not answer in ${(CONTEXT_TIMEOUT + GRACE) / 1000} s; the panel shows what it reads next.` };
+  if (res.error !== undefined) return { ok: false, text: missingTool(res.error, CONTEXT_TOOL) ? missingLine(space, CONTEXT_TOOL) : `${CONTEXT_TOOL} could not run: ${String(res.error).slice(0, 300)}` };
+  const r = res.r ?? {}, out = lastJson(r.stdout);
+  if (r.code === 127 || (r.code !== 0 && missingTool(toolSaid(r), CONTEXT_TOOL))) return { ok: false, text: missingLine(space, CONTEXT_TOOL) };
+  if (r.code !== 0) return { ok: false, text: `Not done: ${toolSaid(r) || `exit ${r.code}`}` };
+  if (out?.outcome === "requested") return { ok: true, text: `Fresh context asked for: it is taken at the Project Agent's next clean point (the request waits until ${clock(out.expires)}).` };
+  if (out?.outcome === "withdrawn") return { ok: true, text: "Request withdrawn." };
+  if (out?.outcome === "none") return { ok: true, text: "No request was pending." };
+  if (out && out.mode === "off") return { ok: true, text: `Context mode off: no fresh contexts from now; the ${kTokens(out.net)} net ends at its next start. Turn fresh contexts on undoes it.` };
+  if (out && out.mode === "fresh") return { ok: true, text: `Context mode fresh: fresh contexts at ${kTokens(out.taskCap)} at a task boundary and ${kTokens(out.passCap)} at a pass end from its launcher's next check; the ${kTokens(out.net)} net at its next start. Turn fresh contexts off undoes it.` };
+  return { ok: true, text: "Done; the panel shows what it reads next." };
+}
+// The dry run's JSON line, for the confirm: { ok: true, ctx, source, due, request, expires, reasons } or { ok: false, text }.
+export function contextDry(res, space, clock = utcHm) {
+  if (!res || res.busy) return null;
+  const out = res.r?.code === 0 ? lastJson(res.r.stdout) : null;
+  if (out?.outcome === "dry-run") {
+    return { ok: true, ctx: isNum(out.ctx) ? out.ctx : null, source: asText(out.source), due: asText(out.due), request: asText(out.request), expires: asText(out.expires),
+      reasons: Array.isArray(out.reasons) ? out.reasons.filter((x) => typeof x === "string") : [] };
+  }
+  const o = contextOutcome(res, space, clock);
+  return { ok: false, text: o && !o.ok ? o.text : `${CONTEXT_TOOL} gave no dry-run line: ${toolSaid(res.r) || "nothing"}` };
+}
+const REASON_WORDS = { "task-cap": "task cap", "pass-cap": "pass cap", person: "asked for", orchestrator: "asked for by the Project Agent" };
+// C6: the line while the conversation running now is the one a reset started; { text, previous } or null.
+export function resetLine(launcher, sessionId, clock = utcHm) {
+  const last = asObj(asObj(launcher).lastReset);
+  if (typeof sessionId !== "string" || !sessionId || last.to !== sessionId || typeof last.from !== "string" || !last.from) return null;
+  const why = [REASON_WORDS[last.reason] ?? asText(last.reason), isNum(last.ctx) ? kTokens(last.ctx) : null].filter(Boolean).join(", ");
+  return { text: `Fresh context at ${clock(last.at)}${why ? ` (${why})` : ""} · previous session ${last.from.slice(0, 8)}…`, previous: last.from };
+}
+// Q7: the last request's outcome when it was not taken (launcher.json `context`), or null.
+export function lastRequestLine(launcher, clock = utcHm) {
+  const c = asObj(asObj(launcher).context);
+  if (!["expired", "refused"].includes(c.outcome)) return null;
+  return `Last request: ${c.outcome} at ${clock(c.at)}${asText(c.why) ? ` (${c.why})` : ""}`;
+}
+
 // A task's artifacts as links: [{ label, url }], https only, each once. From the task itself
 // ("links": [{ label, url }] and "changeRequest": { id, url }), and from the profile's
 // "linkTemplates" ([{ "match": "<regex>", "url": "https://.../{0}" }]): every id the pattern
