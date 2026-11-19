@@ -8,7 +8,7 @@
 import { div } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input } from "gpui-base";
 import { home } from "herdr";
-import { loadRules, changeRules, touched, reorder, newRuleId, exportRules, importRules } from "./store.js";
+import { loadRules, changeRules, touched, reorder, newRuleId, exportRules, importRules, oneLine } from "./store.js";
 import { readAllow } from "./push.js";
 import { Copier, sel } from "./copy.js";
 
@@ -18,9 +18,30 @@ export const ALLOW_EVERY = 30000; // the push allowlist is read at most this oft
 // once the file is written: "rules changed: <ids>" (main.js rulesChanged: one per space while unsent, later ids
 // joined to it). Approving or declining a proposal keeps its own notice (main.js ruleDecided) and sends no second.
 export const NOTICE = "rules changed", NOTICE_MAX = 10;
-export function noticeText(ids) {
+export function noticeText(ids) { // each id on one line (t-085: an imported id can hold anything)
   const shown = ids.slice(0, NOTICE_MAX), more = ids.length - shown.length;
-  return `${NOTICE}: ${shown.join(", ")}${more > 0 ? ` and ${more} more` : ""}`;
+  return `${NOTICE}: ${shown.map((id) => oneLine(id, 80)).join(", ")}${more > 0 ? ` and ${more} more` : ""}`;
+}
+// t-085 (t-101 RL2): a space's rules notices become one, the first (a kept one keeps its place and its why), each id
+// named once. Two arise when a change is made while the space's notice is being sent, and that send fails.
+export function mergeNotices(items) {
+  const first = new Map(), out = [];
+  for (const u of items) {
+    const into = Array.isArray(u.rules) ? first.get(u.spaceId) : null;
+    if (!Array.isArray(u.rules)) out.push(u);
+    else if (!into) { first.set(u.spaceId, u); out.push(u); }
+    else { for (const id of u.rules) if (!into.rules.includes(id)) into.rules.push(id); into.message = noticeText(into.rules); }
+  }
+  return out;
+}
+
+// t-085: a rule id the person names for a new rule: r- and lowercase words of letters and digits, joined by single
+// hyphens, at most RULE_ID_MAX long, and no rule in the file (of any status) has it. ruleIdProblem: why not, or null.
+export const RULE_ID = /^r-[a-z0-9]+(?:-[a-z0-9]+)*$/, RULE_ID_MAX = 60;
+export function ruleIdProblem(id, rules) {
+  if (id.length > RULE_ID_MAX || !RULE_ID.test(id)) return `An id starts with r- and has only lowercase letters, digits and single hyphens (at most ${RULE_ID_MAX} characters), like r-tests-first.`;
+  if ((rules ?? []).some((r) => r.id === id)) return `${id} is already a rule's id; choose another, or leave Id empty to make one from the title.`;
+  return null;
 }
 
 // A two-click Delete (a task's in main.js, a rule's here): the first click arms it, { id, space, at }.
@@ -39,7 +60,7 @@ export class RulesPane {
     this.field = field; // makes the view's text fields (main.js: focus in one drops an armed Delete)
     this.data = null; // loadRules() result
     this.open = new Set(); // expanded rule ids
-    this.form = null; // { id | null, approve, inputs: { title, text, why, appliesTo } }
+    this.form = null; // { id | null, approve, inputs: { title, text, why, appliesTo, and id for a new rule (t-085) } }
     this.armed = null; // arm(): the rule whose Delete was clicked once (a second click deletes); see armedRule()
     this.pressed = null; // rule id being dragged
     this.declined = false; // declined rules shown
@@ -100,12 +121,20 @@ export class RulesPane {
   // Applies a change, then reloads. `after(cx)` runs once the file is written (telling the orchestrator, say),
   // with this task's live cx: the click's is gone by then. `ids` (a list, or a function giving it once the change
   // ran): the rules the person changed, for the "rules changed" notice; none for a proposal's approve or decline.
+  // Only ids in the file before or after the change are named (t-085: a rule deleted meanwhile is not).
   save(space, cx, change, after, ids) {
     this.error = null; this.message = null;
+    const there = new Set();
     cx.spawn(async (cx) => {
       try {
-        await changeRules(space, change);
-        const named = typeof ids === "function" ? ids() : ids;
+        await changeRules(space, (rules) => {
+          there.clear();
+          for (const r of rules) there.add(r.id);
+          const next = change(rules);
+          for (const r of next) there.add(r.id);
+          return next;
+        });
+        const named = (typeof ids === "function" ? ids() : ids)?.filter((id) => there.has(id));
         if (named?.length) this.changed?.(space, named, cx);
         if (after) await after(cx);
       }
@@ -119,6 +148,7 @@ export class RulesPane {
     for (const s of Object.values(this.form?.inputs ?? {})) s.release?.();
     const inputs = {};
     for (const [key, placeholder] of FIELDS) inputs[key] = this.field({ placeholder, value: String(rule?.[key] ?? (key === "appliesTo" ? "all" : "")) });
+    if (!rule) inputs.id = this.field({ placeholder: "Id (optional): r-lowercase-words; empty makes one from the title" }); // t-085: fixed once made
     this.form = { id: rule?.id ?? null, approve: Boolean(approve), inputs };
   }
 
@@ -128,13 +158,16 @@ export class RulesPane {
     const f = this.form, v = Object.fromEntries(FIELDS.map(([k]) => [k, f.inputs[k].value().trim()]));
     if (!v.title || !v.text) { this.error = "A rule needs a title and its text."; cx.notify(); return; }
     v.appliesTo ||= "all";
-    const id = f.id, approve = f.approve;
+    const id = f.id, approve = f.approve, named = f.id ? "" : (f.inputs.id?.value() ?? "").trim();
+    const problem = named && ruleIdProblem(named, this.data?.rules); // checked again against the file when written
+    if (problem) { this.error = problem; cx.notify(); return; }
     let made = id; // the new rule's id, chosen against the file as it is when written
     this.closeForm();
     this.save(space, cx, (rules) => {
       if (!id) {
         const top = Math.max(0, ...rules.map((r) => r.order ?? 0));
-        made = newRuleId(rules, v.title);
+        if (named) { const late = ruleIdProblem(named, rules); if (late) throw new Error(late); } // taken meanwhile: nothing written
+        made = named || newRuleId(rules, v.title);
         return [touched({ id: made, ...v, status: "active", order: top + 10, source: "person" }, "created"), ...rules];
       }
       return rules.map((r) => (r.id === id ? touched({ ...r, ...v, ...(approve ? { status: "active" } : {}) }, approve ? "edited and approved" : "edited") : r));
@@ -167,7 +200,8 @@ export class RulesPane {
     const f = this.form;
     return v_flex().id("rule-form").flex_none().p(10).gap(6).rounded(7).border(1).border_color(t.accent).bg(t.surface)
       .child(div().text_size(12).font_semibold().child(f.id ? (f.approve ? `Edit, then approve ${f.id}` : `Edit ${f.id}`) : "New rule"))
-      .children(FIELDS.map(([key]) => Input.new(f.inputs[key]).h(30).px(8).rounded(6).border_1().border_color(t.input).bg(t.background).text_size(12).text_color(t.foreground)))
+      .when(Boolean(f.id), (el) => el.child(div().text_size(11.5).text_color(t.dim).child(`Id: ${f.id} (can't be changed)`)))
+      .children([...FIELDS.map(([key]) => key), ...(f.inputs.id ? ["id"] : [])].map((key) => Input.new(f.inputs[key]).h(30).px(8).rounded(6).border_1().border_color(t.input).bg(t.background).text_size(12).text_color(t.foreground)))
       .child(h_flex().gap(6)
         .child(this.button(t, "rule-save", f.approve ? "Save and approve" : f.id ? "Save" : "Add rule", (_e, cx) => this.submit(space, cx, onDecided)))
         .child(this.button(t, "rule-cancel", "Cancel", (_e, cx) => { this.closeForm(); cx.notify(); }, t.muted)));

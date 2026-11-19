@@ -814,7 +814,7 @@ export function reorder(rules, id, beforeId) {
 }
 
 export const newRuleId = (rules, title) => {
-  const base = `r-${String(title).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 40) || "rule"}`;
+  const base = `r-${String(title).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 40).replace(/-$/, "") || "rule"}`; // the cut can end on a hyphen
   let id = base, n = 2;
   while (rules.some((r) => r.id === id)) id = `${base}-${n++}`;
   return id;
@@ -836,7 +836,7 @@ export async function importRules(space, path, added = []) {
   await changeRules(space, (rules) => {
     ids.length = 0;
     for (const r of value.rules) {
-      if (!r?.id || typeof r.text !== "string" || rules.some((x) => x.id === r.id)) continue;
+      if (typeof r?.id !== "string" || !r.id || typeof r.text !== "string" || rules.some((x) => x.id === r.id)) continue; // t-085: a string id only
       rules.push(touched({ ...r, status: RULE_STATUS.includes(r.status) && r.status !== "proposed" ? r.status : "active", source: "import", order: 0 }, "imported"));
       ids.push(r.id);
     }
