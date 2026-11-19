@@ -2580,7 +2580,13 @@ def account_wide_summary(account, now):
             continue
         spaces.append(name)
         for e in mine:
-            m = merged.setdefault((e.get("day"), e.get("model")), {"day": e.get("day"), "model": e.get("model"), "tokens": zero(), "money": None})
+            # D8 (J3g): entries keep their endpoint and region, so the billed comparison can split all spaces by them;
+            # entries without them merge per (day, model) as before
+            key = (e.get("day"), e.get("model"), fact_label("endpoint", e.get("endpoint")), fact_label("region", e.get("region")))
+            m = merged.get(key)
+            if m is None:
+                m = merged[key] = {"day": e.get("day"), "model": e.get("model"), "tokens": zero(), "money": None}
+                m.update((f, v) for f, v in (("endpoint", key[2]), ("region", key[3])) if v is not None)
             for k in KINDS:
                 m["tokens"][k] += num((e.get("tokens") or {}).get(k))
             if e.get("money") is not None:
@@ -2588,12 +2594,34 @@ def account_wide_summary(account, now):
                 u = num(e.get("unpricedTokens"))
             else:
                 u = total_tokens({k: num((e.get("tokens") or {}).get(k)) for k in KINDS})
-            unpriced[(e.get("day"), e.get("model"))] = unpriced.get((e.get("day"), e.get("model")), 0) + u
+            unpriced[key] = unpriced.get(key, 0) + u
     for k, m in merged.items():  # a merged entry with a priced part and unpriced use is partial (VERIFY-5 RL5-2)
         if m["money"] is not None and unpriced.get(k):
             m["unpricedTokens"] = unpriced[k]
     return {"v": 1, "account": account, "spaces": spaces, "updated": iso(now),
-            "byDayModel": [merged[k] for k in sorted(merged, key=lambda k: (k[0] or "", k[1] or ""), reverse=True)]}
+            "byDayModel": [merged[k] for k in sorted(merged, key=lambda k: tuple(x or "" for x in k), reverse=True)]}
+
+
+def space_accounts(space):
+    """The account labels of a space's byDayModel entries (entry_account): the space's own first, then the others sorted."""
+    own = space.get("account") or "default"
+    seen = {entry_account(e, own) for e in space.get("byDayModel") or [] if isinstance(e, dict)}
+    return [own] + sorted(a for a in seen if a != own)
+
+
+def space_estimate(space, account):
+    """This space's estimate of one account label over every day of its summary: {money (None: no price), partial}."""
+    own = space.get("account") or "default"
+    money, unpriced = None, False
+    for e in space.get("byDayModel") or []:
+        if not isinstance(e, dict) or entry_account(e, own) != account:
+            continue
+        if e.get("money") is not None:
+            money = (money or 0.0) + e["money"]
+            unpriced = unpriced or bool(e.get("unpricedTokens"))
+        elif total_tokens(e.get("tokens")):
+            unpriced = True
+    return {"money": None if money is None else round(money, 6), "partial": unpriced}
 
 
 def report(directory, by=None, since=None, until=None, as_json=False, account_wide=False, billed=False, now=None, utc=False,
@@ -2953,6 +2981,12 @@ def validate_row(row, source, account, now):
     if note is not None and (not isinstance(note, str) or len(note) > 200):
         raise ValueError("note must be a short text")
     out["note"] = note
+    for k in ("endpoint", "region"):  # D8: the usage type's facts, kept when given (labels only); the id does not use them
+        v = row.get(k)
+        if v is not None:
+            if fact_label(k, v) is None:
+                raise ValueError("{} must be a label".format(k))
+            out[k] = v
     out["source"] = source
     # Scanned before the code adds its own fields: the id is a hash it computes and may hold 12 digits by chance.
     if TWELVE.search(json.dumps(out)) or TWELVE.search(json.dumps(dict(row, amount=out["amount"]), default=str)):
@@ -3101,9 +3135,20 @@ def day_range(a, b):
     return out
 
 
-def billing_comparison(billed, space, here, table):
-    """Estimated (this space, all spaces here) beside billed (account-wide), per model, for the covered days (spec 8.2)."""
-    account = space.get("account") or "default"
+def region_free_endpoints(profile):
+    """The endpoint kinds the profile's price sources call region-free (A-F1 regionFree): a billed row on one carries
+    its bill's region, while the price and the session do not, so the comparison groups it by endpoint only."""
+    sources, _problems = price_sources(profile if isinstance(profile, dict) else {})
+    return tuple(sorted({k for src in sources.values() for k in src.get("regionFree") or [] if fact_label("endpoint", k)}))
+
+
+def billing_comparison(billed, space, here, table, account=None, region_free=()):
+    """Estimated (this space, all spaces here) beside billed (account-wide), per model, for the covered days (spec 8.2).
+    account: the label compared (default the space's own; limit 3 compares each label of the space on its own). here:
+    the account-wide summary of that label, or None when it was not read (all spaces then unknown, never 0). byScope
+    (D8): per (endpoint, region) when a compared billed row carries one; region_free endpoints are grouped by endpoint."""
+    space_account = space.get("account") or "default"
+    account = account or space_account
     currency = (table or {}).get("currency") or (space.get("prices") or {}).get("currency")
     mine = [r for r in billed if r.get("account") == account]
     rows = [r for r in mine if r.get("currency") == currency]
@@ -3114,9 +3159,10 @@ def billing_comparison(billed, space, here, table):
             s["amount"] += r.get("amount") or 0
             s["rows"] += 1
     if not rows:
-        return {"account": account, "currency": currency, "accountWide": True, "models": [], "covered": None, "other": 0.0,
-                "total": {"thisSpace": None, "allSpaces": None, "billed": 0.0}, "calibrated": None, "noPrice": [],
-                "separate": sorted(separate.values(), key=lambda s: s["currency"] or ""), "sources": []}
+        return dict({"account": account, "currency": currency, "accountWide": True, "models": [], "covered": None, "other": 0.0,
+                     "total": {"thisSpace": None, "allSpaces": None, "billed": 0.0}, "calibrated": None, "noPrice": [],
+                     "separate": sorted(separate.values(), key=lambda s: s["currency"] or ""), "sources": []},
+                    **({"allSpacesUnknown": True} if here is None else {}))
     covered = set()
     for r in rows:
         covered.update(day_range(r["from"], r["to"]))
@@ -3124,22 +3170,35 @@ def billing_comparison(billed, space, here, table):
     end = max(max(covered), (space.get("updated") or "")[:10] or max(covered))
     missing = [d for d in day_range(first, end) if d not in covered]
 
-    def est(summary):
-        """({key: money of the priced entries}, {keys with tokens and no price}) over the covered days."""
-        out, unpriced = {}, set()
-        for e in summary.get("byDayModel") or []:
-            if e.get("day") not in covered:
+    free = set(region_free or ())
+
+    def pair(endpoint, region, missing):
+        """(endpoint, region) of a byScope group: missing is '*' for a bill without the field, '?' for an estimate
+        whose fact is unknown (never set against another region's bill); a region-free endpoint's region is '*'."""
+        return (endpoint or missing, "*" if endpoint in free else (region or missing))
+
+    def est(summary, otherwise):
+        """({key: money of the priced entries}, {keys with tokens and no price}, the same per byScope pair) over the
+        covered days. otherwise: the label of an entry that recorded none (the space's own; for the account-wide
+        summary, the account it was summed for)."""
+        out, unpriced, by, by_np = {}, set(), {}, set()
+        for e in (summary or {}).get("byDayModel") or []:
+            if not isinstance(e, dict) or e.get("day") not in covered:
                 continue
-            if entry_account(e, account) != account:  # R-A5: never another account's estimate
+            if entry_account(e, otherwise) != account:  # R-A5: never another account's estimate
                 continue
             key = model_key(table, e.get("model")) or e.get("model")
+            sk = pair(fact_label("endpoint", e.get("endpoint")), fact_label("region", e.get("region")), "?")
             if e.get("money") is not None:
                 out[key] = out.get(key, 0.0) + e["money"]
+                by[sk] = by.get(sk, 0.0) + e["money"]
                 if e.get("unpricedTokens"):  # a mixed entry: priced part only
                     unpriced.add(key)
+                    by_np.add(sk)
             elif total_tokens(e.get("tokens")):
                 unpriced.add(key)
-        return out, unpriced
+                by_np.add(sk)
+        return out, unpriced, by, by_np
 
     def est_of(priced, unpriced, key):
         # No use: a real 0.0. Use and no price: None ("no price"), never 0.
@@ -3147,7 +3206,8 @@ def billing_comparison(billed, space, here, table):
 
     def est_total(priced, unpriced):
         return round(sum(priced.values()), 6) if priced else (None if unpriced else 0.0)
-    (this, this_np), (alls, alls_np) = est(space), est(here)
+    (this, this_np, this_by, this_by_np), (alls, alls_np, alls_by, alls_by_np) = est(space, space_account), est(here, account)
+    known = here is not None
     models, other = {}, 0.0
     for r in rows:
         key = model_key(table, r.get("model")) if r.get("model") else None
@@ -3168,7 +3228,7 @@ def billing_comparison(billed, space, here, table):
     for key in sorted(models):
         m = models[key]
         few = len(m["days"]) < 3 or m["notFinal"]
-        t, a = est_of(this, this_np, key), est_of(alls, alls_np, key)
+        t, a = est_of(this, this_np, key), est_of(alls, alls_np, key) if known else None
         if t is None or key in this_np:
             cal_partial = True
         if t is not None:
@@ -3189,29 +3249,43 @@ def billing_comparison(billed, space, here, table):
         out_models.append({"model": key, "thisSpace": None if t is None else round(t, 6), "allSpaces": None if a is None else round(a, 6),
                            "thisSpacePartial": key in this and key in this_np, "allSpacesPartial": key in alls and key in alls_np,
                            "billed": round(m["billed"], 6), "factor": factor, "notFinal": m["notFinal"], "days": len(m["days"])})
-    return {"account": account, "currency": currency, "accountWide": True,
+    out = {"account": account, "currency": currency, "accountWide": True,
             "covered": {"from": first, "to": max(covered), "days": len(covered), "of": len(day_range(first, end)), "missing": missing},
             "sources": sorted({r.get("source") for r in rows}), "fetchedAt": max(r.get("fetchedAt") or "" for r in rows),
             "models": out_models, "other": round(other, 6),
-            "total": {"thisSpace": est_total(this, this_np), "allSpaces": est_total(alls, alls_np),
+            "total": {"thisSpace": est_total(this, this_np), "allSpaces": est_total(alls, alls_np) if known else None,
                       "thisSpacePartial": bool(this and this_np), "allSpacesPartial": bool(alls and alls_np),
                       "billed": round(sum(r.get("amount") or 0 for r in rows), 6)},
             # Calibrated only where there is a priced estimate to calibrate; partial when a billed model has unpriced use.
             # Also partial when this space has unpriced use of a model that was not billed (VERIFY-5 RL5-1).
             "calibrated": round(calibrated, 6) if cal_priced else None, "calibratedPartial": cal_priced and (cal_partial or bool(this_np)),
             "noPrice": sorted(this_np | alls_np), "separate": sorted(separate.values(), key=lambda s: s["currency"] or "")}
+    if not known:
+        out["allSpacesUnknown"] = True
+    if any(r.get("endpoint") or r.get("region") for r in rows):  # D8: only when the bill names them
+        billed_by = {}
+        for r in rows:
+            sk = pair(r.get("endpoint"), r.get("region"), "*")
+            billed_by[sk] = billed_by.get(sk, 0.0) + (r.get("amount") or 0)
+        out["byScope"] = [{"endpoint": sk[0], "region": sk[1], "billed": round(billed_by.get(sk, 0.0), 6),
+                           "thisSpace": None if est_of(this_by, this_by_np, sk) is None else round(est_of(this_by, this_by_np, sk), 6),
+                           "allSpaces": None if not known or est_of(alls_by, alls_by_np, sk) is None else round(est_of(alls_by, alls_by_np, sk), 6),
+                           "thisSpacePartial": sk in this_by and sk in this_by_np, "allSpacesPartial": known and sk in alls_by and sk in alls_by_np}
+                          for sk in sorted(set(billed_by) | set(this_by) | this_by_np | (set(alls_by) | alls_by_np if known else set()))]
+    return out
 
 
-def billed_lines(s, now):
-    table, _problem, _name = (None, None, None)
-    try:
-        profile = pa.load_profile(s["prices"].get("profile"))
-        table, _problem = load_prices(profile)
-    except pa.Problem:
-        pass
-    here = account_wide_summary(s.get("account") or "default", now)
-    c = billing_comparison(effective_billed(), s, here, table)
-    out = ["Billed (account-wide: includes use outside this space and outside Herdr)"]
+def pair_words(endpoint, region):
+    """A byScope pair in words: '*' is not named by the bill, '?' is not known for the estimate."""
+    if endpoint == "*" and region == "*":
+        return "no endpoint or region"
+    e = {"*": "no endpoint", "?": "endpoint unknown"}.get(endpoint, endpoint)
+    return e if region == "*" else "{} · {}".format(e, "region unknown" if region == "?" else region)
+
+
+def comparison_lines(c):
+    """The report's lines of one comparison (without its head and the status line)."""
+    out = []
     if not c["covered"]:
         if not c["separate"]:
             out.append("  no billed rows for account {}".format(c["account"]))
@@ -3248,8 +3322,50 @@ def billed_lines(s, now):
         cal = c["calibrated"]
         out.append("  calibrated (price factor applied where available): this space {}".format(
             "— (no priced estimate)" if cal is None else fmt_money(cal) + (" + unpriced" if c["calibratedPartial"] else "")))
+        if c.get("allSpacesUnknown"):
+            out.append("  all spaces here: not read for account {}".format(c["account"]))
+        if len(c.get("byScope") or []) > 1:
+            out.append("  By endpoint · region (billed rows with a usage type)")
+            for x in c["byScope"]:
+                out.append("  {:<22} {:>12} {:>16} {:>14}".format(pair_words(x["endpoint"], x["region"])[:22], est(x["thisSpace"], x["thisSpacePartial"]),
+                                                                   est(x["allSpaces"], x["allSpacesPartial"]), fmt_money(x["billed"])))
     for sep in c["separate"]:
         out.append("  in {} (not compared): {} billed, account-wide, {} row(s)".format(sep["currency"], fmt_money(sep["amount"]), sep["rows"]))
+    return out
+
+
+def compare_inputs(s):
+    """(price table or None, region-free endpoints) of a summary's profile; never raises."""
+    table, free = None, ()
+    try:
+        profile = pa.load_profile((s.get("prices") or {}).get("profile"))
+    except pa.Problem:
+        return table, free
+    free = region_free_endpoints(profile)
+    try:
+        table, _problem = load_prices(profile)
+    except pa.Problem:
+        pass
+    return table, free
+
+
+BILLED_HEAD = "account-wide: includes use outside this space and outside Herdr"
+
+
+def billed_lines(s, now):
+    table, free = compare_inputs(s)
+    billed = effective_billed()
+    labels = space_accounts(s)
+    c = billing_comparison(billed, s, account_wide_summary(labels[0], now), table, region_free=free)
+    out = ["Billed ({})".format(BILLED_HEAD)] + comparison_lines(c)
+    for a in labels[1:]:  # limit 3: every other account label of the space, compared on its own (R-A5)
+        o = billing_comparison(billed, s, account_wide_summary(a, now), table, account=a, region_free=free)
+        if not o["covered"] and not o["separate"]:
+            e = space_estimate(s, a)
+            out.append("  account {}: est. {}{} in this space; no billed rows for it".format(a, fmt_money(e["money"]), " + unpriced" if e["partial"] else ""))
+        else:
+            out.append("Billed, account {} ({})".format(a, BILLED_HEAD))
+            out.extend(comparison_lines(o))
     out.append(status_line(now))
     return out
 
@@ -3297,16 +3413,23 @@ def billed_compare(space=None, summary_json=None, here_json=None, now=None):
     else:
         s = pa.read_json(os.path.join(costs_dir(space_directory(space)), "summary.json"), None)
         s = s if isinstance(s, dict) else {}
-    account = s.get("account") or "default"
+    labels = space_accounts(s)
+    account = labels[0]
     here = json_arg(here_json, "--here-json") if here_json is not None else account_wide_summary(account, now)
-    table = None
-    try:
-        table, _problem = load_prices(pa.load_profile((s.get("prices") or {}).get("profile")))
-    except pa.Problem:
-        pass
+    table, free = compare_inputs(s)
     billed = effective_billed()
-    out = {"comparison": billing_comparison(billed, s, here, table), "status": billing_status(now),
+    out = {"comparison": billing_comparison(billed, s, here, table, region_free=free), "status": billing_status(now),
            "rows": sum(1 for r in billed if r.get("account") == account)}
+    # limit 3: each other account label of the space on its own. A passed --here-json is the remote's sum for the
+    # space's own label only: the others' all-spaces figures are then not known (null), never this machine's.
+    others = []
+    for a in labels[1:]:
+        o = billing_comparison(billed, s, None if here_json is not None else account_wide_summary(a, now), table, account=a, region_free=free)
+        o["rows"] = sum(1 for r in billed if r.get("account") == a)
+        o["spaceEstimate"] = space_estimate(s, a)
+        others.append(o)
+    if others:
+        out["others"] = others
     print(json.dumps(out, indent=2))
     return 0
 

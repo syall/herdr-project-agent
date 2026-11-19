@@ -560,9 +560,21 @@ export class CostsPane {
     else if (on && qs.result === "refused") box.child(line(`Billing query refused: ${err}`, t.blocked));
     else if (on && qs.result === "failed" && err) box.child(line(`Billing query failed: ${err}; next try after ${clock(qs.nextAfter)}`, t.blocked));
     const c = d.comparison;
+    // t-032 J3g (limit 3, R-A5): one dim line per other account label of the space, each compared on its own; never
+    // added to this account's figures. A comparison without `others` draws nothing more.
+    const estCell = (v, partial, ccur) => (v === null || v === undefined ? "— est. (no price)" : `${money(v, ccur)} est.${partial ? " + unpriced" : ""}`);
+    const others = (bx) => {
+      for (const o of list(d.others).filter((x) => typeof x.account === "string" && x.account)) {
+        const ocur = o.currency ?? cur, tt = o.total && typeof o.total === "object" ? o.total : {}, se = o.spaceEstimate && typeof o.spaceEstimate === "object" ? o.spaceEstimate : {};
+        bx.child(line(o.covered ? `Account ${o.account}: this space ${estCell(tt.thisSpace, tt.thisSpacePartial, ocur)} · ${money(num(tt.billed), ocur)} billed · account-wide`
+          : list(o.separate).length ? `Account ${o.account}: this space ${estCell(se.money, se.partial, ocur)}; billed only in another currency (not compared)`
+            : `Account ${o.account}: this space ${estCell(se.money, se.partial, ocur)}; no billed rows for it`, t.dim));
+      }
+      return bx;
+    };
     if (!num(d.rows)) {
-      if (!on) return box.child(line("Billed amounts: none. The billing query is off; the person turns it on in their own terminal (pa-costs billed enable, see README)."));
-      return box.child(statusRow()).child(line(`No billed rows for account ${str(c?.account ?? s.account)} yet.`));
+      if (!on) return others(box.child(line("Billed amounts: none. The billing query is off; the person turns it on in their own terminal (pa-costs billed enable, see README).")));
+      return others(box.child(statusRow()).child(line(`No billed rows for account ${str(c?.account ?? s.account)} yet.`)));
     }
     const billedHead = "Billed (account-wide: includes use outside this space and outside Herdr)";
     lines.length = 0; lines.push(billedHead); // the Copy starts at the head (a refused or failed query's line above it is dropped)
@@ -592,8 +604,16 @@ export class CostsPane {
       box.child(fig(["total", cell(tt.thisSpace, tt.thisSpacePartial), cell(tt.allSpaces, tt.allSpacesPartial), `${money(tt.billed, ccur)} billed · account-wide`]));
       box.child(line(`calibrated (est. × price factor, where one applies): this space ${c.calibrated === null || c.calibrated === undefined ? "— (no priced estimate)" : `${money(c.calibrated, ccur)}${c.calibratedPartial ? " + unpriced" : ""}`}`));
       if (Array.isArray(c.noPrice) && c.noPrice.length) box.child(line(`No price for ${c.noPrice.map(str).join(", ")}: its estimate is the priced part only.`, t.dim));
+      // D8 (J3g): billed rows with a usage type give endpoint · region pairs; two or more: one line each, est. beside billed
+      const pairs = list(c.byScope).filter((x) => typeof x.endpoint === "string" && typeof x.region === "string");
+      if (pairs.length > 1) {
+        box.child(line("By endpoint · region (billed rows with a usage type):", t.dim));
+        const words = (e, r) => (e === "*" && r === "*" ? "no endpoint or region" : `${e === "*" ? "no endpoint" : e === "?" ? "endpoint unknown" : e}${r === "*" ? "" : ` · ${r === "?" ? "region unknown" : r}`}`);
+        for (const x of pairs) box.child(line(`${words(x.endpoint, x.region)}: this space ${estCell(x.thisSpace, x.thisSpacePartial, ccur)} · ${money(num(x.billed), ccur)} billed · account-wide`));
+      }
     } else if (c && !d.hereError) box.child(line(c.currency ? `No billed rows in ${str(c.currency)} for account ${str(c.account)}.` : `No price table, so no currency to compare: billed rows for account ${str(c.account)} are not compared.`));
     for (const x of list(c?.separate)) box.child(line(`In ${str(x.currency)} (not compared): ${money(x.amount, x.currency)} billed · account-wide, ${num(x.rows)} row(s)`));
+    others(box);
     if (on) box.child(statusRow());
     return box;
   }
