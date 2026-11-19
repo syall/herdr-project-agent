@@ -151,6 +151,15 @@ export async function loadStartOrder(space, cx) {
   if (r.timedOut) return TIMED_OUT;
   return { text: r.text, missing: r.text === null };
 }
+// The person's task order (t-097 J2, tasks.js): task-order.json, this panel its only writer (writeTaskOrder). One
+// keyed, capped read: { text, missing } (the raw text, for the compare-and-write; tasks.js readTaskOrder parses it),
+// or TIMED_OUT on a give-up (never "missing").
+export async function loadTaskOrder(space, cx) {
+  const r = await readJson(`${stateDir(space)}/task-order.json`, space.machine ?? null, cx);
+  if (r.timedOut) return TIMED_OUT;
+  return { text: r.text, missing: r.text === null };
+}
+export const writeTaskOrder = (space, text, expected) => replaceFile(`${stateDir(space)}/task-order.json`, text, expected, space.machine ?? null);
 // expected: the text read (null: no file then). A file changed since is refused (replaceFile's "changed on disk").
 export const writeStartOrder = (space, text, expected) => replaceFile(`${stateDir(space)}/start-order.json`, text, expected, space.machine ?? null);
 

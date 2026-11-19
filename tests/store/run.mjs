@@ -1082,7 +1082,7 @@ cases["S97-pins-after"] = async () => { // R10: a Places move writes one pin for
   check(same(pa(v2([{ id: "gone", slot: 0 }, { id: "B", slot: 0 }]), "C", "top"), [{ id: "B", slot: 0 }, { id: "C", slot: 0 }]), "a pin of a job not waiting is dropped");
   const v1 = placesMod.readOrder(JSON.stringify({ version: 1, order: ["C", "gone"] })).start;
   check(same(pa(v1, "D", "up"), [{ id: "C", slot: 0 }, { id: "D", slot: 2 }]), `a version 1 file's waiting ids carry over as pins (got ${JSON.stringify(pa(v1, "D", "up"))})`);
-  check(same(pa(null, "A", "down", ["B", "A"]), [{ id: "A", slot: 1 }]) && same(pa(null, "B", "down", ["B", "A"]), [{ id: "B", slot: 1 }]), "the slot counts in the ranked order");
+  check(same(pa(null, "A", "down", ["B", "A"]), [{ id: "A", slot: 2 }]) && same(pa(null, "B", "down", ["B", "A"]), [{ id: "B", slot: 1 }]), "the slot counts in the ranked order");
   // pins that interact: the replaced pin would land elsewhere than drawn; every movable job is pinned in the drawn order
   const x3 = ["A", "B", "X"].map(sJob), start = v2([{ id: "X", slot: 0 }, { id: "B", slot: 1 }]);
   check(same(placesMod.effectiveOrder(x3, start).map((j) => j.id), ["X", "B", "A"]), "the case's effective order");
@@ -1155,6 +1155,14 @@ cases["S97-sections"] = async () => { // R5, R13, R14, R15: the sections drawn f
   const pd = tasksMod.taskSections([{ id: "t-2", state: "done" }, { id: "t-1", state: "done" }], []);
   check(same(pd[0].items.map((i) => i.task.id), ["t-2", "t-1"]), "done keeps the given order");
   check(tasksMod.taskSections([{ id: "t-1", state: "odd" }], [])[0].state === "odd", "an unknown state still gets a section");
+};
+
+cases["S97-after"] = async () => { // R18: a row whose after tasks are not all done says so (an id not in the ledger counts as not done)
+  const tasks = [{ id: "t-1", state: "in-progress" }, { id: "t-2", state: "done" }, { id: "t-3", state: "queued", after: ["t-1", "t-2", "gone", 5] }, { id: "t-4", state: "queued", after: "t-1" }];
+  const secs = tasksMod.taskSections(tasks, rk([["t-1", "in-progress", "agent"], ["t-3", "queued", "agent"], ["t-4", "queued", "agent"]]));
+  const q = secs.find((x) => x.state === "queued").items;
+  check(JSON.stringify(q[0].after) === '["t-1","gone"]' && JSON.stringify(q[1].after) === "[]", `after (got ${JSON.stringify(q.map((i) => i.after))})`);
+  check(tasksMod.afterLine(q[0].after) === "waits for t-1, gone (after)" && tasksMod.afterLine([]) === null, "the words");
 };
 
 cases["S97-order-line"] = async () => { // R2, R15: the order line above the sections

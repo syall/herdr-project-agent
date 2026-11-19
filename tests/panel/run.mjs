@@ -5857,7 +5857,6 @@ async function placesWorld({ waiting = { version: 1, jobs: plJobs() }, order, le
   await click(v, "view-tasks"); await settle();
   return { v, dir };
 }
-const orderOf = (text) => JSON.parse(text).order;
 
 cases["P83-1-places"] = async () => { // AC1.1, AC1.2: the kinds, their limits and holders; finished or ended workers hold nothing
   const { v } = await placesWorld();
@@ -5918,7 +5917,7 @@ cases["P83-5-remote"] = async () => { // AC6.2: on another machine: read there, 
   check(/Working · 3 of 4/.test(look(v).text), `holders through the machine's terminals (got ${look(v).text.slice(0, 600)})`);
   await click(v, "place-top-t-083/design"); await settle();
   const k = `${M}:${RDIR}/start-order.json`;
-  check(g.__writes.includes(k) && JSON.stringify(orderOf(g.__files[k])) === JSON.stringify(["t-083/design", "t-020/verify-2"]), `written on the machine (got ${JSON.stringify(g.__writes)})`);
+  check(g.__writes.includes(k) && JSON.stringify(JSON.parse(g.__files[k]).pins) === JSON.stringify([{ id: "t-083/design", slot: 0 }]), `written on the machine: one pin (t-097 R10) (got ${JSON.stringify(g.__writes)})`);
 };
 
 cases["P83-6-busy"] = async () => { // AC9.3: while a write is in flight a click does nothing
@@ -5977,8 +5976,8 @@ cases["P83-11-badges"] = async () => { // R11: badges on task rows; a click unfo
 };
 
 // ---- t-097 J2: the person's task order and the category moves in the Tasks tab ----
-const TSH = JSON.parse(fs.readFileSync(path.join(here, "..", "samples", "task-order-cases.json"), "utf8"));
-const PSH = JSON.parse(fs.readFileSync(path.join(here, "..", "samples", "places-cases.json"), "utf8"));
+// The shared cases files, read when a case runs (test_panel_shards copies this file without tests/samples and only lists it).
+const sample = (name) => JSON.parse(fs.readFileSync(path.join(here, "..", "samples", name), "utf8"));
 const tq = (id, state, n, extra = {}) => ({ id, title: `Task ${id}`, state, created: `2026-11-${String(n).padStart(2, "0")}T00:00:00Z`, ...extra });
 const tOrder = (order, last = [], updated = "U1") => JSON.stringify({ version: 1, updated, by: "person", order, last, moves: [] });
 // A world with the ledger's tasks (and its taskOrder), task-order.json's text (undefined: no file), open cards and the Tasks view open.
@@ -6000,7 +5999,7 @@ const heads = (v) => Object.keys(look(v).clicks).filter((k) => k.startsWith("tas
 const paTask = (action) => (g.__execs ?? []).filter(([c, a]) => c === "pa-task" && (!action || a[0] === action));
 
 cases["P97-1-shared-rank"] = async () => { // R3, R5: every shared rank case drawn: each ranked section in its ranking's order
-  for (const c of TSH.rankCases) {
+  for (const c of sample("task-order-cases.json").rankCases) {
     const tasks = c.tasks.map((t) => ({ title: `Task ${t.id}`, ...t }));
     const { v } = await orderWorld({ tasks, taskOrder: c.taskOrder ?? undefined, order: c.fileText ?? undefined, unfold: ["parked"] });
     const shown = heads(v);
@@ -6077,8 +6076,9 @@ cases["P97-6-unreadable"] = async () => { // R2: the line, the Project Agent's o
 };
 
 cases["P97-7-start-next"] = async () => { // R18: the rank first (to the very top), then pa-task next; a refused write runs nothing
-  const tasks = [tq("t-1", "in-progress", 1), tq("t-2", "queued", 2), tq("t-3", "queued", 3)];
+  const tasks = [tq("t-1", "in-progress", 1), tq("t-2", "queued", 2), tq("t-3", "queued", 3, { after: ["t-1"] })];
   let { v, path } = await orderWorld({ tasks });
+  check(look(v).text.includes("waits for t-1 (after)"), `the row says what it waits for (got ${look(v).text})`);
   check(Boolean(look(v).clicks["next-t-3"]) && !look(v).clicks["next-t-1"] && Boolean(look(v).clicks["pause-t-1"]) && !look(v).clicks["pause-t-3"], "Start next on Queued, Pause on In progress");
   await click(v, "next-t-3"); await settle();
   check(JSON.stringify(JSON.parse(g.__files[path]).order) === '["t-3"]' && JSON.parse(g.__files[path]).moves.at(-1).move === "next", `the rank (got ${g.__files[path]})`);
@@ -6159,6 +6159,7 @@ cases["P97-12-places-rank"] = async () => { // R9, R27: the waiting list follows
 
 cases["P97-13-shared-places"] = async () => { // R9, R10: the shared rank and pin cases drawn in the Places list
   const label = (id) => { const [task, job] = id.split("/"); return `${task} ${job}`; };
+  const PSH = sample("places-cases.json");
   for (const c of [...PSH.rankCases, ...PSH.pinCases]) {
     const jobs = c.jobs.map((j) => { const x = typeof j === "string" ? { id: j } : j; return P83.job(x.id, "working", { source: x.source ?? "pa" }); });
     const tasks = c.rank.map((id, i) => tq(id, "queued", i + 1));

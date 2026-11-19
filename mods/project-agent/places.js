@@ -3,7 +3,8 @@
 // panel's load reads the files (store.js loadWaiting, loadStartOrder, loadRules), this file draws and computes; the
 // one write (start-order.json, compare-and-write) is main.js's. limitsFrom, readOrder, effectiveOrder and allocate
 // are runtime/tools/pa_places.py's limits_from, read_order, effective_order and allocate: both are checked against
-// tests/samples/places-cases.json, so the panel and pa-places give the same answer. The panel does not read the
+// tests/samples/places-cases.json, so the panel and pa-places give the same answer. t-097 J2: the movable jobs follow
+// their task's place in the task order once one exists (R9), and a ↑ ↓ ⤒ writes one pin for that job (version 2, R10). The panel does not read the
 // journal: its reasons assume no hold (J2-D2); pa-places next decides.
 
 import { div } from "gpui-kit";
@@ -18,8 +19,8 @@ export const MISSING_WAITING = "No waiting list yet: the Project Agent writes it
 export const MOVES_KEPT = 20;
 const ORDER_WHY = {
   missing: "no start order yet", empty: "start-order.json is empty", "not-json": "start-order.json is not JSON",
-  "not-object": "start-order.json is not a JSON object", version: "start-order.json is not version 1",
-  order: "start-order.json's order is not a list of job ids",
+  "not-object": "start-order.json is not a JSON object", version: "start-order.json is not version 1 or 2",
+  order: "start-order.json's order is not a list of job ids", pins: "start-order.json's pins are not a list of {id, slot}",
 };
 const FULL = { working: "working", "no-test": "no-test extra", suite: "suite" }; // the place a skipped job waits for
 const KIND = { working: "working", "no-test": "no-test", suite: "suite step" }; // a job's or holder's kind, as drawn
@@ -46,27 +47,53 @@ export function limitsFrom(doc) {
   return { limits, sources, notes };
 }
 
-// { order, error, line } from start-order.json's text (null: no file). line: what both sides say, null when readable.
+// { start, error, line, doc } from start-order.json's text (null: no file). start, when readable: { version: 1,
+// order } (t-083's whole list) or { version: 2, pins: [{ id, slot }] } (t-097 R10); null otherwise. line: what both
+// sides say, null when readable.
 export function readOrder(text) {
-  const bad = (error) => ({ order: [], error, line: error === "missing" ? "no start order yet; the Project Agent's order is used" : `start order unreadable: ${ORDER_WHY[error]}; the Project Agent's order is used` });
+  const bad = (error) => ({ start: null, error, line: error === "missing" ? "no start order yet; the Project Agent's order is used" : `start order unreadable: ${ORDER_WHY[error]}; the Project Agent's order is used`, doc: null });
   if (text === null || text === undefined) return bad("missing");
   if (!String(text).trim()) return bad("empty");
   let doc;
   try { doc = JSON.parse(text); } catch { return bad("not-json"); }
   if (!obj(doc)) return bad("not-object");
-  if (doc.version !== 1) return bad("version");
-  if (!Array.isArray(doc.order) || !doc.order.every((i) => typeof i === "string")) return bad("order");
-  return { order: doc.order, error: null, line: null, doc };
+  if (doc.version !== 1 && doc.version !== 2) return bad("version");
+  if (doc.version === 1) {
+    if (!Array.isArray(doc.order) || !doc.order.every((i) => typeof i === "string")) return bad("order");
+    return { start: { version: 1, order: doc.order }, error: null, line: null, doc };
+  }
+  if (!Array.isArray(doc.pins) || !doc.pins.every((p) => obj(p) && typeof p.id === "string" && whole(p.slot))) return bad("pins");
+  return { start: { version: 2, pins: doc.pins.map((p) => ({ id: p.id, slot: p.slot })) }, error: null, line: null, doc };
 }
 
-// The jobs in effective order (R8): queue jobs keep their index; the movable slots take the movable jobs the person's
-// order names, in that order, then the others in the Project Agent's order. Unknown ids are ignored.
-export function effectiveOrder(jobs, order) {
-  const movable = jobs.filter((j) => j.source !== "queue"), byId = new Map(movable.map((j) => [j.id, j])), seen = new Set(), ordered = [];
-  for (const i of order) if (byId.has(i) && !seen.has(i)) { seen.add(i); ordered.push(byId.get(i)); }
-  ordered.push(...movable.filter((j) => !seen.has(j.id)));
+const jobTask = (j) => (typeof j.task === "string" ? j.task : String(j.id).split("/")[0]);
+// A start order's pins over the waiting movable ids: a version 1 file's ids as pins 0, 1, 2 ... (deduplicated, the
+// ones waiting), a version 2 file's pins as they are.
+function pinsOf(start, waiting) {
+  if (start?.version === 1) { const named = []; for (const i of start.order) if (waiting.has(i) && !named.includes(i)) named.push(i); return named.map((id, slot) => ({ id, slot })); }
+  return Array.isArray(start?.pins) ? start.pins : [];
+}
+
+// The jobs in effective order (t-097 R9, R10; pa_places.effective_order). Queue jobs keep their index. The movable
+// jobs are sorted by their task's place in `rank` (ranked task ids, top first; one task's jobs and the jobs of
+// unranked tasks keep their added order, unranked after); then the start order's pins apply oldest first, each taking
+// its job out and putting it at `slot` among the movable jobs (clamped to the end; a pin whose job is not a waiting
+// movable job is ignored). start: readOrder's (null: none).
+export function effectiveOrder(jobs, start, rank = null) {
+  let movable = jobs.filter((j) => j.source !== "queue");
+  if (rank && rank.length) {
+    const place = new Map();
+    rank.forEach((id, k) => { if (!place.has(id)) place.set(id, k); });
+    movable = movable.map((j, k) => [j, k]).sort((a, b) => (place.get(jobTask(a[0])) ?? place.size) - (place.get(jobTask(b[0])) ?? place.size) || a[1] - b[1]).map(([j]) => j);
+  }
+  for (const { id, slot } of pinsOf(start, new Set(movable.map((j) => j.id)))) {
+    const at = movable.findIndex((j) => j.id === id);
+    if (at < 0) continue;
+    const [j] = movable.splice(at, 1);
+    movable.splice(Math.min(slot, movable.length), 0, j);
+  }
   let k = 0;
-  return jobs.map((j) => (j.source === "queue" ? j : ordered[k++]));
+  return jobs.map((j) => (j.source === "queue" ? j : movable[k++]));
 }
 
 // [b, n, s]: working-type holders (working, suite, not recorded), no-test holders, suite holders.
@@ -108,30 +135,38 @@ export function holdersFrom(ledger, isLive) {
   return out;
 }
 
-// The new order after a move (R6, R9): the movable ids in effective order with `id` moved; ↑/↓ swap with the nearest
-// movable neighbour (fixed queue jobs are skipped over), ⤒ to the first movable slot. null: nothing to move.
+// The pin a move gives (R9, t-097 R10): the job's new position among the movable jobs in effective order; ↑/↓ swap
+// with the nearest movable neighbour (fixed queue jobs are skipped over), ⤒ to the first movable slot. null: nothing
+// to move.
 export function moveOrder(effective, id, move) {
   const ids = effective.filter((j) => j.source !== "queue").map((j) => j.id), i = ids.indexOf(id);
   if (i < 0) return null;
-  if (move === "up" || move === "top") {
-    if (i === 0) return null;
-    const [x] = ids.splice(i, 1);
-    ids.splice(move === "top" ? 0 : i - 1, 0, x);
-    return ids;
-  }
-  if (move === "down") {
-    if (i === ids.length - 1) return null;
-    [ids[i], ids[i + 1]] = [ids[i + 1], ids[i]];
-    return ids;
-  }
+  if (move === "up" || move === "top") return i === 0 ? null : { id, slot: move === "top" ? 0 : i - 1 };
+  if (move === "down") return i === ids.length - 1 ? null : { id, slot: i + 1 };
   return null;
 }
 
-// The start-order.json text the panel writes: the whole order, by the person, the last MOVES_KEPT moves.
-export function orderText(prevText, order, { id = null, move }) {
+// The pins the panel writes after a move (R10): the start order's pins (a version 1 file's waiting ids as pins 0, 1,
+// 2 ...), less the pins of jobs not waiting and the job's own earlier pin, then the job's new pin. When pins interact
+// so that this would put the jobs elsewhere than the move drawn, every movable job is pinned in the drawn order
+// (J2-D5). "reset": no pins (the task order alone). null: a no-op.
+export function pinsAfter({ jobs, start, rank = null, id, move }) {
+  if (move === "reset") return [];
+  const effective = effectiveOrder(jobs, start, rank), pin = moveOrder(effective, id, move);
+  if (!pin) return null;
+  const want = effective.filter((j) => j.source !== "queue").map((j) => j.id);
+  want.splice(pin.slot, 0, ...want.splice(want.indexOf(id), 1));
+  const waiting = new Set(want);
+  const pins = [...pinsOf(start, waiting).filter((p) => waiting.has(p.id) && p.id !== id).map((p) => ({ id: p.id, slot: p.slot })), pin];
+  const got = effectiveOrder(jobs, { version: 2, pins }, rank).filter((j) => j.source !== "queue").map((j) => j.id);
+  return got.every((x, k) => x === want[k]) ? pins : want.map((x, slot) => ({ id: x, slot }));
+}
+
+// The start-order.json text the panel writes (R10): version 2, the pins, by the person, the last MOVES_KEPT moves.
+export function orderText(prevText, pins, { id = null, move }) {
   const prev = readOrder(prevText).doc, now = stamp();
   const moves = [...(Array.isArray(prev?.moves) ? prev.moves : []), { at: now, ...(id ? { id } : {}), move }].slice(-MOVES_KEPT);
-  return `${JSON.stringify({ version: 1, updated: now, by: "person", order, moves }, null, 2)}\n`;
+  return `${JSON.stringify({ version: 2, updated: now, by: "person", pins, moves }, null, 2)}\n`;
 }
 
 // "t-020-verify" of task t-020 reads "verify" (J2-D1); any other name as it is.
@@ -151,8 +186,9 @@ function limitsOf(rules) {
 }
 
 // What the section draws (pure). waiting, startOrder: the load's results (null or a give-up: not known yet); rules:
-// loadRules's; isLive(address): the worker's terminal is live. shown: false with no waiting list and no holder (D3).
-export function placesRows({ waiting, startOrder, rules, ledger, isLive }) {
+// loadRules's; isLive(address): the worker's terminal is live; rank: the ranked task ids once a task order exists
+// (t-097 R9, J1-D10), else null (the added order). shown: false with no waiting list and no holder (D3).
+export function placesRows({ waiting, startOrder, rules, ledger, isLive, rank = null }) {
   const holders = holdersFrom(ledger, isLive);
   const { limits, sources, notes } = limitsOf(rules);
   const w = limits.working, x = limits["no-test"], cap = limits.suite;
@@ -175,7 +211,8 @@ export function placesRows({ waiting, startOrder, rules, ledger, isLive }) {
   if (waiting.error) return { ...out, state: "error", waitingLine: waiting.error };
   const orderKnown = Boolean(startOrder && !gaveUp(startOrder));
   const read = readOrder(orderKnown && !startOrder.missing ? startOrder.text : null);
-  const effective = effectiveOrder(waiting.doc.jobs.map((j) => ({ ...j, source: j.source ?? "pa" })), read.order);
+  const jobsIn = waiting.doc.jobs.map((j) => ({ ...j, source: j.source ?? "pa" }));
+  const effective = effectiveOrder(jobsIn, read.start, rank);
   const reasons = allocate(effective, limits, holders.map((h) => h.place), "off");
   const movable = effective.filter((j) => j.source !== "queue").map((j) => j.id);
   const jobs = effective.map((j, i) => {
@@ -189,8 +226,9 @@ export function placesRows({ waiting, startOrder, rules, ledger, isLive }) {
     return { key: jobKey(j), id: j.id, label: `${i + 1}. ${j.task ?? "?"} ${j.job ?? ""} · ${j.role ?? "?"} · ${KIND[j.kind] ?? j.kind}`, reason, fixed,
       note: fixed ? "merge queue order (Queue tab)" : null, up: orderKnown && !fixed && k > 0, top: orderKnown && !fixed && k > 0, down: orderKnown && !fixed && k >= 0 && k < movable.length - 1 };
   });
-  return { ...out, state: "ok", jobs, effective, orderKnown, head: `${out.head} · ${jobs.length} waiting`,
-    orderLine: !orderKnown ? "order: not read yet" : read.error === null ? "order: yours" : read.error === "missing" ? "order: the Project Agent's" : read.line,
+  return { ...out, state: "ok", jobs, effective, jobsIn, start: read.start, rank, orderKnown, head: `${out.head} · ${jobs.length} waiting`,
+    orderLine: !orderKnown ? "order: not read yet" : read.error === null && !(read.start.version === 2 && !read.start.pins.length) ? "order: yours"
+      : read.error === null || read.error === "missing" ? (rank ? "order: the task order" : "order: the Project Agent's") : read.line, // J2-D6: no pins, the task order alone
     reset: orderKnown && read.error !== null && read.error !== "missing", orderTextRead: orderKnown && !startOrder.missing ? startOrder.text : null };
 }
 
