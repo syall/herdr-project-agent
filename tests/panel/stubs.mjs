@@ -167,12 +167,13 @@ export const watchFolder = (path) => {
 export const closeOverlay = (o) => { (g.__closed ??= []).push(o); return null; };
 export const pickFolder = async () => null;
 
-// __hcHang ["<address>"]: an hc send to these is recorded and settles (code 0) only once the address leaves the list (t-028 D1: a hung send).
+// __hcHang ["<address>"]: an hc send to these is recorded and settles (code 0) only once the address leaves the list (t-028 D1: a hung send);
+// if the address is in __hcFail by then, it settles refused (code 1; t-085: a send that fails after a change was made meanwhile).
 export const hc = pooled("hc", (args = []) => {
   if (args[0] === "send" && (g.__hcHang ?? []).includes(args[1])) { // answers 0 only once the case takes the address off the list (t-053)
     (g.__hcs ??= []).push(args);
     const gen = g.__gen;
-    return (async () => { while ((g.__hcHang ?? []).includes(args[1])) { if (g.__gen !== gen) throw new Error("an old world"); await new Promise((r) => setTimeout(r, 1)); } return { code: 0, stdout: "", stderr: "" }; })();
+    return (async () => { while ((g.__hcHang ?? []).includes(args[1])) { if (g.__gen !== gen) throw new Error("an old world"); await new Promise((r) => setTimeout(r, 1)); } return (g.__hcFail ?? []).includes(args[1]) ? { code: 1, stdout: "", stderr: "refused" } : { code: 0, stdout: "", stderr: "" }; })(); // t-085: in __hcFail too once let go: refused
   }
   return baseHc(args);
 });

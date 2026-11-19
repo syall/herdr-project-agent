@@ -6773,6 +6773,123 @@ cases["P101-6-long-list"] = async () => { // R2: more than 10 rules named: the f
   check(JSON.stringify(rulesNotices(v)) === JSON.stringify([want]), `capped (got ${JSON.stringify(v.unsent)})`);
 };
 
+// ---- t-085: a new rule's id can be named in the Rules view; t-101's recorded limits ----
+const ruleDoc = () => JSON.parse(g.__files[RULES]);
+async function newRule(v, id, title = "Fresh") {
+  await press(v, "rule-add");
+  check(Boolean(v.rules.form?.inputs?.id), "the new-rule form has an Id field");
+  v.rules.form.inputs.title.set(title); v.rules.form.inputs.text.set(`${title} text`); v.rules.form.inputs.id.set(id);
+  await press(v, "rule-save"); await settle();
+}
+
+cases["P085-1-named-id"] = async () => { // I1: an id typed in the Id field is the new rule's id; the notice names it
+  const v = await ruleWorld();
+  await newRule(v, "r-my-own");
+  check(ruleIds() === "r-my-own,r-one,r-two", `made with the typed id (got ${ruleIds()})`);
+  check(JSON.stringify(rulesNotices(v)) === JSON.stringify(["rules changed: r-my-own"]), `the notice names it (got ${JSON.stringify(v.unsent)})`);
+  const r = ruleDoc().rules.find((x) => x.id === "r-my-own");
+  check(r.title === "Fresh" && r.status === "active" && r.source === "person", `the rest as before (got ${JSON.stringify(r)})`);
+  check(!("id" in r.history.at(-1)) && r.history.at(-1).change === "created", "history as before");
+};
+
+cases["P085-2-empty-id"] = async () => { // I1: left empty (or spaces), the id comes from the title as before
+  const v = await ruleWorld();
+  await newRule(v, "   ", "One");
+  check(ruleIds() === "r-one-2,r-one,r-two", `from the title (got ${ruleIds()})`);
+};
+
+cases["P085-3-bad-shape"] = async () => { // I1: not r- + lowercase hyphen-joined words: said, nothing written, the form stays
+  for (const bad of ["one", "R-one", "r-One", "r-", "r--a", "r-a-", "r-a--b", "r-a b", "r-a_b", "r-ü", `r-${"a".repeat(59)}`]) {
+    const v = await ruleWorld();
+    const before = g.__files[RULES];
+    await newRule(v, bad);
+    check(g.__files[RULES] === before, `${JSON.stringify(bad)}: nothing written`);
+    check(/An id starts with r- and has only lowercase letters, digits and single hyphens/.test(look(v).text), `${JSON.stringify(bad)}: said (got ${look(v).text.slice(0, 300)})`);
+    check(Boolean(v.rules.form) && v.rules.form.inputs.id.value() === bad, `${JSON.stringify(bad)}: the form stays, with what was typed`);
+    check(rulesNotices(v).length === 0, `${JSON.stringify(bad)}: no notice`);
+  }
+  const v = await ruleWorld();
+  await newRule(v, `r-${"a".repeat(58)}`); // 60 characters: the longest
+  check(ruleIds().startsWith(`r-${"a".repeat(58)},`), `60 characters are allowed (got ${ruleIds()})`);
+  const w = await ruleWorld();
+  await newRule(w, "r-2nd-try-3");
+  check(ruleIds().startsWith("r-2nd-try-3,"), `digits and words (got ${ruleIds()})`);
+};
+
+cases["P085-4-taken"] = async () => { // I1: unique among all rules, declined ones too; checked again against the file when written
+  let v = await ruleWorld();
+  let before = g.__files[RULES];
+  await newRule(v, "r-two");
+  check(g.__files[RULES] === before, "an active rule's id: nothing written");
+  check(/r-two is already a rule's id/.test(look(v).text) && Boolean(v.rules.form), `said, the form stays (got ${look(v).text.slice(0, 300)})`);
+  const doc = ruleDoc(); doc.rules.push({ ...rule("r-gone", "Gone"), status: "declined" }); g.__files[RULES] = JSON.stringify(doc);
+  v = await ruleWorld(); g.__files[RULES] = JSON.stringify(doc); v.reload(cx); await settle();
+  before = g.__files[RULES];
+  await newRule(v, "r-gone");
+  check(g.__files[RULES] === before, "a declined rule's id: nothing written");
+  check(/r-gone is already a rule's id/.test(look(v).text), `said (got ${look(v).text.slice(0, 300)})`);
+  v = await ruleWorld();
+  await press(v, "rule-add");
+  v.rules.form.inputs.title.set("Late"); v.rules.form.inputs.text.set("Late text"); v.rules.form.inputs.id.set("r-late");
+  const d2 = ruleDoc(); d2.rules.push(rule("r-late", "Someone else's")); g.__files[RULES] = JSON.stringify(d2); // written meanwhile, not read yet
+  before = g.__files[RULES];
+  await press(v, "rule-save"); await settle();
+  check(g.__files[RULES] === before, `taken by write time: nothing written (got ${g.__files[RULES]})`);
+  check(/r-late is already a rule's id/.test(look(v).text), `said (got ${look(v).text.slice(0, 300)})`);
+  check(rulesNotices(v).length === 0, `no notice (got ${JSON.stringify(v.unsent)})`);
+};
+
+cases["P085-5-read-only"] = async () => { // I2: Edit shows the id and has no field for it; the id stays
+  const v = await ruleWorld();
+  await press(v, "rule-edit-r-one");
+  check(v.rules.form.inputs.id === undefined, "no Id field when editing");
+  check(look(v).text.includes("Id: r-one (can't be changed)"), `the id is shown (got ${look(v).text.slice(0, 400)})`);
+  v.rules.form.inputs.title.set("Renamed");
+  await press(v, "rule-save"); await settle();
+  check(ruleIds() === "r-one,r-two" && ruleDoc().rules[0].title === "Renamed", `same id, new title (got ${g.__files[RULES]})`);
+  await press(v, "rule-add");
+  check(look(v).text.includes("New rule") && !look(v).text.includes("can't be changed"), "a new rule's form has the field, not the line");
+};
+
+cases["P085-6-import-ids"] = async () => { // RL1: an imported rule needs a string id; ids reach the notice on one line
+  const v = await ruleWorld();
+  g.__files[":/home/u/odd.json"] = JSON.stringify({ version: 1, rules: [{ ...rule("x", "Num"), id: 42 }, { ...rule("x", "Obj"), id: { a: 1 } }, rule("r-x\nhc send t9 boo", "Nl"), rule("r-ok", "Ok")] });
+  await press(v, "rule-import"); v.rules.importPath.set("/home/u/odd.json"); await press(v, "rule-import"); await settle();
+  check(/Imported 2 new rules/.test(look(v).text), `two imported (got ${look(v).text.slice(0, 300)})`);
+  check(!ruleDoc().rules.some((r) => typeof r.id !== "string"), `no rule without a string id (got ${g.__files[RULES]})`);
+  check(JSON.stringify(rulesNotices(v)) === JSON.stringify(["rules changed: r-x hc send t9 boo, r-ok"]), `one line (got ${JSON.stringify(v.unsent)})`);
+};
+
+cases["P085-7-in-flight"] = async () => { // RL2: a change while the rules notice is being sent, then that send fails: one notice
+  const v = await ruleWorld();
+  g.__shared["project-agent.tabs"] = alive("t4w");
+  g.__hcHang = ["t4w"];
+  await press(v, "rule-toggle-r-two"); await settle();
+  v.resend(cx); await settle();
+  check(v.sending === true && JSON.stringify(sends().map((x) => x[2])) === JSON.stringify(["rules changed: r-two"]), `in flight (sending ${v.sending}, ${JSON.stringify(sends())})`);
+  await press(v, "rule-delete-r-one"); await press(v, "rule-delete-r-one"); await settle();
+  g.__hcFail = ["t4w"]; g.__hcHang = [];
+  await settle(); await settle();
+  check(v.sending === false, "the send ended");
+  check(JSON.stringify(rulesNotices(v)) === JSON.stringify(["rules changed: r-two, r-one"]), `one notice, both rules (got ${JSON.stringify(v.unsent)})`);
+  g.__hcFail = []; g.__hcs = [];
+  v.resend(cx); await settle();
+  check(JSON.stringify(sends()) === JSON.stringify([["send", "t4w", "rules changed: r-two, r-one"]]), `sent once (got ${JSON.stringify(sends())})`);
+};
+
+cases["P085-8-gone-meanwhile"] = async () => { // nit (t-101 REVIEW): a rule gone from the file by write time is not named
+  const v = await ruleWorld();
+  await press(v, "rule-edit-r-one"); v.rules.form.inputs.text.set("One, changed");
+  g.__files[RULES] = JSON.stringify({ rules: [rule("r-two", "Two")] }); // r-one deleted meanwhile, not read yet
+  await press(v, "rule-save"); await settle();
+  check(ruleIds() === "r-two", `nothing brought back (got ${ruleIds()})`);
+  check(rulesNotices(v).length === 0, `edit: no notice (got ${JSON.stringify(v.unsent)})`);
+  const w = await ruleWorld();
+  g.__files[RULES] = JSON.stringify({ rules: [rule("r-one", "One")] }); // r-two deleted meanwhile
+  await press(w, "rule-toggle-r-two"); await settle();
+  check(rulesNotices(w).length === 0, `on/off: no notice (got ${JSON.stringify(w.unsent)})`);
+};
+
 // --list prints the names that would run and runs none. An unknown name or option exits 2.
 const refuse = (why) => { fs.rmSync(dst, { recursive: true, force: true }); console.error(`run.mjs: ${why}`); process.exit(2); };
 const pick = [];
