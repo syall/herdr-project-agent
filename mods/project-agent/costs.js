@@ -604,10 +604,10 @@ export class CostsPane {
       box.child(fig(["total", cell(tt.thisSpace, tt.thisSpacePartial), cell(tt.allSpaces, tt.allSpacesPartial), `${money(tt.billed, ccur)} billed · account-wide`]));
       box.child(line(`calibrated (est. × price factor, where one applies): this space ${c.calibrated === null || c.calibrated === undefined ? "— (no priced estimate)" : `${money(c.calibrated, ccur)}${c.calibratedPartial ? " + unpriced" : ""}`}`));
       if (Array.isArray(c.noPrice) && c.noPrice.length) box.child(line(`No price for ${c.noPrice.map(str).join(", ")}: its estimate is the priced part only.`, t.dim));
-      // D8 (J3g): billed rows with a usage type give endpoint · region pairs; two or more: one line each, est. beside billed
+      // D8 (J3g): billed rows that name an endpoint give endpoint · region pairs; two or more: one line each, est. beside billed
       const pairs = list(c.byScope).filter((x) => typeof x.endpoint === "string" && typeof x.region === "string");
       if (pairs.length > 1) {
-        box.child(line("By endpoint · region (billed rows with a usage type):", t.dim));
+        box.child(line("By endpoint · region (billed rows that name an endpoint):", t.dim));
         const words = (e, r) => (e === "*" && r === "*" ? "no endpoint or region" : `${e === "*" ? "no endpoint" : e === "?" ? "endpoint unknown" : e}${r === "*" ? "" : ` · ${r === "?" ? "region unknown" : r}`}`);
         for (const x of pairs) box.child(line(`${words(x.endpoint, x.region)}: this space ${estCell(x.thisSpace, x.thisSpacePartial, ccur)} · ${money(num(x.billed), ccur)} billed · account-wide`));
       }

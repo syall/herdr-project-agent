@@ -2981,7 +2981,7 @@ def validate_row(row, source, account, now):
     if note is not None and (not isinstance(note, str) or len(note) > 200):
         raise ValueError("note must be a short text")
     out["note"] = note
-    for k in ("endpoint", "region"):  # D8: the usage type's facts, kept when given (labels only); the id does not use them
+    for k in ("endpoint", "region"):  # D8: the billing label's facts, kept when given (labels only); the id does not use them
         v = row.get(k)
         if v is not None:
             if fact_label(k, v) is None:
@@ -3325,7 +3325,7 @@ def comparison_lines(c):
         if c.get("allSpacesUnknown"):
             out.append("  all spaces here: not read for account {}".format(c["account"]))
         if len(c.get("byScope") or []) > 1:
-            out.append("  By endpoint · region (billed rows with a usage type)")
+            out.append("  By endpoint · region (billed rows that name an endpoint)")
             for x in c["byScope"]:
                 out.append("  {:<22} {:>12} {:>16} {:>14}".format(pair_words(x["endpoint"], x["region"])[:22], est(x["thisSpace"], x["thisSpacePartial"]),
                                                                    est(x["allSpaces"], x["allSpacesPartial"]), fmt_money(x["billed"])))
