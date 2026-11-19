@@ -378,8 +378,8 @@ class T025Removed(unittest.TestCase):  # AC1.1, AC2.1, AC3.1, AC4.4, R10
         self.assertEqual(list(inspect.signature(guard.check_command).parameters), ["line"])
 
     def test_size(self):  # R10: about 230 lines (the build came to 245: DECISIONS.md, t-025 D4; t-041 J3's pa-context row: 254;
-        # t-070 J2's price fetch row: 262)
-        self.assertLessEqual(len(source("pa_guard.py").splitlines()), 262)
+        # t-070 J2's price fetch row: 262; its round 3, a dotted module, runpy and python -c naming the module: 266)
+        self.assertLessEqual(len(source("pa_guard.py").splitlines()), 266)
 
 
 class HookGuard(unittest.TestCase):
@@ -905,11 +905,31 @@ D7_FORMS = [
     ("nohup pa-costs prices fetch --source s", "nohup pa-costs prices fetch --source s"),
     ("python3 -mpa_costs prices fetch",), ("python3 -um pa_costs prices fetch",), ("python3 -Bm pa_costs prices fetch",),
     ("python3 -Em pa_costs prices fetch",), ("python3 -u -Bmpa_costs prices fetch --dry-run",),
+    # t-070 J2 round 3 (REVIEW J2 round 2 M1): a dotted module path, runpy and pdb's -m, and python -c naming pa_costs
+    ("PYTHONPATH=runtime/tools python3 -m runtime.tools.pa_costs prices fetch",), ("python3 -m tools.pa_costs prices fetch",),
+    ("PYTHONPATH=tools python3 -mtools.pa_costs prices fetch",), ("python3 -um tools.pa_costs prices fetch",),
+    ("cd runtime && PYTHONPATH=tools python3 -m tools.pa_costs prices fetch", "PYTHONPATH=tools python3 -m tools.pa_costs prices fetch"),
+    ("python3 -Bmruntime.tools.pa_costs prices fetch",), ("python3 -m runpy pa_costs prices fetch",),
+    ("python3 -m runpy runtime.tools.pa_costs prices fetch",), ("python3 -m pdb -m tools.pa_costs prices fetch",),
+    ("python3 -m PA_COSTS prices fetch",),  # the code words below have no blank: shown() splits the inner text at blanks
+    ("python3 -c '__import__(\"pa_costs\").main()' prices fetch", 'python3 -c __import__("pa_costs").main() prices fetch'),
+    ("python3 -c '__import__(\"runpy\").run_module(\"tools.pa_costs\",run_name=\"__main__\")' prices fetch",
+     'python3 -c __import__("runpy").run_module("tools.pa_costs",run_name="__main__") prices fetch'),
+    ("python3 -c 'exec(open(\"runtime/tools/pa_costs.py\").read())' prices fetch --dry-run",
+     'python3 -c exec(open("runtime/tools/pa_costs.py").read()) prices fetch --dry-run'),
+    ("python3 -c '__import__(\"sys\").argv[1:]=[\"prices\",\"fetch\"];__import__(\"pa_costs\").main()'",
+     'python3 -c __import__("sys").argv[1:]=["prices","fetch"];__import__("pa_costs").main()'),
+    ("python3 -Ic'__import__(\"pa_costs\").main()' prices fetch", 'python3 -Ic__import__("pa_costs").main() prices fetch'),
 ]
 D7_ALLOWED = ["pa-costs prices", "pa-costs prices --space sp1", "pa-costs report", "pa-costs fetch prices",
               "echo pa-costs prices fetch", "grep -n fetch runtime/tools/pa_costs.py", "python3 -m unittest tests/test_pa_costs.py",
               'git commit -m "pa-costs prices fetch"', "python3 runtime/tools/pa_costs.py prices --space sp1",
-              "cat runtime/tools/pa_costs.py | grep prices"]
+              "cat runtime/tools/pa_costs.py | grep prices",
+              # t-070 J2 round 3: other modules and pa_costs without the fetch
+              "python3 -m tests.test_pa_costs prices fetch", "python3 -m unittest tests.test_pa_costs.T070_Net",
+              "python3 -m mypa_costs prices fetch", "python3 -m pa_costs_x prices fetch",
+              "python3 -m tools.pa_costs prices --space sp1", "python3 -c 'import pa_costs; print(pa_costs.__file__)'",
+              "python3 -c 'print(1)' prices fetch", "python3 -m json.tool prices fetch"]
 
 
 class T070Prices(GuardTest):
