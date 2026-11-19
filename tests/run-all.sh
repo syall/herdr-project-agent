@@ -82,7 +82,7 @@ units() { "$PY" -m unittest discover -s tests -p "$1.py" -v; }  # one module: th
 # The long unit modules run as several parts (t-078): <module>:<n> runs the module n times at once, the k-th with
 # PA_UNIT_SHARD=k/n, which its load_tests (tests/unit_shards.py) turns into every n-th test from the k-th, so each
 # test runs in exactly one part and a test added later needs no edit here. A part's argument is <module>@<k>.
-unit_shards="test_pa_queue:4 test_pa_worker:2"
+unit_shards="test_pa_queue:4 test_pa_queue_merge:2 test_pa_worker:2"
 shards_of() { for s in $unit_shards; do [ "${s%%:*}" = "$1" ] && { echo "${s#*:}"; return 0; }; done; echo 1; }
 shard() { sm=${1%@*} sk=${1##*@}; PA_UNIT_SHARD="$sk/$(shards_of "$sm")" "$PY" -m unittest discover -s tests -p "$sm.py" -v; }
 keeper() { [ -n "$NODE" ] || { echo "no node found (set NODE)"; return 1; }; "$NODE" tests/keeper/run.mjs; }
