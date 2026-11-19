@@ -246,6 +246,17 @@ class R1PinAnswers(Base):
         sh(path, "git", "mv", ".claude/ä b.md", "ä c.md")
         self.assertSamePin(path)
 
+    def test_a_path_starting_with_a_blank_counts_as_today(self):
+        # MF-1: v1 quotes " .claude/x" and the old filter kept the blank, so it is counted (not under .claude/);
+        # v2 does not quote it. Same answer as at 2a71d7e.
+        path = self.repo()
+        self.commit(path, " .claude/x", "a\n")
+        write(os.path.join(path, " .claude", "x"), "b\n")
+        self.assertIn('M " .claude/x"', sh(path, "git", "status", "--porcelain", "-uno"))
+        self.assertEqual(self.assertSamePin(path)[0]["uncommitted"], 1)
+        sh(path, "git", "mv", " .claude/x", " .claude/y")
+        self.assertEqual(self.assertSamePin(path)[0]["uncommitted"], 1)
+
     def test_unmerged_path_counts_as_today(self):
         path = self.repo()
         sh(path, "git", "checkout", "-q", "-b", "side")
