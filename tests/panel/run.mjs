@@ -5754,6 +5754,83 @@ cases["Q55-14-titles-skipped"] = async () => { // R2, R7: two repositories with 
   check(/Queue · 2/.test(text), `only readable entries counted (got ${text.slice(0, 400)})`);
 };
 
+// ---- t-084: the Queue tab's worker and evidence links, its header, a merge card's approval; Places holder links ----
+const q84Term = (address) => ({ address, state: "live", argv: ["claude"], labels: {}, status: "working", program: claude });
+const q84Ledger = () => ({ tasks: [{ id: "t-A", title: "A", state: "in-progress", workers: [
+  { address: "t70", role: "queue", name: "t-A-queue", worktree: "/wt/t-A", started: "2026-11-18T10:00:00Z" },
+  { address: "t68", role: "build", name: "t-A-other", worktree: "/wt/elsewhere", started: "2026-11-18T10:00:00Z" },
+  { address: "t67", role: "verifier", name: "t-A-gone", worktree: "/wt/t-A", started: "2026-11-18T10:00:00Z" }] }] });
+const q84Doc = () => qDoc({ [QA]: qRepo([qEntry("t-A", { needs: { shortReview: { tip: sha("b"), file: "SHORT-REVIEW-t-A-1.md" } }, heldApproval: { file: "SHORT-REVIEW-t-A-0.md" } })]) });
+const queueClicks = (v, re) => Object.keys(look(v).clicks).filter((k) => re.test(k));
+
+cases["Q84-1-worker"] = async () => { // R1: the entry's open worker on its worktree, a link to the Agents view; one ended: no link
+  const v = await queueWorld(q84Doc(), { ledger: q84Ledger(), opts: { extraTerms: [q84Term("t70"), q84Term("t68")] } });
+  const { text } = look(v);
+  check(text.includes("queue t70 ↗"), `the worker chip (got ${text})`);
+  check(text.includes("verifier t67 (ended)"), `an unfinished worker whose terminal is gone: dim (got ${text})`);
+  check(!/t68/.test(text), `a worker on another worktree is not the entry's (got ${text})`);
+  const ids = queueClicks(v, /^queue-worker-/);
+  check(ids.length === 1, `one link: the live worker (got ${ids})`);
+  g.__runs = [];
+  await click(v, ids[0]);
+  check(g.__runs.some(([n, a]) => n === "terminal.peek" && a?.terminal === "t70"), `opens t70 (got ${JSON.stringify(g.__runs)})`);
+};
+
+cases["Q84-2-files"] = async () => { // R2: a listed evidence file is a link to the Files view; one not written yet: "(not yet)"
+  const v = await queueWorld(q84Doc(), { ledger: q84Ledger() });
+  g.__execOut = { ":evidence": { stdout: "t-A\tSHORT-REVIEW-t-A-1.md\nt-A\tFINDINGS.md\n" } };
+  advance(3000); v.reload(cx); await settle();
+  const { text } = look(v);
+  check(text.includes("SHORT-REVIEW-t-A-1.md ↗") && text.includes("SHORT-REVIEW-t-A-0.md (not yet)"), `the link and the not-yet file (got ${text})`);
+  const ids = queueClicks(v, /^queue-file-/);
+  check(ids.length === 1, `one file link (got ${ids})`);
+  await click(v, ids[0]);
+  const root = g.__shared["my-files.root"];
+  check(root?.file === "SHORT-REVIEW-t-A-1.md" && root?.path === `${DIR}/evidence/t-A` && root?.task === "t-A", `opens the file in Files (got ${JSON.stringify(root)})`);
+};
+
+cases["Q84-3-header"] = async () => { // R3: the repository header says its main branch once, labelled
+  const v = await queueWorld(twoRepos());
+  const { text } = look(v);
+  check(/into main/.test(text) && !/main main/.test(text), `into main, never main main (got ${text})`);
+};
+
+cases["Q84-4-approval"] = async () => { // R4: an answered merge card for the task: approved on it, not "not asked yet"
+  const merge = (id, task, answer) => JSON.stringify({ id, task, status: "answered", answer, question: `Merge ${task} into main?`, options: [{ label: "Merge" }, { label: "Hold" }],
+    created: "2026-11-19T02:20:50Z", answered: "2026-11-19T02:21:07Z" });
+  const v = await queueWorld(qDoc({ [QA]: qRepo([qEntry("t-A"), qEntry("t-B", { onto: "t-A-b" })]) }), { cards: { "d-194": merge("d-194", "t-A", "Merge"), "d-195": merge("d-195", "t-B", "Hold") } });
+  const { text } = look(v);
+  check(/approval: approved on d-194 \(Merge, 11-19 02:21\)/.test(text), `approved on d-194 (got ${text})`);
+  check((text.match(/approval: not asked yet/g) ?? []).length === 1, `only t-B (Hold) is not asked yet (got ${text})`);
+};
+
+cases["Q84-5-remote"] = async () => { // R1: on a remote space the worker opens through its machine's address
+  world({ machine: M, extraTerms: [q84Term(`${M}/t70`)] });
+  g.__files[`${M}:${RDIR}/queue.json`] = q84Doc();
+  g.__files[`${M}:${RDIR}/ledger.json`] = JSON.stringify(q84Ledger());
+  const v = await mount(); await settle(); await click(v, "view-queue");
+  const ids = queueClicks(v, /^queue-worker-/);
+  check(ids.length === 1, `the live worker links (got ${ids}; ${look(v).text})`);
+  g.__runs = [];
+  await click(v, ids[0]);
+  check(g.__runs.some(([n, a]) => n === "terminal.peek" && a?.terminal === `${M}/t70`), `opens ${M}/t70 (got ${JSON.stringify(g.__runs)})`);
+};
+
+cases["P84-1-holder"] = async () => { // R5: a Places holder line opens its worker in the Agents view
+  const { v } = await placesWorld();
+  check(look(v).text.includes("t53 · t-020 verify · verifier · suite step · since 11-19 10:02 ↗"), `the holder line is a link (got ${look(v).text.slice(0, 900)})`);
+  g.__runs = [];
+  await click(v, "place-holder-t53");
+  check(g.__runs.some(([n, a]) => n === "terminal.peek" && a?.terminal === "t53"), `opens t53 (got ${JSON.stringify(g.__runs)})`);
+};
+
+cases["P84-2-holder-remote"] = async () => { // R5: on a remote space, through the machine's address
+  const { v } = await placesWorld({ machine: M });
+  g.__runs = [];
+  await click(v, "place-holder-t53");
+  check(g.__runs.some(([n, a]) => n === "terminal.peek" && a?.terminal === `${M}/t53`), `opens ${M}/t53 (got ${JSON.stringify(g.__runs)})`);
+};
+
 // ---- t-032 J3g: the billed block compares every account label in the space (limit 3, R-A5) and, where billed rows carry
 // endpoint/region, each pair (D8, A-V3). A comparison without `others` or `byScope` draws exactly as before (J3G_OLD:
 // captured from the 1ed3c5e code). ----

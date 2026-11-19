@@ -859,6 +859,35 @@ cases["S55-queue-rows"] = async () => { // queueRows: the waiting and approval r
   check(queueMod.queueRows({ doc: null, error: "queue.json is version 2; this panel reads version 1", missing: false }, null, []).state === "error", "error");
 };
 
+cases["S84-queue-links"] = async () => { // t-084 R1-R4: an entry's workers and evidence files, the header, a merge card's approval
+  const zoneMod = await import(path.join(dst, "zone.js"));
+  zoneMod.zone.offsetAt = () => 0;
+  const e = (task, x = {}) => ({ task, job: null, branch: `${task}-b`, worktree: `/wt/${task}`, onto: "main", state: "checking", tip: "b".repeat(40), needs: null, suite: null, review: null, approval: null, ...x });
+  const doc = { version: 1, repos: { "/w/p": { main: "main", entries: [
+    e("t-A", { needs: { shortReview: { file: "SHORT-REVIEW-t-A-1.md" } }, review: { tip: "c".repeat(40), verdict: "pass", worker: "t72", file: "SHORT-REVIEW-t-A-1.md" }, suite: { exit: 0, worker: "t71" },
+      heldApproval: { file: "SHORT-REVIEW-t-A-0.md" } }),
+    e("t-B", { onto: "t-A-b", job: "J3g" }),
+    e("t-C", { onto: "t-B-b" }),
+  ], left: [], merged: [] } } };
+  const ledger = { tasks: [
+    { id: "t-A", workers: [{ address: "t70", role: "queue", worktree: "/wt/t-A/" }, { address: "t69", role: "build", worktree: "/wt/t-A", finished: true },
+      { address: "t68", role: "build", worktree: "/wt/other" }, { address: "t71", role: "verifier", worktree: "/wt/t-A", finished: true }] },
+  ] };
+  const card = (id, task, answer, extra = {}) => ({ id, card: { id, task, status: "answered", answer, question: `Merge ${task} into main?`, answered: "2026-11-19T02:21:07Z", ...extra } });
+  const cards = [card("d-190", "t-B", "Merge", { question: "Merge t-B J2 into main?" }), card("d-191", "t-B", "Merge", { question: "Merge t-B J3g into main?" }),
+    card("d-192", "t-C", "Hold"), { id: "d-193", card: { id: "d-193", task: "t-C", status: "open", question: "Merge t-C?" } }];
+  const q = queueMod.queueRows({ doc, error: null, missing: false }, ledger, cards);
+  const r = q.repos[0], [a, b, c] = r.entries;
+  check(r.intoLine === "into main", `the header: into main (got ${JSON.stringify(r.intoLine)})`);
+  check(JSON.stringify((a.workers ?? []).map((w) => [w.address, w.label, Boolean(w.finished)])) === JSON.stringify([["t70", "queue t70", false], ["t71", "verifier t71", true], ["t72", "worker t72", false]]),
+    `t-A: its open worker on its worktree, then the suite and review workers (got ${JSON.stringify(a.workers)})`);
+  check(JSON.stringify(a.files) === JSON.stringify(["SHORT-REVIEW-t-A-1.md", "SHORT-REVIEW-t-A-0.md"]), `t-A's files, once each (got ${JSON.stringify(a.files)})`);
+  check(JSON.stringify(b.workers) === "[]" && JSON.stringify(b.files) === "[]", `t-B: none (got ${JSON.stringify([b.workers, b.files])})`);
+  check(b.approval === "approval: approved on d-191 (Merge, 11-19 02:21)", `t-B J3g: the card naming its job (got ${b.approval})`);
+  check(c.approval === "approval: not asked yet", `t-C: Hold and an open plain card do not count (got ${c.approval})`);
+  check(a.approval === "approval: not asked yet", `t-A: no card (got ${a.approval})`);
+};
+
 // ---- t-083 J2: worker places, the waiting list and the person's start order (places.js, store.js) ----
 const placesMod = await import(path.join(dst, "places.js")).catch(() => null);
 const SHARED = JSON.parse(fs.readFileSync(path.join(here, "..", "samples", "places-cases.json"), "utf8"));
