@@ -486,6 +486,38 @@ class RunAll(unittest.TestCase):
         code, out = self.run_all("--nope")
         self.assertEqual(code, 2, out)
 
+    # ---- t-089 J2 (R12): the parts by place: --except-integration on a machine, --only-integration on the Mac ----
+
+    def test_r12a_except_integration_runs_every_part_but_the_integration_one(self):
+        code, out = self.run_all("--except-integration", PA_CHANGED_FILES="tests/keeper/run.mjs")
+        self.assertEqual(code, 0, out)
+        tail = self.summary(out)
+        names = [l.split(": ok", 1)[0].strip() for l in tail.splitlines() if l.startswith("  ") and ": ok (" in l]
+        self.assertEqual(names, NAMES[:-1])  # the same names and order; PA_CHANGED_FILES does not narrow it
+        with open(self.events) as f:
+            self.assertNotIn("integration", f.read())
+        self.assertIn("  suite slot: waited", tail)
+
+    def test_r12b_only_integration_runs_only_it(self):
+        code, out = self.run_all("--only-integration")
+        self.assertEqual(code, 0, out)
+        tail = self.summary(out)
+        names = [l.split(": ok", 1)[0].strip() for l in tail.splitlines() if l.startswith("  ") and ": ok (" in l]
+        self.assertEqual(names, [NAMES[-1]])
+        with open(self.events) as f:
+            self.assertEqual(f.read().split(), ["start", "integration", "end", "integration"])
+        self.assertIn("  suite slot: waited", tail)
+        self.assertEqual(self.progress()[-1]["parts"]["total"], 1)
+        code, out = self.run_all("--only-integration", integration="fail")
+        self.assertEqual(code, 1, out)
+        self.assertIn("pa-session integration (private hc core): FAILED", self.summary(out))
+
+    def test_r12c_the_place_flags_take_no_other_argument(self):
+        for args in (("--except-integration", "x"), ("--only-integration", "--affected"), ("--except-integration", "--only-integration")):
+            code, out = self.run_all(*args)
+            self.assertEqual(code, 2, (args, out))
+            self.assertIn("usage", out)
+
     # ---- t-072: the suite slot (pa_suite.py's flock slots under HERDR_PA_HOME/suite-slots) ----
 
     def holder(self, *command, **stubs):

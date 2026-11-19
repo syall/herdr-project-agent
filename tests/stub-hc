@@ -1,0 +1,292 @@
+#!/usr/bin/env python3
+"""Stand-in for hc in the remote suite tests (t-089 J2): a machine is a folder, nothing leaves this Mac.
+
+  STUB_HC_ROOT      the stub's folder: <root>/<machine>/ is that machine (its tmp/, terminals/)
+  STUB_HC_LOG       one JSON line per call: the argv as given (before any mapping), for the tests' argv checks
+  STUB_HC_MACHINES  the machines it knows (space-separated); --on another one: exit 1 "unknown machine"
+  STUB_HC_FAIL      comma list of failures:
+                      down:<m>     every call on <m> fails (exit 1, "needs_login")
+                      notool:<m>   exec on <m> sees a PATH with only sh, uname, git and python3 (no node)
+                      lost:<m>     every call on <m> after its first `run` fails (exit 1, "not connected")
+                      write        every `file write` fails
+                      match:<text> an exec whose joined argv holds <text> fails (exit 1) without running
+                      kill         every `kill` fails
+  STUB_HC_SUB       old=new: replaced in every exec's output (a remote that answers with another id)
+--on <m> maps the literal prefix /tmp/pa-suite- in every argument (a script's text too) to
+<root>/<m>/tmp/pa-suite-, so the product's fixed remote paths land under the stub's folder.
+Commands: exec, run --bg, file read|write, kill, rm, ls. Anything else: exit 2.
+"""
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+
+ROOT = os.environ.get("STUB_HC_ROOT") or os.path.join(tempfile.gettempdir(), "stub-hc")
+FAILS = [f for f in (os.environ.get("STUB_HC_FAIL") or "").split(",") if f]
+PREFIX = "/tmp/pa-suite-"
+
+
+def fail(text, code=1):
+    sys.stderr.write("hc: " + text + "\n")
+    sys.exit(code)
+
+
+def mapped(machine, value):
+    return value.replace(PREFIX, os.path.join(ROOT, machine, "tmp", "pa-suite-"))
+
+
+def check_machine(machine):
+    known = (os.environ.get("STUB_HC_MACHINES") or "").split()
+    if machine not in known:
+        fail("unknown machine {}".format(machine))
+    if "down:" + machine in FAILS:
+        fail("needs_login: machine {} needs a login".format(machine))
+    if "lost:" + machine in FAILS and os.path.exists(os.path.join(ROOT, machine, "lost")):
+        fail("machine {} is not connected".format(machine))
+    os.makedirs(os.path.join(ROOT, machine, "tmp"), exist_ok=True)
+
+
+def options(args, flags, valued):
+    """(options, rest): --x value pairs and --flags up to `--` or the first other word."""
+    got, i = {}, 0
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            return got, args[i + 1:]
+        if a in flags:
+            got[a] = True
+        elif a in valued:
+            got.setdefault(a, []).append(args[i + 1])
+            i += 1
+        else:
+            return got, args[i:]
+        i += 1
+    return got, []
+
+
+def one(got, key):
+    return got[key][-1] if key in got else None
+
+
+def terminals():
+    for machine in sorted(os.listdir(ROOT)) if os.path.isdir(ROOT) else []:
+        folder = os.path.join(ROOT, machine, "terminals")
+        for name in sorted(os.listdir(folder)) if os.path.isdir(folder) else []:
+            path = os.path.join(folder, name)
+            try:
+                with open(path) as f:
+                    yield machine, path, json.load(f)
+            except (OSError, ValueError):
+                continue
+
+
+def find(address):
+    machine, _, ref = address.rpartition("/")
+    for m, path, t in terminals():
+        if (not machine or m == machine) and ref in (t.get("id"), t.get("name")):
+            return m, path, t
+    return None, None, None
+
+
+def notool_path(machine):
+    folder = os.path.join(ROOT, machine, "notool-bin")
+    os.makedirs(folder, exist_ok=True)
+    for tool in ("sh", "uname", "git", "python3", "cat", "mkdir", "rm", "mv", "wc", "date", "ls", "tr", "head", "chmod"):
+        where = shutil.which(tool)
+        link = os.path.join(folder, tool)
+        if where and not os.path.lexists(link):
+            os.symlink(where, link)
+    return folder
+
+
+def cmd_exec(args):
+    got, argv = options(args, ("-i", "--stdin", "--json"), ("--on", "--cwd", "--env", "--timeout"))
+    machine = one(got, "--on")
+    env = dict(os.environ)
+    if machine:
+        check_machine(machine)
+        argv = [mapped(machine, a) for a in argv]
+        if "notool:" + machine in FAILS:
+            env["PATH"] = notool_path(machine)
+    joined = " ".join(argv)
+    for f in FAILS:
+        if f.startswith("match:") and f[6:] in joined:
+            fail("stub failure for an exec holding {!r}".format(f[6:]))
+    timeout = float(one(got, "--timeout") or 60)
+    try:
+        r = subprocess.run(argv, cwd=one(got, "--cwd"), env=env, stdin=None if ("-i" in got or "--stdin" in got) else subprocess.DEVNULL,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        fail("timed out after {} s".format(timeout), 124)
+    out = r.stdout
+    sub = os.environ.get("STUB_HC_SUB", "")
+    if "=" in sub:
+        old, new = sub.split("=", 1)
+        out = out.replace(old, new)
+    sys.stdout.write(out)
+    sys.stderr.write(r.stderr)
+    sys.exit(r.returncode)
+
+
+def cmd_run(args):
+    got, argv = options(args, ("--bg", "--rm", "--no-notify", "--json", "--no-parent", "--outlive-parent", "--keep"),
+                        ("--on", "--cwd", "--name", "--label", "--parent", "--timeout"))
+    machine = one(got, "--on") or "local"
+    if machine != "local":
+        check_machine(machine)
+    folder = os.path.join(ROOT, machine, "terminals")
+    os.makedirs(folder, exist_ok=True)
+    n = len(os.listdir(folder)) + 1
+    while os.path.exists(os.path.join(folder, "t{}.json".format(n))):
+        n += 1
+    tid = "t{}".format(n)
+    labels = dict(l.split("=", 1) for l in got.get("--label", []))
+    record = os.path.join(folder, tid + ".json")
+    with open(record, "w") as f:
+        json.dump({"id": tid, "name": one(got, "--name"), "labels": labels, "state": "running", "rm": "--rm" in got}, f)
+    cwd = mapped(machine, one(got, "--cwd") or os.getcwd())
+    argv = [mapped(machine, a) for a in argv]
+    p = subprocess.Popen([sys.executable, os.path.abspath(__file__), "_supervise", record, cwd, "--"] + argv,
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    for _ in range(100):  # until the supervisor wrote its pid
+        try:
+            with open(record) as f:
+                if json.load(f).get("pid"):
+                    break
+        except (OSError, ValueError):
+            pass
+        time.sleep(0.02)
+    if "lost:" + machine in FAILS:
+        open(os.path.join(ROOT, machine, "lost"), "w").close()
+    address = "{}/{}".format(machine, tid)
+    print(json.dumps({"address": address, "id": address, "pid": p.pid}) if "--json" in got else address)
+
+
+def supervise(args):
+    record, cwd = args[0], args[1]
+    argv = args[3:]
+
+    def update(**fields):
+        try:
+            with open(record) as f:
+                row = json.load(f)
+        except (OSError, ValueError):
+            row = {}
+        row.update(fields)
+        with open(record + ".new", "w") as f:
+            json.dump(row, f)
+        os.replace(record + ".new", record)
+    update(pid=os.getpid())
+    child = subprocess.Popen(argv, cwd=cwd)
+
+    def stop(sig, frame):
+        try:
+            child.send_signal(signal.SIGHUP)
+        except OSError:
+            pass
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGHUP, stop)
+    code = child.wait()
+    with open(record) as f:
+        row = json.load(f)
+    if row.get("rm"):
+        os.remove(record)
+    else:
+        update(state="finished", exit=code)
+
+
+def cmd_kill(args):
+    _, rest = options(args, ("--json",), ())
+    machine, path, t = find(rest[0] if rest else "")
+    if machine and machine != "local":
+        check_machine(machine)
+    if "kill" in FAILS:
+        fail("stub kill failure")
+    if not t:
+        fail("no terminal {}".format(rest[0] if rest else ""))
+    try:
+        os.killpg(t["pid"], signal.SIGTERM)
+    except (OSError, KeyError):
+        pass
+    for _ in range(200):
+        if not os.path.exists(path) or json.load(open(path)).get("state") != "running":
+            break
+        time.sleep(0.02)
+
+
+def cmd_rm(args):
+    _, rest = options(args, ("--json",), ())
+    machine, path, t = find(rest[0] if rest else "")
+    if machine and machine != "local":
+        check_machine(machine)
+    if not t:
+        fail("no terminal {}".format(rest[0] if rest else ""))
+    if t.get("state") == "running":
+        fail("terminal {} is still running".format(rest[0]))
+    os.remove(path)
+
+
+def cmd_ls(args):
+    got, _ = options(args, ("--all", "--json"), ("--label",))
+    want = dict(l.split("=", 1) for l in got.get("--label", []))
+    rows = []
+    for machine, _, t in terminals():
+        if machine != "local":
+            if "lost:" + machine in FAILS and os.path.exists(os.path.join(ROOT, machine, "lost")):
+                fail("machine {} is not connected".format(machine))
+        if t.get("state") != "running" and "--all" not in got:
+            continue
+        if all((t.get("labels") or {}).get(k) == v for k, v in want.items()):
+            rows.append(dict(t, id="{}/{}".format(machine, t["id"]), machine=machine))
+    print(json.dumps({"terminals": rows}))
+
+
+def cmd_file(args):
+    if not args or args[0] not in ("read", "write"):
+        fail("stub-hc: file {} not known".format(args[:1]), 2)
+    got, rest = options(args[1:], ("--json",), ("--on", "--cwd", "--offset", "--limit"))
+    machine = one(got, "--on")
+    path = rest[0] if rest else ""
+    if machine:
+        check_machine(machine)
+        path = mapped(machine, path)
+    if args[0] == "write":
+        if "write" in FAILS:
+            fail("stub write failure")
+        data = sys.stdin.buffer.read()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(data)
+        return
+    try:
+        with open(path) as f:
+            lines = f.read().splitlines(True)
+    except OSError as e:
+        fail("cannot read {}: {}".format(rest[0] if rest else "", e.strerror))
+    start = int(one(got, "--offset") or 1)
+    limit = one(got, "--limit")
+    chosen = lines[start - 1:] if limit is None else lines[start - 1:start - 1 + int(limit)]
+    sys.stdout.write("".join(chosen)[:8 * 1024 * 1024])
+
+
+def main():
+    args = sys.argv[1:]
+    if args[:1] == ["_supervise"]:
+        return supervise(args[1:])
+    log = os.environ.get("STUB_HC_LOG")
+    if log:
+        with open(log, "a") as f:
+            f.write(json.dumps(args) + "\n")
+    commands = {"exec": cmd_exec, "run": cmd_run, "kill": cmd_kill, "rm": cmd_rm, "ls": cmd_ls, "file": cmd_file}
+    if not args or args[0] not in commands:
+        fail("stub-hc: command {} not known".format(args[:1]), 2)
+    commands[args[0]](args[1:])
+
+
+if __name__ == "__main__":
+    main()
