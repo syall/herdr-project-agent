@@ -1248,5 +1248,26 @@ class T097TaskOrder(unittest.TestCase):
         self.assertEqual(section(read("runtime", "core", "worker.md"), "## Safety"), WORKER_SAFETY)
 
 
+class T101RulesNotice(unittest.TestCase):  # t-101 R6: what the Project Agent does on a 'rules changed' notice
+    def setUp(self):
+        self.raw = read("runtime", "core", "orchestrator.md")
+        self.workers = part(self.raw, "## Workers", "## Phases and gates")
+        self.readme = flat(read("README.md"))
+
+    def test_r6_core_paragraph(self):
+        self.assertIn("A `rules changed: <rule ids>` notice means the person changed those rules in the Rules view "
+                      "(added, edited, deleted, turned on or off, reordered or imported them): re-read `rules.json`, "
+                      "send each running worker any change that applies to its job (`hc send`: what changed and what "
+                      "stays the same), and journal it with `\"trigger\":\"rules\",\"by\":\"person\",\"rules\":[\"<id>\"]`; "
+                      "then run the pass as usual.", self.workers)
+        # next to the task-order notice
+        at = self.workers.index("A `task order changed` notice is a message: run the pass as usual.")
+        self.assertLess(self.workers.index("A `rules changed: <rule ids>` notice") - at, 200)
+
+    def test_r6_readme_names_it(self):
+        self.assertIn("The panel's \"decision … answered\", \"rule …\" and \"rules changed: …\" notices are sent to the "
+                      "record whose `alive` is true", self.readme)
+
+
 if __name__ == "__main__":
     unittest.main()

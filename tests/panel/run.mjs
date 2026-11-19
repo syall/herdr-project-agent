@@ -6630,6 +6630,92 @@ cases["P119-8-read-only"] = async () => { // R7: nothing in the block runs a too
   check(suiteCalls().every(([, a]) => JSON.stringify(a) === JSON.stringify(["--places", "--json"])), "only --places --json");
 };
 
+// ---- t-101: every rule change the person makes in the Rules view tells the Project Agent, once, naming the rules ----
+const rulesNotices = (v) => v.unsent.filter((u) => u.spaceId === S && /^rules changed/.test(u.message)).map((u) => u.message);
+async function dropOn(v, id) { // the mouse-up of a drag, on the rule row `id`
+  const el = pathTo(v.render(cx), id)?.at(-1);
+  check(Boolean(el?.style?.on_mouse_up), `a drop target ${id}`);
+  el.style.on_mouse_up[1]({}, cx); await settle();
+}
+async function ruleAction(v, kind) {
+  if (kind === "delete") { await press(v, "rule-delete-r-one"); await press(v, "rule-delete-r-one"); }
+  else if (kind === "off") await press(v, "rule-toggle-r-two");
+  else if (kind === "on") { await press(v, "rule-toggle-r-two"); await settle(); v.unsent = []; await press(v, "rule-toggle-r-two"); }
+  else if (kind === "edit") { await press(v, "rule-edit-r-one"); v.rules.form.inputs.text.set("One, changed"); await press(v, "rule-save"); }
+  else if (kind === "add") { await press(v, "rule-add"); v.rules.form.inputs.title.set("Fresh"); v.rules.form.inputs.text.set("Fresh text"); await press(v, "rule-save"); }
+  else if (kind === "reorder") { await press(v, "rule-grip-r-two"); await dropOn(v, "rule-r-one"); }
+  else if (kind === "import") {
+    g.__files[":/home/u/exp.json"] = JSON.stringify({ version: 1, rules: [rule("r-new", "New"), rule("r-one", "One again")] });
+    await press(v, "rule-import"); v.rules.importPath.set("/home/u/exp.json"); await press(v, "rule-import");
+  }
+  await settle();
+}
+
+cases["P101-1-each-change"] = async () => { // R1, R2: add, edit, delete, on/off, reorder, import: one notice naming the rule
+  const want = { delete: "r-one", off: "r-two", on: "r-two", edit: "r-one", add: "r-fresh", reorder: "r-two", import: "r-new" };
+  for (const [kind, id] of Object.entries(want)) {
+    const v = await ruleWorld();
+    const before = g.__files[RULES];
+    await ruleAction(v, kind);
+    check(g.__files[RULES] !== before, `${kind}: rules.json written`);
+    check(JSON.stringify(rulesNotices(v)) === JSON.stringify([`rules changed: ${id}`]), `${kind}: one notice naming ${id} (got ${JSON.stringify(v.unsent)})`);
+  }
+};
+
+cases["P101-2-merged"] = async () => { // R3: while unsent, later changes join the one notice; an id is named once
+  const v = await ruleWorld();
+  await press(v, "rule-toggle-r-two"); await settle();
+  await press(v, "rule-delete-r-one"); await press(v, "rule-delete-r-one"); await settle();
+  await press(v, "rule-toggle-r-two"); await settle();
+  check(JSON.stringify(rulesNotices(v)) === JSON.stringify(["rules changed: r-two, r-one"]), `one notice, both rules once (got ${JSON.stringify(v.unsent)})`);
+  check(v.unsent.length === 1, `nothing else queued (got ${JSON.stringify(v.unsent)})`);
+};
+
+cases["P101-3-nothing-written"] = async () => { // R4: a refused write, an import adding nothing: no notice
+  let v = await ruleWorld();
+  g.__files[RULES] = "{ not json";
+  await press(v, "rule-toggle-r-two"); await settle();
+  check(g.__files[RULES] === "{ not json", "the invalid file is not written over");
+  check(rulesNotices(v).length === 0, `no notice for a refused write (got ${JSON.stringify(v.unsent)})`);
+  v = await ruleWorld();
+  g.__files[":/home/u/same.json"] = JSON.stringify({ version: 1, rules: [rule("r-one", "One"), rule("r-two", "Two")] });
+  await press(v, "rule-import"); v.rules.importPath.set("/home/u/same.json"); await press(v, "rule-import"); await settle();
+  check(/Imported 0 new rules/.test(look(v).text), `the import says 0 (got ${look(v).text.slice(0, 400)})`);
+  check(rulesNotices(v).length === 0, `no notice for an import that added none (got ${JSON.stringify(v.unsent)})`);
+};
+
+cases["P101-4-not-the-agents"] = async () => { // R5: the agent's own proposal sends nothing; approving one keeps its own notice only
+  const v = await ruleWorld();
+  const doc = JSON.parse(g.__files[RULES]);
+  doc.rules.push({ id: "r-p", title: "Proposed", text: "Proposed text", status: "proposed", order: 5, source: "orchestrator" });
+  g.__files[RULES] = JSON.stringify(doc);
+  v.reload(cx); await settle();
+  check(look(v).text.includes("Proposed by the Project Agent"), `the proposal is shown (got ${look(v).text.slice(0, 400)})`);
+  check(v.unsent.length === 0, `a proposal read on a reload queues nothing (got ${JSON.stringify(v.unsent)})`);
+  await press(v, "rule-head-r-p"); await press(v, "rule-approve-r-p"); await settle();
+  check(JSON.parse(g.__files[RULES]).rules.find((r) => r.id === "r-p").status === "active", "approved");
+  check(rulesNotices(v).length === 0 && v.unsent.some((u) => u.message === "rule r-p approved"), `only the approval's notice (got ${JSON.stringify(v.unsent)})`);
+};
+
+cases["P101-5-delivered"] = async () => { // R3: sent by hc send to the live launcher's terminal, once
+  const v = await ruleWorld();
+  g.__shared["project-agent.tabs"] = alive("t4w");
+  await press(v, "rule-toggle-r-two"); await settle();
+  v.resend(cx); await flush(); await settle();
+  const got = g.__hcs.filter((a) => a[0] === "send");
+  check(JSON.stringify(got) === JSON.stringify([["send", "t4w", "rules changed: r-two"]]), `sent once (got ${JSON.stringify(got)})`);
+  check(v.unsent.length === 0, `nothing left (got ${JSON.stringify(v.unsent)})`);
+};
+
+cases["P101-6-long-list"] = async () => { // R2: more than 10 rules named: the first 10 and how many more
+  const v = await ruleWorld();
+  const many = Array.from({ length: 12 }, (_, i) => rule(`r-m${i + 1}`, `M${i + 1}`));
+  g.__files[":/home/u/many.json"] = JSON.stringify({ version: 1, rules: many });
+  await press(v, "rule-import"); v.rules.importPath.set("/home/u/many.json"); await press(v, "rule-import"); await settle();
+  const want = `rules changed: ${many.slice(0, 10).map((r) => r.id).join(", ")} and 2 more`;
+  check(JSON.stringify(rulesNotices(v)) === JSON.stringify([want]), `capped (got ${JSON.stringify(v.unsent)})`);
+};
+
 // --list prints the names that would run and runs none. An unknown name or option exits 2.
 const refuse = (why) => { fs.rmSync(dst, { recursive: true, force: true }); console.error(`run.mjs: ${why}`); process.exit(2); };
 const pick = [];
