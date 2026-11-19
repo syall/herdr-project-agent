@@ -352,8 +352,12 @@ declares none, so the command says "declares no price source"):
 ```
 - **Download**: only the declared `https` URLs (a DNS host name, no port, user, query or IP address),
   no redirect followed, no credential, cookie or authentication sent (`User-Agent: herdr-pa-costs`
-  only; proxies from `HTTPS_PROXY`), each file at most its `maxBytes` (50 MB at most), all of them
-  within 120 s, into a temporary folder removed at the end. Certificate checks are never turned off.
+  only), each file at most its `maxBytes` (50 MB at most) and all of its `Content-Length`, all of
+  them within 120 s (connect, a proxy's reply, the TLS handshake and every read; the name lookup has
+  the system's own timeouts), into a temporary folder removed at the end. Certificate checks are
+  never turned off. The only proxy setting read is `HTTPS_PROXY`, as `http://host:port` or
+  `host:port` with no user name or password (anything else is refused); `https_proxy`, `ALL_PROXY`,
+  `NO_PROXY` and the system's proxy settings are not read.
 - **Reader**: the profile's script (inside its folder, no shell, with only `PATH`, `LANG`, `HOME` and
   `TMPDIR` in its environment) runs once per file and prints one JSON line per price
   (`provider, account, endpoint, region, model, kind` (`in|out|cw5m|cw1h|cr` or `long.<kind>`),
