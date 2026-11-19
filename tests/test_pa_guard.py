@@ -689,6 +689,13 @@ class AC6EditorRule(GuardTest):
             with self.subTest(path=path):
                 self.assertEqual(self.edit(path), EDIT.format(path))
 
+    def test_t083_places_files_are_state(self):  # t-083 J1: waiting.json (pa-places) and start-order.json (the panel)
+        for name in ("waiting.json", "start-order.json"):
+            self.assertIn(name, guard.STATE_FILES)
+            path = os.path.join(self.state, name)
+            with self.subTest(path=path):
+                self.assertEqual(self.edit(path), EDIT.format(path))
+
     def test_links_are_resolved(self):
         link = os.path.join(self.repo, "src", "innocent.txt")
         if not os.path.lexists(link):
