@@ -444,10 +444,11 @@ def gate_commits(worktree, runner=None):
                 oid = line[len("# branch.oid "):].strip()
             elif line[:2] in ("1 ", "2 ", "u "):
                 # The path the porcelain v1 line starts with (for a rename or copy, the original), tested as v1's
-                # "XY path" was: leading blanks dropped, quotes stripped.
+                # "XY path" was: quotes stripped, a leading blank kept (v1 quotes a path with a blank, so the old
+                # filter saw '" .claude/x"' and kept the blank; v2 leaves it unquoted; MF-1).
                 fields = line.split(" ", {"1": 8, "2": 9, "u": 10}[line[0]])
                 tested = fields[-1].split("\t", 1)[-1] if line[0] == "2" else fields[-1]
-                if not tested.lstrip().strip('"').startswith(".claude/"):
+                if not tested.strip('"').startswith(".claude/"):
                     changed += 1
         if oid is None:  # status failed: the commit as read before t-094, no tracked change counted
             changed = 0
