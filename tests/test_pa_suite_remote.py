@@ -11,7 +11,7 @@ Nothing leaves this Mac: hc is tests/stub-hc (a machine is a temp folder), the m
   x6  dirty tree, another command, --module stay local               x16 part medians per place
   x7  only the pinned commit arrives                                 x17 --places
   x8  setup failures -> the Mac in the same call                     x18 docs and help
-  x9  every remote argv a fixed form under /tmp/pa-suite-<run>
+  x9  every remote argv a fixed form under /tmp/pa-suite-<run>      x19 the profile's hooks/tests.sh full (d-222)
 """
 import json
 import os
@@ -673,6 +673,111 @@ class X18Docs(unittest.TestCase):
         r = subprocess.run(["git", "grep", "-l", "box-1"], cwd=REPO, stdout=subprocess.PIPE, universal_newlines=True)
         files = [f for f in r.stdout.split() if not f.startswith("tests/")]
         self.assertEqual(files, ["README.md"])
+
+
+PROFILE_RUNNER = r"""#!/bin/sh
+# A fake profile test runner: in a plain git repo it runs tests/run-all.sh from the top level (as the real one does).
+cd "$(git rev-parse --show-toplevel)" || exit 1
+exec tests/run-all.sh
+"""
+
+
+class X19ProfileRunner(Remote):
+    """d-222 A: a profile whose tests.fullIsRunAll declares that its own full command runs tests/run-all.sh in a plain
+    git repo (unless a named file is in the worktree root or above it) goes remote there; elsewhere it stays local."""
+    declared = {"unlessFound": ["ws.marker"]}
+
+    def setUp(self):
+        super().setUp()
+        os.chmod(os.path.join(self.wt, "tests", "run-all.sh"), 0o755)  # the runner runs only an executable one
+        sh(self.wt, "git", "add", "-A")
+        sh(self.wt, "git", "commit", "-q", "-m", "run-all executable")
+        self.use_profile("hooks/tests.sh full")
+
+    def use_profile(self, full, declared="default"):
+        folder = os.path.join(pa.ROOT, "profiles", "test")
+        write(os.path.join(folder, "hooks", "tests.sh"), PROFILE_RUNNER)
+        os.chmod(os.path.join(folder, "hooks", "tests.sh"), 0o755)
+        tests = {"full": full}
+        declared = self.declared if declared == "default" else declared
+        if declared is not None:
+            tests["fullIsRunAll"] = declared
+        dump({"name": "test", "claude": ["true"], "codex": ["true"], "tests": tests},
+             os.path.join(folder, "profile.json"))
+        agent = pa.read_json(os.path.join(self.dir, "agent.json"))
+        agent.pop("commands", None)
+        dump(agent, os.path.join(self.dir, "agent.json"))
+        return os.path.join(folder, "hooks", "tests.sh")
+
+    def check_local(self, word):
+        code, out = self.main()
+        self.assertEqual(code, 0, out)
+        self.assertFalse([c for c in self.calls() if c[0] in ("run", "file")], self.calls())
+        reasons = [l for l in out.splitlines() if "on this Mac" in l]
+        self.assertTrue(reasons and word in " ".join(reasons), out)
+        self.assertIn("fake whole run on this Mac", self.output(self.run_id(out)))
+        return out
+
+    def test_x19a_plain_git_repo_goes_to_the_machine(self):
+        code, out = self.main()
+        self.assertEqual(code, 0, out)
+        line = self.lines()[-1]
+        self.assertEqual(line.get("machine"), "box-1", out)
+        self.assertIn("fake remote part", self.output(self.run_id(out)))
+        self.assertTrue([c for c in self.calls() if c[0] == "run"], self.calls())
+        self.assertEqual(line.get("command"), os.path.join(pa.ROOT, "profiles", "test", "hooks", "tests.sh") + " full")
+
+    def test_x19b_package_workspace_layout_stays_local(self):
+        ws = os.path.join(self.tmp, "ws")
+        write(os.path.join(ws, "ws.marker"), "a workspace\n")
+        pkg = os.path.join(ws, "src", "Pkg")
+        os.makedirs(os.path.dirname(pkg))
+        shutil.move(self.wt, pkg)
+        write(os.path.join(pkg, "Config"), "package.Pkg = {}\n")
+        sh(pkg, "git", "add", "-A")
+        sh(pkg, "git", "commit", "-q", "-m", "config")
+        self.wt = pkg
+        os.chdir(pkg)
+        self.check_local("plain git repo")
+
+    def test_x19c_another_profile_command_stays_local(self):
+        runner = self.use_profile("hooks/tests.sh full")
+        shutil.copy(runner, os.path.join(os.path.dirname(runner), "other.sh"))
+        self.use_profile("hooks/other.sh full")
+        self.check_local("command")
+
+    def test_x19d_run_all_not_executable_stays_local(self):
+        os.chmod(os.path.join(self.wt, "tests", "run-all.sh"), 0o644)
+        sh(self.wt, "git", "add", "-A")
+        sh(self.wt, "git", "commit", "-q", "-m", "not executable")
+        code, out = self.main()
+        self.assertFalse([c for c in self.calls() if c[0] in ("run", "file")], self.calls())
+        reasons = [l for l in out.splitlines() if "on this Mac" in l]
+        self.assertTrue(reasons and "plain git repo" in " ".join(reasons), out)
+
+    def test_x19e_affected_profile_command_stays_local(self):
+        self.use_profile("hooks/tests.sh affected")
+        self.check_local("command")
+
+    def test_x19f_no_declaration_stays_local(self):
+        self.use_profile("hooks/tests.sh full", declared=None)
+        self.check_local("command")
+
+    def test_x19g_a_bad_declaration_is_named_and_stays_local(self):
+        for bad in ({"unlessFound": ["../x"]}, {"unlessFound": "ws.marker"}, ["ws.marker"], {"unlessFound": [""]}):
+            self.use_profile("hooks/tests.sh full", declared=bad)
+            self.check_local("fullIsRunAll")
+
+    def test_x19h_a_space_command_of_its_own_stays_local(self):
+        self.set_command("sh tests/run-all.sh; true")
+        self.check_local("command")
+
+    def test_x19i_an_empty_list_means_any_plain_git_repo(self):
+        self.use_profile("hooks/tests.sh full", declared={"unlessFound": []})
+        write(os.path.join(self.tmp, "ws.marker"), "")
+        code, out = self.main()
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.lines()[-1].get("machine"), "box-1", out)
 
 
 if __name__ == "__main__":
