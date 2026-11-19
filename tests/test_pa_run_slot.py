@@ -399,6 +399,18 @@ class N1Node(Slot):
         self.assertIn("node_real ran hello.js", out)
 
 
+class N2Binaries(Slot):
+    def test_n2_a_binary_tool_started_with_a_minimal_env_gets_nothing_added(self):
+        # A test starting python3 with env={"PATH": ...} (test_pa_costs j2n6) sees only what it gave: a binary is
+        # linked into bin/, not wrapped in a sh that would add SHLVL and PWD.
+        code, out = self.pa_run("--", "python3", "-c", "import os, subprocess; print('child env', subprocess.run("
+                                "['python3', '-c', 'import os; print(sorted(k for k in os.environ if k in (\\'SHLVL\\', "
+                                "\\'PWD\\')))'], env={'PATH': os.environ['PATH']}, stdout=subprocess.PIPE, "
+                                "universal_newlines=True).stdout.strip())")
+        self.assertEqual(code, 0, out)
+        self.assertIn("child env []", out)
+
+
 class K1Kinds(Slot):
     def test_k1_the_kind_is_inferred_unless_given(self):
         cases = [(["--", "sh", "tests/run-all.sh", "--affected"], "affected"),
