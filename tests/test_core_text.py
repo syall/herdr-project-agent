@@ -1146,9 +1146,12 @@ class T097TaskOrder(unittest.TestCase):
     def test_r23_pass_reads_the_order(self):
         self.assertIn("`pa-places tasks` (the task order: each ranked task, top first, with its source, state, "
                       "`after`, open card and `paused`)", self.passes)
-        self.assertIn("Take new work from `pa-places tasks`, top first: for each task that is ready (its `after` tasks "
-                      "done, not `paused`, no open card, no hold), add its next job to the waiting list; jobs start "
-                      "only through `pa-places next`.", self.passes)
+        self.assertIn("Take new work from `pa-places tasks`, top first: for each task in `queued`, `in-progress`, "
+                      "`investigating` or `review` that is ready (its `after` tasks done, not `paused`, no open card, "
+                      "no hold), add its next job to the waiting list. A `parked`, `needs-decision` or `done` task gets "
+                      "no new job; jobs start only through `pa-places next`.", self.passes)  # J3 MF-2 (B1)
+        self.assertIn("takes the next ready task from the top (Queued, In progress, Investigating or Review; a parked, "
+                      "Needs decision or done task gets no new job)", self.readme)  # B2
 
     def test_r26_files(self):
         self.assertIn("`task-order.json` is the person's too: the panel writes it; read it through `pa-places tasks`, "
@@ -1161,10 +1164,20 @@ class T097TaskOrder(unittest.TestCase):
                       "`paused` is written by `pa-task`: keep it when you write the ledger, never clear it yourself."):
             self.assertIn(words, self.files)
 
-    def test_rl3_seed_the_whole_ranking(self):  # REVIEW J1 round 2 RL-3, Nit-3
-        self.assertIn("The first time you write `taskOrder`, seed `order` with every ranked task in `pa-places tasks` "
-                      "order; after that append each new task at its end, so it starts at the bottom of Queued.",
-                      self.files)
+    def test_rl3_seed_the_whole_ranking(self):  # REVIEW J1 round 2 RL-3, Nit-3; J3 MF-1 (A1): the order work stands in
+        for words in ("The first time you write `taskOrder`, seed `order` with the order work stands in now: the tasks "
+                      "in flight first (`review`, `in-progress`, `investigating`), then the rest by the priorities that "
+                      "stand and the person's standing words, never `pa-places tasks` order (with no task order yet it "
+                      "is only created order).",
+                      "After that a new task goes at the end of your `order`, below the tasks in flight, so it starts "
+                      "at the bottom of Queued.",
+                      "You may place a task higher within your own `order` when the person's standing words say so (a "
+                      "hotfix, unblocking or merging first); your `order` ranks only below the person's `order` and "
+                      "above their `last`, never inside them."):
+            self.assertIn(words, self.files)
+        self.assertNotIn("seed `order` with every ranked task in `pa-places tasks` order", self.files)
+        self.assertIn("first seeded with the order work stood in: tasks in flight first", self.readme)  # A4
+        self.assertIn("a new task lands below the tasks in flight", self.readme)
 
     def test_r12_chat_entry(self):
         self.assertIn("When the person says in chat to do a task now, add a `chat` entry quoting them, with `over` the "
@@ -1185,8 +1198,13 @@ class T097TaskOrder(unittest.TestCase):
         self.assertIn("`pa-task next`, `pause` and `unpause` are the person's; never run them yourself.", self.files)
 
     def test_r19_pause_blocks_waiting_jobs(self):
-        self.assertIn("block its waiting jobs with `pa-places block <id> --why \"paused by the person\"`, and unblock "
-                      "them on Unpause or Start next", self.files)
+        self.assertIn("block its waiting jobs with `pa-places block <id> --why \"paused by the person\"`, and on "
+                      "Unpause or Start next unblock them, except a job that waited for something else before (an open "
+                      "card, an `after` task, a hold): `block` replaces a job's `blockedBy`, so block that one again "
+                      "with what it waits for while it still holds.", self.files)  # B3
+        self.assertNotIn("and unblock them on Unpause or Start next", self.files)
+        self.assertIn("A paused task's worker that stopped is not started again until Unpause or Start next.",
+                      self.files)  # B5
         self.assertIn("Neither starts or stops a worker.", self.files)
 
     def test_verify_rl3_until_a_task_order_exists(self):  # VERIFY J1 round 2 RL-3, R27, J1-D10
@@ -1199,9 +1217,18 @@ class T097TaskOrder(unittest.TestCase):
                       "jobs: give it a ranked task, or ask the person to move it in Places.", self.workers)
 
     def test_rl2_in_flight_tasks_rank_too(self):  # REVIEW J1 RL-2
-        self.assertIn("An in-progress or review task ranks only by its place: its next job can wait behind a higher "
-                      "queued task's job until the person raises it.", self.workers)
-        self.assertIn("in progress", self.readme)
+        self.assertIn("An in-progress or review task ranks only by its place: its next job waits behind a queued "
+                      "task's job only when the person, or their standing words, placed that task higher; if that "
+                      "looks wrong, say so in chat.", self.workers)  # J3 MF-1 (A2)
+        self.assertNotIn("until the person raises it", self.workers)
+        self.assertIn("A task in progress or in review ranks only by its place, so its next job waits behind a queued "
+                      "task's job only when you, or your standing words, placed that task higher", self.readme)  # A3
+        self.assertNotIn("until you raise it", self.readme)
+
+    def test_parked_or_done_jobs_dropped(self):  # J3 round 2 B4: pa-places next reads no task states
+        self.assertIn("When a task is parked, by you or the person, or the person marks it done, drop its waiting jobs "
+                      "with `pa-places drop <id> --why \"<task> parked\"` (or `done`): `pa-places next` does not read "
+                      "task states.", self.files)
 
     def test_readme_paragraph(self):
         for words in ("`task-order.json`", "↑ ↓ ⤒ ⤓", "`PA`", "Start next", "Pause", "Unpause", "Mark done",
