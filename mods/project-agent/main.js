@@ -1569,6 +1569,7 @@ export default class ProjectAgent extends View {
     const view = this.view ?? (listed.length || !tasks.length ? "decisions" : "tasks");
     const queue = queueRows(data.queue, data.ledger, this.cardsFor === space.id ? this.cards : []); // t-055: drawn only from what the load read
     const places = this.placesOf(space, data); // t-083 J2: the Places section and the task rows' badges
+    const onMachine = (address) => (space.machine ? `${space.machine}/${address}` : address); // t-084: a worker's terminal address, as the task rows'
     this.viewShown = view;
     const tab = (id, label) => div().id(`view-${id}`).px(9).h(24).flex().items_center().rounded(6).text_size(12).cursor_pointer()
       .bg(view === id ? t.selected : t.chrome).text_color(view === id ? t.foreground : t.muted).hover((s) => s.bg(t.hover))
@@ -1622,7 +1623,8 @@ export default class ProjectAgent extends View {
       .when(view === "tasks", (el) => el.child(v_flex().id("pa-tasks").flex_1().min_h(0).p(8).gap(6).overflow_y_scrollbar()
         .when(places.shown, (e) => e.child(renderPlaces(t, places, { folded: this.placesFolded, busy: Boolean(this.placesBusy[space.id]), error: this.placesError[space.id] ?? null,
           mark: this.placeMark?.space === space.id && Date.now() < this.placeMark.until ? this.placeMark.key : null, asOf: atZone(new Date(this.dataAt ?? Date.now()).toISOString()).slice(6),
-          onFold: (_e, cx) => { this.placesFolded = !this.placesFolded; cx.notify(); }, onMove: (id, move, cx) => this.moveJob(space, id, move, cx), onReset: (cx) => this.moveJob(space, null, "reset", cx) })))
+          onFold: (_e, cx) => { this.placesFolded = !this.placesFolded; cx.notify(); }, onMove: (id, move, cx) => this.moveJob(space, id, move, cx), onReset: (cx) => this.moveJob(space, null, "reset", cx),
+          onWorker: (address) => this.showAgent(onMachine(address)) })))
         .when(!tasks.length, (e) => e.child(note("No tasks yet. Give the Project Agent a goal in its tab.")))
         // t-097 J2 (R2, R15): the order line once, above the sections; Reset order over an unreadable file; a refused write.
         .when(tasks.length > 0, (e) => e.child(h_flex().id("task-order-line").px(4).gap(8).items_center()
@@ -1646,7 +1648,8 @@ export default class ProjectAgent extends View {
             })),
           ];
         }))))
-      .when(view === "queue", (el) => el.child(renderQueue(t, queue)))
+      .when(view === "queue", (el) => el.child(renderQueue(t, queue, { isLive: (a) => terminals().some((x) => x.address === onMachine(a) && x.state === "live"), onWorker: (a) => this.showAgent(onMachine(a)),
+        evidence: data.evidence, onFile: (task, file) => this.showEvidence(space, task, file) }))) // t-084: worker and evidence links
       .when(view === "costs", (el) => el.child(this.costs.render(t, space, (shared("project-agent.costs") ?? {})[space.id] ?? null)))
       .when(view === "rules", (el) => el.child(this.rules.render(t, space, (id, what, cx) => this.ruleDecided(space, id, what, cx))))
       .when(view === "decisions", (el) => el.child(v_flex().id("pa-decisions").flex_1().min_h(0).p(8).gap(8).overflow_y_scrollbar().track_scroll(this.cardScroll)

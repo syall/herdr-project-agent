@@ -195,7 +195,7 @@ export function placesRows({ waiting, startOrder, rules, ledger, isLive, rank = 
   const [b, n, s] = counts(holders.map((h) => h.place)), used = workingUsed(b, n, w);
   const inWorking = holders.filter((h) => h.place !== "no-test"), noTest = holders.filter((h) => h.place === "no-test");
   const seated = [...inWorking, ...noTest.slice(0, used - b)], extra = noTest.slice(used - b);
-  const line = (h, inSuite) => ({ key: holderKey(h), text: holderLine(h, inSuite) });
+  const line = (h, inSuite) => ({ key: holderKey(h), address: h.address, text: holderLine(h, inSuite) });
   const kinds = [{ kind: "working", head: `Working · ${used} of ${w}${sources.working === "default" ? " (default)" : ""}`, over: used > w, holders: seated.map((h) => line(h)) }];
   if (x || extra.length) kinds.push({ kind: "no-test", head: `No-test extra · ${extra.length} of ${x}`, over: extra.length > x, holders: extra.map((h) => line(h)) });
   if (cap !== null) kinds.push({ kind: "suite", head: `Suite step · ${s} of ${cap}  (held within Working)`, over: s > cap, holders: holders.filter((h) => h.place === "suite").map((h) => line(h, true)) });
@@ -232,8 +232,10 @@ export function placesRows({ waiting, startOrder, rules, ledger, isLive, rank = 
     reset: orderKnown && read.error !== null && read.error !== "missing", orderTextRead: orderKnown && !startOrder.missing ? startOrder.text : null };
 }
 
-// Draws the section (R1, R9). o: { folded, mark (a line key or null), busy, error, asOf, onFold, onMove(id, move, cx), onReset(cx) }
-// (each handler gets its click's cx: a cx is valid only for the call that gave it).
+// Draws the section (R1, R9). o: { folded, mark (a line key or null), busy, error, asOf, onFold, onMove(id, move, cx), onReset(cx),
+// onWorker(address) } (each handler gets its click's cx: a cx is valid only for the call that gave it). t-084 R5: a
+// holder line opens its worker in the Agents view (a holder's terminal is live: holdersFrom).
+
 export function renderPlaces(t, rows, o) {
   const line = (text, color) => div().text_size(11.5).text_color(color ?? t.muted).child(text);
   const btn = (id, label, on) => div().id(id).flex_none().px(6).h(20).flex().items_center().rounded(5).border(1).border_color(t.border).text_size(11.5)
@@ -249,7 +251,8 @@ export function renderPlaces(t, rows, o) {
     .children(rows.notes.map((x) => line(x, t.blocked)))
     .children(rows.kinds.flatMap((k) => [
       div().pt(2).text_size(12).text_color(k.over ? t.blocked : t.foreground).child(k.head),
-      ...(k.holders.length ? k.holders.map((h) => marked(div().pl(12), h.key).child(line(h.text))) : [div().pl(12).child(line("free", t.dim))]),
+      ...(k.holders.length ? k.holders.map((h) => marked(div().id(`place-holder-${h.address}`).pl(12).cursor_pointer().hover((s) => s.bg(t.hover)).on_click(() => o.onWorker?.(h.address)), h.key)
+        .child(line(`${h.text} ↗`))) : [div().pl(12).child(line("free", t.dim))]),
     ]))
     .when(Boolean(o.error), (el) => el.child(line(o.error ?? "", t.blocked)))
     .when(rows.state === "loading", (el) => el.child(line("Loading waiting list…", t.dim)))

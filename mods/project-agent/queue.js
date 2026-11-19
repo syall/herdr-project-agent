@@ -3,7 +3,9 @@
 // merge order (state, the branch each is stacked on, what it waits for, its approval), the entries that left (why,
 // the fix round they went to) and the last merges. Read by the panel's load (store.js loadQueue: one keyed, capped
 // read); this file starts no call. It reads J3b's and J3c's fields (approval, queue cards, doc-only reviews) when
-// they are there, and says "not asked yet" until then.
+// they are there, and says "not asked yet" until then. t-084: each entry's workers (a link to the Agents view) and
+// the evidence files it names (a link to the Files view; "(not yet)" while not written); an answered merge card for
+// the entry's task stands for its approval until J3b writes one.
 
 import { div } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
@@ -53,8 +55,27 @@ function approval(e, cards) {
   if (open) return `approval: card asked (${open.id})`;
   const answered = cards.find((c) => lists(c) && c.status === "answered" && !c.queue.applied && /^Merge/.test(String(c.answer ?? "")));
   if (answered) return `approval: answered on ${answered.id}, applied at the next pa-queue merge`;
+  // t-084 R4: the newest answered merge card for the task (not a queue card); with a job, one that names it.
+  const names = (c) => !e.job || c.job === e.job || new RegExp(`(^|[^A-Za-z0-9_-])${String(e.job).replace(/[^A-Za-z0-9]/g, "\\$&")}([^A-Za-z0-9_-]|$)`).test(String(c.question ?? ""));
+  const merge = cards.filter((c) => obj(c) && c.kind !== "queue" && c.task === e.task && c.status === "answered" && /^Merge\b/.test(String(c.answer ?? "")) && names(c))
+    .sort((a, b) => (Date.parse(b.answered) || 0) - (Date.parse(a.answered) || 0))[0];
+  if (merge) return `approval: approved on ${merge.id} (${merge.answer}${merge.answered ? `, ${at(merge.answered)}` : ""})`;
   return "approval: not asked yet";
 }
+
+// t-084 R1: the entry's workers: the task's unfinished ledger workers on the entry's worktree, then the suite and
+// short-review workers the entry names (their ledger role and finished mark when the task records them).
+const trim = (p) => String(p ?? "").replace(/\/+$/, "");
+function workersOf(e, ledger) {
+  const task = list(ledger?.tasks).find((x) => obj(x) && x.id === e.task);
+  const crew = list(task?.workers).filter((w) => obj(w) && str(w.address));
+  const out = [], add = (w, address) => { if (!out.some((x) => x.address === address)) out.push({ address, label: `${w?.role ?? "worker"} ${address}`, finished: Boolean(w?.finished) }); };
+  if (str(e.worktree)) for (const w of crew) if (!w.finished && trim(w.worktree) === trim(e.worktree)) add(w, String(w.address));
+  for (const a of [e.suite?.worker, e.review?.worker].map(str).filter(Boolean)) add([...crew].reverse().find((w) => w.address === a), a);
+  return out;
+}
+// t-084 R2: the evidence files the entry names, once each.
+const filesOf = (e) => [...new Set([e.needs?.shortReview?.file, e.review?.file, e.heldApproval?.file].map(str).filter(Boolean))];
 
 // The fix round a task that left went to: the first build or fix worker of the ledger started at or after it left.
 function fixRound(l, ledger) {
@@ -92,7 +113,8 @@ export function queueRows(q, ledger, cards = []) {
       const suite = s ? `suite ${s.exit === 0 ? "passed" : `failed (exit ${s.exit})`}${s.ended ? ` ${at(s.ended)}` : ""}${s.worker ? ` by ${s.worker}` : ""}` : null;
       const r = obj(e.review) ? e.review : null;
       const review = r ? `short review ${r.verdict ?? "?"}${r.ended ? ` ${at(r.ended)}` : ""}${r.worker ? ` by ${r.worker}` : ""}` : null;
-      return { key: `${path}#${i}`, label: `${i + 1}. ${who(e)}`, state: str(e.state) ?? "?", stack, waits: waits(e), suite, review, approval: approval(e, cardList) };
+      return { key: `${path}#${i}`, task: e.task, label: `${i + 1}. ${who(e)}`, state: str(e.state) ?? "?", stack, waits: waits(e), suite, review, approval: approval(e, cardList),
+        workers: workersOf(e, ledger), files: filesOf(e) };
     });
     const leftAll = list(rec.left).filter(readable);
     const left = leftAll.slice(-LEFT_SHOWN).reverse().map((l) => ({
@@ -103,7 +125,7 @@ export function queueRows(q, ledger, cards = []) {
     }));
     const merged = list(rec.merged).filter(readable).slice(-MERGED_SHOWN).reverse()
       .map((m) => `${who(m)} merged ${at(m.at)} at ${short(m.tip)} (${m.by ?? "queue"}${m.card ? `, ${m.card}` : ""})`);
-    return { path, title: clash(path) ? path.replace(home(), "~") : base(path), main, entries: shown, skipped: all.length - entries.length,
+    return { path, title: clash(path) ? path.replace(home(), "~") : base(path), main, intoLine: `into ${main}`, entries: shown, skipped: all.length - entries.length,
       left, leftCount: leftAll.length, leftMore: Math.max(0, leftAll.length - LEFT_SHOWN), merged };
   });
   return { state: "ok", repos, count };
@@ -116,10 +138,24 @@ export function queueLabel(rows) {
 
 const TONE = { checking: "working", passed: "done", failed: "blocked", invalidated: "dim" };
 
-// Draws the view; starts nothing (t-053).
-export function renderQueue(t, rows) {
+// Draws the view; starts nothing (t-053). o (t-084): { isLive(address), onWorker(address), evidence (the load's Map of
+// task -> files, or undefined: not known), onFile(task, file) }; a click only opens a view.
+export function renderQueue(t, rows, o = {}) {
   const note = (text, color) => div().px(4).py(4).text_size(12).text_color(color ?? t.dim).child(text);
   const line = (text, color) => div().text_size(11.5).text_color(color ?? t.muted).child(text);
+  const live = (a) => Boolean(o.isLive?.(a));
+  const worker = (e, w, k) => {
+    const on = live(w.address);
+    return h_flex().id(`queue-worker-${e.key}-${k}`).flex_none().px(6).h(20).gap(5).items_center().rounded(5).border(1).border_color(t.border).text_size(11)
+      .text_color(on ? t.foreground : t.dim).when(on, (b) => b.cursor_pointer().hover((s) => s.bg(t.hover)).on_click(() => o.onWorker?.(w.address)))
+      .child(on ? `${w.label} ↗` : `${w.label} ${w.finished ? "(closed)" : "(ended)"}`);
+  };
+  const known = o.evidence instanceof Map;
+  const file = (e, f, k) => {
+    const there = known && (o.evidence.get(e.task) ?? []).includes(f);
+    return there ? div().id(`queue-file-${e.key}-${k}`).flex_none().text_size(11.5).text_color(t.accent).cursor_pointer().on_click(() => o.onFile?.(e.task, f)).child(`${f} ↗`)
+      : div().flex_none().text_size(11.5).text_color(t.dim).child(known ? `${f} (not yet)` : f);
+  };
   const box = v_flex().id("pa-queue").flex_1().min_h(0).p(8).gap(6).overflow_y_scrollbar();
   if (rows.state === "loading") return box.child(note("Loading queue…"));
   if (rows.state === "missing") return box.child(note(MISSING_LINE));
@@ -130,16 +166,18 @@ export function renderQueue(t, rows) {
     .children(rows.repos.map((r) => v_flex().flex_none().p(10).gap(4).rounded(7).border(1).border_color(t.border).bg(t.surface)
       .child(h_flex().gap(8).items_center()
         .child(div().flex_1().min_w(0).truncate().text_size(12.5).font_semibold().child(r.title))
-        .child(div().text_size(11).text_color(t.dim).child(`main ${r.main}`)))
+        .child(div().text_size(11).text_color(t.dim).child(r.intoLine)))
       .when(!r.entries.length, (el) => el.child(line("Queue empty.", t.dim)))
       .children(r.entries.map((e) => v_flex().gap(1).py(2)
         .child(h_flex().gap(8).items_center()
           .child(div().flex_1().min_w(0).truncate().text_size(12).text_color(t.foreground).child(e.label))
           .child(div().text_size(11).text_color(t[TONE[e.state]] ?? t.muted).child(e.state)))
         .child(line(e.stack))
+        .when(e.workers.length > 0, (el) => el.child(h_flex().gap(6).flex_wrap().items_center().children(e.workers.map((w, k) => worker(e, w, k)))))
         .when(Boolean(e.waits), (el) => el.child(line(e.waits ?? "")))
         .when(Boolean(e.suite), (el) => el.child(line(e.suite ?? "", t.dim)))
         .when(Boolean(e.review), (el) => el.child(line(e.review ?? "", t.dim)))
+        .when(e.files.length > 0, (el) => el.child(h_flex().gap(6).flex_wrap().items_center().child(line("evidence:", t.dim)).children(e.files.map((f, k) => file(e, f, k)))))
         .child(line(e.approval, t.dim))))
       .when(r.skipped > 0, (el) => el.child(line(`${r.skipped} ${r.skipped === 1 ? "entry" : "entries"} could not be read`, t.blocked)))
       .when(r.leftCount > 0, (el) => el.child(div().pt(4).text_size(11.5).font_semibold().text_color(t.dim).child(`Left · ${r.leftCount}`))
