@@ -510,7 +510,7 @@ class Session:
     def close(self):
         shutil.rmtree(self.hooks, ignore_errors=True)
         if self.cache is not None:
-            self.cache.clear()
+            self.cache.close()  # t-104 R11: a runner still holding it (Ctx.run) caches nothing after this
         self.cache = None
 
 

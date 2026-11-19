@@ -809,14 +809,22 @@ class ContentCache:
     runner gave them. A run is one pa-gate, one pa-queue command, one pa-push-main plan, check or run (its Session),
     or one evaluate_gate call given none. It belongs to the run, is never module-global and never written to disk.
     Objects never change, so an answer stays true across a rebase or a fast-forward of the same run; nothing that
-    reads a ref, HEAD, the index or the worktree is ever stored (cacheable)."""
+    reads a ref, HEAD, the index or the worktree is ever stored (cacheable). A hit replays the stored answer exactly,
+    its stderr included (t-104 D4). close() ends the run: a closed cache is never looked up or filled again, so a
+    runner built on it and kept past its run (Ctx.run) asks git each time (t-104 R11)."""
 
     def __init__(self):
         self.answers = {}
         self.hits = 0
+        self.closed = False
 
     def clear(self):
         self.answers.clear()
+        self.hits = 0
+
+    def close(self):
+        self.clear()
+        self.closed = True
 
 
 class StdinArgv(tuple):
@@ -903,7 +911,7 @@ def content_git(run, cache=None):
     def call(path, *args, input=None, **kw):
         common, files, hexlen = paths(path)
         check(path, files)
-        codes = cacheable(args, hexlen, input) if cache is not None else None
+        codes = cacheable(args, hexlen, input) if cache is not None and not getattr(cache, "closed", False) else None
         key = None
         if codes:
             argv = tuple(args) if input is None else StdinArgv(tuple(args) + (input.decode("ascii"),))
@@ -924,7 +932,7 @@ def content_git(run, cache=None):
         only after the steering check passes now."""
         common, files, hexlen = paths(path)
         check(path, files)
-        codes = cacheable(args, hexlen) if cache is not None else None
+        codes = cacheable(args, hexlen) if cache is not None and not getattr(cache, "closed", False) else None
         if codes and answer[0] in codes:
             cache.answers.setdefault((os.path.realpath(common), tuple(args)), answer)
     call.common = lambda path: paths(path)[0]
