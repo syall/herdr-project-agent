@@ -7,6 +7,7 @@
   pa-queue out <task> [--job J] --repo R --why T  take an entry out (with its dependents); those behind it are invalidated
   pa-queue restack --repo R [--dry-run]         rebase the invalidated entries as a chain, in merge order
   pa-queue verify <task> [--job J] --repo R     decide whether the branch is clean against the content checked
+                                                (clean, moved or union: a short review; changed; stale)
   pa-queue refresh --repo R                     record short reviews, set passed or failed, restack after a failure
 
 queue.json, in the space's state folder, is written by this tool only, under <state>/.queue.lock; each state change
@@ -14,6 +15,11 @@ appends one journal line ("trigger": "queue"). Workers' shells are refused. Clea
 from git, never from a worker's report. The tool rebases only branches of queue entries, in their own clean worktrees
 with no open worker, with the old tip journalled first; on a conflict it aborts. It never pushes, fetches, merges, or
 touches main or a remote. The queue card and the merge are J3's.
+
+d-166 (t-052 J3c): a rebase conflict a rebase worker resolved by keeping both sides unchanged is `union` (the tool
+proves it with git merge-file --union on the blobs) and needs a doc-only short review (only docstrings or comments?),
+not a new check; an entry that leaves on a restack conflict keeps its approval as resumable, and add restores it once
+that review passes.
 """
 import argparse
 import contextlib
@@ -46,6 +52,8 @@ START_LINE = re.compile(r"^Start: (\S+)[ \t]*$", re.M)
 END_LINE = re.compile(r"^End: (\S+)[ \t]*$", re.M)
 REVIEWER_LINE = re.compile(r"^Reviewer: (\S+)", re.M)
 VERDICT_LINE = re.compile(r"^Verdict: (pass|must fix(?: \(\d+\))?)[ \t]*$", re.M)
+DOC_QUESTION = ("is every conflict region only docstrings or comments, both sides kept word for word? 'yes' or 'no' per "
+                "region with one line of reason")
 QUESTION = ("for each place where the base's change lies within about 30 lines of the change, or where one calls, defines "
             "or shadows something the other uses (names, imports, constants, a test class or method), does the change "
             "still do what it did when it was reviewed? 'yes' or 'no' per place with one line of reason")
@@ -356,8 +364,9 @@ def differing(a, b):
 
 
 def decide(ctx, checked, tip, onto, onto_tip):
-    """R6 and the shared-file rule: {result: clean|moved|changed|stale, files, why, record, shared}."""
-    out = {"result": "changed", "files": [], "why": "", "record": None, "shared": []}
+    """R6, the shared-file rule and d-166: {result: clean|moved|union|changed|stale, files, why, record, shared,
+    unions, checked}."""
+    out = {"result": "changed", "files": [], "why": "", "record": None, "shared": [], "unions": [], "checked": checked.get("commit")}
     if not tip or not onto_tip or ctx.merge_base(tip, onto_tip) != onto_tip:
         return dict(out, result="stale", why="it does not sit on the tip of {}".format(onto))
     now_rec = pa_hooks.content_record(ctx.run, ctx.repo, tip, onto)
@@ -373,6 +382,10 @@ def decide(ctx, checked, tip, onto, onto_tip):
     files = differing(seen, now_rec)
     if moved:
         return dict(out, result="moved", files=[s["path"] for s in shared], shared=shared)
+    union, uwhy, unions, ushared = pa_hooks.union_only(ctx.run, ctx.s.gate_git, ctx.repo, seen, now_rec)
+    if union:  # d-166 (t-052 J3c): never clean alone, a doc-only short review decides
+        return dict(out, result="union", files=sorted([u["path"] for u in unions] + [s["path"] for s in ushared]),
+                    shared=ushared, unions=unions)
     return dict(out, files=files, why=pa_hooks.compare_records(seen, now_rec) or why)
 
 
@@ -384,7 +397,7 @@ def ranges(hunks, side):
     return out
 
 
-def needs_for(ctx, entry, tip, decision, old_base, new_base):
+def needs_for(ctx, entry, tip, decision, old_base, new_base, since=None):
     files = []
     for s in decision["shared"]:
         main = ranges(pa_hooks.diff_hunks(ctx.run, ctx.repo, s["oldBase"], s["newBase"]), "new")
@@ -393,17 +406,30 @@ def needs_for(ctx, entry, tip, decision, old_base, new_base):
         files.append({"path": s["path"], "mainHunks": main, "changeHunks": change, "near": near})
     n = max(1, len(entry.get("rebases") or []))
     name = "SHORT-REVIEW-{}{}-{}.md".format(entry["task"], "-" + entry["job"] if entry.get("job") else "", n)
-    return {"tip": tip, "tree": ctx.tree(tip), "file": name, "since": now(), "oldBase": old_base, "newBase": new_base, "files": files}
+    need = {"tip": tip, "tree": ctx.tree(tip), "file": name, "since": since or now(), "oldBase": old_base, "newBase": new_base,
+            "files": files, "kind": "moved"}
+    if decision.get("unions"):  # d-166 (t-052 J3c): the reviewer judges the conflict regions, lines of the tip's file
+        need.update(kind="doc-only", checked=decision.get("checked"),
+                    unions=[{"path": u["path"], "regions": u["regions"], "order": u["order"]} for u in decision["unions"]])
+    return need
 
 
 def handoff_lines(entry, need):
-    lines = ["{}: a short review is needed (the shared-file rule): a fresh reviewer writes evidence/{}/{}".format(
-        entry["task"], entry["task"], need["file"])]
+    doc = need.get("kind") == "doc-only"
+    lines = ["{}: a short review is needed ({}): a fresh reviewer writes evidence/{}/{}".format(
+        entry["task"], "doc-only: a conflict kept on both sides, d-166" if doc else "the shared-file rule", entry["task"], need["file"])]
+    for u in need.get("unions") or []:
+        lines.append("  {}: conflict regions at lines {} of {}:{} ({}); git diff {} {} -- {} (what the resolution added to "
+                     "the checked change)".format(u["path"], ", ".join("{}-{}".format(a, b) for a, b in u["regions"]),
+                                                  need["tip"], u["path"], u["order"], need.get("checked"), need["tip"], u["path"]))
+    if doc:
+        lines.append("  question: " + DOC_QUESTION + "; then 'Verdict: pass' or 'Verdict: must fix (<n>)'.")
     for f in need["files"]:
         near = "; ".join("main {}-{} near change {}-{}".format(m[0], m[1], c[0], c[1]) for m, c in f["near"]) or "none within {} lines".format(NEAR)
         lines.append("  {}: git diff {} {} -- {} (the base's change); git diff {} {} -- {} (the change); {}".format(
             f["path"], need["oldBase"], need["newBase"], f["path"], need["newBase"], need["tip"], f["path"], near))
-    lines.append("  question: " + QUESTION + "; then 'Verdict: pass' or 'Verdict: must fix (<n>)'.")
+    if need["files"] or not doc:
+        lines.append("  question: " + QUESTION + "; then 'Verdict: pass' or 'Verdict: must fix (<n>)'.")
     lines.append("  the file has the lines Start: <UTC time>, End: <UTC time>, Reviewer: <its address>, "
                  "Checked: {}, and its Verdict: line".format(need["tip"]))
     return lines
@@ -435,17 +461,27 @@ def tool_rebase(ctx, entry, new_tip, onto, data=None, rec=None):
 
 # ---- states ------------------------------------------------------------------------------------
 
-def gate_now(ctx, task):
+def content_only(checks):
+    """True when the only failing checks are the content check: what add's own decision may still accept (d-166)."""
+    fails = [c for c in checks if isinstance(c, dict) and not c.get("ok")]
+    return bool(fails) and all(c.get("check") == pa_hooks.CONTENT_CHECK for c in fails)
+
+
+def gate_now(ctx, task, detail=False):
     result = pa_hooks.evaluate_gate(ctx.directory, task, "review", runner=ctx.s.gate_git)
     fails = [c for c in result["checks"] if not c["ok"]]
     pending = bool(fails) and all(c["check"] == pa_hooks.CONTENT_CHECK and "a short review is needed" in str(c.get("why")) for c in fails)
     why = "; ".join("{} ({})".format(c["check"], c.get("why")) for c in fails)
+    if detail:
+        return result["passed"], pending, why, content_only(result["checks"])
     return result["passed"], pending, why
 
 
-def gate_pin(ctx, rec, tid, tip):
+def gate_pin(ctx, rec, tid, tip, content_failed=False):
+    """GATE.json passed at tip; content_failed: or failed only on the content check there (add, a union, d-166)."""
     g = pa.read_json_safe(os.path.join(ctx.directory, "evidence", tid, "GATE.json"))
-    return isinstance(g, dict) and g.get("passed") is True and g.get("phase") == "review" and \
+    ok = isinstance(g, dict) and (g.get("passed") is True or (content_failed and content_only(g.get("checks") or [])))
+    return ok and g.get("phase") == "review" and \
         any(isinstance(c, dict) and c.get("common") == rec["common"] and c.get("commit") == tip for c in g.get("commits") or [])
 
 
@@ -476,17 +512,19 @@ def derive(ctx, rec):
         else:
             d = decide(ctx, e["checked"], n["tip"], e["onto"], n["ontoTip"])
             n.update(content=d["result"], files=d["files"])
-            if d["result"] not in ("clean", "moved"):
+            if d["result"] not in ("clean", "moved", "union"):
                 n.update(state="changed", why="content changed: {}".format(d["why"] or ", ".join(d["files"])))
             else:
                 tree = ctx.tree(n["tip"])
                 s = latest(suites, lambda r: r.get("tree") == tree and tree and r.get("uncommitted") == 0 and r.get("reusable"))
                 n["suite"] = s
                 r = None
-                if d["result"] == "moved":
-                    # RL-J2-V1, Nit-J2-1 (t-052 J3a): the keys short_review_passed checks, so show matches the gate
+                if d["result"] in ("moved", "union"):
+                    # RL-J2-V1, Nit-J2-1 (t-052 J3a): the keys short_review_passed checks, so show matches the gate;
+                    # a union counts only a doc-only review (t-052 J3c)
                     r = latest(reviews, lambda x: x.get("task") == e["task"] and (x.get("job") or None) == (e.get("job") or None)
-                               and x.get("common") == rec["common"] and x.get("tip") == n["tip"] and tree and x.get("tree") == tree)
+                               and x.get("common") == rec["common"] and x.get("tip") == n["tip"] and tree and x.get("tree") == tree
+                               and (d["result"] != "union" or x.get("about") == "doc-only"))
                     n["review"] = r
                 task = ctx.task(e["task"])
                 if task is None:
@@ -514,7 +552,7 @@ def derive(ctx, rec):
                         n["state"] = "passed"
                     else:
                         waits = [w for w, c in (("its suite", not s), ("pa-gate at its tip", not n["gate"]["pin"]),
-                                                ("its short review", d["result"] == "moved" and not r)) if c]
+                                                ("its short review", d["result"] in ("moved", "union") and not r)) if c]
                         n["why"] = "waiting for " + ", ".join(waits) if waits else ""
                 if s and r:
                     a, b = s.get("seconds") or 0, r.get("seconds") or 0
@@ -532,12 +570,21 @@ def set_state(ctx, entry, state, why=""):
 
 
 def leave(ctx, rec, entry, why):
+    """entry leaves the queue; its approval is void. Only a restack conflict keeps it resumable (d-166, t-052 J3c):
+    with the checked digests, so add can restore it once for a conflict kept on both sides. An approval still held
+    for its doc-only review is void for good."""
     rec["entries"].remove(entry)
-    approval = entry.get("approval")
+    approval, held = entry.get("approval"), entry.get("heldApproval")
+    resumable = why == "conflict" and isinstance(approval, dict)
     if isinstance(approval, dict):
-        approval = dict(approval, void=why)
-    rec["left"].append({"task": entry["task"], "job": entry.get("job"), "branch": entry["branch"], "state": entry.get("state"),
-                        "why": why, "at": now(), "tip": ctx.tip(entry["branch"]), "approval": approval})
+        approval = dict(approval, void=why, **({"resumable": True} if resumable else {}))
+    elif isinstance(held, dict) and isinstance(held.get("approval"), dict):
+        approval = dict(held["approval"], void=why)
+    left = {"task": entry["task"], "job": entry.get("job"), "branch": entry["branch"], "state": entry.get("state"),
+            "why": why, "at": now(), "tip": ctx.tip(entry["branch"]), "approval": approval}
+    if resumable:
+        left["checked"] = {k: (entry.get("checked") or {}).get(k) for k in ("commit", "change", "sequence")}
+    rec["left"].append(left)
     ctx.event("left", entry, why=why, tip=ctx.tip(entry["branch"]))
 
 
@@ -627,10 +674,10 @@ def restack(ctx, data, rec, dry=False):
         new = ctx.tip(e["branch"])
         d = decide(ctx, e["checked"], new, prev, prev_tip)
         last.update(to=new, result=d["result"], files=d["files"])
-        if d["result"] in ("clean", "moved"):
+        if d["result"] in ("clean", "moved", "union"):
             e.update(onto=prev, base=prev_tip, tip=new, suite=None, review=None)
             set_state(ctx, e, "checking", "restacked onto {} ({})".format(prev, d["result"]))
-            if d["result"] == "moved":
+            if d["result"] in ("moved", "union"):
                 e["needs"] = {"shortReview": needs_for(ctx, e, new, d, e["checked"]["base"], prev_tip)}
                 lines += handoff_lines(e, e["needs"]["shortReview"])
             else:
@@ -693,7 +740,7 @@ def record_reviews(ctx, rec):
         line = {"kind": "short-review", "at": now(), "task": e["task"], "job": e.get("job"), "repo": ctx.repo, "common": rec["common"],
                 "branch": e["branch"], "tip": tip, "tree": ctx.tree(tip), "file": need["file"], "fileSha256": sha, "worker": address,
                 "started": start.group(1), "ended": end.group(1), "seconds": round(t1 - t0, 1),
-                "verdict": "pass" if verdict[-1] == "pass" else "must fix"}
+                "verdict": "pass" if verdict[-1] == "pass" else "must fix", "about": need.get("kind") or "moved"}
         os.makedirs(pa_hooks.content_dir(ctx.directory), exist_ok=True)
         with open(os.path.join(pa_hooks.content_dir(ctx.directory), REVIEWS_FILE), "a") as f:
             f.write(json.dumps(line) + "\n")
@@ -723,11 +770,13 @@ def show_lines(ctx, rec, pairs):
         need = (e.get("needs") or {}).get("shortReview")
         lines.append("   content {}; suite {}; short review {}".format(
             n["content"] or "-", run_text(n["suite"]),
-            run_text(n["review"]) if n["review"] else ("needed: " + need["file"] if n["content"] == "moved" and need else "not needed")))
+            run_text(n["review"]) if n["review"] else ("needed: " + need["file"] if n["content"] in ("moved", "union") and need else "not needed")))
         if n["timing"]:
             lines.append("   bottleneck: {} by {} s".format(n["timing"]["bottleneck"], n["timing"]["by"]))
         if e.get("approval"):
             lines.append("   approval: {}".format(json.dumps(e["approval"])))
+        elif e.get("heldApproval"):
+            lines.append("   approval held until its doc-only short review passes: {}".format(json.dumps(e["heldApproval"])))
         front = front and n["state"] == "passed"
         if front:
             mergeable.append(e["task"])
@@ -817,10 +866,13 @@ def add(ctx, data, rec, tid, job):
     main_tip = ctx.tip(rec["main"])
     if ctx.is_ancestor(tip, main_tip):
         raise Refused("{} at {} is already in {}: nothing to queue".format(tid, short(tip), rec["main"]))
-    ok, _pending, why = gate_now(ctx, task)
-    if not ok:
+    ok, _pending, why, only_content = gate_now(ctx, task, detail=True)
+    # d-166 (t-052 J3c): a branch a rebase worker put on the last entry, keeping a conflict's both sides, fails the
+    # gate's content check until it is queued (the gate compares it against main): add's own decision below must then
+    # say union, with no tool rebase in between; any other failure refuses here.
+    if not ok and not only_content:
         raise Refused("the gate does not pass now: {}".format(why))
-    if not gate_pin(ctx, rec, tid, tip):
+    if not gate_pin(ctx, rec, tid, tip, content_failed=not ok):
         raise Refused("GATE.json's pin is not the branch tip {} (run pa-gate {} again)".format(short(tip), tid))
     if pin.get("uncommitted"):
         raise Refused("its worktree has uncommitted tracked changes ({}); commit or drop them first".format(pin["uncommitted"]))
@@ -837,6 +889,9 @@ def add(ctx, data, rec, tid, job):
              "files": sorted(set((planned or {}).get("files") or []) | touched(ctx, checked["base"], checked["commit"])),
              "needs": None, "suite": None, "review": None, "rebases": [], "approval": None}
     lines = []
+    if not ok and entry["base"] != onto_tip:
+        raise Refused("the gate does not pass now: {} (a branch whose conflict was kept on both sides joins only from "
+                      "the tip of {}: rebase it there first)".format(why, onto))
     if entry["base"] != onto_tip:
         why = may_rebase(ctx, entry, task)
         if why:
@@ -850,29 +905,87 @@ def add(ctx, data, rec, tid, job):
         new = ctx.tip(branch)
         d = decide(ctx, checked, new, onto, onto_tip)
         entry["rebases"][-1].update(to=new, result=d["result"], files=d["files"])
-        if d["result"] not in ("clean", "moved"):
+        if d["result"] not in ("clean", "moved", "union"):
             why = ", ".join(d["files"]) or d["why"]
             ctx.journal_now("refused", entry, why="content changed in the rebase: " + why)
             raise Refused("the rebase onto {} changed its content ({}): it needs the R8 check on {}; the branch is kept "
                           "rebased at {}".format(onto, d["why"] or why, why, short(new)))
         entry.update(base=onto_tip, tip=new)
-        if d["result"] == "moved":
+        if d["result"] in ("moved", "union"):
             entry["needs"] = {"shortReview": needs_for(ctx, entry, new, d, checked["base"], onto_tip)}
             lines += handoff_lines(entry, entry["needs"]["shortReview"])
         lines.append("{}: rebased onto {} at {}: {} (run pa-gate {} again)".format(tid, onto, short(onto_tip), d["result"], tid))
     else:
         d = decide(ctx, checked, tip, onto, onto_tip)
-        if d["result"] not in ("clean", "moved"):
+        if d["result"] not in ("clean", "moved", "union"):
             raise Refused("its content is not the content checked ({})".format(d["why"] or ", ".join(d["files"])))
-        if d["result"] == "moved":
-            entry["needs"] = {"shortReview": needs_for(ctx, entry, tip, d, checked["base"], onto_tip)}
+        if not ok and d["result"] != "union":
+            raise Refused("the gate does not pass now: {}".format(why))
+        if d["result"] in ("moved", "union"):
+            # the rebase worker's resolution, not the tool's: a review started after its commit counts, as the gate's
+            since = committed_at(ctx, tip) if d["result"] == "union" else None
+            entry["needs"] = {"shortReview": needs_for(ctx, entry, tip, d, checked["base"], onto_tip, since)}
             lines += handoff_lines(entry, entry["needs"]["shortReview"])
+    lines += resume_approval(ctx, rec, entry, d)
     rec["entries"].append(entry)
     rec["planned"] = [p for p in rec["planned"] if not same(p, tid, job)]
     ctx.event("add", entry, onto=onto, tip=entry["tip"], position=len(rec["entries"]),
               rebase=entry["rebases"][-1]["result"] if entry["rebases"] else None)
+    if entry.get("heldApproval"):  # a review written before add counts at once (refresh records it otherwise)
+        record_reviews(ctx, rec)
+        lines += restore_approvals(ctx, rec)
     save(ctx, data, rec)
     lines.append("{} joined the queue at position {}, on {} (state checking)".format(tid, len(rec["entries"]), onto))
+    return lines
+
+
+def committed_at(ctx, sha):
+    ts = pa_hooks.committer_time(ctx.run, ctx.repo, sha)
+    return pa_hooks.iso_at(ts) if ts is not None else None
+
+
+def resume_approval(ctx, rec, entry, d):
+    """d-166 (t-052 J3c): the task's last left[] record, a restack conflict whose approval is resumable, for the same
+    task, job and checked digests and not used yet: on a union the approval is held for the doc-only short review
+    (restore_approvals) and the record is used; on anything else it is not carried, for good."""
+    last = latest(rec["left"], lambda l: same(l, entry["task"], entry.get("job")))
+    approval = (last or {}).get("approval")
+    if not isinstance(approval, dict) or not approval.get("resumable") or last.get("resumed"):
+        return []
+    checked = {k: entry["checked"].get(k) for k in ("commit", "change", "sequence")}
+    if d["result"] != "union" or last.get("checked") != checked:
+        last["resumed"] = {"at": now(), "carried": False, "why": "not a conflict kept on both sides ({})".format(d["result"])
+                           if d["result"] != "union" else "the checked content differs"}
+        return ["{}: its approval ({}) is not carried: only a conflict kept on both sides keeps it (d-166)".format(
+            entry["task"], approval.get("card") or "the queue card")]
+    kept = {k: v for k, v in approval.items() if k not in ("void", "resumable")}
+    entry["heldApproval"] = {"approval": kept, "left": last.get("at"), "file": entry["needs"]["shortReview"]["file"]}
+    last["resumed"] = {"at": now(), "carried": True}
+    ctx.event("approval-held", entry, card=approval.get("card"), file=entry["heldApproval"]["file"])
+    return ["{}: its approval ({}) is held until the doc-only short review {} passes".format(
+        entry["task"], approval.get("card") or "the queue card", entry["heldApproval"]["file"])]
+
+
+def restore_approvals(ctx, rec):
+    """An approval held for a doc-only short review comes back once that review, recorded for the entry's tip and
+    tree, passed (d-166): carried names the review. A failed review makes the entry fail (derive), which voids it."""
+    lines, reviews = [], pa_hooks.review_runs(ctx.directory)
+    for e in rec["entries"]:
+        held = e.get("heldApproval")
+        if not isinstance(held, dict):
+            continue
+        tip = ctx.tip(e["branch"])
+        tree = ctx.tree(tip)
+        r = latest(reviews, lambda x: x.get("task") == e["task"] and (x.get("job") or None) == (e.get("job") or None)
+                   and x.get("common") == rec["common"] and x.get("tip") == tip and tree and x.get("tree") == tree
+                   and x.get("about") == "doc-only")
+        if not r or r.get("verdict") != "pass":
+            continue
+        e["approval"] = dict(held["approval"], carried="doc-only, short review {}".format(r.get("file")))
+        e["heldApproval"] = None
+        ctx.event("approval-restored", e, card=held["approval"].get("card"), file=r.get("file"), tip=tip)
+        lines.append("{}: its approval ({}) is restored: {}".format(e["task"], held["approval"].get("card") or "the queue card",
+                                                                   e["approval"]["carried"]))
     return lines
 
 
@@ -985,10 +1098,10 @@ def cmd_verify(args):
             if tip != entry.get("tip"):
                 entry["rebases"].append({"at": now(), "from": entry.get("tip"), "to": tip, "onto": onto, "ontoTip": ctx.tip(onto),
                                          "result": d["result"], "files": d["files"]})
-                if d["result"] in ("clean", "moved"):
+                if d["result"] in ("clean", "moved", "union"):
                     entry.update(tip=tip, base=ctx.tip(onto))
                     entry["needs"] = {"shortReview": needs_for(ctx, entry, tip, d, entry["checked"]["base"], ctx.tip(onto))} \
-                        if d["result"] == "moved" else None
+                        if d["result"] in ("moved", "union") else None
             need = (entry.get("needs") or {}).get("shortReview")
             subject = entry
         else:
@@ -1004,20 +1117,21 @@ def cmd_verify(args):
             checked = checked_at_add(ctx, rec, task, pin.get("branch"))
             d = decide(ctx, checked, tip, onto, ctx.tip(onto))
             subject = {"task": args.task, "job": args.job, "rebases": []}
-            need = needs_for(ctx, subject, tip, d, checked["base"], ctx.tip(onto)) if d["result"] == "moved" else None
+            need = needs_for(ctx, subject, tip, d, checked["base"], ctx.tip(onto)) if d["result"] in ("moved", "union") else None
         ctx.event("verify", subject, tip=tip, onto=onto, result=d["result"], files=d["files"])
         save(ctx, data, rec)
     print("{} at {} on {}: {}{}".format(args.task, short(tip), onto, d["result"],
                                        " ({})".format(d["why"] or ", ".join(d["files"])) if d["result"] not in ("clean",) else ""))
-    if d["result"] == "moved" and need:
+    if d["result"] in ("moved", "union") and need:
         print("\n".join(handoff_lines(subject, need)))
-    return 0 if d["result"] in ("clean", "moved") else 1
+    return 0 if d["result"] in ("clean", "moved", "union") else 1
 
 
 def cmd_refresh(args):
     with writing(args) as (ctx, data, rec):
         sync_main(ctx, rec)
         record_reviews(ctx, rec)
+        restored = restore_approvals(ctx, rec)
         pairs = derive(ctx, rec)
         first = None
         for e, n in pairs:
@@ -1032,7 +1146,7 @@ def cmd_refresh(args):
                 if n["timing"] and e.get("timed") != n["tip"]:
                     e["timed"] = n["tip"]
                     ctx.event("timing", e, timing=n["timing"], tip=n["tip"])
-        lines = []
+        lines = restored
         if first:
             e, n = first
             set_state(ctx, e, "failed", n["why"])

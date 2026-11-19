@@ -694,7 +694,8 @@ def compare_records(checked, now):
 def content_check(directory, task, pins, runner=None, records=None):
     """(check, GATE.json content) for the review gate: the commit on VERIFY.md's last Checked: line makes the same
     change as HEAD, per pin (t-052 R5). records: computed records are appended here (with source verify or head)."""
-    run = content_git(globals()["git"] if runner is None else runner)
+    raw = globals()["git"] if runner is None else runner
+    run = content_git(raw)
     evidence = os.path.join(directory, "evidence", str(task.get("id")))
     verify = checked_commits(pa.read_text(os.path.join(evidence, "VERIFY.md")))
     review = checked_commits(pa.read_text(os.path.join(evidence, "REVIEW.md")))
@@ -819,6 +820,21 @@ def content_check(directory, task, pins, runner=None, records=None):
                     else:
                         fails.append("{}change lines only moved in {}: a short review is needed (pa-queue verify names it); "
                                      "HEAD {} against the checked {}".format(label, names, head[:7], x[:7]))
+                    continue
+                union, _uwhy, unions, ushared = union_only(run, raw, path, checked, now)
+                if union:  # d-166 (t-052 J3c): a conflict kept on both sides counts only with a doc-only short review
+                    names = ", ".join(clean(u["path"]) for u in unions[:CONTENT_FILES_SHOWN])
+                    entry["union"] = [u["path"] for u in unions]
+                    if ushared:
+                        entry["moved"] = [f["path"] for f in ushared]
+                    passed = short_review_passed(run, directory, task, common, path, head, now.get("tree"), about="doc-only")
+                    if passed:
+                        entry["shortReview"] = passed.get("file")
+                        notes.append("{}a conflict kept on both sides in {}; doc-only short review {} passed".format(
+                            label, names, clean(passed.get("file"))))
+                    else:
+                        fails.append("{}a conflict kept on both sides in {}: a short review is needed (doc-only; pa-queue "
+                                     "verify names it); HEAD {} against the checked {}".format(label, names, head[:7], x[:7]))
                     continue
                 fails.append("{}{}; HEAD {} against the checked {}".format(label, why, head[:7], x[:7]))
             else:
@@ -986,6 +1002,129 @@ def moved_only(run, path, checked, now):
         return False, "{}: {}".format(type(e).__name__, clean(e)[:200]), []
 
 
+REGULAR_MODES = ("100644", "100755")
+# git merge-file's diff: its own default (myers), then the one a rebase's ort merge uses (histogram), so a resolution
+# made from either conflict shape is found.
+UNION_ALGORITHMS = ((), ("--diff-algorithm=histogram",))
+
+
+def conflict_regions(data):
+    """[[first, last]] lines (1-based) of each conflict of a merge-file output with markers, as they lie in the
+    --union result of the same merge (both sides' lines, no markers)."""
+    regions, line, start, inside = [], 0, None, 0
+    for text in data.split(b"\n"):
+        if inside == 0 and text.startswith(b"<<<<<<<"):
+            inside, start = 1, line + 1
+        elif inside == 1 and text.rstrip(b"\r") == b"=======":
+            inside = 2
+        elif inside == 2 and text.startswith(b">>>>>>>"):
+            inside = 0
+            if line >= start:
+                regions.append([start, line])
+        else:
+            line += 1
+    return regions
+
+
+def union_of(raw, common, mine, old, new, tip):
+    """(order, regions) when blob tip is exactly `git merge-file --union` of the checked tip `mine` and the new base
+    `new` over the old base `old`, in either order ("checked first": mine's lines first; "base first"), and the plain
+    merge of the same has at least one conflict; else (None, why). The four blobs are written raw (git unpack-file:
+    no filter, no attribute) into a mktemp -d folder and merge-file runs on those files only: no work tree, no
+    attributes, no merge driver; nothing is written to the repository (t-052 J3c, V-U2)."""
+    folder = tempfile.mkdtemp(prefix="pa-union-")
+    try:
+        names = {}
+        for key, sha in (("mine", mine), ("old", old), ("new", new), ("tip", tip)):
+            code, out, err = raw(folder, *(CONTENT_GIT + ("--git-dir=" + common, "unpack-file", sha)))
+            name = (out or "").strip()
+            if code or not re.match(r"^\.merge_file_[A-Za-z0-9_]+$", name):
+                raise ContentError("cannot read blob {} ({})".format(str(sha)[:7], clean(err)[-200:]))
+            names[key] = name
+        with open(os.path.join(folder, names["tip"]), "rb") as f:
+            want = f.read()
+        for order, (first, second) in (("checked first", ("mine", "new")), ("base first", ("new", "mine"))):
+            with open(os.path.join(folder, names[first]), "rb") as f:
+                start = f.read()
+            for algorithm in UNION_ALGORITHMS:
+                merged = {}
+                for out_name, union in (("union", ("--union",)), ("markers", ())):
+                    with open(os.path.join(folder, out_name), "wb") as f:
+                        f.write(start)
+                    code, _o, _e = raw(folder, *(("-c", "merge.conflictStyle=merge", "merge-file", "-q") + algorithm + union +
+                                                (out_name, names["old"], names[second])))
+                    with open(os.path.join(folder, out_name), "rb") as f:
+                        merged[out_name] = (code, f.read())
+                (ucode, udata), (mcode, mdata) = merged["union"], merged["markers"]
+                # merge-file exits with the number of conflicts (at most 127), 255 on an error
+                if ucode == 0 and udata == want and 0 < mcode < 128:
+                    regions = conflict_regions(mdata)
+                    if regions:
+                        return order, regions
+        return None, "not both sides kept unchanged"
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+
+
+def union_only(run, raw, path, checked, now):
+    """(True, "", unions, shared) when now makes checked's change with a rebase conflict resolved by keeping both
+    sides unchanged (d-166, t-052 J3c): the same paths; each differing file either moved only (same_lines: in shared)
+    or a union: status M on both sides, the same regular modes, another base, and its tip blob exactly the
+    merge-file --union of the checked tip and the new base (union_of); at least one union; the same commits (count,
+    messages, paths), each the same, moved, or touching only union files differently. unions: [{path, oldBase,
+    newBase, checkedTip, tip, order, regions}]. Else (False, why, [], []). Never raises; never clean alone: a short
+    reviewer judges that every region is only docstrings or comments."""
+    try:
+        a = {f.get("path"): f for f in checked.get("files") or [] if isinstance(f, dict)}
+        b = {f.get("path"): f for f in now.get("files") or [] if isinstance(f, dict)}
+        if set(a) != set(b):
+            return False, "the files touched differ", [], []
+        code, common, err = run(path, "rev-parse", "--path-format=absolute", "--git-common-dir")
+        if code or not common:
+            return False, "cannot find the repository's objects ({})".format(clean(err)[-200:]), [], []
+        unions, shared = [], []
+        for p in sorted(x for x in a if isinstance(x, str)):
+            x, y = a[p], b[p]
+            if x == y:
+                continue
+            if same_lines(run, path, x, y):
+                shared.append({"path": p, "oldBase": x["baseBlob"], "newBase": y["baseBlob"], "tip": y["tipBlob"]})
+                continue
+            if x.get("status") != "M" or y.get("status") != "M" or x.get("baseBlob") == y.get("baseBlob") or \
+                    (x.get("baseMode"), x.get("tipMode")) != (y.get("baseMode"), y.get("tipMode")) or \
+                    x.get("tipMode") not in REGULAR_MODES or x.get("baseMode") not in REGULAR_MODES:
+                return False, "{} changed".format(clean(p)), [], []
+            order, regions = union_of(raw, common, x["tipBlob"], x["baseBlob"], y["baseBlob"], y["tipBlob"])
+            if not order:
+                return False, "{} changed ({})".format(clean(p), regions), [], []
+            unions.append({"path": p, "oldBase": x["baseBlob"], "newBase": y["baseBlob"], "checkedTip": x["tipBlob"],
+                           "tip": y["tipBlob"], "order": order, "regions": regions})
+        if not unions:
+            return False, "no file is a conflict kept on both sides", [], []
+        union_paths = {u["path"] for u in unions}
+        ca, cb = checked.get("commits") or [], now.get("commits") or []
+        if len(ca) != len(cb) or [c.get("message") for c in ca] != [c.get("message") for c in cb]:
+            return False, "the commits changed", [], []
+        for x, y in zip(ca, cb):
+            if x.get("raw") == y.get("raw"):
+                continue
+            for sha in (x.get("sha"), y.get("sha")):
+                if not isinstance(sha, str) or not is_commit(run, path, sha):
+                    return False, "cannot compare the commits (one is not in the repository)", [], []
+            fx = {f["path"]: f for f in raw_files(run, path, x["sha"] + "^", x["sha"])}
+            fy = {f["path"]: f for f in raw_files(run, path, y["sha"] + "^", y["sha"])}
+            if set(fx) != set(fy):
+                return False, "the commits changed", [], []
+            for p in fx:
+                if fx[p] != fy[p] and p not in union_paths and not same_lines(run, path, fx[p], fy[p]):
+                    return False, "the commits changed ({})".format(clean(p)), [], []
+        return True, "", unions, shared
+    except ContentError as e:
+        return False, str(e), [], []
+    except Exception as e:  # an unexpected answer: never a union
+        return False, "{}: {}".format(type(e).__name__, clean(e)[:200]), [], []
+
+
 def iso_at(ts):
     return datetime.datetime.fromtimestamp(round(ts), datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -1050,9 +1189,10 @@ def committer_time(run, path, sha):
     return None
 
 
-def short_review_passed(run, directory, task, common, path, head, tree):
+def short_review_passed(run, directory, task, common, path, head, tree, about=None):
     """The passing short review record for HEAD, or None: one of reviews.jsonl for this task, repository, commit and
-    tree, by a ledger reviewer of the task who is not an author, started at or after HEAD was committed."""
+    tree, by a ledger reviewer of the task who is not an author, started at or after HEAD was committed. about: the
+    question it must have answered ("doc-only" for a conflict kept on both sides, t-052 J3c); None: any."""
     workers = [w for w in task.get("workers") or [] if isinstance(w, dict) and isinstance(w.get("address"), str)]
     authors = {w["address"] for w in workers if str(w.get("role") or "").lower() in ("build", "design")}
     reviewers = {w["address"] for w in workers if str(w.get("role") or "").lower() == "reviewer"} - authors
@@ -1060,7 +1200,7 @@ def short_review_passed(run, directory, task, common, path, head, tree):
     for r in reversed(review_runs(directory)):
         if (r.get("task"), r.get("common"), r.get("tip")) != (task.get("id"), common, head) or not tree or r.get("tree") != tree:
             continue
-        if r.get("verdict") != "pass" or r.get("worker") not in reviewers:
+        if r.get("verdict") != "pass" or r.get("worker") not in reviewers or (about and r.get("about") != about):
             continue
         started = pa.parse_time(str(r.get("started"))) if r.get("started") else None
         if committed is None or started is None or started < committed:
