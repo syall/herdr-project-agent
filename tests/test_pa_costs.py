@@ -3046,6 +3046,11 @@ class CC_Script(CCBase):
         # t-063: a wall-clock bound alone failed under machine load (0.18 s at load 13 on 14 cores). Load barely moves
         # the child's CPU time, so that is the main bound; wall time is bounded as overhead over a bare python3 that
         # runs the same inner command in the same rounds.
+        # t-089 J2-D18: CPU is bounded the same way, as overhead over that bare python3 (its interpreter start and the
+        # inner command), not as an absolute 150 ms: a slower machine (0.162 s in all on a slower Linux machine, 0.057 s here
+        # of which 0.022 s is the bare python3) pays more for the interpreter itself, which is not the statusline's
+        # cost. All of pa_costs' own CPU (its import, reading, recording) is still in the bound, measured on the
+        # machine that runs the test.
         import resource
         noop = shutil.which("true")
         env = dict(os.environ)
@@ -3071,15 +3076,16 @@ class CC_Script(CCBase):
         rounds = []
         for _batch in range(3):
             for _ in range(7):
-                base_took, _c = timed(baseline)
+                base_took, base_cpu = timed(baseline)
                 took, cpu_took = timed(statusline)
-                rounds.append((base_took, took, cpu_took))
-            cpu = min(c for _b, _t, c in rounds)
-            overhead = min(t for _b, t, _c in rounds) - min(b for b, _t, _c in rounds)
+                rounds.append((base_took, took, cpu_took, base_cpu))
+            cpu = min(r[2] for r in rounds) - min(r[3] for r in rounds)
+            overhead = min(r[1] for r in rounds) - min(r[0] for r in rounds)
             if cpu <= 0.15 and overhead <= 0.15:
                 break
         self.assertEqual(self.cc_record()["cost"], 1.25)  # the timed runs did the real work
-        self.assertLessEqual(cpu, 0.15, "CPU seconds of the statusline process and its inner command")
+        seen = "statusline CPU {:.3f} s, bare python3 CPU {:.3f} s".format(min(r[2] for r in rounds), min(r[3] for r in rounds))
+        self.assertLessEqual(cpu, 0.15, "CPU seconds over a bare python3 running the same inner command (" + seen + ")")
         self.assertLessEqual(overhead, 0.15, "wall seconds over a bare python3 running the same inner command")
 
 
