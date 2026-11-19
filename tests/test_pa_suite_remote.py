@@ -1284,28 +1284,37 @@ class X25Sent(StepBase):
         self.assertFalse([c for c in self.calls() if c[0] == "file"], self.calls())
 
     def test_x25e_the_step_counts_in_the_size_bound(self):
-        """ship() itself (pa-full-suite loads its own copy of pa_suite, so BUNDLE_MAX is set on this one)."""
-        import base64
+        """ship() itself (pa-full-suite loads its own copy of pa_suite, so BUNDLE_MAX is set on this one). The
+        positive control measures what one ship sends (b.b64, step.b64, facts.json); the limit is then set between
+        "the bundle and facts.json" and "all three", so only counting step.b64 refuses (VERIFY J1 Must fix 1)."""
         pa_suite.pa = pa
         entry, note = pa_suite.remote_full(pa.load_profile("test"))
         self.assertIsNone(note)
         step = {"entry": entry, "key": {"flavour": "x1"}, "repoSubdir": "src/pkg"}
         tools = pa_suite.probe("box-1")["tools"]
         pin = pa_suite.pins(pa_hooks, self.wt)[0]
-        size = {}
-        for limit, run in ((None, "a" * 12), (len(base64.b64encode(entry["bytes"])) + 10, "b" * 12)):
-            saved = pa_suite.BUNDLE_MAX
-            self.addCleanup(setattr, pa_suite, "BUNDLE_MAX", saved)
-            if limit:
-                pa_suite.BUNDLE_MAX = limit  # the bundle alone is more than 10 bytes
-                with self.assertRaises(pa_suite.SetupFailed) as e:
-                    pa_suite.ship(pa_hooks, "box-1", run, pin, tools, self.wt, step=step)
-                self.assertIn("too large", str(e.exception))
-                self.assertFalse([c for c in self.calls() if c[:2] == ["file", "write"] and run in c[-1]])
-            else:
-                pa_suite.ship(pa_hooks, "box-1", run, pin, tools, self.wt, step=step)
-                self.assertTrue(os.path.isfile(os.path.join(self.remote_folder(run), "step")))
-            pa_suite.cleanup("box-1", run)
+        sent = {}
+        real_hc = pa_suite.hc
+
+        def hc(argv, timeout=120, stdin=None):
+            if argv[:2] == ["file", "write"] and stdin is not None:
+                sent[argv[-1].rsplit("/", 1)[-1]] = len(stdin)
+            return real_hc(argv, timeout=timeout, stdin=stdin)
+        self.addCleanup(setattr, pa_suite, "hc", real_hc)
+        pa_suite.hc = hc
+        saved = pa_suite.BUNDLE_MAX
+        self.addCleanup(setattr, pa_suite, "BUNDLE_MAX", saved)
+        pa_suite.ship(pa_hooks, "box-1", "a" * 12, pin, tools, self.wt, step=step)
+        self.assertTrue(os.path.isfile(os.path.join(self.remote_folder("a" * 12), "step")))
+        pa_suite.cleanup("box-1", "a" * 12)
+        self.assertEqual(sorted(sent), ["b.b64", "facts.json", "step.b64"], sent)
+        self.assertGreater(sent["step.b64"], 100, sent)  # room for the margin below
+        pa_suite.BUNDLE_MAX = sent["b.b64"] + sent["facts.json"] + sent["step.b64"] // 2
+        with self.assertRaises(pa_suite.SetupFailed) as e:
+            pa_suite.ship(pa_hooks, "box-1", "b" * 12, pin, tools, self.wt, step=step)
+        self.assertIn("too large", str(e.exception))
+        self.assertFalse([c for c in self.calls() if c[:2] == ["file", "write"] and "b" * 12 in c[-1]])
+        pa_suite.cleanup("box-1", "b" * 12)
 
 
 class X26Prepare(StepBase):
