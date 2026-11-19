@@ -35,9 +35,10 @@ def cache_folder():
 
 
 def private(folder):
-    """folder (made 0700 when missing) when it and its parent are real directories of this user that neither group nor
-    others can write; else None."""
+    """folder (it and its parent made 0700 when missing, whatever the umask) when it and its parent are real directories
+    of this user that neither group nor others can write; else None."""
     try:
+        os.makedirs(os.path.dirname(folder), mode=0o700, exist_ok=True)  # makedirs applies mode to the leaf only
         os.makedirs(folder, mode=0o700, exist_ok=True)
         for f in (folder, os.path.dirname(folder)):
             st = os.lstat(f)
