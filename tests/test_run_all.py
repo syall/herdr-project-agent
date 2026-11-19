@@ -50,6 +50,7 @@ try:
 except OSError:
     sys.exit(0)
 print('FAIL slot: free during the run'); sys.exit(1)" "$HERDR_PA_HOME/suite-slots/slot-0" || exit 1 ;;
+  git) { echo "git=$(command -v git)"; echo "python3=$(command -v python3)"; echo "path=$PATH"; } > "$STUB_DIR/$k.git" ;;
   wait:*) other=${m#wait:}; n=0
     until grep -q "start $other" "$STUB_DIR/events"; do
       n=$((n + 1)); [ $n -gt 200 ] && { echo "FAIL barrier: $other never started"; exit 1; }; sleep 0.1
@@ -795,6 +796,64 @@ class RunAll(unittest.TestCase):
         self.assertEqual(code, 2, out)
         code, out = self.run_all("--module")
         self.assertEqual(code, 2, out)
+
+    # t-093 (t-062 F1): on a Mac /usr/bin/git is xcrun's front end; run-all.sh asks xcrun once for the real git and
+    # puts a folder holding only a link named git to it (and links to its prefix's other folders) first on PATH for
+    # the parts. Here a fake xcrun first on PATH names a fake prefix, whose bin also holds a python3 that must not
+    # shadow the caller's. Without xcrun, or when it fails or names no <prefix>/bin/git, PATH is unchanged.
+    def git_run(self, xcrun="ok", *args, **stubs):
+        fake = os.path.join(self.tmp, "fakebin")
+        write(os.path.join(fake, "xcrun"), '#!/bin/sh\necho "$*" >> "$STUB_DIR/xcrun-calls"\n'
+              'case "$STUB_xcrun:$*" in\n  ok:"--find git") echo "$STUB_DIR/prefix/bin/git" ;;\n'
+              '  odd:*) echo "$STUB_DIR/prefix/git" ;;\n  *) echo "xcrun: error: no such tool" >&2; exit 1 ;;\nesac\n', 0o755)
+        for name in ("git", "python3"):
+            write(os.path.join(self.tmp, "prefix", "bin", name), "#!/bin/sh\necho fake {}\n".format(name), 0o755)
+        write(os.path.join(self.tmp, "prefix", "git"), "#!/bin/sh\necho odd git\n", 0o755)
+        os.makedirs(os.path.join(self.tmp, "prefix", "libexec", "git-core"))
+        path = fake + os.pathsep + os.environ["PATH"]
+        env = self.env_for(xcrun=xcrun, **stubs)
+        env["PATH"] = path
+        r = subprocess.run(["sh", os.path.join(self.repo, "tests", "run-all.sh")] + list(args), cwd=self.tmp, env=env,
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stdout)
+        seen = {}
+        for part in ("keeper", "integration"):
+            if os.path.exists(os.path.join(self.tmp, part + ".git")):
+                with open(os.path.join(self.tmp, part + ".git")) as f:
+                    seen[part] = dict(line.rstrip("\n").split("=", 1) for line in f)
+        return path, r.stdout, seen
+
+    def test_g1_the_parts_get_the_real_git_named_git_and_nothing_else_of_its_folder(self):
+        path, out, seen = self.git_run("ok", keeper="git", integration="git")
+        folder = self.outputs(out)
+        self.assertEqual(sorted(seen), ["integration", "keeper"], out)
+        for part, s in seen.items():
+            with self.subTest(part=part):
+                self.assertEqual(os.path.basename(s["git"]), "git")  # pa_guard's name check sees "git"
+                self.assertTrue(s["git"].startswith(folder + os.sep), s["git"])
+                self.assertEqual(os.path.realpath(s["git"]), os.path.join(self.tmp, "prefix", "bin", "git"))
+                libexec = os.path.join(os.path.dirname(os.path.dirname(s["git"])), "libexec")
+                self.assertEqual(os.path.realpath(libexec), os.path.join(self.tmp, "prefix", "libexec"))
+                self.assertEqual(s["path"], os.path.dirname(s["git"]) + os.pathsep + path)
+                self.assertEqual(s["python3"], shutil.which("python3", path=path) or "")
+                self.assertEqual(os.listdir(os.path.dirname(s["git"])), ["git"])
+
+    def test_g2_when_xcrun_fails_the_path_is_unchanged(self):
+        path, out, seen = self.git_run("fail", keeper="git", integration="git")
+        self.assertEqual(sorted(seen), ["integration", "keeper"], out)
+        for part, s in seen.items():
+            with self.subTest(part=part):
+                self.assertEqual(s["path"], path)
+                self.assertEqual(s["git"], shutil.which("git", path=path) or "")
+
+    def test_g3_when_xcrun_names_no_prefix_bin_git_the_path_is_unchanged(self):
+        path, out, seen = self.git_run("odd", keeper="git")
+        self.assertEqual(seen["keeper"]["path"], path, out)
+
+    def test_g4_xcrun_is_asked_once_per_run(self):
+        self.git_run("ok")
+        with open(os.path.join(self.tmp, "xcrun-calls")) as f:
+            self.assertEqual(f.read(), "--find git\n")
 
 
 def pa_text(path):
