@@ -11,6 +11,8 @@ import io
 import json
 import os
 import sys
+import threading
+import time
 import unittest
 
 import test_pa_worker as w
@@ -339,6 +341,124 @@ class Trash(ArchiveBase):
         code, _, err = self.run_pa("pa-task", "restore", "t-001", "--space", "sp1")
         self.assertEqual(code, 0, err)
         self.assertEqual(self.names("decisions"), ["d-001.json", "d-002.json"])
+
+
+class T131Limits(ArchiveBase):
+    """t-131 (from t-064: t-054 R1, R2, N1): one lock order, no second copy from a writer racing the archive, unarchive,
+    the later stamp, the README."""
+
+    def blocked_while_locked(self, write):
+        """Whether `write()` waits while another open file holds .archive.lock, and finishes once it is let go."""
+        held = pa.archive_lock(self.dir)
+        done = threading.Event()
+        t = threading.Thread(target=lambda: (write(), done.set()))
+        t.start()
+        try:
+            waited = not done.wait(0.4)
+        finally:
+            held.close()
+        t.join(5)
+        return waited, done.is_set()
+
+    def test_c1_archive_takes_the_push_lock_first(self):
+        self.put("d-001")
+        order, real_a, real_p = [], pa.archive_lock, pa.push_card_lock
+        pa.archive_lock = lambda d: (order.append("archive"), real_a(d))[1]
+        pa.push_card_lock = lambda d: (order.append("push"), real_p(d))[1]
+        try:
+            code, _, err = self.archive()
+        finally:
+            pa.archive_lock, pa.push_card_lock = real_a, real_p
+        self.assertEqual(code, 0, err)
+        self.assertEqual(order, ["push", "archive"], "the order pa-decide and pa-push-main take them in")
+
+    def test_c2_a_card_write_waits_for_the_archive(self):
+        card = self.put("d-001", status="open", answered=None)
+        waited, done = self.blocked_while_locked(lambda: pa.write_card(self.dir, self.dec("d-001"), dict(card, note="x")))
+        self.assertTrue(waited, "a write of a card in decisions/ waits while pa-task archive holds its lock")
+        self.assertTrue(done)
+        self.assertEqual(load(self.dec("d-001"))["note"], "x")
+        self.assertEqual(self.names("decisions-archive"), [])
+
+    def test_c3_push_and_queue_card_writes_wait_too(self):
+        card = self.put("d-push-t-001-1", status="open", answered=None, push={"version": 1})
+        waited, done = self.blocked_while_locked(lambda: pa_push.save_card(self.dir, dict(card, note="y")))
+        self.assertTrue(waited and done, "pa_push.save_card holds the archive lock")
+        self.assertEqual(load(self.dec("d-push-t-001-1"))["note"], "y")
+        queue = open(os.path.join(w.TOOLS, "pa_queue.py")).read()
+        self.assertNotIn("pa.write_json(pa.card_for_write(", queue, "pa_queue writes cards through pa.put_card")
+        self.assertIn("pa.put_card(", queue)
+
+    def test_c4_a_writer_racing_the_archive_leaves_one_copy(self):
+        card = self.put("d-001")
+        real, about, go = pa.write_json, threading.Event(), threading.Event()
+
+        def slow(path, value):  # the writer has its path in decisions/ and is about to write it
+            if path.endswith("d-001.json") and value.get("note") == "later":
+                about.set()
+                go.wait(2)
+            return real(path, value)
+        pa.write_json = slow
+        try:
+            writer = threading.Thread(target=lambda: pa.write_card(self.dir, self.dec("d-001"), dict(card, note="later")))
+            writer.start()
+            self.assertTrue(about.wait(2))
+            result = {}
+            archiver = threading.Thread(target=lambda: result.update(zip(("code", "out", "err"), self.archive())))
+            archiver.start()
+            archiver.join(0.4)  # pa-task archive runs while the writer is between its path and its write
+            go.set()
+            writer.join(5)
+            archiver.join(5)
+        finally:
+            pa.write_json = real
+        self.assertEqual(result.get("code"), 0, result)
+        both = [n for n in self.names("decisions") if n in self.names("decisions-archive")]
+        self.assertEqual(both, [], "never one id in both folders")
+        self.assertEqual(load(pa.card_file(self.dir, "d-001"))["note"], "later", "the writer's change is kept")
+
+    def test_u1_unarchive_brings_a_card_back(self):
+        before = self.put("d-001", where="decisions-archive")
+        text = raw(self.arc("d-001"))
+        code, out, err = self.run_pa("pa-task", "unarchive", "d-001", "--space", "sp1")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.names("decisions-archive"), [])
+        self.assertEqual(raw(self.dec("d-001")), text, "moved as is")
+        self.assertIn("d-001", out)
+        entry = self.journal()[-1]
+        self.assertEqual((entry["by"], entry["trigger"]), ("person", "archive"))
+        self.assertIn("d-001", entry["why"])
+        self.assertEqual(before["id"], "d-001")
+
+    def test_u2_unarchive_refusals(self):
+        self.put("d-001", where="decisions-archive")
+        self.put("d-002", where="decisions-archive")
+        self.put("d-002", note="live")
+        for argv, words in ((("d-009",), "not in decisions-archive"), (("d-002",), "already in decisions/"),
+                            ((), "needs a card id"), (("../x",), "card id")):
+            with self.subTest(argv=argv):
+                code, _, err = self.run_pa("pa-task", "unarchive", *argv, "--space", "sp1")
+                self.assertEqual(code, 2, err)
+                self.assertIn(words, err)
+        self.assertEqual(load(self.dec("d-002"))["note"], "live")
+        os.environ["CLAUDECODE"] = "1"
+        code, _, err = self.run_pa("pa-task", "unarchive", "d-001", "--space", "sp1")
+        self.assertEqual(code, 2)
+        self.assertIn("pa-task unarchive is the person's command", err)
+        self.assertEqual(self.names("decisions-archive"), ["d-001.json", "d-002.json"])
+
+    def test_n1_the_later_stamp_counts(self):
+        self.put("d-001", status="withdrawn", answered=OLD, withdrawnAt=self.now)  # answered long ago, withdrawn now
+        self.put("d-002", status="withdrawn", answered=self.now, withdrawnAt=OLD)
+        code, _, err = self.archive()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.names("decisions-archive"), [])
+        self.assertEqual(pa.card_stamp({"answered": OLD, "withdrawnAt": "2026-02-01T00:00:00Z"}).month, 2)
+
+    def test_r1_readme_says_archive_and_unarchive(self):
+        text = " ".join(open(os.path.join(w.TOOLS, "..", "..", "README.md")).read().split())
+        for words in ("`pa-task archive`", "`pa-task unarchive <card-id>`", "decisions-archive/", "--dry-run"):
+            self.assertIn(words, text)
 
 
 if __name__ == "__main__":

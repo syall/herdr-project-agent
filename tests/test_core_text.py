@@ -1309,5 +1309,13 @@ class T133WorkerLifecycle(unittest.TestCase):  # t-133: report-only workers, clo
                       "`pa-places next`.", self.files)
 
 
+class T131WorktreesShape(unittest.TestCase):  # t-131 (t-020 J6 RL1): RECIPE.md says the shape of project-agent.worktrees
+    def test_recipe_entry_shape(self):
+        text = flat(read("RECIPE.md"))
+        for words in ("`project-agent.worktrees` (space id -> a list: per task its main worktree first, exactly `{ task, path, title }`,",
+                      "then each other worktree it records, `{ task, path, title, job }`"):
+            self.assertIn(words, text)
+
+
 if __name__ == "__main__":
     unittest.main()

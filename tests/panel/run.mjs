@@ -4312,7 +4312,6 @@ cases["P45-push-in-flight"] = async () => { // W1 (t124): while pa-push-main run
   check(Boolean(look(v).clicks[`opt-${PID}-1`]), "a refusal: the card is open again");
 };
 
-
 // ---- t-100: a push card keeps the person's chosen answer selected and locked while its tool runs. The stub theme gives
 // every colour one value, so these draw the card with a theme whose colours are their own names. ----
 const named = new Proxy({}, { get: (_t, k) => String(k) });
@@ -6901,6 +6900,107 @@ cases["P085-8-gone-meanwhile"] = async () => { // nit (t-101 REVIEW): a rule gon
   g.__files[RULES] = JSON.stringify({ rules: [rule("r-one", "One")] }); // r-two deleted meanwhile
   await press(w, "rule-toggle-r-two"); await settle();
   check(rulesNotices(w).length === 0, `on/off: no notice (got ${JSON.stringify(w.unsent)})`);
+};
+
+// ---- t-131: limits from t-100, t-061/t-054 (t-064), t-046 J3 (t-075) and t-020 J6 ----------------------------------
+cases["P131-push-chosen-slow-reload"] = async () => { // t-100 RL1: after a Push from here, before the slow reload reads it answered, Push is drawn chosen
+  let file;
+  const { v, file: f } = await pushWorld({ tool: { run: () => { g.__files[file] = answeredByTool(); return json(0, toolPushed); } } });
+  file = f;
+  await click(v, `opt-${PID}-0`); await settle();
+  g.__delay = { [`:${DIR}/agent.json`]: 5000 };
+  await click(v, `submit-${PID}`); await settle(); await settle();
+  check(v.cards.find((c) => c.id === PID)?.card?.status === "open", "the panel's copy still reads the card open (the reload is slow)");
+  check(v.push.answeredHere(S, PID) === "Push" && !v.push.running(S, PID), "the run ended answered");
+  const rows = pushRows(v);
+  check(rows["0"].chosen && !rows["1"].chosen && !rows.other.chosen, `Push drawn chosen from the run's answer (got ${JSON.stringify(rows)})`);
+  check(!rows["0"].click && !rows["1"].click && !rows.other.click, `locked (got ${JSON.stringify(rows)})`);
+  await step(5000); await settle();
+  check(pushRows(v)["0"].chosen, "after the reload: Push chosen (the card file's answer)");
+};
+
+cases["P131-push-unknown-nothing-chosen"] = async () => { // t-100 RL2: an unknown result: no option drawn chosen, every option locked
+  const v = await pushUnknownThen(() => { throw new Error("unreachable"); });
+  const rows = pushRows(v);
+  check(look(v).text.includes("The result is unknown"), "says the result is unknown");
+  check(!rows["0"].chosen && !rows["1"].chosen && !rows.other.chosen, `nothing chosen (got ${JSON.stringify(rows)})`);
+  check(!rows["0"].click && !rows["1"].click && !rows.other.click, `every option locked (got ${JSON.stringify(rows)})`);
+};
+
+cases["P131-unread-cards-said"] = async () => { // t-061 R1: a card the fallback could not read, with no known copy, is never silently missing
+  world(); localCards(3, { open: 3 });
+  g.__batchFail = { "": { code: 1 } }; g.__fail = [`:${DIR}/decisions/d-002.json`];
+  const v = await mount(); await settle(); await settle();
+  const { text } = look(v);
+  check(!text.includes("Q d-002?"), "d-002 not read");
+  check(text.includes("1 card could not be read now; the next load reads it again."), `said (got ${text.slice(0, 900)})`);
+  g.__batchFail = {}; g.__fail = [];
+  advance(11000); v.reload(cx); await settle(); await settle();
+  const t2 = look(v).text;
+  check(t2.includes("Q d-002?") && !t2.includes("could not be read now"), `read again: shown, the line gone (got ${t2.slice(0, 900)})`);
+};
+
+cases["P131-archive-no-duplicate"] = async () => { // t-054 N2: a card id in decisions/ and in the archive is drawn once (decisions/ wins)
+  world(); localCards(3, { open: 1 });
+  g.__files[`:${DIR}/decisions-archive/d-002.json`] = JSON.stringify({ id: "d-002", status: "answered", answer: "No", question: "The archived copy?", options: [{ label: "Yes" }], created: "2026-01-01T10:00:00Z" });
+  g.__files[`:${DIR}/decisions-archive/d-000.json`] = JSON.stringify({ id: "d-000", status: "answered", answer: "Yes", question: "An archived question?", options: [{ label: "Yes" }], created: "2026-01-01T10:00:00Z" });
+  g.__ls[`:${DIR}/decisions-archive`] = ["d-000.json", "d-002.json"];
+  const v = await mount(); await settle();
+  await click(v, "pa-older"); await click(v, "pa-archive"); await settle();
+  const { text } = look(v);
+  const ids = []; const walk = (x) => { if (!x || typeof x !== "object") return; if (typeof x.key === "string" && x.key === "card-d-002") ids.push(x.key); for (const k of x.kids ?? []) walk(k); }; walk(v.render(cx));
+  check(ids.length === 1, `one element card-d-002 (got ${ids.length})`);
+  check(text.includes("Q d-002?") && !text.includes("The archived copy?") && text.includes("An archived question?"), `decisions/ wins; the other archived card shown (got ${text.slice(0, 1200)})`);
+};
+
+cases["P131-push-other-words-other-window"] = async () => { // t-046 J3 RL2: a push card answered Other shows the words in every window before its own read
+  const gate = deferred();
+  let file;
+  const { v, file: f } = await pushWorld({ tool: { run: () => gate.promise.then((reply) => { g.__files[file] = pushOtherCard("do X first"); return reply; }) } });
+  file = f;
+  const w = await mount(); await settle();
+  await click(v, `opt-${PID}-other`); typeInto(v, PID, "do X first");
+  await click(v, `submit-${PID}`); await settle();
+  check(look(w).text.includes("Your answer: “do X first”"), `the other window, run in flight (got ${look(w).text.slice(0, 900)})`);
+  g.__delay = { [`:${DIR}/agent.json`]: 5000 };
+  gate.resolve(json(0, pushOtherReply)); await settle(); await settle();
+  const tw = locked(w, PID, "Other", "the other window, before its own read");
+  check(tw.includes("Your answer: “do X first”"), `the other window: the words (got ${tw.slice(0, 900)})`);
+  check(look(v).text.includes("Your answer: “do X first”"), `this window, before its slow reload (got ${look(v).text.slice(0, 900)})`);
+};
+
+cases["P131-submit-fallback-no-change-event"] = async () => { // t-046 J3 RL1: a field with no change event: Submit for Other stays on; an empty click is refused with the hint
+  const real = stubs.InputState.new;
+  stubs.InputState.new = (o) => { const s = real(o); delete s.on; return s; };
+  try {
+    const v = await otherWorld({ "d-x": {} });
+    await click(v, "opt-d-x-other");
+    check(Boolean(look(v).clicks["submit-d-x"]), "Submit on for Other with no words (no change event to follow the typing)");
+    await click(v, "submit-d-x"); await settle();
+    check(JSON.parse(g.__files[cardFile("d-x")]).status === "open" && look(v).text.includes(NEEDS_WORDS), `empty: refused with the hint, nothing written (got ${look(v).text.slice(0, 900)})`);
+    fieldOf(v, "d-x").set("do X first"); // typed: no event fires
+    await click(v, "submit-d-x"); await settle();
+    const c = JSON.parse(g.__files[cardFile("d-x")]);
+    check(c.status === "answered" && c.answer === "Other" && c.note === "do X first", `written with the words (got ${JSON.stringify(c)})`);
+    const { v: p } = await pushWorld();
+    await click(p, `opt-${PID}-other`);
+    check(Boolean(look(p).clicks[`submit-${PID}`]), "a push card: Submit on too");
+    await click(p, `submit-${PID}`); await settle();
+    check(pushExecs("run").length === 0 && look(p).text.includes(NEEDS_WORDS), `a push card: no run, the hint (got ${look(p).text.slice(0, 900)})`);
+  } finally { stubs.InputState.new = real; }
+  const v2 = await otherWorld({ "d-x": {} }); // with the change event: as before
+  await click(v2, "opt-d-x-other");
+  check(!look(v2).clicks["submit-d-x"], "with a change event: Submit off until words are typed");
+};
+
+cases["P131-main-job-collides"] = async () => { // t-020 J6 RL-M2: the main worktree's own entry gives its job; another entry with that job gets -2
+  world();
+  g.__files[`:${DIR}/ledger.json`] = JSON.stringify({ tasks: [{ id: "t-8", title: "eight", state: "in-progress", worktree: "/w/t-8-a",
+    worktrees: [{ path: "/w/t-8-a", job: "api" }, { path: "/w/t-8-b", job: "api" }] }] });
+  localCards(1);
+  await mount(); await settle();
+  const got = JSON.stringify(g.__shared["project-agent.worktrees"]?.[S]);
+  check(got === JSON.stringify([{ task: "t-8", path: "/w/t-8-a", title: "eight" }, { task: "t-8", path: "/w/t-8-b", title: "eight", job: "api-2" }]), `the other entry gets api-2 (got ${got})`);
 };
 
 // --list prints the names that would run and runs none. An unknown name or option exits 2.

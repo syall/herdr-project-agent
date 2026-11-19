@@ -3125,6 +3125,81 @@ class CardPerWorktree(Base):
         self.assertEqual((card["status"], card["worktree"], card["previousAnswer"]), ("open", os.path.realpath(path), "Delete"))
 
 
+    def test_k13_an_open_card_of_a_task_no_longer_the_owner_is_withdrawn(self):  # t-131 (t-073 RL4)
+        path = os.path.realpath(self.job_tree("t-003-x"))
+        self.add_task("t-003", "done", path, [])
+        self.add_task("t-004", "done", None, [], worktrees=[{"path": path, "job": "x"}])
+        self.old_card("d-wt-t-004-x", "t-004", path, status="open", answer=None, answered=None, job="x", main=False,
+                      created=self.ANSWERED)
+        before = raw(self.dec("d-wt-t-004-x"))
+        code, out, err = self.check()
+        self.assertEqual(code, 0, err)
+        self.assertIn("t-004: card d-wt-t-004-x is open, but its worktree's card is now t-003's; --open-cards withdraws it", out)
+        self.assertEqual(raw(self.dec("d-wt-t-004-x")), before, "without --open-cards nothing is written")
+        code, out, err = self.check("--open-cards")
+        self.assertEqual(code, 0, err)
+        self.assertIn("t-003: opened card d-wt-t-003 (recommends Delete)", out)
+        self.assertIn("t-004: withdrew card d-wt-t-004-x: its worktree's card is now t-003's", out)
+        self.assertEqual(self.card("d-wt-t-004-x")["status"], "withdrawn")
+        self.assertEqual(self.card("d-wt-t-003")["status"], "open", "the owner's own card stays")
+        self.assertIn("card d-wt-t-003 is open", self.check("--open-cards")[1])
+
+    def test_k14_card_folders_listed_once_per_check(self):  # t-131 (t-073 RL5)
+        for n in range(3, 7):
+            self.add_task("t-00{}".format(n), "in-progress", self.job_tree("t-00{}-x".format(n)), [])
+        for sub in ("decisions", pa.ARCHIVE):
+            os.makedirs(os.path.join(self.dir, sub), exist_ok=True)
+        self.old_card("d-001", "t-003", "/elsewhere")
+        lists, real = [], os.listdir
+
+        def counting(path="."):
+            if os.path.basename(str(path)) in ("decisions", pa.ARCHIVE):
+                lists.append(os.path.basename(str(path)))
+            return real(path)
+        os.listdir = counting
+        try:
+            code, _out, err = self.check()
+        finally:
+            os.listdir = real
+        self.assertEqual(code, 0, err)
+        self.assertLessEqual(lists.count("decisions"), 2, "once for the worktree cards, once for the unrecorded ones (got {})".format(lists))
+
+    def test_k15_the_path_rule_alone_refuses_an_old_card(self):  # t-131 (t-073 VERIFY RL1): no ledger `removed` entry
+        for task, old, new in self.LIVE:
+            with self.subTest(task=task):
+                path = self.job_tree(new)
+                self.merged_commit(path)
+                self.add_task(task, "in-progress", path, [])
+                before = self.old_card("d-wt-" + task, task, self.gone(old))
+                code, out, err = self.check()
+                self.assertEqual(code, 0, err)
+                self.assertNotIn("{}: card d-wt-{} answered".format(task, task), out)
+                code, _, err = self.remove(task)
+                self.assertEqual(code, 2, err)
+                self.assertIn("the card is for {}, not {}".format(self.gone(old), os.path.realpath(path)), err)
+                self.assertTrue(os.path.isdir(path))
+                self.assertEqual(raw(self.dec("d-wt-" + task)), before)
+
+    def test_k16_removed_stamps_compare_as_times(self):  # t-131 (t-073 VERIFY Nit 1)
+        for n, removed in enumerate(("2026-11-01", "2026-11-01T05:00:00-05:00")):
+            with self.subTest(removed=removed):
+                task = "t-02{}".format(n)
+                path = self.job_tree("{}-again".format(task))
+                self.merged_commit(path)
+                self.add_task(task, "in-progress", path, [], worktrees=[{"path": path, "job": "j1", "removed": removed}])
+                self.old_card("d-wt-" + task, task, os.path.realpath(path), answered="2026-11-01T09:00:00Z")
+                self.assertNotIn("{}: card d-wt-{} answered".format(task, task), self.check()[1],
+                                 "removed on the answer's day (or after it, in another zone): the card is spent")
+                code, _, err = self.remove(task)
+                self.assertEqual(code, 2, err)
+                self.assertTrue(os.path.isdir(path))
+        card = {"answered": "2026-11-01T09:00:00Z", "worktree": "/x"}
+        for removed, spent in (("2026-10-31", False), ("2026-10-31T23:00:00-11:00", True), (True, True), ("soon", True)):
+            with self.subTest(removed=removed):
+                got = pa_hooks.card_spent(card, {"worktrees": [{"path": "/x", "removed": removed}]})
+                self.assertEqual(bool(got), spent, got)
+
+
 class Containers(Base):
     """t-020 J3 (AC6.2, AC6.3): removing a worktree also removes the empty container folder it leaves
     (<project>/worktrees/<container>), and nothing else."""
@@ -4335,6 +4410,92 @@ class Unrecorded(Base):
         self.assertNotIn("unrecorded: ", out)
         self.assertEqual(self.unrecorded_cards(), ["d-wt-unrecorded-1.json"], "answered: not listed again")
 
+
+    def test_u12_a_recorded_project_folder_hides_nothing(self):  # t-131 (t-020 J4-a)
+        self.add_task("t-003", "in-progress", self.project)
+        self.add_task("t-017", "in-progress")
+        a = self.tree("t-017-a")
+        code, out, err = self.check()
+        self.assertEqual(code, 0, err)
+        self.assertIn("unrecorded: {} (guess t-017, job a)".format(a), out)
+        # a recorded container inside the scanned folder still holds its worktree
+        self.add_task("t-018", "in-progress", os.path.join(self.project, "worktrees", "t-017-a"))
+        self.assertNotIn("unrecorded: " + a, self.check()[1])
+
+    def test_u13_an_unreadable_agent_json_of_another_space_lists_nothing(self):  # t-131 (t-020 RL-R1 a)
+        self.add_task("t-003", "in-progress")
+        self.tree("t-003-x")
+        write(os.path.join(pa.ROOT, "spaces", "sp2", "agent.json"), "{broken")
+        os.makedirs(os.path.join(pa.ROOT, "spaces", "sp4"))  # no agent.json at all: not a space
+        code, out, err = self.check("--open-cards")
+        self.assertEqual(code, 0, err)
+        self.assertIn("could not read the agent.json of space sp2", out)
+        self.assertNotIn("space sp4", out)
+        self.assertNotIn("unrecorded: ", out)
+        self.assertEqual(self.unrecorded_cards(), [])
+
+    def test_u14_the_scan_takes_no_index_lock_and_never_probes_the_persons(self):  # t-131 (t-020 RL-R2)
+        self.add_task("t-017", "in-progress")
+        a = self.tree("t-017-a")
+        mine = self.tree("my-experiment", commits=1)
+        index = {}
+        for tree in (a, mine):
+            name = subprocess.run(["git", "-C", tree, "rev-parse", "--git-path", "index"], stdout=subprocess.PIPE,
+                                  universal_newlines=True).stdout.strip()
+            index[tree] = os.path.join(tree, name) if not os.path.isabs(name) else name
+            subprocess.run(["git", "-C", tree, "status", "--porcelain"], stdout=subprocess.PIPE)  # a clean index first
+            later = time.time() + 5
+            for f in os.listdir(tree):
+                if os.path.isfile(os.path.join(tree, f)) and f != ".git":
+                    os.utime(os.path.join(tree, f), (later, later))  # same content, newer stat: a plain status refreshes the index
+        before = {t: raw(i) for t, i in index.items()}
+        probed, real = [], pa_hooks.worktree_facts
+        pa_hooks.worktree_facts = lambda path, profile=None: (probed.append(os.path.realpath(path)), real(path, profile))[1]
+        try:
+            code, out, err = self.check()
+        finally:
+            pa_hooks.worktree_facts = real
+        self.assertEqual(code, 0, err)
+        self.assertIn("unrecorded: " + a, out)
+        self.assertIn("1 worktrees under {} not named after a task of this ledger".format(self.folder), out)
+        self.assertEqual(raw(index[a]), before[a], "git status ran with --no-optional-locks: the index is not rewritten")
+        self.assertFalse([p for p in probed if pa_hooks.inside(p, os.path.dirname(mine))], "the person's worktree is never probed")
+
+    def test_u15_a_workspace_folder_from_a_deeper_recorded_path(self):  # t-131 (t-020 RL-R3)
+        ws = os.path.join(self.tmp, "Ws", "worktrees")
+        status = os.path.join(self.tmp, "status.sh")
+        write(status, '#!/bin/sh\nprintf \'{"uncommitted": 0, "unpushed": 0, "branch": "A:feat", "kind": "workspace worktree"}\' "$1"\n')
+        os.chmod(status, 0o755)
+        dump({"name": "test2", "claude": ["true"], "codex": ["true"],
+              "worktree": {"marker": "marker.txt", "status": status, "remove": status}}, os.path.join(pa.ROOT, "profiles", "test2", "profile.json"))
+        agent = load(os.path.join(self.dir, "agent.json"))
+        agent["profile"] = "test2"
+        dump(agent, os.path.join(self.dir, "agent.json"))
+        for name in ("t-003-pkg", "t-017-pkg"):
+            write(os.path.join(ws, name, "marker.txt"), "")
+            os.makedirs(os.path.join(ws, name, "src", "A"))
+        self.add_task("t-003", "in-progress", os.path.join(ws, "t-003-pkg", "src", "A"))  # a package path, three levels down
+        self.add_task("t-017", "in-progress")
+        code, out, err = self.check()
+        self.assertEqual(code, 0, err)
+        self.assertIn("unrecorded: {} (guess t-017, job pkg)".format(os.path.realpath(os.path.join(ws, "t-017-pkg"))), out)
+        self.assertNotIn("unrecorded: " + os.path.realpath(os.path.join(ws, "t-003-pkg")), out)
+
+    def test_u16_described_only_for_a_card_being_written(self):  # t-131 (t-020 RL-J4a)
+        self.add_task("t-017", "in-progress")
+        self.tree("t-017-a")
+        calls, real = [], pa_hooks.describe_worktree
+        pa_hooks.describe_worktree = lambda row, facts, profile: (calls.append(row["path"]), real(row, facts, profile))[1]
+        try:
+            self.assertEqual(self.check()[0], 0)
+            self.assertEqual(calls, [], "a check without --open-cards describes nothing")
+            self.assertEqual(self.check("--open-cards")[0], 0)
+            self.assertEqual(len(calls), 1, "the card's one worktree, once")
+            self.assertEqual(self.card()["items"][0]["branch"], "t-017-a")
+            self.assertIn("card d-wt-unrecorded-1 is open", self.check("--open-cards")[1])
+            self.assertEqual(len(calls), 1, "the same set: the open card stays, nothing described")
+        finally:
+            pa_hooks.describe_worktree = real
 
 if __name__ == "__main__":
     unittest.main()

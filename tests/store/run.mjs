@@ -570,6 +570,19 @@ cases["S61-fallback-known-closed-last"] = async () => { // R1: on the fallback, 
   check(order.slice(0, 5).every((n) => n.startsWith("z-")), `the open (not known answered) ones read first (got ${order.slice(0, 7)})`);
 };
 
+// ---- t-131 (from t-064: t-061 R1) ------------------------------------------------------------------------------
+cases["S131-fallback-missing-counted"] = async () => { // a card whose fallback read failed or hung and has no known copy is never silently missing: counted
+  world(); cards({ "d-1.json": card("d-1"), "d-2.json": card("d-2"), "d-3.json": card("d-3"), "d-4.json": card("d-4") }); g.__batchFail = { [M]: { code: 1 } };
+  g.__hang = [keyOf(remote, "/decisions/d-2.json"), keyOf(remote, "/decisions/d-4.json")]; g.__fail = [keyOf(remote, "/decisions/d-3.json")];
+  const known = [{ id: "d-2", path: `${rdir}/decisions/d-2.json`, text: card("d-2") }];
+  const r = await within(store.loadDecisions(remote, { cx, known }), 15000);
+  check(r.done && Array.isArray(r.value), "the fallback answered");
+  check(r.value?.missing === 2, `d-3 (failed) and d-4 (hung), with no known copy, are counted (got ${r.value?.missing})`);
+  world(); cards({ "d-1.json": card("d-1") });
+  const b = await store.loadDecisions(remote, { cx });
+  check(b.missing === 0, `a whole batch: none missing (got ${b.missing})`);
+};
+
 // ---- t-054 -----------------------------------------------------------------------------------------------------
 cases["S54-archive-folder"] = async () => { // R5: the archive is read with the same batch from decisions-archive/, only when asked
   world(); cards({ "d-1.json": card("d-1") });
