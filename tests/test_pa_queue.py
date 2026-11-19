@@ -1266,17 +1266,20 @@ class U3RestackConflict(UBase):
 
 
 class U7UnionSharedFile(UBase):
-    """A union file is a shared file too (J3c fix round 2, REVIEW J3c Must fix 1): main's hunks outside the conflict
-    regions near the change get the shared-file question (and its file item), as a moved file's would; far ones add
-    nothing to the doc-only question."""
+    """A union file is a shared file too (J3c fix rounds 2 and 3, REVIEW J3c Must fix 1, Q-J2-1): when main has a hunk
+    outside the conflict regions, near the change or far from it, the shared-file question is asked (with its file
+    item), as for a moved file; only when every main hunk lies in a conflict region is the doc-only question alone."""
 
     def conflict(self, main_line, change_line):
-        self.task("t-A", [("a.txt", (2, "two A")), ("a.txt", (main_line, "main A"))])
+        self.task("t-A", [("a.txt", (2, "two A"))] + ([("a.txt", (main_line, "main A"))] if main_line else []))
         self.add("t-A")
         self.task("t-B", [("a.txt", line_edit(line_edit(LINES, 2, "two B"), change_line, "change B"))])
         code, out, err = self.add("t-B", ok=False)
         self.assertIn("needs a rebase worker onto t-A-x", err)
-        text = line_edit(line_edit(union_text("two B", "two A"), main_line + 1, "main A"), change_line + 1, "change B")
+        text = union_text("two B", "two A")
+        if main_line:
+            text = line_edit(text, main_line + 1, "main A")
+        text = line_edit(text, change_line + 1, "change B")
         tip = self.resolve("t-B", "t-A-x", "a.txt", text)
         code, out, err = self.verify("t-B")
         self.assertEqual(code, 0, out + err)
@@ -1292,10 +1295,18 @@ class U7UnionSharedFile(UBase):
         self.assertIn("main 9-9 near change 15-15", out)
         self.assertIn("git diff {} {} -- a.txt (the change)".format(self.ref("t-A-x"), tip), out)
 
-    def test_u7b_main_hunk_far_from_the_change_asks_nothing_extra(self):
+    def test_u7b_main_hunk_far_from_the_change_asks_the_shared_file_question(self):
+        """Q-J2-1: a short review for every shared file, even with nothing within 30 lines (REVIEW J3c round 2)."""
         tip, out = self.conflict(60, 150)
-        self.assertNotIn("still do what it did", out)
+        self.assertIn("still do what it did", out)
         self.assertNotIn(" near change ", out)
+        self.assertIn("none within 30 lines", out)
+        self.assertIn("docstrings or comments", out)
+
+    def test_u7c_every_main_hunk_in_the_conflict_regions_asks_the_doc_only_question_alone(self):
+        tip, out = self.conflict(0, 150)
+        self.assertIn("docstrings or comments", out)
+        self.assertNotIn("still do what it did", out)
 
 
 if __name__ == "__main__":
