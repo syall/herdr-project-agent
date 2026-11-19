@@ -104,6 +104,8 @@ class Base(unittest.TestCase):
         pa.call = lambda argv, check=True: self.calls.append(list(argv)) or ""
         pa.hc_get = lambda address: {}
         pa.live_terminals = lambda: {}
+        self.saved_proc = getattr(pa, "proc_info", None)  # t-077: no test reads a real process (a test fakes it)
+        pa.proc_info = lambda pid: None
 
         def no_exec(*a):
             raise AssertionError("os.execv called unexpectedly: {}".format(a))
@@ -113,6 +115,7 @@ class Base(unittest.TestCase):
     def tearDown(self):
         for k, v in self.saved.items():
             setattr(pa, k, v)
+        pa.proc_info = self.saved_proc
         os.execv = self.saved_os
 
     def stamp(self, commit=None):
@@ -2697,6 +2700,321 @@ class J4_ByPanel(J4Command):
             self.assertEqual(e.exception.code, 2)
         finally:
             sys.argv, pa.cmd_restart = saved
+
+
+# ---- t-077: a launcher Herdr started through its login-shell wrapper (spec.md R1-R7, card d-181) ----------------
+
+# Herdr's wrapper text verbatim (intent.md), as hc reports the tab's argv: sh -c <script> sh <command...>
+WRAPPER_SCRIPT = ("shell=${SHELL:-/bin/sh}\n"
+                  "case \"${shell##*/}\" in\n"
+                  "  fish) exec \"$shell\" -lic 'command $argv[2..]; exec $argv[1] -li' \"$shell\" \"$@\" ;;\n"
+                  "  sh|bash|zsh|dash|ksh) exec \"$shell\" -lic '\"$@\"; exec \"$0\" -li' \"$shell\" \"$@\" ;;\n"
+                  "  *) exec sh -c '\"$@\"; exec \"${SHELL:-sh}\" -i' sh \"$@\" ;;\n"
+                  "esac")
+
+
+def hc_wrapper(*cmd):
+    return ["sh", "-c", WRAPPER_SCRIPT, "sh"] + list(cmd)
+
+
+# the same process as ps shows it after the wrapper's exec, one per branch (investigation.md)
+def ps_zsh(cmd):
+    return '/bin/zsh -lic "$@"; exec "$0" -li /bin/zsh ' + cmd
+
+
+def ps_fish(cmd):
+    return "/usr/bin/fish -lic command $argv[2..]; exec $argv[1] -li /usr/bin/fish " + cmd
+
+
+def ps_star(cmd):
+    return 'sh -c "$@"; exec "${SHELL:-sh}" -i sh ' + cmd
+
+
+T77_TERM, T77_LAUNCHER = 30222, 30310
+T77_CHILD = "/home/u/.local/share/mise/installs/python/3.12.16/bin/python3 /home/u/.config/herdr-pa/tools/pa.py " \
+            "session --space={} --project=/p".format(SP)
+T77_ASK_CHILD = "python3 /Users/u/.local/bin/pa-session --ask"
+
+
+class T77Fakes:
+    """hc's pid 30222 is the wrapper's login shell; launcher.json's pid 30310 is its forked child, the launcher.
+    pa.proc_info answers from self.procs only (never a real process)."""
+
+    def t77_setup(self, cmd):
+        self.term["pid"] = T77_TERM
+        self.term["argv"] = hc_wrapper(*cmd)
+        self.procs = {T77_TERM: (23551, ps_zsh(" ".join(cmd))), T77_LAUNCHER: (T77_TERM, T77_CHILD)}
+        self.asked_pids = []
+
+        def proc_info(pid):
+            self.asked_pids.append(pid)
+            return self.procs.get(pid)
+
+        pa.proc_info = proc_info
+
+    def one_line(self, text):
+        text = text.strip()
+        self.assertTrue(text, "a refusal says something")
+        self.assertNotIn("\n", text)
+        for word in ("case", "esac", "${SHELL", "$argv"):
+            self.assertNotIn(word, text)
+
+
+class T77_Wrapper(Command, T77Fakes):
+    """pa-restart (in place): R1, R3-R6; AC1, AC2, AC3 (restart half), AC5, AC6."""
+
+    def setUp(self):
+        super().setUp()
+        self.t77_setup(["pa-session", "--space", SP])
+        dump(dict(self.rec, pid=T77_LAUNCHER), os.path.join(self.dir, "launcher.json"))
+
+    def passes(self):
+        code, out, err = self.run_cmd(dry_run=True)
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("keeps running", out)
+        self.assertIsNone(self.request_file())
+        self.no_ending_calls()
+
+    def refused(self, part):
+        code, out, err = self.run_cmd(dry_run=True)
+        self.assertEqual(code, 2, out + err)
+        self.assertIn(part, err)
+        self.one_line(err)
+        self.assertIsNone(self.request_file())
+        self.no_ending_calls()
+        return err
+
+    def test_ac1_wrapped_launcher_passes_identification(self):
+        self.passes()
+        record, term = pa.identify_launcher(self.dir, load(os.path.join(self.dir, "agent.json")))
+        self.assertEqual((record["pid"], term["pid"]), (T77_LAUNCHER, T77_TERM))
+        self.assertIn(T77_LAUNCHER, self.asked_pids)
+
+    def test_ac1_wrapper_seen_by_ps_only(self):  # hc gives no argv: the wrapper is proven from ps of hc's pid
+        for form in (ps_zsh, ps_fish, ps_star):
+            with self.subTest(form=form.__name__):
+                self.term.pop("argv", None)
+                self.procs[T77_TERM] = (23551, form("pa-session --space " + SP))
+                self.passes()
+
+    def test_ac1_the_symlinked_launcher_child(self):
+        self.procs[T77_LAUNCHER] = (T77_TERM, "python3 /Users/u/.local/bin/pa-session --space " + SP)
+        self.passes()
+        self.procs[T77_LAUNCHER] = (T77_TERM, "/Users/u/.local/bin/pa-session --space " + SP)
+        self.passes()
+
+    def test_ac1_the_linux_case(self):  # the person's ps on Linux: --ask first tab, child runs pa.py session
+        self.term["argv"] = hc_wrapper("pa-session", "--ask")
+        self.procs[T77_TERM] = (23551, ps_zsh("pa-session --ask"))
+        self.passes()
+
+    def test_ac2_launcher_has_another_parent(self):
+        self.procs[T77_LAUNCHER] = (4242, T77_CHILD)
+        err = self.refused("pid")
+        self.assertIn("4242", err)
+
+    def test_ac2_launcher_is_gone(self):
+        del self.procs[T77_LAUNCHER]
+        err = self.refused("pid")
+        self.assertIn("not running", err)
+
+    def test_ac2_launcher_pid_runs_something_else(self):
+        for cmd in ("python3 /x/other.py session", "/bin/zsh -l", "python3 /x/pa.py restart --space " + SP,
+                    "env pa-session --space " + SP):
+            with self.subTest(cmd=cmd):
+                self.procs[T77_LAUNCHER] = (T77_TERM, cmd)
+                err = self.refused("pid")
+                self.assertIn("not a launcher", err)
+
+    def test_ac2_launcher_pid_is_not_a_number(self):
+        for pid in (None, "30310", True, 0, -5):
+            with self.subTest(pid=pid):
+                dump(dict(self.rec, pid=pid), os.path.join(self.dir, "launcher.json"))
+                self.refused("pid")
+
+    def test_ac3_wrapped_first_tab_is_accepted_for_restart(self):  # O1 yes (card d-181)
+        self.term["argv"] = hc_wrapper("pa-session", "--ask")
+        self.procs[T77_TERM] = (23551, ps_zsh("pa-session --ask"))
+        self.procs[T77_LAUNCHER] = (T77_TERM, T77_ASK_CHILD)
+        self.passes()
+
+    def test_ac5_hand_typed_shell_is_refused(self):  # R4, d-161: a shell where pa-session was typed
+        for argv, ps in ((["/bin/zsh", "-l"], "/bin/zsh -l"), (["-zsh"], "-zsh"), (["/bin/bash"], "/bin/bash"),
+                         (["/bin/zsh", "-c", "pa-session --space " + SP], "/bin/zsh -c pa-session --space " + SP),
+                         (["sh", "-c", "echo hi; \"$@\"", "sh", "pa-session"], 'sh -c echo hi; "$@" sh pa-session')):
+            with self.subTest(argv=argv):
+                self.term["argv"] = argv
+                self.procs[T77_TERM] = (23551, ps)
+                err = self.refused("pid")
+                self.assertIn(T77_TERM.__str__(), err)
+
+    def test_ac6_the_refusal_names_the_wrapper_in_one_line(self):
+        self.procs[T77_LAUNCHER] = (4242, T77_CHILD)
+        err = self.refused("Herdr's login-shell wrapper running 'pa-session --space {}'".format(SP))
+        self.assertNotIn("shell=", err)
+
+    def test_equal_pids_need_no_process_facts(self):  # R7, V4
+        dump(dict(self.rec, pid=T77_TERM), os.path.join(self.dir, "launcher.json"))
+        self.term["argv"] = ["pa-session", "--space", SP]
+        self.passes()
+        self.assertEqual(self.asked_pids, [])
+
+
+class T77_EndWrapper(EndTerminal, T77Fakes):
+    """pa-restart --end-terminal, check (e) and the pid comparisons: R2-R6; AC3 (end half), AC4, AC5, AC6."""
+
+    def setUp(self):
+        super().setUp()
+        self.t77_setup(["pa-session", "--space", SP, "--project", "/p"])
+
+    def passes(self):
+        c, out, err = self.run_end(dry_run=True)
+        self.assertEqual(c, 0, out + err)
+        self.assertIn("Ends:", out)
+        self.assertEqual(self.kills(), [])
+        self.nothing_written()
+        return out
+
+    def refused(self, part):
+        c, out, err = self.run_end(dry_run=True)
+        self.assertEqual(c, 2, out + err)
+        self.assertIn(part, err)
+        self.one_line(err)
+        self.assertEqual(self.kills(), [])
+        self.nothing_written()
+        return err
+
+    def test_ac4_hc_wrapper_argv(self):
+        for cmd in (["pa-session", "--space", SP], ["pa-session", "--space=" + SP, "--project", "/p"],
+                    ["/home/u/.local/bin/pa-session", "--profile", "t", "--space", "m1/" + SP],
+                    ["python3", "/x/tools/pa.py", "session", "--space", SP]):
+            with self.subTest(cmd=cmd):
+                self.term["argv"] = hc_wrapper(*cmd)
+                self.passes()
+
+    def test_ac4_each_ps_form(self):  # hc gives no argv; ps of hc's pid shows the branch it ran
+        for form in (ps_zsh, ps_fish, ps_star):
+            with self.subTest(form=form.__name__):
+                self.term.pop("argv", None)
+                self.procs[T77_TERM] = (23551, form("pa-session --space {} --project /p".format(SP)))
+                self.passes()
+
+    def test_ac4_another_space_is_refused(self):
+        self.term["argv"] = hc_wrapper("pa-session", "--space", "sp9")
+        self.procs[T77_TERM] = (23551, ps_zsh("pa-session --space sp9"))
+        err = self.refused("not this space's pa-session")
+        self.assertIn("Herdr's login-shell wrapper running 'pa-session --space sp9'", err)
+        for form in (ps_zsh, ps_fish, ps_star):
+            with self.subTest(form=form.__name__):
+                self.term.pop("argv", None)
+                self.procs[T77_TERM] = (23551, form("pa-session --space sp9"))
+                self.refused("not this space's pa-session")
+
+    def test_ac3_wrapped_first_tab_stays_refused_for_ending(self):  # d-161
+        self.term["argv"] = hc_wrapper("pa-session", "--ask")
+        self.procs[T77_TERM] = (23551, ps_zsh("pa-session --ask"))
+        err = self.refused("first tab")
+        self.assertIn("close it by hand", err)
+        self.assertIn("Herdr's login-shell wrapper running 'pa-session --ask'", err)
+        self.term.pop("argv")
+        self.refused("first tab")
+
+    def test_ac5_hand_typed_shell_with_a_launcher_child_is_refused(self):  # R4, d-161
+        for argv, ps in ((["/bin/zsh", "-l"], "/bin/zsh -l"), (["-zsh"], "-zsh"),
+                         (["/bin/zsh", "-c", "pa-session --space " + SP], "/bin/zsh -c pa-session --space " + SP)):
+            with self.subTest(argv=argv):
+                self.term["argv"] = argv
+                self.procs[T77_TERM] = (23551, ps)
+                self.procs[T77_LAUNCHER] = (T77_TERM, T77_CHILD)
+                self.refused("not this space's pa-session")
+
+    def test_ac6_the_reported_refusal_is_one_line(self):  # intent.md: the wrapper with a command it does not prove
+        self.term["argv"] = ["sh", "-c", WRAPPER_SCRIPT, "sh", "something", "else"]
+        self.procs[T77_TERM] = (23551, ps_zsh("something else"))
+        err = self.refused("not this space's pa-session")
+        self.assertIn("'something else'", err)
+        self.term["argv"] = ["sh", "-c", WRAPPER_SCRIPT.replace("esac", "esac\n# a newer Herdr"), "sh", "x"]
+        self.procs[T77_TERM] = (23551, "sh")
+        self.refused("not this space's pa-session")
+
+    def test_capable_record_of_the_wrapped_child_points_to_the_in_place_restart(self):
+        dump(dict(self.rec, pid=T77_LAUNCHER), os.path.join(self.dir, "launcher.json"))
+        self.refused("takes an in-place restart")
+
+    def test_j1_record_of_the_wrapped_child_is_this_launcher(self):
+        dump(dict(self.rec, version=1, accepts=None, pid=T77_LAUNCHER), os.path.join(self.dir, "launcher.json"))
+        self.passes()
+
+    def test_j1_record_of_another_process_disagrees(self):
+        dump(dict(self.rec, version=1, accepts=None, pid=T77_LAUNCHER), os.path.join(self.dir, "launcher.json"))
+        self.procs[T77_LAUNCHER] = (4242, T77_CHILD)
+        self.refused("disagrees")
+
+    def test_the_whole_end_with_the_wrapper(self):  # the re-check under the lock compares hc pids only (R7)
+        self.no_workers()
+        c, out, err = self.run_end()
+        self.assertEqual(c, 0, out + err)
+        self.assertEqual(self.kills(), [["hc", "kill", "t1"]])
+
+
+class T77_Units(Base):
+    """wrapped_command (R3), pa_session_argv on ps words, proc_info (R6) with a fake ps."""
+
+    def test_wrapped_command_forms(self):
+        cases = [(hc_wrapper("pa-session", "--ask"), ["pa-session", "--ask"]),
+                 (ps_zsh("pa-session --ask"), ["pa-session", "--ask"]),
+                 ('/bin/bash -lic "$@"; exec "$0" -li /bin/bash pa-session --space ' + SP, ["pa-session", "--space", SP]),
+                 (ps_fish("pa-session --ask"), ["pa-session", "--ask"]),
+                 (ps_star("pa-session --ask"), ["pa-session", "--ask"])]
+        for value, want in cases:
+            with self.subTest(value=value):
+                self.assertEqual(pa.wrapped_command(value), want)
+
+    def test_not_the_wrapper(self):
+        for value in (["/bin/zsh", "-l"], ["-zsh"], "/bin/zsh -l", "-zsh", None, [], "", 5, ["sh", "-c"],
+                      hc_wrapper(), ps_zsh("").strip(), ["sh", "-c", "\"$@\"", "sh", "pa-session"],
+                      ["sh", "-c", WRAPPER_SCRIPT, "bash", "pa-session"], ["bash", "-c", WRAPPER_SCRIPT, "sh", "x"],
+                      '/bin/zsh -ic "$@"; exec "$0" -li /bin/zsh pa-session', '/bin/zsh -lic "$@" /bin/zsh pa-session',
+                      '/bin/zsh -lic "$@"; exec "$0" -li /bin/bash pa-session', 'env -lic "$@"; exec "$0" -li env x',
+                      'sh -c "$@"; exec "${SHELL:-sh}" -i bash x', ["sh", "-c", WRAPPER_SCRIPT, "sh", 3]):
+            with self.subTest(value=value):
+                self.assertIsNone(pa.wrapped_command(value))
+
+    def test_pa_session_argv_takes_the_symlink_under_python(self):
+        self.assertTrue(pa.pa_session_argv(["python3", "/Users/u/.local/bin/pa-session", "--space", SP], SP))
+        self.assertFalse(pa.pa_session_argv(["python3", "/Users/u/.local/bin/pa-session", "--ask"], SP))
+        self.assertFalse(pa.pa_session_argv(["python3", "/x/pa-sessions", "--space", SP], SP))
+
+    def test_proc_info_reads_ps(self):
+        from unittest import mock
+        real = self.saved_proc
+        seen = []
+
+        def run(out=None, code=0, raises=None):
+            def fake(argv, **kw):
+                seen.append(list(argv))
+                if raises:
+                    raise raises
+                return subprocess.CompletedProcess(argv, code, stdout=out, stderr="")
+            return fake
+
+        with mock.patch.object(pa.subprocess, "run", run('  30222 /bin/zsh -lic "$@"; exec "$0" -li /bin/zsh x\n')):
+            self.assertEqual(real(30310), (30222, '/bin/zsh -lic "$@"; exec "$0" -li /bin/zsh x'))
+        self.assertEqual(seen[-1][0], "ps")
+        self.assertIn("30310", seen[-1])
+        for fake in (run("", 1), run(""), run("   \n"), run("abc def\n"), run("30222\n"),
+                     run(raises=OSError("no ps")), run(raises=subprocess.TimeoutExpired("ps", 5))):
+            with mock.patch.object(pa.subprocess, "run", fake):
+                self.assertIsNone(real(30310))
+        n = len(seen)
+        for pid in (None, True, 0, -1, "30310", 3.0):
+            with mock.patch.object(pa.subprocess, "run", run("1 x\n")):
+                self.assertIsNone(real(pid))
+        self.assertEqual(len(seen), n, "no ps for a pid that is not a positive number")
+
+    def test_launcher_record_has_ppid(self):  # O3: diagnostic only
+        ctx = self.record()
+        self.assertEqual(ctx["launcher"]["ppid"], os.getppid())
 
 
 if __name__ == "__main__":
