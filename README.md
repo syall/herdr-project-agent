@@ -419,6 +419,12 @@ accountWide, source}`), from a script the profile declares:
 Billed figures are **account-wide**: they include use outside this space and outside Herdr, so they
 are never shown as this space's spend. A price factor (from billed quantities) gives a `calibrated`
 figure beside `est.`; a scope ratio is shown but never applied.
+When the space's estimates carry more than one account label, each other label is compared on its own,
+its estimates against its own bill only (`others` in `billed compare --json`, a block per label in
+`report --billed`, one line per label in the view); a label with estimates and no billed rows says so.
+When the billing source gives usage types, billed rows keep their `endpoint` and `region`, and the
+comparison is split by them (`byScope`; `?` an estimate whose endpoint or region is not known, `*` a bill
+that names none; an endpoint the price sources call region-free is compared by endpoint only).
 
 **Claude Code's own figure** (`CC`, optional): Claude Code computes a cost per session itself, at list
 price, in USD, and hands it to its status line. When the profile declares `statusLine` (below),
