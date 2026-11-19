@@ -128,9 +128,13 @@ def row_of(words):
     removing = max([k for k, w in enumerate(words) if w in ("-d", "--delete")], default=-1)
     tool = next((word(k + 1) for k in range(first, n) if names[k] == "pa.py" and (k == first or PYTHON.match(names[first]))),
                 names[first][3:] if first < n and names[first][:3] == "pa-" else "")  # pa-<tool>, or pa.py <tool>
-    costs = next((k for k in range(first, n) if (names[k] in ("pa-costs", "pa_costs.py") or re.fullmatch(r"-[a-z]*m(pa_costs)?", names[k])
-                  and "pa_costs" in (names[k][-8:], program(word(k + 1)))) and (k == first or PYTHON.match(names[first]))), n)  # pa-costs, pa_costs.py, -m pa_costs, -um pa_costs, -mpa_costs
-    rest = words[costs + 1:]
+    py = first < n and PYTHON.match(names[first])  # D7: pa-costs, pa_costs.py, a module whose last dotted part is pa_costs
+    module = lambda k: (re.fullmatch(r"-[a-z]*?m([\w.]+)", names[k]) or re.fullmatch(r"(.*)", names[k])).group(1)
+    costs = next((k for k in range(first, n) if (names[k] in ("pa-costs", "pa_costs.py") or module(k).rsplit(".", 1)[-1]
+                  == "pa_costs") and (k == first or py)), n)  # -m [a.b.]pa_costs, -um x, -mx, runpy's or pdb -m's module
+    code = next((k for k in range(first + 1, n) if py and re.fullmatch(r"-[A-Za-z]*?c.*", words[k], re.S)
+                 and "pa_costs" in " ".join(words[k:k + 2]).lower()), n)  # python -c '<code naming pa_costs>' [args]
+    rest = re.findall(r"[\w-]+", " ".join(words[code:])) if code < costs else words[costs + 1:]
     if any(word(j) in ("push", "send-pack", "http-push") or word(j) in ("subtree", "lfs") and after(j) == "push"
            for j in subs) or first < n and names[first] in ("git-push", "git-send-pack", "git-http-push"):
         row = DENY_PUSH
