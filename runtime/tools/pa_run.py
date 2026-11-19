@@ -14,7 +14,9 @@ to stderr); pa-run exits with argv's code.
   with `git apply --index`, and its commit and tree must be C and T.
 - argv (R2): an argv list, each word quoted into the fixed remote script. argv[0] is python3, node, sh or a relative
   path to an executable file in the tree. Refused (125): hc or any other name, `sh -c`, a command that starts an hc
-  core (tests/pa_session_check.sh; tests/run-all.sh with no flag or --only-integration: use pa-full-suite).
+  core (tests/pa_session_check.sh; tests/run-all.sh unless its first word is --affected, --except-integration
+  or --module: use pa-full-suite). sh's script and an argv[0] path must be relative and stay inside the tree; they
+  are compared by realpath (a symlink in the tree to either script is that script).
 - Never sent (R8): a changed path matching the guard's secret patterns or the profile's secretPaths, or under
   .claude/; ignored files; bundle and patch over 6 MB base64 (125).
 - Where (R9 as J1-D1, R10, R11): every run on a machine takes one of its `cap` slots (the same slots as full
@@ -56,6 +58,9 @@ KEEP = 30 * 86400  # test-runs.jsonl lines older than this are dropped on write
 ARGV_KEEP = 200
 SESSION_CHECK = "tests/pa_session_check.sh"
 RUN_ALL = "tests/run-all.sh"
+# run-all.sh's own case: the flags that are not a whole run ("" is its no-flag run, --only-integration its
+# integration part, anything else its usage); run-all.sh runs only with one of these first (J1-D13)
+RUN_ALL_FLAGS = ("--affected", "--except-integration", "--module")
 GIT_SAFE = ["-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false", "-c", "core.splitIndex=false"]
 
 
@@ -151,25 +156,58 @@ def tree_path(subdir, word):
     return posixpath.normpath(posixpath.join(subdir or "", word)) if word else ""
 
 
+def script_rel(subdir, word):
+    """sh's script, or an argv[0] path: from the tree's top, normalised; None when it is absolute, empty or leaves
+    the tree (a path that leaves and comes back, ../w/tests/run-all.sh, is refused too: J1-D13)."""
+    if not word or word.startswith("/"):
+        return None
+    rel = tree_path(subdir, word)
+    if rel == ".." or rel.startswith("../") or rel.startswith("/"):
+        return None
+    return rel
+
+
+def is_file(top, rel, target):
+    """Is rel (from the top) the tree's file target: the same realpath under the top, or the same file (a symlink,
+    a hard link or another case spelling of it)?"""
+    a = os.path.realpath(os.path.join(top, rel))
+    b = os.path.realpath(os.path.join(top, target))
+    if a == b:
+        return True
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return False
+
+
 def check_argv(argv, top, subdir, commit=None, overlay=(), h=None):
     """R2: None when argv may run, else why not."""
     if not argv:
         return "no command after --"
     first = argv[0]
-    script = 0
+    script = None
     if first == "sh":
         script, why = sh_script(argv)
         if why:
             return why
-    for i, word in enumerate(argv):  # first: what starts an hc core is named as such
-        rel = tree_path(subdir, word) if not word.startswith("-") else None
-        if rel == SESSION_CHECK:
+    elif first not in PROGRAMS:
+        script = 0
+    if script is not None:  # what runs as a script: relative, inside the tree, and not one that starts an hc core
+        word = argv[script]
+        rel = script_rel(subdir, word)
+        if rel is None:
+            return "{} {!r} is an absolute path or leaves the tree (..): give a relative path inside the tree".format(
+                "sh's script" if script else "argv[0]", word)
+        if is_file(top, rel, SESSION_CHECK):
             return "{} starts an hc core: use pa-full-suite: the integration part runs on this Mac".format(SESSION_CHECK)
-        if rel == RUN_ALL and i == script:
-            flags = argv[i + 1:]
-            if not flags or flags[0] == "--only-integration":
-                return "{} {} starts an hc core: use pa-full-suite: the integration part runs on this Mac".format(
-                    RUN_ALL, " ".join(flags) or "(no flag)")
+        if is_file(top, rel, RUN_ALL):
+            flags = argv[script + 1:]
+            if not flags or flags[0] not in RUN_ALL_FLAGS:  # allowlist: everything else is a whole run (fail closed)
+                return "{} {} is a whole run or starts an hc core (allowed: {}): use pa-full-suite".format(
+                    RUN_ALL, " ".join(repr(f) if not f else f for f in flags) or "(no flag)", ", ".join(RUN_ALL_FLAGS))
+    for word in argv[1:]:  # the session check named anywhere as a path in the tree
+        if not word.startswith("-") and tree_path(subdir, word) == SESSION_CHECK:
+            return "{} starts an hc core: use pa-full-suite: the integration part runs on this Mac".format(SESSION_CHECK)
     if first == "hc":
         return "argv[0] is hc: hc never runs from pa-run (a test reaches no hc core)"
     if first not in PROGRAMS:
