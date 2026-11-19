@@ -1088,7 +1088,7 @@ cases["S41-5-context-outcome"] = async () => { // R6, R13: the texts of each ans
   check(store.contextOutcome({ r: { code: 0, stdout: "done\n", stderr: "" } }, local, hm).ok, "exit 0 without a JSON line: ok");
 };
 
-cases["S41-6-context-settings"] = async () => { // R13: context.json over the defaults; read on the space's machine
+cases["S41-6-context-settings"] = async () => { // R13: context.json over the defaults; read on the space's machine; no costs file (J5-D1)
   const d = store.contextSettings(null);
   check(d.mode === "fresh" && d.taskCap === 150000 && d.passCap === 250000 && d.net === 400000 && d.problem === null, `missing: the defaults (got ${JSON.stringify(d)})`);
   const off = store.contextSettings({ v: 1, mode: "off", taskCap: 120000, passCap: 250000, net: 400000, enabledAt: null, by: "person" });
@@ -1101,18 +1101,17 @@ cases["S41-6-context-settings"] = async () => { // R13: context.json over the de
   g.__files[`${M}:${rdir}/context.json`] = JSON.stringify({ v: 1, mode: "off", taskCap: 150000, passCap: 250000, net: 400000, enabledAt: null, by: "panel" });
   g.__files[`${M}:${rdir}/costs/summary.json`] = JSON.stringify({ updated: `${TODAY}T07:59:00Z`, paContext: [pcDay()] });
   const r = await store.loadContext(remote, cx);
-  check(r.settings.mode === "off" && Array.isArray(r.paContext) && r.paContext[0].mean === 158000, `remote read (got ${JSON.stringify(r)})`);
-  check(g.__reads.includes(`${M}:${rdir}/context.json`) && g.__reads.includes(`${M}:${rdir}/costs/summary.json`) && g.__reads.every((x) => x.startsWith(`${M}:`)), `both on ${M} (got ${JSON.stringify(g.__reads)})`);
+  check(r.settings.mode === "off" && r.paContext === undefined, `remote read (got ${JSON.stringify(r)})`);
+  check(JSON.stringify(g.__reads) === JSON.stringify([`${M}:${rdir}/context.json`]), `context.json only, on ${M}; no costs file (J5-D1, t-009 R11) (got ${JSON.stringify(g.__reads)})`);
   world();
-  const only = await store.loadContext(local, cx, { summary: false });
-  check(only.settings.mode === "fresh" && only.paContext === undefined && g.__reads.length === 1 && g.__reads[0].endsWith("/context.json"), `summary: false reads context.json only (got ${JSON.stringify(g.__reads)})`);
+  const missing = await store.loadContext(local, cx);
+  check(missing.settings.mode === "fresh" && missing.settings.problem === null && g.__reads.length === 1 && g.__reads[0].endsWith("/context.json"), `missing: the defaults, one read (got ${JSON.stringify(g.__reads)})`);
   world();
   g.__files[`:${ldir}/context.json`] = "{not json";
-  g.__files[`:${ldir}/costs/summary.json`] = "[1]";
   const b = await store.loadContext(local, cx);
-  check(b.settings.mode === "fresh" && /not valid JSON/.test(b.settings.problem ?? "") && b.paContext === null, `broken files (got ${JSON.stringify(b)})`);
+  check(b.settings.mode === "fresh" && /not valid JSON/.test(b.settings.problem ?? ""), `a broken file (got ${JSON.stringify(b)})`);
   world();
-  g.__hang = [`${M}:${rdir}/costs/summary.json`];
+  g.__hang = [`${M}:${rdir}/context.json`];
   const { done, value: h } = await within(store.loadContext(remote, cx), 12000);
   check(done && store.gaveUp(h), `a hung read gives up (done ${done}, got ${JSON.stringify(h)})`);
 };

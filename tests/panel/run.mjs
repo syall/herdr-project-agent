@@ -5983,7 +5983,8 @@ const SUMMARY41 = { updated: `${DAY41}T07:59:00Z`, paContext: [{ day: DAY41, cal
 const DRY41 = (over = {}) => ({ code: 0, stdout: `mode fresh  taskCap 150,000  passCap 250,000\ncontext: 260k (transcript)\nDry run: nothing written.\n${JSON.stringify({ outcome: "dry-run", ctx: 260000, source: "transcript", due: "pass-cap", request: null, expires: null, reasons: [], ...over })}\n`, stderr: "" });
 const ASKED41 = { code: 0, stdout: `Requested (rq-1): a fresh context at the Project Agent's next clean point.\n${JSON.stringify({ outcome: "requested", request: "rq-1", expires: `${DAY41}T10:00:00Z` })}\n`, stderr: "" };
 const SET41 = (mode) => ({ code: 0, stdout: `mode ${mode}\n${JSON.stringify({ v: 1, mode, taskCap: 150000, passCap: 250000, net: 400000, enabledAt: null, by: "panel" })}\n`, stderr: "" });
-// liveWorld with a launcher that takes context requests, agent.json's sessionId, context.json and the summary.
+// liveWorld with a launcher that takes context requests, agent.json's sessionId, context.json and the summary (read
+// only by the Costs view: J5-D1).
 // fresh(args, on): the context tool's answer (default: the dry run, a request, or the set's settings).
 function ctxWorld({ machine = null, launcher = LREC({ accepts: ["restart", "context"] }), context, summary = SUMMARY41, sessionId = "s1", status = "idle", fresh = null } = {}) {
   const w = liveWorld({ launcher, machine, status });
@@ -6002,22 +6003,27 @@ const ctxWrites = () => ctxRuns().filter(([, a]) => !a.includes("--dry-run"));
 const summaryReads = (dir) => g.__reads.filter((r) => r === `${dir}/costs/summary.json`);
 const ASK_ARGV = ["fresh", "--space", S, "--by", "panel", "--json", "--why", "the Fresh context button in the Project Agent panel"];
 
-cases["P41-1-context-line"] = async () => { // R15: today's (UTC) line, the switch and the button while it runs
-  ctxWorld();
+cases["P41-1-context-line"] = async () => { // R15, J5-D1: the line from the Costs view's own read (as of its time), the switch and the button
+  const { dir } = ctxWorld();
   const v = await liveMount();
   const { text, clicks } = look(v);
-  check(text.includes("PA context today (UTC): mean 158k · peak 254k · resets 6 (fresh 6, compact 0)"), `the line (got ${text.slice(0, 900)})`);
+  check(text.includes("PA context: open the Costs tab to read it.") && !text.includes("PA context today"), `before any Costs read (got ${text.slice(0, 900)})`);
+  check(summaryReads(dir).length === 0, `no summary.json read outside the Costs view (got ${summaryReads(dir).length})`);
   check(Boolean(clicks["pa-fresh"]) && /Fresh context/.test(text), `the button (clicks ${Object.keys(clicks)})`);
   check(Boolean(clicks["pa-context-mode"]) && /Turn fresh contexts off/.test(text) && /mode fresh/.test(text), "the mode and its switch");
   check(Boolean(clicks["pa-restart"]), "Restart still there");
   check(ctxRuns().length === 0, "nothing run without a click");
+  await click(v, "view-costs"); await settle();
+  check(summaryReads(dir).length === 1, `the Costs view's one read (got ${summaryReads(dir).length})`);
+  check(look(v).text.includes("PA context today (UTC): mean 158k · peak 254k · resets 6 (fresh 6, compact 0) (as of 08:00)"), `the line (got ${look(v).text.slice(0, 900)})`);
 };
 
-cases["P41-2-no-summary"] = async () => { // R15: no summary: no line; the rest stays
+cases["P41-2-no-summary"] = async () => { // R15, J5-D1: no summary: no line once the Costs view has read; the rest stays
   ctxWorld({ summary: null });
   const v = await liveMount();
+  await click(v, "view-costs"); await settle();
   const { text, clicks } = look(v);
-  check(!text.includes("PA context today"), `no line (got ${text.slice(0, 600)})`);
+  check(!text.includes("PA context today") && !text.includes("open the Costs tab"), `no line (got ${text.slice(0, 600)})`);
   check(Boolean(clicks["pa-fresh"]) && Boolean(clicks["pa-context-mode"]) && Boolean(clicks["pa-restart"]), `button, switch, Restart (got ${Object.keys(clicks)})`);
 };
 
@@ -6031,7 +6037,7 @@ cases["P41-3-button-when"] = async () => { // R6: only live + accepts "context" 
   world(); // not running
   g.__files[`:${DIR}/costs/summary.json`] = JSON.stringify(SUMMARY41);
   v = await liveMount();
-  check(!look(v).clicks["pa-fresh"] && Boolean(look(v).clicks["pa-context-mode"]) && look(v).text.includes("PA context today (UTC)"), "down: no button; the line and the switch stay");
+  check(!look(v).clicks["pa-fresh"] && Boolean(look(v).clicks["pa-context-mode"]) && look(v).text.includes("PA context: open the Costs tab to read it."), `down: no button; the line and the switch stay (got ${look(v).text.slice(0, 700)})`);
   world({ machine: M }); g.__machines = [{ name: null, layout: "ready" }, { name: M, layout: "offline" }];
   v = await liveMount();
   check(!look(v).clicks["pa-fresh"] && !look(v).clicks["pa-context-mode"], "offline: neither");
@@ -6162,24 +6168,22 @@ cases["P41-12-reset-line"] = async () => { // C6: the line while this conversati
   check(!look(v).text.includes("Fresh context at 07:02") && !look(v).clicks["copy-previous-session"], "another session: no line");
 };
 
-cases["P41-13-summary-throttle"] = async () => { // Q2: summary.json at most once a minute per space; context.json each load
+cases["P41-13-no-summary-read"] = async () => { // J5-D1, t-009 R11: no summary.json read outside the Costs view across reloads; context.json each load
   const { dir } = ctxWorld();
   const v = await liveMount();
   const ctxReads = () => g.__reads.filter((r) => r === `${dir}/context.json`).length;
-  check(summaryReads(dir).length === 1, `one read at mount (got ${summaryReads(dir).length})`);
   const c0 = ctxReads();
-  advance(30000); await fire(10000); await settle();
+  check(c0 >= 1, `context.json read at mount (got ${c0})`);
+  for (let i = 0; i < 3; i++) { advance(31000); await fire(10000); await settle(); }
   check(ctxReads() > c0, "context.json read again");
-  check(summaryReads(dir).length === 1, `not again within a minute (got ${summaryReads(dir).length})`);
-  check(look(v).text.includes("PA context today (UTC): mean 158k"), "the line kept");
-  advance(31000); await fire(10000); await settle();
-  check(summaryReads(dir).length === 2, `again after a minute (got ${summaryReads(dir).length})`);
+  check(summaryReads(dir).length === 0, `no summary.json read (got ${summaryReads(dir).length})`);
+  check(look(v).text.includes("PA context: open the Costs tab to read it."), `the line (got ${look(v).text.slice(0, 700)})`);
 };
 
 cases["P41-14-remote"] = async () => { // R6, R13: a space on m1: reads and runs there; no --on
   const { dir } = ctxWorld({ machine: M });
   const v = await liveMount();
-  check(g.__reads.includes(`${dir}/context.json`) && summaryReads(dir).length === 1, `read on ${M} (got ${JSON.stringify(g.__reads.filter((r) => /context|summary/.test(r)))})`);
+  check(g.__reads.includes(`${dir}/context.json`) && summaryReads(dir).length === 0, `context.json on ${M}, no summary read (got ${JSON.stringify(g.__reads.filter((r) => /context|summary/.test(r)))})`);
   check(!g.__reads.some((r) => /context\.json|summary\.json/.test(r) && !r.startsWith(`${M}:`)), "nothing local");
   await click(v, "pa-fresh"); await settle();
   await click(v, "pa-fresh-go"); await settle();
