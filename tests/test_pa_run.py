@@ -164,11 +164,53 @@ class R1Argv(Run):
             (["sh", "tests/run-all.sh"], "use pa-full-suite"),
             (["tests/run-all.sh", "--only-integration"], "use pa-full-suite"),
             (["sh", "tests/run-all.sh", "--only-integration"], "use pa-full-suite"),
+            # round 2 (MF-1): sh options with an argument, combined flags, --, stdin, what cannot be parsed
+            (["sh", "-o", "errexit", "-c", "hc ls"], "sh -c"),
+            (["sh", "+o", "x", "-c", "y"], "sh -c"),
+            (["sh", "-eo", "pipefail", "-c", "x"], "sh -c"),
+            (["sh", "-e", "-o", "nounset", "-xc", "x"], "sh -c"),
+            (["sh", "-ce", "x"], "sh -c"),
+            (["sh", "+c", "x"], "sh -c"),
+            (["sh", "--", "-c", "x"], "starts with -"),
+            (["sh", "-s"], "stdin"),
+            (["sh", "-es", "x"], "stdin"),
+            (["sh"], "stdin"),
+            (["sh", "-e"], "stdin"),
+            (["sh", "-o"], "cannot parse"),
+            (["sh", "--norc", "probe.sh"], "cannot parse"),
+            (["sh", "-i", "probe.sh"], "cannot parse"),
+            (["sh", "-eZ", "probe.sh"], "cannot parse"),
+            # round 2 (MF-2): the two scripts spelled another way or after sh's options
+            (["sh", "-e", "tests/run-all.sh"], "use pa-full-suite"),
+            (["sh", "--", "tests/run-all.sh"], "use pa-full-suite"),
+            (["sh", "-", "tests/run-all.sh"], "use pa-full-suite"),
+            (["sh", "-x", "tests/run-all.sh", "--only-integration"], "use pa-full-suite"),
+            (["sh", "-o", "errexit", "tests/run-all.sh"], "use pa-full-suite"),
+            (["sh", "tests/../tests/run-all.sh"], "use pa-full-suite"),
+            (["sh", "./tests//run-all.sh"], "use pa-full-suite"),
+            (["tests/../tests/run-all.sh"], "use pa-full-suite"),
+            (["./tests//run-all.sh"], "use pa-full-suite"),
+            (["sh", "-e", "tests/pa_session_check.sh"], "pa_session_check.sh"),
+            (["sh", "--", "tests/pa_session_check.sh"], "pa_session_check.sh"),
+            (["sh", "tests/../tests/pa_session_check.sh"], "pa_session_check.sh"),
+            (["sh", "tests//../tests/pa_session_check.sh", "/tmp/x"], "pa_session_check.sh"),
+            (["tests/../tests/pa_session_check.sh"], "pa_session_check.sh"),
         ]
         for argv, why in cases:
             code, out = self.pa_run("--", *argv)
             self.assertEqual(code, 125, (argv, out))
             self.assertIn("pa-run: not run", out, argv)
+            self.assertIn(why, out, argv)
+        self.assertEqual(self.calls(), [])
+
+    def test_r1e_refusals_from_a_subfolder(self):
+        """--cwd tests: the two scripts by their names there, and by a .. spelling."""
+        for argv, why in ((["sh", "run-all.sh"], "use pa-full-suite"), (["sh", "-e", "./run-all.sh"], "use pa-full-suite"),
+                          (["sh", "../tests/run-all.sh"], "use pa-full-suite"),
+                          (["sh", "--", "pa_session_check.sh"], "pa_session_check.sh"),
+                          (["sh", "../tests/pa_session_check.sh"], "pa_session_check.sh")):
+            code, out = self.pa_run("--cwd", "tests", "--", *argv)
+            self.assertEqual(code, 125, (argv, out))
             self.assertIn(why, out, argv)
         self.assertEqual(self.calls(), [])
 
@@ -183,7 +225,9 @@ class R1Argv(Run):
         for argv in (["python3", "-m", "unittest", "tests.test_x"], ["node", "x.mjs"], ["sh", "probe.sh"],
                      ["./probe.sh"], ["probe.sh"], ["sh", "tests/run-all.sh", "--except-integration"],
                      ["sh", "tests/run-all.sh", "--affected"], ["sh", "tests/run-all.sh", "--module", "test_x"],
-                     ["python3", "-c", "print(1)"]):
+                     ["python3", "-c", "print(1)"], ["sh", "-e", "probe.sh"], ["sh", "-eo", "pipefail", "probe.sh"],
+                     ["sh", "-o", "errexit", "+x", "probe.sh"], ["sh", "--", "probe.sh"], ["sh", "-", "probe.sh"],
+                     ["sh", "-x", "tests/run-all.sh", "--affected"], ["sh", "-e", "probe.sh", "-c", "x"]):
             self.assertIsNone(pa_run.check_argv(argv, self.wt, "", None, []), argv)
 
     def test_r1d_no_argv_is_a_usage_error(self):
