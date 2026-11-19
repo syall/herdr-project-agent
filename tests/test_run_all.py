@@ -21,8 +21,15 @@ import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SHARDS = ["panel harness {}/4".format(k) for k in (1, 2, 3, 4)]
-NAMES = ["python 3.7 parse", "unit tests: test_stub", "keeper harness"] + SHARDS + ["store harness",
-         "pa-session integration (private hc core)"]
+# t-112: the integration check is three parts, each its own pa_session_check.sh --part <k> with its own core.
+INTEGRATION = ["pa-session integration {}/3 (private hc core)".format(k) for k in (1, 2, 3)]
+NAMES = ["python 3.7 parse", "unit tests: test_stub", "keeper harness"] + SHARDS + ["store harness"] + INTEGRATION
+# The stub pa_session_check.sh: records its arguments and runs stub.sh as integration<k> for --part <k> (plain
+# "integration" without one), so STUB_integration<k> picks each part's mode.
+CHECK = '''echo "$*" >> "$STUB_DIR/integrationargs"
+k=; [ "${2:-}" = --part ] && k=${3:-}
+exec sh stub.sh "integration$k"
+'''
 # The stub panel run.mjs: records its arguments and runs stub.sh as panel<k> for --shard=<k>/<n> (plain "panel"
 # without one), so STUB_panel<k> picks each shard's mode.
 PANEL = '''echo "$*" >> "$STUB_DIR/panelargs"
@@ -168,7 +175,7 @@ class RunAll(unittest.TestCase):
             write(os.path.join(self.repo, "tests", part, "run.mjs"), "exec sh stub.sh {}\n".format(part))
         write(os.path.join(self.repo, "tests", "panel", "run.mjs"), PANEL)
         write(os.path.join(self.repo, "tests", "setup-scratch.sh"), "exit 0\n")
-        write(os.path.join(self.repo, "tests", "pa_session_check.sh"), "exec sh stub.sh integration\n")
+        write(os.path.join(self.repo, "tests", "pa_session_check.sh"), CHECK)
         self.node = os.path.join(self.tmp, "node")
         write(self.node, '#!/bin/sh\nexec sh "$@"\n', 0o755)
         self.events = os.path.join(self.tmp, "events")
@@ -208,7 +215,7 @@ class RunAll(unittest.TestCase):
         self.assertTrue(out.rstrip().splitlines()[-1].startswith("=== all passed (outputs: "), out)
         folder = self.outputs(out)
         files = sorted(os.listdir(folder))
-        self.assertEqual(len([f for f in files if f.endswith(".log")]), 9, files)
+        self.assertEqual(len([f for f in files if f.endswith(".log")]), 11, files)
         keeper = [f for f in files if "keeper" in f and f.endswith(".log")][0]
         with open(os.path.join(folder, keeper)) as f:
             self.assertEqual(f.read(), "keeper says hello\nkeeper done\n")
@@ -232,7 +239,7 @@ class RunAll(unittest.TestCase):
         self.assertIn("panel2 line 11\n", tail)
         self.assertIn("panel2 line 50\n", tail)
         self.assertNotIn("panel2 line 10\n", tail)
-        for name in ["python 3.7 parse", "store harness", "pa-session integration (private hc core)"] + SHARDS[:1] + SHARDS[2:]:
+        for name in ["python 3.7 parse", "store harness"] + INTEGRATION + SHARDS[:1] + SHARDS[2:]:
             self.assertIn("{}: ok".format(name), tail)
         self.outputs(out)
 
@@ -297,7 +304,8 @@ class RunAll(unittest.TestCase):
         with open(self.events) as f:
             events = f.read().split()
         pairs = [events[i:i + 4] for i in range(0, len(events), 4)]
-        self.assertEqual(pairs, [["start", k, "end", k] for k in ("keeper", "panel1", "panel2", "panel3", "panel4", "store", "integration")], events)
+        self.assertEqual(pairs, [["start", k, "end", k] for k in ("keeper", "panel1", "panel2", "panel3", "panel4", "store", "integration1",
+                                                               "integration2", "integration3")], events)
         self.assertTrue(out.rstrip().splitlines()[-1].startswith("=== all passed (outputs: "), out)
 
     def test_r4c_serial_failure(self):
@@ -361,7 +369,7 @@ class RunAll(unittest.TestCase):
     def test_r6b_affected_without_files_runs_the_fast_set(self):
         code, out = self.run_all("--affected")
         self.assertEqual(code, 0, out)
-        for name in NAMES[:-1]:
+        for name in NAMES[:-3]:
             self.assertIn("{}: ok".format(name), self.summary(out))
         self.assertNotIn("integration", out)
 
@@ -376,9 +384,9 @@ class RunAll(unittest.TestCase):
             with open(os.path.join(self.tmp, "tmpdirs")) as f:
                 seen = dict(line.split(" ", 1) for line in f.read().splitlines())
             self.assertEqual(sorted(seen), sorted(["units", "keeper", "panel1", "panel2", "panel3", "panel4", "store",
-                                                   "integration"]), seen)
+                                                   "integration1", "integration2", "integration3"]), seen)
             dirs = [os.path.realpath(d) for d in seen.values()]
-            self.assertEqual(len(set(dirs)), 8, seen)
+            self.assertEqual(len(set(dirs)), 10, seen)
             for d in dirs:
                 self.assertTrue(d.startswith(os.path.realpath(folder) + os.sep) and os.path.isdir(d), (d, folder))
 
@@ -461,7 +469,7 @@ class RunAll(unittest.TestCase):
             self.assertIn("  {}: ok".format(name), tail)
         self.assertTrue(out.rstrip().splitlines()[-1].startswith("=== 1 part(s) failed: unit tests: test_b (outputs: "), out)
         folder = self.outputs(out)
-        self.assertEqual(len([f for f in os.listdir(folder) if f.endswith(".log")]), 11, os.listdir(folder))
+        self.assertEqual(len([f for f in os.listdir(folder) if f.endswith(".log")]), 13, os.listdir(folder))
 
     def sharded_modules(self):
         """Stub test_pa_queue.py (nine tests, a class fixture) and test_pa_worker.py (five) with the real
@@ -527,7 +535,7 @@ class RunAll(unittest.TestCase):
         self.assertEqual(code, 0, out)
         tail = self.summary(out)
         names = [l.split(": ok", 1)[0].strip() for l in tail.splitlines() if l.startswith("  ") and ": ok (" in l]
-        self.assertEqual(names, NAMES[:-1])  # the same names and order; PA_CHANGED_FILES does not narrow it
+        self.assertEqual(names, NAMES[:-3])  # the same names and order; PA_CHANGED_FILES does not narrow it
         with open(self.events) as f:
             self.assertNotIn("integration", f.read())
         self.assertIn("  suite slot: waited", tail)
@@ -537,17 +545,47 @@ class RunAll(unittest.TestCase):
         self.assertEqual(code, 0, out)
         tail = self.summary(out)
         names = [l.split(": ok", 1)[0].strip() for l in tail.splitlines() if l.startswith("  ") and ": ok (" in l]
-        self.assertEqual(names, [NAMES[-1]])
+        self.assertEqual(names, INTEGRATION)
         with open(self.events) as f:
-            self.assertEqual(f.read().split(), ["start", "integration", "end", "integration"])
+            events = f.read().split()
+        self.assertEqual(sorted(zip(events[::2], events[1::2])), sorted(
+            (e, "integration{}".format(k)) for k in (1, 2, 3) for e in ("start", "end")), events)
+        with open(os.path.join(self.tmp, "integrationargs")) as f:
+            args = sorted(f.read().splitlines())
+        self.assertEqual([a.split(" ", 1)[1] for a in args], ["--part 1", "--part 2", "--part 3"], args)
+        self.assertTrue(all(a.split(" ", 1)[0].startswith("/tmp/t001.") for a in args), args)
+        self.assertEqual(len(set(a.split(" ", 1)[0] for a in args)), 3, args)  # its own scratch per part
         self.assertIn("  suite slot: waited", tail)
-        self.assertEqual(self.progress()[-1]["parts"]["total"], 1)
-        code, out = self.run_all("--only-integration", integration="fail")
+        self.assertEqual(self.progress()[-1]["parts"]["total"], 3)
+
+    def test_r12d_a_failing_integration_part_is_named_alone(self):
+        # t-112 R6: a failing step makes only its part FAILED, its FAIL lines in the summary; the other parts ok.
+        for serial in ("", "1"):
+            with self.subTest(serial=serial):
+                write(self.events, "")
+                code, out = self.run_all("--only-integration", integration2="fail", PA_SERIAL=serial)
+                self.assertEqual(code, 1, out)
+                tail = self.summary(out)
+                self.assertIn("--- pa-session integration 2/3 (private hc core): FAILED\n  FAIL K-x: boom\n  FAIL K-y: bang", tail)
+                self.assertIn("  pa-session integration 1/3 (private hc core): ok (", tail)
+                self.assertIn("  pa-session integration 2/3 (private hc core): FAILED (", tail)
+                self.assertIn("  pa-session integration 3/3 (private hc core): ok (", tail)
+                self.assertTrue(out.rstrip().splitlines()[-1].startswith(
+                    "=== 1 part(s) failed: pa-session integration 2/3 (private hc core) (outputs: "), out)
+        # A part that cannot start its core (SKIP, exit 2) is FAILED with its last 40 lines, the others ok.
+        write(os.path.join(self.repo, "tests", "pa_session_check.sh"),
+              '[ "$3" = 3 ] && { echo "SKIP: scratch core did not start"; exit 2; }\n' + CHECK)
+        code, out = self.run_all("--only-integration")
         self.assertEqual(code, 1, out)
-        self.assertIn("pa-session integration (private hc core): FAILED", self.summary(out))
+        tail = self.summary(out)
+        self.assertIn("--- pa-session integration 3/3 (private hc core): FAILED (no failing test named; its last 40 lines:)\n"
+                      "  SKIP: scratch core did not start", tail)
+        for k in (1, 2):
+            self.assertIn("  pa-session integration {}/3 (private hc core): ok (".format(k), tail)
 
     def test_r12c_the_place_flags_take_no_other_argument(self):
-        for args in (("--except-integration", "x"), ("--only-integration", "--affected"), ("--except-integration", "--only-integration")):
+        for args in (("--except-integration", "x"), ("--only-integration", "--affected"), ("--except-integration", "--only-integration"),
+                     ("--part",), ("--part", "1"), ("--only-integration=2",), ("--only-integration", "--part", "2")):
             code, out = self.run_all(*args)
             self.assertEqual(code, 2, (args, out))
             self.assertIn("usage", out)
@@ -791,7 +829,7 @@ class RunAll(unittest.TestCase):
 
     def test_p1_every_run_has_a_progress_file(self):
         # Full and --affected: running (parts done of total, the parts running now and their last output), then done.
-        for args, total in (((), 9), (("--affected",), 8)):
+        for args, total in (((), 11), (("--affected",), 8)):
             with self.subTest(args=args):
                 shutil.rmtree(os.path.join(self.home, "suite-runs"), ignore_errors=True)
                 log = os.path.join(self.tmp, "p1.out")
@@ -883,16 +921,16 @@ class RunAll(unittest.TestCase):
                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, timeout=120)
         self.assertEqual(r.returncode, 0, r.stdout)
         seen = {}
-        for part in ("keeper", "integration"):
+        for part in ("keeper", "integration1", "integration2", "integration3"):
             if os.path.exists(os.path.join(self.tmp, part + ".git")):
                 with open(os.path.join(self.tmp, part + ".git")) as f:
                     seen[part] = dict(line.rstrip("\n").split("=", 1) for line in f)
         return path, r.stdout, seen
 
     def test_g1_the_parts_get_the_real_git_named_git_and_nothing_else_of_its_folder(self):
-        path, out, seen = self.git_run("ok", keeper="git", integration="git")
+        path, out, seen = self.git_run("ok", keeper="git", integration2="git")
         folder = self.outputs(out)
-        self.assertEqual(sorted(seen), ["integration", "keeper"], out)
+        self.assertEqual(sorted(seen), ["integration2", "keeper"], out)
         for part, s in seen.items():
             with self.subTest(part=part):
                 self.assertEqual(os.path.basename(s["git"]), "git")  # pa_guard's name check sees "git"
@@ -905,8 +943,8 @@ class RunAll(unittest.TestCase):
                 self.assertEqual(os.listdir(os.path.dirname(s["git"])), ["git"])
 
     def test_g2_when_xcrun_fails_the_path_is_unchanged(self):
-        path, out, seen = self.git_run("fail", keeper="git", integration="git")
-        self.assertEqual(sorted(seen), ["integration", "keeper"], out)
+        path, out, seen = self.git_run("fail", keeper="git", integration2="git")
+        self.assertEqual(sorted(seen), ["integration2", "keeper"], out)
         for part, s in seen.items():
             with self.subTest(part=part):
                 self.assertEqual(s["path"], path)
@@ -920,6 +958,211 @@ class RunAll(unittest.TestCase):
         self.git_run("ok")
         with open(os.path.join(self.tmp, "xcrun-calls")) as f:
             self.assertEqual(f.read(), "--find git\n")
+
+
+
+# ---- t-112: the integration check's three parts (R9: the table, read from the script's text, never run; §10: the
+# real script refuses a bad --part or scratch before anything is written and before any hc call) ----
+
+CHECK_SCRIPT = os.path.join(HERE, "pa_session_check.sh")
+STEP_NAME = r"(?:S[1-9][0-9]*[a-z]?|R)"
+CONTROLS = ["S9", "R"]  # the per-core controls, last in every part (R4)
+
+
+def table_problems(text):
+    """What is wrong with pa_session_check.sh's part table, read from its text: [] when nothing."""
+    problems = []
+    m = re.search(r"^part_table='\n(.*?)^'$", text, re.M | re.S)
+    if not m:
+        return ["no part_table='...' block"]
+    parts = {}
+    for line in m.group(1).splitlines():
+        if not line.strip():
+            continue
+        lm = re.match(r"^\s*([0-9]+)\s*:(.*)$", line)
+        if not lm:
+            problems.append("cannot parse the table line {!r}".format(line))
+            continue
+        k, names = lm.group(1), lm.group(2).split()
+        for n in names:
+            if not re.fullmatch(STEP_NAME, n):
+                problems.append("part {}: {!r} is not a step name".format(k, n))
+        if k in parts:
+            problems.append("part {} listed twice".format(k))
+        parts[k] = names
+    if sorted(parts) != ["1", "2", "3"]:
+        problems.append("parts {} (want 1, 2, 3)".format(sorted(parts)))
+    defined = re.findall(r"^step_([A-Za-z0-9_]+)\(\) \{", text, re.M)
+    for f in defined:
+        if not re.fullmatch(STEP_NAME, f):
+            problems.append("step_{} is not a step name".format(f))
+    if len(set(defined)) != len(defined):
+        problems.append("a step_ function defined twice: {}".format(defined))
+    for k, names in sorted(parts.items()):
+        if not [n for n in names if n not in CONTROLS]:
+            problems.append("part {} has no steps".format(k))
+        if names[-2:] != CONTROLS or names.count("S9") != 1 or names.count("R") != 1:
+            problems.append("part {} does not end with S9 R once: {}".format(k, names))
+        for n in names:
+            if n not in defined:
+                problems.append("part {}: {} has no step_{} function".format(k, n, n))
+    for f in defined:
+        if f in CONTROLS:
+            continue
+        where = [k for k, names in sorted(parts.items()) for n in names if n == f]
+        if len(where) != 1:
+            problems.append("step {} is in {} parts ({})".format(f, len(where), where))
+    am = re.search(r"^steps_all=\"([^\"]*)\"$", text, re.M)
+    if not am:
+        problems.append("no steps_all=\"...\" line")
+        return problems
+    whole = am.group(1).split()
+    if whole != defined:
+        problems.append("steps_all {} is not the step_ functions in their order {}".format(whole, defined))
+    for k, names in sorted(parts.items()):
+        at = [whole.index(n) for n in names if n in whole]
+        if at != sorted(at):
+            problems.append("part {} is not in the whole run's order: {}".format(k, names))
+    return problems
+
+
+class PartTable(unittest.TestCase):
+    def setUp(self):
+        with open(CHECK_SCRIPT) as f:
+            self.text = f.read()
+
+    def table(self, rows):
+        start = self.text.index("part_table='\n")
+        end = self.text.index("\n'\n", start)
+        return self.text[:start] + "part_table='\n" + rows + self.text[end:]
+
+    def test_t1_the_table_puts_every_step_in_one_part_and_the_controls_in_each(self):
+        self.assertEqual(table_problems(self.text), [])
+        m = re.search(r"^part_table='\n(.*?)^'$", self.text, re.M | re.S)
+        rows = [l.split(":", 1) for l in m.group(1).splitlines() if l.strip()]
+        self.assertEqual({k.strip(): v.split() for k, v in rows}, {
+            "1": "S1 S2 S5 S6a S7 S3 S4 S12 S9 R".split(),
+            "2": "S8 S10 S11 S14 S9 R".split(),
+            "3": "S13 S13d S9 R".split()})  # spec R1
+        self.assertIn('steps_all="S1 S2 S5 S6a S7 S3 S4 S8 S10 S11 S12 S13 S13d S14 S9 R"', self.text)
+
+    def test_t2_each_fault_is_found(self):
+        good = ("1: S1 S2 S5 S6a S7 S3 S4 S12 S9 R\n2: S8 S10 S11 S14 S9 R\n3: S13 S13d S9 R")
+        self.assertEqual(table_problems(self.table(good)), [])
+        self.assertEqual(table_problems(self.table("  1 :  S1  S2 S5\tS6a S7 S3 S4 S12 S9 R \n2:S8 S10 S11 S14 S9 R\n"
+                                                   "3: S13 S13d S9 R")), [])  # other spacing is accepted
+        cases = {
+            "a step with no function": good.replace("S14 S9", "S14 S15 S9"),
+            "a function in no part": good.replace(" S12 S9", " S9"),
+            "a step in two parts": good.replace("S13 S13d", "S12 S13 S13d"),
+            "a part with no steps": good.replace("3: S13 S13d S9 R", "3: S9 R").replace("S12 S9", "S12 S13 S13d S9"),
+            "a part with nothing": good.replace("3: S13 S13d S9 R", "3:").replace("S12 S9", "S12 S13 S13d S9"),
+            "a lower-case name": good.replace("S1 S2", "s1 S2"),
+            "a zero-padded name": good.replace("S1 S2", "S01 S2"),
+            "a line it cannot parse": good + "\nfour: S1",
+            "a part listed twice": good + "\n3: S9 R",
+            "no part 3": good.replace("\n3: S13 S13d S9 R", "").replace("S12 S9", "S12 S13 S13d S9"),
+            "a part without R": good.replace("S13d S9 R", "S13d S9"),
+            "the controls not last": good.replace("S13 S13d S9 R", "S9 R S13 S13d"),
+            "out of the whole run's order": good.replace("S8 S10", "S10 S8"),
+        }
+        for why, rows in cases.items():
+            with self.subTest(why=why):
+                self.assertNotEqual(table_problems(self.table(rows)), [], rows)
+        extra = self.table(good).replace("\nstep_S9() {", "\nstep_S99() {\n  :\n}\nstep_S9() {", 1)
+        self.assertTrue([p for p in table_problems(extra) if "S99" in p], table_problems(extra))
+        odd = self.table(good).replace("\nstep_S9() {", "\nstep_s9x() {\n  :\n}\nstep_S9() {", 1)
+        self.assertTrue([p for p in table_problems(odd) if "s9x" in p], table_problems(odd))
+        self.assertNotEqual(table_problems(self.text.replace("part_table='", "parts='", 1)), [])
+
+    def test_t3_s8s_state_is_one_helper_s8_calls(self):
+        # R3: part 3 starts S13 from S8's state through the same helper S8 calls, so the two cannot drift.
+        self.assertEqual(len(re.findall(r"^s8_state\(\) \{", self.text, re.M)), 1)
+        body = self.text.split("\nstep_S8() {", 1)[1].split("\n}\n", 1)[0]
+        self.assertIn("s8_state", body)
+        self.assertNotIn("MARKER-T037", body)
+
+
+class CheckArgs(unittest.TestCase):
+    """The real pa_session_check.sh with a scratch that has the two files it looks for, an hc first on PATH that
+    only records its calls (and fails, so a run that gets past the arguments stops at the gate: SKIP)."""
+
+    def setUp(self):
+        self.tmp = os.path.realpath(tempfile.mkdtemp(prefix="t112-args-", dir="/tmp"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.s = os.path.join(self.tmp, "s")
+        self.calls = os.path.join(self.tmp, "hc-calls")
+        self.bin = os.path.join(self.tmp, "fakebin")
+        hc = '#!/bin/sh\necho "$HC_SESSION $*" >> "{}"\nexit 1\n'.format(self.calls)
+        for d in (os.path.join(self.s, "bin"), self.bin):
+            write(os.path.join(d, "hc"), hc, 0o755)
+        for name in ("pa-session", "stub-claude"):
+            write(os.path.join(self.s, "bin", name), "#!/bin/sh\nexit 0\n", 0o755)
+
+    def run_check(self, *args):
+        env = {k: v for k, v in os.environ.items() if not k.startswith(("HC_", "CLAUDE"))}
+        env["PATH"] = self.bin + os.pathsep + env.get("PATH", "")
+        r = subprocess.run(["sh", CHECK_SCRIPT] + list(args), cwd=self.tmp, env=env, stdin=subprocess.DEVNULL,
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, timeout=60)
+        return r.returncode, r.stdout
+
+    def tree(self):
+        seen = {}
+        for root, dirs, files in os.walk(self.tmp):
+            for n in dirs + files:
+                p = os.path.join(root, n)
+                st = os.lstat(p)
+                seen[p] = (st.st_size, st.st_mtime_ns)
+        return seen
+
+    def refused(self, args, why="usage"):
+        before = self.tree()
+        code, out = self.run_check(*args)
+        self.assertEqual(code, 2, (args, out))
+        self.assertIn(why, out, args)
+        self.assertNotIn("scratch core", out, args)
+        self.assertFalse(os.path.exists(self.calls), (args, out))  # no hc call: no core started
+        self.assertEqual(self.tree(), before, args)  # nothing written
+
+    def test_a1_a_bad_part_is_refused_before_anything(self):
+        s = self.s
+        for args in ([s, "--part", "0"], [s, "--part", "4"], [s, "--part", "-1"], [s, "--part", "01"],
+                     [s, "--part", "+1"], [s, "--part", "1.0"], [s, "--part", " 1"], [s, "--part", "1x"],
+                     [s, "--part"], [s, "--part", ""], [s, "--part=1"], [s, "--part", "--part", "1"],
+                     [s, "--part", "-x"], [s, "--part", "1", "--part", "2"], [s, "--part", "1", "extra"],
+                     [s, "1"], [s, "-x", "1"], [s, "extra"]):
+            with self.subTest(args=args[1:]):
+                self.refused(args)
+
+    def test_a2_a_bad_scratch_is_refused_before_anything(self):
+        os.symlink("/usr", os.path.join(self.tmp, "out"))  # a folder outside the three roots
+        for args in (["--part", "1", self.s], ["/tmp/../etc", "--part", "1"], [self.tmp + "/s/../../../etc"],
+                     ["/tmp/../etc"], [os.path.join(self.tmp, "out")], [os.path.join(self.tmp, "out"), "--part", "2"],
+                     ["t001.x"], ["-x"]):
+            with self.subTest(args=args):
+                self.refused(args, "not a temp folder")
+        for args in ([], [""], ["", "--part", "1"]):
+            with self.subTest(args=args):
+                self.refused(args)
+
+    def test_a3_a_good_part_reaches_the_gate_with_its_name(self):
+        # The control: the same scratch with a good --part gets past the arguments, says its part and steps
+        # first, and asks its own core (session pa-t001-p<k>-<pid>); the fake hc fails, so it stops there (SKIP).
+        for args, first, session in (((self.s, "--part", "2"), "part 2/3: S8 S10 S11 S14 S9 R", r"pa-t001-p2-[0-9]+"),
+                                     ((self.s + "/", "--part", "3"), "part 3/3: S13 S13d S9 R", r"pa-t001-p3-[0-9]+"),
+                                     ((self.s, "--part", "1"), "part 1/3: S1 S2 S5 S6a S7 S3 S4 S12 S9 R", r"pa-t001-p1-[0-9]+"),
+                                     ((self.s,), "whole run: S1 S2 S5 S6a S7 S3 S4 S8 S10 S11 S12 S13 S13d S14 S9 R",
+                                      r"pa-t001-[0-9]+")):
+            with self.subTest(args=args[1:]):
+                if os.path.exists(self.calls):
+                    os.remove(self.calls)
+                code, out = self.run_check(*args)
+                self.assertEqual(code, 2, out)
+                self.assertEqual(out.splitlines()[0], first, out)
+                self.assertIn("SKIP: scratch core did not start", out)
+                with open(self.calls) as f:
+                    calls = f.read().splitlines()
+                self.assertTrue(calls and all(re.fullmatch(session + r" server (status --json|stop)", c) for c in calls), calls)
 
 
 def pa_text(path):

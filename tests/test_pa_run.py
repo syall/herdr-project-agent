@@ -228,6 +228,42 @@ class R1Argv(Run):
             self.assertIn(why, out, argv)
         self.assertEqual(self.calls(), [])
 
+    def test_r1g_part_words_do_not_get_around_the_session_check_refusal(self):
+        """t-112 R8: the integration check's --part <k> (three parts) adds no way past the refusal: each of
+        today's pa_session_check.sh cases again with the part words, --part=1, and wrappers as argv[0]."""
+        write(os.path.join(self.wt, "tests", "pa_session_check.sh"), "echo x\n")
+        os.symlink("tests/pa_session_check.sh", os.path.join(self.wt, "psc.sh"))
+        sh(self.wt, "git", "add", "-A")
+        sh(self.wt, "git", "commit", "-q", "-m", "more")
+        cases = []
+        for k in ("1", "2", "3"):
+            part = ["--part", k]
+            cases += [
+                (["sh", "tests/pa_session_check.sh", "/tmp/x"] + part, "pa_session_check.sh"),
+                (["sh", "-e", "tests/pa_session_check.sh", "/tmp/x"] + part, "pa_session_check.sh"),
+                (["sh", "--", "tests/pa_session_check.sh", "/tmp/x"] + part, "pa_session_check.sh"),
+                (["./tests/pa_session_check.sh"] + part, "pa_session_check.sh"),
+                (["sh", "tests//pa_session_check.sh"] + part, "pa_session_check.sh"),
+                (["sh", "tests/../tests/pa_session_check.sh"] + part, "pa_session_check.sh"),
+                (["sh", "psc.sh"] + part, "pa_session_check.sh"),
+                (["./psc.sh"] + part, "pa_session_check.sh"),
+                (["sh", "tests/pa_session_check.sh", "--part=" + k], "pa_session_check.sh"),
+                (["sh", "../w/tests/pa_session_check.sh"] + part, "leaves the tree"),
+                (["sh", os.path.join(self.wt, "tests", "pa_session_check.sh")] + part, "absolute"),
+                (["env", "sh", "tests/pa_session_check.sh"] + part, "pa-run: not run"),  # refused (today by the path rule, before argv[0]'s)
+                (["bash", "tests/pa_session_check.sh"] + part, "pa-run: not run"),  # refused (today by the path rule, before argv[0]'s)
+                (["timeout", "60", "sh", "tests/pa_session_check.sh"] + part, "pa-run: not run"),  # refused (today by the path rule, before argv[0]'s)
+                (["nice", "sh", "tests/pa_session_check.sh"] + part, "pa-run: not run"),  # refused (today by the path rule, before argv[0]'s)
+                (["sh", "tests/run-all.sh", "--only-integration"] + part, "use pa-full-suite"),
+            ]
+        cases.append((["sh", "tests/run-all.sh", "--only-integration"], "use pa-full-suite"))
+        for argv, why in cases:
+            code, out = self.pa_run("--", *argv)
+            self.assertEqual(code, 125, (argv, out))
+            self.assertIn("pa-run: not run", out, argv)
+            self.assertIn(why, out, argv)
+        self.assertEqual(self.calls(), [])
+
     def test_r1e_refusals_from_a_subfolder(self):
         """--cwd tests: the two scripts by their names there, and by a .. spelling."""
         for argv, why in ((["sh", "run-all.sh"], "use pa-full-suite"), (["sh", "-e", "./run-all.sh"], "use pa-full-suite"),
