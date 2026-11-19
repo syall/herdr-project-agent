@@ -154,8 +154,8 @@ a verifier, reviewer or check worker `check` (`full` or `diff`).
 A hold or resume line adds `"hold": "on"` (a hold) or `"hold": "off"` (a resume), with the
 person's words in `why`: `{"at":"<UTC time>","pass":12,"trigger":"message","hold":"on","why":"<their words>"}`.
 `pa-places` reads that key alone: a hold journalled without it does not stop `pa-places next`.
-If `standing.md` `# Hold` names a hold in force and the journal's last hold line has no `hold`
-key, append one with `"hold": "on"` quoting it before you run `pa-places next`.
+If `standing.md` `# Hold` names a hold in force and the journal's last line about a hold or
+resume has no `hold` key, append one with `"hold": "on"` quoting it before you run `pa-places next`.
 
 `waiting.json` is written only by `pa-places`, never by hand. `start-order.json` is the
 person's: the panel writes it; read it through `pa-places`, never write it.
@@ -385,13 +385,15 @@ Run `hc --skill` once to learn `hc`. Start workers with the profile's commands (
 - Before starting the first worker in a worktree, install the verification hooks there:
   `pa-hooks install <worktree> --task <task-id>` (add `--fix` for a bug fix: it locks test
   files). They lint after each edit, run the affected tests when a task is marked complete
-  and before a session ends, and block what cannot be taken back. Never remove or edit them.
+  and before a session ends (not for a worker that changed nothing in its worktree since it
+  started, so a report-only worker closes at once), and block what cannot be taken back.
+  Never remove or edit them.
 - Workers take places. Kinds: `working` (a job that runs tests: build, fix, verifier,
   check), `no-test` (a job that runs none: design, plan-only, reviewer, docs-only, a watch)
   and `suite` (a job whose work includes the full-suite step: verifier, check, and a
   high-tier build or fix). A no-test job takes a working place, else the no-test extra
   place; a suite job needs a working place and a suite place. Their limits are the rules'
-  `places` (see Rules).
+  `places` (see Rules). Add a verifier or check with `--kind suite`.
   A job ready or nearly ready to start goes on the waiting list with
   `pa-places add <task> --job <job> --kind <kind> --role <role>` (`--source queue` for a
   merge-queue entry's check; `--blocked-by "<line>"` for what else it waits for: an open
@@ -403,7 +405,8 @@ Run `hc --skill` once to learn `hc`. Start workers with the profile's commands (
   `pa-places start <id> --worker <addr>` and record the `place` it prints in the worker's
   ledger entry. A job whose kind is full is skipped, never waited on. Start nothing
   `pa-places next` does not mark `start` (on a hold, a hold it cannot read or no terminal
-  list, it marks none). The order comes from the person's `start-order.json`.
+  list, it marks none). The order is the person's `start-order.json` over your list
+  (merge-queue jobs keep theirs), as `pa-places next` prints it.
   The person's order never answers a card, approves a rule, lifts a hold, raises a limit,
   clears a `blockedBy`, or starts a job that is not ready. It only says which ready job
   goes first. A `start order changed` notice is a message: run the pass as usual.
@@ -424,8 +427,8 @@ Run `hc --skill` once to learn `hc`. Start workers with the profile's commands (
   send each running worker any change that applies to its job (`hc send`: what changed and what
   stays the same), and journal it with `"trigger":"rules","by":"person","rules":["<id>"]`; then
   run the pass as usual.
-  A worker that has reported, but whose report you have not read yet, does not
-  count; close it once read.
+  A worker that has reported, but whose report you have not read yet, still holds its
+  place until it is closed; close it once read.
 - Never sleep, poll or block on `hc wait` to see what workers are doing. To look at one
   on a pass: `hc get <t>` for its status, `hc read <t> --lines 40` for its screen.
 - You can update a running worker at any time:
@@ -470,7 +473,12 @@ Run `hc --skill` once to learn `hc`. Start workers with the profile's commands (
   `--when-idle` closes it by itself once it is idle (within 10 minutes), under the same
   checks, and journals the result without a message to you; do not start a pass only to
   close it. A `close-when-idle` journal line saying it was not closed is for your next
-  pass. Committed work that is not pushed or
+  pass. To send a follow-up to a worker after `--when-idle`, run
+  `pa-worker close <t> --cancel-when-idle` first; a new turn that begins before the close
+  also stops it (journaled, not closed). The waiter writes the worker's `finished`,
+  `closed`, `closedBy` and `report` itself: re-read `ledger.json` before you next write it.
+  If a `close-when-idle` line says it closed a worker whose entry is not `finished`, run
+  `pa-worker close` for it again; that records it. Committed work that is not pushed or
   merged does not stop a close: the worktree and its branch stay. Never end a worker
   with `hc kill` or `hc rm` yourself, and never run `pa-cleanup` unless the person asks.
   When the person asks you to close a worker, use `pa-worker close` too; if it refuses,

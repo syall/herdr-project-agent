@@ -178,9 +178,14 @@ function holderLine(h, inSuite = false) {
 }
 const holderKey = (h) => `holder:${h.address}`, jobKey = (j) => `job:${j.id}`;
 
-// The limits the load's rules give: loadRules's result (null or a give-up: the defaults, said once).
+// The limits the load's rules give: loadRules's result (null or a give-up: the defaults, said once). A file that only
+// fails the Rules view's checks (rules.doc kept) gives the limits pa-places reads from it (t-133, t-083 J2 RL1).
 function limitsOf(rules) {
   if (!rules || gaveUp(rules)) return { ...limitsFrom({}), notes: [] };
+  if (rules.error && rules.doc && Array.isArray(rules.doc.rules)) {
+    const got = limitsFrom(rules.doc);
+    return { ...got, notes: [`${rules.error}; the limits are read as pa-places reads them`, ...got.notes] };
+  }
   if (rules.error) return { ...limitsFrom({}), notes: [`${rules.error}; the default limits are used`] };
   return limitsFrom(rules.doc ?? { rules: rules.rules });
 }

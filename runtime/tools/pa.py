@@ -163,11 +163,16 @@ def backup(path, change):
     return target
 
 
+CALL_TIMEOUT = None  # seconds a `call` may take; None: no limit. Only a detached waiter sets it (t-133, pa-worker --when-idle)
+
+
 def call(argv, check=True):
     try:
-        r = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+        r = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=CALL_TIMEOUT)
     except FileNotFoundError:
         raise Problem("{} is not installed or not on PATH".format(argv[0]))
+    except subprocess.TimeoutExpired:
+        raise Problem("{} did not answer in {} s".format(" ".join(argv[:3]), CALL_TIMEOUT))
     if check and r.returncode:
         raise Problem("{} failed: {}".format(" ".join(argv[:3]), (r.stderr or r.stdout).strip()))
     return r.stdout

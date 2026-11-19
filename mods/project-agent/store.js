@@ -788,7 +788,7 @@ export async function loadRules(space, cx) {
     else if (!RULE_STATUS.includes(r.status)) problems.push(`${r.id} has status ${JSON.stringify(r.status)}`);
     if (r?.id) seen.add(r.id);
   });
-  if (problems.length) return { path, text, rules: [], error: `rules.json: ${problems.slice(0, 3).join("; ")}` };
+  if (problems.length) return { path, text, rules: [], error: `rules.json: ${problems.slice(0, 3).join("; ")}`, doc: value }; // t-133: doc for places.js limitsOf, as pa-places reads it
   return { path, text, rules: [...rules].sort((a, b) => (b.order ?? 0) - (a.order ?? 0)), error: null, doc: value };
 }
 

@@ -49,11 +49,13 @@ ORDER_WHY = {"missing": "no start order yet", "empty": "start-order.json is empt
              "not-json": "start-order.json is not JSON", "not-object": "start-order.json is not a JSON object",
              "version": "start-order.json is not version 1 or 2",
              "order": "start-order.json's order is not a list of job ids",
-             "pins": "start-order.json's pins are not a list of {id, slot}"}
+             "pins": "start-order.json's pins are not a list of {id, slot}",
+             "unreadable": "start-order.json cannot be read"}
 TASK_ORDER_WHY = {"empty": "task-order.json is empty", "not-json": "task-order.json is not JSON",
                   "not-object": "task-order.json is not a JSON object", "version": "task-order.json is not version 1",
                   "order": "task-order.json's order is not a list of task ids",
-                  "last": "task-order.json's last is not a list of task ids"}
+                  "last": "task-order.json's last is not a list of task ids",
+                  "unreadable": "task-order.json cannot be read"}
 RANKED = ("in-progress", "investigating", "review", "queued")  # their sections show ranks and move buttons
 HIDDEN = ("needs-decision", "parked")  # in the ranking with a hidden rank: no number, no buttons, no jobs for parked
 MOVES = ("up", "down", "top", "bottom")
@@ -63,6 +65,10 @@ LABEL = {"working": "working", "no-test": "no-test extra", "suite": "suite"}
 
 class Refused(Exception):
     pass
+
+
+class Unreadable(Exception):
+    """A file that is there but cannot be read (t-133, t-083 RL2): not allowed, a folder, not UTF-8 text."""
 
 
 # ---- pure: limits, order, allocation, hold (the shared cases in tests/samples/places-cases.json) ----------------
@@ -102,8 +108,11 @@ def strings(value):
 
 
 def read_order(text):
-    """(start, error code or None, why or None) from start-order.json's text (None: no file). start, when readable:
+    """(start, error code or None, why or None) from start-order.json's text (None: no file; Unreadable: a file that
+    cannot be read). start, when readable:
     {"version": 1, "order": [job ids]} (t-083's whole list) or {"version": 2, "pins": [{id, slot}]} (t-097 R10)."""
+    if isinstance(text, Unreadable):
+        return None, "unreadable", ORDER_WHY["unreadable"]
     if text is None:
         return None, "missing", ORDER_WHY["missing"]
     if not text.strip():
@@ -177,6 +186,8 @@ def effective_order(jobs, start, rank=None):
 def read_task_order(text):
     """(doc, error code or None, why or None) from task-order.json's text (None: no file; t-097 R1, R2). doc, when
     readable: {order, last, updated}; an unreadable file gives None: nothing of it is used, never the readable part."""
+    if isinstance(text, Unreadable):
+        return None, "unreadable", TASK_ORDER_WHY["unreadable"]
     if text is None:
         return None, "missing", None
     if not text.strip():
@@ -352,9 +363,11 @@ def allocate(jobs, limits, holders, hold):
             r["action"] = "blocked"
             continue
         kind = j.get("kind")
+        free = {"working": w - working_used(b, n, w), "no-test": x - max(0, b + n - w),
+                 "suite": None if cap is None else cap - s, "used": working_used(b, n, w), "limit": w}
         if kind == "no-test":
             if b + n < w + x:
-                r["action"], r["place"] = "start", ("working" if b + n < w else "no-test")
+                r["action"], r["place"], r["free"] = "start", ("working" if b + n < w else "no-test"), free
                 n += 1
             elif x:
                 r["action"], r["full"] = "skip", {"kind": "no-test", "used": max(0, b + n - w), "limit": x}
@@ -366,7 +379,7 @@ def allocate(jobs, limits, holders, hold):
         elif b >= w or b + n >= w + x:  # working-type holders below working, and the pooled total below both
             r["action"], r["full"] = "skip", {"kind": "working", "used": working_used(b, n, w), "limit": w}
         else:
-            r["action"], r["place"] = "start", kind
+            r["action"], r["place"], r["free"] = "start", kind, free
             b += 1
             s += kind == "suite"
     return out
@@ -386,14 +399,26 @@ def hold_state(text):
             continue
         if isinstance(value, dict) and "hold" in value:
             v = value["hold"]
-            state = "on" if v in ("on", True) else "off" if v in ("off", False) else "unknown"
+            state = "on" if v == "on" or v is True else "off" if v == "off" or v is False else "unknown"  # t-133: 0, 1 unknown
             doubt = False
     return "unknown" if doubt else state
 
 
+def start_why(r):
+    """Why a job starts (t-133, t-083 nit 7): the place it takes and what is free there, before it takes it."""
+    f = r.get("free")
+    if not f:
+        return "start"
+    if r["place"] == "no-test":
+        return "start: no-test extra {} free (working {} of {})".format(f["no-test"], f["used"], f["limit"])
+    if r["place"] == "suite" and f["suite"] is not None:
+        return "start: suite {} free (working {} free)".format(f["suite"], f["working"])
+    return "start: working {} free".format(f["working"])
+
+
 def reason_text(r, job):
     if r["action"] == "start":
-        return "start   record place: {}".format(r["place"])
+        return "{}   record place: {}".format(start_why(r), r["place"])
     if r["action"] == "blocked":
         return "blocked: {}".format(job.get("blockedBy"))
     if r["action"] == "skip":
@@ -405,19 +430,33 @@ def reason_text(r, job):
 # ---- the space's files ------------------------------------------------------------------------------------------
 
 def read_text(path):
+    """The file's text; None when there is no such file; Unreadable when it is there but cannot be read."""
     try:
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             return f.read()
     except FileNotFoundError:
         return None
+    except (OSError, UnicodeDecodeError) as e:
+        raise Unreadable(getattr(e, "strerror", None) or type(e).__name__)
+
+
+def read_or_unreadable(path):
+    """read_text, with an unreadable file given back as its Unreadable (read_order and read_task_order say so)."""
+    try:
+        return read_text(path)
+    except Unreadable as e:
+        return e
 
 
 def load_waiting(directory):
     path = os.path.join(directory, WAITING_FILE)
-    text = read_text(path)
+    bad = "{} is not a valid waiting list ({}); nothing was changed (the person decides what to do with it)"
+    try:
+        text = read_text(path)
+    except Unreadable as e:
+        raise Refused(bad.format(path, "it cannot be read: {}".format(e)))
     if text is None:
         return {"version": 1, "jobs": []}
-    bad = "{} is not a valid waiting list ({}); nothing was changed (the person decides what to do with it)"
     try:
         data = json.loads(text)
     except ValueError:
@@ -429,6 +468,11 @@ def load_waiting(directory):
                 or j.get("source", "pa") not in SOURCES:
             raise Refused(bad.format(path, "job {} needs an id, a kind ({}) and a source (pa or queue)".format(
                 i + 1, ", ".join(KINDS))))
+    seen = set()
+    for j in data["jobs"]:
+        if j["id"] in seen:
+            raise Refused(bad.format(path, "{} is listed twice".format(j["id"])))
+        seen.add(j["id"])
     return data
 
 
@@ -440,7 +484,10 @@ def save_waiting(directory, data):
 
 def load_rules(directory):
     """(limits, sources, notes); a missing or broken rules.json gives the defaults and one note."""
-    text = read_text(os.path.join(directory, RULES_FILE))
+    try:
+        text = read_text(os.path.join(directory, RULES_FILE))
+    except Unreadable as e:
+        return limits_from({})[:2] + (["rules.json cannot be read ({}); the default limits are used".format(e)],)
     if text is None:
         return limits_from({})[:2] + (["rules.json is missing; the default limits are used"],)
     try:
@@ -476,11 +523,11 @@ class State:
         self.directory = directory
         self.waiting = load_waiting(directory)
         self.limits, self.sources, self.notes = load_rules(directory)
-        self.start, self.order_error, _ = read_order(read_text(os.path.join(directory, ORDER_FILE)))
+        self.start, self.order_error, _ = read_order(read_or_unreadable(os.path.join(directory, ORDER_FILE)))
         ledger = pa_hooks.read_ledger(directory)
         ledger = ledger if isinstance(ledger, dict) else {}
         self.tasks = [t for t in ledger.get("tasks") or [] if isinstance(t, dict)] if isinstance(ledger.get("tasks"), list) else []
-        self.task_order_doc, self.task_order_error, _ = read_task_order(read_text(os.path.join(directory, TASK_ORDER_FILE)))
+        self.task_order_doc, self.task_order_error, _ = read_task_order(read_or_unreadable(os.path.join(directory, TASK_ORDER_FILE)))
         self.task_order = ledger.get("taskOrder")
         if not task_order_parts(self.task_order)[2]:
             self.notes = self.notes + ["ledger taskOrder is not {order, chat}; ignored"]
@@ -488,7 +535,8 @@ class State:
         live = pa.live_terminals()
         self.terminals = live is not None
         self.holders = holders_from(ledger, live or {}, skip)
-        self.hold = hold_state(read_text(os.path.join(directory, "journal.jsonl"))) if self.terminals else "no-terminals"
+        journal = read_or_unreadable(os.path.join(directory, "journal.jsonl"))
+        self.hold = ("unknown" if isinstance(journal, Unreadable) else hold_state(journal)) if self.terminals else "no-terminals"
         # Until a task order exists (a readable task-order.json or a ledger taskOrder), the waiting list keeps the
         # added order, today's priorities (R27, J1-D10); the start order's pins apply either way.
         has_order = self.task_order_doc is not None or (self.task_order is not None and task_order_parts(self.task_order)[2])
@@ -584,7 +632,15 @@ def cmd_add(args):
     return 0
 
 
+def given_why(args):
+    """--why must say something (t-133, t-083 nit 6): a blank one would store a blocker that reads as none."""
+    if not (args.why or "").strip():
+        raise Refused("--why needs the reason, in words; nothing was changed")
+    return args.why
+
+
 def cmd_block(args):
+    given_why(args)
     with writing(args) as (directory, data):
         _i, job = find(data, args.id)
         job["blockedBy"] = args.why
@@ -605,6 +661,7 @@ def cmd_unblock(args):
 
 
 def cmd_drop(args):
+    given_why(args)
     with writing(args) as (directory, data):
         i, job = find(data, args.id)
         del data["jobs"][i]

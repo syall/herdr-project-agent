@@ -30,7 +30,9 @@ Selected by the name it is invoked as (symlinks in ~/.local/bin):
                                                 JSON line, exit 0 accepted, 1 not, 2 usage or hc error
   pa-hook <name>                                one hook, called by the agent harness (reads its JSON on stdin):
       lint-after-edit   after each edit: lint the changed file
-      affected-tests    when a task is marked complete, and (--stop) before the session ends
+      affected-tests    when a task is marked complete, and (--stop) before the session ends; nothing when the
+                        worktree is as it was when this worker started (t-133)
+      session-start     when a session starts: record the worktree's state once per worker (temp folder)
       test-file-lock    before an edit: no test-file edits during a fix task
       guard             before a command or an edit: nothing that cannot be taken back,
                         and the short denylist in pa_guard.py
@@ -224,6 +226,65 @@ def hook_lint(data, _args):
     return 0
 
 
+# t-133: a worker that changed nothing in its worktree since it started (a reviewer, verifier, check or design worker)
+# runs no affected tests at its end. The session-start hook records the worktree's state once per worker, in the temp
+# folder (nothing is written into the worktree); first write wins, so a resume or a compaction keeps the first state.
+START_DIR = None  # None: tempfile.gettempdir()
+
+
+def start_path(root, data):
+    key = os.environ.get("HC_TERMINAL_ID") or "session:" + str(data.get("session_id") or "none")
+    digest = hashlib.sha1("{}\0{}".format(root, key).encode("utf-8")).hexdigest()[:24]
+    return os.path.join(START_DIR or tempfile.gettempdir(), "pa-hook-start-{}.json".format(digest))
+
+
+def tree_state(root):
+    """{head, files: {path: sha1 of its bytes, or "gone"}} of the worktree's changed files (changed_files), or None."""
+    try:
+        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                              universal_newlines=True, timeout=30).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    files = {}
+    for rel in changed_files(root):
+        path = os.path.join(root, rel)
+        try:
+            if os.path.isdir(path):
+                files[rel] = "dir:" + ",".join(sorted(os.listdir(path)))
+            else:
+                with open(path, "rb") as f:
+                    files[rel] = hashlib.sha1(f.read()).hexdigest()
+        except OSError:
+            files[rel] = "gone"
+    return {"head": head, "files": files}
+
+
+def hook_session_start(data, _args):
+    record = find_task(data.get("cwd") or os.getcwd())
+    if not record:
+        return 0
+    path = start_path(record["root"], data)
+    if os.path.exists(path):
+        return 0
+    state = tree_state(record["root"])
+    if state is None:
+        return 0
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        pa.write_json(path, dict(state, root=record["root"], task=record.get("task"), at=pa.now()))
+    except OSError:
+        pass
+    return 0
+
+
+def unchanged_since_start(root, data):
+    start = pa.read_json(start_path(root, data))
+    if not isinstance(start, dict) or start.get("root") != root:
+        return False
+    now = tree_state(root)
+    return now is not None and now["head"] == start.get("head") and now["files"] == start.get("files")
+
+
 def hook_affected(data, args):
     record, agent, profile = hook_context(data)
     if not record:
@@ -231,6 +292,8 @@ def hook_affected(data, args):
     files = changed_files(record["root"])
     command = command_for("affected", agent, profile)
     if not files or not command:
+        return 0
+    if unchanged_since_start(record["root"], data):
         return 0
     code, out = run_shell(command, record["root"], files, 900)
     if not code:
@@ -318,7 +381,8 @@ def _hook_guard(data, _args):
     return 0
 
 
-HOOKS = {"lint-after-edit": hook_lint, "affected-tests": hook_affected, "test-file-lock": hook_test_lock, "guard": hook_guard}
+HOOKS = {"lint-after-edit": hook_lint, "affected-tests": hook_affected, "test-file-lock": hook_test_lock, "guard": hook_guard,
+         "session-start": hook_session_start}
 
 
 # ---- pa-hooks install / remove ------------------------------------------------------------------
@@ -331,6 +395,7 @@ def hook_settings():
         "PostToolUse": [{"matcher": "Edit|Write|MultiEdit", "hooks": [dict(run("lint-after-edit"), timeout=150)]}],
         "TaskCompleted": [{"hooks": [dict(run("affected-tests"), timeout=930)]}],
         "Stop": [{"hooks": [dict(run("affected-tests --stop"), timeout=930)]}],
+        "SessionStart": [{"hooks": [dict(run("session-start"), timeout=60)]}],
     }
 
 
@@ -3142,9 +3207,11 @@ class Refused(pa.Problem):
         self.kind = kind
 
 
-def close_worker(directory, agent, profile, address, evidence, card_id=None, trigger="close"):
+def close_worker(directory, agent, profile, address, evidence, card_id=None, trigger="close", stop=None):
     """pa-worker close <address> --evidence F (spec 3.2 and 3.3), or --card <id>: the person's answer on a
-    leftovers card stands in for the evidence file (card d-031). Returns the lines to print."""
+    leftovers card stands in for the evidence file (card d-031). Returns the lines to print. stop(info): the
+    --when-idle waiter's own refusal ((kind, text) or None), checked with each status read, the last one under the
+    ledger lock right before the kill (t-133)."""
     if "/" in address:
         raise pa.Problem("{} is on another machine; pa-worker close runs on the machine the space runs on".format(address))
     if address == agent.get("terminal"):
@@ -3155,7 +3222,7 @@ def close_worker(directory, agent, profile, address, evidence, card_id=None, tri
         raise unrecorded(address)
     if info is None:
         raise pa.Problem("cannot read {}'s state from hc ({}); nothing was closed".format(address, why))
-    refusal = identity_refusal(address, task, entry, info)
+    refusal = identity_refusal(address, task, entry, info) or (stop and stop(info))
     if refusal:
         raise Refused(*refusal)
     if entry.get("finished") and not info:
@@ -3183,7 +3250,7 @@ def close_worker(directory, agent, profile, address, evidence, card_id=None, tri
             raise unrecorded(address)
         if info is None:
             raise pa.Problem("cannot read {}'s state from hc ({}); nothing was closed".format(address, why))
-        refusal = identity_refusal(address, task, entry, info) or status_refusal(address, entry, info)
+        refusal = identity_refusal(address, task, entry, info) or (stop and stop(info)) or status_refusal(address, entry, info)
         if refusal:
             raise Refused(*refusal)
         if card:
@@ -3207,13 +3274,21 @@ def close_worker(directory, agent, profile, address, evidence, card_id=None, tri
 # It journals what happened and sends no hc message, so it starts no Project Agent pass. A worker that
 # becomes blocked is never closed: it is left for the person.
 
-WHEN_IDLE_LIMIT = 600  # seconds the waiter waits, at most
+WHEN_IDLE_LIMIT = 600  # seconds the waiter waits, at most (awake time and wall-clock time both, t-133)
 WHEN_IDLE_POLL = 5  # seconds between its checks
+WHEN_IDLE_HC_TIMEOUT = 30  # seconds one hc call of the waiter may take (t-133: a hung hc cannot hold it, or the lock)
 
 
-def spawn_idle_closer(directory, space, address, report):
-    """Starts the waiter in its own session, detached from the caller, with no terminal input or output."""
+def idle_file(directory, address, ext):
+    return os.path.join(directory, ".close-when-idle-{}.{}".format(re.sub(r"[^A-Za-z0-9_-]", "_", address), ext))
+
+
+def spawn_idle_closer(directory, space, address, report, turn_ms=None):
+    """Starts the waiter in its own session, detached from the caller, with no terminal input or output. turn_ms: hc's
+    status_ms of the working turn it waits for (t-133)."""
     argv = [sys.executable, os.path.abspath(sys.argv[0]), "close", address, "--evidence", report, "--space", space, "--idle-waiter"]
+    if turn_ms is not None:
+        argv += ["--turn-ms", str(turn_ms)]
     subprocess.Popen(argv, cwd=directory, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                      start_new_session=True, close_fds=True)
 
@@ -3226,40 +3301,98 @@ def close_when_idle(directory, agent, profile, space, address, evidence):
         if e.kind != "working":
             raise
     task, entry = recorded(read_ledger(directory), address)
-    spawn_idle_closer(directory, space, address, report_path(directory, task["id"], address, evidence))
+    try:
+        os.unlink(idle_file(directory, address, "cancel"))  # a new --when-idle: an old cancel no longer applies
+    except FileNotFoundError:
+        pass
+    turn = pa.hc_get(address).get("status_ms")
+    spawn_idle_closer(directory, space, address, report_path(directory, task["id"], address, evidence),
+                      turn_ms=turn if isinstance(turn, (int, float)) and not isinstance(turn, bool) else None)
     return ["{} is working; it will be closed once it is idle (checked every {} s, for up to {} min), under the same checks, "
-            "and the result journaled (trigger close-when-idle). Nothing more to do for it.".format(
-                worker_label(address, entry, None), WHEN_IDLE_POLL, int(WHEN_IDLE_LIMIT // 60))]
+            "and the result journaled (trigger close-when-idle). Nothing more to do for it. To send it a follow-up "
+            "first, run pa-worker close {} --cancel-when-idle.".format(
+                worker_label(address, entry, None), WHEN_IDLE_POLL, int(WHEN_IDLE_LIMIT // 60), address)]
 
 
-def wait_idle(directory, agent, profile, address, evidence):
+def idle_stop(directory, address, turn_ms):
+    """The waiter's own refusals (t-133): a cancel by the Project Agent, or a new turn (another status_ms while working)."""
+    def stop(info):
+        if os.path.exists(idle_file(directory, address, "cancel")):
+            return "cancelled", "{}: the close was cancelled (pa-worker close --cancel-when-idle)".format(address)
+        if turn_ms is not None and info and status_word(info) == "working" and info.get("status_ms") not in (None, turn_ms):
+            return "turn", "{}: a new turn began after --when-idle (a follow-up)".format(address)
+        return None
+    return stop
+
+
+def wait_idle(directory, agent, profile, address, evidence, turn_ms=None):
     """The waiter: one per worker (a lock in the space folder; a second one leaves at once). Every refusal
     but `working` ends it, and so does the limit; the close journals itself, anything else is journaled here."""
     import fcntl
-    with open(os.path.join(directory, ".close-when-idle-{}.lock".format(re.sub(r"[^A-Za-z0-9_-]", "_", address))), "a") as lock:
+    with open(idle_file(directory, address, "lock"), "a") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             return
-        deadline = time.monotonic() + WHEN_IDLE_LIMIT
-        while True:
+        saved, pa.CALL_TIMEOUT = pa.CALL_TIMEOUT, WHEN_IDLE_HC_TIMEOUT
+        try:
+            kind, text = waiting(directory, agent, profile, address, evidence, turn_ms)
+        finally:
+            pa.CALL_TIMEOUT = saved
             try:
-                close_worker(directory, agent, profile, address, evidence, trigger="close-when-idle")
-                return
-            except Refused as e:
-                if e.kind == "working" and time.monotonic() < deadline:
-                    time.sleep(WHEN_IDLE_POLL)
-                    continue
-                kind, text = e.kind, str(e)
-            except Exception as e:  # noqa: BLE001 (detached: nobody sees a traceback, so it is journaled)
-                kind, text = "error", str(e) or type(e).__name__
-            break
+                os.unlink(idle_file(directory, address, "cancel"))
+            except FileNotFoundError:
+                pass
+    if kind is None:
+        return
     if kind == "working":
         text = "{} still working after {} s".format(address, WHEN_IDLE_LIMIT)
     what = "left for the person; not closed" if kind == "blocked" else "not closed"
     task, _entry = recorded(read_ledger(directory), address)
     append_journal(directory, {"by": "agent" if by_an_agent() else "person", "trigger": "close-when-idle",
                                "task": (task or {}).get("id"), "why": "{}: {} (pa-worker close --when-idle)".format(text, what)})
+
+
+def waiting(directory, agent, profile, address, evidence, turn_ms):
+    """The waiter's loop: (None, None) once closed, else (refusal kind, text)."""
+    stop = idle_stop(directory, address, turn_ms)
+    deadline, wall = time.monotonic() + WHEN_IDLE_LIMIT, time.time() + WHEN_IDLE_LIMIT
+    while True:
+        try:
+            close_worker(directory, agent, profile, address, evidence, trigger="close-when-idle", stop=stop)
+            return None, None
+        except Refused as e:
+            if e.kind == "working" and time.monotonic() < deadline and time.time() < wall:
+                time.sleep(WHEN_IDLE_POLL)
+                continue
+            return e.kind, str(e)
+        except Exception as e:  # noqa: BLE001 (detached: nobody sees a traceback, so it is journaled)
+            return "error", str(e) or type(e).__name__
+
+
+def cancel_when_idle(directory, address):
+    """pa-worker close <address> --cancel-when-idle (t-133): the waiter left by --when-idle closes nothing. Written under
+    the ledger lock, which the waiter's last check before the kill holds too: the cancel lands first, or it was closed."""
+    import fcntl
+    with ledger_lock(directory):
+        with open(idle_file(directory, address, "lock"), "a") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(lock, fcntl.LOCK_UN)
+                running = False
+            except OSError:
+                running = True
+        task, entry = recorded(read_ledger(directory), address)
+        if not running:
+            done = entry and entry.get("finished")
+            return ["{}: no pa-worker close --when-idle is waiting for {}; nothing to cancel{}.".format(
+                address, address, " (it is already closed)" if done else "")]
+        with open(idle_file(directory, address, "cancel"), "w") as f:
+            f.write(pa.now() + "\n")
+        append_journal(directory, {"by": "agent" if by_an_agent() else "person", "trigger": "close-when-idle",
+                                   "task": (task or {}).get("id"),
+                                   "why": "{}: close --when-idle cancelled; the worker stays open".format(address)})
+    return ["{}: close --when-idle cancelled; the worker stays open (close it later with pa-worker close).".format(address)]
 
 
 def keep_worker(directory, agent, address, quote, off):
@@ -3605,8 +3738,12 @@ def cmd_worker(args):
             return close_leftovers(directory, agent, profile, args.dry_run)
         if args.card and not args.address:
             return close_by_card(directory, agent, profile, args.card)
+        if args.cancel_when_idle:
+            for line in cancel_when_idle(directory, args.address):
+                print(line)
+            return
         if args.idle_waiter:
-            return wait_idle(directory, agent, profile, args.address, args.evidence)
+            return wait_idle(directory, agent, profile, args.address, args.evidence, args.turn_ms)
         lines = (close_when_idle(directory, agent, profile, space, args.address, args.evidence) if args.when_idle
                  else close_worker(directory, agent, profile, args.address, args.evidence, args.card))
         for line in lines:
@@ -4303,6 +4440,8 @@ def main():
         parser.add_argument("--dry-run", action="store_true", help="close --leftovers: only list what it would do")
         parser.add_argument("--when-idle", action="store_true", help="close: if it is still working, close it once idle (in the background, up to 10 min)")
         parser.add_argument("--idle-waiter", action="store_true", help=argparse.SUPPRESS)  # the --when-idle waiter itself
+        parser.add_argument("--turn-ms", type=int, help=argparse.SUPPRESS)  # the waiter: hc's status_ms of the turn it waits for
+        parser.add_argument("--cancel-when-idle", action="store_true", help="close: the waiter a --when-idle left closes nothing")
         parser.add_argument("--quote", help="keep: the person's own words")
         parser.add_argument("--off", action="store_true", help="keep: the person says it may be closed again")
         parser.add_argument("--space")
@@ -4311,6 +4450,9 @@ def main():
             raise pa.Problem("pa-worker close takes --evidence or --card, not both")
         if args.action == "close" and (sum(map(bool, (args.address, args.leftovers))) != 1 if not args.card else bool(args.leftovers)):
             raise pa.Problem("pa-worker close needs an address and --evidence, or --leftovers, or --card <id>")
+        if args.cancel_when_idle and (args.action != "close" or not args.address or args.when_idle or args.idle_waiter
+                                      or args.evidence or args.card or args.leftovers):
+            raise pa.Problem("pa-worker close <address> --cancel-when-idle takes nothing else")
         if (args.when_idle or args.idle_waiter) and (args.action != "close" or not args.address or not args.evidence or args.card):
             raise pa.Problem("pa-worker close --when-idle needs an address and --evidence")
         if args.action != "close" and not args.address:
