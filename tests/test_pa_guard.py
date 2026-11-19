@@ -958,6 +958,29 @@ class T070Prices(GuardTest):
             with self.subTest(line=line):
                 self.assertIn(D7.split("{}")[1], str(self.check(line)))  # D7's text after the line shown
 
+    def test_d7_split_names(self):  # t-070 J2 round 6: the prefilter reads the line with quotes and escapes taken out
+        for line, inner in D7_SPLIT_FORMS:
+            with self.subTest(line=line):
+                self.assertEqual(self.check(line), msg(D7, inner))
+
+    def test_d7_prefilter(self):  # t-070 J2 round 6 (VERIFY J2 round 5 M1): no D7 scan on a line that cannot name pa-costs
+        counted, real = [], guard.PYTHON  # PYTHON.match per command: DENY_TOOLS's, plus D7's py only when the line names it
+        with mock.patch.object(guard, "PYTHON", mock.Mock(match=lambda w: counted.append(w) or real.match(w))):
+            for line, calls in (("python3 x; " * 50, 50), ("a;" * 5000, 5000), ("python3 pa_co''sts; " * 50, 100)):
+                with self.subTest(line=line[:40]):
+                    del counted[:]
+                    self.check(line)
+                    self.assertEqual(len(counted), calls)
+
+
+D7_SPLIT_FORMS = [("pa_co''sts prices fetch", "pa_costs prices fetch"), ("pa\\_costs prices fetch", "pa_costs prices fetch"),
+                  ('"pa"-costs prices fetch', "pa-costs prices fetch"), ("Pa-Co'S'ts prices fetch", "Pa-CoSts prices fetch"),
+                  ("pa$'_costs' prices fetch", "pa_costs prices fetch"), ("pa_\\\ncosts prices fetch", "pa_costs prices fetch"),
+                  ("python3 -m 'pa_'co\"sts\" prices fetch", "python3 -m pa_costs prices fetch"),
+                  ("sh -c \"pa_co''sts prices fetch\"", "pa_costs prices fetch"),
+                  ("echo $(PA_CO\\STS prices fetch)", "PA_COSTS prices fetch"),
+                  ("eval 'pa_\\\ncosts' prices fetch", "pa_costs prices fetch")]
+
 
 if __name__ == "__main__":
     unittest.main()
