@@ -130,6 +130,30 @@ export async function loadQueue(space, cx) {
   return { doc: v, error: null, missing: false };
 }
 
+// Worker places (places.js, t-083 J2): the Project Agent's waiting.json (pa-places is its only writer) and the person's
+// start-order.json (this panel is its only writer, writeStartOrder). One keyed, capped read each; a give-up returns
+// TIMED_OUT (never "missing"). loadWaiting: { doc, error, missing }, each job checked as pa_places.load_waiting does.
+// loadStartOrder: { text, missing }: the raw text, for the compare-and-write; places.js readOrder parses it.
+const PLACE_KINDS = ["working", "no-test", "suite"];
+export async function loadWaiting(space, cx) {
+  const r = await readJson(`${stateDir(space)}/waiting.json`, space.machine ?? null, cx);
+  if (r.timedOut) return TIMED_OUT;
+  if (r.text === null) return { doc: null, error: null, missing: true };
+  if (r.error) return { doc: null, error: `waiting.json is not valid JSON: ${r.error}`, missing: false };
+  const v = r.value;
+  if (!v || typeof v !== "object" || Array.isArray(v) || !Array.isArray(v.jobs)) return { doc: null, error: 'waiting.json needs a "jobs" list', missing: false };
+  const bad = v.jobs.findIndex((j) => !j || typeof j !== "object" || typeof j.id !== "string" || !PLACE_KINDS.includes(j.kind) || !["pa", "queue"].includes(j.source ?? "pa"));
+  if (bad >= 0) return { doc: null, error: `waiting.json: job ${bad + 1} needs an id, a kind (${PLACE_KINDS.join(", ")}) and a source (pa or queue)`, missing: false };
+  return { doc: v, error: null, missing: false };
+}
+export async function loadStartOrder(space, cx) {
+  const r = await readJson(`${stateDir(space)}/start-order.json`, space.machine ?? null, cx);
+  if (r.timedOut) return TIMED_OUT;
+  return { text: r.text, missing: r.text === null };
+}
+// expected: the text read (null: no file then). A file changed since is refused (replaceFile's "changed on disk").
+export const writeStartOrder = (space, text, expected) => replaceFile(`${stateDir(space)}/start-order.json`, text, expected, space.machine ?? null);
+
 // The space's ledger alone ({ value, text, error, timedOut? }), for the hidden panel's refresh.
 export const loadLedger = (space, cx) => readJson(`${stateDir(space)}/ledger.json`, space.machine, cx);
 

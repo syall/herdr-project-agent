@@ -14,9 +14,10 @@ import { View, div } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, ScrollHandle } from "gpui-base";
 import { spaces, panes, agents, terminals, machines, theme, run, props, home, notify, shared, setShared, closeOverlay, openOverlay, window, layout } from "herdr";
 import { Host, gaveUp, read as hostRead, run as hostRun, watch, refusalLine } from "./host.js";
-import { loadSpace, loadLedger, loadQueue, loadProfile, loadDecisions, loadRules, TIMED_OUT, READ_LIMIT, answerDecision, notifyOrchestrator, changeRules, touched, localId, paHome, stateDir, taskActions, taskLinks, evidenceTasks, cardEvidence, staleInstructions, liveTarget, lookAlike, OPEN_REQUESTS, keeperJudging, startingLabels, OTHER, OTHER_MAX, OTHER_TOO_LONG, isOther, oneLine, codeState, codeBadge, loadCode, restartArgs, runRestart, restartOutcome, endTerminalLine, RESTART_MARK, RESTART_MARK_TTL, RESTARTED_FOR, RESTART_TIMEOUT, DRY_TIMEOUT } from "./store.js";
+import { loadSpace, loadLedger, loadQueue, loadWaiting, loadStartOrder, writeStartOrder, loadProfile, loadDecisions, loadRules, TIMED_OUT, READ_LIMIT, answerDecision, notifyOrchestrator, changeRules, touched, localId, paHome, stateDir, taskActions, taskLinks, evidenceTasks, cardEvidence, staleInstructions, liveTarget, lookAlike, OPEN_REQUESTS, keeperJudging, startingLabels, OTHER, OTHER_MAX, OTHER_TOO_LONG, isOther, oneLine, codeState, codeBadge, loadCode, restartArgs, runRestart, restartOutcome, endTerminalLine, RESTART_MARK, RESTART_MARK_TTL, RESTARTED_FOR, RESTART_TIMEOUT, DRY_TIMEOUT } from "./store.js";
 import { RulesPane, arm, armHolds, fieldState } from "./rules.js"; // arm, armHolds: the two-click Delete (ARM_WAIT, 10 s)
-import { queueRows, queueLabel, renderQueue } from "./queue.js"; // t-055: the Queue view (read only)
+import { queueRows, queueLabel, renderQueue, at as atZone } from "./queue.js"; // t-055: the Queue view (read only)
+import { placesRows, renderPlaces, moveOrder, orderText, NOTICE as ORDER_NOTICE } from "./places.js"; // t-083 J2: places and the start order (Tasks)
 import { SetupPane } from "./setup.js";
 import { Keeper, idleShell } from "./keeper.js";
 import { WorkerPane } from "./worker.js";
@@ -182,6 +183,9 @@ export default class ProjectAgent extends View {
     // read after it). Dropped by resolveMarks (commit) once a read shows the answer or a later change, or on a failure.
     this.sent = {};
     this.failed = {}; // card id -> why the answer wasn't written
+    // t-083 J2: the Places section of the Tasks view (open unless folded), a start-order write in flight per space, its
+    // refusal line, and the line a task-row badge marks for 3 s ({ space, key, until }).
+    this.placesFolded = false; this.placesBusy = {}; this.placesError = {}; this.placeMark = null;
     this.unsent = []; // [{ spaceId, message, why? }] notices the orchestrator hasn't had yet (its terminal is looked up when sending)
     this.opening = {}; // space id -> { at, before }: when this copy asked the keeper to open its Project Agent, and the record terminals then
     this.openMsg = {}; // space id -> why the last Open did not start anything
@@ -220,7 +224,7 @@ export default class ProjectAgent extends View {
     if (props()?.timer) return; // the always-on copy only keeps time; it shows nothing
     this.reload(cx);
     cx.timer.every(10000, (cx) => { this.reload(cx, BG); this.resend(cx); });
-    cx.timer.every(1000, (cx) => { this.wake(cx); this.costsDue(cx); this.deferredDue(cx); if ((this.armed && !this.armedTask(this.space)) || (this.rules.armed && !this.rules.armedRule(this.space))) cx.notify(); }); // shown again (render may not run for a hidden copy); an armed Delete timed out
+    cx.timer.every(1000, (cx) => { this.wake(cx); this.costsDue(cx); this.deferredDue(cx); if ((this.armed && !this.armedTask(this.space)) || (this.rules.armed && !this.rules.armedRule(this.space))) cx.notify(); if (this.placeMark && Date.now() >= this.placeMark.until) { this.placeMark = null; cx.notify(); } }); // shown again (render may not run for a hidden copy); an armed Delete timed out; a badge's mark ended
     // Changes under spaces/ (one watch, D3): a batch reloads only for what the panel shows (watched()), coalesced.
     this.host.spawn(cx, async (cx) => {
       for (;;) {
@@ -417,7 +421,7 @@ export default class ProjectAgent extends View {
         }
         if (data.agent && current() && shown()) { // first paint: the header and the tasks
           const same = this.space === space.id;
-          this.data = { ...data, evidence: same ? this.data?.evidence : undefined, stale: same ? this.data?.stale : undefined, code: same ? this.data?.code : undefined, queue: same ? this.data?.queue : undefined };
+          this.data = { ...data, evidence: same ? this.data?.evidence : undefined, stale: same ? this.data?.stale : undefined, code: same ? this.data?.code : undefined, queue: same ? this.data?.queue : undefined, waiting: same ? this.data?.waiting : undefined, startOrder: same ? this.data?.startOrder : undefined };
           if (this.cardsFor !== space.id) { this.cards = []; this.cardsFor = null; this.rules.data = null; }
           if (!same) this.dataAt = Date.now();
           this.space = space.id;
@@ -427,16 +431,18 @@ export default class ProjectAgent extends View {
           // A read that times out or fails keeps the last known value: the kept load's, else what is shown for the space.
           const cap = (p, fallback) => p.then((v) => (gaveUp(v) ? fallback() : v), () => fallback()); // each read capped in the store
           const known = [...(kept && !kept.cardsUnknown ? kept.cards : []), ...(this.space === space.id && this.cardsFor === space.id ? this.cards : [])];
-          let evidence, stale, code, queue;
-          [cards, rules, evidence, stale, code, queue] = await Promise.all([
+          let evidence, stale, code, queue, waiting, startOrder;
+          [cards, rules, evidence, stale, code, queue, waiting, startOrder] = await Promise.all([
             loadDecisions(space, { cx: rcx, live: current, known, out: cardsOut }),
             cap(loadRules(space, rcx), () => kept?.rules ?? (this.space === space.id && this.cardsFor === space.id ? this.rules.data : null) ?? null), // null: the Rules view says Loading…
             cap(evidenceTasks(space, rcx), () => kept?.data?.evidence ?? shownNow()?.evidence), // undefined: unknown
             cap(staleInstructions(space, data.agent.profile, rcx), () => kept?.data?.stale ?? shownNow()?.stale ?? []),
             cap(loadCode(space, rcx), () => kept?.data?.code ?? shownNow()?.code ?? null), // t-037 J4: launcher.json + installed.json
             cap(loadQueue(space, rcx), () => kept?.data?.queue ?? shownNow()?.queue ?? null), // t-055: queue.json; a give-up keeps the last known (null: "Loading queue…")
+            cap(loadWaiting(space, rcx), () => kept?.data?.waiting ?? shownNow()?.waiting ?? null), // t-083 J2: waiting.json (pa-places writes it); as loadQueue
+            cap(loadStartOrder(space, rcx), () => kept?.data?.startOrder ?? shownNow()?.startOrder ?? null), // t-083 J2: start-order.json's text (the panel writes it)
           ]);
-          data.evidence = evidence; data.stale = stale; data.code = code; data.queue = queue;
+          data.evidence = evidence; data.stale = stale; data.code = code; data.queue = queue; data.waiting = waiting; data.startOrder = startOrder;
         }
       }
       catch (e) { data = { agent: null, errors: [String(e.message ?? e)], failed: true }; } // a read in the first round threw
@@ -859,6 +865,36 @@ export default class ProjectAgent extends View {
     cx.notify();
   }
 
+  // t-083 J2: the Places section's rows for the space as loaded: limits from the load's rules, holders from the ledger
+  // with their terminals looked up as the task rows do (the machine prefix on a remote space).
+  placesOf(space, data) {
+    const live = (address) => { const a = space.machine ? `${space.machine}/${address}` : address; return terminals().some((x) => x.address === a && x.state === "live"); };
+    return placesRows({ waiting: data?.waiting, startOrder: data?.startOrder, rules: this.rules.data, ledger: data?.ledger, isLive: live });
+  }
+
+  // A ↑ ↓ ⤒ click or Reset order (R6): the whole new order written by compare-and-write against the text read; then one
+  // "start order changed" notice per space while unsent (J2-D5), and a reload. A refused write says why and reloads.
+  // Nothing while a write of this space is in flight (AC9.3). It decides nothing else (R10): it only writes the order.
+  moveJob(space, id, move, cx) {
+    if (this.placesBusy[space.id] || this.space !== space.id) return;
+    const p = this.placesOf(space, this.data);
+    if (p.state !== "ok" || !p.orderKnown) return;
+    const order = move === "reset" ? p.effective.filter((j) => j.source !== "queue").map((j) => j.id) : moveOrder(p.effective, id, move);
+    if (!order) return;
+    const expected = p.orderTextRead, text = orderText(expected, order, { id, move });
+    this.placesBusy[space.id] = true; delete this.placesError[space.id];
+    cx.spawn(async (cx) => {
+      try {
+        await writeStartOrder(space, text, expected);
+        if (this.space === space.id && this.data) this.data = { ...this.data, startOrder: { text, missing: false } }; // drawn now; the reload reads it again
+        if (!this.unsent.some((u) => u.spaceId === space.id && u.message === ORDER_NOTICE)) this.unsent.push({ spaceId: space.id, message: ORDER_NOTICE });
+        this.resend(cx);
+      } catch (e) { this.placesError[space.id] = String(e.message ?? e); }
+      finally { delete this.placesBusy[space.id]; this.reload(cx); cx.notify(); }
+    });
+    cx.notify();
+  }
+
   // Deliver what the orchestrator hasn't had yet, to the terminal its launcher runs in now. With
   // none, nothing is sent and the notice waits; an undelivered notice is kept and retried. A
   // space's notices go out in order: one that waits holds back the ones after it.
@@ -1062,7 +1098,7 @@ export default class ProjectAgent extends View {
     ];
   }
 
-  task(t, task, space) {
+  task(t, task, space, badges = []) {
     const open = this.open.has(task.id), armed = open && this.armedTask(space.id) === task.id;
     // A press on the armed Delete or its Cancel stops here: a press anywhere else in the panel disarms (render's root).
     const keep = (el) => el.on_mouse_down("left", (_e, cx) => cx.stop_propagation());
@@ -1075,6 +1111,11 @@ export default class ProjectAgent extends View {
         .child(div().flex_none().text_size(11.5).text_color(t.dim).child(String(task.id ?? "?")))
         .child(div().flex_1().min_w(0).truncate().text_size(12.5).text_color(t.foreground).child(String(task.title ?? "(untitled)")))
         .when(Boolean(task.phase), (el) => el.child(div().flex_none().text_size(10.5).text_color(t.dim).child(String(task.phase))))
+        // t-083 J2 (R11): one badge per waiting or holding job; a click unfolds Places and marks that line for 3 s.
+        .children(badges.map((b, i) => div().id(`badge-${task.id}-${i}`).flex_none().px(6).h(18).flex().items_center().rounded(5).border(1).border_color(t.border)
+          .text_size(10.5).text_color(t.muted).cursor_pointer().hover((s) => s.bg(t.hover))
+          .on_click((_e, cx) => { cx.stop_propagation(); this.placesFolded = false; this.placeMark = { space: space.id, key: b.key, until: Date.now() + 3000 }; cx.notify(); })
+          .child(b.text)))
         .child(this.chip(t, String(task.state ?? "?"), tone)))
       .when(open, (el) => el.child(v_flex().px(10).pb(9).gap(6).text_size(12).text_color(t.muted)
         .when(Boolean(task.goal), (e) => e.child(div().child(sel(`sel-goal-${task.id}`, String(task.goal)))))
@@ -1330,6 +1371,7 @@ export default class ProjectAgent extends View {
     }
     const view = this.view ?? (listed.length || !tasks.length ? "decisions" : "tasks");
     const queue = queueRows(data.queue, data.ledger, this.cardsFor === space.id ? this.cards : []); // t-055: drawn only from what the load read
+    const places = this.placesOf(space, data); // t-083 J2: the Places section and the task rows' badges
     this.viewShown = view;
     const tab = (id, label) => div().id(`view-${id}`).px(9).h(24).flex().items_center().rounded(6).text_size(12).cursor_pointer()
       .bg(view === id ? t.selected : t.chrome).text_color(view === id ? t.foreground : t.muted).hover((s) => s.bg(t.hover))
@@ -1379,6 +1421,9 @@ export default class ProjectAgent extends View {
       .when(unsent.length > 0 && Boolean(live), (el) => el.child(div().px(12).py(6).text_size(11.5).text_color(t.blocked)
         .child(`Saved, but the Project Agent hasn't been told yet (${unsent[0]?.why ?? "sending"}). Trying again every 10 s.`)))
       .when(view === "tasks", (el) => el.child(v_flex().id("pa-tasks").flex_1().min_h(0).p(8).gap(6).overflow_y_scrollbar()
+        .when(places.shown, (e) => e.child(renderPlaces(t, places, { folded: this.placesFolded, busy: Boolean(this.placesBusy[space.id]), error: this.placesError[space.id] ?? null,
+          mark: this.placeMark?.space === space.id && Date.now() < this.placeMark.until ? this.placeMark.key : null, asOf: atZone(new Date(this.dataAt ?? Date.now()).toISOString()).slice(6),
+          onFold: (_e, cx) => { this.placesFolded = !this.placesFolded; cx.notify(); }, onMove: (id, move, cx) => this.moveJob(space, id, move, cx), onReset: (cx) => this.moveJob(space, null, "reset", cx) })))
         .when(!tasks.length, (e) => e.child(note("No tasks yet. Give the Project Agent a goal in its tab.")))
         .children(sections.flatMap((s) => {
           const folded = this.folded.has(s.state);
@@ -1387,7 +1432,7 @@ export default class ProjectAgent extends View {
               .on_click((_e, cx) => { folded ? this.folded.delete(s.state) : this.folded.add(s.state); cx.notify(); })
               .child(div().child(folded ? "▸" : "▾")).child(div().font_semibold().child(String(s.state ?? "no state").replace(/-/g, " ")))
               .child(div().child(String(s.tasks.length))),
-            ...(folded ? [] : s.tasks.map((task) => this.task(t, task, space))),
+            ...(folded ? [] : s.tasks.map((task) => this.task(t, task, space, places.badges[task.id] ?? []))),
           ];
         }))))
       .when(view === "queue", (el) => el.child(renderQueue(t, queue)))

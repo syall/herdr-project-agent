@@ -5841,13 +5841,13 @@ const plLedger = () => ({ tasks: [
   { id: "t-083", title: "Worker places", state: "in-progress" },
   { id: "t-090", title: "Nothing here", state: "in-progress" },
 ] });
-// A world with the places files (undefined: none; null: leave out) and the Tasks view open.
+// A world with the places files (null: no such file; waiting text or doc) and the Tasks view open.
 async function placesWorld({ waiting = { version: 1, jobs: plJobs() }, order, ledger = plLedger(), rules = P83.rules, machine = null, terms = ["t51", "t53", "t54", "t59x"] } = {}) {
   world({ machine, extraTerms: terms.map((a) => plTerm(machine ? `${machine}/${a}` : a)) });
   const dir = machine ? `${machine}:${RDIR}` : `:${DIR}`;
   g.__files[`${dir}/ledger.json`] = JSON.stringify(ledger);
   if (rules !== undefined) g.__files[`${dir}/rules.json`] = rules;
-  if (waiting !== undefined) g.__files[`${dir}/waiting.json`] = typeof waiting === "string" ? waiting : JSON.stringify(waiting);
+  if (waiting !== null) g.__files[`${dir}/waiting.json`] = typeof waiting === "string" ? waiting : JSON.stringify(waiting);
   if (order !== undefined) g.__files[`${dir}/start-order.json`] = order;
   const v = await mount(); await settle();
   await click(v, "view-tasks"); await settle();
@@ -5923,7 +5923,7 @@ cases["P83-6-busy"] = async () => { // AC9.3: while a write is in flight a click
 };
 
 cases["P83-7-waiting-missing"] = async () => { // AC9.2: no waiting list (a worker holds a place): its line; invalid: its error, no buttons
-  let { v } = await placesWorld({ waiting: undefined });
+  let { v } = await placesWorld({ waiting: null });
   check(look(v).text.includes("No waiting list yet: the Project Agent writes it with pa-places."), `missing (got ${look(v).text.slice(0, 800)})`);
   ({ v } = await placesWorld({ waiting: "{x" }));
   const { text, clicks } = look(v);
@@ -5931,7 +5931,7 @@ cases["P83-7-waiting-missing"] = async () => { // AC9.2: no waiting list (a work
 };
 
 cases["P83-8-hidden"] = async () => { // D3, AC11.1: no waiting list and no holder: no section, no badges
-  const { v } = await placesWorld({ waiting: undefined, terms: [] });
+  const { v } = await placesWorld({ waiting: null, terms: [] });
   const { text, clicks } = look(v);
   check(!/Places ·/.test(text) && !Object.keys(clicks).some((k) => k.startsWith("badge-")), `nothing drawn (got ${text.slice(0, 600)})`);
 };
@@ -5965,7 +5965,7 @@ cases["P83-11-badges"] = async () => { // R11: badges on task rows; a click unfo
   const id = Object.keys(look(v).clicks).find((k) => k.startsWith("badge-t-083"));
   check(Boolean(id), "a badge for t-083");
   await click(v, id);
-  check(look(v).text.includes("Working · 3 of 4") && v.placeMark?.id === "job:t-083/design", `unfolded and marked (got ${JSON.stringify(v.placeMark)})`);
+  check(look(v).text.includes("Working · 3 of 4") && v.placeMark?.key === "job:t-083/design", `unfolded and marked (got ${JSON.stringify(v.placeMark)})`);
   advance(3500); await fire(1000);
   check(!v.placeMark, "the mark ends after 3 s");
 };
