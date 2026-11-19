@@ -685,7 +685,7 @@ exec tests/run-all.sh
 class X19ProfileRunner(Remote):
     """d-222 A: a profile whose tests.fullIsRunAll declares that its own full command runs tests/run-all.sh in a plain
     git repo (unless a named file is in the worktree root or above it) goes remote there; elsewhere it stays local."""
-    declared = {"unlessFound": ["ws.marker"]}
+    declared = {"command": "hooks/tests.sh full", "unlessFound": ["ws.marker"]}
 
     def setUp(self):
         super().setUp()
@@ -709,8 +709,8 @@ class X19ProfileRunner(Remote):
         dump(agent, os.path.join(self.dir, "agent.json"))
         return os.path.join(folder, "hooks", "tests.sh")
 
-    def check_local(self, word):
-        code, out = self.main()
+    def check_local(self, word, *args):
+        code, out = self.main(*args)
         self.assertEqual(code, 0, out)
         self.assertFalse([c for c in self.calls() if c[0] in ("run", "file")], self.calls())
         reasons = [l for l in out.splitlines() if "on this Mac" in l]
@@ -764,16 +764,18 @@ class X19ProfileRunner(Remote):
         self.check_local("command")
 
     def test_x19g_a_bad_declaration_is_named_and_stays_local(self):
-        for bad in ({"unlessFound": ["../x"]}, {"unlessFound": "ws.marker"}, ["ws.marker"], {"unlessFound": [""]}):
+        c = "hooks/tests.sh full"
+        for bad in ({"command": c, "unlessFound": [".."]}, {"command": c, "unlessFound": "ws.marker"}, ["ws.marker"],
+                    {"unlessFound": ["ws.marker"]}, {"command": c, "unlessFound": ["a/b"]}):
             self.use_profile("hooks/tests.sh full", declared=bad)
-            self.check_local("fullIsRunAll")
+            self.check_local("fullIsRunAll", "--again")  # the same tree each time
 
     def test_x19h_a_space_command_of_its_own_stays_local(self):
         self.set_command("sh tests/run-all.sh; true")
         self.check_local("command")
 
     def test_x19i_an_empty_list_means_any_plain_git_repo(self):
-        self.use_profile("hooks/tests.sh full", declared={"unlessFound": []})
+        self.use_profile("hooks/tests.sh full", declared={"command": "hooks/tests.sh full", "unlessFound": []})
         write(os.path.join(self.tmp, "ws.marker"), "")
         code, out = self.main()
         self.assertEqual(code, 0, out)
