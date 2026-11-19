@@ -128,8 +128,8 @@ def row_of(words):
     removing = max([k for k, w in enumerate(words) if w in ("-d", "--delete")], default=-1)
     tool = next((word(k + 1) for k in range(first, n) if names[k] == "pa.py" and (k == first or PYTHON.match(names[first]))),
                 names[first][3:] if first < n and names[first][:3] == "pa-" else "")  # pa-<tool>, or pa.py <tool>
-    costs = next((k for k in range(first, n) if (names[k] in ("pa-costs", "pa_costs.py") or names[k] == "pa_costs" and words[k - 1] == "-m")
-                  and (k == first or PYTHON.match(names[first]))), n)  # pa-costs, or a python running pa_costs.py
+    costs = next((k for k in range(first, n) if (names[k] in ("pa-costs", "pa_costs.py") or re.fullmatch(r"-[a-z]*m(pa_costs)?", names[k])
+                  and "pa_costs" in (names[k][-8:], program(word(k + 1)))) and (k == first or PYTHON.match(names[first]))), n)  # pa-costs, pa_costs.py, -m pa_costs, -um pa_costs, -mpa_costs
     rest = words[costs + 1:]
     if any(word(j) in ("push", "send-pack", "http-push") or word(j) in ("subtree", "lfs") and after(j) == "push"
            for j in subs) or first < n and names[first] in ("git-push", "git-send-pack", "git-http-push"):
