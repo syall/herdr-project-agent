@@ -6779,10 +6779,15 @@ class T070_ScopeToday(J2Base):
                  (None, None, None, None), (None, "regional", "region-b", None)]
         for day in ("2026-01-01", "2026-06-15", "2026-11-01", "2026-11-05", "2026-11-16"):
             for f in facts:
-                for model in ("model-a", "model-a-x", "model-old"):
+                for model in ("model-a", "model-a-x"):
                     when = day + "T10:00:00Z"
                     self.assertEqual(self.figures(pa_costs.price_for(new, model, when, f)),
                                      self.figures(pa_costs.price_for(old, model, when, f)), (day, f, model))
+                self.assertEqual(self.figures(pa_costs.price_for(new, "model-old", day + "T10:00:00Z", ("provider-a", "global", None, None))),
+                                 self.figures(pa_costs.price_for(old, "model-old", day + "T10:00:00Z", ("provider-a", "global", None, None))))
+        # Q-J1-4 (d-200: counted on the J4 card, not built): a model the source lacks, on an endpoint the migration takes
+        # out of the default scope, is no longer priced; only scopes the fetch creates are carried
+        self.assertIsNone(pa_costs.price_for(new, "model-old", "2026-06-15T10:00:00Z", self.REGIONAL_A))
         when = "2026-11-17T10:00:00Z"
         self.assertEqual(pa_costs.price_for(new, "model-a", when, self.REGIONAL_A)["in"], 1.1)
         self.assertEqual(pa_costs.price_for(new, "model-a", when, ("provider-a", "geo", "region-a", None))["in"], 1.1)
