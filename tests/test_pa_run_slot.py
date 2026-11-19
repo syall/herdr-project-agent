@@ -7,10 +7,12 @@ machine), and the temp HERDR_PA_HOME, space and worktree come from test_pa_run's
   s2  R12: when the step stays here (no machines, a caller's slot, PA_SUITE_REMOTE, PA_SUITE_LOCAL_RUN, a plain run)
   s3  R11: unreachable or a setup failure: this Mac with "mac", 125 with "none"
   s4  R8: a secret path or a bad PA_CHANGED_FILES path: 125, nothing shipped
-  s5  R14: PA_SUITE_DEADLINE ends the wait (deadline - median, else - 300 s) and the run (killed there, 124)
+  s5  R14: PA_SUITE_DEADLINE ends the wait (deadline - median, else - 300 s) and the run (killed there, 124, `did not
+      finish`: the run had started)
   s6  R13: the slot step's hc calls get PA_SUITE_HC_*; the command gets neither HC_* nor PA_SUITE_HC_*
   s7  R19, T1: one test-runs.jsonl line per slot-step run (remote and local); pa-full-suite writes a full line
-  s8  R14, R15: hook_affected's deadline and its could-not-run message
+  s8  R14, R15: hook_affected's deadline and its could-not-run message; a run that started and did not end (the
+      hook's own 900 s, the deadline during the run) is a failure to fix, never "could not run" (MF-J2-1)
   s9  TERM during a remote slot-step run: 143, cleaned
   n1  the machine's node a script that finds its real binary beside $0: pa-run -- node runs it
   k1  T1: the kind inferred when --for is not given; --for wins
@@ -247,6 +249,7 @@ class S5Deadline(Slot):
         self.assertEqual(code, 124, out + err)
         self.assertLess(took, 40, out + err)
         self.assertIn("deadline", out.splitlines()[-1])
+        self.assertRegex(out.splitlines()[-1], r"^run-all\.sh: did not finish on box-1: ")  # MF-J2-1: it started
         self.assertEqual(self.terminals(), [])
         self.assertEqual(self.remote_folders(), [])
 
@@ -367,6 +370,40 @@ class S8Hook(Slot):
         self.assertEqual(code, 1, err)
         self.assertIn("The affected tests could not run (task t-1): run-all.sh: not run on box-1: setup failed: x.",
                       err)
+
+    def assert_did_not_finish(self, code, err, line):
+        self.assertEqual(code, ("exit", 2), err)
+        self.assertIn("The affected tests did not finish (task t-1): {}. A test may hang: fix the code and run them "
+                      "again.".format(line), err)
+        self.assertNotIn("could not run", err)
+        self.assertNotIn("Do not change code", err)
+
+    def test_s8e_the_hooks_own_timeout_is_a_failure_to_fix(self):
+        # MF-J2-1 (review-j2-hang.py): a test the change makes hang outlives run_shell's limit (900 s; 1 s here)
+        saved = pa_hooks.AFFECTED_LIMIT
+        pa_hooks.AFFECTED_LIMIT = 1
+        self.addCleanup(setattr, pa_hooks, "AFFECTED_LIMIT", saved)
+        code, err = self.hook(self.script("echo '=== unit tests: test_x'\nexec sleep 20\n"))
+        self.assert_did_not_finish(code, err, "(timed out after 1 s)")
+
+    def test_s8f_review_j2_hang_run_shell_timing_out(self):
+        # the reviewer's case as it was written: run_shell returns what it returns on its own timeout
+        saved = pa_hooks.run_shell
+        pa_hooks.run_shell = lambda *a, **k: (124, "=== unit tests: test_x\n...\n(timed out after 900 s)")
+        self.addCleanup(setattr, pa_hooks, "run_shell", saved)
+        code, err = self.hook(self.script("exit 0\n"))
+        self.assert_did_not_finish(code, err, "(timed out after 900 s)")
+
+    def test_s8g_the_deadline_during_a_started_run_is_a_failure_to_fix(self):
+        line = ("run-all.sh: did not finish on box-1: the deadline (PA_SUITE_DEADLINE) came after 870 s; the run "
+                "there was ended")
+        code, err = self.hook(self.script("echo '--- unit tests'\necho '{}'\nexit 124\n".format(line)))
+        self.assert_did_not_finish(code, err, line)
+
+    def test_s8h_the_stop_variant_holds_the_session_for_a_run_that_did_not_finish(self):
+        line = "run-all.sh: did not finish on box-1: timed out after 3600 s there"
+        code, err = self.hook(self.script("echo '{}'\nexit 124\n".format(line)), "--stop")
+        self.assert_did_not_finish(code, err, line)
 
 
 class S9Interrupt(Slot):
