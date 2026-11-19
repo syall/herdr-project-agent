@@ -13,11 +13,15 @@
                       kill         every `kill` fails
   STUB_HC_SUB       old=new: replaced in every exec's output (a remote that answers with another id)
 --on <m> maps the literal prefix /tmp/pa-suite- in every argument (a script's text too) to
-<root>/<m>/tmp/pa-suite-, so the product's fixed remote paths land under the stub's folder.
+<root>/<m>/tmp/pa-suite-, so the product's fixed remote paths land under the stub's folder. One exception: a
+/tmp/pa-suite-<12 hex> folder that really exists on this machine is an outer run's (the suite itself running on a
+suite machine, its PATH starting with that run's bin/ tool links, which the probe then finds), not one of the stub
+machine's; it is left as it is (J2-D17).
 Commands: exec, run --bg, file read|write, kill, rm, ls. Anything else: exit 2.
 """
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -28,6 +32,7 @@ import time
 ROOT = os.environ.get("STUB_HC_ROOT") or os.path.join(tempfile.gettempdir(), "stub-hc")
 FAILS = [f for f in (os.environ.get("STUB_HC_FAIL") or "").split(",") if f]
 PREFIX = "/tmp/pa-suite-"
+RUN_ID = re.compile(r"[0-9a-f]{12}(?![0-9a-f])")
 
 
 def fail(text, code=1):
@@ -36,7 +41,14 @@ def fail(text, code=1):
 
 
 def mapped(machine, value):
-    return value.replace(PREFIX, os.path.join(ROOT, machine, "tmp", "pa-suite-"))
+    to = os.path.join(ROOT, machine, "tmp", "pa-suite-")
+    parts = value.split(PREFIX)
+    out = [parts[0]]
+    for part in parts[1:]:
+        run = RUN_ID.match(part)
+        real = run and os.path.isdir(PREFIX + run.group(0))
+        out.append((PREFIX if real else to) + part)
+    return "".join(out)
 
 
 def check_machine(machine):
