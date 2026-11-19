@@ -55,7 +55,7 @@ for a in "$@"; do
   esac
 done
 echo "remote ${PA_SUITE_REMOTE:-unset}"
-hc ls > /dev/null 2>&1; echo "hc-exit $?"
+if [ -n "${PA_SUITE_REMOTE:-}" ]; then hc ls > /dev/null 2>&1; echo "hc-exit $?"; fi  # a local run's hc is the stub's log
 exit $code
 """
 
@@ -254,7 +254,8 @@ class R4Remote(Run):
         terms = os.path.join(self.stub, "box-1", "terminals")
         self.assertEqual([n for n in os.listdir(terms) if n.endswith(".json")], [])
         # the patch that arrived is git diff --binary C T, and the setup compared the tree there
-        patch = base64.b64decode(open(os.path.join(self.keep, "p.b64"), "rb").read())
+        with open(os.path.join(self.keep, "p.b64"), "rb") as f:
+            patch = base64.b64decode(f.read())
         self.assertIn(b"GIT binary patch", patch)
         self.assertIn(b"n.txt", patch)
         setup = [c for c in self.calls() if c[0] == "exec" and "apply --index" in " ".join(c)]
@@ -289,7 +290,7 @@ class R4Remote(Run):
             if c[0] in ("exec", "file", "run"):
                 self.assertEqual(c[c.index("--on") + 1], "box-1", c)
             if c[0] == "file":
-                self.assertTrue(c[-1].startswith(folder + "/"), c)
+                self.assertTrue(c[4].startswith(folder + "/"), c)  # file read|write --on M <path> ...
             if c[0] == "run":
                 for flag in ("--bg", "--rm", "--no-notify"):
                     self.assertIn(flag, c)

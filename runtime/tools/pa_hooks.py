@@ -12,6 +12,9 @@ Selected by the name it is invoked as (symlinks in ~/.local/bin):
   pa-full-suite --last [--commit C|--tree T]    the last recorded run; --report: its parts by time
   pa-full-suite --local | --on M | --places     on this Mac only, on machine M only, or where runs can go: the
                                                 machines of config.json's suiteMachines (t-089, see pa_suite.py)
+  pa-run [--on M|--local] [--commit C --overlay P] -- <argv...>
+                                                a test command in the tree to run (HEAD plus the worktree's changes)
+                                                on a configured machine or this Mac (t-107, see pa_run.py)
   pa-worktree check [--open-cards]              worktrees whose tasks are all done or parked: list them, open decision cards
   pa-worktree remove <task-id>                  delete a task's worktree, only with an answered "Delete" card
   pa-worker info <address>                      what deleting a worker would remove, as JSON
@@ -4107,6 +4110,23 @@ def cmd_full_suite(args):
     return module.full_suite(types.SimpleNamespace(**globals()), args)  # this module's helpers (also when a test loaded it)
 
 
+def load_tool(name):
+    """A tool module of this folder (pa_suite, pa_run), sharing pa."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(name, os.path.join(os.path.dirname(os.path.realpath(__file__)), name + ".py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    module.pa = pa
+    return module
+
+
+def cmd_run(args):
+    """pa-run (t-107): any test command in the tree to run, on a configured machine or this Mac: pa_run.py."""
+    import types
+    module = load_tool("pa_run")
+    return sys.exit(module.main(types.SimpleNamespace(**globals()), args))
+
+
 def suite_record(directory, record, command, code, seconds, pins=None, extra=None):
     """One line per repository of the worktree in content/suites.jsonl: what the full suite ran on (t-052 AC7.1).
     pins: the repos as taken before the run (each with its tree; t-056), else read now. extra: more keys per line."""
@@ -4207,7 +4227,24 @@ def main():
                                                                   "cap, holders) and this Mac's slot")
         parser.add_argument("--space")
         return cmd_full_suite(parser.parse_args())
-    raise pa.Problem("invoke as pa-gate, pa-hooks, pa-hook, pa-worktree, pa-worker, pa-trust or pa-full-suite")
+    if kind == "pa-run":
+        parser.description = "Run a test command in the tree to run (HEAD plus the worktree's changes) on a machine of " \
+                             "config.json's suiteMachines, or this Mac (t-107; see pa_run.py)."
+        parser.add_argument("--on", metavar="M", help="on machine M only; 125 when it cannot run there (no fallback)")
+        parser.add_argument("--local", action="store_true", help="on this Mac, never on a configured machine")
+        parser.add_argument("--commit", metavar="C", help="the tree to run is commit C (an ancestor of HEAD), with only "
+                                                          "the --overlay paths from the worktree")
+        parser.add_argument("--overlay", metavar="PATH", action="append", help="with --commit: a path taken from the "
+                                                                              "worktree (missing there: deleted); repeat")
+        parser.add_argument("--cwd", metavar="SUBDIR", help="run in this folder of the tree (default: the current one)")
+        parser.add_argument("--for", dest="kind", default="other", choices=("single", "failing-first", "mutation",
+                            "module", "affected", "measure", "other"), help="the kind of run, for the record")
+        parser.add_argument("argv", nargs=argparse.REMAINDER, help="-- then the command's words")
+        args = parser.parse_args()
+        if not [w for w in args.argv if w != "--"][:1]:
+            parser.error("give the command after --")
+        return cmd_run(args)
+    raise pa.Problem("invoke as pa-gate, pa-hooks, pa-hook, pa-worktree, pa-worker, pa-trust, pa-full-suite or pa-run")
 
 
 if __name__ == "__main__":

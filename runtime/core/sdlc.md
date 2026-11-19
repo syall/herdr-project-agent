@@ -50,3 +50,6 @@ that differ.
   which ready job starts first.
 - The full suite may run on another machine the person configured; a pass there counts, and
   `pa-full-suite --local` runs it on this Mac (for a macOS-only check).
+- Other test commands run as `pa-run -- <command>` (failing-first: `pa-run --commit <base>
+  --overlay <test file> -- <command>`), on such a machine with the worktree's changes;
+  `pa-run --local` runs on this Mac only where a rule allows it.

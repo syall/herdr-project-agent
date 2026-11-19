@@ -96,6 +96,9 @@ folder and the address to report to.
   The full suite may run on another machine the person configured (the part that needs
   this Mac stays here); a pass there counts for the tree, and `pa-full-suite --local`
   runs it on this Mac.
+- Run other test commands as `pa-run -- <command>` (failing-first: `pa-run --commit <base>
+  --overlay <test file> -- <command>`); it runs your worktree's tree, changes included, on
+  such a machine. Use `pa-run --local` (this Mac) only where a rule allows it.
 - For a bug fix, commit a failing test first. Do not edit test files while fixing.
 - Paste real tool output into `build.log`; never summarize a build you did not run.
 - A hook that exits with code 2 means fix it and try again. Do not work around a hook.

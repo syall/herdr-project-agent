@@ -111,6 +111,8 @@ BUNDLE_MAX = 6 * 1024 * 1024  # base64 bytes; hc reads at most 8 MB
 REMOTE_COMMAND = "sh tests/run-all.sh"  # the only command that goes to a machine (R6; as_run_all, J2-D15)
 FILE_NAME = re.compile(r"^[^/\x00]+$")
 TOOLS = ("git", "python3", "node", "sh")
+FAST_POLL, FAST_SPAN = 1.0, 60  # t-107 R17: a pa-run's watcher polls every second for its first minute
+FALLBACKS = ("mac", "none")  # t-107 R11: config.json's suiteFallback
 SIGNAL_EXIT = {signal.SIGTERM: 143, signal.SIGINT: 130, signal.SIGHUP: 129}
 
 
@@ -1015,6 +1017,15 @@ def machines(cfg):
     return good, bad
 
 
+def fallback(cfg):
+    """t-107 R11: (config.json's suiteFallback, a note on a bad value or None). "mac" (the default): a run no machine
+    takes may run on this Mac; "none": never on its own (only --local)."""
+    value = (cfg or {}).get("suiteFallback", "mac")
+    if value in FALLBACKS:
+        return value, None
+    return "mac", "suiteFallback {!r} ignored: one of \"mac\", \"none\"; read as \"mac\"".format(value)
+
+
 def hc(argv, timeout=120, stdin=None):
     """(exit, stdout, stderr) of one hc call."""
     feed = {"input": stdin} if stdin is not None else {"stdin": subprocess.DEVNULL}
@@ -1133,12 +1144,18 @@ def folder_of(run):
     return "/tmp/pa-suite-" + run
 
 
-def ship(h, machine, run, pin, tools, root):
-    """R7, R8: the run folder there, the bundle of the pinned commit, the clone checked out and its ids checked."""
+def ship(h, machine, run, pin, tools, root, patch=None, head=None):
+    """R7, R8: the run folder there, the bundle of the pinned commit, the clone checked out and its ids checked.
+    t-107 (pa-run): head, the commit the bundle holds when the commit to check out is an ancestor of it; patch, the
+    `git diff --binary` from the commit to pin["tree"], sent as p.b64 and applied with `git apply --index` there,
+    then the clone's index tree (write-tree) must be that tree. Without a patch the script is t-089's."""
     folder = folder_of(run)
     commit, tree = pin.get("commit") or "", pin.get("tree") or ""
-    if not SHA.match(commit) or not SHA.match(tree):
+    head = head or commit
+    if not SHA.match(commit) or not SHA.match(tree) or not SHA.match(head):
         raise SetupFailed("bad pins {!r} {!r}".format(commit, tree))
+    extra = base64.b64encode(patch.encode("utf-8", "surrogateescape") if isinstance(patch, str) else patch).decode(
+        "ascii") if patch else ""
     for t in TOOLS:
         if not TOOL_PATH.match((tools.get(t) or {}).get("path") or ""):
             raise SetupFailed("bad {} path from the probe".format(t))
@@ -1152,17 +1169,21 @@ def ship(h, machine, run, pin, tools, root):
         if code:
             raise SetupFailed("git bundle create: " + first_line(err, "exit {}".format(code)))
         code, heads, err = h.git(root, "bundle", "list-heads", bundle)
-        if code or heads.split() != [commit, "HEAD"]:
-            raise SetupFailed("the bundle's heads are {!r}, not the pinned commit {} (HEAD moved?)".format(heads, commit))
+        if code or heads.split() != [head, "HEAD"]:
+            raise SetupFailed("the bundle's heads are {!r}, not the pinned commit {} (HEAD moved?)".format(heads, head))
         with open(bundle, "rb") as f:
             data = base64.b64encode(f.read()).decode("ascii")
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
-    if len(data) > BUNDLE_MAX:
-        raise SetupFailed("bundle too large ({} bytes base64, at most {})".format(len(data), BUNDLE_MAX))
+    if len(data) + len(extra) > BUNDLE_MAX:
+        raise SetupFailed("bundle too large ({} bytes base64, at most {})".format(len(data) + len(extra), BUNDLE_MAX))
     code, _, err = hc(["file", "write", "--on", machine, folder + "/b.b64"], stdin=data)
     if code:
         raise SetupFailed("hc file write: " + first_line(err, "exit {}".format(code)))
+    if extra:
+        code, _, err = hc(["file", "write", "--on", machine, folder + "/p.b64"], stdin=extra)
+        if code:
+            raise SetupFailed("hc file write: " + first_line(err, "exit {}".format(code)))
     py, git, sh_path = tools["python3"]["path"], tools["git"]["path"], tools["sh"]["path"]
     script = "\n".join([
         "set -e",
@@ -1174,8 +1195,14 @@ def ship(h, machine, run, pin, tools, root):
         "mkdir -m 700 bin home tmp xdg npm u",
         "printf '%s\\n' '#!{}' 'echo \"hc is not available in a remote suite run\" >&2' 'exit 2' > bin/hc".format(sh_path),
         "chmod 755 bin/hc",
-    ] + ["ln -s {} bin/{}".format(tools[t]["path"], t) for t in TOOLS] + [
-        "{} -C w rev-parse HEAD 'HEAD^{{tree}}'".format(git), ""])
+    ] + ["ln -s {} bin/{}".format(tools[t]["path"], t) for t in TOOLS] + ([
+        "{} -c 'import base64, sys; open(sys.argv[2], \"wb\").write(base64.b64decode(open(sys.argv[1]).read()))' p.b64 p.patch".format(py),
+        "rm -f p.b64",
+        "{} -C w apply --index --binary {}/p.patch".format(git, folder),
+        "rm -f p.patch",
+        "{} -C w rev-parse HEAD".format(git),
+        "{} -C w write-tree".format(git), ""] if extra else [
+        "{} -C w rev-parse HEAD 'HEAD^{{tree}}'".format(git), ""]))
     code, out, err = hc(["exec", "--on", machine, "--timeout", "300", "--", "sh", "-c", script], timeout=360)
     if code:
         raise SetupFailed("setup: " + first_line(err or out, "exit {}".format(code)))
@@ -1201,9 +1228,11 @@ def run_script(folder, tools):
         "date +%s > ../t1", ""])
 
 
-def start_remote(machine, run, folder, tools):
+def start_remote(machine, run, folder, tools, script=None):
+    """The run's hc terminal there; script: t-107's pa-run script in place of run_script's."""
     code, out, err = hc(["run", "--bg", "--rm", "--no-notify", "--json", "--on", machine, "--name", "pa-suite-" + run,
-                         "--label", "pa.suite=" + run, "--cwd", folder + "/w", "--", "sh", "-c", run_script(folder, tools)])
+                         "--label", "pa.suite=" + run, "--cwd", folder + "/w", "--", "sh", "-c",
+                         script or run_script(folder, tools)])
     if code:
         raise SetupFailed("hc run: " + first_line(err, "exit {}".format(code)))
     try:
@@ -1258,10 +1287,11 @@ class RemoteWatcher(threading.Thread):
     """R15, R17: copies a remote run's output (whole lines) and progress back while it runs; ends when its code
     is there, after REMOTE_TIMEOUT, or after LOST_GRACE s with no good read."""
 
-    def __init__(self, machine, folder, output, progress, side):
+    def __init__(self, machine, folder, output, progress, side, sink=None, fast=False):
         threading.Thread.__init__(self, daemon=True)
         self.machine, self.folder, self.output, self.progress, self.side = machine, folder, output, progress, side
         self.poll, self.grace = env_seconds("PA_SUITE_REMOTE_POLL", REMOTE_POLL), env_seconds("PA_SUITE_LOST_GRACE", LOST_GRACE)
+        self.sink, self.fast = sink, fast  # t-107: each copied text to sink too; fast: 1 s polls for the first 60 s
         self.lines, self.code, self.remote_lines, self.lost, self.timed_out = 0, None, None, None, False
         self.began = self.last_ok = time.time()
         self.stopping, self.ended = threading.Event(), threading.Event()
@@ -1283,7 +1313,7 @@ class RemoteWatcher(threading.Thread):
                 if now - self.began > REMOTE_TIMEOUT:
                     self.timed_out = True
                     break
-                self.stopping.wait(self.poll)
+                self.stopping.wait(min(self.poll, FAST_POLL) if self.fast and now - self.began < FAST_SPAN else self.poll)
         finally:
             self.ended.set()
 
@@ -1295,6 +1325,8 @@ class RemoteWatcher(threading.Thread):
                 with open(self.output, "a") as f:
                     f.write(whole)
                 self.lines += whole.count("\n")
+                if self.sink:
+                    self.sink(whole)
         ok, rc, lines, row = remote_status(self.machine, self.folder)
         if not ok:
             return
@@ -1483,6 +1515,10 @@ def full_suite(h, args):
     # t-089: the places. No suiteMachines (or --local): this Mac, today's path and lines exactly.
     good, bad = ([], []) if local else machines(pa.config())
     config_path = os.path.join(home(), "config.json")
+    if good and not on and fallback(pa.config())[0] == "none":  # t-107 R11: never this Mac on its own
+        on = good[0]["machine"]
+        print("pa-full-suite: suiteFallback is \"none\" in {}: as --on {} (--local runs on this Mac)".format(
+            config_path, on), flush=True)
     remote_mode = bool(on or good)
     note, chosen, probes, reachable = None, None, {}, []
     for b in bad:  # named once, even when no entry is left (then the run is today's)

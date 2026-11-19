@@ -1,0 +1,655 @@
+"""pa-run (t-107): any test command in the tree to run, on a configured machine or this Mac. Python standard library
+only (3.7+). Loaded by pa_hooks.py from its own folder (h: the pa_hooks module, for its helpers); it loads
+pa_suite.py from the same folder for t-089's remote parts (probe, slots, ship, terminal, watcher, cleanup, sweep).
+
+  pa-run [--on M | --local] [--commit C] [--overlay PATH ...] [--cwd SUBDIR] [--for KIND] -- <argv...>
+
+Run inside a task's worktree. argv runs in the tree to run and its output streams to stdout (pa-run's own lines go
+to stderr); pa-run exits with argv's code.
+- The tree to run (R4-R6): HEAD plus every change in the worktree (what `git add -A` would stage: tracked changes,
+  deletions, untracked files that are not ignored); with --commit C (an ancestor of HEAD, or HEAD), C with only the
+  --overlay paths taken from the worktree (a path missing there is deleted). It is built with a temporary index and
+  object folder (GIT_INDEX_FILE, GIT_OBJECT_DIRECTORY, the repo's objects as alternates): nothing is written under
+  .git. The patch `git diff --binary C T` travels with the bundle of HEAD; there the clone checks out C, applies it
+  with `git apply --index`, and its commit and tree must be C and T.
+- argv (R2): an argv list, each word quoted into the fixed remote script. argv[0] is python3, node, sh or a relative
+  path to an executable file in the tree. Refused (125): hc or any other name, `sh -c`, a command that starts an hc
+  core (tests/pa_session_check.sh; tests/run-all.sh with no flag or --only-integration: use pa-full-suite).
+- Never sent (R8): a changed path matching the guard's secret patterns or the profile's secretPaths, or under
+  .claude/; ignored files; bundle and patch over 6 MB base64 (125).
+- Where (R9 as J1-D1, R10, R11): every run on a machine takes one of its `cap` slots (the same slots as full
+  suites). The first configured machine with a free slot that is reachable; all busy: it waits, saying for whom, up
+  to PA_SUITE_WAIT_LIMIT (600) s, then 124. None reachable or its setup failed: this Mac when config.json's
+  suiteFallback is "mac" (the default), else 125. --on M: only M (125 when it cannot). --local, or no suiteMachines:
+  this Mac (with --commit, in a scratch clone).
+- There (R16, R17): t-089's run folder, own HOME/TMPDIR/XDG/HERDR_PA_HOME, refusing hc shim, PATH {folder}/bin first,
+  plus PA_SUITE_REMOTE=1; output copied back every second for the first minute, then every PA_SUITE_REMOTE_POLL s.
+  Only the output and code come back. TERM, INT, HUP: the terminal ended, the folder removed, 143, 130, 129.
+- Records (R18-R20): evidence/<task>/run-<id>.out (the whole output), one build.log line, one line per run in
+  HERDR_PA_HOME/test-runs.jsonl (local runs too; lines older than 30 days dropped), a progress file of kind pa-run.
+Exit: argv's code; 125 not run; 124 no slot came free or the machine was lost.
+"""
+import base64
+import fcntl
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import uuid
+
+pa = None  # set by pa_hooks after loading
+S = None   # pa_suite, set by load()
+
+NOT_RUN, NO_SLOT = 125, 124
+KINDS = ("single", "failing-first", "mutation", "module", "affected", "measure", "other")
+PROGRAMS = ("python3", "node", "sh")
+WAIT_LIMIT = 600  # PA_SUITE_WAIT_LIMIT
+KEEP = 30 * 86400  # test-runs.jsonl lines older than this are dropped on write
+ARGV_KEEP = 200
+SESSION_CHECK = "tests/pa_session_check.sh"
+RUN_ALL = "tests/run-all.sh"
+GIT_SAFE = ["-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false", "-c", "core.splitIndex=false"]
+
+
+class NotRun(Exception):
+    pass
+
+
+def load(h):
+    """pa_suite from this folder (once), sharing pa."""
+    global S
+    if S is None:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("pa_suite", os.path.join(os.path.dirname(os.path.realpath(__file__)),
+                                                                                "pa_suite.py"))
+        S = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(S)
+    S.pa = pa
+    return S
+
+
+def say(line):
+    print("pa-run: " + line, file=sys.stderr, flush=True)
+
+
+# ---- argv (R2) ----
+
+def clean_rel(value):
+    """A relative path inside the tree, normalised ('' for the top), else None."""
+    if not value or os.path.isabs(value):
+        return None if value else ""
+    n = os.path.normpath(value)
+    if n == ".":
+        return ""
+    if n == ".." or n.startswith("../") or "/../" in "/" + value + "/":
+        return None
+    return n
+
+
+def check_cwd(value):
+    n = clean_rel(value or "")
+    return (n, None) if n is not None else (None, "--cwd {!r} is not a folder inside the tree (relative, no ..)".format(value))
+
+
+def executable_in(top, rel, commit, overlay, h):
+    """Is rel (from the top) an executable file in the tree to run?"""
+    if commit and rel not in overlay:
+        code, out, _ = h.git(top, "ls-tree", commit, "--", rel)
+        return not code and out.split(" ")[0] == "100755"
+    path = os.path.join(top, rel)
+    return os.path.isfile(path) and os.access(path, os.X_OK)
+
+
+def check_argv(argv, top, subdir, commit=None, overlay=(), h=None):
+    """R2: None when argv may run, else why not."""
+    if not argv:
+        return "no command after --"
+    first = argv[0]
+    for i, word in enumerate(argv):  # first: what starts an hc core is named as such
+        rel = clean_rel(os.path.join(subdir or "", word)) if word and not word.startswith("-") else None
+        if rel == SESSION_CHECK:
+            return "{} starts an hc core: use pa-full-suite: the integration part runs on this Mac".format(SESSION_CHECK)
+        if rel == RUN_ALL and (i == 0 or (i == 1 and first == "sh")):
+            flags = argv[i + 1:]
+            if not flags or flags[0] == "--only-integration":
+                return "{} {} starts an hc core: use pa-full-suite: the integration part runs on this Mac".format(
+                    RUN_ALL, " ".join(flags) or "(no flag)")
+    if first == "hc":
+        return "argv[0] is hc: hc never runs from pa-run (a test reaches no hc core)"
+    if first not in PROGRAMS:
+        if os.path.isabs(first):
+            return "argv[0] {!r} is an absolute path: give python3, node, sh or a relative path in the tree".format(first)
+        if "/.." in "/" + first + "/" or first.startswith(".."):
+            return "argv[0] {!r} has ..: give a path inside the tree".format(first)
+        rel = clean_rel(os.path.join(subdir or "", first))
+        if rel is None or not executable_in(top, rel, commit, set(overlay or ()), h or _h):
+            return "argv[0] {!r} is not python3, node, sh or an executable file in the tree".format(first)
+    if first == "sh":
+        for word in argv[1:]:
+            if word == "-" or not word.startswith("-"):
+                break
+            if not word.startswith("--") and "c" in word[1:]:
+                return "sh -c runs a shell line; give the command's own words (sh <script> ...)"
+    return None
+
+
+_h = None
+
+
+# ---- the tree to run (R4-R8) ----
+
+def git_bytes(top, env, *args, stdin=None):
+    try:
+        r = subprocess.run(["git"] + GIT_SAFE + ["-C", top] + list(args), env=env, input=stdin,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300)
+    except subprocess.TimeoutExpired:
+        return 124, b"", b"git timed out"
+    except OSError as e:
+        return 127, b"", str(e).encode()
+    return r.returncode, r.stdout, r.stderr
+
+
+def text(b):
+    return b.decode("utf-8", "replace").strip()
+
+
+def secret_patterns(h, profile):
+    return list(h.DENY_PATHS) + [(p, "a secret ({} profile)".format((profile or {}).get("name")))
+                                 for p in (profile or {}).get("secretPaths", []) if isinstance(p, str)]
+
+
+def tree_to_run(h, top, commit=None, overlay=None, secrets=None):
+    """R4-R6, R8: {commit, head, tree, patch (bytes), paths}. secrets: [(pattern, what)] checked against the changed
+    paths (with .claude/), or None to skip (a local run: nothing is sent). Raises NotRun. Writes nothing in .git:
+    git add and write-tree see only the temp object folder (with the repo's objects as alternates, git would
+    "freshen" an existing object by setting its mtime), so every object they write lands there; read-tree and diff,
+    which only read, see the repo's objects too (J1-D3)."""
+    load(None)
+    base_env = dict(os.environ, GIT_OPTIONAL_LOCKS="0")
+    for k in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES"):
+        base_env.pop(k, None)
+    code, out, err = git_bytes(top, base_env, "rev-parse", "--verify", "-q", "HEAD^{commit}")
+    head = text(out)
+    if code or not S.SHA.match(head):
+        raise NotRun("the worktree has no commit (git rev-parse HEAD: {})".format(text(err) or code))
+    code, out, err = git_bytes(top, base_env, "rev-parse", "--git-common-dir")
+    common = text(out)
+    if code or not common:
+        raise NotRun("git rev-parse --git-common-dir: " + (text(err) or str(code)))
+    common = os.path.realpath(os.path.join(top, common))
+    code, out, _ = git_bytes(top, base_env, "rev-parse", "--git-path", "index")
+    real_index = os.path.join(top, text(out)) if not code and text(out) else None
+    base = head
+    if commit:
+        code, out, err = git_bytes(top, base_env, "rev-parse", "--verify", "-q", commit + "^{commit}")
+        base = text(out)
+        if code or not S.SHA.match(base):
+            raise NotRun("--commit {}: not a commit here".format(commit))
+        code, _, _ = git_bytes(top, base_env, "merge-base", "--is-ancestor", base, head)
+        if code:
+            raise NotRun("--commit {} is not an ancestor of HEAD {} (v1 runs only HEAD's history)".format(commit, head[:12]))
+    scratch = tempfile.mkdtemp(prefix="pa-run-tree-")
+    try:
+        os.makedirs(os.path.join(scratch, "objects", "pack"))
+        os.makedirs(os.path.join(scratch, "objects", "info"))
+        write_env = dict(base_env, GIT_INDEX_FILE=os.path.join(scratch, "index"),
+                         GIT_OBJECT_DIRECTORY=os.path.join(scratch, "objects"))
+        env = dict(write_env, GIT_ALTERNATE_OBJECT_DIRECTORIES=os.path.join(common, "objects"))
+        if commit:
+            steps = [("read-tree", base), ("add", "-A", "--") + tuple(overlay or ())] if overlay else [("read-tree", base)]
+        else:
+            copied = False
+            if real_index and os.path.isfile(real_index):  # read only: its stat data spares rehashing every file
+                try:
+                    shutil.copyfile(real_index, env["GIT_INDEX_FILE"])
+                    copied = True
+                except OSError:
+                    pass
+            steps = ([] if copied else [("read-tree", head)]) + [("add", "-A")]
+        for step in steps:
+            code, _, err = git_bytes(top, write_env if step[0] == "add" else env, *step)
+            if code and step[0] == "add" and not commit:  # a copied index git cannot use: from HEAD instead
+                git_bytes(top, env, "read-tree", head)
+                code, _, err = git_bytes(top, write_env, *step)
+            if code:
+                raise NotRun("git {}: {}".format(step[0], S.first_line(text(err), "exit {}".format(code))))
+        code, out, err = git_bytes(top, write_env, "write-tree", "--missing-ok")
+        tree = text(out)
+        if code or not S.SHA.match(tree):
+            raise NotRun("git write-tree: " + (text(err) or str(code)))
+        diff = ["diff", "--no-color", "--no-ext-diff", "--no-textconv", "--no-renames", "--src-prefix=a/",
+                "--dst-prefix=b/"]
+        code, names, err = git_bytes(top, env, *(diff + ["--name-only", "-z", base, tree]))
+        if code:
+            raise NotRun("git diff --name-only: " + text(err))
+        paths = [p.decode("utf-8", "surrogateescape") for p in names.split(b"\0") if p]
+        patch = b""
+        if paths:
+            code, patch, err = git_bytes(top, env, *(diff + ["--binary", "--full-index", base, tree]))
+            if code:
+                raise NotRun("git diff --binary: " + text(err))
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    if secrets is not None:
+        for p in paths:
+            if p.startswith(".claude/") or "/.claude/" in "/" + p:
+                raise NotRun("{} is under .claude/ (the worker's own settings): never sent".format(p))
+            for pattern, what in secrets:
+                if re.search(pattern, p):
+                    raise NotRun("{} is {}: never sent".format(p, what))
+    return {"commit": base, "head": head, "tree": tree, "patch": patch, "paths": paths}
+
+
+# ---- records (R18, R19) ----
+
+def runs_file():
+    return os.path.join(S.home(), "test-runs.jsonl")
+
+
+def record(row):
+    """One line in HERDR_PA_HOME/test-runs.jsonl; lines older than KEEP dropped. Never raises."""
+    path = runs_file()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path + ".lock", "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            keep, now = [], time.time()
+            for r in S.read_lines(path):
+                at = S.epoch(r.get("at"))
+                if at is None or now - at <= KEEP:
+                    keep.append(r)
+            keep.append(row)
+            tmp = "{}.tmp-{}".format(path, os.getpid())
+            with open(tmp, "w") as f:
+                f.write("".join(json.dumps(r) + "\n" for r in keep))
+            os.replace(tmp, path)
+    except OSError as e:
+        say("could not record the run in {} ({})".format(path, e))
+
+
+def words(argv):
+    return " ".join(shlex.quote(w) for w in argv)
+
+
+# ---- running ----
+
+class Run(object):
+    def __init__(self, h, args, record_, directory, profile):
+        self.h, self.args, self.task = h, args, record_
+        self.directory, self.profile = directory, profile
+        self.run = uuid.uuid4().hex[:12]
+        self.evidence = os.path.join(directory, "evidence", record_["task"])
+        os.makedirs(self.evidence, exist_ok=True)
+        self.output = os.path.join(self.evidence, "run-{}.out".format(self.run))
+        self.build_log = os.path.join(self.evidence, "build.log")
+        self.kind = args.kind or "other"
+        self.began = time.time()
+        self.waited = 0.0
+        self.overhead = {"probe": None, "ship": None, "start": None, "copyback": None, "cleanup": None}
+        self.notes = []
+        self.progress = None
+        self.printed = 0
+
+    def finish(self, code, place, machine=None, os_name=None, ran=None):
+        seconds = round(time.time() - self.began, 1)
+        at = pa.now()
+        argv = words(self.argv)
+        with open(self.build_log, "a") as f:
+            f.write("=== {} pa-run {}: {} on {} -> exit {} after {:.0f}s (waited {:.0f}s){}\n".format(
+                at, self.kind, argv[:ARGV_KEEP], machine or "this Mac", code, seconds, self.waited,
+                "; " + "; ".join(self.notes) if self.notes else ""))
+        record({"at": at, "run": self.run, "task": self.task.get("task"), "worker": os.environ.get("HC_TERMINAL_ID") or None,
+                "kind": self.kind, "argv": argv[:ARGV_KEEP], "commit": (getattr(self, "tree", None) or {}).get("commit"),
+                "tree": (getattr(self, "tree", None) or {}).get("tree"), "place": place, "machine": machine, "os": os_name,
+                "waited": round(self.waited, 1), "seconds": seconds, "ran": ran, "overhead": self.overhead,
+                "exit": code, "note": "; ".join(self.notes) or None, "output": self.output})
+        S.update_progress(self.progress, state="done", exit=code, end=at, note="; ".join(self.notes) or None)
+        return code
+
+    def sink(self, chunk):
+        sys.stdout.write(chunk)
+        sys.stdout.flush()
+        self.printed += chunk.count("\n")
+
+
+def main(h, args):
+    global _h
+    _h = h
+    load(h)
+    record_ = h.find_task(os.getcwd())
+    if not record_:
+        raise pa.Problem("run pa-run inside a task's worktree (pa-hooks install marks it)")
+    argv = list(args.argv or [])
+    if argv[:1] == ["--"]:
+        argv = argv[1:]
+    if args.on and args.local:
+        say("not run: --on and --local name two places; give one")
+        return NOT_RUN
+    code, top, err = h.git(os.getcwd(), "rev-parse", "--show-toplevel")
+    if code or not top:
+        say("not run: not in a git tree ({})".format(err or code))
+        return NOT_RUN
+    top = os.path.realpath(top)
+    here = os.path.relpath(os.path.realpath(os.getcwd()), top)
+    if args.cwd is not None:
+        subdir, why = check_cwd(args.cwd)
+    else:
+        subdir, why = check_cwd("" if here == "." else here)
+    if why:
+        say("not run: " + why)
+        return NOT_RUN
+    overlay = []
+    for p in args.overlay or []:
+        rel = clean_rel(os.path.relpath(os.path.abspath(p), top)) if not os.path.isabs(p) or p.startswith(top) else None
+        if rel is None or rel == "":
+            say("not run: --overlay {!r} is not a path inside the tree".format(p))
+            return NOT_RUN
+        overlay.append(rel)
+    if overlay and not args.commit:
+        say("not run: --overlay goes with --commit (without it every change is in the tree already)")
+        return NOT_RUN
+    why = check_argv(argv, top, subdir, args.commit, overlay, h)
+    if why:
+        say("not run: " + why)
+        return NOT_RUN
+    directory, _agent, profile = h.load_context(record_["space"])
+    r = Run(h, args, record_, directory, profile)
+    r.argv, r.top, r.subdir, r.overlay = argv, top, subdir, overlay
+    saved = {}
+
+    def on_signal(sig, frame):
+        raise S.Interrupted(S.SIGNAL_EXIT.get(sig, 1))
+    for sig in S.SIGNAL_EXIT:
+        saved[sig] = signal.signal(sig, on_signal)
+    try:
+        return place_and_run(r)
+    finally:
+        for sig, old in saved.items():
+            signal.signal(sig, old)
+
+
+def place_and_run(r):
+    args = r.args
+    cfg = pa.config()
+    good, bad = ([], []) if args.local else S.machines(cfg)
+    where = os.path.join(S.home(), "config.json")
+    for b in bad:
+        say("suiteMachines in {}: {}".format(where, b))
+    if args.on and not [m for m in good if m["machine"] == args.on]:
+        say("not run on {}: not a machine of suiteMachines in {}".format(args.on, where))
+        return NOT_RUN
+    fb, fb_note = S.fallback(cfg) if good else ("mac", None)
+    if fb_note:
+        say("{} in {}".format(fb_note, where))
+    if not good:
+        return run_local(r, "--local" if args.local else "no suiteMachines in " + where)
+    candidates = [m for m in good if not args.on or m["machine"] == args.on]
+    name = args.on or candidates[0]["machine"]
+    try:
+        tree = tree_to_run(r.h, r.top, args.commit, r.overlay, secret_patterns(r.h, r.profile))
+        size = len(base64.b64encode(tree["patch"])) if tree["patch"] else 0
+        if size > S.BUNDLE_MAX:
+            raise NotRun("too large: the patch is {} bytes base64, at most {} with the bundle".format(size, S.BUNDLE_MAX))
+    except NotRun as e:
+        say("not run on {}: {}".format(name, e))
+        return NOT_RUN
+    r.tree = tree
+    info = {"task": r.task.get("task"), "worker": os.environ.get("HC_TERMINAL_ID") or None,
+            "what": "pa-run {}: {}".format(r.kind, words(r.argv)[:120]), "dir": r.top}
+    r.progress = S.new_progress({"run": r.run, "kind": "pa-run", "what": words(r.argv)[:ARGV_KEEP], "for": r.kind,
+                                 "task": r.task.get("task"), "worker": info["worker"], "dir": r.top,
+                                 "commit": tree["commit"], "tree": tree["tree"], "pid": os.getpid(), "state": "waiting",
+                                 "queued": pa.now(), "output": r.output, "place": "local"})
+    probes, chosen, slot = {}, None, None
+    queued = time.time()
+    try:
+        for m in candidates:  # a free slot first (a local flock), then the probe
+            f, _ = S.try_slot(S.machine_dir(m["machine"]), m["cap"], info)
+            if not f:
+                continue
+            probes[m["machine"]] = p = S.probe(m["machine"])
+            if p["ok"]:
+                chosen, slot = m, f
+                break
+            S.release(f)
+            say("{} is not reachable: {}".format(m["machine"], p.get("reason")))
+        if not chosen:
+            for m in candidates:
+                if m["machine"] not in probes:
+                    probes[m["machine"]] = p = S.probe(m["machine"])
+                    if not p["ok"]:
+                        say("{} is not reachable: {}".format(m["machine"], p.get("reason")))
+            reachable = [m for m in candidates if probes[m["machine"]]["ok"]]
+            if reachable:
+                chosen, slot = wait_for_slot(r, reachable, info)
+                if not chosen:
+                    return r.finish(NO_SLOT, None)
+            else:
+                why = "; ".join("{}: {}".format(k, v.get("reason")) for k, v in probes.items())
+                return not_there(r, name, "not reachable ({})".format(why), fb)
+        r.waited = time.time() - queued
+        p = probes[chosen["machine"]]
+        r.overhead["probe"] = p.get("seconds")
+        try:
+            return run_remote(r, chosen["machine"], p, slot)
+        except S.SetupFailed as e:
+            return not_there(r, chosen["machine"], "setup failed: {}".format(e), fb)
+    except S.Interrupted as e:
+        say("interrupted while choosing a place")
+        r.notes.append("interrupted")
+        return r.finish(e.code, None)
+    finally:
+        if slot is not None:
+            S.release(slot)
+
+
+def not_there(r, machine, why, fb):
+    if r.args.on or fb == "none":
+        line = "not run on {}: {}{}".format(machine, why, "" if r.args.on else
+                                            " (suiteFallback \"none\": never this Mac on its own; --local runs here)")
+        say(line)
+        r.notes.append(line)
+        return r.finish(NOT_RUN, None)
+    return run_local(r, "{} {}".format(machine, why))
+
+
+def wait_for_slot(r, reachable, info):
+    """R10: a slot on any reachable machine, waiting up to PA_SUITE_WAIT_LIMIT s. (machine, slot) or (None, None)."""
+    value = os.environ.get("PA_SUITE_WAIT_LIMIT", "")
+    limit = float(value) if value.replace(".", "", 1).isdigit() else WAIT_LIMIT
+    began, shown = time.time(), None
+    while True:
+        texts = []
+        for m in reachable:
+            f, holders = S.try_slot(S.machine_dir(m["machine"]), m["cap"], info)
+            if f:
+                return m, f
+            texts.append("{} (cap {}): {}".format(m["machine"], m["cap"], S.describe(holders)))
+        text = "; ".join(texts)
+        if text != shown:
+            say("waiting for a slot on {}".format(text))
+            S.update_progress(r.progress, waiting_for=text)
+            shown = text
+        if time.time() - began >= limit:
+            line = "no slot came free in {:.0f} s (running: {})".format(time.time() - began, text)
+            say(line)
+            r.notes.append(line)
+            r.waited = time.time() - began
+            return None, None
+        time.sleep(S.POLL)
+
+
+def argv_script(folder, tools, argv, subdir):
+    """R16: the fixed remote script: t-089's environment, PA_SUITE_REMOTE=1, the quoted argv in the clone's subdir."""
+    first = argv[0]
+    if first not in PROGRAMS:
+        first = "./" + os.path.normpath(first)
+    command = words([first] + list(argv[1:]))
+    changed = os.environ.get("PA_CHANGED_FILES", "")
+    return "\n".join([
+        "date +%s > {}/t0".format(folder),
+        "unset HC_TERMINAL_ID HC_SOCKET HC_TERMINAL_SOCKET HC_SCOPE CLAUDECODE",
+        "export HERDR_PA_HOME={0}/home TMPDIR={0}/tmp XDG_CACHE_HOME={0}/xdg/cache XDG_CONFIG_HOME={0}/xdg/config "
+        "XDG_DATA_HOME={0}/xdg/data XDG_STATE_HOME={0}/xdg/state PYTHONDONTWRITEBYTECODE=1 npm_config_cache={0}/npm "
+        "NODE={1} HOME={0}/u PA_SUITE_REMOTE=1 PA_CHANGED_FILES={2}".format(folder, tools["node"]["path"],
+                                                                            shlex.quote(changed)),
+        "export PATH={}/bin:$PATH".format(folder),
+        "( cd {} && {} ) > {}/out 2>&1 < /dev/null".format(shlex.quote(subdir or "."), command, folder),
+        "rc=$?",
+        "date +%s > {}/t1".format(folder),
+        "echo $rc > {0}/code.new && mv {0}/code.new {0}/code".format(folder), ""])
+
+
+def run_remote(r, machine, found, slot):
+    """R7, R16, R17 on machine under its slot. Its exit code; SetupFailed before anything ran there."""
+    h, tree = r.h, r.tree
+    tools, os_name = found.get("tools") or {}, found.get("os")
+    folder = S.folder_of(r.run)
+    for n in S.sweep(machine, r.run):
+        say("leftovers of an earlier run on {}: {}".format(machine, n))
+    S.update_progress(r.progress, place=machine, machine=machine, os=os_name, remote={"folder": folder, "terminal": None})
+    say("run {} on {} ({}; reachable in {:g}s): output in {}".format(r.run, machine, os_name, found.get("seconds") or 0,
+                                                                     r.output))
+    terminal, watcher = None, None
+    try:
+        try:
+            t = time.time()
+            S.ship(h, machine, r.run, {"commit": tree["commit"], "tree": tree["tree"]}, tools, r.top,
+                   patch=tree["patch"] or None, head=tree["head"])
+            r.overhead["ship"] = round(time.time() - t, 1)
+            t = time.time()
+            terminal = S.start_remote(machine, r.run, folder, tools, argv_script(folder, tools, r.argv, r.subdir))
+            r.overhead["start"] = round(time.time() - t, 1)
+        except S.SetupFailed:
+            S.cleanup(machine, r.run, terminal)
+            S.update_progress(r.progress, cleaned=True, place="local", machine=None, remote=None)
+            raise
+        S.update_progress(r.progress, state="running", start=pa.now(), remote={"folder": folder, "terminal": terminal})
+        watcher = S.RemoteWatcher(machine, folder, r.output, r.progress, None, sink=r.sink, fast=True)
+        watcher.start()
+        while not watcher.ended.wait(0.2):
+            pass
+        seen = time.time()
+        ran = None
+        if watcher.lost is not None:
+            code = NO_SLOT
+            r.notes.append("machine {} lost after {:.0f} s".format(machine, watcher.lost))
+        elif watcher.timed_out:
+            code = NO_SLOT
+            r.notes.append("timed out after {} s there".format(S.REMOTE_TIMEOUT))
+        else:
+            code = watcher.code
+            n = watcher.final()
+            if n:
+                r.notes.append(n)
+            rest = (pa.read_text(r.output) or "").splitlines(True)[r.printed:]
+            if rest:
+                r.sink("".join(rest))
+            c, out, _ = S.hc(["exec", "--on", machine, "--timeout", "30", "--", "cat", folder + "/t0", folder + "/t1"])
+            stamps = [int(x) for x in out.split() if x.isdigit()] if not c else []
+            if len(stamps) == 2:
+                ran = stamps[1] - stamps[0]
+                r.overhead["copyback"] = round(max(0.0, seen - stamps[1]), 1)
+        for n in r.notes:
+            say(n)
+        t = time.time()
+        left = S.cleanup(machine, r.run, terminal)
+        r.overhead["cleanup"] = round(time.time() - t, 1)
+        terminal = None
+        for n in left:
+            say("cleanup on {}: {} (the exit stays {})".format(machine, n, code))
+        S.update_progress(r.progress, cleaned=not [n for n in left if n.startswith("rm -rf")])
+        say("exit {} on {} ({}) after {:.0f}s; output in {}".format(code, machine, os_name, time.time() - r.began, r.output))
+        return r.finish(code, machine, machine, os_name, ran)
+    except S.Interrupted as e:
+        say("interrupted: ending the run on {} and cleaning up".format(machine))
+        if watcher is not None:
+            watcher.stop()
+        left = S.cleanup(machine, r.run, terminal)
+        for n in left:
+            say("cleanup on {}: {}".format(machine, n))
+        S.update_progress(r.progress, cleaned=not [n for n in left if n.startswith("rm -rf")])
+        r.notes.append("interrupted")
+        return r.finish(e.code, machine, machine, os_name)
+    finally:
+        if watcher is not None:
+            watcher.stop()
+
+
+def run_local(r, why):
+    """This Mac: the worktree itself, or (--commit) a scratch clone with the tree to run checked out."""
+    say("run {} on this Mac ({}): output in {}".format(r.run, why, r.output))
+    if why != "--local":
+        r.notes.append("on this Mac: " + why)
+    if r.progress is None:
+        r.progress = S.new_progress({"run": r.run, "kind": "pa-run", "what": words(r.argv)[:ARGV_KEEP], "for": r.kind,
+                                     "task": r.task.get("task"), "dir": r.top, "pid": os.getpid(), "state": "waiting",
+                                     "queued": pa.now(), "output": r.output, "place": "local"})
+    else:
+        S.update_progress(r.progress, place="local", machine=None, remote=None)
+    scratch = None
+    child = None
+    try:
+        root = r.top
+        if r.args.commit:
+            try:
+                tree = getattr(r, "tree", None) or tree_to_run(r.h, r.top, r.args.commit, r.overlay, None)
+                scratch = tempfile.mkdtemp(prefix="pa-run-")
+                root = os.path.join(scratch, "w")
+                local_checkout(r.top, root, tree)
+            except NotRun as e:
+                say("not run on this Mac: {}".format(e))
+                r.notes.append(str(e))
+                return r.finish(NOT_RUN, "local")
+        first = r.argv[0] if r.argv[0] in PROGRAMS else "./" + os.path.normpath(r.argv[0])
+        S.update_progress(r.progress, state="running", start=pa.now())
+        with open(r.output, "w") as out:
+            child = subprocess.Popen([first] + r.argv[1:], cwd=os.path.join(root, r.subdir or ""), stdin=subprocess.DEVNULL,
+                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
+            for line in iter(child.stdout.readline, b""):
+                chunk = line.decode("utf-8", "replace")
+                out.write(chunk)
+                out.flush()
+                r.sink(chunk)
+            code = child.wait()
+        code = 128 - code if code < 0 else code
+        say("exit {} on this Mac after {:.0f}s; output in {}".format(code, time.time() - r.began, r.output))
+        return r.finish(code, "local", None, S.mac_os())
+    except S.Interrupted as e:
+        if child is not None:
+            S.stop_group(child)
+        r.notes.append("interrupted")
+        return r.finish(e.code, "local", None, S.mac_os())
+    finally:
+        if child is not None and child.poll() is None:
+            S.stop_group(child)
+        if scratch:
+            shutil.rmtree(scratch, ignore_errors=True)
+
+
+def local_checkout(top, root, tree):
+    """A scratch clone (objects shared, nothing written in the source) with C checked out and the patch applied to
+    its index; its tree must be T."""
+    env = dict(os.environ)
+    for k in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES"):
+        env.pop(k, None)
+    for argv, stdin in ((["clone", "-q", "--shared", "--no-checkout", top, root], None),
+                        (["-C", root, "checkout", "-q", "--detach", tree["commit"]], None)) + (
+            ((["-C", root, "apply", "--index", "--binary", "-"], tree["patch"]),) if tree["patch"] else ()):
+        try:
+            p = subprocess.run(["git"] + argv, env=env, input=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               timeout=300)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            raise NotRun("git {}: {}".format(argv[0], e))
+        if p.returncode:
+            raise NotRun("git {}: {}".format(" ".join(argv[:3]), text(p.stderr)))
+    p = subprocess.run(["git", "-C", root, "write-tree"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+    if text(p.stdout) != tree["tree"]:
+        raise NotRun("the scratch tree is {}, not {}".format(text(p.stdout) or "nothing", tree["tree"]))

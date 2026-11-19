@@ -614,6 +614,22 @@ runs on this Mac, `--on <machine>` only there (exit 2 if it cannot), and `--plac
 whether it is reachable, its cap and who holds its slots. After updating, run `pa-sync --on <machine>` before installing the mod, so remote launchers
 get the new `pa-session` (see the install order above).
 
+Any other test command goes the same way with `pa-run -- <command>` (for example `pa-run -- python3 -m
+unittest tests.test_x`): the tree to run is HEAD plus every change in the worktree (what `git add -A` would stage),
+sent as a bundle and a patch whose tree id is checked there; `pa-run --commit <base> --overlay <test file> --
+<command>` runs an older commit with only the listed files from the worktree (a failing-first check). Nothing is
+written in the repository's `.git`; a changed secret file (`.env`, keys, a profile's `secretPaths`) or a file under
+`.claude/` is never sent. It takes the same machine slots as `pa-full-suite`, streams the output back and exits with
+the command's code (125: not run, with the reason; 124: no slot came free). Each run is one line in
+`~/.config/herdr-pa/test-runs.jsonl`. When no machine can take a run, it runs on this Mac unless config.json says
+
+```json
+"suiteFallback": "none"
+```
+
+Then `pa-run` ends with 125 and `pa-full-suite` behaves as `--on box-1` (the first machine); `--local` still runs on
+this Mac.
+
 ## Licence
 
 Apache License 2.0; see `LICENSE` and `NOTICE`.
