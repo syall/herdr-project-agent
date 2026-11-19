@@ -602,7 +602,11 @@ Full suites on another machine: list hc machines (`hc machine ls`) in this Mac's
 `pa-full-suite` then runs every part but the integration check on the first reachable machine with a free
 slot (`tests/run-all.sh --except-integration`, in an hc terminal under `/tmp/pa-suite-<run>` with its own home
 and temp folders), and the integration check on this Mac at the same time (`--only-integration`). Only a
-clean worktree whose full command is `sh tests/run-all.sh` goes: a `git bundle` of the pinned commit is sent,
+clean worktree whose full command is `sh tests/run-all.sh` goes, or a profile's own full command that the profile
+declares runs it in a plain git repo (`"tests": {"full": "hooks/tests.sh full", "fullIsRunAll": {"command":
+"hooks/tests.sh full", "unlessFound": ["<a file that marks a workspace>"]}}`): that counts while the worktree root
+is its git top level with an executable `tests/run-all.sh` and no listed file is in it or a folder above it.
+Then: a `git bundle` of the pinned commit is sent,
 and its commit and tree are checked there. If every machine is busy for `PA_SUITE_PREFER_WAIT` (300) s, or
 none is reachable, or the setup there fails, the run is on this Mac and says why. The output, `--status`,
 `--wait`, `build.log` and the record name the place; a pass there counts for the tree. `pa-full-suite --local`

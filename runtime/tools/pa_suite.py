@@ -39,7 +39,8 @@ by the caller). Script mode never loads pa.py (run-all.sh's test fixture stubs i
 The remote mode (t-089): HERDR_PA_HOME/config.json (this Mac's, never synced) may list machines,
   "suiteMachines": [{"machine": "<hc machine name>", "cap": <1..32, default 1>}, ...]
 in order of preference (a bad entry is named and skipped; a cap over 32 is used as 32). Then a run of the command
-`sh tests/run-all.sh` from a clean one-repo worktree (not --module) goes to the first reachable machine (one
+`sh tests/run-all.sh` from a clean one-repo worktree (not --module; or a profile full command its tests.fullIsRunAll
+declares to be that in a plain git repo, see as_run_all) goes to the first reachable machine (one
 `hc exec` probe: uname and the paths and versions of git, python3 >= 3.7, node and sh) with a free slot: a local flock
 under suite-slots/<machine>/ (its cap), held by this pa-full-suite for the whole run. All busy: it waits, and after
 PA_SUITE_PREFER_WAIT (300) s this Mac's slot counts too; none reachable: this Mac at once. There: mkdir -m 700
@@ -107,7 +108,8 @@ REMOTE_POLL = 5  # PA_SUITE_REMOTE_POLL: how often a remote run's output and pro
 LOST_GRACE = 300  # PA_SUITE_LOST_GRACE: no good read from the machine for this long ends the run (124)
 REMOTE_TIMEOUT = 3600  # as a local run's own timeout
 BUNDLE_MAX = 6 * 1024 * 1024  # base64 bytes; hc reads at most 8 MB
-REMOTE_COMMAND = "sh tests/run-all.sh"  # the only command that goes to a machine (R6)
+REMOTE_COMMAND = "sh tests/run-all.sh"  # the only command that goes to a machine (R6; as_run_all, J2-D15)
+FILE_NAME = re.compile(r"^[^/\x00]+$")
 TOOLS = ("git", "python3", "node", "sh")
 SIGNAL_EXIT = {signal.SIGTERM: 143, signal.SIGINT: 130, signal.SIGHUP: 129}
 
@@ -1070,12 +1072,50 @@ def probe(machine):
     return found
 
 
-def remote_ok(command, found, module):
-    """R6: None when this run may go to a machine, else why it stays on this Mac."""
+def as_run_all(h, command, profile, root):
+    """d-222 A (J2-D15): (the command R6 checks, why not run-all.sh or None). A profile may declare in its tests that
+    its own full command runs tests/run-all.sh from the top level of a plain git repo:
+      "fullIsRunAll": {"command": "<its tests.full, as written>", "unlessFound": ["<file name>", ...]}
+    It counts as `sh tests/run-all.sh` only while tests.full is that command and the space has no command of its own,
+    the worktree root is its git top level with an executable tests/run-all.sh, and none of the named files is in the
+    root or a folder above it (the profile's marks of a workspace whose full command does more)."""
+    tests = (profile or {}).get("tests") or {}
+    said = tests.get("fullIsRunAll")
+    if said is None or command == REMOTE_COMMAND:
+        return command, None
+    names = said.get("unlessFound") if isinstance(said, dict) else None
+    if (not isinstance(said, dict) or not isinstance(said.get("command"), str) or not isinstance(names, list)
+            or not all(isinstance(n, str) and FILE_NAME.match(n) and n not in (".", "..") for n in names)):
+        return command, ('profile {}: tests.fullIsRunAll must be {{"command": "<tests.full>", "unlessFound": '
+                         '[<file names>]}}; ignored').format(profile.get("name"))
+    if said["command"] != tests.get("full") or command != h.command_for("full", {}, profile):
+        return command, None
+    only = "the profile's full command runs tests/run-all.sh only in a plain git repo"
+    top = os.path.realpath(root)
+    code, out, _ = h.git(top, "rev-parse", "--show-toplevel")
+    if code or not out or os.path.realpath(out) != top:
+        return command, "{}; {} is not its git top level".format(only, top)
+    run_all = os.path.join(top, "tests", "run-all.sh")
+    if not os.path.isfile(run_all) or not os.access(run_all, os.X_OK):
+        return command, "{}; {} is not executable".format(only, run_all)
+    d = top
+    while True:
+        for n in names:
+            if os.path.lexists(os.path.join(d, n)):
+                return command, "{}; {} is in {}".format(only, n, d)
+        up = os.path.dirname(d)
+        if up == d:
+            return REMOTE_COMMAND, None
+        d = up
+
+
+def remote_ok(command, found, module, why_not=None):
+    """R6: None when this run may go to a machine, else why it stays on this Mac. command is as_run_all's."""
     if module:
         return "--module runs on this Mac"
     if command != REMOTE_COMMAND:
-        return "the full command is `{}`, not `{}`".format(command, REMOTE_COMMAND)
+        return "the full command is `{}`, not `{}`{}".format(command, REMOTE_COMMAND,
+                                                              " ({})".format(why_not) if why_not else "")
     if len(found) != 1 or not found[0].get("commit") or not found[0].get("tree"):
         return "the worktree is not one git repository with a commit"
     if found[0].get("untracked"):
@@ -1449,8 +1489,9 @@ def full_suite(h, args):
     note, chosen, probes, reachable = None, None, {}, []
     for b in bad:  # named once, even when no entry is left (then the run is today's)
         log("pa-full-suite: suiteMachines in {}: {}".format(config_path, b))
+    eligible, why_not = (command, None) if module else as_run_all(h, command, profile, record["root"])
     if remote_mode:
-        why = remote_ok(command, found, module)
+        why = remote_ok(eligible, found, module, why_not)
         if on and not [m for m in good if m["machine"] == on]:
             print("pa-full-suite: --on {}: not a machine of suiteMachines in {}".format(on, config_path))
             return sys.exit(2)
@@ -1528,7 +1569,7 @@ def full_suite(h, args):
         m = chosen["machine"]
         try:
             code = run_remote(h, args, record, directory, command, evidence, build_log, where, run, output, progress,
-                              slot, m, probes[m], queued, pulse, reuse, log)
+                              slot, m, probes[m], queued, pulse, reuse, log, eligible)
         except SetupFailed as e:  # before anything ran there: this Mac in the same call (exit 2 with --on)
             release(slot)
             note = "setup on {} failed: {}".format(m, e)
@@ -1627,7 +1668,7 @@ def run_on_mac(h, record, directory, command, module, build_log, where, run, out
 
 
 def run_remote(h, args, record, directory, command, evidence, build_log, where, run, output, progress, slot, machine,
-               found_probe, queued, pulse, reuse, log):
+               found_probe, queued, pulse, reuse, log, eligible=None):
     """R7-R18 on machine under its slot: ship, run there, the integration part here, copy back, record, clean.
     Its exit code; SetupFailed before anything ran there (the slot is then still held, for the caller to release)."""
     root = record["root"]
@@ -1636,7 +1677,7 @@ def run_remote(h, args, record, directory, command, evidence, build_log, where, 
         release(slot)
         update_progress(progress, state="done", exit=0, end=pa.now(), note="not run: this tree passed while it waited")
         return 0
-    why = remote_ok(command, found, None)
+    why = remote_ok(eligible or command, found, None)
     if why:
         raise SetupFailed(why)
     waited = round(time.time() - queued, 1)
