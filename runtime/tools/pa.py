@@ -2171,6 +2171,7 @@ def launcher_start(ctx, address, space, directory, p):
         commit = (as_text(as_dict(installed.get("source")).get("commit"))
                   if tools is not None and installed.get("tools") == tools else None)
         record = {"version": LAUNCHER_VERSION, "accepts": list(ACCEPTS), "instance": instance, "pid": os.getpid(),
+                  "ppid": os.getppid(),  # t-077 O3: diagnostic only; identification reads the live process tree
                   "terminal": address, "space": space,
                   "started": ctx.get("startedAt") or ctx.setdefault("startedAt", now()),
                   "code": {"tools": tools, "file": me, "installed": as_text(installed.get("tools")), "commit": commit},
@@ -3355,8 +3356,15 @@ def identify_launcher(directory, agent):
         raise Problem("cannot restart: launcher.json is for terminal {} in space {}, not terminal {}{}".format(
             record.get("terminal"), record.get("space"), terminal, instead))
     if term.get("pid") != record.get("pid"):
-        raise Problem("cannot restart: terminal {} runs pid {}, launcher.json says pid {}: not the launcher that "
-                      "wrote it{}".format(terminal, term.get("pid"), record.get("pid"), instead))
+        wrapped = wrapper_of(term)
+        if wrapped is None:  # R4: a tab that is not Herdr's wrapper (a shell where it was typed) stays refused
+            raise Problem("cannot restart: terminal {} runs pid {} ({}), launcher.json says pid {}: not the launcher "
+                          "that wrote it{}".format(terminal, term.get("pid"), seen_text(term.get("argv")),
+                                                   record.get("pid"), instead))
+        why = child_link(term.get("pid"), record.get("pid"))
+        if why:  # R1 (a), (b): the record's pid is the wrapper's live launcher child, or it is refused
+            raise Problem("cannot restart: terminal {} runs pid {} ({}), launcher.json says pid {}: {}{}".format(
+                terminal, term.get("pid"), seen_text(None, wrapped), record.get("pid"), why, instead))
     return record, term
 
 
@@ -3547,6 +3555,113 @@ def in_agent():
 PYTHON_NAME = re.compile(r"python[0-9.]*$")
 
 
+def proc_info(pid):
+    """(parent pid, command line) of a process on this machine, from ps (the same flags on macOS and Linux); None
+    when pid is not a positive number, the process is gone, or ps fails (t-077 R6: not proven, never accepted)."""
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return None
+    try:
+        r = subprocess.run(["ps", "-ww", "-o", "ppid=", "-o", "command=", "-p", str(pid)], stdout=subprocess.PIPE,
+                           stderr=subprocess.DEVNULL, universal_newlines=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    lines = (r.stdout or "").strip().splitlines() if r.returncode == 0 else []
+    parts = lines[0].split(None, 1) if lines else []
+    if len(parts) != 2 or not parts[0].isdigit():
+        return None
+    return int(parts[0]), parts[1].strip()
+
+
+# Herdr's login-shell wrapper (t-077 R3). hc reports a tab's argv as `sh -c <script> sh <command...>`; the script is
+# matched by its parts (spec O2: a reworded script is "not the wrapper", refused, safe)
+WRAPPER_SCRIPT_PARTS = ("shell=${SHELL:-/bin/sh}", 'case "${shell##*/}" in',
+                        "exec \"$shell\" -lic 'command $argv[2..]; exec $argv[1] -li' \"$shell\" \"$@\"",
+                        "exec \"$shell\" -lic '\"$@\"; exec \"$0\" -li' \"$shell\" \"$@\"",
+                        "exec sh -c '\"$@\"; exec \"${SHELL:-sh}\" -i' sh \"$@\"", "esac")
+# ... and ps shows the same process after the script's exec as `<shell> <words> <shell> <command...>`, one per branch:
+# (the shell's names, the words between the shell and its own $0, which is the shell again)
+WRAPPER_PS_FORMS = ((("sh", "bash", "zsh", "dash", "ksh"), ["-lic", '"$@";', "exec", '"$0"', "-li"]),
+                    (("fish",), ["-lic", "command", "$argv[2..];", "exec", "$argv[1]", "-li"]),
+                    (("sh",), ["-c", '"$@";', "exec", '"${SHELL:-sh}"', "-i"]))
+
+
+def wrapped_command(value):
+    """The command words Herdr's login-shell wrapper runs ("$@" after its own $0), from hc's argv (a list) or a ps
+    command line (a string); None for anything else, a shell where something was typed included (R4)."""
+    if isinstance(value, list):
+        if not all(isinstance(a, str) for a in value):
+            return None
+        if (len(value) >= 5 and os.path.basename(value[0]) == "sh" and value[1] == "-c" and value[3] == "sh"
+                and all(" ".join(part.split()) in " ".join(value[2].split()) for part in WRAPPER_SCRIPT_PARTS)):
+            return value[4:]
+        value = " ".join(value)
+    if not isinstance(value, str):
+        return None
+    words = value.split()  # ps gives a string: split on whitespace only; a path with spaces fails to match (safe)
+    for names, middle in WRAPPER_PS_FORMS:
+        k = 1 + len(middle)
+        if (len(words) > k + 1 and os.path.basename(words[0]) in names and words[1:k] == middle
+                and words[k] == words[0]):
+            return words[k + 1:]
+    return None
+
+
+def wrapper_of(term):
+    """The command Herdr's login-shell wrapper runs in this terminal: from hc's argv, else from ps of hc's pid (the
+    wrapper's login shell after its exec); None when the terminal's program is not the wrapper."""
+    wrapped = wrapped_command(term.get("argv"))
+    if wrapped is None:
+        info = proc_info(term.get("pid"))
+        wrapped = wrapped_command(info[1]) if info else None
+    return wrapped
+
+
+def launcher_words(words):
+    """A launcher's command words: pa-session, or a python running pa-session (the symlink, as ps shows it) or
+    pa.py session."""
+    if not words or not all(isinstance(w, str) for w in words):
+        return False
+    base = os.path.basename(words[0])
+    if base == "pa-session":
+        return True
+    if not PYTHON_NAME.match(base) or len(words) < 2:
+        return False
+    script = os.path.basename(words[1])
+    return script == "pa-session" or (script == "pa.py" and len(words) >= 3 and words[2] == "session")
+
+
+def child_link(term_pid, pid):
+    """None when pid is a live launcher whose parent is term_pid (the wrapper's login shell forks the launcher, so
+    hc's pid and launcher.json's differ: R1 (a), (b)); else what was seen, in one line."""
+    info = proc_info(pid)
+    if not info:
+        return "pid {} is not running (or cannot be read)".format(pid)
+    ppid, command = info
+    if ppid != term_pid:
+        return "pid {}'s parent is {}, not {}".format(pid, ppid, term_pid)
+    if not launcher_words(command.split()):
+        return "pid {} runs {!r}, not a launcher".format(pid, short_words(command.split()))
+    return None
+
+
+def short_words(words, n=4):
+    """The first n words, each cut to 60 characters, in one line."""
+    return " ".join(w if len(w) <= 60 else w[:57] + "..." for w in words[:n])
+
+
+def seen_text(argv, wrapped=None):
+    """What a terminal runs, in one line (R5): the wrapper and the first words it runs, or argv's first words with a
+    script (a newline or a long word) shown as <script>; never the script's text."""
+    if wrapped is not None:
+        return "Herdr's login-shell wrapper running {!r}".format(short_words(wrapped))
+    if isinstance(argv, str):
+        argv = argv.split()
+    if not isinstance(argv, list):
+        return "'unknown'"
+    words = [a if "\n" not in a and len(a) <= 60 else "<script>" for a in argv[:6] if isinstance(a, str)]
+    return repr(" ".join(" ".join(words).split())) if words else "'unknown'"
+
+
 def pa_session_argv(argv, space):
     """R10 (e): hc's start argv of the terminal is a launcher for this space: `pa-session ... --space <id>`, or a
     python running pa.py session with that flag; exactly one --space value, the space's local id."""
@@ -3555,6 +3670,8 @@ def pa_session_argv(argv, space):
     base = os.path.basename(argv[0])
     if base == "pa-session":
         rest = argv[1:]
+    elif PYTHON_NAME.match(base) and len(argv) >= 2 and os.path.basename(argv[1]) == "pa-session":
+        rest = argv[2:]  # the symlinked launcher as ps shows it (t-077)
     elif PYTHON_NAME.match(base) and len(argv) >= 3 and os.path.basename(argv[1]) == "pa.py" and argv[2] == "session":
         rest = argv[3:]
     else:
@@ -3579,20 +3696,27 @@ def identify_old_launcher(directory, agent):
     terminal, term = check_terminal(directory, agent)
     space = agent.get("space")
     argv = term.get("argv")
+    wrapped = None
     if not pa_session_argv(argv, space):
-        shown = " ".join(a for a in argv[:4] if isinstance(a, str)) if isinstance(argv, list) else ""
-        if (isinstance(argv, list) and argv and isinstance(argv[0], str) and os.path.basename(argv[0]) == "pa-session"
-                and "--ask" in argv):  # card d-161 'B: keep strict': refused, said plainly
-            raise Problem("cannot end it: its terminal is a space's first tab, started with {!r} (no --space), so it "
-                          "cannot be proven to be this space's launcher; close it by hand if it is the Project Agent "
-                          "(the keeper or the panel's Open then starts a restart-capable one)".format(shown))
-        raise Problem("cannot end it: its terminal's program is {!r}, not this space's pa-session; close it by hand "
-                      "if it is the Project Agent".format(shown or "unknown"))
+        wrapped = wrapper_of(term)  # t-077 R2: Herdr's login-shell wrapper running this space's pa-session
+        if not pa_session_argv(wrapped, space):
+            shown = seen_text(argv, wrapped)
+            ran = wrapped if wrapped is not None else argv
+            if (isinstance(ran, list) and ran and isinstance(ran[0], str) and os.path.basename(ran[0]) == "pa-session"
+                    and "--ask" in ran):  # card d-161 'B: keep strict': refused, said plainly (wrapped or not)
+                raise Problem("cannot end it: its terminal is a space's first tab, started with {} (no --space), so "
+                              "it cannot be proven to be this space's launcher; close it by hand if it is the Project "
+                              "Agent (the keeper or the panel's Open then starts a restart-capable one)".format(shown))
+            raise Problem("cannot end it: its terminal's program is {}, not this space's pa-session; close it by hand "
+                          "if it is the Project Agent".format(shown))
     record = read_json_safe(os.path.join(directory, "launcher.json"))
     rec = as_dict(record)
     note = None
+    # the record's launcher is this terminal's: the same pid, or the wrapper's live launcher child (t-077 R2)
+    same = rec.get("pid") == term.get("pid") or (
+        wrapped is not None and child_link(term.get("pid"), rec.get("pid")) is None)
     if restart_capable(record):
-        if rec.get("terminal") == terminal and rec.get("pid") == term.get("pid"):
+        if rec.get("terminal") == terminal and same:
             text = ("This launcher takes an in-place restart: run pa-restart --space {} (its workers keep "
                     "running).".format(space))
             last = as_dict(rec.get("restart"))
@@ -3601,7 +3725,7 @@ def identify_old_launcher(directory, agent):
                          "the install (pa-doctor), then pa-restart.".format(as_text(last.get("why")) or "no reason recorded"))
             raise Problem(text)
         note = "launcher.json is from terminal {} pid {}, not this launcher".format(rec.get("terminal"), rec.get("pid"))
-    elif rec.get("terminal") == terminal and "pid" in rec and rec.get("pid") != term.get("pid"):
+    elif rec.get("terminal") == terminal and "pid" in rec and not same:
         raise Problem("cannot end it: launcher.json disagrees with the terminal (pid {} in launcher.json, {} in hc): "
                       "not certain which launcher runs there".format(rec.get("pid"), term.get("pid")))
     return terminal, term, note
