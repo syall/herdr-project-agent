@@ -376,6 +376,40 @@ class Runs(QBase):
         self.assertTrue(spy.calls, "add evaluates the gate")
         self.assertTrue(all(c is not None for _m, c in spy.calls), spy.calls)
 
+    def test_r7_ctx_run_uses_the_command_cache(self):
+        """VERIFY J2 Must fix 1 (mutation M12): Ctx.run is built on the Session's cache, so two content calls of one
+        R3 shape through ctx.run run git once and fill ctx.s.cache; a ref-reading call is never stored."""
+        self.task("t-A", [("fa.txt", "a\n")])
+        tip = self.tip("t-A")
+        base = self.ref("main")
+        runs = []
+        real = pa_push.Session.gate_git
+
+        def gate_git(s, path, *args, **kw):
+            runs.append(tuple(args))
+            return real(s, path, *args, **kw)
+        with mock.patch.object(pa_push.Session, "gate_git", gate_git):
+            ctx = pa_queue.Ctx(self.dir, self.proj)
+            try:
+                first = (ctx.tree(tip), ctx.is_ancestor(base, tip), ctx.merge_base(base, tip))
+                made = list(runs)
+                second = (ctx.tree(tip), ctx.is_ancestor(base, tip), ctx.merge_base(base, tip))
+                self.assertEqual(second, first)
+                self.assertTrue(first[0] and first[1] and first[2] == base, first)
+                self.assertEqual(runs, made, "the same R3 calls again through ctx.run run no git")
+                self.assertEqual(ctx.s.cache.hits, 3)
+                keys = {argv for _common, argv in ctx.s.cache.answers}
+                self.assertIn(("rev-parse", "--verify", "-q", tip + "^{tree}"), keys)
+                self.assertIn(("merge-base", "--is-ancestor", base, tip), keys)
+                self.assertIn(("merge-base", base, tip), keys)
+                answers_ok(self, ctx.s.cache.answers)
+                self.assertEqual(ctx.tip("t-A-x"), tip)
+                ctx.tip("t-A-x")
+                tips = [c for c in runs if "refs/heads/t-A-x^{commit}" in c]
+                self.assertEqual(len(tips), 2, "a ref-reading call runs git each time")
+            finally:
+                ctx.close()
+
 
 class MergeRuns(merge_tests.MBase):
     def test_ac3_4_merge_rebases_and_merges_three_with_one_cache(self):
