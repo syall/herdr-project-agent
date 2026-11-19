@@ -6198,6 +6198,19 @@ cases["P41-15-last-outcome"] = async () => { // Q7: the last request's outcome i
   check(look(v).text.includes("Last request: expired at 06:00"), `said (got ${look(v).text.slice(0, 900)})`);
 };
 
+cases["P41-16-cross-midnight"] = async () => { // MF-J5-1: a read from an earlier UTC day names its day, never "no calls yet"
+  ctxWorld();
+  const v = await liveMount();
+  g.__now = T0 + (15 * 60 + 50) * 60000; // 23:50 UTC on DAY41
+  await click(v, "view-costs"); await settle();
+  check(look(v).text.includes("PA context today (UTC): mean 158k · peak 254k · resets 6 (fresh 6, compact 0) (as of 23:50)"), `at read time (got ${look(v).text.slice(0, 900)})`);
+  await click(v, "view-tasks"); await settle();
+  advance(20 * 60000); await fire(1000); await settle(); // 00:10 UTC the next day; the Costs view is not shown
+  const text = look(v).text;
+  check(!text.includes("no Project Agent calls yet") && !text.includes("PA context today"), `not today's, not "no calls" (got ${text.slice(0, 900)})`);
+  check(text.includes(`PA context ${DAY41} (UTC): mean 158k · peak 254k · resets 6 (fresh 6, compact 0) (as of ${DAY41.slice(5)} 23:50)`), `the read's day named (got ${text.slice(0, 900)})`);
+};
+
 // --list prints the names that would run and runs none. An unknown name or option exits 2.
 const refuse = (why) => { fs.rmSync(dst, { recursive: true, force: true }); console.error(`run.mjs: ${why}`); process.exit(2); };
 const pick = [];

@@ -1031,6 +1031,13 @@ cases["S41-1-context-line"] = async () => { // R15: today's (UTC) paContext entr
   check(store.contextDay([pcDay({ calls: "40" })], T0) === null && store.contextDay([pcDay({ resets: null })], T0) === null && store.contextDay([null, 5], T0) === null, "malformed entries: none, no throw");
 };
 
+cases["S41-8-context-line-day"] = async () => { // MF-J5-1: the day of the read, named when it is not today's
+  const AT = T0 + (15 * 60 + 50) * 60000, NEXT = AT + 20 * 60000; // 23:50 UTC, then 00:10 the next day
+  check(store.contextLine([pcDay()], AT, AT) === "PA context today (UTC): mean 158k · peak 254k · resets 6 (fresh 6, compact 0)", "same day: today");
+  check(store.contextLine([pcDay()], AT, NEXT) === `PA context ${TODAY} (UTC): mean 158k · peak 254k · resets 6 (fresh 6, compact 0)`, `read yesterday: its day and its figures (got ${store.contextLine([pcDay()], AT, NEXT)})`);
+  check(store.contextLine([], AT, NEXT) === `PA context ${TODAY} (UTC): no Project Agent calls yet`, "read yesterday, no entry: that day named");
+};
+
 cases["S41-2-context-args"] = async () => { // R6, R13: the tool's argv; never --on (the exec runs on the space's machine)
   const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
   check(eq(store.contextArgs(remote, { dry: true }), ["fresh", "--space", S, "--dry-run", "--json"]), `dry (got ${JSON.stringify(store.contextArgs(remote, { dry: true }))})`);
