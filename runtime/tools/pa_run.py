@@ -33,6 +33,7 @@ import base64
 import fcntl
 import json
 import os
+import posixpath
 import re
 import shlex
 import shutil
@@ -107,16 +108,64 @@ def executable_in(top, rel, commit, overlay, h):
     return os.path.isfile(path) and os.access(path, os.X_OK)
 
 
+SH_FLAGS = set("abCefhmnuvx")  # POSIX sh's set options; with o (takes the next word as its name) all sh may get
+
+
+def sh_script(argv):
+    """argv[0] is sh: (index of the script word, None) or (None, why not). Parses sh's options the way sh does:
+    `-`/`+` clusters of SH_FLAGS letters, `o` in a cluster takes the next word, `--` or `-` ends them. -c (a shell
+    line), -s or no script (a shell line from stdin), a script word starting with - (cannot be told from an
+    option), and anything else (-i, a long option, an unknown letter, -o with no name) are refused: fail closed."""
+    i = 1
+    while i < len(argv):
+        word = argv[i]
+        if word in ("--", "-"):
+            i += 1
+            break
+        if word[:1] not in ("-", "+"):
+            break
+        if word == "+" or word.startswith("--"):
+            return None, "sh option {!r}: cannot parse it, so it is refused".format(word)
+        names = 0
+        for letter in word[1:]:
+            if letter == "c":
+                return None, "sh -c runs a shell line; give the command's own words (sh <script> ...)"
+            if letter == "s":
+                return None, "sh -s reads a shell line from stdin; give a script (sh <script> ...)"
+            if letter == "o":
+                names += 1
+            elif letter not in SH_FLAGS:
+                return None, "sh option {!r}: cannot parse it, so it is refused".format(word)
+        if i + names >= len(argv) and names:
+            return None, "sh option {!r} needs a name after it: cannot parse it, so it is refused".format(word)
+        i += 1 + names
+    if i >= len(argv):
+        return None, "sh with no script reads a shell line from stdin; give a script (sh <script> ...)"
+    if argv[i].startswith("-"):
+        return None, "sh script {!r} starts with -: it cannot be told from an option".format(argv[i])
+    return i, None
+
+
+def tree_path(subdir, word):
+    """word as a path from the tree's top, normalised the way the file system reads it ('..' and '//' resolved)."""
+    return posixpath.normpath(posixpath.join(subdir or "", word)) if word else ""
+
+
 def check_argv(argv, top, subdir, commit=None, overlay=(), h=None):
     """R2: None when argv may run, else why not."""
     if not argv:
         return "no command after --"
     first = argv[0]
+    script = 0
+    if first == "sh":
+        script, why = sh_script(argv)
+        if why:
+            return why
     for i, word in enumerate(argv):  # first: what starts an hc core is named as such
-        rel = clean_rel(os.path.join(subdir or "", word)) if word and not word.startswith("-") else None
+        rel = tree_path(subdir, word) if not word.startswith("-") else None
         if rel == SESSION_CHECK:
             return "{} starts an hc core: use pa-full-suite: the integration part runs on this Mac".format(SESSION_CHECK)
-        if rel == RUN_ALL and (i == 0 or (i == 1 and first == "sh")):
+        if rel == RUN_ALL and i == script:
             flags = argv[i + 1:]
             if not flags or flags[0] == "--only-integration":
                 return "{} {} starts an hc core: use pa-full-suite: the integration part runs on this Mac".format(
@@ -131,12 +180,6 @@ def check_argv(argv, top, subdir, commit=None, overlay=(), h=None):
         rel = clean_rel(os.path.join(subdir or "", first))
         if rel is None or not executable_in(top, rel, commit, set(overlay or ()), h or _h):
             return "argv[0] {!r} is not python3, node, sh or an executable file in the tree".format(first)
-    if first == "sh":
-        for word in argv[1:]:
-            if word == "-" or not word.startswith("-"):
-                break
-            if not word.startswith("--") and "c" in word[1:]:
-                return "sh -c runs a shell line; give the command's own words (sh <script> ...)"
     return None
 
 
