@@ -508,8 +508,10 @@ def gate_commits(worktree, runner=None):
             if not found:
                 return None
             top, common, branch = found
-        # 2: the commit and the tracked changes. --no-optional-locks stays the first argument.
-        code, status, _ = git(path, "--no-optional-locks", "status", "--porcelain=v2", "--branch", "--untracked-files=no")
+        # 2: the commit and the tracked changes. --no-optional-locks stays the first argument. --no-ahead-behind
+        # (t-108 review N-1): no walk to count against the upstream, which the pin never reads (branch.ab says +? -?).
+        code, status, _ = git(path, "--no-optional-locks", "status", "--porcelain=v2", "--branch", "--untracked-files=no",
+                              "--no-ahead-behind")
         commit, changed, oid = None, 0, None
         for line in status.splitlines() if not code else []:
             if line.startswith("# branch.oid "):
@@ -518,6 +520,9 @@ def gate_commits(worktree, runner=None):
                 # The path the porcelain v1 line starts with (for a rename or copy, the original), tested as v1's
                 # "XY path" was: quotes stripped, a leading blank kept (v1 quotes a path with a blank, so the old
                 # filter saw '" .claude/x"' and kept the blank; v2 leaves it unquoted; MF-1).
+                # v2's fields before the path (git-status(1)): 8 on an ordinary "1" line (XY sub mH mI mW hH hI),
+                # 9 on a rename or copy "2" line (... X<score>), 10 on an unmerged "u" line (... m1 m2 m3 mW h1 h2
+                # h3); splitting that many times leaves the path, blanks and all, as the last field (t-108 N-2).
                 fields = line.split(" ", {"1": 8, "2": 9, "u": 10}[line[0]])
                 tested = fields[-1].split("\t", 1)[-1] if line[0] == "2" else fields[-1]
                 if not tested.strip('"').startswith(".claude/"):

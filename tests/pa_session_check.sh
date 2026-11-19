@@ -130,9 +130,9 @@ end13() { # terminal space outfile: pa-restart --end-terminal --anyway in its ow
     sh -c '"$0" --space "$1" --end-terminal --anyway --why S13 > "$2" 2>&1; echo "rc=$?" >> "$2"' "$S/bin/pa-restart" "$2" "$3" >/dev/null
 }
 answer13() { # terminal outfile: wait for the question, type yes, wait for the exit code
-  wait_for 30 grep -q "Type yes" "$2" || return 1
+  wait_for 30 grep -qs "Type yes" "$2" || return 1  # -s: the file may not exist yet (t-108 N-3)
   scratch hc send "$1" yes >/dev/null 2>&1
-  wait_for 120 grep -q "^rc=" "$2"
+  wait_for 120 grep -qs "^rc=" "$2"
 }
 # The state a step leaves for later steps in another part (t-112 R3): <step>:<the step that makes it>:<helper>. The
 # maker calls the helper, and a part that runs <step> without the maker calls it first, so the two cannot drift.
