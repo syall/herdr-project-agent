@@ -1607,8 +1607,8 @@ def ship(h, machine, run, pin, tools, root, patch=None, head=None, step=None):
         "mkdir -m 700 bin home tmp xdg npm u",
         "printf '%s\\n' '#!{}' 'echo \"hc is not available in a remote suite run\" >&2' 'exit 2' > bin/hc".format(sh_path),
         "chmod 755 bin/hc",
-    ] + ["printf '%s\\n' '#!{}' 'exec {} \"$@\"' > bin/{} && chmod 755 bin/{}".format(sh_path, tools[t]["path"], t, t)
-         for t in TOOLS] + ([
+    ] + ["if [ \"$(head -c 2 {1})\" = '#!' ]; then printf '%s\\n' '#!{0}' 'exec {1} \"$@\"' > bin/{2} && chmod 755 "
+         "bin/{2}; else ln -s {1} bin/{2}; fi".format(sh_path, tools[t]["path"], t) for t in TOOLS] + ([
         "{} -c 'import base64, sys; open(sys.argv[2], \"wb\").write(base64.b64decode(open(sys.argv[1]).read()))' step.b64 step".format(py),
         "rm -f step.b64",
         "chmod 700 step"] if step else []) + ([
@@ -1645,8 +1645,9 @@ def step_env(folder, real_home):
 
 def run_script(folder, tools, command=None, cwd=None, extra=None):
     """R10, R11: the remote terminal's fixed script. {folder}/bin holds hc's refusing shim and, for each probed
-    tool, a two-line `exec <probed path> "$@"` wrapper (made at setup; t-107 J2: not a link, so a tool that is itself
-    a script finding its files beside "$0", as a node shim's node_real, still finds them), and only it goes ahead of the machine's PATH: a probed tool's folder is never put first, so
+    tool, a link to it, or (t-107 J2) when the tool is itself a script (#!) a two-line `exec <probed path> "$@"`
+    wrapper, so a script finding its files beside "$0" (a node shim's node_real) still finds them, while a binary
+    started with a minimal env gets nothing a wrapper's sh would add (SHLVL, PWD); made at setup. Only it goes ahead of the machine's PATH: a probed tool's folder is never put first, so
     another tool in it (an older python3 beside git) cannot shadow the probed one, and the record names what ran.
     t-106: command (a step run's `<run>/step run <run>`) in place of run-all.sh, started in <folder>/<cwd> (checked
     by prepare_step), with the extra export line (step_env); t0, t1, out and code at the run folder's top."""
