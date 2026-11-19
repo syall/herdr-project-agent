@@ -3016,22 +3016,40 @@ CS4_UNIT_SRC = ("''.join('def f{0}(a, b={0}, *c, **d):\\n    x = [i * a for i in
                 "    return {{\\'k{0}\\': (x, a + b, c, d), \\'s\\': \\'v\\' * {0}}}\\n'.format(i) for i in range(2000))")
 CS4_UNIT_REF = 0.060
 CS4_MARGIN = 1.1
+# t-111: the scale is capped, so a very slow or very busy machine cannot stretch the bound without end (4x: the
+# efficiency cores here are 2.8x, the cloud machine under another suite about 3x).
+CS4_SCALE_CAP = 4.0
+# t-111: Claude Code's status line command, as pa.cc_statusline_setting writes it (the launcher, not pa_costs.py).
+STATUSLINE = [sys.executable, os.path.join(TOOLS, "pa_statusline.py"), "statusline"]
+
+
+def cs4_limit(unit_s):
+    """cs4's bound for a machine whose unit (CS4_UNIT_SRC's CPU over a bare python3) is unit_s seconds."""
+    return CS4_LIMIT * min(CS4_SCALE_CAP, max(1.0, unit_s / CS4_UNIT_REF)) * CS4_MARGIN
 
 
 class CC_Script(CCBase):
-    """R2 as a real process: `python3 pa_costs.py statusline ...`, as Claude Code runs it."""
+    """R2 as a real process: `python3 pa_statusline.py statusline ...`, as Claude Code runs it (t-111; before it,
+    `python3 pa_costs.py statusline ...`, which still works: cs0)."""
 
-    def script(self, tail, data):
+    def script(self, tail, data, entry=None):
         env = dict(os.environ)
         env.update(_HOMES)
         env["HC_TERMINAL_ID"] = "t5"
         began = time.time()
-        r = subprocess.run([sys.executable, os.path.join(TOOLS, "pa_costs.py"), "statusline"] + list(tail), input=data,
+        r = subprocess.run(list(entry or STATUSLINE) + list(tail), input=data,
                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, timeout=30)
         took = time.time() - began
         OUTPUT_SEEN.append(r.stdout.decode(errors="replace")[:4096] + r.stderr.decode(errors="replace"))
         self.assertEqual((r.returncode, r.stderr), (0, b""), tail)
         return r.stdout, took
+
+    def test_cs0_pa_costs_statusline_still_works(self):
+        # t-111: sessions started before it keep `pa_costs.py statusline` in their settings until relaunched
+        out, _t = self.script(["--space", "sp1", "--then", cc_stub("ok")], cc_bytes(),
+                              entry=[sys.executable, os.path.join(TOOLS, "pa_costs.py"), "statusline"])
+        self.assertEqual(out, b"STATUS-LINE ok")
+        self.assertEqual(self.cc_record()["cost"], 1.25)
 
     def test_cs1_prints_the_inner_bytes_and_records(self):
         out, _t = self.script(["--space", "sp1", "--then", cc_stub("ok")], cc_bytes())
@@ -3075,7 +3093,7 @@ class CC_Script(CCBase):
         env = dict(os.environ)
         env.update(_HOMES)
         env["HC_TERMINAL_ID"] = "t5"
-        statusline = [sys.executable, os.path.join(TOOLS, "pa_costs.py"), "statusline", "--space", "sp1", "--then", noop]
+        statusline = STATUSLINE + ["--space", "sp1", "--then", noop]
         baseline = [sys.executable, "-c", "import subprocess, sys; sys.stdin.buffer.read(); subprocess.run([sys.argv[1]])",
                     noop]
         unit = [sys.executable, "-c", "import subprocess, sys; sys.stdin.buffer.read(); compile(" + CS4_UNIT_SRC
@@ -3104,14 +3122,217 @@ class CC_Script(CCBase):
             cpu = min(r[2] for r in rounds) - min(r[3] for r in rounds)
             overhead = min(r[1] for r in rounds) - min(r[0] for r in rounds)
             unit_s = max(0.0, min(r[4] for r in rounds) - min(r[3] for r in rounds))
-            limit = CS4_LIMIT * max(1.0, unit_s / CS4_UNIT_REF) * CS4_MARGIN
+            limit = cs4_limit(unit_s)
             if cpu <= limit and overhead <= limit:
                 break
         self.assertEqual(self.cc_record()["cost"], 1.25)  # the timed runs did the real work
-        seen = "statusline CPU {:.3f} s, bare python3 CPU {:.3f} s, unit {:.3f} s (reference {:.3f} s), limit {:.3f} s".format(
-            min(r[2] for r in rounds), min(r[3] for r in rounds), unit_s, CS4_UNIT_REF, limit)
+        seen = ("statusline CPU {:.3f} s, bare python3 CPU {:.3f} s, unit {:.3f} s (reference {:.3f} s, scale {:.2f}, cap {:.1f}),"
+                " CPU over bare {:.3f} s, wall over bare {:.3f} s, limit {:.3f} s, rounds {}").format(
+            min(r[2] for r in rounds), min(r[3] for r in rounds), unit_s, CS4_UNIT_REF, max(1.0, unit_s / CS4_UNIT_REF),
+            CS4_SCALE_CAP, cpu, overhead, limit, len(rounds))
         self.assertLessEqual(cpu, limit, "CPU seconds over a bare python3 running the same inner command (" + seen + ")")
         self.assertLessEqual(overhead, limit, "wall seconds over a bare python3 running the same inner command (" + seen + ")")
+        print("\ncs4 passed: " + seen, file=sys.__stderr__)  # t-111: the figures on a pass too, for the next comparison
+
+    def test_cs4_scale_is_capped(self):
+        # t-111: the bound above can grow with the machine's unit, but not past CS4_SCALE_CAP
+        self.assertEqual(CS4_SCALE_CAP, 4.0)
+        self.assertAlmostEqual(cs4_limit(0.0), CS4_LIMIT * CS4_MARGIN)
+        self.assertAlmostEqual(cs4_limit(CS4_UNIT_REF * 2), CS4_LIMIT * 2 * CS4_MARGIN)
+        self.assertAlmostEqual(cs4_limit(CS4_UNIT_REF * 4), CS4_LIMIT * 4 * CS4_MARGIN)
+        self.assertAlmostEqual(cs4_limit(CS4_UNIT_REF * 40), CS4_LIMIT * 4 * CS4_MARGIN)
+
+
+def sl_module():
+    """runtime/tools/pa_statusline.py as a module of its own (its main() is not run)."""
+    spec = importlib.util.spec_from_file_location("pa_statusline_under_test", os.path.join(TOOLS, "pa_statusline.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def tools_copy(name, broken=()):
+    """A fresh copy of runtime/tools/*.py in TMP/<name>, as an installed tools/ folder; a module in broken raises."""
+    folder = os.path.join(TMP, name)
+    shutil.rmtree(folder, ignore_errors=True)
+    os.makedirs(folder)
+    for n in os.listdir(TOOLS):
+        if n.endswith(".py"):
+            shutil.copy2(os.path.join(TOOLS, n), os.path.join(folder, n))
+    for n in broken:
+        write(os.path.join(folder, n + ".py"), "raise RuntimeError('broken on purpose')\n")
+    return folder
+
+
+class SL_Cache(CCBase):
+    """t-111: the status line loads pa.py and pa_costs.py from compiled code cached outside tools/
+    (<HERDR_PA_HOME>/cache/pycache), checked by the source's content, never stale, partial or shared unsafely."""
+
+    def env(self):
+        env = dict(os.environ)
+        env.update(_HOMES)
+        env["HC_TERMINAL_ID"] = "t5"
+        env.pop("PYTHONDONTWRITEBYTECODE", None)
+        env.pop("PYTHONPYCACHEPREFIX", None)
+        return env
+
+    def run_launcher(self, tools, tail=None, data=None):
+        tail = ["statusline", "--space", "sp1", "--then", cc_stub("ok")] if tail is None else tail
+        r = subprocess.run([sys.executable, os.path.join(tools, "pa_statusline.py")] + tail, input=cc_bytes() if data is None else data,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=self.env(), timeout=30)
+        return r.returncode, r.stdout, r.stderr
+
+    def cache(self):
+        return os.path.join(_HOMES["HERDR_PA_HOME"], "cache", "pycache")
+
+    def tmp_dir(self, name):
+        folder = os.path.join(TMP, name)
+        shutil.rmtree(folder, ignore_errors=True)
+        os.makedirs(folder)
+        return folder
+
+    def test_sc1_prints_records_and_caches_outside_tools(self):
+        tools = tools_copy("sc1-tools")
+        before = all_files(tools)
+        for _ in range(2):
+            self.assertEqual(self.run_launcher(tools), (0, b"STATUS-LINE ok", b""))
+            self.assertEqual(self.cc_record()["cost"], 1.25)
+        self.assertEqual(all_files(tools), before)  # nothing written in the installed tools
+        tag = re.escape(sys.implementation.cache_tag)
+        names = sorted(os.listdir(self.cache()))
+        self.assertEqual(len(names), 2, names)
+        self.assertRegex(names[0], r"^pa-[0-9a-f]{16}\." + tag + r"\.pyc$")
+        self.assertRegex(names[1], r"^pa_costs-[0-9a-f]{16}\." + tag + r"\.pyc$")
+        self.assertEqual(os.stat(self.cache()).st_mode & 0o777, 0o700)
+        for n in names:
+            self.assertEqual(os.stat(os.path.join(self.cache(), n)).st_mode & 0o077, 0)
+
+    def test_sc1b_other_arguments_and_a_broken_tool(self):
+        tools = tools_copy("sc1b-tools")
+        code, out, err = self.run_launcher(tools, tail=["collect"])
+        self.assertEqual((code, out), (2, b""))
+        self.assertIn(b"statusline", err)
+        broken = tools_copy("sc1b-broken", broken=("pa_costs",))
+        self.assertEqual(self.run_launcher(broken), (0, b"", b""))  # a status line never fails
+        broken = tools_copy("sc1b-broken-pa", broken=("pa",))
+        self.assertEqual(self.run_launcher(broken), (0, b"", b""))
+
+    def test_sc2_a_hit_compiles_nothing_and_new_source_is_never_stale(self):
+        m = sl_module()
+        folder = self.tmp_dir("sc2")
+        cache = m.private(os.path.join(self.tmp_dir("sc2-cache"), "pycache"))
+        self.assertIsNotNone(cache)
+        toy = os.path.join(folder, "sl_toy.py")
+        write(toy, "X = 'aaaa'\n")
+        self.addCleanup(sys.modules.pop, "sl_toy", None)
+        mod = m.load("sl_toy", folder, cache)
+        self.assertEqual((mod.X, mod.__name__, mod.__file__), ("aaaa", "sl_toy", os.path.realpath(toy)))
+        self.assertIs(sys.modules["sl_toy"], mod)
+        self.assertEqual(len(os.listdir(cache)), 1)
+        with mock.patch("builtins.compile", side_effect=AssertionError("compiled again")):
+            self.assertEqual(m.load("sl_toy", folder, cache).X, "aaaa")  # a hit
+        st = os.stat(toy)
+        write(toy, "X = 'bbbb'\n")  # same size, and the same times put back: only the content tells
+        os.utime(toy, ns=(st.st_atime_ns, st.st_mtime_ns))
+        self.assertEqual((os.stat(toy).st_size, os.stat(toy).st_mtime_ns), (st.st_size, st.st_mtime_ns))
+        self.assertEqual(m.load("sl_toy", folder, cache).X, "bbbb")
+        self.assertEqual(len(os.listdir(cache)), 1)  # replaced, not one more
+        with mock.patch("builtins.compile", side_effect=AssertionError("compiled again")):
+            self.assertEqual(m.load("sl_toy", folder, cache).X, "bbbb")
+
+    def test_sc3_a_partial_or_damaged_file_is_never_used(self):
+        m = sl_module()
+        folder = self.tmp_dir("sc3")
+        cache = m.private(os.path.join(self.tmp_dir("sc3-cache"), "pycache"))
+        write(os.path.join(folder, "sl_toy3.py"), "X = sum(range(10))\n" * 50)
+        self.addCleanup(sys.modules.pop, "sl_toy3", None)
+        self.assertEqual(m.load("sl_toy3", folder, cache).X, 45)
+        [name] = os.listdir(cache)
+        path = os.path.join(cache, name)
+        good = raw(path)
+        for bad in (good[:len(good) // 2], good[:-1] + bytes([good[-1] ^ 1]), b"", b"\0" * len(good),
+                    good[:40] + bytes([good[40] ^ 1]) + good[41:]):
+            with open(path, "wb") as f:
+                f.write(bad)
+            self.assertEqual(m.load("sl_toy3", folder, cache).X, 45)
+            self.assertEqual(raw(path), good)  # repaired
+        self.assertEqual(os.listdir(cache), [name])
+
+    def test_sc4_an_unsafe_or_read_only_folder_is_not_used(self):
+        m = sl_module()
+        folder = self.tmp_dir("sc4")
+        write(os.path.join(folder, "sl_toy4.py"), "X = 4\n")
+        self.addCleanup(sys.modules.pop, "sl_toy4", None)
+        shared = self.tmp_dir("sc4-shared")
+        os.chmod(shared, 0o777)
+        self.assertIsNone(m.private(shared))  # others could write code into it
+        real = m.private(os.path.join(self.tmp_dir("sc4-real"), "pycache"))
+        link = os.path.join(TMP, "sc4-link")
+        if os.path.lexists(link):
+            os.unlink(link)
+        os.symlink(real, link)
+        self.assertIsNone(m.private(link))
+        a_file = os.path.join(TMP, "sc4-file")
+        write(a_file, "x")
+        self.assertIsNone(m.private(os.path.join(a_file, "pycache")))
+        self.assertEqual(m.load("sl_toy4", folder, None).X, 4)  # no cache: compiled in memory
+        if os.getuid() != 0:
+            ro = m.private(os.path.join(self.tmp_dir("sc4-ro"), "pycache"))
+            os.chmod(ro, 0o500)
+            self.addCleanup(os.chmod, ro, 0o700)
+            self.assertEqual(m.load("sl_toy4", folder, ro).X, 4)
+            self.assertEqual(os.listdir(ro), [])
+        # the launcher itself, with its cache folder writable by others: right output, the folder left alone
+        os.makedirs(self.cache())
+        os.chmod(self.cache(), 0o777)
+        self.assertEqual(self.run_launcher(tools_copy("sc4-tools")), (0, b"STATUS-LINE ok", b""))
+        self.assertEqual(os.listdir(self.cache()), [])
+
+    def test_sc5_two_writers_at_once(self):
+        cache = os.path.join(self.tmp_dir("sc5-cache"), "pycache")
+        code = ("import importlib.util, sys\n"
+                "spec = importlib.util.spec_from_file_location('sl', sys.argv[1])\n"
+                "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n"
+                "c = m.private(sys.argv[3])\n"
+                "path, code = m.code_of('pa', sys.argv[2], c)\n"
+                "print(path, code.co_filename)\n")
+        procs = [subprocess.Popen([sys.executable, "-c", code, os.path.join(TOOLS, "pa_statusline.py"), TOOLS, cache],
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=self.env()) for _ in range(8)]
+        for p in procs:
+            self.addCleanup(lambda p=p: p.poll() is None and p.kill())
+        results = [p.communicate(timeout=60) + (p.returncode,) for p in procs]
+        real = os.path.realpath(os.path.join(TOOLS, "pa.py"))
+        for out, err, rc in results:
+            self.assertEqual((rc, err), (0, b""))
+            self.assertEqual(out.decode().split(), [real, real])
+        [name] = os.listdir(cache)  # one file, no temp file left
+        m = sl_module()
+        with mock.patch("builtins.compile", side_effect=AssertionError("compiled again")):
+            self.assertEqual(m.code_of("pa", TOOLS, m.private(cache))[0], real)
+
+    def test_sc6_the_launcher_is_small_stdlib_only_and_parses_as_3_7(self):
+        import ast
+        src = open(os.path.join(TOOLS, "pa_statusline.py")).read()
+        tree = ast.parse(src, feature_version=(3, 7))
+        names = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                names.update(a.name.split(".")[0] for a in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                names.add((node.module or "").split(".")[0])
+        self.assertLessEqual(names, {"hashlib", "importlib", "marshal", "os", "stat", "sys", "tempfile", "time"})
+        self.assertLess(len(src.splitlines()), 200)
+
+    def test_sc7_the_setting_names_the_launcher_and_needs_it(self):
+        p = {"name": "test", "statusLine": {"command": ["true"]}}
+        sl = pa.cc_statusline_setting(p, "sp1")
+        self.assertEqual(shlex.split(sl["command"])[:3], [sys.executable, pa.STATUSLINE_FILE, "statusline"])
+        saved = pa.STATUSLINE_FILE
+        pa.STATUSLINE_FILE = os.path.join(TMP, "no-such-statusline.py")
+        try:
+            self.assertIsNone(pa.cc_statusline_setting(p, "sp1"))
+        finally:
+            pa.STATUSLINE_FILE = saved
 
 
 HANG_SCRIPT = "#!/bin/sh\ncat > /dev/null\nsleep 30 &\necho $$ $! > \"$1.part\"\nmv \"$1.part\" \"$1\"\nwait\n"
@@ -3141,8 +3362,7 @@ class CC_Cancel(CCBase):
         env = dict(os.environ)
         env.update(_HOMES)
         env["HC_TERMINAL_ID"] = "t5"
-        p = subprocess.Popen([sys.executable, os.path.join(TOOLS, "pa_costs.py"), "statusline", "--space", "sp1", "--then",
-                              stub, pids_file], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+        p = subprocess.Popen(STATUSLINE + ["--space", "sp1", "--then", stub, pids_file], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
         self.addCleanup(lambda: p.poll() is None and p.kill())
         p.stdin.write(cc_bytes())
         p.stdin.close()
@@ -3258,9 +3478,10 @@ class CC_Launch(Base):
         cmd = self.launch("claude", "do the job")
         sl = self.ours(cmd)
         self.assertEqual(sl["refreshInterval"], 15)
-        self.assertEqual(shlex.split(sl["command"]), [sys.executable, pa.COSTS_FILE, "statusline", "--space", "sp1", "--then",
-                                                    self.inner, "--flag", "a b"])
-        self.assertTrue(os.path.isabs(pa.COSTS_FILE) and os.path.isfile(pa.COSTS_FILE))
+        self.assertEqual(shlex.split(sl["command"]), [sys.executable, pa.STATUSLINE_FILE, "statusline", "--space", "sp1",
+                                                    "--then", self.inner, "--flag", "a b"])  # t-111: the launcher
+        self.assertTrue(os.path.isabs(pa.STATUSLINE_FILE) and os.path.isfile(pa.STATUSLINE_FILE))
+        self.assertEqual(os.path.dirname(pa.STATUSLINE_FILE), os.path.dirname(pa.COSTS_FILE))
         self.assertEqual(self.settings_count(cmd), 1)
         self.assertIn("--session-id", cmd[:-2])
         self.set_profile()
