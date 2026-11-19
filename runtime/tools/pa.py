@@ -1098,7 +1098,10 @@ def hook_directory(space):
 
 def cmd_context(args):
     if args.action == "set":
-        return context_relay(args) if getattr(args, "on", None) else context_set(args)
+        if getattr(args, "on", None):
+            refuse_set_in_agent()  # before the relay: on the far side it runs under hc exec (REVIEW J4 MF-J4-1)
+            return context_relay(args)
+        return context_set(args)
     if args.action == "fresh":
         return context_fresh(args)
     if args.action == "followup":
@@ -1127,11 +1130,15 @@ def cmd_context(args):
     sys.stdout.flush()
 
 
+def refuse_set_in_agent():
+    if any(os.environ.get(k) for k in AGENT_VARS):
+        raise Problem("pa-context set is the person's command: type it in a terminal, not in an agent's session")
+
+
 def context_set(args):
     """pa-context set: the person's command. Merges the options over the current settings, checks them and writes
     context.json; with no option it shows them."""
-    if any(os.environ.get(k) for k in AGENT_VARS):
-        raise Problem("pa-context set is the person's command: type it in a terminal, not in an agent's session")
+    refuse_set_in_agent()
     directory, _agent = space_for_command(args.space)
     path = os.path.join(directory, CONTEXT_FILE)
     current, problem = read_context(directory)
@@ -1449,8 +1456,10 @@ def clean_point(ctx, directory, agent, size, at, address):
             reasons.append(("b", "checkpoint older than the turn"))
     for cid in answered_unacted(directory, journal_tail(directory)):
         reasons.append(("c", "card {} answered, not acted on".format(cid)))
-    live = set((live_terminals() or {}).keys())
-    for task, worker, job in worker_handoffs_missing(directory, ledger, live):
+    terminals = live_terminals()
+    if terminals is None:  # hc ls failed: which workers are live is unknown, so no reset (REVIEW J4 MF-J4-2)
+        reasons.append(("d", "terminal list unavailable"))
+    for task, worker, job in worker_handoffs_missing(directory, ledger, set((terminals or {}).keys())):
         reasons.append(("d", "worker {} ({} {}) has no handoff file".format(worker, task, job)))
     _text, _sections, problems, _warnings = read_standing(directory)
     for problem in problems[:2]:
@@ -1684,13 +1693,13 @@ def context_report(directory, agent):
 
 def context_fresh(args):
     """pa-context fresh: asks the launcher for a fresh context at its next clean point (R6); --withdraw, --dry-run."""
-    if args.on:
-        return context_relay(args)
     in_claude = os.environ.get("CLAUDECODE") not in (None, "", "0")
     if args.by == "panel" and any(os.environ.get(k) for k in AGENT_VARS):
         raise Problem("--by panel is the panel's own flag; it is refused inside Claude")
     if in_claude and not args.dry_run and not (args.why or "").strip():
         raise Problem("inside Claude, pa-context fresh needs --why quoting the person's own words")
+    if args.on:  # after the checks, as cmd_restart: the far side runs under hc exec (REVIEW J4 MF-J4-1)
+        return context_relay(args)
     directory, agent = space_for_command(args.space)
     if args.dry_run:
         settings, size, due, reasons, req = context_report(directory, agent)
