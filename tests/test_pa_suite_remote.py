@@ -46,7 +46,7 @@ case "${1:-}" in
     echo "refs: $(git for-each-ref --format='%(refname)' | tr '\n' ' ')"
     echo "files: $(ls -A | tr '\n' ' ')"
     echo "status: [$(git status --porcelain | tr '\n' ' ')]"
-    echo "python3 ran: $(python3 -c 'import sys; print(sys.executable)' 2>&1)"
+    echo "python3 ran: $(python3 -c 'import os, sys; print(os.path.realpath(sys.executable))' 2>&1)"
     mkdir -p "$HERDR_PA_HOME/suite-runs"
     printf '{"run": "rr", "parts": {"total": 3, "done": 2, "running": [], "failed": [], "hung": []}}' > "$HERDR_PA_HOME/suite-runs/rr.json"
     if [ -n "${FAKE_GO:-}" ]; then while [ ! -f "$FAKE_GO" ]; do sleep 0.1; done; fi
