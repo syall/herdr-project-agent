@@ -3004,6 +3004,20 @@ class CC_StatusLine(CCBase):
         self.assertEqual((pa_costs.INNER_TIMEOUT, pa_costs.RECORD_BUDGET), (2.0, 0.3))
 
 
+# t-110 D1: cs4's bound, in the units of the machine that runs it. CS4_UNIT_SRC is an expression the timed child builds
+# and compiles (2000 small functions: fixed, not the repo's code, so it does not grow with pa_costs); its CPU over a
+# bare python3 is the machine's unit. CS4_UNIT_REF is that unit on the reference machine (an M-series Mac, Python
+# 3.12, best of 21: 0.060 s, three runs within 1 ms), where the limit is CS4_LIMIT * CS4_MARGIN. CS4_MARGIN covers the
+# statusline's own CPU mixing compile with other work (stdlib imports, the record write) that need not scale exactly
+# as the unit: on that Mac's efficiency cores (a slower CPU) the overhead grew 2.3-2.6x and the unit 2.8x; 1.1 allows
+# a spread of that size the other way.
+CS4_LIMIT = 0.15
+CS4_UNIT_SRC = ("''.join('def f{0}(a, b={0}, *c, **d):\\n    x = [i * a for i in range(b) if i % 3]\\n"
+                "    return {{\\'k{0}\\': (x, a + b, c, d), \\'s\\': \\'v\\' * {0}}}\\n'.format(i) for i in range(2000))")
+CS4_UNIT_REF = 0.060
+CS4_MARGIN = 1.1
+
+
 class CC_Script(CCBase):
     """R2 as a real process: `python3 pa_costs.py statusline ...`, as Claude Code runs it."""
 
@@ -3051,6 +3065,11 @@ class CC_Script(CCBase):
         # of which 0.022 s is the bare python3) pays more for the interpreter itself, which is not the statusline's
         # cost. All of pa_costs' own CPU (its import, reading, recording) is still in the bound, measured on the
         # machine that runs the test.
+        # t-110 D1: most of that own CPU (about 70 % here) is compiling pa.py and pa_costs.py from source on every run,
+        # CPU-bound work that a slower or busier CPU inflates far more than a bare interpreter start (cloud machine:
+        # bare python3 1.3x this Mac, the overhead 2.7x). So the bound is in this machine's units: a fixed compile
+        # workload (CS4_UNIT_SRC, not the repo's code) is timed in the same rounds, and both bounds are
+        # CS4_LIMIT * max(1, unit / CS4_UNIT_REF) * CS4_MARGIN. On the reference Mac that is 150 ms * CS4_MARGIN.
         import resource
         noop = shutil.which("true")
         env = dict(os.environ)
@@ -3059,6 +3078,8 @@ class CC_Script(CCBase):
         statusline = [sys.executable, os.path.join(TOOLS, "pa_costs.py"), "statusline", "--space", "sp1", "--then", noop]
         baseline = [sys.executable, "-c", "import subprocess, sys; sys.stdin.buffer.read(); subprocess.run([sys.argv[1]])",
                     noop]
+        unit = [sys.executable, "-c", "import subprocess, sys; sys.stdin.buffer.read(); compile(" + CS4_UNIT_SRC
+                + ", '<cs4-unit>', 'exec'); subprocess.run([sys.argv[1]])", noop]
 
         def timed(cmd):
             before = resource.getrusage(resource.RUSAGE_CHILDREN)
@@ -3078,15 +3099,19 @@ class CC_Script(CCBase):
             for _ in range(7):
                 base_took, base_cpu = timed(baseline)
                 took, cpu_took = timed(statusline)
-                rounds.append((base_took, took, cpu_took, base_cpu))
+                _unit_took, unit_cpu = timed(unit)
+                rounds.append((base_took, took, cpu_took, base_cpu, unit_cpu))
             cpu = min(r[2] for r in rounds) - min(r[3] for r in rounds)
             overhead = min(r[1] for r in rounds) - min(r[0] for r in rounds)
-            if cpu <= 0.15 and overhead <= 0.15:
+            unit_s = max(0.0, min(r[4] for r in rounds) - min(r[3] for r in rounds))
+            limit = CS4_LIMIT * max(1.0, unit_s / CS4_UNIT_REF) * CS4_MARGIN
+            if cpu <= limit and overhead <= limit:
                 break
         self.assertEqual(self.cc_record()["cost"], 1.25)  # the timed runs did the real work
-        seen = "statusline CPU {:.3f} s, bare python3 CPU {:.3f} s".format(min(r[2] for r in rounds), min(r[3] for r in rounds))
-        self.assertLessEqual(cpu, 0.15, "CPU seconds over a bare python3 running the same inner command (" + seen + ")")
-        self.assertLessEqual(overhead, 0.15, "wall seconds over a bare python3 running the same inner command")
+        seen = "statusline CPU {:.3f} s, bare python3 CPU {:.3f} s, unit {:.3f} s (reference {:.3f} s), limit {:.3f} s".format(
+            min(r[2] for r in rounds), min(r[3] for r in rounds), unit_s, CS4_UNIT_REF, limit)
+        self.assertLessEqual(cpu, limit, "CPU seconds over a bare python3 running the same inner command (" + seen + ")")
+        self.assertLessEqual(overhead, limit, "wall seconds over a bare python3 running the same inner command (" + seen + ")")
 
 
 HANG_SCRIPT = "#!/bin/sh\ncat > /dev/null\nsleep 30 &\necho $$ $! > \"$1.part\"\nmv \"$1.part\" \"$1\"\nwait\n"
