@@ -94,6 +94,34 @@ function onScreen(name = "project-agent") {
   walk(layout(), true);
   return shown || !found;
 }
+// t-020 J6 (AC9.1): a ledger task's worktrees, main first: [{path (as written), job, main}]. The panel's mirror of
+// pa.task_worktrees: `worktree` (job main), then `worktrees` entries, then the old `extraWorktrees` strings (job from the
+// folder); merged by path (no realpath here: the space may be on another machine, so the written path with "//", "/./"
+// and a trailing "/" folded), the first one wins; an entry with `removed` is skipped and hides the same path in later
+// sources, unless it is `worktree` itself; a job already taken in the task gets -2, -3, ...
+const jobSlug = (text) => String(text ?? "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40).replace(/-+$/, "") || "job";
+const pathKey = (p) => { const k = String(p).trim().replace(/\/+/g, "/").replace(/\/(\.\/)+/g, "/").replace(/\/\.$/, "/"); return k.length > 1 ? k.replace(/\/$/, "") : k; };
+const legacyJob = (taskId, p) => {
+  const parts = pathKey(p).split("/"), name = parts.at(-3) === "worktrees" ? parts.at(-2) : parts.at(-1);
+  return jobSlug(taskId && name.startsWith(`${taskId}-`) ? name.slice(taskId.length + 1) : name);
+};
+function taskTrees(x) {
+  if (!x || typeof x !== "object") return [];
+  const tid = String(x.id ?? ""), usable = (e) => e && typeof e === "object" && typeof e.path === "string" && e.path.trim() !== "";
+  const entries = (Array.isArray(x.worktrees) ? x.worktrees : []).filter(usable), extras = Array.isArray(x.extraWorktrees) ? x.extraWorktrees : [];
+  const out = [], seen = new Set(), jobs = new Set();
+  const add = (path, job, main) => {
+    if (jobs.has(job)) { let n = 2; while (jobs.has(`${job}-${n}`)) n++; job = `${job}-${n}`; }
+    jobs.add(job); seen.add(pathKey(path)); out.push({ path, job, main });
+  };
+  const entryJob = (e) => (typeof e.job === "string" && e.job.trim() ? jobSlug(e.job) : legacyJob(tid, e.path));
+  const main = typeof x.worktree === "string" && x.worktree.trim() ? x.worktree : null;
+  if (main) { const own = entries.find((e) => pathKey(e.path) === pathKey(main)); add(main, own ? entryJob(own) : "main", true); }
+  for (const e of entries) if (e.removed) seen.add(pathKey(e.path));
+  for (const e of entries) if (!e.removed && !seen.has(pathKey(e.path))) add(e.path, entryJob(e), false);
+  for (const p of extras) if (typeof p === "string" && p.trim() && !seen.has(pathKey(p))) add(p, legacyJob(tid, p), false);
+  return out;
+}
 const when = (iso) => { const d = new Date(iso); return Number.isNaN(d.getTime()) ? "" : d.toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }); };
 
 export default class ProjectAgent extends View {
@@ -520,7 +548,8 @@ export default class ProjectAgent extends View {
 
   shareLedger(space, data) {
     // Tell other mods (a Changes view, say) which worktrees this space's tasks use.
-    const trees = (data.ledger?.tasks ?? []).filter((x) => x.worktree && x.id).map((x) => ({ task: x.id, path: String(x.worktree), title: String(x.title ?? "") }));
+    // Every recorded, unremoved worktree (t-020 AC9.1): the main one exactly { task, path, title } as before, the others with their job.
+    const trees = (data.ledger?.tasks ?? []).filter((x) => x?.id).flatMap((x) => taskTrees(x).map((w) => ({ task: x.id, path: w.path, title: String(x.title ?? ""), ...(w.main ? {} : { job: w.job }) })));
     const allTrees = { ...(shared("project-agent.worktrees") ?? {}) };
     if (JSON.stringify(allTrees[space.id] ?? []) !== JSON.stringify(trees)) { if (trees.length) allTrees[space.id] = trees; else delete allTrees[space.id]; setShared("project-agent.worktrees", allTrees); }
     // Folders worth a shortcut in a Files view (shared "my-files.places": { space: [{ label, path, group }] }):
@@ -534,7 +563,8 @@ export default class ProjectAgent extends View {
       const files = known && data.evidence.get(x.id);
       if (files) spots.push({ label: `${x.id} evidence · ${files.length} ${files.length === 1 ? "file" : "files"}`, detail: String(x.title ?? ""), path: `${dir}/evidence/${x.id}`, group: "Project Agent", task: x.id });
       else if (!known && hadAt(`${dir}/evidence/${x.id}`)) spots.push(hadAt(`${dir}/evidence/${x.id}`));
-      if (x.worktree) spots.push({ label: `${x.id} worktree`, detail: String(x.title ?? ""), path: String(x.worktree), group: "Project Agent", task: x.id });
+      for (const w of taskTrees(x)) spots.push(w.main ? { label: `${x.id} worktree`, detail: String(x.title ?? ""), path: w.path, group: "Project Agent", task: x.id }
+        : { label: `${x.id} worktree · ${w.job}`, detail: String(x.title ?? ""), path: w.path, group: "Project Agent", task: x.id, job: w.job });
     }
     const allSpots = { ...(shared("my-files.places") ?? {}) };
     if (JSON.stringify(allSpots[space.id] ?? []) !== JSON.stringify(spots)) { if (spots.length) allSpots[space.id] = spots; else delete allSpots[space.id]; setShared("my-files.places", allSpots); }
