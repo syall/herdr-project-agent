@@ -43,6 +43,7 @@ import argparse
 import contextlib
 import datetime
 import hashlib
+import io
 import json
 import os
 import re
@@ -621,6 +622,13 @@ CONTENT_GIT = ("--no-replace-objects", "-c", "core.commitGraph=false")
 # cannot reach git there): the content path refuses while one exists (t-052 J1 round 3, verify MF-R2-1).
 STEERING_FILES = (("info/grafts", "a grafts file"), ("shallow", "a shallow file"))
 RAW_DIFF = ("diff", "--raw", "-z", "--no-renames", "--no-abbrev", "--no-ext-diff", "--no-textconv", "--ignore-submodules=none")
+# t-104 R1: every diff of one record in one call. Each stdin line `<commit> <parent>` gives `<commit>\0` and then the
+# same `:meta\0path\0` pairs as RAW_DIFF of parent..commit; --always prints that header for an empty diff too, so
+# every line can be framed. The parent is always named (from the commit object, R6), never found by git.
+DIFF_TREE = ("diff-tree", "--stdin", "--always", "-r", "-z", "--raw", "--no-renames", "--no-abbrev", "--no-ext-diff",
+             "--no-textconv", "--ignore-submodules=none")
+PARENTS_CHANGED = ("the commit objects between {} and {} are not the chain git listed; something changed what git says "
+                   "a commit's parents are during a call (a grafts or shallow file); the content cannot be compared")
 
 
 class ContentError(Exception):
@@ -640,11 +648,25 @@ def checked_commits(text):
     return CHECKED_LINE.findall(text or "")
 
 
-def raw_files(run, path, a, b):
-    """[{path, status, baseMode, tipMode, baseBlob, tipBlob}] of a..b, sorted by path. NUL-separated, so any path is exact."""
+def as_text(data, errors=None):
+    """bytes as both runners read a whole answer today (t-104 R2): decoded as a text-mode pipe decodes (subprocess
+    universal_newlines: the pipe's encoding and errors, then \\r\\n and \\r to \\n), then stripped. Each piece of a
+    batch answer goes through it on its own, so its text, and any decode error, is that of the one call it replaces."""
+    pipe = io.TextIOWrapper(io.BytesIO(), errors=errors)
+    return data.decode(pipe.encoding, pipe.errors).replace("\r\n", "\n").replace("\r", "\n").strip()
+
+
+def raw_files(run, path, a, b, label=None):
+    """[{path, status, baseMode, tipMode, baseBlob, tipBlob}] of a..b, sorted by path. NUL-separated, so any path is exact.
+    label: the name a failure gives a (default a)."""
     code, out, err = run(path, *(RAW_DIFF + (a, b)))
     if code:
-        raise ContentError("git diff {}..{} failed ({})".format(a[:7], b[:7], clean(err)[-200:]))
+        raise ContentError("git diff {}..{} failed ({})".format((label or a)[:7], b[:7], clean(err)[-200:]))
+    return parse_raw(out)
+
+
+def parse_raw(out):
+    """raw_files of one `diff --raw -z` answer (text)."""
     parts, files, i = out.split("\0"), [], 0
     while i < len(parts):
         meta = parts[i].strip("\n")
@@ -662,11 +684,79 @@ def raw_files(run, path, a, b):
 
 def commit_message(run, path, sha):
     """The commit's message as stored (git cat-file: no program runs, no signature is checked)."""
+    return commit_object(run, path, sha)[1]
+
+
+def commit_object(run, path, sha):
+    """([parent ids], message) of the commit as stored, from one cat-file commit."""
     code, out, err = run(path, "cat-file", "commit", sha)
     if code:
         raise ContentError("cannot read commit {} ({})".format(sha[:7], clean(err)[-200:]))
     head, sep, message = out.partition("\n\n")
-    return message if sep else ""
+    return [line[7:] for line in head.split("\n") if line.startswith("parent ")], message if sep else ""
+
+
+def batch_objects(run, path, ids):
+    """[commit object bytes] of ids, in order, from one cat-file --batch (t-104 R1), or None when the call fails or
+    its answer is not exactly one `<id> commit <size>` object per id (a missing object, another type, a short read,
+    trailing bytes): the caller then asks today's per-call way (R3)."""
+    try:
+        data = "".join(i + "\n" for i in ids).encode("ascii")
+    except UnicodeEncodeError:
+        return None
+    code, out, _err = run(path, "cat-file", "--batch", input=data)
+    if code or not isinstance(out, bytes):
+        return None
+    objects, at = [], 0
+    for sha in ids:
+        end = out.find(b"\n", at)
+        head = out[at:end].split(b" ") if end >= 0 else []
+        if len(head) != 3 or head[0] != sha.encode("ascii") or head[1] != b"commit" or not head[2].isdigit():
+            return None
+        start = end + 1
+        stop = start + int(head[2])
+        if out[stop:stop + 1] != b"\n":
+            return None
+        objects.append(out[start:stop])
+        at = stop + 1
+    return objects if at == len(out) else None
+
+
+def batch_diffs(run, path, pairs):
+    """[raw diff bytes, as RAW_DIFF prints them] of each (commit, parent) pair, in order, from one DIFF_TREE call
+    (t-104 R1), or None when the call fails or its answer cannot be framed exactly (R3). The answer is read in
+    tokens: a header must be the next pair's commit id, and after it come `:meta` `path` pairs while the next token
+    starts with `:`; a path is always a pair's second token, so no path can move the frame."""
+    try:
+        data = "".join(a + " " + b + "\n" for a, b in pairs).encode("ascii")
+    except UnicodeEncodeError:
+        return None
+    code, out, _err = run(path, *DIFF_TREE, input=data)
+    if code or not isinstance(out, bytes):
+        return None
+    tokens = out.split(b"\0")
+    if tokens[-1] != b"":
+        return None
+    tokens.pop()
+    pieces, i = [], 0
+    for sha, _parent in pairs:
+        if i >= len(tokens) or tokens[i] != sha.encode("ascii"):
+            return None
+        i += 1
+        start = i
+        while i < len(tokens) and tokens[i].startswith(b":"):
+            if i + 1 >= len(tokens):
+                return None
+            i += 2
+        pieces.append(b"".join(t + b"\0" for t in tokens[start:i]))
+    return pieces if i == len(tokens) else None
+
+
+def object_header(obj):
+    """(tree id or None, [parent ids]) of a commit object's bytes: its header lines, ASCII."""
+    lines = obj.split(b"\n\n", 1)[0].split(b"\n")
+    tree = lines[0][5:].decode("ascii", "replace") if lines[0].startswith(b"tree ") else None
+    return tree, [line[7:].decode("ascii", "replace") for line in lines if line.startswith(b"parent ")]
 
 
 def is_commit(run, path, sha):
@@ -729,20 +819,42 @@ class ContentCache:
         self.answers.clear()
 
 
-def cacheable(args, hexlen):
+class StdinArgv(tuple):
+    """A cache key's argv for a call given stdin (t-104 R4): the argv, then the input (ASCII text) as its last word,
+    so the key holds both and cacheable reads the input back from it. Only content_git makes one."""
+
+
+def cacheable(args, hexlen, input=None):
     """The exit codes under which the answer of content call args (CONTENT_GIT not included) may be stored, or None
     for a call that is never stored (t-094 R3). Only these exact shapes, every value a full object id of the
     repository's own length hexlen (J2-D1: in a SHA-1 repository 64 hex is a ref name to git, and in a SHA-256 one
     40 hex is an abbreviation, which git tries as a ref first; an unknown format caches nothing):
     cat-file commit <id>; cat-file -e <id>^{commit}; RAW_DIFF <id>[^] <id>; rev-list [--reverse] [--parents]
     [--count] <id>..<id>; rev-parse --verify -q <id>^{tree}; merge-base <id> <id>; merge-base --is-ancestor <id>
-    <id> (exit 0 or 1). Everything else, a ref, HEAD, a short id, status, config, a write, is never stored."""
+    <id> (exit 0 or 1). Everything else, a ref, HEAD, a short id, status, config, a write, is never stored.
+    input (t-104 R4): the bytes given on stdin. Only two shapes take it, and they require it: cat-file --batch with
+    lines `<id>`, and DIFF_TREE with lines `<id> <id>`; one space between ids, `\\n` after every line, nothing else,
+    at least one line. Every other shape is never stored with input."""
+    if isinstance(args, StdinArgv):
+        args, input = tuple(args[:-1]), args[-1].encode("ascii")
     if hexlen not in OBJECT_HEX.values():
         return None
     args = tuple(args)
 
     def oid(v):
         return isinstance(v, str) and len(v) == hexlen and all(c in "0123456789abcdef" for c in v)
+    if input is not None:
+        if not isinstance(input, bytes) or not input.endswith(b"\n"):
+            return None
+        try:
+            lines = input.decode("ascii")[:-1].split("\n")
+        except UnicodeDecodeError:
+            return None
+        if args == ("cat-file", "--batch"):
+            return {0} if all(oid(line) for line in lines) else None
+        if args == DIFF_TREE:
+            return {0} if all(len(ids) == 2 and oid(ids[0]) and oid(ids[1]) for ids in (line.split(" ") for line in lines)) else None
+        return None
     n = len(RAW_DIFF)
     if len(args) == 3 and args[:2] == ("cat-file", "commit") and oid(args[2]):
         return {0}
@@ -788,20 +900,36 @@ def content_git(run, cache=None):
             known[path] = (common, files, hexlen)
         return known[path]
 
-    def call(path, *args, **kw):
+    def call(path, *args, input=None, **kw):
         common, files, hexlen = paths(path)
         check(path, files)
-        codes = cacheable(args, hexlen) if cache is not None else None
-        key = (os.path.realpath(common), tuple(args)) if codes else None
+        codes = cacheable(args, hexlen, input) if cache is not None else None
+        key = None
+        if codes:
+            argv = tuple(args) if input is None else StdinArgv(tuple(args) + (input.decode("ascii"),))
+            key = (os.path.realpath(common), argv)
         if key is not None and key in cache.answers:
             cache.hits += 1
             return cache.answers[key]
+        if input is not None:
+            kw["input"] = input
         answer = run(path, *(CONTENT_GIT + args), **kw)
         check(path, files)
         if key is not None and answer[0] in codes:
             cache.answers[key] = answer
         return answer
+    def keep(path, args, answer):
+        """Store answer as the answer of args, as call would have stored it (t-104 D7: the per-call answers a batch
+        already holds, so a later per-call record of the same run asks git nothing). Only an R3 shape, exit 0, and
+        only after the steering check passes now."""
+        common, files, hexlen = paths(path)
+        check(path, files)
+        codes = cacheable(args, hexlen) if cache is not None else None
+        if codes and answer[0] in codes:
+            cache.answers.setdefault((os.path.realpath(common), tuple(args)), answer)
     call.common = lambda path: paths(path)[0]
+    call.keep = keep
+    call.takes_input = bool(getattr(run, "takes_input", False))  # t-104: a batch only where the runner takes stdin
     return call
 
 
@@ -846,14 +974,26 @@ def content_record(run, path, tip, onto, base=None):
         merges = [row[0] for row in rows if len(row) > 2]
         if merges:
             raise ContentError("the branch has a merge commit ({}); the content check takes linear branches".format(merges[-1][:7]))
-        listed = " ".join(row[0] for row in rows)
-        code, tree, err = run(path, "rev-parse", "--verify", "-q", tip + "^{tree}")
-        files = raw_files(run, path, base, tip)
-        commits = []
-        for sha in listed.split():
-            message = commit_message(run, path, sha)
-            commits.append({"sha": sha, "raw": digest(raw_files(run, path, sha + "^", sha)),
-                            "message": hashlib.sha256(message.encode("utf-8")).hexdigest()})
+        listed = [row[0] for row in rows]
+        # t-104 R6: the chain is checked against the commit objects themselves (their own parent lines), which no
+        # grafts or shallow file changes: c1's parent is base, each next one's the one before, the last is tip.
+        changed = ContentError(PARENTS_CHANGED.format(clean(base)[:7], tip[:7]))
+        if (listed[-1] if listed else base) != tip:
+            raise changed
+        batched = content_batched(run, path, tip, base, listed, changed) if getattr(run, "takes_input", False) else None
+        if batched is not None:
+            tree, files, commits = batched
+        else:  # today's calls, one per answer (t-104 R3), the parents checked the same way
+            code, tree, err = run(path, "rev-parse", "--verify", "-q", tip + "^{tree}")
+            files = raw_files(run, path, base, tip)
+            commits, parent = [], base
+            for sha in listed:
+                parents, message = commit_object(run, path, sha)
+                if parents != [parent]:
+                    raise changed
+                commits.append({"sha": sha, "raw": digest(raw_files(run, path, parent, sha, label=sha)),
+                                "message": hashlib.sha256(message.encode("utf-8")).hexdigest()})
+                parent = sha
         _c, common, _e = common_dir(run, path)
         return {"repo": os.path.realpath(path), "common": os.path.realpath(common) if common else None, "commit": tip,
                 "tree": tree or None, "onto": onto, "base": base, "files": files, "commits": commits,
@@ -863,6 +1003,44 @@ def content_record(run, path, tip, onto, base=None):
         return {"error": str(e)}
     except Exception as e:  # a decode error, an unexpected answer: a record error, never a crash of the gate
         return {"error": "could not compute the content of {} ({}: {})".format(tip[:7], type(e).__name__, clean(e)[:200])}
+
+
+def content_batched(run, path, tip, base, listed, changed):
+    """(tree, files, commits) of content_record from two batch calls (t-104 R1): one cat-file --batch for the commit
+    objects (tip's alone when none is listed), then one DIFF_TREE for the whole change and each commit against the
+    parent its object names. None when either call fails or cannot be framed (R3: the caller asks per call). Raises
+    changed when the objects are not rev-list's chain (R6). Each piece is decoded on its own, in today's order (the
+    whole change, then each commit's message and diff), so an error is today's (R2)."""
+    objects = batch_objects(run, path, listed or [tip])
+    if objects is None:
+        return None
+    heads = [object_header(obj) for obj in objects]
+    tree = heads[-1][0]
+    if tree is None:
+        return None
+    parent = base
+    for sha, (_tree, parents) in zip(listed, heads):
+        if parents != [parent]:
+            raise changed
+        parent = sha
+    pieces = batch_diffs(run, path, [(tip, base)] + [(sha, heads[i][1][0]) for i, sha in enumerate(listed)])
+    if pieces is None:
+        return None
+    whole = as_text(pieces[0])
+    files = parse_raw(whole)
+    commits, answers = [], [(("rev-parse", "--verify", "-q", tip + "^{tree}"), tree), (RAW_DIFF + (base, tip), whole)]
+    for i, (sha, obj, piece) in enumerate(zip(listed, objects, pieces[1:])):
+        text = as_text(obj)
+        _head, sep, message = text.partition("\n\n")
+        message = message if sep else ""
+        raw = as_text(piece)
+        commits.append({"sha": sha, "raw": digest(parse_raw(raw)),
+                        "message": hashlib.sha256(message.encode("utf-8")).hexdigest()})
+        answers += [(("cat-file", "commit", sha), text), (RAW_DIFF + (heads[i][1][0], sha), raw)]
+    if callable(getattr(run, "keep", None)):
+        for args, out in answers:
+            run.keep(path, args, (0, out, ""))
+    return tree, files, commits
 
 
 def content_required(directory, task):
@@ -1542,9 +1720,20 @@ def cmd_gate(args):
 GIT_TIMEOUT = 20  # seconds, for each git call made while checking or describing a worktree
 
 
-def git(path, *args, timeout=None):
-    """(exit code, stdout, stderr), stripped. A call that runs past the timeout gives code 124."""
+def git(path, *args, timeout=None, input=None):
+    """(exit code, stdout, stderr), stripped. A call that runs past the timeout gives code 124.
+    input (bytes, t-104): given on stdin; stdout is then the answer's bytes as git wrote them (not decoded, not
+    stripped: a batch answer is framed by byte sizes), stderr text as without it."""
     limit = timeout or GIT_TIMEOUT
+    if input is not None:
+        try:
+            r = subprocess.run(["git", "-C", path] + list(args), input=input, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, timeout=limit)
+        except subprocess.TimeoutExpired:
+            return 124, b"", "git {} timed out after {} s".format(args[0] if args else "", limit)
+        except OSError as e:
+            return 127, b"", str(e)
+        return r.returncode, r.stdout, as_text(r.stderr, "replace")
     try:
         r = subprocess.run(["git", "-C", path] + list(args), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                            universal_newlines=True, timeout=limit)
@@ -1553,6 +1742,9 @@ def git(path, *args, timeout=None):
     except OSError as e:
         return 127, "", str(e)
     return r.returncode, r.stdout.strip(), r.stderr.strip()
+
+
+git.takes_input = True
 
 
 def worktree_facts(path, profile=None):

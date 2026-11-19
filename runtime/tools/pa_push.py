@@ -26,6 +26,7 @@ import contextlib
 import datetime
 import fcntl
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -204,17 +205,20 @@ def clean_env(env=None):
     return env
 
 
-def git_call(argv, timeout, cwd=None):
+def git_call(argv, timeout, cwd=None, input=None):
     """(exit code, stdout, stderr) of one program: an argv list, never a shell, with clean_env(). A call past
-    its timeout gives 124; a program that cannot start gives 127."""
+    its timeout gives 124; a program that cannot start gives 127. input (bytes, t-104): given on stdin instead of
+    an empty one; stdout is then the answer's bytes, stderr text as without it."""
+    raw = input is not None
+    how = {"input": input} if raw else {"stdin": subprocess.DEVNULL, "universal_newlines": True}
     try:
-        r = subprocess.run(list(argv), cwd=cwd, env=clean_env(), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                           stderr=subprocess.PIPE, universal_newlines=True, timeout=max(1, timeout))
+        r = subprocess.run(list(argv), cwd=cwd, env=clean_env(), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           timeout=max(1, timeout), **how)
     except subprocess.TimeoutExpired:
-        return 124, "", "{} timed out after {} s".format(" ".join(argv[:4]), int(timeout))
+        return 124, b"" if raw else "", "{} timed out after {} s".format(" ".join(argv[:4]), int(timeout))
     except OSError as e:
-        return 127, "", str(e)
-    return r.returncode, r.stdout, r.stderr
+        return 127, b"" if raw else "", str(e)
+    return r.returncode, r.stdout, pa_hooks.as_text(r.stderr, "replace") if raw else r.stderr
 
 
 def base(path, hooks):
@@ -452,6 +456,17 @@ def short(sha):
     return (sha or "")[:7] or "none"
 
 
+class TakesInput:
+    """True while git_call takes stdin (t-104 D8): Session.gate_git's takes_input. A git_call put in its place
+    without an input parameter (a test's recorder) keeps the content path on today's per-call calls."""
+
+    def __bool__(self):
+        try:
+            return "input" in inspect.signature(git_call).parameters
+        except (TypeError, ValueError):
+            return False
+
+
 class Session:
     """The git context of one plan, check or run: an empty hooks folder (removed by close), a deadline, and the run's
     cache of object-addressed content answers (t-094 R3, R6: the gate it evaluates; dropped by close). Its own
@@ -465,20 +480,24 @@ class Session:
     def left(self):
         return float("inf") if self.deadline is None else self.deadline - time.monotonic()
 
-    def git(self, path, args, timeout=30):
+    def git(self, path, args, timeout=30, input=None):
         left = self.left()
         if left < 2:
-            return 124, "", "ran out of time"
-        return git_call(base(path, self.hooks) + list(args), min(timeout, left))
+            return 124, "" if input is None else b"", "ran out of time"
+        if input is None:
+            return git_call(base(path, self.hooks) + list(args), min(timeout, left))
+        return git_call(base(path, self.hooks) + list(args), min(timeout, left), input=input)
 
-    def gate_git(self, path, *args, timeout=None):
+    def gate_git(self, path, *args, timeout=None, input=None):
         """pa_hooks.git()'s signature and stripped result, run as self.git runs (hooks and fsmonitor off, no
-        GIT_*): the runner the gate evaluation is given, so it runs nothing the task worktree names."""
+        GIT_*): the runner the gate evaluation is given, so it runs nothing the task worktree names. With input
+        (t-104), as pa_hooks.git(): stdout is the answer's bytes, unstripped (a strip would cut a batch's last object)."""
         args = list(args)
         if "status" in args:  # never look inside a nested repository (its own settings could name a program)
             args.insert(args.index("status") + 1, "--ignore-submodules=all")
-        code, out, err = self.git(path, args, timeout or pa_hooks.GIT_TIMEOUT)
-        return code, out.strip(), err.strip()
+        code, out, err = self.git(path, args, timeout or pa_hooks.GIT_TIMEOUT, input=input)
+        return code, out if input is not None else out.strip(), err.strip()
+    gate_git.takes_input = TakesInput()  # read through the bound method: content_record batches with it (t-104 R1)
 
     def sha(self, path, ref):
         code, out, _err = self.git(path, ["rev-parse", "--verify", "-q", ref + "^{commit}"])
