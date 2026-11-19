@@ -92,6 +92,23 @@ class T(unittest.TestCase):
 '''
 
 
+# A long module that run-all.sh runs in shards (t-078): the real unit_shards.py hook, a class fixture that records
+# its shard, and test methods (filled in) that record themselves; STUB_fail names one test that fails.
+SHARDED = '''import os, unittest
+from unit_shards import load_tests  # noqa: F401
+D = os.environ["STUB_DIR"]
+def mark(line):
+    with open(os.path.join(D, "ran"), "a") as f:
+        f.write(line + "\\n")
+    if os.environ.get("STUB_fail") == line:
+        raise AssertionError("boom " + line)
+class T(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        mark("class {me} " + os.environ.get("PA_UNIT_SHARD", "-"))
+{tests}'''
+
+
 # Holds slot-0 of the suite slots (an flock, its holder line as pa_suite writes it), then touches the ready file.
 # With a command after them, runs it as its child with PA_SUITE_SLOT naming the slot (as pa-full-suite does; not
 # with STUB_NO_MARKER, as the pa-full-suite before t-072 does) and exits with its code; else sleeps until killed.
@@ -406,6 +423,59 @@ class RunAll(unittest.TestCase):
         self.assertTrue(out.rstrip().splitlines()[-1].startswith("=== 1 part(s) failed: unit tests: test_b (outputs: "), out)
         folder = self.outputs(out)
         self.assertEqual(len([f for f in os.listdir(folder) if f.endswith(".log")]), 11, os.listdir(folder))
+
+    def sharded_modules(self):
+        """Stub test_pa_queue.py (nine tests, a class fixture) and test_pa_worker.py (five) with the real
+        tests/unit_shards.py hook, so the table in run-all.sh shards them."""
+        shutil.copy(os.path.join(HERE, "unit_shards.py"), os.path.join(self.repo, "tests"))
+        for module, count in (("test_pa_queue", 9), ("test_pa_worker", 5)):
+            write(os.path.join(self.repo, "tests", module + ".py"), SHARDED.format(me=module, tests="".join(
+                "    def test_{0}(self): mark('{1}.test_{0}')\n".format(i, module) for i in range(1, count + 1))))
+        return ["{}.test_{}".format(m, i) for m, c in (("test_pa_queue", 9), ("test_pa_worker", 5)) for i in range(1, c + 1)]
+
+    def test_r11_long_modules_run_in_shards(self):
+        # t-078: test_pa_queue runs as four parts and test_pa_worker as two, each with its own PA_UNIT_SHARD
+        # (unit_shards.py's every n-th test), named "<module> k/n" in order; each test runs exactly once, each
+        # shard sets up its class fixture; a failing shard is named with its failing test.
+        everything = self.sharded_modules()
+        code, out = self.run_all(PA_UNIT_SHARD="9/9")  # an outer value is not a part's
+        self.assertEqual(code, 0, out)
+        with open(os.path.join(self.tmp, "ran")) as f:
+            ran = f.read().split("\n")
+        tests = sorted(l for l in ran if ".test_" in l)
+        self.assertEqual(tests, sorted(everything), out)
+        fixtures = sorted(l for l in ran if l.startswith("class "))
+        self.assertEqual(fixtures, sorted(["class test_pa_queue {}/4".format(k) for k in (1, 2, 3, 4)] +
+                                          ["class test_pa_worker {}/2".format(k) for k in (1, 2)]), out)
+        parts = (["unit tests: test_pa_queue {}/4".format(k) for k in (1, 2, 3, 4)] +
+                 ["unit tests: test_pa_worker {}/2".format(k) for k in (1, 2)])
+        body = out.split("\n=== summary", 1)[0]
+        at = [body.index("=== " + name + "\n") for name in parts]
+        self.assertEqual(at, sorted(at), body)
+        self.assertNotIn("=== unit tests: test_pa_queue\n", body)
+        self.assertNotIn("=== unit tests: test_pa_worker\n", body)
+        for name in parts + ["unit tests: test_stub"]:
+            self.assertIn("  {}: ok".format(name), self.summary(out))
+        self.assertIn("Ran 3 tests", body.split("=== unit tests: test_pa_queue 1/4\n", 1)[1].split("\n=== ", 1)[0])
+        os.remove(os.path.join(self.tmp, "ran"))
+        code, out = self.run_all(fail="test_pa_queue.test_6")  # test_6 is in shard 2/4 (index 5)
+        self.assertEqual(code, 1, out)
+        tail = "\n".join(out.rstrip().splitlines()[-40:])
+        self.assertIn("--- unit tests: test_pa_queue 2/4: FAILED", tail)
+        self.assertIn("FAIL: test_6 (test_pa_queue.T", tail)
+        self.assertTrue(out.rstrip().splitlines()[-1].startswith("=== 1 part(s) failed: unit tests: test_pa_queue 2/4 (outputs: "), out)
+
+    def test_r6e_affected_fixture_module_runs_the_unit_tests(self):
+        # A change to a test helper that is not a test_*.py module (queue_fixtures.py, push_fixtures.py,
+        # unit_shards.py) runs the unit parts, the shards among them.
+        self.sharded_modules()
+        for changed in ("tests/queue_fixtures.py", "tests/push_fixtures.py", "tests/unit_shards.py"):
+            with self.subTest(changed=changed):
+                code, out = self.run_all("--affected", PA_CHANGED_FILES=changed)
+                self.assertEqual(code, 0, out)
+                for name in ("unit tests: test_stub", "unit tests: test_pa_queue 3/4", "unit tests: test_pa_worker 2/2"):
+                    self.assertIn("  {}: ok".format(name), self.summary(out))
+                self.assertNotIn("keeper harness", out)
 
     def test_r7_usage(self):
         code, out = self.run_all("--nope")
