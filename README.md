@@ -391,6 +391,21 @@ before), so `billed compare` sets this space's estimates beside the bill of that
 stacked on, what each waits for and its approval, then the entries that left (why, the fix round they
 went to) and the last merges; `pa-queue show` reads each state now.
 
+**Places** (a folding section at the top of the Tasks tab) shows how many workers run of each kind of
+place and who holds each, then the jobs waiting to start in the order they will start. The kinds are
+`working` (a job that runs tests), `no-test` (a job that runs none: it takes a working place, else the
+no-test extra place) and `suite` (a job at the full-suite step: a working place and a suite place).
+Their limits are the rules' `places` (`"places": {"working": 4, "no-test": 1, "suite": 2}` on an active
+rule, the highest one per kind); with none, working 4, no-test 0 and no suite cap. The Project Agent
+keeps the waiting list in `waiting.json` with `pa-places` (`add`, `block`, `unblock`, `drop`, `start`;
+`pa-places next` says which job starts and why the others wait). You move a waiting job with ↑ ↓ ⤒;
+the panel writes your order to `start-order.json`, which no tool writes, and tells the agent `start
+order changed`. Your order only says which ready job goes first: it answers no card, approves no rule,
+lifts no hold and raises no limit. Merge-queue checks keep the queue's order (Queue tab). A space's
+suite places are not the machine's suite slot: the suite places limit how many of this space's workers
+are at the full-suite step, while the slot (`PA_SUITE_CAP`, default 1, see Checks) lets that many suite
+runs at once on the machine, across every space.
+
 **The Costs view** (Project panel, fifth tab) reads only `costs/summary.json` on the space's machine,
 only while it is shown, at most every 10 s. It shows Total, Today and Last 7 days, then the spend by
 activity, task, session type and day, each with its drill-down, and `Refresh` (runs `pa-costs

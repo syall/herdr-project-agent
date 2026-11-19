@@ -61,6 +61,15 @@ A new space opens with a 600 x 440 dialog: a Project Agent card (`Set up for <fo
   it asks "Delete the task, its evidence and its cards?" with a Cancel beside it; Cancel, a click
   anywhere else in the panel, collapsing the task, another view or space, or 10 s without a
   second click put it back to Delete….
+- **Places:** above the state sections, a folding **Places** section headed `Places · 3 of 4
+  working · 2 waiting`: each kind of place with its limit and holders (`Working · 3 of 4`,
+  `No-test extra · 0 of 1`, `Suite step · 1 of 2`, one line per worker: address, task, job, role,
+  since), the limits' rule, then `Waiting · n`, one line per job in the order they will start
+  (position, task, job, role, kind, why it waits: `blocked: …`, `waits for a suite place (2 of 2)`,
+  `next to start`) with ↑ ↓ ⤒ to move it. A merge-queue check shows `merge queue order (Queue tab)`
+  and no buttons. A move writes your order and tells the agent; it only says which ready job goes
+  first. A task row shows a badge per waiting or running job (`next #2 · suite step`, `running ·
+  working`); a click unfolds Places and marks that line.
 - **Finished workers are closed by the agent.** The agent starts one fresh worker per job, named
   for the job (`t-010-tests`, `t-010-fix`), and closes it in the pass where it reads its report,
   with `pa-worker close`. That command refuses a worker that is working or blocked, has no

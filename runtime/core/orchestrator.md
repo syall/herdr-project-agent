@@ -17,8 +17,9 @@ worker report, an answered decision ("decision d-007 answered"), or "scheduled p
    `standing.md`, every decision in `decisions/` whose status changed, and the new messages.
    Read them again each pass; do not trust what you remember.
 2. Update the ledger and append one line per state change to `journal.jsonl`.
-3. Decide the next actions: start a worker, prompt one, run the gate and move a task
-   on, close a finished task, or open a decision card.
+3. Decide the next actions: start a worker (through the waiting list, see Workers),
+   prompt one, run the gate and move a task on, close a finished task, or open a
+   decision card.
 4. Write the ledger again, with its `context` checkpoint, before you end your turn, and
    before any long wait.
 
@@ -66,7 +67,8 @@ Start nothing else until asked: no new task, no move to a phase that needs the p
 no worker for a task with an open card. When the person says to hold or to resume,
 append a journal line recording it, in their words. If the last such line in the
 journal is a hold, start nothing at all until the person says go. `paused` in
-`schedule.json` stops timed passes only; it is not a hold.
+`schedule.json` stops timed passes only; it is not a hold. Give each hold or resume line
+the `hold` key (see Files).
 `pa-restart` is the person's: run it only at their word, with `--why` quoting them.
 `pa-context fresh` is the person's too: run it only at their word, with `--why` quoting them.
 If `pa-doctor` reports a broken ledger, do not guess: rebuild it from `ledger.last-good.json`
@@ -118,7 +120,7 @@ a step already taken.
                    "started": "<UTC time>" },
                  { "address": "t15", "role": "build", "name": "t-003-fix", "round": 2,
                    "started": "<UTC time>",
-                   "finished": true, "closed": "<UTC time>", "closedBy": "agent",
+                   "place": "working", "finished": true, "closed": "<UTC time>", "closedBy": "agent",
                    "report": "FINDINGS.md" } ],
     "worktree": "<path or null>",
     "worktrees": [ { "path": "<path>", "job": "main", "created": "<UTC time>" } ],
@@ -135,6 +137,8 @@ issue, document or dashboard, one entry each. The panel draws one button per lin
 slug, unique in the task); `worktree` is the first of them. Mark an entry
 `"removed": "<UTC time>"` once its worktree is removed, and `"keep": true` to keep that one
 whatever happens. A worker's `worktree` is the folder it was started in.
+A worker's `place` is the kind of place the worker was started for (`working`, `no-test` or
+`suite`), as `pa-places start` prints it; write it in the same ledger write that records the worker.
 A worker's `finished`, `closed`, `closedBy`, `report`, `keep`, `keptAt`, `keepQuote`,
 `unkeptAt` and `unkeepQuote` are written by `pa-worker close` and `pa-worker keep`, and
 the top-level `workerPolicy` by `pa-worker close --leftovers`; never write them by hand,
@@ -143,6 +147,14 @@ and keep them when you write the ledger.
 `{"at":"<UTC time>","pass":12,"trigger":"message|report|decision|scheduled|manual","task":"t-003","from":"plan","to":"build","why":"..."}`
 On a line about a worker, add `worker` (its address), `round` (see Rounds), and for
 a verifier, reviewer or check worker `check` (`full` or `diff`).
+A hold or resume line adds `"hold": "on"` (a hold) or `"hold": "off"` (a resume), with the
+person's words in `why`: `{"at":"<UTC time>","pass":12,"trigger":"message","hold":"on","why":"<their words>"}`.
+`pa-places` reads that key alone: a hold journalled without it does not stop `pa-places next`.
+If `standing.md` `# Hold` names a hold in force and the journal's last hold line has no `hold`
+key, append one with `"hold": "on"` quoting it before you run `pa-places next`.
+
+`waiting.json` is written only by `pa-places`, never by hand. `start-order.json` is the
+person's: the panel writes it; read it through `pa-places`, never write it.
 
 The person can change a task themselves from the panel or with `pa-task` (mark it done, park
 it, reopen it, delete it). You get a message when they do. Their change stands: re-read the
@@ -253,6 +265,9 @@ Rules belong to the person. Each has `id`, `title`, `text`, `why`, `appliesTo`
   the rule's status for you. Answered Other, the rule stays proposed: act on their words;
   to change what it says, propose a new rule on a new card.
 - A rule may list extra required evidence: `"evidence": ["screenshot.png"]`. The gate checks it.
+- A rule may carry the space's worker places: `"places": {"working": 4, "no-test": 1, "suite": 2}`.
+  Those are the limits `pa-places` uses (per kind, the highest active rule that names it; else
+  working 4, no-test 0 and no suite cap). To change a limit, propose a rule; nothing else raises or lowers one.
 - If you cannot follow a rule (it names a tool you lack, say), set
   `"needsAttention": "<why>"` on it and leave its text alone.
 - Never re-propose a `declined` rule.
@@ -336,8 +351,28 @@ Run `hc --skill` once to learn `hc`. Start workers with the profile's commands (
   `pa-hooks install <worktree> --task <task-id>` (add `--fix` for a bug fix: it locks test
   files). They lint after each edit, run the affected tests when a task is marked complete
   and before a session ends, and block what cannot be taken back. Never remove or edit them.
-- At most 4 workers working at once, and never more than the person can review. Wait
-  instead. A worker that has reported, but whose report you have not read yet, does not
+- Workers take places. Kinds: `working` (a job that runs tests: build, fix, verifier,
+  check), `no-test` (a job that runs none: design, plan-only, reviewer, docs-only, a watch)
+  and `suite` (a job whose work includes the full-suite step: verifier, check, and a
+  high-tier build or fix). A no-test job takes a working place, else the no-test extra
+  place; a suite job needs a working place and a suite place. Their limits are the rules'
+  `places` (see Rules).
+  A job ready or nearly ready to start goes on the waiting list with
+  `pa-places add <task> --job <job> --kind <kind> --role <role>` (`--source queue` for a
+  merge-queue entry's check; `--blocked-by "<line>"` for what else it waits for: an open
+  card, a task in `after`, a hold), and `pa-places block`, `unblock` and `drop --why` as
+  that changes. Every new worker goes through the list, a second try (`-2`) included. A
+  follow-up to a running worker for its own job takes no new place.
+- To start workers, run `pa-places next` and start the jobs it marks `start`, in its order,
+  and never more than the person can review; for each, run
+  `pa-places start <id> --worker <addr>` and record the `place` it prints in the worker's
+  ledger entry. A job whose kind is full is skipped, never waited on. Start nothing
+  `pa-places next` does not mark `start` (on a hold, a hold it cannot read or no terminal
+  list, it marks none). The order comes from the person's `start-order.json`.
+  The person's order never answers a card, approves a rule, lifts a hold, raises a limit,
+  clears a `blockedBy`, or starts a job that is not ready. It only says which ready job
+  goes first. A `start order changed` notice is a message: run the pass as usual.
+  A worker that has reported, but whose report you have not read yet, does not
   count; close it once read.
 - Never sleep, poll or block on `hc wait` to see what workers are doing. To look at one
   on a pass: `hc get <t>` for its status, `hc read <t> --lines 40` for its screen.
