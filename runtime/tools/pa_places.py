@@ -19,7 +19,8 @@ waiting.json, in the space's state folder, is written by this tool only, under <
 and rename); each change appends one journal line ("trigger": "places"). Workers' shells are refused the writes.
 start-order.json and task-order.json are the person's (the panel writes them); rules.json is the person's: this tool
 reads them and writes none of them. The waiting list's movable jobs follow their task's place in the task ranking
-(task-order.json over the ledger's taskOrder, then created order); the start order's pins then move single jobs. The hold: the last journal line with a "hold" key ("on" or "off") decides; when that cannot be told,
+(task-order.json over the ledger's taskOrder, then created order) once a task order exists (a readable task-order.json
+or a ledger taskOrder); until then they keep the added order. The start order's pins then move single jobs. The hold: the last journal line with a "hold" key ("on" or "off") decides; when that cannot be told,
 `hold unknown` and nothing starts.
 """
 import argparse
@@ -280,7 +281,8 @@ def move_task(ranking, section, tid, move, order, last):
     same = [k for k, r in enumerate(ranking) if r["state"] == section]
     pos = same.index(i)
     seq = list(ids)
-    chats = sum(1 for r in ranking if r["source"] == "chat")
+    chat_ids = [r["id"] for r in ranking if r["source"] == "chat"]
+    chats = len(chat_ids)
     if move == "up" or move == "top":
         if pos == 0:
             return None
@@ -303,7 +305,9 @@ def move_task(ranking, section, tid, move, order, last):
             end = -1
     else:
         return None
-    prefix = seq[:max(end, chats - 1) + 1] if move != "bottom" else [x for x in ids[:chats] if x != tid]
+    # the prefix runs to the lower moved place and to every chat task's place after the move (a top can shift them)
+    lowest_chat = max((k for k, x in enumerate(seq) if x in chat_ids), default=-1)
+    prefix = seq[:max(end, lowest_chat) + 1] if move != "bottom" else [x for x in ids[:chats] if x != tid]
     new_order = list(prefix)
     for x in order:
         if x not in new_order and not (move == "bottom" and x == tid):
@@ -485,7 +489,10 @@ class State:
         self.terminals = live is not None
         self.holders = holders_from(ledger, live or {}, skip)
         self.hold = hold_state(read_text(os.path.join(directory, "journal.jsonl"))) if self.terminals else "no-terminals"
-        self.jobs = effective_order(self.waiting["jobs"], self.start, [r["id"] for r in self.ranking])
+        # Until a task order exists (a readable task-order.json or a ledger taskOrder), the waiting list keeps the
+        # added order, today's priorities (R27, J1-D10); the start order's pins apply either way.
+        has_order = self.task_order_doc is not None or (self.task_order is not None and task_order_parts(self.task_order)[2])
+        self.jobs = effective_order(self.waiting["jobs"], self.start, [r["id"] for r in self.ranking] if has_order else None)
         self.reasons = allocate(self.jobs, self.limits, [h["place"] for h in self.holders], self.hold)
         for r in self.reasons:
             if r["action"] == "hold":
