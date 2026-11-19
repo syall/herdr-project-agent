@@ -673,6 +673,7 @@ class Q23Rejoin(QBase):
         self.task("t-A", [("a.txt", (2, "two A"))])
         self.add("t-A")
         self.task("t-B", [("a.txt", (2, "two B")), ("fb.txt", "b\n")])
+        self.checked_tip = self.tip("t-B")
         code, out, err = self.add("t-B", ok=False)
         self.assertIn("needs a rebase worker onto t-A-x", err)
         self.rebase_worker("t-B", "t-A-x", "a.txt", 2, "two AB")
@@ -1041,6 +1042,227 @@ class A5JobWorktree(QBase):
         entries = [{"task": "t-A", "job": "j1", "branch": "t-A-j1"}]
         self.assertEqual(pa_hooks.entry_below(pa_hooks.git, self.proj, rec, entries, "t-A", commit, job="j2"), "t-A-j1")
         self.assertIsNone(pa_hooks.entry_below(pa_hooks.git, self.proj, rec, entries, "t-A", commit, job="j1"))
+
+
+
+# ---- t-052 J3c: d-166 doc-only conflicts (decide's `union`, plan JJ.4) ------------------------------------
+
+def union_text(first, second, line=2):
+    """LINES with line `line` replaced by two lines: what git merge-file --union gives for a conflict there."""
+    lines = LINES.splitlines(True)
+    lines[line - 1] = first + "\n" + second + "\n"
+    return "".join(lines)
+
+
+APPROVAL = {"card": "d-q1", "answeredBy": "person", "at": "2000-01-03T00:00:00Z"}
+
+
+class UBase(QBase):
+    """A rebase worker resolves a conflict by hand (the tool never does, AC18.1)."""
+
+    def resolve(self, tid, onto, f, text, extra=None):
+        wt = self.trees[tid]
+        r = subprocess.run(["git", "rebase", onto], cwd=wt, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertNotEqual(r.returncode, 0, "the rebase was expected to conflict")
+        write(os.path.join(wt, f), text)
+        sh(wt, "git", "add", f)
+        if extra:
+            write(os.path.join(wt, extra[0]), extra[1])
+            sh(wt, "git", "add", extra[0])
+        sh(wt, "git", "-c", "core.editor=true", "rebase", "--continue")
+        gitdir = sh(wt, "git", "rev-parse", "--absolute-git-dir")
+        self.assertFalse(any(os.path.exists(os.path.join(gitdir, n)) for n in ("rebase-merge", "rebase-apply")))
+        return self.tip(tid)
+
+    def verify(self, tid):
+        return self.queue("verify", tid, "--repo", self.proj)
+
+    def review(self, tid, verdict="pass", reviewer=None):
+        reviewer = reviewer or tid + "s"
+        self.add_worker(tid, reviewer, "reviewer")
+        need = self.entry(tid)["needs"]["shortReview"] if any(e["task"] == tid for e in self.entries()) else None
+        name = need["file"] if need else "SHORT-REVIEW-{}-1.md".format(tid)
+        write(os.path.join(self.evidence(tid), name), review_text(self.tip(tid), reviewer, verdict=verdict))
+        return name
+
+
+class U1AddConflict(UBase):
+    """B's add conflicts with A on a.txt line 2 (a docstring line, say); a rebase worker keeps both sides."""
+
+    def setUp(self):
+        super().setUp()
+        self.task("t-A", [("a.txt", (2, "two A"))])
+        self.add("t-A")
+        self.task("t-B", [("a.txt", (2, "two B")), ("fb.txt", "b\n")])
+        self.checked_tip = self.tip("t-B")
+        code, out, err = self.add("t-B", ok=False)
+        self.assertIn("needs a rebase worker onto t-A-x", err)
+
+    def test_u1_both_sides_kept_is_union_with_a_doc_only_review(self):
+        tip = self.resolve("t-B", "t-A-x", "a.txt", union_text("two B", "two A"))
+        code, out, err = self.verify("t-B")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn(": union", out)
+        self.assertIn("SHORT-REVIEW-t-B-1.md", out)
+        self.assertIn("docstrings or comments", out)
+        self.assertIn("a.txt", out)
+        self.assertIn("lines 2-3", out)
+        self.assertIn(tip, out)
+        self.assertEqual(self.journal("verify")[-1]["result"], "union")
+
+    def test_u1b_union_only_unit(self):
+        self.resolve("t-B", "t-A-x", "a.txt", union_text("two B", "two A"))
+        run = pa_hooks.content_git(pa_hooks.git)
+        checked = pa_hooks.content_record(run, self.proj, self.checked_tip, "main", self.ref("main"))
+        now = pa_hooks.content_record(run, self.proj, self.tip("t-B"), "t-A-x")
+        self.assertFalse(pa_hooks.moved_only(run, self.proj, checked, now)[0])
+        ok, why, unions, shared = pa_hooks.union_only(run, pa_hooks.git, self.proj, checked, now)
+        self.assertTrue(ok, why)
+        self.assertEqual(shared, [])
+        self.assertEqual([(u["path"], u["regions"], u["order"]) for u in unions], [("a.txt", [[2, 3]], "checked first")])
+        self.assertFalse(pa_hooks.union_only(run, pa_hooks.git, self.proj, checked, checked)[0], "no differing file: not a union")
+
+    def test_u2a_one_side_only_is_changed(self):
+        self.resolve("t-B", "t-A-x", "a.txt", line_edit(LINES, 2, "two A"))
+        code, out, err = self.verify("t-B")
+        self.assertEqual(code, 1, out + err)
+        self.assertIn(": changed", out)
+
+    def test_u2b_the_other_side_only_is_changed(self):
+        self.resolve("t-B", "t-A-x", "a.txt", line_edit(LINES, 2, "two B"))
+        code, out, err = self.verify("t-B")
+        self.assertEqual(code, 1, out + err)
+        self.assertIn(": changed", out)
+
+    def test_u2c_a_line_edited_in_the_resolution_is_changed(self):
+        self.resolve("t-B", "t-A-x", "a.txt", union_text("two B", "two A, edited"))
+        code, out, err = self.verify("t-B")
+        self.assertEqual(code, 1, out + err)
+        self.assertIn(": changed", out)
+
+    def test_u5_union_in_one_file_and_a_real_change_in_another_is_changed(self):
+        self.resolve("t-B", "t-A-x", "a.txt", union_text("two B", "two A"), extra=("b.txt", "b, changed\n"))
+        code, out, err = self.verify("t-B")
+        self.assertEqual(code, 1, out + err)
+        self.assertIn(": changed", out)
+
+    def test_u6_sides_swapped_is_union(self):
+        self.resolve("t-B", "t-A-x", "a.txt", union_text("two A", "two B"))
+        code, out, err = self.verify("t-B")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn(": union", out)
+
+    def test_u6b_add_joins_and_the_gate_needs_the_doc_only_review(self):
+        """No approval to keep at add (the task was not in the queue): it joins on t-A-x as union, the gate waits for
+        the short review, which counts only once refresh records it (V-U3: union never counts without it)."""
+        self.resolve("t-B", "t-A-x", "a.txt", union_text("two A", "two B"))
+        self.gate("t-B")
+        self.add("t-B")
+        e = self.entry("t-B")
+        self.assertEqual((e["onto"], e["state"], e["approval"]), ("t-A-x", "checking", None))
+        need = e["needs"]["shortReview"]
+        self.assertEqual(need["kind"], "doc-only")
+        self.assertEqual([u["path"] for u in need["unions"]], ["a.txt"])
+        code, out, _ = self.gate("t-B")
+        self.assertEqual(code, 1, out)
+        self.assertIn("a short review is needed", out)
+        self.review("t-B")
+        self.queue("refresh", "--repo", self.proj)
+        code, out, _ = self.gate("t-B")
+        self.assertEqual(code, 0, out)
+        self.assertIn("short review", out)
+
+
+class U3RestackConflict(UBase):
+    """t-B is in the queue on t-A-x with an approval; main moves under a.txt line 2; the restack conflicts and t-B
+    leaves, keeping its approval as resumable (d-166). A rebase worker keeps both sides."""
+
+    def setUp(self):
+        super().setUp()
+        self.task("t-A", [("fa.txt", "a\n")])
+        self.add("t-A")
+        self.task("t-B", [("a.txt", (2, "two B")), ("fb.txt", "b\n")])
+        self.add("t-B")
+        self.set_entries(lambda r: r["entries"][1].update(approval=dict(APPROVAL)))
+        self.on_main("a.txt", (2, "two M"))
+        code, out, err = self.queue("restack", "--repo", self.proj)
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("conflict", out)
+        self.assertEqual([e["task"] for e in self.entries()], ["t-A"])
+        self.left = self.qrepo()["left"][-1]
+
+    def test_u3a_conflict_keeps_the_approval_resumable(self):
+        self.assertEqual((self.left["task"], self.left["why"]), ("t-B", "conflict"))
+        self.assertEqual(self.left["approval"]["card"], "d-q1")
+        self.assertEqual(self.left["approval"]["void"], "conflict")
+        self.assertIs(self.left["approval"]["resumable"], True)
+        self.assertEqual(self.left["checked"]["commit"], self.checked_commit())
+
+    def checked_commit(self):
+        return pa_hooks.checked_commits(read(os.path.join(self.evidence("t-B"), "VERIFY.md")))[-1]
+
+    def test_u3b_reviewed_then_add_restores_the_approval(self):
+        self.resolve("t-B", "t-A-x", "a.txt", union_text("two B", "two M"))
+        code, out, err = self.verify("t-B")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn(": union", out)
+        self.review("t-B")
+        self.gate("t-B")
+        code, out, err = self.add("t-B")
+        e = self.entry("t-B")
+        self.assertEqual(e["onto"], "t-A-x")
+        self.assertEqual(e["approval"]["card"], "d-q1")
+        self.assertNotIn("void", e["approval"])
+        self.assertNotIn("resumable", e["approval"])
+        self.assertEqual(e["approval"]["carried"], "doc-only, short review SHORT-REVIEW-t-B-1.md")
+        self.assertIsNone(e.get("heldApproval"))
+        self.assertTrue(self.qrepo()["left"][-1].get("resumed"))
+        code, out, _ = self.gate("t-B")
+        self.assertEqual(code, 0, out)
+        self.assertIn("short review", out)
+
+    def test_u3c_without_the_review_the_approval_is_held_until_refresh_records_it(self):
+        self.resolve("t-B", "t-A-x", "a.txt", union_text("two B", "two M"))
+        self.gate("t-B")
+        self.add("t-B")
+        e = self.entry("t-B")
+        self.assertIsNone(e["approval"])
+        self.assertEqual(e["heldApproval"]["approval"]["card"], "d-q1")
+        code, out, _ = self.gate("t-B")
+        self.assertEqual(code, 1, out)
+        self.assertIn("a short review is needed", out)
+        self.queue("refresh", "--repo", self.proj)
+        self.assertIsNone(self.entry("t-B")["approval"], "no review yet: still held")
+        self.review("t-B")
+        code, out, err = self.queue("refresh", "--repo", self.proj)
+        self.assertEqual(code, 0, out + err)
+        e = self.entry("t-B")
+        self.assertEqual(e["approval"]["card"], "d-q1")
+        self.assertEqual(e["approval"]["carried"], "doc-only, short review SHORT-REVIEW-t-B-1.md")
+        self.assertIsNone(e.get("heldApproval"))
+        self.assertEqual(self.gate("t-B")[0], 0)
+
+    def test_u3d_a_changed_resolution_does_not_restore_it(self):
+        self.resolve("t-B", "t-A-x", "a.txt", line_edit(LINES, 2, "two B and M"))
+        self.gate("t-B")
+        code, out, err = self.add("t-B", ok=False)
+        self.assertEqual(code, 1, out + err)
+        self.assertEqual([e["task"] for e in self.entries()], ["t-A"])
+
+    def test_u4_a_must_fix_short_review_voids_the_approval_for_good(self):
+        self.resolve("t-B", "t-A-x", "a.txt", union_text("two B", "two M"))
+        self.gate("t-B")
+        self.add("t-B")
+        self.review("t-B", verdict="must fix (1)")
+        code, out, err = self.queue("refresh", "--repo", self.proj)
+        self.assertEqual([e["task"] for e in self.entries()], ["t-A"])
+        left = self.qrepo()["left"]
+        self.assertEqual(left[-1]["task"], "t-B")
+        self.assertIn("short review", left[-1]["why"])
+        self.assertEqual(left[-1]["approval"]["card"], "d-q1")
+        self.assertTrue(left[-1]["approval"]["void"])
+        self.assertNotIn("resumable", left[-1]["approval"])
+        self.assertTrue(left[-2].get("resumed"), "the conflict's approval was used once")
 
 
 if __name__ == "__main__":
