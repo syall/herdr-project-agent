@@ -1309,5 +1309,173 @@ class U7UnionSharedFile(UBase):
         self.assertNotIn("still do what it did", out)
 
 
+# ---- t-086: the J3c limits (RL-J3c-1, RL-J3c-3) and test gaps (RL-J3c-V1..V4) --------------------------------
+
+class T86Limits(UBase):
+    """RL-J3c-1: a union file is checked commit by commit; RL-J3c-3: conflict markers are found by an exact marker
+    size, so a content line that starts with 7 marker characters is not a marker."""
+
+    def records(self, tid, checked_tip, onto):
+        run = pa_hooks.content_git(pa_hooks.git)
+        checked = pa_hooks.content_record(run, self.proj, checked_tip, "main", self.ref("main"))
+        now = pa_hooks.content_record(run, self.proj, self.tip(tid), onto)
+        return run, checked, now
+
+    def two_commits(self):
+        self.task("t-A", [("a.txt", (2, "two A"))])
+        self.add("t-A")
+        self.task("t-B", [("a.txt", (2, "two B")), ("a.txt", (150, "change B"))])
+        checked_tip = self.tip("t-B")
+        code, out, err = self.add("t-B", ok=False)
+        self.assertIn("needs a rebase worker onto t-A-x", err)
+        return checked_tip
+
+    def test_t1_union_file_checked_in_every_commit(self):
+        """c1' leaves a.txt line 2 as a third text, c2' brings the union back: the tip is the union, the history is
+        not (RL-J3c-1)."""
+        checked_tip = self.two_commits()
+        wt, onto = self.trees["t-B"], self.ref("t-A-x")
+        sh(wt, "git", "checkout", "-q", "-B", "t-B-x", onto)
+        write(os.path.join(wt, "a.txt"), line_edit(read(os.path.join(wt, "a.txt")), 2, "two C"))
+        sh(wt, "git", "commit", "-q", "-am", "t-B a.txt")
+        write(os.path.join(wt, "a.txt"), line_edit(union_text("two B", "two A"), 151, "change B"))
+        sh(wt, "git", "commit", "-q", "-am", "t-B a.txt")
+        run, checked, now = self.records("t-B", checked_tip, "t-A-x")
+        ok, why, unions, shared = pa_hooks.union_only(run, pa_hooks.git, self.proj, checked, now)
+        self.assertFalse(ok, "an intermediate commit that is no union must not pass: {}".format(unions))
+        self.assertIn("the commits changed", why)
+        code, out, err = self.verify("t-B")
+        self.assertEqual(code, 1, out + err)
+        self.assertIn(": changed", out)
+
+    def test_t1b_honest_two_commit_rebase_stays_a_union(self):
+        checked_tip = self.two_commits()
+        self.resolve("t-B", "t-A-x", "a.txt", union_text("two B", "two A"))
+        run, checked, now = self.records("t-B", checked_tip, "t-A-x")
+        ok, why, unions, shared = pa_hooks.union_only(run, pa_hooks.git, self.proj, checked, now)
+        self.assertTrue(ok, why)
+        self.assertEqual([(u["path"], u["regions"]) for u in unions], [("a.txt", [[2, 3]])])
+        code, out, err = self.verify("t-B")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn(": union", out)
+
+    def union_regions(self, main_text, change_text, resolved):
+        self.task("t-A", [("a.txt", (2, main_text))])
+        self.add("t-A")
+        self.task("t-B", [("a.txt", (2, change_text))])
+        checked_tip = self.tip("t-B")
+        code, out, err = self.add("t-B", ok=False)
+        self.assertIn("needs a rebase worker onto t-A-x", err)
+        self.resolve("t-B", "t-A-x", "a.txt", resolved)
+        run, checked, now = self.records("t-B", checked_tip, "t-A-x")
+        ok, why, unions, shared = pa_hooks.union_only(run, pa_hooks.git, self.proj, checked, now)
+        self.assertTrue(ok, why)
+        return [u["regions"] for u in unions]
+
+    def test_t2_a_content_line_like_a_closing_marker_stays_in_the_region(self):
+        """RL-J3c-3: main's side holds a line starting with >>>>>>>: the region is all of both sides, lines 2-4."""
+        self.assertEqual(self.union_regions(">>>>>>> fake\ntwo A", "two B", union_text("two B", ">>>>>>> fake\ntwo A")),
+                         [[[2, 4]]])
+
+    def test_t2b_a_content_line_like_an_opening_marker_above_opens_nothing(self):
+        self.on_main("a.txt", (1, "<<<<<<<< example"))
+        self.assertEqual(self.union_regions("two A", "two B", line_edit(union_text("two B", "two A"), 1, "<<<<<<<< example")),
+                         [[[2, 3]]])
+
+    def test_t2c_a_content_line_like_a_separator_stays_in_the_region(self):
+        self.assertEqual(self.union_regions("two A", "=======\ntwo B", union_text("=======\ntwo B", "two A")),
+                         [[[2, 4]]])
+
+    def test_v4_a_conflict_only_the_histogram_diff_finds(self):
+        """RL-J3c-V4 (D-J3c-2): myers places this conflict elsewhere; the rebase's (histogram) union is found only by
+        UNION_ALGORITHMS' histogram entry."""
+        self.on_main("c.txt", "one\n{\none\n}\n")
+        self.task("t-A", [("c.txt", "one\n}\n{\none\n")])
+        self.add("t-A")
+        self.task("t-B", [("c.txt", "one\none\n{\none\n}\n")])
+        checked_tip = self.tip("t-B")
+        code, out, err = self.add("t-B", ok=False)
+        self.assertIn("needs a rebase worker onto t-A-x", err)
+        self.resolve("t-B", "t-A-x", "c.txt", "one\none\n{\none\n}\n{\none\n")
+        run, checked, now = self.records("t-B", checked_tip, "t-A-x")
+        ok, why, unions, shared = pa_hooks.union_only(run, pa_hooks.git, self.proj, checked, now)
+        self.assertTrue(ok, why)
+        saved = pa_hooks.UNION_ALGORITHMS
+        pa_hooks.UNION_ALGORITHMS = ((),)
+        try:
+            self.assertFalse(pa_hooks.union_only(run, pa_hooks.git, self.proj, checked, now)[0],
+                             "myers alone does not find this union")
+        finally:
+            pa_hooks.UNION_ALGORITHMS = saved
+
+
+class T86TipLine(unittest.TestCase):
+    def test_v1_tip_line_shifts_by_insertions_and_rewrites(self):
+        """RL-J3c-V1 (M6): -U0 hunks new base -> tip: 3 lines inserted after line 1, lines 5-6 rewritten as 3."""
+        hunks = [{"old": (1, 0), "new": (2, 3)}, {"old": (5, 2), "new": (8, 3)}]
+        got = {n: pa_queue.tip_line(n, hunks) for n in (1, 2, 4, 5, 6, 7, 10)}
+        self.assertEqual(got, {1: 1, 2: 5, 4: 7, 5: None, 6: None, 7: 11, 10: 14})
+        self.assertEqual(pa_queue.tip_line(3, [{"old": (3, 0), "new": (4, 2)}]), 3, "an insertion after the line")
+
+    def test_v1b_region_of(self):
+        regions = [[2, 3], [10, 12]]
+        self.assertEqual(pa_queue.region_of(5, 7, [[1, 4], [5, 8]]), 1)
+        self.assertEqual(pa_queue.region_of(10, 12, regions), 1)
+        self.assertIsNone(pa_queue.region_of(3, 10, regions), "across two regions")
+        self.assertIsNone(pa_queue.region_of(None, 3, regions))
+        self.assertIsNone(pa_queue.region_of(2, None, regions))
+
+
+class T86HeldApproval(U3RestackConflict):
+    """RL-J3c-V2, V3: what keeps a held approval held."""
+
+    def test_v2_must_fix_review_written_before_add_keeps_the_approval_held(self):
+        self.resolve("t-B", "t-A-x", "a.txt", union_text("two B", "two M"))
+        self.review("t-B", verdict="must fix (1)")
+        self.gate("t-B")
+        self.add("t-B")
+        e = self.entry("t-B")
+        self.assertIsNone(e["approval"])
+        self.assertEqual(e["heldApproval"]["approval"]["card"], "d-q1")
+
+    def fake_review(self, about):
+        """A passing reviews.jsonl line for t-B's tip that answered another question (or none)."""
+        tip = self.tip("t-B")
+        self.add_worker("t-B", "t-Bs", "reviewer")
+        run = pa_hooks.content_git(pa_hooks.git)
+        line = {"kind": "short-review", "at": pa.now(), "task": "t-B", "job": None, "repo": self.proj,
+                "common": self.qrepo()["common"] if "common" in self.qrepo() else None, "branch": "t-B-x", "tip": tip,
+                "tree": sh(self.proj, "git", "rev-parse", tip + "^{tree}"), "file": "SHORT-REVIEW-t-B-1.md",
+                "worker": "t-Bs", "started": pa.now(), "ended": pa.now(), "seconds": 1.0, "verdict": "pass"}
+        if line["common"] is None:
+            line["common"] = pa_hooks.common_dir(run, self.proj)[1]
+        if about:
+            line["about"] = about
+        path = os.path.join(self.dir, "content", "reviews.jsonl")
+        with open(path, "a") as f:
+            f.write(json.dumps(line) + "\n")
+        self.assertEqual(pa_hooks.review_runs(self.dir)[-1]["tip"], tip)
+
+    def held_with(self, about):
+        self.resolve("t-B", "t-A-x", "a.txt", union_text("two B", "two M"))
+        self.gate("t-B")
+        self.add("t-B")
+        self.assertIsNotNone(self.entry("t-B")["heldApproval"])
+        self.fake_review(about)
+        code, out, _ = self.gate("t-B")
+        self.assertEqual(code, 1, out)
+        self.assertIn("a short review is needed", out)
+        self.queue("refresh", "--repo", self.proj)
+        e = self.entry("t-B")
+        self.assertIsNone(e["approval"])
+        self.assertEqual(e["heldApproval"]["approval"]["card"], "d-q1")
+
+    def test_v3_a_moved_kind_review_does_not_count_for_a_union(self):
+        self.held_with("moved")
+
+    def test_v3b_a_review_with_no_about_does_not_count_for_a_union(self):
+        self.held_with(None)
+
+
 if __name__ == "__main__":
     unittest.main()
