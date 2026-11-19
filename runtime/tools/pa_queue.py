@@ -36,6 +36,7 @@ import os
 import re
 import sys
 import time
+import uuid
 
 sys.dont_write_bytecode = True  # keep tools/ free of caches
 import pa  # noqa: E402
@@ -82,6 +83,19 @@ short = pa_push.short
 
 def now():
     return pa.now()
+
+
+def new_instance():
+    """D-J3b-10 (AC9.2, R9 (1)): the id of one entry instance, set when it joins and never again. 'added' is
+    second-resolution and a fast machine can leave and rejoin within one second, so a card binds this id, not the time."""
+    return uuid.uuid4().hex
+
+
+def instance_of(e):
+    """The entry's instance id; an entry queued before ids existed gets one now (the caller saves the queue)."""
+    if not (isinstance(e.get("instance"), str) and e["instance"]):
+        e["instance"] = new_instance()
+    return e["instance"]
 
 
 # ---- the queue file, the lock, the journal ------------------------------------------------------
@@ -1002,7 +1016,7 @@ def add(ctx, data, rec, tid, job):
     onto = rec["entries"][-1]["branch"] if rec["entries"] else rec["main"]
     onto_tip = ctx.tip(onto)
     checked = checked_at_add(ctx, rec, task, branch)
-    entry = {"task": tid, "job": job, "branch": branch, "worktree": tree, "onto": onto, "dependsOn": dep, "state": "checking",
+    entry = {"task": tid, "job": job, "instance": new_instance(), "branch": branch, "worktree": tree, "onto": onto, "dependsOn": dep, "state": "checking",
              "added": now(), "base": upstream(ctx, rec, tip, onto_tip), "tip": tip, "checked": checked,
              "files": sorted(set((planned or {}).get("files") or []) | touched(ctx, checked["base"], checked["commit"])),
              "needs": None, "suite": None, "review": None, "rebases": [], "approval": None}
@@ -1457,7 +1471,8 @@ def cmd_card(args):
             c = e["checked"]
             entries.append({"task": e["task"], "job": e.get("job"), "branch": e["branch"], "tip": n["tip"], "onto": e["onto"],
                             "base": e["base"], "change": c["change"], "sequence": c["sequence"], "commit": c["commit"],
-                            "verify": c.get("verify"), "review": c.get("review"), "state": n["state"], "added": e.get("added")})
+                            "verify": c.get("verify"), "review": c.get("review"), "state": n["state"], "added": e.get("added"),
+                            "instance": instance_of(e)})
             context.append("{}. {} {} on {}: tip {}, content {} (as checked at {}: VERIFY.md {}, REVIEW.md {}), state {}{}; "
                            "evidence/{}/".format(i, label(e), e["branch"], e["onto"], short(n["tip"]), n["content"], short(c["commit"]),
                                                  short(c.get("verify")), short(c.get("review")), n["state"],
@@ -1487,7 +1502,9 @@ def cmd_card(args):
 def apply_cards(ctx, rec):
     """R9 (1), AC9.2, AC10.5: every answered queue card of this repository not applied yet records its approvals, once.
     Merge all in order / Merge up to X approve that prefix of the card's entries, each only while it is the same entry
-    the card asked about (task, job, when it joined, the checked digests); the first that is not ends the prefix.
+    the card asked about (task, job, its instance id, when it joined, the checked digests); the first that is not ends
+    the prefix. The instance id (D-J3b-10) is what tells a task that left and joined again from the one listed, even
+    within the same second; a card or an entry without one approves nothing.
     Not now approves nothing; Other is left alone (no tool acts on the person's own words)."""
     lines, applied = [], rec.setdefault("applied", [])
     for cid, card in queue_cards(ctx.directory, rec["common"]):
@@ -1501,14 +1518,16 @@ def apply_cards(ctx, rec):
         for x in listed[:max(0, min(k, len(listed)))]:
             e = next((e for e in rec["entries"] if same(e, x.get("task"), x.get("job"))), None)
             c = (e or {}).get("checked") or {}
-            if e is None or (x.get("added"), x.get("commit"), x.get("change"), x.get("sequence")) != (
+            same_instance = e is not None and isinstance(x.get("instance"), str) and bool(x["instance"]) and \
+                x["instance"] == e.get("instance")
+            if e is None or not same_instance or (x.get("added"), x.get("commit"), x.get("change"), x.get("sequence")) != (
                     e.get("added"), c.get("commit"), c.get("change"), c.get("sequence")):
                 skipped.append("{}: {}".format(x.get("task"), "no longer queued" if e is None else
                                                "not the entry the card asked about (it left and joined again, or its check changed)"))
                 break
             e["approval"] = {"card": cid, "answeredAt": card.get("answered"), "answeredBy": card.get("answeredBy") or "person, in the panel",
                              "option": card.get("answer"), "commit": c["commit"], "change": c["change"], "sequence": c["sequence"],
-                             "added": e.get("added"), "void": None}
+                             "added": e.get("added"), "instance": e.get("instance"), "void": None}
             approved.append({"task": e["task"], "job": e.get("job")})
             ctx.event("approve", e, card=cid, option=card.get("answer"))
         q["applied"] = {"at": now(), "approved": approved, "skipped": skipped}
