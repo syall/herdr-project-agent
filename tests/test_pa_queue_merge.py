@@ -137,6 +137,23 @@ class M1Card(MBase):
         self.assertIn("t-C", err)
         self.assertEqual(self.queue_cards(), [])
 
+    def test_m1d_limits_that_do_not_fit_are_refused_not_cut(self):
+        """t-109 MF-1 (AC10.3): the facts plus --limits over the card's context cap refuse; no limit is ever cut."""
+        self.three()
+        limits = LIMITS + "; t-C: RL-1 " + "x" * pa_hooks.CONTEXT_MAX + " END-OF-LIMITS"
+        code, out, err = self.make_card(limits)
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("refused", err)
+        self.assertIn("fewer entries", err)
+        self.assertIn("shorten", err)
+        self.assertEqual(self.queue_cards(), [])
+        self.assertEqual(self.journal("card"), [])
+        code, out, err = self.make_card()
+        self.assertEqual(code, 0, out + err)
+        context = self.card("d-queue-1")["context"]
+        self.assertTrue(context.endswith(LIMITS), context[-80:])
+        self.assertLessEqual(len(context), pa_hooks.CONTEXT_MAX)
+
     def test_m1c_an_entry_on_an_open_card_is_not_listed_again(self):
         self.three()
         self.assertEqual(self.make_card()[0], 0)
