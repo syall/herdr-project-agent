@@ -827,18 +827,21 @@ export async function exportRules(space, rules) {
   return path;
 }
 
-// Rules from an exported file that this space doesn't have yet, as active rules of the person's.
-export async function importRules(space, path) {
+// Rules from an exported file that this space doesn't have yet, as active rules of the person's. Returns how many
+// were added; their ids are pushed onto `added` (t-101: the "rules changed" notice names them).
+export async function importRules(space, path, added = []) {
   const { value, error } = await readJson(path.replace(/^~(?=\/)/, space.machine ? "." : home()), space.machine ?? null);
   if (error || !Array.isArray(value?.rules)) throw new Error(error ? `Not valid JSON: ${error}` : "No file with a \"rules\" list at that path.");
-  let added = 0;
+  const ids = [];
   await changeRules(space, (rules) => {
+    ids.length = 0;
     for (const r of value.rules) {
       if (!r?.id || typeof r.text !== "string" || rules.some((x) => x.id === r.id)) continue;
       rules.push(touched({ ...r, status: RULE_STATUS.includes(r.status) && r.status !== "proposed" ? r.status : "active", source: "import", order: 0 }, "imported"));
-      added += 1;
+      ids.push(r.id);
     }
     return rules.sort((a, b) => (b.order ?? 0) - (a.order ?? 0)).map((r, i, all) => ({ ...r, order: (all.length - i) * 10 }));
   });
-  return added;
+  added.push(...ids);
+  return ids.length;
 }

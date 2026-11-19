@@ -17,7 +17,7 @@ import { v_flex, h_flex, InputState, Input, ScrollHandle } from "gpui-base";
 import { spaces, panes, agents, terminals, machines, theme, run, props, home, notify, shared, setShared, closeOverlay, openOverlay, window, layout } from "herdr";
 import { Host, gaveUp, read as hostRead, run as hostRun, watch, refusalLine } from "./host.js";
 import { loadSpace, loadLedger, loadQueue, loadWaiting, loadStartOrder, writeStartOrder, loadMachines, loadTaskOrder, writeTaskOrder, loadProfile, loadDecisions, loadRules, TIMED_OUT, READ_LIMIT, answerDecision, notifyOrchestrator, changeRules, touched, localId, paHome, stateDir, taskActions, taskLinks, evidenceTasks, cardEvidence, staleInstructions, liveTarget, lookAlike, OPEN_REQUESTS, keeperJudging, startingLabels, OTHER, OTHER_MAX, OTHER_TOO_LONG, isOther, oneLine, codeState, codeBadge, loadCode, restartArgs, runRestart, restartOutcome, endTerminalLine, RESTART_MARK, RESTART_MARK_TTL, RESTARTED_FOR, RESTART_TIMEOUT, DRY_TIMEOUT, contextCapable, contextSettings, loadContext, contextLine, contextAt, contextArgs, runContext, contextOutcome, contextDry, resetLine, lastRequestLine, CONTEXT_FOR } from "./store.js";
-import { RulesPane, arm, armHolds, fieldState } from "./rules.js"; // arm, armHolds: the two-click Delete (ARM_WAIT, 10 s)
+import { RulesPane, arm, armHolds, fieldState, noticeText as rulesNotice } from "./rules.js"; // arm, armHolds: the two-click Delete (ARM_WAIT, 10 s)
 import { queueRows, queueLabel, renderQueue, at as atZone } from "./queue.js"; // t-055: the Queue view (read only)
 import { placesRows, renderPlaces, pinsAfter, orderText, NOTICE as ORDER_NOTICE } from "./places.js"; // t-083 J2: places and the start order (Tasks)
 import { readTaskOrder, effectiveTasks, hasTaskOrder, moveTask, startNextOrder, pruneOrder, taskOrderText, taskSections, foldLine, chipText, afterLine, orderLine as taskOrderLine, doneLine, NOTICE as TASK_ORDER_NOTICE } from "./tasks.js"; // t-097 J2: the person's task order (Tasks)
@@ -161,6 +161,7 @@ export default class ProjectAgent extends View {
     this.viewShown = null; // the view the last render drew (this.view, or the one picked for null)
     this.rules = new RulesPane((options) => this.field(options));
     this.rules.host = this.host;
+    this.rules.changed = (space, ids, cx) => this.rulesChanged(space, ids, cx); // t-101: the person's rule changes
     this.copier = new Copier(); // the Copy controls of cards and tasks (copy.js, t-026)
     // push cards: the last pa-push-main check and run of each (push.js); its runs take the shared mark (t-045 round 2)
     this.push = new PushCards((spaceId, id, label, running, unknown) => this.sharePush(spaceId, id, label, running, unknown), (spaceId, id, asked) => this.openedPush(spaceId, id, asked), this.host);
@@ -1104,6 +1105,16 @@ export default class ProjectAgent extends View {
         cx.notify();
       });
     } catch { this.sending = false; }
+  }
+
+  // t-101: the person changed these rules in the Rules view (rules.js). One "rules changed: <ids>" notice per space
+  // while unsent: a later change adds its ids to it (each named once). A notice already being sent is not in
+  // `unsent`, so a change made meanwhile starts a new one.
+  rulesChanged(space, ids, cx) {
+    const queued = this.unsent.find((u) => u.spaceId === space.id && Array.isArray(u.rules));
+    if (queued) { for (const id of ids) if (!queued.rules.includes(id)) queued.rules.push(id); queued.message = rulesNotice(queued.rules); }
+    else { const rules = [...new Set(ids)]; this.unsent.push({ spaceId: space.id, rules, message: rulesNotice(rules) }); }
+    this.resend(cx);
   }
 
   // A proposal approved or declined in the Rules view: answer its card too, and tell the orchestrator.

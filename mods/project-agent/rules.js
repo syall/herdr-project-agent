@@ -14,6 +14,15 @@ import { Copier, sel } from "./copy.js";
 
 export const ALLOW_EVERY = 30000; // the push allowlist is read at most this often, but for Refresh
 
+// t-101: every change the person makes here (add, edit, delete, on/off, reorder, import) tells the Project Agent,
+// once the file is written: "rules changed: <ids>" (main.js rulesChanged: one per space while unsent, later ids
+// joined to it). Approving or declining a proposal keeps its own notice (main.js ruleDecided) and sends no second.
+export const NOTICE = "rules changed", NOTICE_MAX = 10;
+export function noticeText(ids) {
+  const shown = ids.slice(0, NOTICE_MAX), more = ids.length - shown.length;
+  return `${NOTICE}: ${shown.join(", ")}${more > 0 ? ` and ${more} more` : ""}`;
+}
+
 // A two-click Delete (a task's in main.js, a rule's here): the first click arms it, { id, space, at }.
 // The arm holds while its space is shown, its item is expanded and it is under ARM_WAIT old; a
 // press anywhere else in the panel, a Cancel beside it, or another view or space drops it (main.js).
@@ -38,6 +47,7 @@ export class RulesPane {
     this.message = null; this.error = null;
     this.importPath = null; // InputState, made on first use (never in render)
     this.allow = {}; // space id -> { data, asked, busy }: the last pa-push-allow show --json (data: its report, or { error })
+    this.changed = null; // (space, ids, cx): the person changed these rules (main.js: the "rules changed" notice)
   }
 
   // Reads the push allowlist for the view (main.js: the view opening, a reload while it is shown;
@@ -88,11 +98,17 @@ export class RulesPane {
   async load(space) { this.data = await loadRules(space); }
 
   // Applies a change, then reloads. `after(cx)` runs once the file is written (telling the orchestrator, say),
-  // with this task's live cx: the click's is gone by then.
-  save(space, cx, change, after) {
+  // with this task's live cx: the click's is gone by then. `ids` (a list, or a function giving it once the change
+  // ran): the rules the person changed, for the "rules changed" notice; none for a proposal's approve or decline.
+  save(space, cx, change, after, ids) {
     this.error = null; this.message = null;
     cx.spawn(async (cx) => {
-      try { await changeRules(space, change); if (after) await after(cx); }
+      try {
+        await changeRules(space, change);
+        const named = typeof ids === "function" ? ids() : ids;
+        if (named?.length) this.changed?.(space, named, cx);
+        if (after) await after(cx);
+      }
       catch (e) { this.error = String(e.message ?? e); }
       try { await this.load(space); } catch {}
       cx.notify();
@@ -113,18 +129,20 @@ export class RulesPane {
     if (!v.title || !v.text) { this.error = "A rule needs a title and its text."; cx.notify(); return; }
     v.appliesTo ||= "all";
     const id = f.id, approve = f.approve;
+    let made = id; // the new rule's id, chosen against the file as it is when written
     this.closeForm();
     this.save(space, cx, (rules) => {
       if (!id) {
         const top = Math.max(0, ...rules.map((r) => r.order ?? 0));
-        return [touched({ id: newRuleId(rules, v.title), ...v, status: "active", order: top + 10, source: "person" }, "created"), ...rules];
+        made = newRuleId(rules, v.title);
+        return [touched({ id: made, ...v, status: "active", order: top + 10, source: "person" }, "created"), ...rules];
       }
       return rules.map((r) => (r.id === id ? touched({ ...r, ...v, ...(approve ? { status: "active" } : {}) }, approve ? "edited and approved" : "edited") : r));
-    }, approve ? (cx) => onDecided(id, "approved", cx) : null);
+    }, approve ? (cx) => onDecided(id, "approved", cx) : null, approve ? null : () => [made]);
   }
 
   setStatus(space, cx, id, status, what, onDecided) {
-    this.save(space, cx, (rules) => rules.map((r) => (r.id === id ? touched({ ...r, status }, what) : r)), onDecided ? (cx) => onDecided(id, what, cx) : null);
+    this.save(space, cx, (rules) => rules.map((r) => (r.id === id ? touched({ ...r, status }, what) : r)), onDecided ? (cx) => onDecided(id, what, cx) : null, onDecided ? null : [id]);
   }
 
   // These buttons stop the press (so it never reaches the panel's root), so each one but the armed
@@ -174,7 +192,7 @@ export class RulesPane {
       .when(this.pressed === rule.id, (el) => el.opacity(0.5))
       .when(movable, (el) => el.on_mouse_up("left", (_e, cx) => {
         const from = this.pressed; this.pressed = null;
-        if (from && from !== rule.id) this.save(space, cx, (rules) => reorder(rules, from, rule.id)); else cx.notify();
+        if (from && from !== rule.id) this.save(space, cx, (rules) => reorder(rules, from, rule.id), null, [from]); else cx.notify();
       }))
       .child(h_flex().id(`rule-head-${rule.id}`).h(32).px(8).gap(7).items_center().cursor_pointer().hover((s) => s.bg(t.hover))
         .on_click((_e, cx) => { open ? this.open.delete(rule.id) : this.open.add(rule.id); this.armed = null; cx.notify(); })
@@ -206,7 +224,7 @@ export class RulesPane {
             // The arm is asked again at the click (t-028): one that ran out since this was drawn only arms again.
             if (this.armedRule(space.id) !== rule.id) { this.armed = arm(rule.id, space.id); cx.notify(); return; }
             this.armed = null;
-            this.save(space, cx, (rules) => rules.filter((r) => r.id !== rule.id));
+            this.save(space, cx, (rules) => rules.filter((r) => r.id !== rule.id), null, [rule.id]);
           }, armed ? t.blocked : t.muted, true))
           .when(armed, (e) => e.child(this.button(t, `rule-delete-cancel-${rule.id}`, "Cancel", (_e, cx) => { this.armed = null; cx.notify(); }, t.muted, true))))));
   }
@@ -235,7 +253,12 @@ export class RulesPane {
             const path = this.importPath.value().trim();
             if (!path) { this.importPath.release?.(); this.importPath = null; cx.notify(); return; }
             cx.spawn(async (cx) => {
-              try { this.message = `Imported ${await importRules(space, path)} new rules.`; this.importPath.release?.(); this.importPath = null; await this.load(space); }
+              const added = [];
+              try {
+                this.message = `Imported ${await importRules(space, path, added)} new rules.`; this.importPath.release?.(); this.importPath = null;
+                if (added.length) this.changed?.(space, added, cx);
+                await this.load(space);
+              }
               catch (e) { this.error = String(e.message ?? e); }
               cx.notify();
             });

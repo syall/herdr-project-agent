@@ -419,6 +419,11 @@ Run `hc --skill` once to learn `hc`. Start workers with the profile's commands (
   task goes first. A category move from the panel never passes a gate, never answers or
   withdraws a card, and never starts or stops a worker by itself. A `task order changed`
   notice is a message: run the pass as usual.
+  A `rules changed: <rule ids>` notice means the person changed those rules in the Rules view
+  (added, edited, deleted, turned on or off, reordered or imported them): re-read `rules.json`,
+  send each running worker any change that applies to its job (`hc send`: what changed and what
+  stays the same), and journal it with `"trigger":"rules","by":"person","rules":["<id>"]`; then
+  run the pass as usual.
   A worker that has reported, but whose report you have not read yet, does not
   count; close it once read.
 - Never sleep, poll or block on `hc wait` to see what workers are doing. To look at one

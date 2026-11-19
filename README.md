@@ -179,7 +179,7 @@ Other answer keeps it as `previousAnswer` / `previousNote`, and a card asked aga
 
 ## Messages go only to a live launcher
 
-The panel's "decision … answered" and "rule …" notices are sent to the record whose `alive` is true,
+The panel's "decision … answered", "rule …" and "rules changed: …" notices are sent to the record whose `alive` is true,
 looked up when sending; with none, nothing is sent and the panel says "Answer saved. The Project
 Agent is not running." The pass timer sends passes only to an `alive` record's terminal; new-card
 notifications still cover every recorded space. `pa-pass`, and the notices of `pa-task` and
