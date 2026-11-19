@@ -14,6 +14,9 @@ Nothing leaves this Mac: hc is tests/stub-hc (a machine is a temp folder), the m
   x9  every remote argv a fixed form under /tmp/pa-suite-<run>      x19 the profile's hooks/tests.sh full (d-222)
                                                                      x20 each probed tool is the one that runs
                                                                      x21 the suite itself run on a suite machine
+t-106 J1, a profile's step run (tests.remoteFull): x22 when it applies (R1), x23 the entry's H-cases (R2), x24 the
+facts hook's H-cases (R3), x25 what is sent (R5), x26 probe and prepare, prepare's H-cases (R6, R7), x27 exit,
+record and output (R13-R15), x28 cleanup (R16), x29 generic words and docs (R17), x30 no step: today's run.
 """
 import json
 import os
@@ -839,6 +842,669 @@ class X21InsideARemoteRun(Remote):
         self.assertTrue(ran, text)
         self.assertEqual(os.path.realpath(ran.group(1)), os.path.realpath(sys.executable), text)
         self.assertTrue(os.path.isdir(os.path.join(outer, "bin")), "the outer run's folder is left alone")
+
+
+# ---- t-106 J1: a profile's remote full command with a facts hook and a step (R1-R7, R13-R17) ----
+
+STEP_TESTS_SH = r"""#!/bin/sh
+# The stub profile's own full command (its local run): prints like a whole run on this Mac.
+echo "fake whole run on this Mac ($1)"
+echo "  unit tests: test_a: ok (9s)"
+exit "${FAKE_EXIT:-0}"
+"""
+
+STEP_FACTS = r"""#!/bin/sh
+# An invented facts hook: answers for the root it is given (or prints FAKE_FACTS_FILE as it is).
+[ -n "${FAKE_FACTS_LOG:-}" ] && printf '%s|%s|%s|[%s]\n' "$#" "$1" "$(pwd)" "${PA_CHANGED_FILES-unset}" >> "$FAKE_FACTS_LOG"
+if [ -n "${FAKE_FACTS_SLEEP:-}" ]; then sleep "$FAKE_FACTS_SLEEP"; echo late > "$FAKE_FACTS_LATE"; fi
+if [ -n "${FAKE_FACTS_FILE:-}" ]; then cat "$FAKE_FACTS_FILE"; exit "${FAKE_FACTS_EXIT:-0}"; fi
+echo '{"ok": true, "repoSubdir": "src/pkg", "key": {"flavour": "x1"}, "show": "Flavour x1", "extra": "never sent"}'
+exit "${FAKE_FACTS_EXIT:-0}"
+"""
+
+STEP_SCRIPT = r"""#!/bin/sh
+# An invented step: probe names its tools; prepare lays the clone out as box/src/pkg and keeps a folder under the
+# real HOME; run runs a stub suite there.
+action=$1 run=$2
+[ -n "${FAKE_STEP_LOG:-}" ] && printf '%s|%s|%s|%s|%s|%s|%s\n' "$action" "$run" "$(pwd)" "$HOME" "${PA_STEP_FACTS:-}" "${PA_STEP_REAL_HOME:-}" "${PA_STEP_RUN:-}" >> "$FAKE_STEP_LOG"
+layout() {
+  keep="$PA_STEP_REAL_HOME/.cache/stub-keep"
+  mkdir -p "$keep"; state=reused; [ -f "$keep/made" ] || { : > "$keep/made"; state=created; }
+  echo "keep $keep"; echo "kept $state"
+  mkdir -p box/src && mv w box/src/pkg || exit 5
+  echo "laid out"
+  echo "home stubtool"
+}
+case $action in
+  probe)
+    if [ -n "${FAKE_STEP_PROBE:-}" ]; then printf '%s\n' "$FAKE_STEP_PROBE"; else echo "tool stubtool /bin/sh 1.0"; echo "tool stub-hash - abc123"; fi
+    exit "${FAKE_STEP_PROBE_EXIT:-0}" ;;
+  prepare)
+    if [ -n "${FAKE_PREPARE:-}" ]; then . "$FAKE_PREPARE"; exit "${FAKE_PREPARE_EXIT:-0}"; fi
+    layout
+    echo "cwd box/src/pkg"
+    exit "${FAKE_PREPARE_EXIT:-0}" ;;
+  run)
+    echo "stub step run in $(pwd)"
+    echo "facts: $(cat "$PA_STEP_FACTS")"
+    echo "env HOME=$HOME HERDR_PA_HOME=$HERDR_PA_HOME PCF=[${PA_CHANGED_FILES-unset}]"
+    hc ls > /dev/null 2>&1; echo "hc-exit $?"
+    if [ -n "${FAKE_GO:-}" ]; then while [ ! -f "$FAKE_GO" ]; do sleep 0.1; done; fi
+    echo "=== summary (each part's whole output: /tmp/x)"
+    echo "  unit tests: test_s: ok (2s)"
+    exit "${FAKE_STEP_EXIT:-0}" ;;
+esac
+exit 9
+"""
+
+STEP_ENTRY = {"command": "hooks/tests.sh full", "marker": "box.marker", "facts": "hooks/facts.sh", "step": "hooks/step.sh"}
+
+
+class StepBase(Remote):
+    """A stub profile whose tests.remoteFull names a facts hook and a step; the worktree has the marker above it."""
+
+    def setUp(self):
+        super().setUp()
+        self.folder = os.path.join(pa.ROOT, "profiles", "test")
+        for name, text in (("tests.sh", STEP_TESTS_SH), ("facts.sh", STEP_FACTS), ("step.sh", STEP_SCRIPT)):
+            write(os.path.join(self.folder, "hooks", name), text)
+            os.chmod(os.path.join(self.folder, "hooks", name), 0o755)
+        self.use_entry(dict(STEP_ENTRY))
+        agent = pa.read_json(os.path.join(self.dir, "agent.json"))
+        agent.pop("commands", None)
+        dump(agent, os.path.join(self.dir, "agent.json"))
+        write(os.path.join(self.tmp, "box.marker"), "")
+        self.step_log = os.path.join(self.tmp, "step.log")
+        self.facts_log = os.path.join(self.tmp, "facts.log")
+        self.keep_dir = os.path.join(os.environ["HOME"], ".cache", "stub-keep")
+        shutil.rmtree(self.keep_dir, ignore_errors=True)
+        self.addCleanup(shutil.rmtree, self.keep_dir, True)
+        for k in ("FAKE_FACTS_FILE", "FAKE_FACTS_EXIT", "FAKE_FACTS_SLEEP", "FAKE_FACTS_LATE", "FAKE_STEP_PROBE",
+                  "FAKE_STEP_PROBE_EXIT", "FAKE_PREPARE", "FAKE_PREPARE_EXIT", "FAKE_STEP_EXIT", "STUB_HC_KEEP",
+                  "PA_SUITE_FACTS_TIMEOUT"):
+            self.setenv(**{k: None})
+        self.setenv(FAKE_STEP_LOG=self.step_log, FAKE_FACTS_LOG=self.facts_log)
+
+    def use_entry(self, entry, full="hooks/tests.sh full", extra=None):
+        tests = {"full": full}
+        if entry is not None:
+            tests["remoteFull"] = entry
+        tests.update(extra or {})
+        profile = {"name": "test", "claude": ["true"], "codex": ["true"], "tests": tests}
+        dump(profile, os.path.join(self.folder, "profile.json"))
+
+    def command(self):
+        return os.path.join(self.folder, "hooks", "tests.sh") + " full"
+
+    def step_calls(self):
+        return [l.split("|") for l in (pa.read_text(self.step_log) or "").splitlines()]
+
+    def facts_calls(self):
+        return (pa.read_text(self.facts_log) or "").splitlines()
+
+    def check_local(self, word, *args):
+        """The run stays on this Mac (no terminal, no file sent) and the output says word."""
+        code, out = self.main("--again", *args)
+        self.assertEqual(code, 0, out)
+        self.assertFalse([c for c in self.calls() if c[0] in ("run", "file")], self.calls())
+        self.assertIn(word, out)
+        self.assertIn("fake whole run on this Mac", self.output(self.run_id(out)) or "", out)
+        self.assertNotIn("step", self.lines()[-1])
+        return out
+
+    def check_refused_on(self, word):
+        """With --on: exit 2, the word in the output, no record."""
+        before = len(self.lines())
+        code, out = self.main("--on", "box-1")
+        self.assertEqual(code, 2, out)
+        self.assertIn(word, out)
+        self.assertEqual(len(self.lines()), before, out)
+        return out
+
+    def fresh_log(self):
+        for p in (self.log, self.step_log, self.facts_log):
+            if os.path.exists(p):
+                os.remove(p)
+
+
+class X22StepRun(StepBase):
+    """R1: when a run is a step run."""
+
+    def test_x22a_a_step_run_goes_to_the_machine_through_probe_prepare_run(self):
+        code, out = self.main()
+        self.assertEqual(code, 0, out)
+        run = self.run_id(out)
+        line = self.lines()[-1]
+        self.assertEqual(line.get("machine"), "box-1", out)
+        self.assertEqual(line.get("command"), self.command())
+        self.assertEqual([c[0] for c in self.step_calls()], ["probe", "prepare", "run"], self.step_calls())
+        text = self.output(run)
+        self.assertIn("stub step run in ", text)
+        self.assertIn("/box/src/pkg", text)
+        self.assertEqual(len(self.facts_calls()), 1)
+        n, root, cwd, pcf = self.facts_calls()[0].split("|")
+        self.assertEqual((n, os.path.realpath(root), os.path.realpath(cwd), pcf),
+                         ("1", os.path.realpath(self.wt), os.path.realpath(self.wt), "[unset]"))
+
+    def test_x22b_no_marker_above_the_root_stays_local(self):
+        os.remove(os.path.join(self.tmp, "box.marker"))
+        self.check_local("box.marker")
+        self.assertEqual(self.facts_calls(), [])
+
+    def test_x22c_the_marker_in_the_root_itself_does_not_count(self):
+        os.remove(os.path.join(self.tmp, "box.marker"))
+        write(os.path.join(self.wt, "box.marker"), "")
+        sh(self.wt, "git", "add", "-A")
+        sh(self.wt, "git", "commit", "-q", "-m", "marker in root")
+        self.check_local("box.marker")
+        self.assertEqual(self.facts_calls(), [])
+
+    def test_x22d_a_dirty_tree_stays_local_and_the_facts_hook_does_not_run(self):
+        write(os.path.join(self.wt, "loose.txt"), "x\n")
+        self.check_local("untracked")
+        self.assertEqual(self.facts_calls(), [])
+
+    def test_x22e_module_stays_local(self):
+        self.main("--module", "test_x")
+        self.assertFalse([c for c in self.calls() if c[0] in ("run", "file")], self.calls())
+        self.assertEqual(self.facts_calls(), [])
+
+    def test_x22f_a_space_command_of_its_own_stays_local(self):
+        self.set_command(self.command())
+        self.check_local("command")
+        self.assertEqual(self.facts_calls(), [])
+
+    def test_x22g_another_profile_full_command_ignores_the_entry(self):
+        self.use_entry(dict(STEP_ENTRY), full="hooks/tests.sh full --x")
+        self.check_local("remoteFull")
+        self.assertEqual(self.facts_calls(), [])
+
+    def test_x22h_full_is_run_all_is_checked_first(self):
+        os.chmod(os.path.join(self.wt, "tests", "run-all.sh"), 0o755)
+        sh(self.wt, "git", "add", "-A")
+        sh(self.wt, "git", "commit", "-q", "-m", "run-all executable")
+        write(os.path.join(self.folder, "hooks", "tests.sh"), PROFILE_RUNNER)
+        self.use_entry(dict(STEP_ENTRY), extra={"fullIsRunAll": {"command": "hooks/tests.sh full", "unlessFound": []}})
+        code, out = self.main()
+        self.assertEqual(code, 0, out)
+        self.assertIn("fake remote part", self.output(self.run_id(out)))
+        self.assertEqual(self.step_calls(), [])
+        self.assertEqual(self.facts_calls(), [])
+        self.assertNotIn("step", self.lines()[-1])
+
+    def test_x22i_no_machines_no_facts_hook_and_no_hc_call(self):
+        self.configure([])
+        code, out = self.main()
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.calls(), [])
+        self.assertEqual(self.facts_calls(), [])
+        self.assertRegex(out.splitlines()[0], r"^pa-full-suite: run [0-9a-f]{12}: output in ")
+
+    def test_x22j_local_flag_no_facts_hook(self):
+        code, out = self.main("--local")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.calls(), [])
+        self.assertEqual(self.facts_calls(), [])
+
+
+class X23Entry(StepBase):
+    """R2: each bad remoteFull is ignored (named once) and the run is today's (local here)."""
+
+    def bad(self, entry, word="remoteFull", files=None):
+        for name, kind in (files or {}).items():
+            path = os.path.join(self.folder, "hooks", name)
+            if os.path.lexists(path):
+                if os.path.isdir(path) and not os.path.islink(path):
+                    shutil.rmtree(path)
+                else:
+                    os.remove(path)
+            kind(path)
+        self.use_entry(entry)
+        self.fresh_log()
+        out = self.check_local(word)
+        self.assertEqual(out.count("remoteFull"), 1, out)
+        self.assertEqual(self.facts_calls(), [])
+        return out
+
+    def test_x23a_command_spellings(self):
+        for c in (" hooks/tests.sh full", "hooks/tests.sh  full", "sh hooks/tests.sh full",
+                  "sh -c 'hooks/tests.sh full'", "env X=1 hooks/tests.sh full", self.command()):
+            with self.subTest(command=c):
+                self.bad(dict(STEP_ENTRY, command=c))
+
+    def test_x23b_markers(self):
+        for m in ("", ".", "..", "a/box.marker", "x\u0000y", "box.marker\n", 3, None, ["box.marker"]):
+            with self.subTest(marker=m):
+                self.bad(dict(STEP_ENTRY, marker=m))
+
+    def test_x23c_a_dash_marker_is_accepted(self):
+        os.remove(os.path.join(self.tmp, "box.marker"))
+        write(os.path.join(self.tmp, "-x"), "")
+        self.use_entry(dict(STEP_ENTRY, marker="-x"))
+        code, out = self.main()
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.lines()[-1].get("machine"), "box-1", out)
+
+    def test_x23d_hook_paths(self):
+        for key in ("facts", "step"):
+            for p in ("", "/bin/sh", "../x", "hooks/../../x", "./hooks/x", "hooks//x", "hooks/sub/x", "-hooks/x",
+                      "hooks/x\n", "hooks/..", "hooks/.", "hooks/missing.sh", ["hooks/step.sh"], 7):
+                with self.subTest(key=key, path=p):
+                    self.bad(dict(STEP_ENTRY, **{key: p}))
+
+    def test_x23e_hook_files(self):
+        def link_to(target):
+            return lambda path: os.symlink(target, path)
+
+        def fifo(path):
+            os.mkfifo(path)
+
+        def plain(path):
+            write(path, "#!/bin/sh\n")
+
+        def big(path):
+            write(path, "#!/bin/sh\n" + "#" * (64 * 1024 + 1 - len("#!/bin/sh\n")))
+            os.chmod(path, 0o755)
+
+        def folder(path):
+            os.makedirs(path)
+        outside = os.path.join(self.tmp, "outside.sh")
+        write(outside, STEP_SCRIPT)
+        os.chmod(outside, 0o755)
+        cases = (("passwd", link_to("/etc/passwd")), ("out", link_to(outside)), ("rel", link_to("../../outside")),
+                 ("fifo", fifo), ("plain", plain), ("big", big), ("dir", folder))
+        for key in ("facts", "step"):
+            for name, kind in cases:
+                with self.subTest(key=key, case=name):
+                    self.bad(dict(STEP_ENTRY, **{key: "hooks/x-" + name}), files={"x-" + name: kind})
+
+    def test_x23f_exactly_64_kb_is_accepted(self):
+        path = os.path.join(self.folder, "hooks", "step.sh")
+        write(path, STEP_SCRIPT + "#" * (64 * 1024 - len(STEP_SCRIPT.encode()) - 1) + "\n")
+        self.assertEqual(os.path.getsize(path), 64 * 1024)
+        code, out = self.main()
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.lines()[-1].get("machine"), "box-1", out)
+
+    def test_x23g_keys(self):
+        entry = dict(STEP_ENTRY)
+        entry["Step"] = entry.pop("step")
+        for e in (entry, dict(STEP_ENTRY, other="x"), {k: v for k, v in STEP_ENTRY.items() if k != "marker"},
+                  ["hooks/step.sh"], "hooks/step.sh"):
+            with self.subTest(entry=e):
+                self.bad(e)
+
+
+class X24Facts(StepBase):
+    """R3: each bad facts answer: local with the reason (output, build.log, the record's note); --on: exit 2."""
+
+    def answer(self, text, code=0):
+        path = os.path.join(self.tmp, "facts-answer")
+        with open(path, "w") as f:
+            f.write(text)
+        self.setenv(FAKE_FACTS_FILE=path, FAKE_FACTS_EXIT=str(code))
+
+    def refused(self, text, code=0):
+        self.answer(text, code)
+        self.fresh_log()
+        out = self.check_local("facts hook")
+        self.assertIn("facts hook", self.lines()[-1].get("note") or "", self.lines()[-1])
+        self.assertIn("facts hook", self.build_log().splitlines()[-1] if False else self.build_log())
+        self.assertEqual(self.step_calls(), [])
+        return out
+
+    def good(self, **change):
+        value = {"ok": True, "repoSubdir": "src/pkg", "key": {"flavour": "x1"}, "show": "Flavour x1"}
+        value.update(change)
+        return json.dumps(value)
+
+    def test_x24a_exit_and_shape(self):
+        for text, code in ((self.good(), 1), ("not json", 0), (self.good() + "\n" + self.good(), 0),
+                           (json.dumps({"ok": True, "repoSubdir": "src/pkg", "key": {"flavour": "x1"},
+                                        "show": "s", "pad": "x" * (16 * 1024)}), 0),
+                           (json.dumps({"repoSubdir": "src/pkg", "key": {}, "show": "s"}), 0),
+                           (self.good(ok="true"), 0), (self.good(ok=1), 0), (self.good(key=["flavour", "x1"]), 0),
+                           ("[]", 0), ("", 0), (self.good(show="a\nb"), 0), (self.good(show=3), 0)):
+            with self.subTest(text=text[:60], code=code):
+                self.refused(text, code)
+
+    def test_x24b_key_names(self):
+        for name in ("Event-Id", "", "a" * 33, "1a", "a b"):
+            with self.subTest(name=name):
+                self.refused(self.good(key={name: "x1"}))
+
+    def test_x24c_key_values(self):
+        for value in ("", "-rf", "--root", "../x", "a/../b", "a//b", "/abs", "a b", "a;b", "$(x)", "`x`", "a\nb",
+                      "x" * 129, 5, None, ["x"], "a/..", "a/b/"):
+            with self.subTest(value=value):
+                self.refused(self.good(key={"flavour": value}))
+
+    def test_x24d_too_many_keys(self):
+        self.refused(self.good(key={"k{}".format(i): "v" for i in range(9)}))
+
+    def test_x24e_repo_subdir(self):
+        for value in ("", ".", "/src/P", "src/../P", "src/P/", "src//P", "-P", "a/b/c/d/e", "src/-P", "src/./P",
+                      None, 3, "src/P\n"):
+            with self.subTest(value=value):
+                self.refused(self.good(repoSubdir=value))
+
+    def test_x24f_ok_false_names_its_reason(self):
+        out = self.refused(json.dumps({"ok": False, "reason": "not a stub workspace"}))
+        self.assertIn("not a stub workspace", out)
+
+    def test_x24g_on_gives_exit_2(self):
+        self.answer(json.dumps({"ok": False, "reason": "not a stub workspace"}))
+        self.check_refused_on("not a stub workspace")
+        self.assertFalse([c for c in self.calls() if c[0] in ("run", "file")], self.calls())
+
+    def test_x24h_a_slow_hook_is_killed_and_the_run_is_local(self):
+        late = os.path.join(self.tmp, "late")
+        self.setenv(PA_SUITE_FACTS_TIMEOUT="1", FAKE_FACTS_SLEEP="4", FAKE_FACTS_LATE=late)
+        began = time.time()
+        self.check_local("facts hook")
+        self.assertLess(time.time() - began, 20)
+        time.sleep(4.5)
+        self.assertFalse(os.path.exists(late), "the facts hook was not killed")
+
+    def test_x24i_eight_keys_long_values_and_four_segments_are_accepted(self):
+        key = {"k{}".format(i): "v" + "x" * 127 for i in range(8)}
+        key["k0"] = "a.b_c@d/e+f-g"
+        self.answer(self.good(key=key, repoSubdir="a/b/c/d"))
+        path = os.path.join(self.tmp, "prepare.sh")
+        write(path, "mkdir -p a/b/c && mv w a/b/c/d && echo 'cwd a/b/c/d'\n")
+        self.setenv(FAKE_PREPARE=path)
+        code, out = self.main()
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.lines()[-1]["step"]["facts"], key)
+
+
+class X25Sent(StepBase):
+    """R5: the bundle, the step and the facts file are sent; nothing else."""
+
+    def test_x25a_only_the_bundle_the_step_and_the_facts_arrive(self):
+        import base64
+        import hashlib
+        keep = os.path.join(self.tmp, "kept")
+        self.setenv(STUB_HC_KEEP=keep)
+        code, out = self.main()
+        self.assertEqual(code, 0, out)
+        self.assertEqual(sorted(os.listdir(keep)), ["b.b64", "facts.json", "step.b64"])
+        with open(os.path.join(keep, "facts.json")) as f:
+            self.assertEqual(json.load(f), {"key": {"flavour": "x1"}, "repoSubdir": "src/pkg"})
+        with open(os.path.join(keep, "step.b64")) as f:
+            sent = base64.b64decode(f.read())
+        with open(os.path.join(self.folder, "hooks", "step.sh"), "rb") as f:
+            self.assertEqual(sent, f.read())
+        self.assertEqual(self.lines()[-1]["step"]["sha256"], hashlib.sha256(sent).hexdigest())
+        self.assertEqual(len([c for c in self.calls() if c[:2] == ["file", "write"]]), 3, self.calls())
+
+    def test_x25b_the_step_argv_is_fixed_words(self):
+        code, out = self.main()
+        self.assertEqual(code, 0, out)
+        run = self.run_id(out)
+        folder = "/tmp/pa-suite-" + run
+        actions = []
+        for c in self.calls():
+            text = c[-1] if c and c[0] in ("exec", "run") else ""
+            for m in re.finditer(r"(\S+/step) (\w+) (\S+)", text):
+                self.assertEqual((m.group(1), m.group(3)), (folder + "/step", folder), text)
+                actions.append(m.group(2))
+            self.assertNotIn("x1", " ".join(c))
+            self.assertNotIn("Flavour", " ".join(c))
+        self.assertEqual(actions, ["probe", "prepare", "run"])
+        run_call = [c for c in self.calls() if c[0] == "run"][0]
+        self.assertEqual(run_call[run_call.index("--cwd") + 1], folder)
+        setup = [c for c in self.calls() if c[0] == "exec" and "clone" in c[-1]][0]
+        self.assertIn("chmod 700 step", setup[-1])
+
+    def test_x25c_a_committed_secret_is_never_sent(self):
+        dot = "."
+        for name in (dot + "env", "conf/" + dot + "env.local", dot + "ssh/id", "credent" + "ials",
+                     dot + "claude/x.json"):
+            with self.subTest(path=name):
+                path = os.path.join(self.wt, name)
+                write(path, "x\n")
+                sh(self.wt, "git", "add", "-f", name)
+                sh(self.wt, "git", "commit", "-q", "-m", "a secret")
+                self.fresh_log()
+                self.check_refused_on("never sent")
+                self.assertFalse([c for c in self.calls() if c[0] == "file"], self.calls())
+                sh(self.wt, "git", "rm", "-q", "--cached", name)
+                os.remove(path)
+                sh(self.wt, "git", "commit", "-q", "-m", "dropped")
+
+    def test_x25d_a_profile_secret_path_is_never_sent(self):
+        profile = pa.read_json(os.path.join(self.folder, "profile.json"))
+        profile["secretPaths"] = [r"(^|/)token\.txt$"]
+        dump(profile, os.path.join(self.folder, "profile.json"))
+        write(os.path.join(self.wt, "token.txt"), "x\n")
+        sh(self.wt, "git", "add", "-A")
+        sh(self.wt, "git", "commit", "-q", "-m", "token")
+        self.check_refused_on("never sent")
+        self.assertFalse([c for c in self.calls() if c[0] == "file"], self.calls())
+
+    def test_x25e_the_step_counts_in_the_size_bound(self):
+        import base64
+        saved = pa_suite.BUNDLE_MAX
+        self.addCleanup(setattr, pa_suite, "BUNDLE_MAX", saved)
+        with open(os.path.join(self.folder, "hooks", "step.sh"), "rb") as f:
+            step_b64 = len(base64.b64encode(f.read()))
+        pa_suite.BUNDLE_MAX = step_b64 + 10  # the bundle alone is more than 10 bytes
+        self.check_refused_on("too large")
+
+
+class X26Prepare(StepBase):
+    """R6: the step's probe and prepare; each bad prepare output is a setup failure."""
+
+    def snippet(self, text):
+        path = os.path.join(self.tmp, "prepare.sh")
+        write(path, text)
+        self.setenv(FAKE_PREPARE=path)
+
+    def test_x26a_prepare_output_h_cases(self):
+        lay = "mkdir -p box/src && mv w box/src/pkg\n"
+        cwd = "echo 'cwd box/src/pkg'\n"
+        cases = {
+            "cwd /abs": lay + "echo 'cwd /abs'\n",
+            "cwd ../x": lay + "echo 'cwd ../x'\n",
+            "cwd w/../..": "echo 'cwd w/../..'\n",
+            "cwd empty": lay + "echo 'cwd '\n",
+            "no cwd": lay,
+            "two cwd": lay + cwd + cwd,
+            "missing folder": lay + "echo 'cwd nothere'\n",
+            "symlink out": "ln -s / out\necho 'cwd out'\n",
+            "symlink up": "ln -s .. up\necho 'cwd up'\n",
+            "keep relative": "echo 'keep relative/path'\n" + lay + cwd,
+            "keep /": "echo 'keep /'\n" + lay + cwd,
+            "keep /tmp": "echo 'keep /tmp'\n" + lay + cwd,
+            "keep HOME": "echo \"keep $PA_STEP_REAL_HOME\"\n" + lay + cwd,
+            "keep above HOME": "echo \"keep $(dirname \"$PA_STEP_REAL_HOME\")\"\n" + lay + cwd,
+            "keep ..": "echo \"keep $PA_STEP_REAL_HOME/a/../b\"\n" + lay + cwd,
+            "keep space": "echo \"keep $PA_STEP_REAL_HOME/a b\"\n" + lay + cwd,
+            "keep cr": "printf 'keep %s/a\\rb\\n' \"$PA_STEP_REAL_HOME\"\n" + lay + cwd,
+            "keep under run": "echo \"keep $PA_STEP_RUN/k\"\n" + lay + cwd,
+            "keep the run": "echo \"keep $PA_STEP_RUN\"\n" + lay + cwd,
+            "two keep": "echo \"keep $PA_STEP_REAL_HOME/k\"; echo \"keep $PA_STEP_REAL_HOME/k2\"\n" + lay + cwd,
+            "keep not first": lay + "echo \"keep $PA_STEP_REAL_HOME/k\"\n" + cwd,
+            "bad kept": "echo \"keep $PA_STEP_REAL_HOME/k\"; echo 'kept maybe'\n" + lay + cwd,
+            "bad home": lay + "echo 'home a b'\n" + cwd,
+        }
+        for name, text in cases.items():
+            with self.subTest(case=name):
+                self.snippet(text)
+                self.fresh_log()
+                out = self.check_refused_on("prepare")
+                self.assertEqual(os.listdir(os.path.join(self.stub, "box-1", "tmp")), [], out)
+
+    def test_x26b_prepare_exit_is_a_setup_failure_and_falls_back(self):
+        self.setenv(FAKE_PREPARE_EXIT="3")
+        code, out = self.main()
+        self.assertEqual(code, 0, out)
+        self.assertIn("setup on box-1 failed", out)
+        self.assertIn("prepare", out)
+        line = self.lines()[-1]
+        self.assertIsNone(line.get("machine"))
+        self.assertIn("prepare", line.get("note"))
+        self.assertIn("fake whole run on this Mac", self.output(self.run_id(out)))
+
+    def test_x26c_probe_missing_tool_or_exit_is_a_setup_failure(self):
+        for env in ({"FAKE_STEP_PROBE": "missing stubtool"}, {"FAKE_STEP_PROBE_EXIT": "1"},
+                    {"FAKE_STEP_PROBE": "tool stubtool relative/path 1"}):
+            with self.subTest(env=env):
+                self.setenv(FAKE_STEP_PROBE=None, FAKE_STEP_PROBE_EXIT=None)
+                self.setenv(**env)
+                self.fresh_log()
+                self.check_refused_on("probe")
+                self.assertNotIn("prepare", [c[0] for c in self.step_calls()])
+
+    def test_x26d_each_action_has_the_scratch_home_and_the_step_variables(self):
+        code, out = self.main()
+        self.assertEqual(code, 0, out)
+        run = self.run_id(out)
+        folder = os.path.realpath(self.remote_folder(run)) if os.path.exists(self.remote_folder(run)) else None
+        rows = self.step_calls()
+        self.assertEqual([r[0] for r in rows], ["probe", "prepare", "run"])
+        want_folder = os.path.join(os.path.realpath(os.path.join(self.stub, "box-1", "tmp")), "pa-suite-" + run)
+        self.assertIsNone(folder)  # cleaned
+        for action, arg, cwd, home_, facts, real, step_run in rows:
+            self.assertEqual(arg, want_folder, action)
+            self.assertEqual(home_, want_folder + "/u", action)
+            self.assertEqual(facts, want_folder + "/facts.json", action)
+            self.assertEqual(real, os.environ["HOME"], action)
+            self.assertEqual(step_run, want_folder, action)
+            want = want_folder if action != "run" else want_folder + "/box/src/pkg"
+            self.assertEqual(os.path.realpath(cwd), os.path.realpath(want) if os.path.exists(want) else want, action)
+        text = self.output(run)
+        self.assertIn("hc-exit 2", text)
+        self.assertIn("PCF=[]", text)
+
+    def test_x26e_a_cwd_symlink_inside_the_run_folder_is_accepted(self):
+        self.snippet("mkdir -p box/src && mv w box/src/pkg && ln -s box/src/pkg here\necho 'cwd here'\n")
+        code, out = self.main("--on", "box-1")
+        self.assertEqual(code, 0, out)
+
+    def test_x26f_a_missing_home_line_in_the_probe_is_a_setup_failure(self):
+        saved = pa_suite.HOME_LINE
+        self.addCleanup(setattr, pa_suite, "HOME_LINE", saved)
+        pa_suite.HOME_LINE = "printf 'home %s\\n' relative\n"
+        self.check_refused_on("HOME")
+
+
+class X27Record(StepBase):
+    """R13-R15: exit, record, output and build.log of a step run."""
+
+    def test_x27a_record_and_output(self):
+        code, out = self.main()
+        self.assertEqual(code, 0, out)
+        run = self.run_id(out)
+        self.assertRegex(out, r"pa-full-suite: run {} on box-1 \(\w+; Flavour x1; reachable in [0-9.]+s\)".format(run))
+        line = self.lines()[-1]
+        self.assertEqual(line["command"], self.command())
+        self.assertEqual([p["place"] for p in line["places"]], ["box-1"])
+        self.assertEqual(line["places"][0]["exit"], 0)
+        self.assertIn("step:stubtool", line["tools"])
+        self.assertEqual(line["tools"]["step:stub-hash"], {"path": "-", "version": "abc123"})
+        self.assertEqual([(p.get("name"), p.get("place")) for p in line["parts"]], [("unit tests: test_s", "box-1")])
+        step = line["step"]
+        self.assertEqual(step["facts"], {"flavour": "x1"})
+        self.assertEqual(step["keep"], "created")
+        self.assertEqual(step["homeExceptions"], ["stubtool"])
+        self.assertRegex(step["sha256"], r"^[0-9a-f]{64}$")
+        text = self.output(run)
+        self.assertNotIn("=== local part", text)
+        self.assertIn("=== places: box-1 ({}) exit 0 -> exit 0".format(line["os"]), text)
+        self.assertRegex(text, r"=== step: Flavour x1; workspace created in [0-9.]+s")
+        self.assertIn("on box-1 (", self.build_log())
+        self.assertFalse(os.path.exists(os.path.join(self.dir, "evidence", "t-1", "full-suite-{}-local.out".format(run))))
+        code, out = self.main("--again")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.lines()[-1]["step"]["keep"], "reused")
+        self.assertIn("workspace reused", self.output(self.run_id(out)))
+
+    def test_x27b_the_exit_is_the_step_runs(self):
+        self.setenv(FAKE_STEP_EXIT="3")
+        code, out = self.main()
+        self.assertEqual(code, 3, out)
+        self.assertEqual(self.lines()[-1]["exit"], 3)
+        self.assertIn("exit 3 -> exit 3", self.output(self.run_id(out)))
+
+    def test_x27c_no_local_part_runs(self):
+        code, out = self.main()
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("fake local part", self.output(self.run_id(out)))
+        self.assertNotIn("this Mac", out.splitlines()[-1])
+
+    def test_x27d_lost_machine_is_124(self):
+        self.setenv(STUB_HC_FAIL="lost:box-1", FAKE_GO=os.path.join(self.tmp, "go"))
+        code, out = self.main()
+        self.assertEqual(code, 124, out)
+        self.assertIn("machine box-1 lost after", self.output(self.run_id(out)))
+        self.assertEqual(self.lines()[-1]["exit"], 124)
+
+    def test_x27e_term_cleans_and_exits_143(self):
+        self.setenv(FAKE_GO=os.path.join(self.tmp, "go"))
+        p, log = self.background()
+        self.assertTrue(self.until(lambda: RUN.search(pa.read_text(log) or "")), pa.read_text(log))
+        run = self.run_id(pa.read_text(log))
+        self.assertTrue(self.until(lambda: "stub step run" in (self.output(run) or "")), pa.read_text(log))
+        p.send_signal(signal.SIGTERM)
+        self.assertEqual(p.wait(timeout=60), 143, pa.read_text(log))
+        self.assertFalse(os.path.exists(self.remote_folder(run)))
+        self.assertEqual(self.lines(), [])
+
+
+class X28Cleanup(StepBase):
+    """R16: the run folder (the step's layout inside it) is removed; the kept folder never is."""
+
+    def test_x28_run_folder_removed_keep_left(self):
+        code, out = self.main()
+        self.assertEqual(code, 0, out)
+        run = self.run_id(out)
+        self.assertFalse(os.path.exists(self.remote_folder(run)))
+        self.assertTrue(os.path.isfile(os.path.join(self.keep_dir, "made")))
+        rm = [c for c in self.calls() if c[0] == "exec" and "-rf" in c]
+        self.assertEqual(rm[-1][-1], "/tmp/pa-suite-" + run)
+        for c in self.calls():
+            self.assertNotIn(self.keep_dir, " ".join(c))
+
+
+class X29Generic(unittest.TestCase):
+    """R17: no workspace tool's words in the public tool, its tests or docs; the docs name tests.remoteFull."""
+    WORDS = ["bra" + "zil", "package" + "info", "version" + "set", "event" + "id", "tool" + "box"]
+
+    def test_x29a_no_profile_terms(self):
+        for rel in ("runtime/tools/pa_suite.py", "tests/test_pa_suite_remote.py", "tests/stub-hc", "README.md"):
+            with open(os.path.join(REPO, rel)) as f:
+                text = f.read().lower()
+            for w in self.WORDS:
+                self.assertNotIn(w, text, rel)
+
+    def test_x29b_docs(self):
+        with open(os.path.join(REPO, "README.md")) as f:
+            readme = " ".join(f.read().split())
+        self.assertIn("remoteFull", readme)
+        for word in ("probe", "prepare", "PA_STEP_FACTS", "PA_STEP_REAL_HOME", "kept created"):
+            self.assertIn(word, readme)
+        doc = " ".join(pa_suite.__doc__.split())
+        for word in ("remoteFull", "facts", "prepare", "kept"):
+            self.assertIn(word, doc)
+
+
+class X30NoStepUnchanged(Remote):
+    """Today's remote runs, with no remoteFull: the probe argv byte-equal to t-089's, no step key."""
+
+    def test_x30_probe_and_record_unchanged(self):
+        code, out = self.main()
+        self.assertEqual(code, 0, out)
+        run = self.run_id(out)
+        probes = [c for c in self.calls() if c[0] == "exec" and "uname" in c[-1]]
+        self.assertEqual(probes[0], ["exec", "--on", "box-1", "--timeout", "30", "--", "sh", "-c", pa_suite.PROBE])
+        line = self.lines()[-1]
+        self.assertNotIn("step", line)
+        self.assertEqual([p["place"] for p in line["places"]], ["box-1", "local"])
+        run_call = [c for c in self.calls() if c[0] == "run"][0]
+        self.assertEqual(run_call[run_call.index("--cwd") + 1], "/tmp/pa-suite-{}/w".format(run))
+        self.assertEqual(run_call[-1], pa_suite.run_script("/tmp/pa-suite-" + run, line["tools"]))
 
 
 if __name__ == "__main__":
