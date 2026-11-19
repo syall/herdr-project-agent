@@ -16,7 +16,7 @@ import { View, div } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, ScrollHandle } from "gpui-base";
 import { spaces, panes, agents, terminals, machines, theme, run, props, home, notify, shared, setShared, closeOverlay, openOverlay, window, layout } from "herdr";
 import { Host, gaveUp, read as hostRead, run as hostRun, watch, refusalLine } from "./host.js";
-import { loadSpace, loadLedger, loadQueue, loadWaiting, loadStartOrder, writeStartOrder, loadProfile, loadDecisions, loadRules, TIMED_OUT, READ_LIMIT, answerDecision, notifyOrchestrator, changeRules, touched, localId, paHome, stateDir, taskActions, taskLinks, evidenceTasks, cardEvidence, staleInstructions, liveTarget, lookAlike, OPEN_REQUESTS, keeperJudging, startingLabels, OTHER, OTHER_MAX, OTHER_TOO_LONG, isOther, oneLine, codeState, codeBadge, loadCode, restartArgs, runRestart, restartOutcome, endTerminalLine, RESTART_MARK, RESTART_MARK_TTL, RESTARTED_FOR, RESTART_TIMEOUT, DRY_TIMEOUT, contextCapable, contextSettings, loadContext, contextLine, contextArgs, runContext, contextOutcome, contextDry, resetLine, lastRequestLine, CONTEXT_FOR } from "./store.js";
+import { loadSpace, loadLedger, loadQueue, loadWaiting, loadStartOrder, writeStartOrder, loadProfile, loadDecisions, loadRules, TIMED_OUT, READ_LIMIT, answerDecision, notifyOrchestrator, changeRules, touched, localId, paHome, stateDir, taskActions, taskLinks, evidenceTasks, cardEvidence, staleInstructions, liveTarget, lookAlike, OPEN_REQUESTS, keeperJudging, startingLabels, OTHER, OTHER_MAX, OTHER_TOO_LONG, isOther, oneLine, codeState, codeBadge, loadCode, restartArgs, runRestart, restartOutcome, endTerminalLine, RESTART_MARK, RESTART_MARK_TTL, RESTARTED_FOR, RESTART_TIMEOUT, DRY_TIMEOUT, contextCapable, contextSettings, loadContext, contextLine, contextAt, contextArgs, runContext, contextOutcome, contextDry, resetLine, lastRequestLine, CONTEXT_FOR } from "./store.js";
 import { RulesPane, arm, armHolds, fieldState } from "./rules.js"; // arm, armHolds: the two-click Delete (ARM_WAIT, 10 s)
 import { queueRows, queueLabel, renderQueue, at as atZone } from "./queue.js"; // t-055: the Queue view (read only)
 import { placesRows, renderPlaces, moveOrder, orderText, NOTICE as ORDER_NOTICE } from "./places.js"; // t-083 J2: places and the start order (Tasks)
@@ -766,9 +766,11 @@ export default class ProjectAgent extends View {
     if (!c || typeof c !== "object" || known === "offline") return null;
     const s = c.settings ?? contextSettings(null), launcher = data.code?.launcher ?? null, busy = this.contextBusy[space.id];
     const clock = (iso) => this.contextClock(iso), costs = this.costs.peek(space.id); // the Costs view's last read (J5-D1)
-    // The day of the read, not today's (MF-J5-1); an earlier day is named, and so is the date in its "as of".
-    const now = Date.now(), read = costs && costs.readAt ? contextLine(costs.summary?.paContext, costs.readAt, now) : null;
-    const readIso = costs && costs.readAt ? new Date(costs.readAt).toISOString() : null;
+    // The day of the summary's figures (its updated, else the read: MF-J5r2-1), not today's (MF-J5-1); an earlier day
+    // is named, and so is the date in its "as of". One time gives both the day and the "as of".
+    const now = Date.now(), at = costs && costs.readAt ? contextAt(costs.summary, costs.readAt) : null;
+    const read = at !== null ? contextLine(costs.summary?.paContext, at, now) : null;
+    const readIso = at !== null ? new Date(at).toISOString() : null;
     const asOf = readIso && readIso.slice(0, 10) !== new Date(now).toISOString().slice(0, 10) ? atZone(readIso) : clock(readIso);
     const line = !costs || !costs.readAt ? "PA context: open the Costs tab to read it." : read ? `${read} (as of ${asOf})` : null;
     const button = known === "live" && contextCapable(launcher) && s.mode === "fresh" && !busy;

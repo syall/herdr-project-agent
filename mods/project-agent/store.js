@@ -399,6 +399,12 @@ export function contextDay(paContext, now = Date.now()) {
   if (!e || !isNum(e.calls) || !isNum(e.peak) || !(e.mean === null || isNum(e.mean)) || !isObj(e.resets) || !isNum(e.resets.fresh) || !isNum(e.resets.compact)) return null;
   return e;
 }
+// When the summary's figures are from (MF-J5r2-1): its own `updated`, as pa-costs report takes its day from it; the
+// Costs view's read time when `updated` is missing or not a valid time.
+export function contextAt(summary, readAt) {
+  const ms = typeof summary?.updated === "string" ? Date.parse(summary.updated) : NaN;
+  return Number.isFinite(ms) ? ms : readAt;
+}
 // The R15 line (as pa-costs report's), or null when there is no paContext. `at` is when paContext was read: its UTC
 // day is the one shown, named when it is not `today`'s (MF-J5-1: a read from yesterday is not today's "no calls").
 export function contextLine(paContext, at = Date.now(), today = at) {
