@@ -406,7 +406,8 @@ def gate_commits(worktree, runner=None):
         return []
     root = os.path.realpath(worktree)
 
-    def entry(path):
+    def where(path):
+        """(top, common, branch) as the pre-t-094 calls read them, or None: the fallback of entry's first call."""
         code, top, _ = git(path, "rev-parse", "--show-toplevel")
         if code or not top or os.path.realpath(top) != path:
             return None
@@ -415,12 +416,47 @@ def gate_commits(worktree, runner=None):
             code, common, _ = git(path, "rev-parse", "--git-common-dir")
             common = os.path.join(path, common) if not code and common else None
         _c, branch, _ = git(path, "symbolic-ref", "--short", "-q", "HEAD")
-        code, commit, _ = git(path, "rev-parse", "--verify", "-q", "HEAD")
-        _c, status, _ = git(path, "--no-optional-locks", "status", "--porcelain", "--untracked-files=no")
-        # "XY path" (git() strips the output, so the first line may have lost a leading space)
-        changed = [l for l in status.splitlines() if l.strip() and not l.split(None, 1)[-1].strip('"').startswith(".claude/")]
+        return top, common, branch or None
+
+    def entry(path):
+        # Two calls (t-094 R1, J1-D1). 1: the top level, the absolute common dir and HEAD's short name;
+        # --abbrev-ref=loose shortens as symbolic-ref --short does (heads/x when a tag x exists), and HEAD means
+        # detached. It fails on an unborn HEAD, a HEAD naming a missing ref, or outside a repository: then the
+        # calls as before t-094 (where()).
+        code, out, _ = git(path, "rev-parse", "--show-toplevel", "--path-format=absolute", "--git-common-dir",
+                           "--abbrev-ref=loose", "HEAD")
+        lines = out.splitlines() if not code else []
+        if len(lines) == 3 and os.path.isabs(lines[1]):
+            top, common, short = lines
+            if not top or os.path.realpath(top) != path:
+                return None
+            branch = None if short == "HEAD" else short or None
+        else:
+            found = where(path)
+            if not found:
+                return None
+            top, common, branch = found
+        # 2: the commit and the tracked changes. --no-optional-locks stays the first argument.
+        code, status, _ = git(path, "--no-optional-locks", "status", "--porcelain=v2", "--branch", "--untracked-files=no")
+        commit, changed, oid = None, 0, None
+        for line in status.splitlines() if not code else []:
+            if line.startswith("# branch.oid "):
+                oid = line[len("# branch.oid "):].strip()
+            elif line[:2] in ("1 ", "2 ", "u "):
+                # The path the porcelain v1 line starts with (for a rename or copy, the original), tested as v1's
+                # "XY path" was: leading blanks dropped, quotes stripped.
+                fields = line.split(" ", {"1": 8, "2": 9, "u": 10}[line[0]])
+                tested = fields[-1].split("\t", 1)[-1] if line[0] == "2" else fields[-1]
+                if not tested.lstrip().strip('"').startswith(".claude/"):
+                    changed += 1
+        if oid is None:  # status failed: the commit as read before t-094, no tracked change counted
+            changed = 0
+            c, commit, _ = git(path, "rev-parse", "--verify", "-q", "HEAD")
+            commit = commit if not c and commit else None
+        elif oid != "(initial)":
+            commit = oid or None
         return {"repo": path, "common": os.path.realpath(common) if common else None, "branch": branch or None,
-                "commit": commit if not code and commit else None, "uncommitted": len(changed)}
+                "commit": commit, "uncommitted": changed}
 
     one = entry(root)
     if one:
@@ -564,34 +600,69 @@ def is_commit(run, path, sha):
     return run(path, "cat-file", "-e", sha + "^{commit}")[0] == 0
 
 
-def steering_files(run, path):
-    """[(absolute path, what)] of the files that would change what git says a commit's parents are, as git itself
-    resolves them for this repository (`--git-path`: the common directory's info/grafts or GIT_GRAFT_FILE, and its
-    shallow file). Raises ContentError when git cannot say."""
-    found = []
-    for name, what in STEERING_FILES:
-        code, out, err = run(path, *(CONTENT_GIT + ("rev-parse", "--path-format=absolute", "--git-path", name)))
-        if code or not out or not os.path.isabs(out):
+def repo_paths(run, path):
+    """(common dir, [(absolute path, what)]): the repository's common directory and the files that would change what
+    git says a commit's parents are, as git itself resolves them (`--git-path`: the common directory's info/grafts
+    or GIT_GRAFT_FILE, and its shallow file), in one call (t-094 R2). Raises ContentError when git cannot say."""
+    names = ()
+    for name, _what in STEERING_FILES:
+        names += ("--git-path", name)
+    code, out, err = run(path, *(CONTENT_GIT + ("rev-parse", "--path-format=absolute", "--git-common-dir") + names))
+    lines = out.split("\n") if not code and out else []
+    for i, (_name, what) in enumerate(STEERING_FILES):
+        if len(lines) != 1 + len(STEERING_FILES) or not os.path.isabs(lines[0]) or not os.path.isabs(lines[1 + i]):
             raise ContentError("cannot tell where {} would be ({})".format(what, clean(err)[-200:] or "no answer"))
-        found.append((out, what))
-    return found
+    return lines[0], [(lines[1 + i], what) for i, (_name, what) in enumerate(STEERING_FILES)]
+
+
+def steering_files(run, path):
+    """[(absolute path, what)] of the files that would change what git says a commit's parents are (repo_paths)."""
+    return repo_paths(run, path)[1]
+
+
+def steering_refusal(path, name, what):
+    why = "the repository has {} ({}), which changes what git says a commit's parents are; the content cannot be " \
+          "compared".format(what, clean(name))
+    if what == "a shallow file":  # t-094 R9 (t-057 item 1): the fix; the grafts file has none to name
+        why += " (fix: git fetch --unshallow in {})".format(clean(path))
+    return why
 
 
 def content_git(run):
     """run for the content path (t-052 J1 rounds 2 and 3, verify MF-1 and MF-R2-1): CONTENT_GIT before every
-    subcommand, and ContentError instead of any call while a grafts or shallow file exists, checked before each
-    call. gate_git drops GIT_*, so options and this check, not variables, are what hold in pa-push-main too."""
-    files = {}
+    subcommand, and ContentError instead of any call while a grafts or shallow file exists, checked before and
+    after each call (t-094 R10: a file made during the call discards its answer). gate_git drops GIT_*, so options
+    and this check, not variables, are what hold in pa-push-main too. call.common(path): the common directory, from
+    the same one paths call per folder (t-094 R2)."""
+    known = {}
+
+    def check(path, files):
+        for name, what in files:
+            if os.path.lexists(name):
+                raise ContentError(steering_refusal(path, name, what))
+
+    def paths(path):
+        if path not in known:
+            common, files = repo_paths(run, path)
+            check(path, files)  # after the paths call itself (R10)
+            known[path] = (common, files)
+        return known[path]
 
     def call(path, *args, **kw):
-        if path not in files:
-            files[path] = steering_files(run, path)
-        for name, what in files[path]:
-            if os.path.lexists(name):
-                raise ContentError("the repository has {} ({}), which changes what git says a commit's parents are; "
-                                   "the content cannot be compared".format(what, clean(name)))
-        return run(path, *(CONTENT_GIT + args), **kw)
+        files = paths(path)[1]
+        check(path, files)
+        answer = run(path, *(CONTENT_GIT + args), **kw)
+        check(path, files)
+        return answer
+    call.common = lambda path: paths(path)[0]
     return call
+
+
+def common_dir(run, path):
+    """(code, common dir, err) of the content path's runner: content_git's one paths answer, else a call."""
+    if callable(getattr(run, "common", None)):
+        return 0, run.common(path), ""
+    return run(path, "rev-parse", "--path-format=absolute", "--git-common-dir")
 
 
 def content_main(run, path, profile):
@@ -619,14 +690,16 @@ def content_record(run, path, tip, onto, base=None):
             code, base, err = run(path, "merge-base", tip, "refs/heads/" + onto)
             if code or not base:
                 raise ContentError("no merge base of {} and {}".format(tip[:7], onto))
-        code, merges, err = run(path, "rev-list", "--min-parents=2", base + ".." + tip)
+        # One rev-list (t-094 R4): each line is a commit and its parents, oldest first; more than one parent is a
+        # merge, and the newest merge (the last such line) is named. Without merges the first ids are the commits.
+        code, lines, err = run(path, "rev-list", "--reverse", "--parents", base + ".." + tip)
         if code:
             raise ContentError("git rev-list failed ({})".format(clean(err)[-200:]))
-        if merges.split():
-            raise ContentError("the branch has a merge commit ({}); the content check takes linear branches".format(merges.split()[0][:7]))
-        code, listed, err = run(path, "rev-list", "--reverse", "--first-parent", base + ".." + tip)
-        if code:
-            raise ContentError("git rev-list failed ({})".format(clean(err)[-200:]))
+        rows = [line.split() for line in lines.splitlines() if line.split()]
+        merges = [row[0] for row in rows if len(row) > 2]
+        if merges:
+            raise ContentError("the branch has a merge commit ({}); the content check takes linear branches".format(merges[-1][:7]))
+        listed = " ".join(row[0] for row in rows)
         code, tree, err = run(path, "rev-parse", "--verify", "-q", tip + "^{tree}")
         files = raw_files(run, path, base, tip)
         commits = []
@@ -634,7 +707,7 @@ def content_record(run, path, tip, onto, base=None):
             message = commit_message(run, path, sha)
             commits.append({"sha": sha, "raw": digest(raw_files(run, path, sha + "^", sha)),
                             "message": hashlib.sha256(message.encode("utf-8")).hexdigest()})
-        _c, common, _e = run(path, "rev-parse", "--path-format=absolute", "--git-common-dir")
+        _c, common, _e = common_dir(run, path)
         return {"repo": os.path.realpath(path), "common": os.path.realpath(common) if common else None, "commit": tip,
                 "tree": tree or None, "onto": onto, "base": base, "files": files, "commits": commits,
                 "change": digest(files), "sequence": digest([[c["raw"], c["message"]] for c in commits]),
@@ -1081,7 +1154,7 @@ def union_only(run, raw, path, checked, now):
         b = {f.get("path"): f for f in now.get("files") or [] if isinstance(f, dict)}
         if set(a) != set(b):
             return False, "the files touched differ", [], []
-        code, common, err = run(path, "rev-parse", "--path-format=absolute", "--git-common-dir")
+        code, common, err = common_dir(run, path)
         if code or not common:
             return False, "cannot find the repository's objects ({})".format(clean(err)[-200:]), [], []
         unions, shared = [], []
