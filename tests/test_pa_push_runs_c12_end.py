@@ -27,11 +27,18 @@ class RunChecks(Runs):
 
     def test_r_c13_prepush_fails(self):
         self.replan(prePush=["/bin/sh", "-c", "echo checking; echo bad thing >&2; exit 3"])
-        before = {n for n in os.listdir(tempfile.gettempdir()) if n.startswith("pa-push-")}
-        r = self.assertRefused(self.run_push(), "C13", "the allowlist's prePush check failed (exit 3)")
+        # t-104 R9: run_push's temp folders go to this test's own folder, so another run's pa-push-* folders in the
+        # machine-wide temp dir are never counted as this run's leftovers.
+        own, saved = tempfile.mkdtemp(prefix="c13-"), tempfile.tempdir
+        tempfile.tempdir = own
+        try:
+            r = self.assertRefused(self.run_push(), "C13", "the allowlist's prePush check failed (exit 3)")
+            leftovers = [n for n in os.listdir(own) if n.startswith("pa-push-")]
+        finally:
+            tempfile.tempdir = saved
+            shutil.rmtree(own, ignore_errors=True)
         self.assertIn("bad thing", r["refusal"]["message"])
-        leftovers = {n for n in os.listdir(tempfile.gettempdir()) if n.startswith("pa-push-")} - before
-        self.assertEqual(leftovers, set(), "the temporary clone and hooks folder are removed")
+        self.assertEqual(leftovers, [], "the temporary clone and hooks folder are removed")
 
     def test_r_deadline(self):
         r = self.assertRefused(self.run_push(deadline=time.monotonic() + 100), "deadline", "ran out of time before pushing; nothing was pushed")

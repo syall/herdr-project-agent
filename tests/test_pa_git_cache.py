@@ -231,6 +231,7 @@ class Shapes(Repo):
             ("config", "--get", "core.hooksPath"), ("worktree", "list", "--porcelain", "-z"),
             ("unpack-file", a), ("merge-file", "-q", "-p", "x", "y", "z"), ("update-ref", "refs/heads/x", a),
             ("diff", "-U0", "--no-color", "--output=/tmp/x", a, b), (),
+            ("cat-file", "commit", "refs/heads/" + "x" * 29), ("cat-file", "commit", a.upper()),  # t-104 R10: oid()'s hex test
         ]
         for argv in never:
             self.assertIsNone(pa_hooks.cacheable(argv, 40), argv)

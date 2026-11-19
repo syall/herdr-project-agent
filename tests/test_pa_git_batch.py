@@ -543,5 +543,38 @@ class Parents(Repo):
                                            "branches".format(tip[:7])})
 
 
+# ---- R11: the cache's lifetime ----------------------------------------------------------------------------------
+
+class Lifetime(QBase):
+    def test_ac11_1_after_session_close_ctx_run_caches_nothing(self):
+        tip = self.ref("main")
+        ctx = pa_queue.Ctx(self.dir, self.proj)
+        cache = ctx.s.cache
+        try:
+            first = ctx.run(self.proj, "cat-file", "commit", tip)
+            self.assertEqual(ctx.run(self.proj, "cat-file", "commit", tip), first)
+            self.assertEqual((len(cache.answers), cache.hits), (1, 1))
+        finally:
+            ctx.close()
+        self.assertTrue(cache.closed)
+        self.assertEqual((cache.answers, cache.hits), ({}, 0), "close drops the answers and the hits")
+        self.assertEqual(ctx.run(self.proj, "cat-file", "commit", tip), first, "the closure still answers")
+        ctx.run(self.proj, "cat-file", "commit", tip)
+        self.assertEqual((cache.answers, cache.hits), ({}, 0), "a closed cache is never looked up or filled")
+
+    def test_ac11_2_clear_resets_the_hits(self):
+        tip = self.ref("main")
+        cache = pa_hooks.ContentCache()
+        run = pa_hooks.content_git(pa_hooks.git, cache)
+        run(self.proj, "cat-file", "commit", tip)
+        run(self.proj, "cat-file", "commit", tip)
+        self.assertEqual(cache.hits, 1)
+        cache.clear()
+        self.assertEqual((cache.answers, cache.hits), ({}, 0))
+        self.assertFalse(cache.closed, "clear is not close: the cache is used again")
+        run(self.proj, "cat-file", "commit", tip)
+        self.assertEqual(len(cache.answers), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
