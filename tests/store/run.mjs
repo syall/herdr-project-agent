@@ -859,6 +859,160 @@ cases["S55-queue-rows"] = async () => { // queueRows: the waiting and approval r
   check(queueMod.queueRows({ doc: null, error: "queue.json is version 2; this panel reads version 1", missing: false }, null, []).state === "error", "error");
 };
 
+// ---- t-083 J2: worker places, the waiting list and the person's start order (places.js, store.js) ----
+const placesMod = await import(path.join(dst, "places.js")).catch(() => null);
+const SHARED = JSON.parse(fs.readFileSync(path.join(here, "..", "samples", "places-cases.json"), "utf8"));
+const sJob = (j) => { // a shared case's job, as tests/test_pa_places.py job(): a string is a movable working job
+  const x = typeof j === "string" ? { id: j } : j, [task, name] = x.id.split("/");
+  return { id: x.id, kind: x.kind ?? "working", source: x.source ?? "pa", blockedBy: x.blockedBy ?? null, task, job: name ?? task, role: "build", added: "2026-11-19T00:00:00Z" };
+};
+const WK = (space) => keyOf(space, "/waiting.json"), OK = (space) => keyOf(space, "/start-order.json");
+const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+
+cases["S83-shared-cases"] = async () => { // AC8.3: the JS side agrees with pa_places.py on every shared case
+  check(typeof placesMod?.readOrder === "function" && typeof placesMod?.effectiveOrder === "function" && typeof placesMod?.limitsFrom === "function" && typeof placesMod?.allocate === "function", "places.js exports readOrder, effectiveOrder, limitsFrom, allocate");
+  check(SHARED.version === 1 && SHARED.orderCases.length && SHARED.limitCases.length && SHARED.allocCases.length, "the shared file has its three lists");
+  for (const c of SHARED.orderCases) {
+    const r = placesMod.readOrder(c.orderText);
+    check(r.error === c.error, `${c.name}: error ${JSON.stringify(c.error)} (got ${JSON.stringify(r.error)})`);
+    const ids = placesMod.effectiveOrder(c.jobs.map(sJob), r.order).map((j) => j.id);
+    check(same(ids, c.effective), `${c.name}: ${JSON.stringify(c.effective)} (got ${JSON.stringify(ids)})`);
+  }
+  for (const c of SHARED.limitCases) {
+    const r = placesMod.limitsFrom(c.rules);
+    check(same(r.limits, c.limits) && same(r.sources, c.sources) && same(r.notes, c.notes), `${c.name} (got ${JSON.stringify(r)})`);
+  }
+  for (const c of SHARED.allocCases) {
+    const got = placesMod.allocate(c.jobs.map(sJob), c.limits, c.holders, c.hold).map((r) => ({ id: r.id, action: r.action, place: r.place, full: r.full }));
+    check(same(got, c.expect), `${c.name}: ${JSON.stringify(c.expect)} (got ${JSON.stringify(got)})`);
+  }
+};
+
+cases["S83-order-lines"] = async () => { // AC8.2, J1-D2: the lines the panel and pa-places both say
+  check(typeof placesMod?.readOrder === "function", "places.js exports readOrder");
+  check(placesMod.readOrder(null).line === "no start order yet; the Project Agent's order is used", "missing");
+  check(placesMod.readOrder("{x").line === "start order unreadable: start-order.json is not JSON; the Project Agent's order is used", `not JSON (got ${placesMod.readOrder("{x").line})`);
+  check(placesMod.readOrder('{"version": 1, "order": ["a"]}').line === null, "valid: no line");
+};
+
+cases["S83-load-waiting"] = async () => { // loadWaiting: missing, valid, each invalid form, read on the space's machine
+  check(typeof store.loadWaiting === "function", "store.loadWaiting exists");
+  world();
+  let r = await store.loadWaiting(remote, cx);
+  check(r.missing === true && r.doc === null && r.error === null, `missing (got ${JSON.stringify(r)})`);
+  check(g.__issued.some((x) => x.on === M && x.kind === "read" && x.path === `${rdir}/waiting.json`), "read on the space's machine");
+  const doc = { version: 1, jobs: [{ id: "t-1/build", task: "t-1", job: "build", kind: "working", role: "build", source: "pa", added: "x", blockedBy: null }, { id: "t-2/v", kind: "suite" }] };
+  g.__files[WK(local)] = JSON.stringify(doc);
+  r = await store.loadWaiting(local, cx);
+  check(r.missing === false && r.error === null && same(r.doc, doc), `valid; a job with no source is a pa job (got ${JSON.stringify(r)})`);
+  for (const [body, why] of [["{x", /^waiting\.json is not valid JSON/], ["[]", /needs a "jobs" list/], [JSON.stringify({ version: 1, jobs: {} }), /needs a "jobs" list/],
+    [JSON.stringify({ version: 1, jobs: [{ id: "a", kind: "gpu" }] }), /job 1 needs an id, a kind \(working, no-test, suite\) and a source \(pa or queue\)/],
+    [JSON.stringify({ version: 1, jobs: [{ id: "a", kind: "working" }, { id: "b", kind: "working", source: "x" }] }), /job 2 needs/],
+    [JSON.stringify({ version: 1, jobs: [{ kind: "working" }] }), /job 1 needs/]]) {
+    g.__files[WK(local)] = body;
+    r = await store.loadWaiting(local, cx);
+    check(r.doc === null && why.test(r.error ?? ""), `${body}: ${why} (got ${JSON.stringify(r)})`);
+  }
+};
+
+cases["S83-load-order"] = async () => { // loadStartOrder: the raw text for the compare; missing; read on the machine
+  check(typeof store.loadStartOrder === "function", "store.loadStartOrder exists");
+  world();
+  let r = await store.loadStartOrder(remote, cx);
+  check(r.missing === true && r.text === null, `missing (got ${JSON.stringify(r)})`);
+  check(g.__issued.some((x) => x.on === M && x.kind === "read" && x.path === `${rdir}/start-order.json`), "read on the space's machine");
+  g.__files[OK(local)] = "{not json";
+  r = await store.loadStartOrder(local, cx);
+  check(r.missing === false && r.text === "{not json", `an unreadable file keeps its text (got ${JSON.stringify(r)})`);
+};
+
+cases["S83-load-hung"] = async () => { // a hung read gives up as TIMED_OUT, never "missing"
+  world();
+  for (const [fn, key] of [[store.loadWaiting, WK(remote)], [store.loadStartOrder, OK(remote)]]) {
+    g.__hang = [key];
+    const { done, value } = await within(fn(remote, cx), 12000, 12);
+    check(done && store.gaveUp(value) && !value.missing, `${key}: gave up (got ${JSON.stringify(value)})`);
+    g.__hang = [];
+  }
+};
+
+cases["S83-write-order"] = async () => { // AC6.1, AC6.2: compare-and-write, locally and on the space's machine
+  check(typeof store.writeStartOrder === "function", "store.writeStartOrder exists");
+  world();
+  await store.writeStartOrder(local, "A\n", null);
+  check(g.__files[OK(local)] === "A\n", "a new local file");
+  let err = null;
+  try { await store.writeStartOrder(local, "B\n", "old\n"); } catch (e) { err = String(e.message ?? e); }
+  check(/changed on disk.*reloaded, try again/.test(err ?? "") && g.__files[OK(local)] === "A\n", `a changed file is refused (got ${err})`);
+  await store.writeStartOrder(remote, "R\n", null);
+  check(g.__files[OK(remote)] === "R\n" && g.__writes.includes(OK(remote)), "a new remote file through the python write");
+  err = null;
+  try { await store.writeStartOrder(remote, "S\n", "other\n"); } catch (e) { err = String(e.message ?? e); }
+  check(/changed on disk/.test(err ?? "") && g.__files[OK(remote)] === "R\n", `remote: a changed file is refused (got ${err})`);
+};
+
+cases["S83-move-order"] = async () => { // R9: ↑/↓ swap with the nearest movable job (fixed queue jobs skipped), ⤒, the ends
+  check(typeof placesMod?.moveOrder === "function", "places.js exports moveOrder");
+  const eff = ["A", { id: "Q", source: "queue" }, "B", "C"].map(sJob);
+  const mv = (id, m) => placesMod.moveOrder(eff, id, m);
+  check(same(mv("B", "up"), ["B", "A", "C"]), `B up skips Q (got ${JSON.stringify(mv("B", "up"))})`);
+  check(same(mv("A", "down"), ["B", "A", "C"]), `A down skips Q (got ${JSON.stringify(mv("A", "down"))})`);
+  check(same(mv("C", "top"), ["C", "A", "B"]), `C to the top (got ${JSON.stringify(mv("C", "top"))})`);
+  check(mv("A", "up") === null && mv("A", "top") === null && mv("C", "down") === null, "off an end: null");
+  check(mv("Q", "up") === null && mv("gone", "top") === null, "a fixed or unknown job: null");
+};
+
+cases["S83-order-text"] = async () => { // R6: the file the panel writes: version 1, by person, moves (last 20)
+  check(typeof placesMod?.orderText === "function", "places.js exports orderText");
+  const prev = JSON.stringify({ version: 1, order: ["x"], moves: Array.from({ length: 20 }, (_, i) => ({ at: "t", id: `j${i}`, move: "up" })) });
+  const doc = JSON.parse(placesMod.orderText(prev, ["B", "A"], { id: "B", move: "top" }));
+  check(doc.version === 1 && doc.by === "person" && same(doc.order, ["B", "A"]) && typeof doc.updated === "string", `the head (got ${JSON.stringify(doc)})`);
+  check(doc.moves.length === 20 && doc.moves[0].id === "j1" && doc.moves[19].id === "B" && doc.moves[19].move === "top", `the last 20 moves (got ${JSON.stringify(doc.moves.slice(-2))})`);
+  const fresh = JSON.parse(placesMod.orderText("{bad", ["A"], { id: null, move: "reset" }));
+  check(same(fresh.order, ["A"]) && fresh.moves.length === 1 && fresh.moves[0].move === "reset", `over an unreadable file (got ${JSON.stringify(fresh)})`);
+  check(placesMod.orderText(null, [], { id: "A", move: "up" }).endsWith("}\n"), "a trailing newline");
+};
+
+cases["S83-rows"] = async () => { // R1 AC1.1-1.4, R9, R11 without rendering: placesRows
+  check(typeof placesMod?.placesRows === "function", "places.js exports placesRows");
+  const zoneMod = await import(path.join(dst, "zone.js"));
+  zoneMod.zone.offsetAt = () => 0;
+  const rules = { rules: [], error: null, doc: { rules: [{ id: "r-places", text: "x", status: "active", order: 50, places: { working: 4, "no-test": 1, suite: 2 } }] } };
+  const w = (address, name, role, extra = {}) => ({ address, name, role, started: "2026-11-19T10:02:00Z", ...extra });
+  const ledger = { tasks: [
+    { id: "t-020", workers: [w("t51", "t-020-build", "build", { place: "working" }), w("t53", "t-020-verify", "verifier", { place: "suite" }), w("t60", "t-020-old", "build", { place: "working", finished: "x" })] },
+    { id: "t-041", workers: [w("t54", "t-041-review", "reviewer", { place: "no-test" }), w("t61", "t-041-gone", "build", { place: "working" })] },
+  ] };
+  const live = new Set(["t51", "t53", "t54", "t60"]);
+  const waiting = { doc: { version: 1, jobs: [sJob({ id: "t-020/verify-2", kind: "suite" }), { ...sJob({ id: "t-060/merge-check", kind: "suite", source: "queue" }), role: "verifier" }, sJob({ id: "t-083/design", kind: "no-test" })] }, error: null, missing: false };
+  const rows = placesMod.placesRows({ waiting, startOrder: { text: null, missing: true }, rules, ledger, isLive: (a) => live.has(a) });
+  check(rows.shown && rows.state === "ok", `shown (got ${JSON.stringify({ shown: rows.shown, state: rows.state })})`);
+  const heads = rows.kinds.map((k) => k.head);
+  check(same(heads, ["Working · 3 of 4", "No-test extra · 0 of 1", "Suite step · 1 of 2  (held within Working)"]), `AC1.1 heads (got ${JSON.stringify(heads)})`);
+  const lines = rows.kinds[0].holders.map((h) => h.text);
+  check(lines.includes("t53 · t-020 verify · verifier · suite step · since 11-19 10:02"), `AC1.1 holder line (got ${JSON.stringify(lines)})`);
+  check(!lines.some((l) => /t60|t61/.test(l)), "AC1.2 finished and not live hold nothing");
+  check(rows.head === "Places · 3 of 4 working · 3 waiting", `head (got ${rows.head})`);
+  check(rows.limitsLine === "limits: r-places", `limits line (got ${rows.limitsLine})`);
+  const jl = rows.jobs.map((j) => [j.label, j.reason, j.up, j.down, j.top, j.fixed]);
+  check(rows.jobs[0].label === "1. t-020 verify-2 · build · suite step" && rows.jobs[2].label === "3. t-083 design · build · no-test", `labels (got ${JSON.stringify(jl)})`);
+  check(rows.jobs[0].reason === "next to start" && rows.jobs[2].reason === "next to start: the no-test extra place is free", `reasons (got ${JSON.stringify(jl)})`);
+  check(rows.jobs[1].fixed && rows.jobs[1].note === "merge queue order (Queue tab)" && rows.jobs[1].reason === "waits for a suite place (2 of 2)" && !rows.jobs[1].up && !rows.jobs[1].down && !rows.jobs[1].top, `the queue job: fixed, no buttons (got ${JSON.stringify(jl[1])})`);
+  check(!rows.jobs[0].up && !rows.jobs[0].top && rows.jobs[0].down && rows.jobs[2].up && rows.jobs[2].top && !rows.jobs[2].down, `AC9.1 (got ${JSON.stringify(jl)})`);
+  check(same(rows.badges["t-020"].map((b) => b.text), ["running · working", "running · suite step", "next #1 · suite step"]), `R11 badges (got ${JSON.stringify(rows.badges["t-020"])})`);
+  check(!rows.badges["t-999"], "AC11.1 no badge");
+  // AC1.3 no place recorded; AC1.4 over the limit
+  const over = { tasks: [{ id: "t-1", workers: ["a", "b", "c", "d", "e"].map((x) => w(x, `t-1-${x}`, "build", x === "e" ? {} : { place: "working" })) }] };
+  const r2 = placesMod.placesRows({ waiting: { doc: null, error: null, missing: true }, startOrder: null, rules, ledger: over, isLive: () => true });
+  check(r2.kinds[0].head === "Working · 5 of 4" && r2.kinds[0].over === true, `AC1.4 (got ${JSON.stringify(r2.kinds[0])})`);
+  check(r2.kinds[0].holders.some((h) => /^e · t-1 e · build · kind not recorded · since/.test(h.text)), `AC1.3 (got ${JSON.stringify(r2.kinds[0].holders.map((h) => h.text))})`);
+  check(r2.waitingLine === "No waiting list yet: the Project Agent writes it with pa-places.", `AC9.2 (got ${r2.waitingLine})`);
+  // AC2.4 defaults; D3: nothing waiting, no holder: not shown
+  const r3 = placesMod.placesRows({ waiting: { doc: { version: 1, jobs: [] }, error: null, missing: false }, startOrder: null, rules: { rules: [], error: null, doc: { rules: [] } }, ledger: { tasks: [] }, isLive: () => true });
+  check(same(r3.kinds.map((k) => k.head), ["Working · 0 of 4 (default)"]), `AC2.4 (got ${JSON.stringify(r3.kinds.map((k) => k.head))})`);
+  check(placesMod.placesRows({ waiting: { doc: null, error: null, missing: true }, startOrder: null, rules: null, ledger: { tasks: [] }, isLive: () => true }).shown === false, "D3: no list, no holder: not shown");
+};
+
 const pick = process.argv.slice(2);
 let failed = 0;
 for (const [name, fn] of Object.entries(cases)) {

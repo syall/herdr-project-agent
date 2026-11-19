@@ -5826,6 +5826,150 @@ cases["P-costs-j3-reads"] = async () => { // the view reads and runs nothing new
   check(JSON.stringify(old) === JSON.stringify(now), `the same reads and execs (old ${JSON.stringify(old)} new ${JSON.stringify(now)})`);
 };
 
+// ---- t-083 J2: worker places and the start order in the Tasks tab ----
+const P83 = {
+  rules: JSON.stringify({ version: 1, rules: [{ id: "r-places", title: "Worker places", text: "x", status: "active", order: 50, places: { working: 4, "no-test": 1, suite: 2 } }] }),
+  worker: (address, name, role, extra = {}) => ({ address, name, role, round: 1, started: "2026-11-19T10:02:00Z", ...extra }),
+  job: (id, kind, extra = {}) => { const [task, job] = id.split("/"); return { id, task, job, kind, role: kind === "no-test" ? "design" : "verifier", source: "pa", added: "2026-11-19T10:00:00Z", blockedBy: null, ...extra }; },
+};
+const plTerm = (address) => ({ address, state: "live", argv: ["claude"], labels: {}, status: "working", program: claude });
+const plJobs = () => [P83.job("t-020/verify-2", "suite"), P83.job("t-060/merge-check", "suite", { source: "queue" }), P83.job("t-083/design", "no-test")];
+const plLedger = () => ({ tasks: [
+  { id: "t-020", title: "Panel worktrees", state: "in-progress", workers: [P83.worker("t51", "t-020-build", "build", { place: "working" }), P83.worker("t53", "t-020-verify", "verifier", { place: "suite" })] },
+  { id: "t-041", title: "Fresh reset", state: "in-progress", workers: [P83.worker("t54", "t-041-review", "reviewer", { place: "no-test" }), P83.worker("t59", "t-041-old", "build", { place: "working", finished: "2026-11-19T09:00:00Z" })] },
+  { id: "t-060", title: "Merge queue cards", state: "in-progress" },
+  { id: "t-083", title: "Worker places", state: "in-progress" },
+  { id: "t-090", title: "Nothing here", state: "in-progress" },
+] });
+// A world with the places files (undefined: none; null: leave out) and the Tasks view open.
+async function placesWorld({ waiting = { version: 1, jobs: plJobs() }, order, ledger = plLedger(), rules = P83.rules, machine = null, terms = ["t51", "t53", "t54", "t59x"] } = {}) {
+  world({ machine, extraTerms: terms.map((a) => plTerm(machine ? `${machine}/${a}` : a)) });
+  const dir = machine ? `${machine}:${RDIR}` : `:${DIR}`;
+  g.__files[`${dir}/ledger.json`] = JSON.stringify(ledger);
+  if (rules !== undefined) g.__files[`${dir}/rules.json`] = rules;
+  if (waiting !== undefined) g.__files[`${dir}/waiting.json`] = typeof waiting === "string" ? waiting : JSON.stringify(waiting);
+  if (order !== undefined) g.__files[`${dir}/start-order.json`] = order;
+  const v = await mount(); await settle();
+  await click(v, "view-tasks"); await settle();
+  return { v, dir };
+}
+const orderOf = (text) => JSON.parse(text).order;
+
+cases["P83-1-places"] = async () => { // AC1.1, AC1.2: the kinds, their limits and holders; finished or ended workers hold nothing
+  const { v } = await placesWorld();
+  const { text } = look(v);
+  check(/Places · 3 of 4 working · 3 waiting/.test(text), `the section head (got ${text.slice(0, 600)})`);
+  check(text.includes("Working · 3 of 4") && text.includes("No-test extra · 0 of 1") && text.includes("Suite step · 1 of 2  (held within Working)"), `AC1.1 the three kinds (got ${text.slice(0, 900)})`);
+  check(text.includes("t53 · t-020 verify · verifier · suite step · since 11-19 10:02") && text.includes("t54 · t-041 review · reviewer · since 11-19 10:02"), `AC1.1 holder lines (got ${text.slice(0, 900)})`);
+  check(text.includes("limits: r-places"), "the limits' rule");
+  check(!/t59 ·/.test(text), "AC1.2: a finished worker is not drawn");
+  check(text.indexOf("Places ·") < text.indexOf("in progress"), "the section comes before the task sections");
+};
+
+cases["P83-2-waiting"] = async () => { // R9: effective order, kind labels, reasons, the queue job without buttons; AC9.1
+  const { v } = await placesWorld();
+  const { text, clicks } = look(v);
+  const at = ["1. t-020 verify-2 · verifier · suite step", "2. t-060 merge-check · verifier · suite step", "3. t-083 design · design · no-test"].map((s) => text.indexOf(s));
+  check(at.every((i) => i >= 0) && at[0] < at[1] && at[1] < at[2], `the jobs in order (got ${text})`);
+  check(text.includes("Waiting · 3") && text.includes("merge queue order (Queue tab)") && text.includes("waits for a suite place (2 of 2)") && text.includes("next to start: the no-test extra place is free"), `reasons (got ${text})`);
+  check(/order: the Project Agent's/.test(text), "no order file: the Project Agent's order");
+  check(!clicks["place-up-t-060/merge-check"] && !clicks["place-down-t-060/merge-check"] && !clicks["place-top-t-060/merge-check"], "the queue job has no buttons");
+  check(!clicks["place-up-t-020/verify-2"] && !clicks["place-top-t-020/verify-2"] && Boolean(clicks["place-down-t-020/verify-2"]), "AC9.1: the top movable job: ↓ only");
+  check(Boolean(clicks["place-up-t-083/design"]) && Boolean(clicks["place-top-t-083/design"]) && !clicks["place-down-t-083/design"], "AC9.1: the last: ↑ and ⤒");
+};
+
+cases["P83-3-move"] = async () => { // AC6.1, AC6.3: a move writes the whole order by compare-and-write; three moves, one notice
+  const { v, dir } = await placesWorld();
+  const path = `${dir}/start-order.json`;
+  await click(v, "place-top-t-083/design"); await settle();
+  check(typeof g.__files[path] === "string" && JSON.stringify(orderOf(g.__files[path])) === JSON.stringify(["t-083/design", "t-020/verify-2"]), `the new order (got ${g.__files[path]})`);
+  const doc = JSON.parse(g.__files[path]);
+  check(doc.version === 1 && doc.by === "person" && doc.moves.length === 1 && doc.moves[0].id === "t-083/design" && doc.moves[0].move === "top", `the file (got ${g.__files[path]})`);
+  check(/order: yours/.test(look(v).text) && look(v).text.indexOf("1. t-083 design") >= 0, `drawn in the new order (got ${look(v).text})`);
+  await click(v, "place-down-t-083/design"); await settle();
+  await click(v, "place-up-t-083/design"); await settle();
+  check(JSON.stringify(orderOf(g.__files[path])) === JSON.stringify(["t-083/design", "t-020/verify-2"]), `after down and up (got ${g.__files[path]})`);
+  check(JSON.parse(g.__files[path]).moves.length === 3, "three moves recorded");
+  const n = v.unsent.filter((u) => u.message === "start order changed").length;
+  check(n === 1, `one notice for three moves (got ${JSON.stringify(v.unsent)})`);
+};
+
+cases["P83-4-stale"] = async () => { // AC6.1: a file changed since the read is refused, nothing written, the view reloads
+  const { v, dir } = await placesWorld({ order: JSON.stringify({ version: 1, order: [] }) });
+  const path = `${dir}/start-order.json`, other = JSON.stringify({ version: 1, order: ["t-020/verify-2"], by: "person" });
+  g.__files[path] = other;
+  const before = g.__reads.filter((r) => r.endsWith("start-order.json")).length;
+  await click(v, "place-top-t-083/design"); await settle();
+  check(g.__files[path] === other, `nothing written (got ${g.__files[path]})`);
+  check(/changed on disk.*reloaded, try again/.test(look(v).text), `the refusal is said (got ${look(v).text.slice(0, 800)})`);
+  check(g.__reads.filter((r) => r.endsWith("start-order.json")).length > before, "the view reloads");
+  check(!v.unsent.some((u) => u.message === "start order changed"), "no notice for a refused write");
+};
+
+cases["P83-5-remote"] = async () => { // AC6.2: on another machine: read there, written there by the python compare-and-write
+  const { v } = await placesWorld({ machine: M });
+  check(g.__issued.some((x) => x.on === M && x.kind === "read" && x.path === `${RDIR}/waiting.json`) && g.__issued.some((x) => x.on === M && x.kind === "read" && x.path === `${RDIR}/start-order.json`), "both read on the space's machine");
+  check(/Working · 3 of 4/.test(look(v).text), `holders through the machine's terminals (got ${look(v).text.slice(0, 600)})`);
+  await click(v, "place-top-t-083/design"); await settle();
+  const k = `${M}:${RDIR}/start-order.json`;
+  check(g.__writes.includes(k) && JSON.stringify(orderOf(g.__files[k])) === JSON.stringify(["t-083/design", "t-020/verify-2"]), `written on the machine (got ${JSON.stringify(g.__writes)})`);
+};
+
+cases["P83-6-busy"] = async () => { // AC9.3: while a write is in flight a click does nothing
+  const { v, dir } = await placesWorld();
+  v.placesBusy[S] = true;
+  await click(v, "place-top-t-083/design"); await settle();
+  check(g.__files[`${dir}/start-order.json`] === undefined && !g.__writes.some((w) => w.endsWith("start-order.json")), "nothing written");
+};
+
+cases["P83-7-waiting-missing"] = async () => { // AC9.2: no waiting list (a worker holds a place): its line; invalid: its error, no buttons
+  let { v } = await placesWorld({ waiting: undefined });
+  check(look(v).text.includes("No waiting list yet: the Project Agent writes it with pa-places."), `missing (got ${look(v).text.slice(0, 800)})`);
+  ({ v } = await placesWorld({ waiting: "{x" }));
+  const { text, clicks } = look(v);
+  check(/waiting\.json is not valid JSON/.test(text) && !Object.keys(clicks).some((k) => k.startsWith("place-")), `invalid (got ${text.slice(0, 800)})`);
+};
+
+cases["P83-8-hidden"] = async () => { // D3, AC11.1: no waiting list and no holder: no section, no badges
+  const { v } = await placesWorld({ waiting: undefined, terms: [] });
+  const { text, clicks } = look(v);
+  check(!/Places ·/.test(text) && !Object.keys(clicks).some((k) => k.startsWith("badge-")), `nothing drawn (got ${text.slice(0, 600)})`);
+};
+
+cases["P83-9-unreadable"] = async () => { // AC8.2: an unreadable order: said, the PA's order used, Reset order writes over that text
+  const { v, dir } = await placesWorld({ order: "{bad" });
+  const { text } = look(v);
+  check(text.includes("start order unreadable: start-order.json is not JSON; the Project Agent's order is used"), `the line (got ${text.slice(0, 900)})`);
+  await click(v, "places-reset"); await settle();
+  const doc = JSON.parse(g.__files[`${dir}/start-order.json`]);
+  check(JSON.stringify(doc.order) === JSON.stringify(["t-020/verify-2", "t-083/design"]) && doc.moves.at(-1).move === "reset", `reset to the effective order (got ${JSON.stringify(doc)})`);
+};
+
+cases["P83-10-limits"] = async () => { // AC2.3, AC2.4, AC1.3, AC1.4: defaults, a bad value named, unrecorded and over the limit
+  const ledger = { tasks: [{ id: "t-1", title: "One", state: "in-progress", workers: ["a1", "a2", "a3", "a4", "a5"].map((x) => P83.worker(x, `t-1-${x}`, "build", x === "a5" ? {} : { place: "working" })) }] };
+  let { v } = await placesWorld({ ledger, terms: ["a1", "a2", "a3", "a4", "a5"], rules: JSON.stringify({ version: 1, rules: [{ id: "r-x", text: "x", status: "active", order: 9, places: { gpu: 2 } }] }) });
+  const { text } = look(v);
+  check(text.includes("Working · 5 of 4 (default)") && !text.includes("No-test extra") && !text.includes("Suite step"), `AC2.4, AC1.4 (got ${text.slice(0, 900)})`);
+  check(text.includes("r-x: places.gpu is not a known kind; ignored"), "AC2.3 the note");
+  check(text.includes("a5 · t-1 a5 · build · kind not recorded · since"), `AC1.3 (got ${text.slice(0, 900)})`);
+  check(text.includes("One"), "the tab is still drawn");
+};
+
+cases["P83-11-badges"] = async () => { // R11: badges on task rows; a click unfolds Places and marks the line for 3 s
+  const { v } = await placesWorld();
+  const { text, clicks } = look(v);
+  check(text.includes("running · working") && text.includes("running · suite step") && text.includes("next #1 · suite step") && text.includes("next #3 · no-test"), `badges (got ${text})`);
+  check(!Object.keys(clicks).some((k) => k.startsWith("badge-t-090")), "AC11.1: no badge without a job");
+  await click(v, "places-head"); // fold the section
+  check(!look(v).text.includes("Working · 3 of 4"), "folded");
+  const id = Object.keys(look(v).clicks).find((k) => k.startsWith("badge-t-083"));
+  check(Boolean(id), "a badge for t-083");
+  await click(v, id);
+  check(look(v).text.includes("Working · 3 of 4") && v.placeMark?.id === "job:t-083/design", `unfolded and marked (got ${JSON.stringify(v.placeMark)})`);
+  advance(3500); await fire(1000);
+  check(!v.placeMark, "the mark ends after 3 s");
+};
+
 // --list prints the names that would run and runs none. An unknown name or option exits 2.
 const refuse = (why) => { fs.rmSync(dst, { recursive: true, force: true }); console.error(`run.mjs: ${why}`); process.exit(2); };
 const pick = [];
