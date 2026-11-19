@@ -251,7 +251,7 @@ export function renderPlaces(t, rows, o) {
     .children(rows.notes.map((x) => line(x, t.blocked)))
     .children(rows.kinds.flatMap((k) => [
       div().pt(2).text_size(12).text_color(k.over ? t.blocked : t.foreground).child(k.head),
-      ...(k.holders.length ? k.holders.map((h) => marked(div().id(`place-holder-${h.address}`).pl(12).cursor_pointer().hover((s) => s.bg(t.hover)).on_click(() => o.onWorker?.(h.address)), h.key)
+      ...(k.holders.length ? k.holders.map((h) => marked(div().id(`places-holder-${h.address}`).pl(12).cursor_pointer().hover((s) => s.bg(t.hover)).on_click(() => o.onWorker?.(h.address)), h.key)
         .child(line(`${h.text} ↗`))) : [div().pl(12).child(line("free", t.dim))]),
     ]))
     .when(Boolean(o.error), (el) => el.child(line(o.error ?? "", t.blocked)))

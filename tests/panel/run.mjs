@@ -5820,14 +5820,14 @@ cases["P84-1-holder"] = async () => { // R5: a Places holder line opens its work
   const { v } = await placesWorld();
   check(look(v).text.includes("t53 · t-020 verify · verifier · suite step · since 11-19 10:02 ↗"), `the holder line is a link (got ${look(v).text.slice(0, 900)})`);
   g.__runs = [];
-  await click(v, "place-holder-t53");
+  await click(v, "places-holder-t53");
   check(g.__runs.some(([n, a]) => n === "terminal.peek" && a?.terminal === "t53"), `opens t53 (got ${JSON.stringify(g.__runs)})`);
 };
 
 cases["P84-2-holder-remote"] = async () => { // R5: on a remote space, through the machine's address
   const { v } = await placesWorld({ machine: M });
   g.__runs = [];
-  await click(v, "place-holder-t53");
+  await click(v, "places-holder-t53");
   check(g.__runs.some(([n, a]) => n === "terminal.peek" && a?.terminal === `${M}/t53`), `opens ${M}/t53 (got ${JSON.stringify(g.__runs)})`);
 };
 
