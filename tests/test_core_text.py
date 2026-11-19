@@ -1199,9 +1199,10 @@ class T097TaskOrder(unittest.TestCase):
 
     def test_r19_pause_blocks_waiting_jobs(self):
         self.assertIn("block its waiting jobs with `pa-places block <id> --why \"paused by the person\"`, and on "
-                      "Unpause or Start next unblock them, except a job that waited for something else before (an open "
-                      "card, an `after` task, a hold): `block` replaces a job's `blockedBy`, so block that one again "
-                      "with what it waits for while it still holds.", self.files)  # B3
+                      "Unpause or Start next end that reason with `pa-places unblock <id> --why \"paused by the "
+                      "person\"`: a job that also waits for something else (an open card, an `after` task, a hold) "
+                      "keeps that reason and stays blocked.", self.files)  # B3; t-120 (J3 round 2 RL-2): pa-places keeps it
+        self.assertNotIn("so block that one again", self.files)
         self.assertNotIn("and unblock them on Unpause or Start next", self.files)
         self.assertIn("A paused task's worker that stopped is not started again until Unpause or Start next.",
                       self.files)  # B5
@@ -1226,9 +1227,9 @@ class T097TaskOrder(unittest.TestCase):
         self.assertNotIn("until you raise it", self.readme)
 
     def test_parked_or_done_jobs_dropped(self):  # J3 round 2 B4: pa-places next reads no task states
-        self.assertIn("When a task is parked, by you or the person, or the person marks it done, drop its waiting jobs "
-                      "with `pa-places drop <id> --why \"<task> parked\"` (or `done`): `pa-places next` does not read "
-                      "task states.", self.files)
+        self.assertIn("When a task is parked, by you or the person, or the person marks it done or deletes it, drop its "
+                      "waiting jobs with `pa-places drop <id> --why \"<task> parked\"` (or `done`, `deleted`): "
+                      "`pa-places next` does not read task states.", self.files)  # t-120 (J3 round 2 RL-1): deleted too
 
     def test_readme_paragraph(self):
         for words in ("`task-order.json`", "↑ ↓ ⤒ ⤓", "`PA`", "Start next", "Pause", "Unpause", "Mark done",
@@ -1246,6 +1247,31 @@ class T097TaskOrder(unittest.TestCase):
     def test_safety_unchanged(self):
         self.assertEqual(section(self.raw, "## Safety"), ORCHESTRATOR_SAFETY)
         self.assertEqual(section(read("runtime", "core", "worker.md"), "## Safety"), WORKER_SAFETY)
+
+
+class T120TaskOrderLimits(unittest.TestCase):  # t-120: t-097 J3's Recorded limits
+    setUp = T097TaskOrder.setUp
+
+    def test_rl3_reopened_task_not_ready(self):  # REVIEW J3 round 2 RL-3: step 3 and the ask-first rule agree
+        self.assertIn("A task the person reopened is not ready until they have said what they want done.", self.passes)
+
+    def test_rl1_start_next_rank_is_the_panel_s(self):  # REVIEW J3 RL-1
+        self.assertIn("The panel's Start next puts the task at the top of the task order and then runs `pa-task next`, "
+                      "which puts it `in-progress`; `pa-task next` alone changes only its state, not its rank.", self.files)
+        self.assertNotIn("Start next puts the task `in-progress` at the top of the task order.", self.files)
+        self.assertIn("`pa-task next` from a terminal changes only the state", self.readme)
+
+    def test_rl_r1_reopened_at_the_bottom(self):  # VERIFY J3 rebase RL-R1, REVIEW J3 round 2 RL-2
+        self.assertIn("When the person reopens a done task, `pa-task reopen` takes it out of your `taskOrder` (`order` "
+                      "and `chat`), so it starts at the bottom of Queued; place it again only as you would a new task.",
+                      self.files)
+        self.assertIn("`pa-task reopen` takes it out of the Project Agent's order, and the place your file gave it "
+                      "before is not read", self.readme)
+
+    def test_rl2_unblock_one_reason(self):  # VERIFY J3 round 2 RL-2: pa-places keeps every reason
+        self.assertIn("When one thing a job waits for ends, end that reason alone: `pa-places unblock <id> --why "
+                      "\"<its line>\"`; `unblock <id>` with no `--why` ends every reason.", self.workers)
+        self.assertIn("a job stays blocked until each reason it was blocked for is unblocked", self.places)
 
 
 class T101RulesNotice(unittest.TestCase):  # t-101 R6: what the Project Agent does on a 'rules changed' notice

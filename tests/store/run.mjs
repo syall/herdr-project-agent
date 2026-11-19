@@ -1171,6 +1171,21 @@ cases["S97-pins-after"] = async () => { // R10: a Places move writes one pin for
   check(pa(null, "Q", "up", null, q) === null && same(pa(null, "B", "up", null, q), [{ id: "B", slot: 0 }]), "a queue job has no pin; slots count the movable jobs");
 };
 
+cases["S120-pins-small"] = async () => { // t-120 (t-097 REVIEW J2 RL-1, R10): a fallback and a version 1 file pin only what the drawn order needs
+  const v2 = (pins) => placesMod.readOrder(JSON.stringify({ version: 2, pins })).start, ids = (js, start, rank) => placesMod.effectiveOrder(js, start, rank).map((j) => j.id);
+  const js = ["A", "B", "X", "C", "D"].map(sJob), rank = ["A", "B", "X", "C", "D"], start = v2([{ id: "X", slot: 0 }, { id: "B", slot: 1 }]);
+  check(same(ids(js, start, rank), ["X", "B", "A", "C", "D"]), "the case's effective order");
+  const got = placesMod.pinsAfter({ jobs: js, start, rank, id: "X", move: "down" });
+  check(same(ids(js, v2(got), rank), ["B", "X", "A", "C", "D"]), `the written pins give the order drawn (got ${JSON.stringify(got)})`);
+  check(got.length === 2 && got.every((p) => p.id === "B" || p.id === "X"), `only the jobs the drawn order needs are pinned (got ${JSON.stringify(got)})`);
+  check(same(ids(js, v2(got), ["A", "B", "X", "D", "C"]), ["B", "X", "A", "D", "C"]), "a later task move still reorders the jobs not pinned");
+  const four = ["A", "B", "C", "D"].map(sJob), v1 = placesMod.readOrder(JSON.stringify({ version: 1, order: ["B", "A", "C", "D"] })).start;
+  check(same(ids(four, v1, null), ["B", "A", "C", "D"]), "a version 1 whole list");
+  const g1 = placesMod.pinsAfter({ jobs: four, start: v1, rank: null, id: "D", move: "up" });
+  check(same(ids(four, v2(g1), null), ["B", "A", "D", "C"]), `drawn as moved (got ${JSON.stringify(g1)})`);
+  check(same(g1, [{ id: "B", slot: 0 }, { id: "D", slot: 2 }]), `a version 1 file is not carried over as a pin for every job (got ${JSON.stringify(g1)})`);
+};
+
 cases["S97-prune-text"] = async () => { // R4, R1, R8: prune, then the file the panel writes
   check(typeof tasksMod?.pruneOrder === "function" && typeof tasksMod?.taskOrderText === "function", "tasks.js exports pruneOrder, taskOrderText");
   const tasks = [{ id: "t-1", state: "queued" }, { id: "t-2", state: "done" }, { id: "t-3", state: "parked" }, { id: "t-4", state: "needs-decision" }, { id: "t-5", state: "done" }, { id: "t-6", state: "review" }];

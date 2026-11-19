@@ -1027,6 +1027,58 @@ class T133Places(Base):
         self.assertIn("start: suite 2 free (working 4 free)   record place: suite", self.ok("next"))
 
 
+class T120Reasons(Base):  # t-120 (t-097 J3 round 2 RL-2): a second block keeps the earlier reason; unblock --why ends one
+    def job(self):
+        return self.waiting()["jobs"][0]
+
+    def test_second_reason_kept(self):
+        self.add("t-1", "build")
+        self.ok("block", "t-1/build", "--why", "waits for d-7")
+        self.ok("block", "t-1/build", "--why", "paused by the person")
+        self.assertEqual(self.job()["blockedBy"], "waits for d-7")
+        self.assertEqual(self.job()["blockedAlso"], ["paused by the person"])
+        self.ok("block", "t-1/build", "--why", "paused by the person")  # the same reason again adds nothing
+        self.assertEqual(self.job()["blockedAlso"], ["paused by the person"])
+
+    def test_unblock_one_reason(self):
+        self.add("t-1", "build")
+        self.ok("block", "t-1/build", "--why", "waits for d-7")
+        self.ok("block", "t-1/build", "--why", "paused by the person")
+        out = self.ok("unblock", "t-1/build", "--why", "paused by the person")
+        self.assertIn("still blocked: waits for d-7", out)
+        self.assertEqual(self.job()["blockedBy"], "waits for d-7")
+        self.assertNotIn("blockedAlso", self.job())
+        self.assertIn("blocked: waits for d-7", self.ok("next"))
+        self.assertEqual(self.journal("unblock")[-1]["why"], "paused by the person")
+
+    def test_unblock_the_first_reason_promotes_the_next(self):
+        self.add("t-1", "build")
+        self.ok("block", "t-1/build", "--why", "waits for d-7")
+        self.ok("block", "t-1/build", "--why", "paused by the person")
+        self.ok("unblock", "t-1/build", "--why", "waits for d-7")
+        self.assertEqual(self.job()["blockedBy"], "paused by the person")
+        self.assertNotIn("blockedAlso", self.job())
+        self.ok("unblock", "t-1/build", "--why", "paused by the person")
+        self.assertIsNone(self.job()["blockedBy"])
+
+    def test_unblock_a_reason_it_does_not_have(self):
+        self.add("t-1", "build")
+        self.ok("block", "t-1/build", "--why", "waits for d-7")
+        before = read(self.path("waiting.json"))
+        code, out, err = self.run_main("unblock", "t-1/build", "--why", "paused by the person")
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("not blocked by: paused by the person", err)
+        self.assertEqual(read(self.path("waiting.json")), before)
+
+    def test_plain_unblock_clears_every_reason(self):  # as before
+        self.add("t-1", "build")
+        self.ok("block", "t-1/build", "--why", "waits for d-7")
+        self.ok("block", "t-1/build", "--why", "paused by the person")
+        self.ok("unblock", "t-1/build")
+        self.assertIsNone(self.job()["blockedBy"])
+        self.assertNotIn("blockedAlso", self.job())
+
+
 # ---- wiring: install, parse check, guard (AC5.3, AC5.4) ----------------------------------------------------------
 
 class Wiring(unittest.TestCase):

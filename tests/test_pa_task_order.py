@@ -21,8 +21,9 @@ pa = w.pa
 setUpModule = w.setUpModule
 tearDownModule = w.tearDownModule
 
-NEXT = ("The person asked to start task t-1 next: its next job goes first in the waiting list. Its after tasks, "
-        "cards and holds still apply; no worker was started.")
+NEXT = ("The person asked to start task t-1 next: it is in progress now. Its next job goes first in the waiting list "
+        "only while it is at the top of the task order (the panel's Start next puts it there; pa-task next alone "
+        "changes only its state). Its after tasks, cards and holds still apply; no worker was started.")  # t-120 (J3 RL-1)
 PAUSE = ("The person paused task t-1: let its running workers finish their job; start no new job for it, and block "
          "its waiting jobs (\"paused by the person\"), until they start it again.")
 UNPAUSE = ("The person unpaused task t-1: unblock its waiting jobs paused by the person; its turn comes at its place "
@@ -293,6 +294,63 @@ class Unchanged(TaskBase):  # R6, R20, R1: the order file is never written; done
         self.task("queued")
         err = self.refused("next", "t-9")
         self.assertIn("no task t-9", err)
+
+
+def places_tool():
+    """runtime/tools/pa_places.py over this module's pa (sys.modules restored after the load)."""
+    import importlib.util
+    saved = {k: sys.modules.get(k) for k in ("pa", "pa_hooks")}
+    sys.modules["pa"], sys.modules["pa_hooks"] = pa, w.pa_hooks
+    try:
+        spec = importlib.util.spec_from_file_location("pa_places_t120", os.path.join(w.TOOLS, "pa_places.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = v
+
+
+class T120Reopen(TaskBase):  # t-120 (t-097 J3 rebase RL-R1, R5): a reopened done task starts at the bottom of Queued
+    def order_ledger(self, state, task_order):
+        self.ledger({"version": 1, "taskOrder": task_order,
+                     "tasks": [{"id": "t-1", "title": "One", "state": state, "workers": [], "created": "2026-11-01T00:00:00Z"},
+                               {"id": "t-2", "title": "Two", "state": "queued", "workers": []}]})
+
+    def test_reopen_of_done_stamps_and_leaves_the_agent_order(self):
+        self.order_ledger("done", {"order": ["t-1", "t-2"], "chat": [{"task": "t-1", "quote": "now", "over": None},
+                                                                     {"task": "t-2", "quote": "too", "over": None}]})
+        self.ok("reopen", "t-1")
+        t = self.one()
+        self.assertEqual(t["state"], "queued")
+        self.assertEqual(t["reopened"], t["updated"])
+        self.assertEqual(self.ledger()["taskOrder"], {"order": ["t-2"], "chat": [{"task": "t-2", "quote": "too", "over": None}]})
+
+    def test_reopen_of_parked_keeps_its_place(self):  # R5: a parked task comes back where it was
+        self.order_ledger("parked", {"order": ["t-1", "t-2"], "chat": []})
+        self.ok("reopen", "t-1")
+        self.assertNotIn("reopened", self.one())
+        self.assertEqual(self.ledger()["taskOrder"], {"order": ["t-1", "t-2"], "chat": []})
+
+    def test_reopen_with_no_task_order_writes_none(self):
+        self.task("done")
+        self.ok("reopen", "t-1")
+        self.assertIn("reopened", self.one())
+        self.assertNotIn("taskOrder", self.ledger())
+
+    def test_the_ranking_puts_it_last(self):  # through pa_places with the file still naming it first
+        pa_places = places_tool()
+        path = os.path.join(self.dir, "task-order.json")
+        with open(path, "w") as f:
+            f.write(json.dumps({"version": 1, "updated": "2026-11-01T00:00:00Z", "by": "person", "order": ["t-1"], "last": []}))
+        self.order_ledger("done", {"order": ["t-1"], "chat": []})
+        self.ok("reopen", "t-1")
+        doc, _e, _w = pa_places.read_task_order(raw(path).decode())
+        got = pa_places.effective_tasks(self.ledger()["tasks"], self.ledger()["taskOrder"], doc)
+        self.assertEqual([r["id"] for r in got], ["t-2", "t-1"])
 
 
 if __name__ == "__main__":

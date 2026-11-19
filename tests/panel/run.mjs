@@ -6128,7 +6128,7 @@ const sample = (name) => JSON.parse(fs.readFileSync(path.join(here, "..", "sampl
 const tq = (id, state, n, extra = {}) => ({ id, title: `Task ${id}`, state, created: `2026-11-${String(n).padStart(2, "0")}T00:00:00Z`, ...extra });
 const tOrder = (order, last = [], updated = "U1") => JSON.stringify({ version: 1, updated, by: "person", order, last, moves: [] });
 // A world with the ledger's tasks (and its taskOrder), task-order.json's text (undefined: no file), open cards and the Tasks view open.
-async function orderWorld({ tasks, taskOrder, order, machine = null, cards = [], waiting, startOrder, queue, terms = [], unfold = [] } = {}) {
+async function orderWorld({ tasks, taskOrder, order, machine = null, cards = [], waiting, startOrder, queue, terms = [], unfold = [], hang = [], execHang = [] } = {}) {
   world({ machine, extraTerms: terms.map((a) => plTerm(machine ? `${machine}/${a}` : a)) });
   const dir = machine ? `${machine}:${RDIR}` : `:${DIR}`;
   g.__files[`${dir}/ledger.json`] = JSON.stringify({ tasks, ...(taskOrder !== undefined ? { taskOrder } : {}) });
@@ -6137,6 +6137,7 @@ async function orderWorld({ tasks, taskOrder, order, machine = null, cards = [],
   if (startOrder !== undefined) g.__files[`${dir}/start-order.json`] = startOrder;
   if (queue !== undefined) g.__files[`${dir}/queue.json`] = JSON.stringify(queue);
   if (cards.length) { g.__ls[`${dir}/decisions`] = cards.map((c) => `${c.id}.json`); for (const c of cards) g.__files[`${dir}/decisions/${c.id}.json`] = JSON.stringify({ question: "Q?", options: [{ label: "A" }], created: "2026-11-16T10:00:00Z", status: "open", ...c }); }
+  g.__hang = hang.map((f) => `${dir}/${f}`); g.__execHang = execHang; // t-120: reads that do not answer on the first load
   const v = await mount(); await settle();
   await click(v, "view-tasks"); await settle();
   for (const s of unfold) v.folded.delete(s);
@@ -6315,6 +6316,66 @@ cases["P97-13-shared-places"] = async () => { // R9, R10: the shared rank and pi
     const at = c.effective.map((id, i) => text.indexOf(`${i + 1}. ${label(id)} `));
     check(at.every((x) => x >= 0), `${c.name}: ${JSON.stringify(c.effective)} (got ${text.slice(text.indexOf("Waiting ·"), text.indexOf("Waiting ·") + 400)})`);
   }
+};
+
+// ---- t-120: t-097 J2's Recorded limits ----
+cases["P120-1-prune"] = async () => { // t-097 VERIFY J2 RL-1 (R4): a task-order write drops done and gone ids from order and last
+  const tasks = [tq("t-1", "queued", 1), tq("t-2", "queued", 2), tq("t-9", "done", 9)];
+  const { v, path } = await orderWorld({ tasks, order: tOrder(["t-9", "t-1", "t-77"], ["t-9", "t-77"]) });
+  await click(v, "tmove-up-t-2"); await settle();
+  const doc = JSON.parse(g.__files[path]);
+  check(JSON.stringify(doc.order) === '["t-2","t-1"]' && JSON.stringify(doc.last) === "[]", `pruned (got ${g.__files[path]})`);
+};
+
+cases["P120-2-next-fails"] = async () => { // t-097 VERIFY J2 RL-2 (R18): (b) failing after (a): the rank stays written, the row says why
+  const tasks = [tq("t-1", "in-progress", 1), tq("t-2", "queued", 2), tq("t-3", "queued", 3)];
+  const { v, path } = await orderWorld({ tasks });
+  g.__execFn = (c, a) => (c === "pa-task" && a[0] === "next" ? { code: 1, stdout: "", stderr: "pa-task: t-3 is waiting on decision d-9." } : undefined);
+  await click(v, "task-head-t-3");
+  await click(v, "next-t-3"); await settle();
+  g.__execFn = null;
+  check(paTask("next").length === 1, `pa-task next ran once (got ${JSON.stringify(g.__execs)})`);
+  check(JSON.stringify(JSON.parse(g.__files[path]).order) === '["t-3"]', `the rank stays (got ${g.__files[path]})`);
+  check(look(v).text.includes("pa-task: t-3 is waiting on decision d-9."), `the row shows the error (got ${look(v).text})`);
+};
+
+cases["P120-3-places-rank-unknown"] = async () => { // t-097 REVIEW J2 RL-2 (R9): no Places move while the task order is not known
+  const tasks = [tq("t-1", "queued", 1), tq("t-2", "queued", 2)];
+  const waiting = { version: 1, jobs: [P83.job("t-2/build", "working"), P83.job("t-1/build", "working")] };
+  const { v } = await orderWorld({ tasks, waiting, order: tOrder(["t-1"]), hang: ["task-order.json"] });
+  await step(11000); await step(11000);
+  let { text, clicks } = look(v);
+  check(text.includes("Waiting · 2"), `the waiting list is drawn (got ${text.slice(0, 900)})`);
+  check(!Object.keys(clicks).some((k) => k.startsWith("place-")), `no Places moves (have ${Object.keys(clicks).filter((k) => k.startsWith("place-"))})`);
+  check(text.includes("moves wait for the task order to be read"), `the line says why (got ${text.slice(0, 1200)})`);
+  g.__hang = [];
+  advance(3000); v.reload(cx); await settle(); await step(1000);
+  ({ text, clicks } = look(v));
+  check(Boolean(clicks["place-down-t-1/build"]) && text.indexOf("1. t-1 build") >= 0, `read: by rank, the moves back (got ${text.slice(0, 900)})`);
+};
+
+cases["P120-4-cards-not-read"] = async () => { // t-097 REVIEW J2 RL-3 (R17): no Park or Mark done on a needs-decision task until its cards are read
+  const tasks = [tq("t-1", "needs-decision", 1), tq("t-2", "queued", 2)];
+  const { v } = await orderWorld({ tasks, cards: [{ id: "d-231", task: "t-1" }], execHang: [":batch"], hang: ["decisions/d-231.json"] });
+  await click(v, "task-head-t-1"); await click(v, "task-head-t-2");
+  let { text, clicks } = look(v);
+  check(v.cardsFor !== S, "the cards are not read yet");
+  check(!clicks["done-t-1"] && !clicks["park-t-1"] && Boolean(clicks["delete-t-1"]), `no move out yet, Delete stays (have ${Object.keys(clicks)})`);
+  check(text.includes("Checking for open decisions…"), `the line (got ${text})`);
+  check(Boolean(clicks["done-t-2"]) && Boolean(clicks["park-t-2"]), "a queued task is not held back");
+  g.__execHang = []; g.__hang = [];
+  advance(3000); v.reload(cx); await settle(); await step(1000);
+  ({ text, clicks } = look(v));
+  check(v.cardsFor === S && text.includes("Answer d-231 first") && !clicks["done-t-1"] && !text.includes("Checking for open decisions…"), `read: as P97-9 (got ${text})`);
+};
+
+cases["P120-5-reopened"] = async () => { // t-097 VERIFY J3 rebase RL-R1 (R5): a reopened done task starts at the bottom of Queued and a move does not bring it back
+  const tasks = [tq("t-1", "queued", 1, { reopened: "2026-11-19T10:00:00Z" }), tq("t-2", "queued", 2), tq("t-3", "queued", 3), tq("t-4", "queued", 4)];
+  const { v, path } = await orderWorld({ tasks, order: tOrder(["t-1", "t-2"], [], "2026-11-19T09:00:00Z") });
+  check(JSON.stringify(heads(v)) === '["t-2","t-3","t-4","t-1"]', `at the bottom (got ${JSON.stringify(heads(v))})`);
+  await click(v, "tmove-down-t-2"); await settle();
+  check(!JSON.parse(g.__files[path]).order.includes("t-1"), `its old place is not written back (got ${g.__files[path]})`);
+  check(JSON.stringify(heads(v)) === '["t-3","t-2","t-4","t-1"]', `still at the bottom (got ${JSON.stringify(heads(v))})`);
 };
 
 // ---- t-041 J5: the context line (R15), the Fresh context button (R6), the mode switch (R13), the reset line (C6) ----
