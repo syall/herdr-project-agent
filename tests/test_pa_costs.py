@@ -3207,6 +3207,20 @@ class SL_Cache(CCBase):
         for n in names:
             self.assertEqual(os.stat(os.path.join(self.cache(), n)).st_mode & 0o077, 0)
 
+    def test_sc1c_a_group_writable_umask_still_caches(self):
+        # umask 002 (user-private-group logins): cache/ and pycache/ are both made 0700, so the cache is used
+        shutil.rmtree(os.path.dirname(self.cache()), ignore_errors=True)
+        old = os.umask(0o002)
+        try:
+            for _ in range(2):
+                self.assertEqual(self.run_launcher(tools_copy("sc1c-tools")), (0, b"STATUS-LINE ok", b""))
+        finally:
+            os.umask(old)
+        names = sorted(os.listdir(self.cache()))
+        self.assertEqual(len(names), 2, names)
+        for f in (self.cache(), os.path.dirname(self.cache())):
+            self.assertEqual(os.stat(f).st_mode & 0o777, 0o700, f)
+
     def test_sc1b_other_arguments_and_a_broken_tool(self):
         tools = tools_copy("sc1b-tools")
         code, out, err = self.run_launcher(tools, tail=["collect"])
@@ -3312,7 +3326,8 @@ class SL_Cache(CCBase):
 
     def test_sc6_the_launcher_is_small_stdlib_only_and_parses_as_3_7(self):
         import ast
-        src = open(os.path.join(TOOLS, "pa_statusline.py")).read()
+        with open(os.path.join(TOOLS, "pa_statusline.py")) as f:
+            src = f.read()
         tree = ast.parse(src, feature_version=(3, 7))
         names = set()
         for node in ast.walk(tree):
