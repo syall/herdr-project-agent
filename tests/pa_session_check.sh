@@ -6,7 +6,8 @@
 # Three parts (t-112): run-all.sh runs `--part 1`, `--part 2` and `--part 3` at once, each against its own scratch
 # folder and its own private hc core (session pa-t001-p<k>-<pid>). part_table below puts every step in exactly one
 # part; the per-core controls S9 and R run last in every part, and the gate first. Each step is a function step_<name>
-# (today's code, moved). Part 3's S13 starts from the state S8 leaves (s8_state, which S8 calls too). Without --part,
+# (today's code, moved). A step whose start state another part's step makes today starts from it through the same
+# helper (replays: S13 from S8's s8_state, S12 from S11's s11_folders). Without --part,
 # every step runs in today's order (steps_all) in one core (session pa-t001-<pid>): for debugging and for
 # failing-first runs. The first output line names the part and its steps. Any other argument, or a scratch that is
 # not under /tmp, /private/tmp or /var/folders as given and once resolved (pwd -P), is refused (exit 2) before
@@ -133,8 +134,12 @@ answer13() { # terminal outfile: wait for the question, type yes, wait for the e
   scratch hc send "$1" yes >/dev/null 2>&1
   wait_for 120 grep -q "^rc=" "$2"
 }
-# The state S8 leaves for the steps after it (t-112 R3): S8 calls it, and a part that runs S13 without S8
-# calls it before S13, so the two cannot drift.
+# The state a step leaves for later steps in another part (t-112 R3): <step>:<the step that makes it>:<helper>. The
+# maker calls the helper, and a part that runs <step> without the maker calls it first, so the two cannot drift.
+replays="S12:S11:s11_folders S13:S8:s8_state"
+s11_folders() {
+mkdir -p "$S/proj11" "$S/proj12"  # own project folders: a finished space's folder is adopted by project (find_orphan)
+}
 s8_state() {
   echo "MARKER-T037-$$" >> "$S/pa/core/orchestrator.md"
   printf '{"name":"test","claude":["%s/bin/stub-claude"],"codex":["true"],"systemPromptSnapshot":"off"}\n' "$S" > "$S/pa/profiles/test/profile.json"
@@ -333,7 +338,7 @@ step_S11() {
 SP11=sp1111111111111111111111111111dddd
 L11="$S/pa/spaces/$SP11/launcher.json"
 cp "$S/pa/tools/pa.py" "$S/pa.py.good"
-mkdir -p "$S/proj11" "$S/proj12"  # own project folders: a finished space's folder is adopted by project (find_orphan)
+s11_folders
 before=$(lines)
 start n11 "$SP11" "$S/proj11"
 if wait_for 15 has_lines $((before + 1)); then
@@ -638,14 +643,15 @@ cleanup() {
 trap cleanup EXIT
 
 # The steps of this run, in order (t-112).
-ran_S8=
+ran=" "
 for step in $steps; do
-  if [ "$step" = S13 ] && [ -z "$ran_S8" ]; then
-    s8_state
-    echo "S13 starts from S8's state (t-112 R3): the marker line, the snapshot-off profile, stamped"
-  fi
+  for r in $replays; do
+    [ "${r%%:*}" = "$step" ] || continue
+    from=${r#*:}; from=${from%%:*}
+    case "$ran" in *" $from "*) ;; *) "${r##*:}"; echo "$step starts from $from's state (t-112 R3: ${r##*:})" ;; esac
+  done
   "step_$step"
-  [ "$step" = S8 ] && ran_S8=1
+  ran="$ran$step "
 done
 
 [ "$fails" = 0 ] && echo "all pa-session checks passed" || echo "$fails pa-session check(s) failed"
