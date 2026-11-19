@@ -5541,7 +5541,7 @@ cases["Q55-2-entries"] = async () => { // R2: entries in merge order, state, sta
 
 cases["Q55-3-restack"] = async () => { // R2: an onto that is not the entry ahead; invalidated waits for a restack; a failed suite
   const v = await queueWorld(qDoc({ [QA]: qRepo([
-    qEntry("t-A"),
+    qEntry("t-A", { suite: { exit: 0, ended: "2026-11-18T10:04:00Z", worker: "t44" } }),
     qEntry("t-B", { onto: "t-gone-b", state: "invalidated" }),
     qEntry("t-C", { onto: "t-B-b", state: "failed", suite: { exit: 1, ended: "2026-11-18T10:09:00Z", worker: "t43" } }),
   ]) }));

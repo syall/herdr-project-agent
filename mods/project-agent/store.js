@@ -116,6 +116,20 @@ export async function loadCosts(space, cx, live = () => true) {
   return { summary: null, error: null, timedOut: false, missing: names.includes("sessions.jsonl") ? "pending" : "none" };
 }
 
+// The Queue view (queue.js, t-055): the space's queue.json as pa-queue last wrote it (t-052; pa-queue is its only
+// writer). One keyed, capped read. { doc, error, missing }: missing when there is no file; error (doc null) when it is
+// not JSON, has no "repos" object, or is not version 1. A give-up returns TIMED_OUT (never "missing").
+export async function loadQueue(space, cx) {
+  const r = await readJson(`${stateDir(space)}/queue.json`, space.machine ?? null, cx);
+  if (r.timedOut) return TIMED_OUT;
+  if (r.text === null) return { doc: null, error: null, missing: true };
+  if (r.error) return { doc: null, error: `queue.json is not valid JSON: ${r.error}`, missing: false };
+  const v = r.value;
+  if (!v || typeof v !== "object" || Array.isArray(v) || !v.repos || typeof v.repos !== "object" || Array.isArray(v.repos)) return { doc: null, error: 'queue.json needs a "repos" object', missing: false };
+  if (v.version !== 1) return { doc: null, error: `queue.json is version ${JSON.stringify(v.version ?? null)}; this panel reads version 1`, missing: false };
+  return { doc: v, error: null, missing: false };
+}
+
 // The space's ledger alone ({ value, text, error, timedOut? }), for the hidden panel's refresh.
 export const loadLedger = (space, cx) => readJson(`${stateDir(space)}/ledger.json`, space.machine, cx);
 

@@ -14,8 +14,9 @@ import { View, div } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, ScrollHandle } from "gpui-base";
 import { spaces, panes, agents, terminals, machines, theme, run, props, home, notify, shared, setShared, closeOverlay, openOverlay, window, layout } from "herdr";
 import { Host, gaveUp, read as hostRead, run as hostRun, watch, refusalLine } from "./host.js";
-import { loadSpace, loadLedger, loadProfile, loadDecisions, loadRules, TIMED_OUT, READ_LIMIT, answerDecision, notifyOrchestrator, changeRules, touched, localId, paHome, stateDir, taskActions, taskLinks, evidenceTasks, cardEvidence, staleInstructions, liveTarget, lookAlike, OPEN_REQUESTS, keeperJudging, startingLabels, OTHER, OTHER_MAX, OTHER_TOO_LONG, isOther, oneLine, codeState, codeBadge, loadCode, restartArgs, runRestart, restartOutcome, endTerminalLine, RESTART_MARK, RESTART_MARK_TTL, RESTARTED_FOR, RESTART_TIMEOUT, DRY_TIMEOUT } from "./store.js";
+import { loadSpace, loadLedger, loadQueue, loadProfile, loadDecisions, loadRules, TIMED_OUT, READ_LIMIT, answerDecision, notifyOrchestrator, changeRules, touched, localId, paHome, stateDir, taskActions, taskLinks, evidenceTasks, cardEvidence, staleInstructions, liveTarget, lookAlike, OPEN_REQUESTS, keeperJudging, startingLabels, OTHER, OTHER_MAX, OTHER_TOO_LONG, isOther, oneLine, codeState, codeBadge, loadCode, restartArgs, runRestart, restartOutcome, endTerminalLine, RESTART_MARK, RESTART_MARK_TTL, RESTARTED_FOR, RESTART_TIMEOUT, DRY_TIMEOUT } from "./store.js";
 import { RulesPane, arm, armHolds, fieldState } from "./rules.js"; // arm, armHolds: the two-click Delete (ARM_WAIT, 10 s)
+import { queueRows, queueLabel, renderQueue } from "./queue.js"; // t-055: the Queue view (read only)
 import { SetupPane } from "./setup.js";
 import { Keeper, idleShell } from "./keeper.js";
 import { WorkerPane } from "./worker.js";
@@ -40,7 +41,7 @@ const COALESCE = 2000; // t-053: a background trigger (timer, watch) starts at m
 const BG = Object.freeze({ background: true });
 // t-053: the watch batch paths, under the shown local space's folder, that the panel shows (a heartbeat, a log, the lock,
 // the session log, the cost records and other spaces' folders reload nothing; the root itself: everything).
-const SHOWN_PATH = /^(agent\.json|launcher\.json|ledger\.json|schedule\.json|pass-request\.json|rules\.json|decisions(\/[^/]+)?|evidence(\/[^/]+(\/(?!build\.log$)[^/]+)?)?|costs\/summary\.json)$/;
+const SHOWN_PATH = /^(agent\.json|launcher\.json|ledger\.json|schedule\.json|pass-request\.json|rules\.json|queue\.json|decisions(\/[^/]+)?|evidence(\/[^/]+(\/(?!build\.log$)[^/]+)?)?|costs\/summary\.json)$/;
 // A part of loadSpace's result that did not answer (its `unknown`), and the fields it fills.
 const PARTS = { ledger: ["ledger"], profile: ["profile", "profileDir"], schedule: ["schedule"], request: ["request"] };
 const NOTE = "Note for the Project Agent (optional)";
@@ -124,7 +125,7 @@ export default class ProjectAgent extends View {
     this.again = {}; // space id -> a reload came while its load was in flight: one more when it ends (if the space is still shown)
     this.profiles = {}; // space id -> { at, busy, done, profile }: its profile, read once per session (a full load's counts)
     this.asleep = false; // not on screen: only the open-card count is read
-    this.view = null; // "decisions" | "tasks" | "rules" | "costs"; null: decisions when any is open
+    this.view = null; // "decisions" | "tasks" | "queue" | "rules" | "costs"; null: decisions when any is open
     this.viewShown = null; // the view the last render drew (this.view, or the one picked for null)
     this.rules = new RulesPane((options) => this.field(options));
     this.rules.host = this.host;
@@ -388,7 +389,7 @@ export default class ProjectAgent extends View {
         }
         if (data.agent && current() && shown()) { // first paint: the header and the tasks
           const same = this.space === space.id;
-          this.data = { ...data, evidence: same ? this.data?.evidence : undefined, stale: same ? this.data?.stale : undefined, code: same ? this.data?.code : undefined };
+          this.data = { ...data, evidence: same ? this.data?.evidence : undefined, stale: same ? this.data?.stale : undefined, code: same ? this.data?.code : undefined, queue: same ? this.data?.queue : undefined };
           if (this.cardsFor !== space.id) { this.cards = []; this.cardsFor = null; this.rules.data = null; }
           if (!same) this.dataAt = Date.now();
           this.space = space.id;
@@ -398,15 +399,16 @@ export default class ProjectAgent extends View {
           // A read that times out or fails keeps the last known value: the kept load's, else what is shown for the space.
           const cap = (p, fallback) => p.then((v) => (gaveUp(v) ? fallback() : v), () => fallback()); // each read capped in the store
           const known = [...(kept && !kept.cardsUnknown ? kept.cards : []), ...(this.space === space.id && this.cardsFor === space.id ? this.cards : [])];
-          let evidence, stale, code;
-          [cards, rules, evidence, stale, code] = await Promise.all([
+          let evidence, stale, code, queue;
+          [cards, rules, evidence, stale, code, queue] = await Promise.all([
             loadDecisions(space, { cx: rcx, live: current, known, out: cardsOut }),
             cap(loadRules(space, rcx), () => kept?.rules ?? (this.space === space.id && this.cardsFor === space.id ? this.rules.data : null) ?? null), // null: the Rules view says Loading…
             cap(evidenceTasks(space, rcx), () => kept?.data?.evidence ?? shownNow()?.evidence), // undefined: unknown
             cap(staleInstructions(space, data.agent.profile, rcx), () => kept?.data?.stale ?? shownNow()?.stale ?? []),
             cap(loadCode(space, rcx), () => kept?.data?.code ?? shownNow()?.code ?? null), // t-037 J4: launcher.json + installed.json
+            cap(loadQueue(space, rcx), () => kept?.data?.queue ?? shownNow()?.queue ?? null), // t-055: queue.json; a give-up keeps the last known (null: "Loading queue…")
           ]);
-          data.evidence = evidence; data.stale = stale; data.code = code;
+          data.evidence = evidence; data.stale = stale; data.code = code; data.queue = queue;
         }
       }
       catch (e) { data = { agent: null, errors: [String(e.message ?? e)], failed: true }; } // a read in the first round threw
@@ -1297,6 +1299,7 @@ export default class ProjectAgent extends View {
       if (state) this.folded.delete(state);
     }
     const view = this.view ?? (listed.length || !tasks.length ? "decisions" : "tasks");
+    const queue = queueRows(data.queue, data.ledger, this.cardsFor === space.id ? this.cards : []); // t-055: drawn only from what the load read
     this.viewShown = view;
     const tab = (id, label) => div().id(`view-${id}`).px(9).h(24).flex().items_center().rounded(6).text_size(12).cursor_pointer()
       .bg(view === id ? t.selected : t.chrome).text_color(view === id ? t.foreground : t.muted).hover((s) => s.bg(t.hover))
@@ -1334,6 +1337,7 @@ export default class ProjectAgent extends View {
       .child(h_flex().px(8).py(6).gap(4).flex_none().border_b(1).border_color(t.border)
         .child(tab("decisions", openCards.length ? `Decisions · ${openCards.length}` : "Decisions"))
         .child(tab("tasks", `Tasks · ${tasks.length}`))
+        .child(tab("queue", queueLabel(queue)))
         .child(tab("rules", this.rules.data?.error ? "Rules · !" : `Rules · ${(this.rules.data?.rules ?? []).filter((r) => r.status === "active").length}`))
         .child(tab("costs", this.costs.tabLabel(space.id))))
       .children((data.errors ?? []).map((e) => div().px(12).py(6).text_size(11.5).text_color(t.blocked).child(e)))
@@ -1356,6 +1360,7 @@ export default class ProjectAgent extends View {
             ...(folded ? [] : s.tasks.map((task) => this.task(t, task, space))),
           ];
         }))))
+      .when(view === "queue", (el) => el.child(renderQueue(t, queue)))
       .when(view === "costs", (el) => el.child(this.costs.render(t, space, (shared("project-agent.costs") ?? {})[space.id] ?? null)))
       .when(view === "rules", (el) => el.child(this.rules.render(t, space, (id, what, cx) => this.ruleDecided(space, id, what, cx))))
       .when(view === "decisions", (el) => el.child(v_flex().id("pa-decisions").flex_1().min_h(0).p(8).gap(8).overflow_y_scrollbar().track_scroll(this.cardScroll)

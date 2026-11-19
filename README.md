@@ -382,7 +382,12 @@ The account label of estimates and of billed rows is the same chain: on a machin
 before), so `billed compare` sets this space's estimates beside the bill of that account, and
 `--account-wide` finds them under that label. Set `costs.account` in the machine config to choose it.
 
-**The Costs view** (Project panel, fourth tab) reads only `costs/summary.json` on the space's machine,
+**The Queue view** (Project panel, third tab) shows each repository's merge queue from `queue.json` as
+`pa-queue` last wrote it, read only: the entries in merge order with their state, the branch each is
+stacked on, what each waits for and its approval, then the entries that left (why, the fix round they
+went to) and the last merges; `pa-queue show` reads each state now.
+
+**The Costs view** (Project panel, fifth tab) reads only `costs/summary.json` on the space's machine,
 only while it is shown, at most every 10 s. It shows Total, Today and Last 7 days, then the spend by
 activity, task, session type and day, each with its drill-down, and `Refresh` (runs `pa-costs
 collect`). Nothing in it writes anything except those two buttons and `Turn off` below.

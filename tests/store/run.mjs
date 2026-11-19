@@ -833,6 +833,8 @@ cases["S55-load-queue-hung"] = async () => { // a hung read gives up as TIMED_OU
 
 cases["S55-queue-rows"] = async () => { // queueRows: the waiting and approval rules, without rendering
   check(typeof queueMod?.queueRows === "function", "queue.js exports queueRows");
+  const zoneMod = await import(path.join(dst, "zone.js"));
+  zoneMod.zone.offsetAt = () => 0; // UTC, never the machine's zone (as the panel harness)
   const e = (task, x = {}) => ({ task, job: null, branch: `${task}-b`, onto: "main", state: "checking", tip: "b".repeat(40), needs: null, suite: null, review: null, approval: null, ...x });
   const doc = { version: 1, repos: { "/w/p": { main: "main", entries: [
     e("t-A", { suite: { exit: 0, ended: "2026-11-18T10:05:00Z", worker: "t40" } }),
