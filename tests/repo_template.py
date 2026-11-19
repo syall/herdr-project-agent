@@ -4,8 +4,8 @@ A fixture that made the same repository with git in every setUp (init, config, a
 process as a template, under its own temp folder, and copies it into each test's folder with shutil.copytree: no
 process start. Each test still owns its copy alone (objects, refs, index, config); the template is never handed to a
 test and never written after it is built. A layout whose files name absolute paths (a remote url, linked worktrees)
-is fixed by its fixture after the copy; references() lists what still names the template, and the fixtures assert
-it is empty.
+is pointed at the copy by relink(); references() lists what still names the template, and the fixtures assert it is
+empty.
 """
 import os
 import shutil
@@ -38,15 +38,32 @@ def template(base, key):
     return os.path.join(base, "templates", key)
 
 
-def references(dest, old):
-    """The git files under dest whose text still names the folder old (a copy must name only itself)."""
-    found = []
+def _path_files(dest):
     for top, dirs, names in os.walk(dest):
         dirs[:] = [d for d in dirs if d != "objects"]
         for n in names:
             p = os.path.join(top, n)
             if n in _PATH_FILES or (n == ".git" and os.path.isfile(p)):
-                with open(p, errors="replace") as f:
-                    if old in f.read():
-                        found.append(p)
+                yield p
+
+
+def relink(dest, old):
+    """Point the git files under dest that name a path inside old (the template: a remote url, a worktree's .git file
+    and its gitdir) at the same path inside dest. A plain text rewrite, the same on every git version (git 2.47's
+    `worktree repair` keeps links that still name a valid worktree, the template's own)."""
+    for p in _path_files(dest):
+        with open(p, errors="surrogateescape") as f:
+            text = f.read()
+        if old + os.sep in text:
+            with open(p, "w", errors="surrogateescape") as f:
+                f.write(text.replace(old + os.sep, dest + os.sep))
+
+
+def references(dest, old):
+    """The git files under dest whose text still names the folder old (a copy must name only itself)."""
+    found = []
+    for p in _path_files(dest):
+        with open(p, errors="replace") as f:
+            if old in f.read():
+                found.append(p)
     return found

@@ -176,11 +176,12 @@ class Repo(unittest.TestCase):
         self.wt = os.path.join(self.tmp, "wt")
         self.url = "file://" + self.origin
         self.assertTrue(self.url.startswith("file://" + TMP))
-        # t-095: origin.git, main and wt are built once (build_repos) and copied into this test's folder; then main
-        # gets this test's remote url and the worktree links are repaired, and nothing may still name the template.
+        # t-095: origin.git, main and wt are built once (build_repos) and copied into this test's folder; then the
+        # paths git wrote (main's remote url, the worktree links) are pointed at this copy, and nothing may still name
+        # the template. Not `git worktree repair`: git 2.47 leaves links that still name a valid worktree (the
+        # template's) as they are.
         repo_template.copy(TMP, "repos", self.tmp, build_repos)
-        sh(self.main, "git", "config", "remote.origin.url", self.url)
-        sh(self.main, "git", "worktree", "repair", self.wt)
+        repo_template.relink(self.tmp, repo_template.template(TMP, "repos"))
         self.assertEqual([], repo_template.references(self.tmp, repo_template.template(TMP, "repos")))
         self.dir = os.path.join(pa.ROOT, "spaces", SPACE)
         dump({"space": SPACE, "terminal": "t0", "terminals": ["t0"], "profile": "test", "name": "S"}, os.path.join(self.dir, "agent.json"))
