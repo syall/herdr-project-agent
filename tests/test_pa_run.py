@@ -91,7 +91,8 @@ class Run(tpr.Remote):
         sh(self.wt, "git", "add", "-A")
         sh(self.wt, "git", "commit", "-q", "-m", "probe")
         self.keep = os.path.join(self.tmp, "kept")
-        self.setenv(STUB_HC_KEEP=self.keep, PA_SUITE_WAIT_LIMIT=None)
+        self.setenv(STUB_HC_KEEP=self.keep, PA_SUITE_WAIT_LIMIT=None,
+                    PA_SUITE_REMOTE=None)  # the suite itself run on a machine has it set; a local run here must not
 
     def pa_run(self, *args):
         out, err = io.StringIO(), io.StringIO()
