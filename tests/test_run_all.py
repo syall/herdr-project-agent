@@ -1083,6 +1083,67 @@ class PartTable(unittest.TestCase):
         self.assertNotIn('echo "MARKER-T037', body)  # the marker is written by s8_state only
 
 
+def function_bodies(text):
+    """name -> body of every top-level shell function `name() {` ... `}` in the text."""
+    return dict(re.findall(r"^([A-Za-z0-9_]+)\(\) \{\n(.*?)^\}$", text, re.M | re.S))
+
+
+def folder_problems(text):
+    """t-112 R3: a part makes every project folder ($S/proj*) its steps use: setup-scratch.sh makes $S/proj, a step
+    of the part makes one, or a replay (replays="<step>:<the step that makes it today>:<helper>") runs before a
+    step whose maker is in another part."""
+    problems = []
+    fns = function_bodies(text)
+    m = re.search(r"^part_table='\n(.*?)^'$", text, re.M | re.S)
+    parts = {l.split(":", 1)[0].strip(): l.split(":", 1)[1].split() for l in m.group(1).splitlines() if l.strip()}
+    rm = re.search(r"^replays=\"([^\"]*)\"$", text, re.M)
+    if not rm:
+        return ["no replays=\"...\" line"]
+    replays = [r.split(":") for r in rm.group(1).split()]
+    for r in replays:
+        if len(r) != 3 or r[2] not in fns or "step_" + r[0] not in fns or "step_" + r[1] not in fns:
+            problems.append("replay {} names a missing step or helper".format(r))
+        elif r[2] not in fns["step_" + r[1]]:
+            problems.append("replay {}: step_{} does not call {}".format(r, r[1], r[2]))
+
+    def made(body):
+        return {f for line in body.splitlines() if line.strip().startswith("mkdir ")
+                for f in re.findall(r'"\$S/(proj[A-Za-z0-9]*)"', line)}
+
+    def used(body):
+        return set(re.findall(r'"\$S/(proj[A-Za-z0-9]*)"', body))
+
+    for k, steps in sorted(parts.items()):
+        have = {"proj"}
+        for s in steps:
+            for step, src, helper in [r for r in replays if len(r) == 3]:
+                if step == s and src not in steps and helper in fns:
+                    have |= made(fns[helper])
+            body = fns.get("step_" + s, "")
+            for name in re.findall(r"^\s*([a-z0-9_]+)\s*$", body, re.M):  # a helper the step calls on its own line
+                if name in fns:
+                    have |= made(fns[name])
+            have |= made(body)
+            missing = used(body) - have
+            if missing:
+                problems.append("part {}: {} uses {} that no step before it in the part makes".format(k, s, sorted(missing)))
+    return problems
+
+
+class PartState(unittest.TestCase):
+    def setUp(self):
+        with open(CHECK_SCRIPT) as f:
+            self.text = f.read()
+
+    def test_t4_each_part_makes_the_project_folders_its_steps_use(self):
+        # The cloud run of c3523e1: part 1's S12 found no $S/proj12 (S11, in part 2, made it): "no launcher.json".
+        self.assertEqual(folder_problems(self.text), [])
+        m = re.search(r'^replays="([^"]*)"$', self.text, re.M)
+        self.assertEqual(sorted(m.group(1).split()), ["S12:S11:s11_folders", "S13:S8:s8_state"])
+        no_replay = self.text.replace(m.group(0), 'replays="S13:S8:s8_state"')
+        self.assertTrue([p for p in folder_problems(no_replay) if "S12" in p and "proj12" in p], folder_problems(no_replay))
+
+
 class CheckArgs(unittest.TestCase):
     """The real pa_session_check.sh with a scratch that has the two files it looks for, an hc first on PATH that
     only records its calls (and fails, so a run that gets past the arguments stops at the gate: SKIP)."""
