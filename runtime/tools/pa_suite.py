@@ -1174,6 +1174,7 @@ def ship(h, machine, run, pin, tools, root):
         "mkdir -m 700 bin home tmp xdg npm u",
         "printf '%s\\n' '#!{}' 'echo \"hc is not available in a remote suite run\" >&2' 'exit 2' > bin/hc".format(sh_path),
         "chmod 755 bin/hc",
+    ] + ["ln -s {} bin/{}".format(tools[t]["path"], t) for t in TOOLS] + [
         "{} -C w rev-parse HEAD 'HEAD^{{tree}}'".format(git), ""])
     code, out, err = hc(["exec", "--on", machine, "--timeout", "300", "--", "sh", "-c", script], timeout=360)
     if code:
@@ -1185,19 +1186,16 @@ def ship(h, machine, run, pin, tools, root):
 
 
 def run_script(folder, tools):
-    """R10, R11: the remote terminal's fixed script."""
-    dirs = []
-    for t in TOOLS:
-        d = os.path.dirname(tools[t]["path"])
-        if d not in dirs:
-            dirs.append(d)
+    """R10, R11: the remote terminal's fixed script. {folder}/bin holds hc's refusing shim and a link to each probed
+    tool (made at setup), and only it goes ahead of the machine's PATH: a probed tool's folder is never put first, so
+    another tool in it (an older python3 beside git) cannot shadow the probed one, and the record names what ran."""
     return "\n".join([
         "date +%s > ../t0",
         "unset HC_TERMINAL_ID HC_SOCKET HC_TERMINAL_SOCKET HC_SCOPE CLAUDECODE",
         "export HERDR_PA_HOME={0}/home TMPDIR={0}/tmp XDG_CACHE_HOME={0}/xdg/cache XDG_CONFIG_HOME={0}/xdg/config "
         "XDG_DATA_HOME={0}/xdg/data XDG_STATE_HOME={0}/xdg/state PYTHONDONTWRITEBYTECODE=1 npm_config_cache={0}/npm "
         "PA_CHANGED_FILES= NODE={1} HOME={0}/u".format(folder, tools["node"]["path"]),
-        "export PATH={}/bin:{}:$PATH".format(folder, ":".join(dirs)),
+        "export PATH={}/bin:$PATH".format(folder),
         "sh tests/run-all.sh --except-integration > ../out 2>&1",
         "echo $? > ../code.new && mv ../code.new ../code",
         "date +%s > ../t1", ""])
