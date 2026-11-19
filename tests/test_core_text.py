@@ -1019,5 +1019,103 @@ class T046OtherAnswer(unittest.TestCase):  # t-046 R11 AC1, AC2 (spec section 4,
                 self.assertNotIn(words, text, name)
 
 
+# t-083 J3 (R4, R10, R12; J1's RL1): worker places, the waiting list, the person's start order, the hold key
+T083_R10 = ("The person's order never answers a card, approves a rule, lifts a hold, raises a limit, clears a "
+            "`blockedBy`, or starts a job that is not ready. It only says which ready job goes first.")
+
+
+class T083Places(unittest.TestCase):
+    def setUp(self):
+        self.raw = read("runtime", "core", "orchestrator.md")
+        self.text = flat(self.raw)
+        self.passes = part(self.raw, "## The pass", "## After a restart or a compaction")
+        self.restart = part(self.raw, "## After a restart or a compaction", "## What must be on disk")
+        self.files = part(self.raw, "## Files", "## Decision cards")
+        self.rules = part(self.raw, "## Rules", "## Workers")
+        self.workers = part(self.raw, "## Workers", "## Phases and gates")
+
+    def test_r10_order_decides_nothing_else(self):  # AC10.1, verbatim
+        self.assertIn(T083_R10, self.workers)
+
+    def test_pass_step_names_the_waiting_list(self):
+        self.assertIn("start a worker (through the waiting list, see Workers)", self.passes)
+
+    def test_old_limit_sentence_gone(self):
+        self.assertNotIn("At most 4 workers working at once", self.text)
+        # the pinned sentences next to it stay
+        self.assertIn("never more than the person can review", self.workers)
+        self.assertIn("A worker that has reported, but whose report you have not read yet, does not count; close it "
+                      "once read.", self.workers)
+
+    def test_kinds_and_commands(self):  # R5, R7 text side; OQ-J3-2, OQ-J3-3 (d-205)
+        for words in ("`working` (a job that runs tests: build, fix, verifier, check)",
+                      "`no-test` (a job that runs none: design, plan-only, reviewer, docs-only, a watch)",
+                      "`suite` (a job whose work includes the full-suite step: verifier, check, and a high-tier build "
+                      "or fix)",
+                      "`pa-places add <task> --job <job> --kind <kind> --role <role>`",
+                      "`--source queue` for a merge-queue entry's check",
+                      "`--blocked-by \"<line>\"`",
+                      "run `pa-places next`",
+                      "`pa-places start <id> --worker <addr>`",
+                      "A job whose kind is full is skipped, never waited on.",
+                      "Start nothing `pa-places next` does not mark `start`",
+                      "a second try (`-2`) included",
+                      "A follow-up to a running worker for its own job takes no new place.",
+                      "A `start order changed` notice is a message: run the pass as usual."):
+            self.assertIn(words, self.workers)
+
+    def test_r4_place_recorded(self):  # AC4.1
+        self.assertIn("record the `place` it prints in the worker's ledger entry", self.workers)
+        self.assertIn("`place` is the kind of place the worker was started for (`working`, `no-test` or `suite`), as "
+                      "`pa-places start` prints it; write it in the same ledger write that records the worker.",
+                      self.files)
+        self.assertIn('"place": "working", "finished": true', self.files)
+
+    def test_files_and_their_writers(self):  # R5, R6, AC5.4 text side
+        self.assertIn("`waiting.json` is written only by `pa-places`, never by hand.", self.files)
+        self.assertIn("`start-order.json` is the person's: the panel writes it; read it through `pa-places`, never "
+                      "write it.", self.files)
+
+    def test_rl1_hold_key(self):  # J1 RL1, J1-D1; OQ-J3-1 (d-205)
+        self.assertIn('A hold or resume line adds `"hold": "on"` (a hold) or `"hold": "off"` (a resume), with the '
+                      "person's words in `why`", self.files)
+        self.assertIn('"hold":"on"', self.files)
+        self.assertIn("`pa-places` reads that key alone: a hold journalled without it does not stop `pa-places next`.",
+                      self.files)
+        self.assertIn("If `standing.md` `# Hold` names a hold in force and the journal's last hold line has no `hold` "
+                      'key, append one with `"hold": "on"` quoting it before you run `pa-places next`.', self.files)
+        self.assertIn("Give each hold or resume line the `hold` key (see Files).", self.restart)
+        # the pinned hold sentence is unchanged and the pointer follows the pinned run
+        self.assertLess(self.restart.index("it is not a hold."), self.restart.index("Give each hold or resume line"))
+
+    def test_rules_carry_the_limits(self):  # R2, R3 text side
+        self.assertIn('A rule may carry the space\'s worker places: `"places": {"working": 4, "no-test": 1, '
+                      '"suite": 2}`.', self.rules)
+        self.assertIn("To change a limit, propose a rule; nothing else raises or lowers one.", self.rules)
+
+    def test_sdlc_practice(self):
+        sdlc = flat(read("runtime", "core", "sdlc.md"))
+        self.assertIn("- Add workers only while review keeps up.", sdlc)
+        self.assertIn("- Worker places and their limits are the rules' (`places`); the person's start order only says "
+                      "which ready job starts first.", sdlc)
+
+    def test_readme_places_paragraph(self):
+        readme = read("README.md")
+        para = flat(readme[readme.index("**Places**"):readme.index("**The Costs view**")])
+        for words in ("`pa-places`", "`waiting.json`", "`start-order.json`", "`places`", "`PA_SUITE_CAP`",
+                      "Tasks tab"):
+            self.assertIn(words, para)
+
+    def test_recipe_tasks_bullet(self):
+        recipe = flat(read("RECIPE.md"))
+        self.assertIn("**Places** section", recipe)
+        self.assertIn("Waiting", recipe)
+        self.assertIn("merge queue order (Queue tab)", recipe)
+
+    def test_safety_unchanged(self):
+        self.assertEqual(section(self.raw, "## Safety"), ORCHESTRATOR_SAFETY)
+        self.assertEqual(section(read("runtime", "core", "worker.md"), "## Safety"), WORKER_SAFETY)
+
+
 if __name__ == "__main__":
     unittest.main()
