@@ -1840,6 +1840,78 @@ async function pushWorld({ machine = null, tool = {}, card, opts = {}, layout = 
 }
 const deferred = () => { let resolve; const promise = new Promise((r) => { resolve = r; }); return { promise, resolve }; };
 
+// ---- t-140 Part A (R4): a queue card that pushes is answered only through the push tool, like a push card ----
+const QID = "d-queue-1", QLABEL = "Merge all in order and push";
+const queueCardText = (push = true, extra = {}) => JSON.stringify({ id: QID, task: "t-1", kind: "queue",
+  question: "Merge 1 queued change into main of repo, in order, and push main?", context: "CONTEXT FROM THE CARD FILE",
+  options: [{ label: push ? QLABEL : "Merge all in order", detail: "Merges t-1 into local main", count: 1 }, { label: "Not now", detail: "Nothing merges or is pushed.", count: 0 }],
+  recommendation: push ? QLABEL : "Merge all in order", status: "open", answer: null, note: null, created: "2026-11-16T10:00:00Z", answered: null,
+  queue: { version: 1, repo: "/repo", common: "/repo/.git", mainBefore: PR, entries: [{ task: "t-1", job: null, tip: PC }],
+    ...(push ? { push: { version: 1, path: "/repo", url: PURL, branch: "main" } } : {}) }, ...extra });
+const queueCheck = (over = {}) => ({ card: QID, kind: "queue", ok: true, refusal: null, caller: { ok: true, why: null, ancestors: ["herdr"] }, status: "open", done: false, result: null,
+  facts: { path: "/repo", url: PURL, branch: "main", localNow: PR, remoteNow: PR, checkedAt: "2026-11-16T10:00:00Z",
+    allow: { file: "/home/u/.config/herdr-pa/push-allow.json", sha: "a".repeat(64), mtime: "2026-11-16T08:00:00Z", entry: { path: "/repo", url: PURL, branch: "main", space: S, enabled: true } } },
+  options: [{ label: QLABEL, count: 1, entries: [{ task: "t-1", job: null, tip: PC }], mergeNow: ["t-1"], waits: null, extra: [],
+    push: { ok: true, refusal: null, commit: PC, count: 1, commits: [{ sha: PC, subject: "the task's change", author: "A <a@x>" }] } }],
+  seen: "queue-seen-1", ...over });
+async function queueWorld({ card = queueCardText(), tool = {} } = {}) {
+  world();
+  const file = `:${DIR}/decisions/${QID}.json`;
+  g.__files[file] = card; g.__ls[`:${DIR}/decisions`] = [`${QID}.json`];
+  g.__files[`:${DIR}/ledger.json`] = JSON.stringify({ tasks: [{ id: "t-1", title: "One", state: "review", updated: "2026-11-16T10:02:00Z" }] });
+  g.__files[`:${DIR}/schedule.json`] = JSON.stringify({ everyMinutes: 15 });
+  pushTool({ check: () => json(0, queueCheck()), ...tool });
+  const v = await mount(); await settle();
+  return { v, file };
+}
+
+cases["P-qpush-run"] = async () => { // A4.1: Submit of a merge option runs the push tool once with the card's own label; never answerDecision
+  let file;
+  const { v, file: f } = await queueWorld({ tool: { run: () => { g.__files[file] = queueCardText(true, { status: "answered", answer: QLABEL, answered: "2026-11-16T10:01:00Z", answeredBy: "person, in the panel" });
+    return json(0, { ok: true, done: true, answer: QLABEL, refusal: null, message: `d-queue-1 answered ${QLABEL}: merged t-1 (main aa22000..cc11000); pushed ${PURL} main aa22000..cc11000`,
+      result: { at: "2026-11-16T10:01:00Z", state: "pushed", from: PR, to: PC, commits: 1, merged: ["t-1"], check: null, message: "pushed" } }); } } });
+  file = f;
+  const checks = pushExecs("check");
+  check(checks.length === 1 && JSON.stringify(checks[0][1]) === JSON.stringify(["check", QID, "--space", S, "--json"]), `one check of the queue card (got ${JSON.stringify(checks.map((x) => x[1]))})`);
+  let { text } = look(v);
+  for (const want of ["Read now by pa-push-main check (not from the card file)", `Pushes to: ${PURL}`, QLABEL, "Merges now: t-1", "Commits to push (1):", "cc11000 the task's change"])
+    check(text.includes(want), `shows "${want}" (got ${text.slice(0, 1500)})`);
+  check(!text.includes("CONTEXT FROM THE CARD FILE"), "the card file's context is not shown");
+  const writes = (g.__writes ?? []).length;
+  await click(v, `opt-${QID}-0`); await settle();
+  check(pushExecs("check").length === 2, `picking the merge option checks again (got ${pushExecs("check").length})`);
+  await click(v, `submit-${QID}`); await settle(); await settle();
+  const runs = pushExecs("run");
+  check(runs.length === 1, `one run (got ${runs.length})`);
+  check(JSON.stringify(runs[0][1]) === JSON.stringify(["run", QID, "--answer", QLABEL, "--space", S, "--seen", "queue-seen-1", "--json"]), `its argv (got ${JSON.stringify(runs[0][1])})`);
+  check(!(g.__writes ?? []).slice(writes).some((k) => String(k).includes("/decisions/")), "the panel wrote no card file (never answerDecision)");
+  text = look(v).text;
+  check(text.includes(`answered: ${QLABEL}`), `the card says answered (got ${text.slice(0, 1200)})`);
+};
+
+cases["P-qpush-check-failed"] = async () => { // A4.2: no passed check: a merge option cannot be submitted, and says why; Not now and Other can
+  const { v } = await queueWorld({ tool: { check: () => { throw new Error("no such tool"); } } });
+  await click(v, `opt-${QID}-0`); await settle();
+  let { text, clicks } = look(v);
+  check(!clicks[`submit-${QID}`], `Submit is off for the merge option (got ${Object.keys(clicks)})`);
+  check(text.includes("pa-push-main check could not run"), `says why (got ${text.slice(0, 1500)})`);
+  await click(v, `opt-${QID}-1`); await settle();
+  ({ clicks } = look(v));
+  check(Boolean(clicks[`submit-${QID}`]), "Not now can be submitted");
+  await click(v, `submit-${QID}`); await settle();
+  const runs = pushExecs("run");
+  check(runs.length === 1 && JSON.stringify(runs[0][1]) === JSON.stringify(["run", QID, "--answer", "Not now", "--space", S, "--json"]), `Not now runs the tool, without --seen (got ${JSON.stringify(runs.map((x) => x[1]))})`);
+};
+
+cases["P-qpush-plain-queue-card"] = async () => { // A4.3: a queue card without queue.push is answered as today
+  const { v, file } = await queueWorld({ card: queueCardText(false) });
+  check(pushExecs().length === 0, `no check (got ${JSON.stringify(pushExecs())})`);
+  check(look(v).text.includes("CONTEXT FROM THE CARD FILE"), "its own context is shown");
+  await click(v, `opt-${QID}-0`); await click(v, `submit-${QID}`); await settle();
+  check(pushExecs().length === 0, "no run");
+  check(JSON.parse(g.__files[file]).status === "answered", "answerDecision wrote the answer");
+};
+
 cases["P-push-facts"] = async () => { // §8.1: the block shows the facts of the last check, not the card file's own text
   const { v } = await pushWorld();
   const { text } = look(v);

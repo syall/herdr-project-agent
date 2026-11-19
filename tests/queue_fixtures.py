@@ -85,12 +85,20 @@ REVIEW_FILES = ["intent.md", "spec.md", "plan.md", "FINDINGS.md", "DECISIONS.md"
 SPACE = "sp1"
 
 
+def no_push_tool_path(path):
+    """PATH without the folders that hold an installed push tool (t-140 R1: a queue card pushes only where the tool
+    is on PATH): a queue test sees the tool only where it puts a stand-in itself, on every machine alike."""
+    keep = [p for p in (path or "").split(os.pathsep) if p and not os.path.exists(os.path.join(p, "pa-push-main"))]
+    return os.pathsep.join(keep)
+
+
 def setUpModule():
-    for k in list(TEST_ENV) + list(DROP_ENV):
+    for k in list(TEST_ENV) + list(DROP_ENV) + ["PATH"]:
         _module_env[k] = os.environ.get(k)
     for k in DROP_ENV:
         os.environ.pop(k, None)
     os.environ.update(TEST_ENV)
+    os.environ["PATH"] = no_push_tool_path(os.environ.get("PATH"))
     os.makedirs(TEST_ENV["HOME"], exist_ok=True)
 
 
