@@ -6727,6 +6727,143 @@ J3G_MAIN = {"account": "acct-a", "currency": "USD", "accountWide": True,
             "calibrated": 5.0, "calibratedPartial": False, "noPrice": [], "separate": []}
 
 
+class T070_ScopeToday(J2Base):
+    """t-070 J1 (d-162, d-200): a new scope's first row beneath a wider row starts today (the fetch's day, or a later
+    source date), and when the fetch changes the file's default scope the rows that priced that scope before are carried
+    into it, so every past day keeps the figure it was priced at. A model no wider row priced keeps the source date."""
+
+    REGIONAL_A = ("provider-a", "regional", "region-a", None)
+    REGIONAL_B = ("provider-a", "regional", "region-b", None)
+
+    def setUp(self):
+        super().setUp()
+        prof = load(os.path.join(self.profile_dir, "profile.json"))
+        prof["pricing"] = {"defaultProvider": "provider-a", "endpointPriceAs": {"geo": "regional"}}
+        dump(prof, os.path.join(self.profile_dir, "profile.json"))
+
+    def table(self):
+        table, problem = pa_costs.load_prices(pa.load_profile("test"))
+        self.assertIsNone(problem)
+        return table
+
+    @staticmethod
+    def figures(entry):
+        if entry is None:
+            return None
+        return tuple(entry.get(k, 0) for k in pa_costs.KINDS) + (json.dumps(entry.get("long"), sort_keys=True),)
+
+    def test_t070_s1_migration_regional_first_row_today_and_the_old_row_carried(self):
+        before = self.written()
+        code, out, err = self.fetch(source="src-a", yes=True)
+        self.assertEqual(code, 0, err)
+        after = self.written()
+        for scope, price in ((self.REGIONAL_A, 1.1), (self.REGIONAL_B, 1.2)):
+            rows = self.scoped(after, scope)["model-a"]
+            self.assertEqual([r["validFrom"] for r in rows], ["2026-01-01", "2026-11-17"], scope)
+            c = rows[0]
+            self.assertEqual((c["in"], c["out"], c["cw5m"], c["cw1h"], c["cr"]), (1.0, 10.0, 2.0, 4.0, 0.5))
+            self.assertEqual(c["carried"]["from"], "provider-a · * · * · *")
+            self.assertEqual((c["provider"], c["endpoint"], c["region"]), scope[:3])
+            self.assertEqual(rows[1]["in"], price)
+            self.assertNotIn("carried", rows[1])
+            self.assertEqual(rows[1]["fetched"]["url"], URL_A if scope == self.REGIONAL_A else URL_B)
+        for model, rows in before["models"].items():
+            self.assertEqual(after["models"][model][:len(rows)], rows, model)
+
+    def test_t070_s2_every_past_day_keeps_its_figure(self):
+        old = self.table()
+        code, out, err = self.fetch(source="src-a", yes=True)
+        self.assertEqual(code, 0, err)
+        new = self.table()
+        facts = [self.REGIONAL_A, self.REGIONAL_B, ("provider-a", "global", None, None), ("provider-a", "geo", "region-a", None),
+                 (None, None, None, None), (None, "regional", "region-b", None)]
+        for day in ("2026-01-01", "2026-06-15", "2026-11-01", "2026-11-05", "2026-11-16"):
+            for f in facts:
+                for model in ("model-a", "model-a-x", "model-old"):
+                    when = day + "T10:00:00Z"
+                    self.assertEqual(self.figures(pa_costs.price_for(new, model, when, f)),
+                                     self.figures(pa_costs.price_for(old, model, when, f)), (day, f, model))
+        when = "2026-11-17T10:00:00Z"
+        self.assertEqual(pa_costs.price_for(new, "model-a", when, self.REGIONAL_A)["in"], 1.1)
+        self.assertEqual(pa_costs.price_for(new, "model-a", when, ("provider-a", "geo", "region-a", None))["in"], 1.1)
+        self.assertEqual(pa_costs.price_for(new, "model-a", when, self.REGIONAL_B)["in"], 1.2)
+
+    def test_t070_s3_a_region_beneath_the_same_default_starts_today_with_nothing_carried(self):
+        value = fetch_sample("prices-before.json")
+        value["defaultScope"] = {"provider": "provider-a", "endpoint": "global", "region": None, "account": None}
+        self.prices(value)
+        self.served[URL_B] = fetch_sample("list-region-b-global-differs.json")
+        code, out, err = self.fetch(source="src-a", yes=True)
+        self.assertEqual(code, 0, err)
+        after = self.written()
+        gb = self.scoped(after, ("provider-a", "global", "region-b", None))["model-a"]
+        self.assertEqual([(r["validFrom"], r["in"]) for r in gb], [("2026-11-17", 0.9)])
+        self.assertNotIn("carried", gb[0])
+        new = self.table()
+        f = ("provider-a", "global", "region-b", None)
+        self.assertEqual(pa_costs.price_for(new, "model-a", "2026-11-05T10:00:00Z", f)["in"], 1.0)
+        self.assertEqual(pa_costs.price_for(new, "model-a", "2026-11-17T10:00:00Z", f)["in"], 0.9)
+        # the default is global only: nothing priced regional sessions before, so their rows keep the source date
+        self.assertEqual([r["validFrom"] for r in self.scoped(after, self.REGIONAL_A)["model-a"]], ["2026-11-01"])
+
+    def test_t070_s4_no_wider_row_keeps_the_source_date(self):
+        self.served[URL_B] = fetch_sample("list-region-b-third-model.json")
+        code, out, err = self.fetch(source="src-a", yes=True)
+        self.assertEqual(code, 0, err)
+        after = self.written()
+        self.assertEqual([r["validFrom"] for r in after["models"]["model-b"]], ["2026-11-01"])
+        self.assertNotIn("carried", after["models"]["model-b"][0])
+        c = self.scoped(after, ("provider-a", "global", "region-b", None))["model-c"]
+        self.assertEqual([r["validFrom"] for r in c], ["2026-11-01"])
+
+    def test_t070_s5_a_source_date_after_today_is_kept_and_the_days_before_carried(self):
+        for url in (URL_A, URL_B):
+            value = json.loads(json.dumps(self.served[url]))
+            for r in value["rows"]:
+                if r["endpoint"] == "regional":
+                    r["effective"] = "2026-12-01"
+            self.served[url] = value
+        code, out, err = self.fetch(source="src-a", yes=True)
+        self.assertEqual(code, 0, err)
+        rows = self.scoped(self.written(), self.REGIONAL_A)["model-a"]
+        self.assertEqual([r["validFrom"] for r in rows], ["2026-01-01", "2026-12-01"])
+        new = self.table()
+        self.assertEqual(pa_costs.price_for(new, "model-a", "2026-11-20T10:00:00Z", self.REGIONAL_A)["in"], 1.0)
+        self.assertEqual(pa_costs.price_for(new, "model-a", "2026-12-02T10:00:00Z", self.REGIONAL_A)["in"], 1.1)
+
+    def test_t070_s6_the_dry_run_names_the_date_and_the_carried_rows(self):
+        before = self.snapshot()
+        code, out, err = self.fetch(source="src-a", dry_run=True)
+        self.assertEqual(code, 0, err)
+        self.assertIn("provider-a · regional · region-a · * / model-a: added (validFrom 2026-11-17, source effective 2026-11-01; "
+                      "earlier days keep the prices of provider-a · * · * · *): in 1.1", out)
+        self.assertIn("provider-a · regional · region-a · * / model-a: 1 row carried from provider-a · * · * · * (validFrom 2026-01-01) "
+                      "so days before 2026-11-17 keep their prices", out)
+        self.assertIn("2 new scope row(s) beneath a wider row start today or later; 2 row(s) carried (the file's default scope changed)", out)
+        self.assertIn("provider-a · global · * · * / model-b: added (validFrom 2026-11-01)", out)
+        self.assert_untouched(before)
+
+    def test_t070_s7_a_second_identical_fetch_writes_nothing(self):
+        self.assertEqual(self.fetch(source="src-a", yes=True)[0], 0)
+        before = self.snapshot()
+        code, out, _err = self.fetch(source="src-a", yes=True)
+        self.assertEqual(code, 0)
+        self.assertIn("no change", out)
+        self.assertNotIn("carried", out)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_t070_s8_the_written_file_loads_clean(self):
+        self.assertEqual(self.fetch(source="src-a", yes=True)[0], 0)
+        self.assertEqual(self.table()["warnings"], [])
+
+    def test_t070_s9_no_file_yet_keeps_the_source_date(self):
+        os.remove(self.target())
+        code, out, err = self.fetch(source="src-a", yes=True)
+        self.assertEqual(code, 0, err)
+        rows = self.scoped(self.written(), self.REGIONAL_A)["model-a"]
+        self.assertEqual([r["validFrom"] for r in rows], ["2026-11-01"])
+
+
 class J3G_Accounts(BillingBase):
     """Limit 3 (RL-3), R-A5: one comparison per account label present in the space; the space's own first, as today."""
 
