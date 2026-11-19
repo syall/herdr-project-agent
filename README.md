@@ -703,6 +703,15 @@ the command's code (125: not run, with the reason; 124: no slot came free). Each
 Then `pa-run` ends with 125 and `pa-full-suite` behaves as `--on box-1` (the first machine); `--local` still runs on
 this Mac.
 
+`tests/run-all.sh --affected` and `--module test_x`, run by hand or by the affected-tests hook, go to the machine
+the same way (their first line says `run-all.sh: on box-1 (...)`); a run under `pa-full-suite` or `pa-run --local`
+stays where it was placed. The hook gives the run a deadline 30 s before its own 900 s limit, and when the tests
+could not run there (no slot came free in time, not reachable with `"suiteFallback": "none"`) it says so rather than
+asking for a code fix. Every pa-run, run-all.sh and pa-full-suite run records its kind (affected, single, module,
+failing-first, mutation, full), place, wall time, slot wait, the test's own time and the setup and transfer time
+apart; `pa-run --report [--days N]` shows, per kind, the run counts and medians on this Mac and on each machine and
+says which is faster (3 runs each needed).
+
 ## Licence
 
 Apache License 2.0; see `LICENSE` and `NOTICE`.

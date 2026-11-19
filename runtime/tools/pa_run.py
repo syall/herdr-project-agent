@@ -29,6 +29,12 @@ to stderr); pa-run exits with argv's code.
   Only the output and code come back. TERM, INT, HUP: the terminal ended, the folder removed, 143, 130, 129.
 - Records (R18-R20): evidence/<task>/run-<id>.out (the whole output), one build.log line, one line per run in
   HERDR_PA_HOME/test-runs.jsonl (local runs too; lines older than 30 days dropped), a progress file of kind pa-run.
+- Kinds (T1, J2): --for, else inferred: run-all.sh --affected / --module, --commit with --overlay (failing-first),
+  python3 -m unittest (single), else other. A local run's line has the command's own time (ran) and its setup apart.
+- The slot step (J2, R12-R14): pa_suite.py slot runs run-all.sh's --affected and --module on a machine through
+  slot_run (this code, no pa.py), honouring PA_SUITE_DEADLINE; a local pa-run sets PA_SUITE_LOCAL_RUN so a
+  run-all.sh under it stays here and is not recorded twice.
+  pa-run --report [--days N]   per kind: runs and medians here and on each machine, and which is faster (T2)
 Exit: argv's code; 125 not run; 124 no slot came free or the machine was lost.
 """
 import base64
@@ -81,8 +87,31 @@ def load(h):
     return S
 
 
+PREFIX = "pa-run"  # the slot step (slot_run) says its lines as run-all.sh, on stdout (R12)
+TO_STDOUT = False
+
+
 def say(line):
-    print("pa-run: " + line, file=sys.stderr, flush=True)
+    print("{}: {}".format(PREFIX, line), file=sys.stdout if TO_STDOUT else sys.stderr, flush=True)
+
+
+def infer_kind(argv, commit, overlay):
+    """T1: the kind of a run given no --for: run-all.sh --affected / --module, a failing-first shape (--commit with
+    --overlay), a unittest run (single), else other."""
+    words_ = list(argv)
+    if words_[:1] == ["sh"]:
+        i, _ = sh_script(words_)
+        words_ = words_[i:] if i is not None else words_[1:]
+    if words_ and os.path.normpath(words_[0]) == RUN_ALL:
+        if words_[1:2] == ["--affected"]:
+            return "affected"
+        if words_[1:2] == ["--module"]:
+            return "module"
+    if commit and overlay:
+        return "failing-first"
+    if argv[:3] == ["python3", "-m", "unittest"]:
+        return "single"
+    return "other"
 
 
 # ---- argv (R2) ----
@@ -335,24 +364,8 @@ def runs_file():
 
 
 def record(row):
-    """One line in HERDR_PA_HOME/test-runs.jsonl; lines older than KEEP dropped. Never raises."""
-    path = runs_file()
-    try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path + ".lock", "a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            keep, now = [], time.time()
-            for r in S.read_lines(path):
-                at = S.epoch(r.get("at"))
-                if at is None or now - at <= KEEP:
-                    keep.append(r)
-            keep.append(row)
-            tmp = "{}.tmp-{}".format(path, os.getpid())
-            with open(tmp, "w") as f:
-                f.write("".join(json.dumps(r) + "\n" for r in keep))
-            os.replace(tmp, path)
-    except OSError as e:
-        say("could not record the run in {} ({})".format(path, e))
+    """One line in HERDR_PA_HOME/test-runs.jsonl (pa_suite.test_run_record; lines older than 30 days dropped)."""
+    S.test_run_record(row, say=say)
 
 
 def words(argv):
@@ -362,14 +375,21 @@ def words(argv):
 # ---- running ----
 
 class Run(object):
-    def __init__(self, h, args, record_, directory, profile):
+    """One run. The slot step's (slot_run) sets slot: its output file is given, no build.log line, its own worker,
+    the deadline (R14), and on_mac (its Mac path: the step goes on with today's local run)."""
+
+    def __init__(self, h, args, record_, directory, profile, output=None):
         self.h, self.args, self.task = h, args, record_
         self.directory, self.profile = directory, profile
         self.run = uuid.uuid4().hex[:12]
-        self.evidence = os.path.join(directory, "evidence", record_["task"])
-        os.makedirs(self.evidence, exist_ok=True)
-        self.output = os.path.join(self.evidence, "run-{}.out".format(self.run))
-        self.build_log = os.path.join(self.evidence, "build.log")
+        if output is None:
+            self.evidence = os.path.join(directory, "evidence", record_["task"])
+            os.makedirs(self.evidence, exist_ok=True)
+            output = os.path.join(self.evidence, "run-{}.out".format(self.run))
+            self.build_log = os.path.join(self.evidence, "build.log")
+        else:
+            self.build_log = None
+        self.output = output
         self.kind = args.kind or "other"
         self.began = time.time()
         self.waited = 0.0
@@ -377,20 +397,23 @@ class Run(object):
         self.notes = []
         self.progress = None
         self.printed = 0
+        self.slot, self.worker, self.deadline, self.on_mac = False, os.environ.get("HC_TERMINAL_ID") or None, None, None
+        self.temp_output = False  # the slot step's output outside a task's evidence folder: removed, not recorded
 
     def finish(self, code, place, machine=None, os_name=None, ran=None):
         seconds = round(time.time() - self.began, 1)
         at = pa.now()
         argv = words(self.argv)
-        with open(self.build_log, "a") as f:
-            f.write("=== {} pa-run {}: {} on {} -> exit {} after {:.0f}s (waited {:.0f}s){}\n".format(
-                at, self.kind, argv[:ARGV_KEEP], machine or "this Mac", code, seconds, self.waited,
-                "; " + "; ".join(self.notes) if self.notes else ""))
-        record({"at": at, "run": self.run, "task": self.task.get("task"), "worker": os.environ.get("HC_TERMINAL_ID") or None,
+        if self.build_log:
+            with open(self.build_log, "a") as f:
+                f.write("=== {} pa-run {}: {} on {} -> exit {} after {:.0f}s (waited {:.0f}s){}\n".format(
+                    at, self.kind, argv[:ARGV_KEEP], machine or "this Mac", code, seconds, self.waited,
+                    "; " + "; ".join(self.notes) if self.notes else ""))
+        record({"at": at, "run": self.run, "task": self.task.get("task"), "worker": self.worker,
                 "kind": self.kind, "argv": argv[:ARGV_KEEP], "commit": (getattr(self, "tree", None) or {}).get("commit"),
                 "tree": (getattr(self, "tree", None) or {}).get("tree"), "place": place, "machine": machine, "os": os_name,
                 "waited": round(self.waited, 1), "seconds": seconds, "ran": ran, "overhead": self.overhead,
-                "exit": code, "note": "; ".join(self.notes) or None, "output": self.output})
+                "exit": code, "note": "; ".join(self.notes) or None, "output": None if self.temp_output else self.output})
         S.update_progress(self.progress, state="done", exit=code, end=at, note="; ".join(self.notes) or None)
         return code
 
@@ -441,6 +464,8 @@ def main(h, args):
         say("not run: " + why)
         return NOT_RUN
     directory, _agent, profile = h.load_context(record_["space"])
+    if not args.kind:
+        args.kind = infer_kind(argv, args.commit, overlay)
     r = Run(h, args, record_, directory, profile)
     r.argv, r.top, r.subdir, r.overlay = argv, top, subdir, overlay
     saved = {}
@@ -482,12 +507,15 @@ def place_and_run(r):
         say("not run on {}: {}".format(name, e))
         return NOT_RUN
     r.tree = tree
-    info = {"task": r.task.get("task"), "worker": os.environ.get("HC_TERMINAL_ID") or None,
-            "what": "pa-run {}: {}".format(r.kind, words(r.argv)[:120]), "dir": r.top}
-    r.progress = S.new_progress({"run": r.run, "kind": "pa-run", "what": words(r.argv)[:ARGV_KEEP], "for": r.kind,
-                                 "task": r.task.get("task"), "worker": info["worker"], "dir": r.top,
-                                 "commit": tree["commit"], "tree": tree["tree"], "pid": os.getpid(), "state": "waiting",
-                                 "queued": pa.now(), "output": r.output, "place": "local"})
+    info = {"task": r.task.get("task"), "worker": r.worker,
+            "what": "{} {}: {}".format("run-all.sh" if r.slot else "pa-run", r.kind, words(r.argv)[:120]), "dir": r.top}
+    if r.progress is None:  # the slot step's run has its own (kind run-all.sh)
+        r.progress = S.new_progress({"run": r.run, "kind": "pa-run", "what": words(r.argv)[:ARGV_KEEP], "for": r.kind,
+                                     "task": r.task.get("task"), "worker": info["worker"], "dir": r.top,
+                                     "commit": tree["commit"], "tree": tree["tree"], "pid": os.getpid(),
+                                     "state": "waiting", "queued": pa.now(), "output": r.output, "place": "local"})
+    else:
+        S.update_progress(r.progress, commit=tree["commit"], tree=tree["tree"])
     probes, chosen, slot = {}, None, None
     queued = time.time()
     try:
@@ -538,28 +566,36 @@ def not_there(r, machine, why, fb):
         say(line)
         r.notes.append(line)
         return r.finish(NOT_RUN, None)
+    if r.on_mac:
+        return r.on_mac(r, "{} {}".format(machine, why))
     return run_local(r, "{} {}".format(machine, why))
 
 
 def wait_for_slot(r, reachable, info):
-    """R10: a slot on any reachable machine, waiting up to PA_SUITE_WAIT_LIMIT s. (machine, slot) or (None, None)."""
+    """R10: a slot on any reachable machine, waiting up to PA_SUITE_WAIT_LIMIT s (the slot step: SLOT_WAIT_LIMIT,
+    and with a deadline (R14) each machine only until the deadline minus the kind's median there, else minus 300 s).
+    (machine, slot) or (None, None)."""
     value = os.environ.get("PA_SUITE_WAIT_LIMIT", "")
-    limit = float(value) if value.replace(".", "", 1).isdigit() else WAIT_LIMIT
+    limit = float(value) if value.replace(".", "", 1).isdigit() else (S.SLOT_WAIT_LIMIT if r.slot else WAIT_LIMIT)
     began, shown = time.time(), None
+    ends = {m["machine"]: S.wait_end(r.deadline, r.kind, m["machine"]) for m in reachable} if r.deadline else {}
     while True:
-        texts = []
-        for m in reachable:
+        texts, now = [], time.time()
+        live = [m for m in reachable if now < ends.get(m["machine"], float("inf"))]
+        for m in live:
             f, holders = S.try_slot(S.machine_dir(m["machine"]), m["cap"], info)
             if f:
                 return m, f
             texts.append("{} (cap {}): {}".format(m["machine"], m["cap"], S.describe(holders)))
-        text = "; ".join(texts)
-        if text != shown:
+        text = "; ".join(texts) or "-"
+        if live and text != shown:
             say("waiting for a slot on {}".format(text))
             S.update_progress(r.progress, waiting_for=text)
             shown = text
-        if time.time() - began >= limit:
-            line = "no slot came free in {:.0f} s (running: {})".format(time.time() - began, text)
+        if not live or time.time() - began >= limit:
+            line = "not run on {}: no slot came free in {:.0f} s ({})".format(
+                ", ".join(m["machine"] for m in reachable), time.time() - began,
+                "running: " + (shown or text) if live else "the deadline (PA_SUITE_DEADLINE) leaves no time to run")
             say(line)
             r.notes.append(line)
             r.waited = time.time() - began
@@ -593,11 +629,14 @@ def run_remote(r, machine, found, slot):
     h, tree = r.h, r.tree
     tools, os_name = found.get("tools") or {}, found.get("os")
     folder = S.folder_of(r.run)
+    if r.slot:  # R12: the run's first line
+        say("on {} ({})".format(machine, os_name))
+    else:
+        say("run {} on {} ({}; reachable in {:g}s): output in {}".format(r.run, machine, os_name,
+                                                                         found.get("seconds") or 0, r.output))
     for n in S.sweep(machine, r.run):
         say("leftovers of an earlier run on {}: {}".format(machine, n))
     S.update_progress(r.progress, place=machine, machine=machine, os=os_name, remote={"folder": folder, "terminal": None})
-    say("run {} on {} ({}; reachable in {:g}s): output in {}".format(r.run, machine, os_name, found.get("seconds") or 0,
-                                                                     r.output))
     terminal, watcher = None, None
     try:
         try:
@@ -615,11 +654,19 @@ def run_remote(r, machine, found, slot):
         S.update_progress(r.progress, state="running", start=pa.now(), remote={"folder": folder, "terminal": terminal})
         watcher = S.RemoteWatcher(machine, folder, r.output, r.progress, None, sink=r.sink, fast=True)
         watcher.start()
+        late = False
         while not watcher.ended.wait(0.2):
-            pass
+            if r.deadline and time.time() >= r.deadline:  # R14: the hook's deadline came
+                late = True
+                break
         seen = time.time()
         ran = None
-        if watcher.lost is not None:
+        if late:
+            watcher.stop()
+            code = NO_SLOT
+            r.notes.append("not run on {}: the deadline (PA_SUITE_DEADLINE) came after {:.0f} s; the run there was "
+                           "ended".format(machine, time.time() - r.began))
+        elif watcher.lost is not None:
             code = NO_SLOT
             r.notes.append("machine {} lost after {:.0f} s".format(machine, watcher.lost))
         elif watcher.timed_out:
@@ -638,8 +685,9 @@ def run_remote(r, machine, found, slot):
             if len(stamps) == 2:
                 ran = stamps[1] - stamps[0]
                 r.overhead["copyback"] = round(max(0.0, seen - stamps[1]), 1)
-        for n in r.notes:
-            say(n)
+        if not r.slot:
+            for n in r.notes:
+                say(n)
         t = time.time()
         left = S.cleanup(machine, r.run, terminal)
         r.overhead["cleanup"] = round(time.time() - t, 1)
@@ -647,7 +695,12 @@ def run_remote(r, machine, found, slot):
         for n in left:
             say("cleanup on {}: {} (the exit stays {})".format(machine, n, code))
         S.update_progress(r.progress, cleaned=not [n for n in left if n.startswith("rm -rf")])
-        say("exit {} on {} ({}) after {:.0f}s; output in {}".format(code, machine, os_name, time.time() - r.began, r.output))
+        if not r.slot:
+            say("exit {} on {} ({}) after {:.0f}s; output in {}".format(code, machine, os_name, time.time() - r.began,
+                                                                       r.output))
+        elif code == NO_SLOT and r.notes:  # the slot step's not-run line comes last (R15 reads it)
+            line = r.notes[-1]
+            say(line if line.startswith("not run on ") else "not run on {}: {}".format(machine, line))
         return r.finish(code, machine, machine, os_name, ran)
     except S.Interrupted as e:
         say("interrupted: ending the run on {} and cleaning up".format(machine))
@@ -677,9 +730,11 @@ def run_local(r, why):
         S.update_progress(r.progress, place="local", machine=None, remote=None)
     scratch = None
     child = None
+    r.overhead = {"setup": 0}  # T1: a local run's setup (the scratch clone of --commit) apart from its own time
     try:
         root = r.top
         if r.args.commit:
+            t = time.time()
             try:
                 tree = getattr(r, "tree", None) or tree_to_run(r.h, r.top, r.args.commit, r.overlay, None)
                 scratch = tempfile.mkdtemp(prefix="pa-run-")
@@ -689,20 +744,25 @@ def run_local(r, why):
                 say("not run on this Mac: {}".format(e))
                 r.notes.append(str(e))
                 return r.finish(NOT_RUN, "local")
+            r.overhead["setup"] = round(time.time() - t, 1)
         first = r.argv[0] if r.argv[0] in PROGRAMS else "./" + os.path.normpath(r.argv[0])
         S.update_progress(r.progress, state="running", start=pa.now())
+        # PA_SUITE_LOCAL_RUN: a run-all.sh under it neither goes to a machine nor records (this run does)
+        env = dict(os.environ, PA_SUITE_LOCAL_RUN=r.run)
+        started = time.time()
         with open(r.output, "w") as out:
             child = subprocess.Popen([first] + r.argv[1:], cwd=os.path.join(root, r.subdir or ""), stdin=subprocess.DEVNULL,
-                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
+                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True, env=env)
             for line in iter(child.stdout.readline, b""):
                 chunk = line.decode("utf-8", "replace")
                 out.write(chunk)
                 out.flush()
                 r.sink(chunk)
             code = child.wait()
+        ran = round(time.time() - started, 1)
         code = 128 - code if code < 0 else code
         say("exit {} on this Mac after {:.0f}s; output in {}".format(code, time.time() - r.began, r.output))
-        return r.finish(code, "local", None, S.mac_os())
+        return r.finish(code, "local", None, S.mac_os(), ran)
     except S.Interrupted as e:
         if child is not None:
             S.stop_group(child)
@@ -734,3 +794,200 @@ def local_checkout(top, root, tree):
     p = subprocess.run(["git", "-C", root, "write-tree"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
     if text(p.stdout) != tree["tree"]:
         raise NotRun("the scratch tree is {}, not {}".format(text(p.stdout) or "nothing", tree["tree"]))
+
+
+# ---- the slot step's run on a machine (t-107 J2: R12-R14) ----
+
+LOCAL = None  # slot_run's answer for "run it on this Mac" (the slot step goes on with today's path)
+CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def script_profile(record_, cfg):
+    """The profile of the task's space (for its secretPaths), read under HERDR_PA_HOME without pa.py: {} when no
+    profile is named anywhere (the guard's list alone, as the guard with no profile). Raises NotRun when one is
+    named but cannot be read (fail closed)."""
+    name, home = None, S.home()
+    space = (record_.get("space") or "").split("/")[-1]
+    if space:
+        if not S.SEGMENT.fullmatch(space) or space in (".", ".."):
+            raise NotRun("the task's space {!r} is not a space id".format(space))
+        try:
+            with open(os.path.join(home, "spaces", space, "agent.json")) as f:
+                name = (json.load(f) or {}).get("profile")
+        except (OSError, ValueError, AttributeError):
+            name = None
+    name = name or os.environ.get("HERDR_PA_PROFILE") or (cfg or {}).get("defaultProfile")
+    if not name:
+        return {}
+    if not isinstance(name, str) or not S.SEGMENT.fullmatch(name) or name in (".", ".."):
+        raise NotRun("the profile {!r} is not a profile name".format(name))
+    try:
+        with open(os.path.join(home, "profiles", name, "profile.json")) as f:
+            profile = json.load(f)
+    except (OSError, ValueError) as e:
+        raise NotRun("the profile {!r} cannot be read for its secretPaths ({})".format(name, e))
+    if not isinstance(profile, dict) or profile.get("name") != name:
+        raise NotRun("the profile {!r} cannot be read for its secretPaths".format(name))
+    return profile
+
+
+def check_changed(value, secrets):
+    """R12: PA_CHANGED_FILES's paths, each relative, inside the tree, no control character, not a secret pattern or
+    under .claude/ (they are sent): None, or why not."""
+    for p in [w for w in re.split(r"[ \t\n]+", value or "") if w]:
+        if CONTROL.search(p) or os.path.isabs(p) or clean_rel(p) in (None, ""):
+            return "PA_CHANGED_FILES names {!r}: not a relative path inside the tree".format(p)
+        if p.startswith(".claude/") or "/.claude/" in "/" + p:
+            return "PA_CHANGED_FILES names {!r}: under .claude/, never sent".format(p)
+        for pattern, what in secrets:
+            if re.search(pattern, p):
+                return "PA_CHANGED_FILES names {!r}: {}, never sent".format(p, what)
+    return None
+
+
+def slot_run(h, command, flags, kind, step_args, progress, at):
+    """R12: the slot step's `sh tests/run-all.sh <flags>` on a machine, through pa-run's code (tree to run, place,
+    ship, terminal, watcher, cleanup, records). Lines say `run-all.sh: ...` on stdout, the first `on <M> (<os>)`,
+    then the run's output as it comes; 124/125 end with `run-all.sh: not run on <M>: <reason>`. Its exit code, or
+    LOCAL (not reachable or setup failed with suiteFallback "mac": the step runs it here and has said why)."""
+    import types
+    global PREFIX, TO_STDOUT, _h
+    PREFIX, TO_STDOUT, _h = "run-all.sh", True, h
+    cfg = pa.config()
+    record_ = S.task_record(step_args.dir) or {}
+    top = os.path.realpath(step_args.dir)
+    argv = ["sh", RUN_ALL] + list(flags)
+    args = types.SimpleNamespace(on=None, local=False, commit=None, overlay=None, cwd=None, kind=kind)
+    name = (S.machines(cfg)[0] or [{}])[0].get("machine") or "a machine"
+    output_dir = None
+    space = (record_.get("space") or "").split("/")[-1]
+    evidence = os.path.join(S.home(), "spaces", space, "evidence", record_.get("task") or "") if space and \
+        S.SEGMENT.fullmatch(space) and S.SEGMENT.fullmatch(record_.get("task") or "") else None
+    if not (evidence and os.path.isdir(os.path.dirname(evidence))):
+        output_dir = tempfile.mkdtemp(prefix="pa-run-slot-")
+        evidence = output_dir
+    else:
+        os.makedirs(evidence, exist_ok=True)
+
+    def done(code, line=None):
+        if line:
+            say("not run on {}: {}".format(name, line))
+        S.update_progress(progress, state="done", exit=code, end=pa.now())
+        return code
+    try:
+        try:
+            profile = script_profile(record_, cfg)
+        except NotRun as e:
+            return done(NOT_RUN, str(e))
+        why = check_changed(os.environ.get("PA_CHANGED_FILES", ""), secret_patterns(h, profile))
+        if why:
+            return done(NOT_RUN, why)
+        r = Run(h, args, dict(record_, task=record_.get("task")), None, profile, output=os.devnull)
+        r.output = os.path.join(evidence, "run-{}.out".format(r.run))
+        r.temp_output = output_dir is not None
+        r.slot, r.worker, r.deadline, r.progress = True, step_args.worker or None, at, progress
+        r.argv, r.top, r.subdir, r.overlay = argv, top, "", []
+        here = {}
+
+        def on_mac(r_, why_):
+            say("on this Mac: " + why_)
+            here["why"] = why_
+            return LOCAL
+        r.on_mac = on_mac
+        saved = {}
+
+        def on_signal(sig, frame):
+            raise S.Interrupted(S.SIGNAL_EXIT.get(sig, 1))
+        for sig in S.SIGNAL_EXIT:
+            saved[sig] = signal.signal(sig, on_signal)
+        try:
+            code = place_and_run(r)
+        finally:
+            for sig, old in saved.items():
+                signal.signal(sig, old)
+        if code is LOCAL:
+            S.update_progress(progress, state="waiting", place="local", machine=None, remote=None,
+                              note="on this Mac: " + here.get("why", ""))
+            return LOCAL
+        S.update_progress(progress, state="done", exit=code, end=pa.now())
+        return code
+    finally:
+        if output_dir:
+            shutil.rmtree(output_dir, ignore_errors=True)
+
+
+# ---- the report (T2): which kinds of run are faster where ----
+
+MIN_RUNS = 3
+SAME = 0.10  # medians within 10 % of the faster one: about the same
+
+
+def fmt(value):
+    return "-" if value is None else "{:g}s".format(round(value, 1))
+
+
+def report(days=None):
+    """T2: per kind and place, the run count and medians of the test's own time (ran), setup+transfer (overhead),
+    the wall time without the wait (seconds - waited) and the wait; per kind a verdict from the wall medians."""
+    import statistics
+    rows = S.read_lines(S.test_runs_path())
+    if days:
+        rows = [r for r in rows if (S.epoch(r.get("at")) or 0) >= time.time() - days * 86400]
+    groups = {}
+    for r in rows:
+        if r.get("exit") in (NO_SLOT, NOT_RUN, None) or not isinstance(r.get("seconds"), (int, float)):
+            continue
+        groups.setdefault(r.get("kind") or "other", {}).setdefault(r.get("place") or "local", []).append(r)
+
+    def med(values):
+        values = [v for v in values if isinstance(v, (int, float))]
+        return statistics.median(values) if values else None
+
+    def stats(runs):
+        return {"n": len(runs),
+                "wall": med([r["seconds"] - (r.get("waited") or 0) for r in runs]),
+                "ran": med([r.get("ran") for r in runs]),
+                "over": med([sum(v for v in (r.get("overhead") or {}).values() if isinstance(v, (int, float)))
+                             for r in runs]),
+                "waited": med([r.get("waited") or 0 for r in runs])}
+    lines = ["test runs by kind and place ({}, {} lines{}); verdicts compare the median wall time without the slot "
+             "wait, {} runs each needed".format(S.test_runs_path(), len(rows), ", last {} days".format(days) if days
+                                                 else "", MIN_RUNS)]
+    order = ["affected", "single", "module", "failing-first", "mutation", "full", "measure", "other"]
+    for kind in sorted(groups, key=lambda k: (order.index(k) if k in order else len(order), k)):
+        places = {p: stats(v) for p, v in groups[kind].items()}
+        local = places.get("local")
+        machines_ = sorted(p for p in places if p != "local")
+        if not machines_ or not local or local["n"] < MIN_RUNS:
+            there = sum(places[m]["n"] for m in machines_)
+            lines.append("{}: not enough runs ({} local, {} on {}; {} each needed)".format(
+                kind, local["n"] if local else 0, there, machines_[0] if len(machines_) == 1 else "a machine", MIN_RUNS))
+        for m in machines_:
+            other = places[m]
+            if not local or local["n"] < MIN_RUNS:
+                continue
+            if other["n"] < MIN_RUNS:
+                verdict = "not enough runs ({} local, {} on {}; {} each needed)".format(local["n"], other["n"], m, MIN_RUNS)
+            elif abs(local["wall"] - other["wall"]) <= SAME * min(local["wall"], other["wall"]):
+                verdict = "about the same"
+            else:
+                verdict = "faster locally" if local["wall"] < other["wall"] else "faster on " + m
+            lines.append("{}: {} (local {} runs, median {}; {} {} runs, median {})".format(
+                kind, verdict, local["n"], fmt(local["wall"]), m, other["n"], fmt(other["wall"])))
+        for p in ["local"] + machines_:
+            if p in places:
+                st = places[p]
+                lines.append("  {:<24} runs {:>3}  test {:>8}  setup+transfer {:>7}  wall {:>8}  waited {:>7}".format(
+                    p, st["n"], fmt(st["ran"]), fmt(st["over"]), fmt(st["wall"]), fmt(st["waited"])))
+    if not groups:
+        lines.append("no runs recorded yet")
+    print("\n".join(lines))
+    return 0
+
+
+def report_main(h, args):
+    """pa-run --report (T2): no worktree needed."""
+    global _h
+    _h = h
+    load(h)
+    return report(args.days)

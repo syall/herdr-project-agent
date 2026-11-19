@@ -16,6 +16,7 @@ Selected by the name it is invoked as (symlinks in ~/.local/bin):
   pa-run [--on M|--local] [--commit C --overlay P] -- <argv...>
                                                 a test command in the tree to run (HEAD plus the worktree's changes)
                                                 on a configured machine or this Mac (t-107, see pa_run.py)
+  pa-run --report [--days N]                    which kinds of test run are faster here or on a machine (t-107)
   pa-worktree check [--open-cards]              worktrees whose tasks are all done or parked: list them, open decision cards
   pa-worktree remove <task-id>                  delete a task's worktree, only with an answered "Delete" card
   pa-worker info <address>                      what deleting a worker would remove, as JSON
@@ -173,11 +174,11 @@ def changed_files(root, every=False):
     return files
 
 
-def run_shell(command, cwd, files, timeout):
+def run_shell(command, cwd, files, timeout, extra_env=None):
     """Runs a configured command. {file}/{files} are filled in; PA_CHANGED_FILES lists them, one per line."""
     quoted = " ".join(shlex.quote(f) for f in files)
     line = command.replace("{files}", quoted).replace("{file}", quoted)
-    env = dict(os.environ, PA_CHANGED_FILES="\n".join(files))
+    env = dict(os.environ, PA_CHANGED_FILES="\n".join(files), **(extra_env or {}))
     try:
         r = subprocess.run(["sh", "-c", line], cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                            universal_newlines=True, timeout=timeout)
@@ -288,6 +289,20 @@ def unchanged_since_start(root, data):
     return now is not None and now["head"] == start.get("head") and now["files"] == start.get("files")
 
 
+AFFECTED_LIMIT = 900  # the affected-tests hook's run_shell limit
+DEADLINE_SPARE = 30  # R14: PA_SUITE_DEADLINE is this long before that limit
+
+
+def not_run_line(out):
+    """R15: the line that says why the tests did not run: the last `... not run ...` / `no slot came free` line,
+    else the last line."""
+    lines = [l.strip() for l in (out or "").splitlines() if l.strip()]
+    for line in reversed(lines):
+        if re.search(r"\bnot run\b|no slot came free|timed out after", line):
+            return line.rstrip(".")
+    return lines[-1].rstrip(".") if lines else "(no output)"
+
+
 def hook_affected(data, args):
     record, agent, profile = hook_context(data)
     if not record:
@@ -298,9 +313,18 @@ def hook_affected(data, args):
         return 0
     if unchanged_since_start(record["root"], data):
         return 0
-    code, out = run_shell(command, record["root"], files, 900)
+    # t-107 R14: the slot step's wait and a run on a machine end before this hook's own limit (900 s, less 30)
+    code, out = run_shell(command, record["root"], files, AFFECTED_LIMIT,
+                          {"PA_SUITE_DEADLINE": str(int(time.time()) + AFFECTED_LIMIT - DEADLINE_SPARE)})
     if not code:
         return 0
+    if code in (124, 125):  # R15: could not run (no slot, not reachable, refused, the deadline), not a test failure
+        message = "The affected tests could not run (task {}): {}. Do not change code for this; report it " \
+                  "(r-cloud-runs).\n{}".format(record["task"], not_run_line(out), tail(out, 20))
+        if "--stop" in args:  # let the session stop, saying so
+            print(message, file=sys.stderr)
+            return 1
+        block(message)
     message = "The tests affected by this session's changes fail (task {}). Fix the code and run them again.\n{}".format(record["task"], tail(out))
     if "--stop" in args:
         # Hold the session open a few times, then let it end and say so, rather than loop forever.
@@ -4659,6 +4683,11 @@ def load_tool(name):
     return module
 
 
+def types_namespace(names):
+    import types
+    return types.SimpleNamespace(**names)
+
+
 def cmd_run(args):
     """pa-run (t-107): any test command in the tree to run, on a configured machine or this Mac: pa_run.py."""
     import types
@@ -4782,10 +4811,16 @@ def main():
         parser.add_argument("--overlay", metavar="PATH", action="append", help="with --commit: a path taken from the "
                                                                               "worktree (missing there: deleted); repeat")
         parser.add_argument("--cwd", metavar="SUBDIR", help="run in this folder of the tree (default: the current one)")
-        parser.add_argument("--for", dest="kind", default="other", choices=("single", "failing-first", "mutation",
-                            "module", "affected", "measure", "other"), help="the kind of run, for the record")
+        parser.add_argument("--for", dest="kind", default=None, choices=("single", "failing-first", "mutation",
+                            "module", "affected", "measure", "other"), help="the kind of run, for the record (default: "
+                                                                          "inferred from the command)")
+        parser.add_argument("--report", action="store_true", help="which kinds of test run are faster on this Mac or "
+                                                                  "on a machine, from HERDR_PA_HOME/test-runs.jsonl")
+        parser.add_argument("--days", type=float, help="--report: only runs of the last N days")
         parser.add_argument("argv", nargs=argparse.REMAINDER, help="-- then the command's words")
         args = parser.parse_args()
+        if args.report:
+            return sys.exit(load_tool("pa_run").report_main(types_namespace(globals()), args))
         if not [w for w in args.argv if w != "--"][:1]:
             parser.error("give the command after --")
         return cmd_run(args)

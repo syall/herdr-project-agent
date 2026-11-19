@@ -27,17 +27,29 @@
 # a dead holder never blocks, and a run whose caller holds the slot (pa-full-suite) does not wait for itself. The
 # summary's first line and the run folder's file `slot` say how long it waited. A run that selects no part takes
 # no slot; nor do a few tests run on their own (python3 -m unittest tests.test_x.T.test_y).
+# On a machine (t-107 J2): with machines in HERDR_PA_HOME/config.json's suiteMachines, a --affected or --module run
+# by hand or by a hook (no caller's slot, not on a machine, not placed here by pa-run) is run there by the slot
+# step, through pa-run's code: its first line `run-all.sh: on <machine> (<os>)`, then this script's output from
+# there (parts, summary); 124/125 end with `run-all.sh: not run on <machine>: <why>`. PA_SUITE_DEADLINE (an epoch
+# second, the affected-tests hook's) ends the wait and the run before it.
 # Progress and the part limit (t-076): pa_suite.py, holding the slot, watches the run folder (the files `parts`,
 # <i>.pid, <i>.start, <i>.end, <i>.code): it keeps the run's progress file under HERDR_PA_HOME/suite-runs
 # (pa-full-suite --status reads it) and stops a part past max(PA_PART_LIMIT or 900 s, 3x its recorded median),
 # writing <i>.hung; the summary names it HUNG, the other parts finish, and the run exits 1.
-# Exit: 0 all passed, 1 a part failed, 2 a usage error or no temp folder, 124 no slot came free,
+# Exit: 0 all passed, 1 a part failed, 2 a usage error or no temp folder, 124 no slot came free (or the deadline),
+# 125 not run on a machine (refused, not reachable with suiteFallback "none"),
 # 130/143/129 interrupt, terminate, hangup.
 # Node: $NODE, else `node` on PATH, else the newest mise install.
 set -u
 worker=${HC_TERMINAL_ID:-}  # named to a run waiting for the slot (read before it is dropped below)
+# t-107 R13: the slot step (which may run this on a machine through hc) gets them as PA_SUITE_HC_<NAME>, exported
+# only on its exec line below; these shell variables are never exported, so no part sees them.
+for v in TERMINAL_ID SOCKET TERMINAL_SOCKET SCOPE; do
+  eval "if [ -n \"\${HC_$v+x}\" ]; then keep_hc_$v=\$HC_$v; else unset keep_hc_$v; fi"
+done
 # Never reach the person's hc core from a test: drop every variable that names it.
 unset HC_TERMINAL_ID HC_SOCKET HC_TERMINAL_SOCKET HC_SCOPE CLAUDECODE
+unset PA_SUITE_HC_TERMINAL_ID PA_SUITE_HC_SOCKET PA_SUITE_HC_TERMINAL_SOCKET PA_SUITE_HC_SCOPE  # never inherited
 unset PA_UNIT_SHARD  # set below for one shard part only (t-078), never inherited
 here=$(cd "$(dirname "$0")" && pwd)
 repo=$(cd "$here/.." && pwd)
@@ -141,6 +153,9 @@ fi
 helper=$repo/runtime/tools/pa_suite.py
 if [ "${PA_SUITE_SLOT_PID:-}" != "$PPID" ]; then
   if [ -n "$PY" ] && [ -f "$helper" ]; then
+    for v in TERMINAL_ID SOCKET TERMINAL_SOCKET SCOPE; do
+      eval "if [ -n \"\${keep_hc_$v+x}\" ]; then PA_SUITE_HC_$v=\$keep_hc_$v; export PA_SUITE_HC_$v; fi"
+    done
     exec "$PY" "$helper" slot --for "tests/run-all.sh${*:+ $*}" --worker "$worker" --dir "$repo" -- \
       sh "$here/$(basename "$0")" "$@"
   fi

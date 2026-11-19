@@ -39,6 +39,11 @@ no trusted marker, any locked slot of this home whose holder is an ancestor coun
 none). A wait ends after SLOT_WAIT_LIMIT s (PA_SUITE_WAIT_LIMIT) or once this process's caller is gone, never later.
 The command gets PA_SUITE_SLOT, PA_SUITE_SLOT_PID (this process) and PA_SUITE_HOLD (the seconds waited, or held
 by the caller). Script mode never loads pa.py (run-all.sh's test fixture stubs it): HERDR_PA_HOME and a UTC clock.
+t-107 J2: with suiteMachines configured, a `--affected` or `--module test_x` run of this tree's run-all.sh that no
+caller placed (no trusted caller slot, PA_SUITE_REMOTE and PA_SUITE_LOCAL_RUN unset) goes to a machine through
+pa_run.slot_run (R12), with PA_SUITE_HC_* (run-all.sh's kept hc variables) set back only in its own hc calls (R13)
+and PA_SUITE_DEADLINE ending its wait and run (R14); with suiteFallback "none" a plain or place-flag run by hand is
+125. Every run it places is one line in HERDR_PA_HOME/test-runs.jsonl (R19, T1).
 
 The remote mode (t-089): HERDR_PA_HOME/config.json (this Mac's, never synced) may list machines,
   "suiteMachines": [{"machine": "<hc machine name>", "cap": <1..32, default 1>}, ...]
@@ -164,10 +169,14 @@ def home():
     return os.environ.get("HERDR_PA_HOME") or os.path.join(os.path.expanduser("~"), ".config", "herdr-pa")
 
 
+def utc_now():
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def stamp():
     if pa is not None and getattr(pa, "now", None):
         return pa.now()
-    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return utc_now()
 
 
 def slot_dir():
@@ -605,6 +614,153 @@ class Watcher(threading.Thread):
             pass
 
 
+# ---- t-107 J2: the slot step's records, kinds, deadline, and its run on a machine (R12-R14, R19, T1) ----
+
+RUNS_KEEP = 30 * 86400  # test-runs.jsonl lines older than this are dropped on write
+DEADLINE_MARGIN = 300  # R14: with no median of the kind there, the wait ends this long before the deadline
+
+
+def test_runs_path():
+    return os.path.join(home(), "test-runs.jsonl")
+
+
+def test_run_record(row, say=None):
+    """t-107 R19, T1: one line in HERDR_PA_HOME/test-runs.jsonl (this Mac's, every space's); lines older than RUNS_KEEP
+    dropped. Never raises; a failure is said (say, else stderr)."""
+    path = test_runs_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path + ".lock", "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            keep, now = [], time.time()
+            for r in read_lines(path):
+                at = epoch(r.get("at"))
+                if at is None or now - at <= RUNS_KEEP:
+                    keep.append(r)
+            keep.append(row)
+            tmp = "{}.tmp-{}".format(path, os.getpid())
+            with open(tmp, "w") as f:
+                f.write("".join(json.dumps(r) + "\n" for r in keep))
+            os.replace(tmp, path)
+    except OSError as e:
+        (say or (lambda m: print(m, file=sys.stderr)))("could not record the run in {} ({})".format(path, e))
+
+
+def kind_median(kind, place):
+    """The median wall seconds (without the wait) of the recorded runs of kind at place that ran, or None."""
+    times = []
+    for r in read_lines(test_runs_path()):
+        if r.get("kind") == kind and r.get("place") == place and r.get("exit") not in (124, 125, None):
+            seconds, waited = r.get("seconds"), r.get("waited") or 0
+            if isinstance(seconds, (int, float)) and isinstance(waited, (int, float)):
+                times.append(max(0.0, seconds - waited))
+    return statistics.median(times) if times else None
+
+
+def deadline():
+    """R14: PA_SUITE_DEADLINE (an epoch second the hook gives), or None."""
+    value = os.environ.get("PA_SUITE_DEADLINE", "")
+    return float(value) if value.isdigit() else None
+
+
+def wait_end(at, kind, place):
+    """R14: when a wait for a slot at place must end, given the deadline at: minus the kind's median there, else
+    minus DEADLINE_MARGIN."""
+    median = kind_median(kind, place)
+    return at - (median if median is not None else DEADLINE_MARGIN)
+
+
+def slot_kind(command, top):
+    """t-107: (kind, flags) when command is `sh <top>/tests/run-all.sh <flags>` (this tree's run-all.sh): kind
+    affected, module, full (no flag) or other (a place flag); (None, None) for any other command or a usage error."""
+    if len(command) < 2 or os.path.basename(command[0]) != "sh":
+        return None, None
+    try:
+        same = os.path.samefile(command[1], os.path.join(top, "tests", "run-all.sh"))
+    except OSError:
+        same = False
+    if not same:
+        return None, None
+    flags = list(command[2:])
+    if flags == ["--affected"]:
+        return "affected", flags
+    if len(flags) == 2 and flags[0] == "--module" and MODULE.match(flags[1]):
+        return "module", flags
+    if not flags:
+        return "full", flags
+    if flags in (["--except-integration"], ["--only-integration"]):
+        return "other", flags
+    return None, None
+
+
+def read_config():
+    try:
+        with open(os.path.join(home(), "config.json")) as f:
+            cfg = json.load(f)
+        return cfg if isinstance(cfg, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def deny_paths():
+    """The guard's DENY_PATHS, read from pa_hooks.py beside this file without importing it (script mode never loads
+    pa.py): [(pattern, what)]. Raises ValueError when it cannot be read (the caller fails closed)."""
+    import ast
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "pa_hooks.py")
+    with open(path) as f:
+        tree = ast.parse(f.read())
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "DENY_PATHS" for t in node.targets):
+            value = ast.literal_eval(node.value)
+            if isinstance(value, list) and value and all(
+                    isinstance(v, tuple) and len(v) == 2 and all(isinstance(x, str) for x in v) for v in value):
+                return value
+    raise ValueError("no DENY_PATHS list in " + path)
+
+
+def script_git(path, *args, timeout=None):
+    """pa_hooks.git's shape for script mode: (exit code, stdout, stderr), stripped."""
+    try:
+        r = subprocess.run(["git", "-C", path] + list(args), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           universal_newlines=True, timeout=timeout or 120)
+    except subprocess.TimeoutExpired:
+        return 124, "", "git {} timed out".format(args[0] if args else "")
+    except OSError as e:
+        return 127, "", str(e)
+    return r.returncode, r.stdout.strip(), r.stderr.strip()
+
+
+def script_read_text(path):
+    try:
+        with open(path) as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def slot_remote(command, flags, kind, args, progress, cfg, at):
+    """R12: the slot step's run on a machine through pa_run.py (beside this file): its exit code, or None to run on
+    this Mac (no machine took it and suiteFallback allows). Never imports pa.py: pa_run gets a script-mode pa (UTC
+    clock, this config, read_text) and h (git, the guard's DENY_PATHS)."""
+    import importlib.util
+    import types
+    machine = (machines(cfg)[0] or [{}])[0].get("machine") or "a machine"
+    try:
+        h = types.SimpleNamespace(git=script_git, DENY_PATHS=deny_paths())
+        spec = importlib.util.spec_from_file_location("pa_run", os.path.join(
+            os.path.dirname(os.path.realpath(__file__)), "pa_run.py"))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    except Exception as e:  # noqa: BLE001 - A2: a broken slot step says why, never silently on this Mac
+        print("run-all.sh: not run on {}: the slot step cannot load its parts ({}: {})".format(
+            machine, type(e).__name__, e), flush=True)
+        update_progress(progress, state="done", exit=125, end=stamp())
+        return 125
+    module.S = sys.modules[__name__]
+    module.pa = types.SimpleNamespace(now=utc_now, config=lambda: cfg, read_text=script_read_text, ROOT=home())
+    return module.slot_run(h, command, flags, kind, args, progress, at)
+
+
 def run_under_slot(argv):
     """The script entry point (see the top): a slot, the command under it, its exit code."""
     parser = argparse.ArgumentParser(prog="pa_suite.py slot")
@@ -616,11 +772,25 @@ def run_under_slot(argv):
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     if not command:
         parser.error("no command after --")
+    take_hc_env()  # R13: PA_SUITE_HC_* only for this step's own hc calls, never in the command's env
     value = os.environ.get("PA_SUITE_WAIT_LIMIT", "")
     limit = int(value) if value.isdigit() else SLOT_WAIT_LIMIT
     who = args.what.split()[0] if args.what.split() else "pa_suite.py"
     path, caller = caller_slot(os.environ.get("PA_SUITE_SLOT", ""))
     slot, parent = None, os.getppid()
+    began = time.time()
+    # t-107: what the command is, and whether this step places it (a run by hand or a hook's): not under a caller's
+    # slot, not on a machine already, not placed on this Mac by pa-run (which records its own run)
+    kind, flags = slot_kind(command, args.dir)
+    placing = not caller and not os.environ.get("PA_SUITE_REMOTE") and not os.environ.get("PA_SUITE_LOCAL_RUN")
+    cfg = read_config() if placing else {}
+    good = machines(cfg)[0] if placing else []
+    at = deadline()
+    if good and kind in ("full", "other") and fallback(cfg)[0] == "none":  # R12: by hand, with "none"
+        print("run-all.sh: not run on {}: use pa-full-suite: the integration part runs on this Mac (suiteFallback "
+              "\"none\": never this Mac on its own; pa-run --local -- sh tests/run-all.sh --except-integration runs "
+              "the rest here)".format(good[0]["machine"]), flush=True)
+        return 125
     # The progress file (t-076): the caller's (a pa-full-suite holding the slot) gets this run's parts; else its own.
     progress = os.environ.get("PA_SUITE_PROGRESS", "") if caller else ""
     if not (progress and os.path.dirname(os.path.realpath(progress)) == os.path.realpath(runs_dir())
@@ -635,10 +805,17 @@ def run_under_slot(argv):
                                  "worker": args.worker or None, "dir": os.path.realpath(args.dir),
                                  "commit": head_commit(args.dir), "pid": os.getpid(), "state": "waiting",
                                  "queued": stamp(), "median_total": total, "median_runs": runs})
+    if good and kind in ("affected", "module"):  # R12: to a machine, through pa-run's code
+        code = slot_remote(command, flags, kind, args, progress, cfg, at)
+        if code is not None:
+            return code
+        began = time.time()  # on this Mac after all (it said why): the local run's own times from here
+    if at is not None and not caller:  # R14: the wait ends before the deadline
+        limit = max(0, min(limit, wait_end(at, kind, "local") - time.time()))
+    queued = time.time()
     if caller:
         hold = "held by the caller (task {}, pid {}, {})".format(caller.get("task"), caller.get("pid"), os.path.basename(path))
     else:
-        queued = time.time()
         info = {"task": task_of(args.dir), "worker": args.worker or None, "what": args.what, "dir": args.dir}
         shown = {}
 
@@ -673,6 +850,7 @@ def run_under_slot(argv):
     def forward(sig, frame):  # TERM, INT or HUP to this process goes to the run, which stops its parts
         if child is not None and child.poll() is None:
             child.send_signal(sig)
+    started = time.time()
     try:
         for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
             signal.signal(sig, forward)
@@ -690,6 +868,13 @@ def run_under_slot(argv):
     code = 128 - code if code < 0 else code
     if own:
         update_progress(progress, state="done", exit=code, end=stamp())
+    if placing and kind is not None:  # R19, T1: this Mac's run, recorded (a caller's or pa-run's records its own)
+        now = time.time()
+        test_run_record({"at": stamp(), "run": run, "task": task_of(args.dir), "worker": args.worker or None,
+                         "kind": kind, "argv": " ".join(["sh", "tests/run-all.sh"] + flags), "place": "local",
+                         "machine": None, "os": mac_os(), "waited": round(started - queued, 1),
+                         "seconds": round(now - began, 1), "ran": round(now - started, 1), "overhead": {"setup": 0},
+                         "exit": code, "note": None, "output": None})
     return code
 
 
@@ -1058,9 +1243,24 @@ def fallback(cfg):
     return "mac", "suiteFallback {!r} ignored: one of \"mac\", \"none\"; read as \"mac\"".format(value)
 
 
+HC_NAMES = ("HC_TERMINAL_ID", "HC_SOCKET", "HC_TERMINAL_SOCKET", "HC_SCOPE")
+HC_ENV = {}  # t-107 R13: the slot step's hc variables (from PA_SUITE_HC_*), set only in its own hc calls' env
+
+
+def take_hc_env():
+    """t-107 R13: PA_SUITE_HC_<NAME> (run-all.sh's kept hc variables) removed from this process's env (so the command
+    under the slot never sees them) and kept in HC_ENV as <NAME> for hc() alone."""
+    for name in HC_NAMES:
+        value = os.environ.pop("PA_SUITE_" + name, None)
+        if value is not None:
+            HC_ENV[name] = value
+
+
 def hc(argv, timeout=120, stdin=None):
-    """(exit, stdout, stderr) of one hc call."""
+    """(exit, stdout, stderr) of one hc call (with HC_ENV in its env when the slot step set it)."""
     feed = {"input": stdin} if stdin is not None else {"stdin": subprocess.DEVNULL}
+    if HC_ENV:
+        feed["env"] = dict(os.environ, **HC_ENV)
     try:
         r = subprocess.run(["hc"] + argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True,
                            timeout=timeout, **feed)
@@ -1407,7 +1607,8 @@ def ship(h, machine, run, pin, tools, root, patch=None, head=None, step=None):
         "mkdir -m 700 bin home tmp xdg npm u",
         "printf '%s\\n' '#!{}' 'echo \"hc is not available in a remote suite run\" >&2' 'exit 2' > bin/hc".format(sh_path),
         "chmod 755 bin/hc",
-    ] + ["ln -s {} bin/{}".format(tools[t]["path"], t) for t in TOOLS] + ([
+    ] + ["printf '%s\\n' '#!{}' 'exec {} \"$@\"' > bin/{} && chmod 755 bin/{}".format(sh_path, tools[t]["path"], t, t)
+         for t in TOOLS] + ([
         "{} -c 'import base64, sys; open(sys.argv[2], \"wb\").write(base64.b64decode(open(sys.argv[1]).read()))' step.b64 step".format(py),
         "rm -f step.b64",
         "chmod 700 step"] if step else []) + ([
@@ -1443,8 +1644,9 @@ def step_env(folder, real_home):
 
 
 def run_script(folder, tools, command=None, cwd=None, extra=None):
-    """R10, R11: the remote terminal's fixed script. {folder}/bin holds hc's refusing shim and a link to each probed
-    tool (made at setup), and only it goes ahead of the machine's PATH: a probed tool's folder is never put first, so
+    """R10, R11: the remote terminal's fixed script. {folder}/bin holds hc's refusing shim and, for each probed
+    tool, a two-line `exec <probed path> "$@"` wrapper (made at setup; t-107 J2: not a link, so a tool that is itself
+    a script finding its files beside "$0", as a node shim's node_real, still finds them), and only it goes ahead of the machine's PATH: a probed tool's folder is never put first, so
     another tool in it (an older python3 beside git) cannot shadow the probed one, and the record names what ran.
     t-106: command (a step run's `<run>/step run <run>`) in place of run-all.sh, started in <folder>/<cwd> (checked
     by prepare_step), with the extra export line (step_env); t0, t1, out and code at the run folder's top."""
@@ -2023,6 +2225,15 @@ def wait_for_machine(reachable, info, mac_too, pulse):
         time.sleep(POLL)
 
 
+def suite_timing(record, command, module, run, code, place, machine, os_name, waited, seconds, ran, overhead, output):
+    """t-107 T1: a pa-full-suite run's line in test-runs.jsonl (kind full, or module), beside its suite record."""
+    test_run_record({"at": stamp(), "run": run, "task": record.get("task"),
+                     "worker": os.environ.get("HC_TERMINAL_ID") or None, "kind": "module" if module else "full",
+                     "argv": command if not module else "{} --module {}".format(command, module), "place": place,
+                     "machine": machine, "os": os_name, "waited": waited, "seconds": seconds, "ran": ran,
+                     "overhead": overhead, "exit": code, "note": None, "output": output})
+
+
 def run_on_mac(h, record, directory, command, module, build_log, where, run, output, progress, slot, queued, pulse,
                reuse, note=None):
     """The run on this Mac under slot (today's path); its exit code. note: why it is here (t-089), for the record."""
@@ -2063,6 +2274,8 @@ def run_on_mac(h, record, directory, command, module, build_log, where, run, out
         recorded = "recorded in " + where
     except OSError as e:
         recorded = "could not record the run in {} ({})".format(where, e)
+    suite_timing(record, command, module, run, code, "local", None, mac_os(), waited, seconds, seconds, {"setup": 0},
+                 output)
     print(h.tail(out, 40))
     if change:
         print("pa-full-suite: the worktree changed during the run ({}); the run is recorded under the tree it started "
@@ -2104,9 +2317,13 @@ def run_remote(h, args, record, directory, command, evidence, build_log, where, 
         raise Interrupted(SIGNAL_EXIT.get(sig, 1))
     for sig in SIGNAL_EXIT:
         saved[sig] = signal.signal(sig, on_signal)
+    times = {"probe": found_probe.get("seconds"), "ship": None, "start": None, "copyback": None, "cleanup": None}
     try:
         try:
+            t = time.time()
             ship(h, machine, run, found[0], tools, root, step=step)
+            times["ship"] = round(time.time() - t, 1)
+            t = time.time()
             if step:
                 real_home = found_probe.get("home")
                 if not real_home:
@@ -2119,6 +2336,7 @@ def run_remote(h, args, record, directory, command, evidence, build_log, where, 
                 ran_from = time.time()  # R14: a step run's place seconds count from its terminal's start
             else:
                 terminal = start_remote(machine, run, folder, tools)
+            times["start"] = round(time.time() - t, 1)
         except SetupFailed:
             for n in cleanup(machine, run, terminal):
                 log("pa-full-suite: cleanup on {}: {}".format(machine, n))
@@ -2220,12 +2438,16 @@ def run_remote(h, args, record, directory, command, evidence, build_log, where, 
             recorded = "recorded in " + where
         except OSError as e:
             recorded = "could not record the run in {} ({})".format(where, e)
+        t = time.time()
         left = cleanup(machine, run, terminal)
+        times["cleanup"] = round(time.time() - t, 1)
         for n in left:
             log("pa-full-suite: cleanup on {}: {} (the exit stays {})".format(machine, n, code))
         if not [n for n in left if n.startswith("rm -rf")]:
             update_progress(progress, cleaned=True)
         terminal = None  # cleaned
+        suite_timing(record, command, None, run, code, machine, machine, os_name, waited, seconds, remote_seconds,
+                     times, output)
         print(h.tail(out, 40))
         if change:
             print("pa-full-suite: the worktree changed during the run ({}); the run is recorded under the tree it started "
