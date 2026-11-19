@@ -379,8 +379,9 @@ class T025Removed(unittest.TestCase):  # AC1.1, AC2.1, AC3.1, AC4.4, R10
 
     def test_size(self):  # R10: about 230 lines (the build came to 245: DECISIONS.md, t-025 D4; t-041 J3's pa-context row: 254;
         # t-070 J2's price fetch row: 262; its round 3, a dotted module, runpy and python -c naming the module: 266;
-        # its round 6, the D7 scan in its own function, run only on a line that names pa-costs: 269)
-        self.assertLessEqual(len(source("pa_guard.py").splitlines()), 269)
+        # its round 6, the D7 scan in its own function, run only on a line that names pa-costs: 269;
+        # t-133's pa-places write row (t-083 RL3): 275)
+        self.assertLessEqual(len(source("pa_guard.py").splitlines()), 275)
 
 
 class HookGuard(unittest.TestCase):
@@ -873,6 +874,38 @@ class T037Restart(GuardTest):  # t-037 J2: workers never run pa-restart
 
     def test_d5_allowed(self):
         for line in D5_ALLOWED:
+            with self.subTest(line=line):
+                self.assertIsNone(self.check(line))
+
+
+# t-133 (t-083 RL3): the pa-places write commands are the Project Agent's; a worker's shell is refused them wherever it
+# runs from (pa-places' own refusal rests on a task record above the folder or HC_TERMINAL_ID)
+D8 = ("Refused by the Project Agent's guard: {}. pa-places add, block, unblock, drop and start are the Project Agent's: "
+      "a worker never changes the waiting list. Say in your report what is ready or what it waits for. There is no override.")
+D8_FORMS = [
+    ("pa-places add t-1 --job b --kind working --role r",), ("pa-places start t-1/b --worker t5",),
+    ("pa-places block t-1/b --why x",), ("pa-places unblock t-1/b",), ("pa-places drop t-1/b --why x",),
+    ("~/.local/bin/pa-places add t-1 --job b --kind working --role r",), ("PA-PLACES drop t-1/b --why x",),
+    ("python3 runtime/tools/pa_places.py add t-1 --job b --kind working --role r",),
+    ("python3 -I ~/.config/herdr-pa/tools/pa_places.py start t-1/b --worker t5",),
+    ("env X=1 pa-places start t-1/b --worker t5",), ("cd /tmp && pa-places add t-1", "pa-places add t-1"),
+    ("sh -c 'pa-places drop t-1/b --why x'", "pa-places drop t-1/b --why x"),
+    ("y=$(pa-places start t-1/b --worker t5)", "pa-places start t-1/b --worker t5"),
+]
+D8_ALLOWED = ["pa-places next", "pa-places show --json", "pa-places limits", "pa-places tasks --json", "pa-places --help",
+              "python3 runtime/tools/pa_places.py next", "grep -n 'pa-places add' README.md", "echo pa-places add",
+              "python3 -m unittest tests.test_pa_places", "man pa-places-start"]
+
+
+class T133Places(GuardTest):  # t-133 (t-083 RL3): workers never run the pa-places write commands
+    def test_d8_forms(self):
+        for form in D8_FORMS:
+            line, inner = form[0], form[-1]
+            with self.subTest(line=line):
+                self.assertEqual(self.check(line), msg(D8, inner))
+
+    def test_d8_allowed(self):
+        for line in D8_ALLOWED:
             with self.subTest(line=line):
                 self.assertIsNone(self.check(line))
 
