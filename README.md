@@ -601,7 +601,9 @@ Full suites on another machine: list hc machines (`hc machine ls`) in this Mac's
 
 `pa-full-suite` then runs every part but the integration check on the first reachable machine with a free
 slot (`tests/run-all.sh --except-integration`, in an hc terminal under `/tmp/pa-suite-<run>` with its own home
-and temp folders), and the integration check on this Mac at the same time (`--only-integration`). Only a
+and temp folders), and the integration check on this Mac at the same time (`--only-integration`: three
+integration parts at once, each with its own private hc core, `tests/pa_session_check.sh <scratch> --part 1|2|3`;
+without `--part` it runs every step in one core). Only a
 clean worktree whose full command is `sh tests/run-all.sh` goes, or a profile's own full command that the profile
 declares runs it in a plain git repo (`"tests": {"full": "hooks/tests.sh full", "fullIsRunAll": {"command":
 "hooks/tests.sh full", "unlessFound": ["<a file that marks a workspace>"]}}`): that counts while the worktree root

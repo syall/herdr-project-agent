@@ -3,8 +3,9 @@
 #   tests/run-all.sh             full suite: Python 3.7 parse check, unit tests (each tests/test_*.py its own part;
 #                                the long ones in unit_shards below are several parts, each case in exactly one),
 #                                keeper harness, panel harness (four parts: run.mjs --shard=1/4 .. 4/4, each case in
-#                                exactly one), store harness, and the pa-session integration check against a
-#                                private hc core
+#                                exactly one), store harness, and the pa-session integration check: three
+#                                integration parts (pa_session_check.sh --part 1..3), each with its own private hc
+#                                core and scratch folder, each step in exactly one part (t-112)
 #   tests/run-all.sh --affected  the fast set only (no integration check). With PA_CHANGED_FILES
 #                                (paths separated by spaces or newlines), parts whose files did not
 #                                change are skipped; without it, the whole fast set runs.
@@ -13,7 +14,7 @@
 #   tests/run-all.sh --except-integration  every part of the full run but the integration check (same order, names,
 #                                shards, slot, progress); PA_CHANGED_FILES is not read. pa-full-suite runs it on a
 #                                configured machine (t-089)
-#   tests/run-all.sh --only-integration  the integration check alone as one part (same slot, progress, summary):
+#   tests/run-all.sh --only-integration  the integration check alone: its three parts (same slot, progress, summary):
 #                                the part pa-full-suite keeps on this Mac while the rest runs on a machine
 # The parts run at the same time (they share no temp folder, home, port or hc core); PA_SERIAL=1 runs them
 # one after another, each streamed as it runs. Each part's whole output is kept in its own file in one temp
@@ -91,9 +92,12 @@ keeper() { [ -n "$NODE" ] || { echo "no node found (set NODE)"; return 1; }; "$N
 panel_parts=4
 panel() { [ -n "$NODE" ] || { echo "no node found (set NODE)"; return 1; }; "$NODE" tests/panel/run.mjs "--shard=$1/$panel_parts"; }
 store() { [ -n "$NODE" ] || { echo "no node found (set NODE)"; return 1; }; "$NODE" tests/store/run.mjs; }
+# The integration check is three parts at once (t-112): $1 is the part, 1..integration_parts, each with its own
+# scratch folder and so its own private hc core.
+integration_parts=3
 integration() {
   S=$(mktemp -d /tmp/t001.XXXXXX) || return 1
-  sh tests/setup-scratch.sh "$S" && sh tests/pa_session_check.sh "$S"
+  sh tests/setup-scratch.sh "$S" && sh tests/pa_session_check.sh "$S" --part "$1"
   code=$?
   rm -rf "$S"
   return $code
@@ -127,7 +131,10 @@ if [ "$want_panel" = 1 ]; then
   while [ "$k" -le "$panel_parts" ]; do add panel "panel harness $k/$panel_parts" "$k"; k=$((k + 1)); done
 fi
 [ "$want_store" = 1 ] && add store "store harness"
-[ "$affected" = 0 ] && [ "$place" != except-integration ] && add integration "pa-session integration (private hc core)"
+if [ "$affected" = 0 ] && [ "$place" != except-integration ]; then
+  k=1
+  while [ "$k" -le "$integration_parts" ]; do add integration "pa-session integration $k/$integration_parts (private hc core)" "$k"; k=$((k + 1)); done
+fi
 
 # Take the slot: pa_suite.py runs this script again under it, with PA_SUITE_SLOT_PID set to its own pid (this
 # script's parent then) and PA_SUITE_HOLD saying how it got the slot.

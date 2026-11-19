@@ -8,6 +8,9 @@
 set -eu
 S=${1:?usage: setup-scratch.sh <scratch dir>}
 case "$S" in /tmp/*|/private/tmp/*|/var/folders/*) ;; *) echo "refusing: $S is not a temp folder" >&2; exit 2 ;; esac
+# Once resolved too (t-112 §10): /tmp/../etc, or a /tmp link to another folder, is not a temp folder.
+real_s=$(cd "$S" 2>/dev/null && pwd -P) || { echo "refusing: $S is not a temp folder (no such folder)" >&2; exit 2; }
+case "$real_s" in /tmp/*|/private/tmp/*|/var/folders/*|/private/var/folders/*) ;; *) echo "refusing: $S is not a temp folder (resolved: $real_s)" >&2; exit 2 ;; esac
 here=$(cd "$(dirname "$0")" && pwd)
 repo=$(cd "$here/.." && pwd)
 mkdir -p "$S/pa/profiles/test" "$S/bin" "$S/state" "$S/config" "$S/run" "$S/app" "$S/claude" "$S/proj"

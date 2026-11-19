@@ -552,7 +552,7 @@ class RunAll(unittest.TestCase):
             (e, "integration{}".format(k)) for k in (1, 2, 3) for e in ("start", "end")), events)
         with open(os.path.join(self.tmp, "integrationargs")) as f:
             args = sorted(f.read().splitlines())
-        self.assertEqual([a.split(" ", 1)[1] for a in args], ["--part 1", "--part 2", "--part 3"], args)
+        self.assertEqual(sorted(a.split(" ", 1)[1] for a in args), ["--part 1", "--part 2", "--part 3"], args)
         self.assertTrue(all(a.split(" ", 1)[0].startswith("/tmp/t001.") for a in args), args)
         self.assertEqual(len(set(a.split(" ", 1)[0] for a in args)), 3, args)  # its own scratch per part
         self.assertIn("  suite slot: waited", tail)
@@ -1080,7 +1080,7 @@ class PartTable(unittest.TestCase):
         self.assertEqual(len(re.findall(r"^s8_state\(\) \{", self.text, re.M)), 1)
         body = self.text.split("\nstep_S8() {", 1)[1].split("\n}\n", 1)[0]
         self.assertIn("s8_state", body)
-        self.assertNotIn("MARKER-T037", body)
+        self.assertNotIn('echo "MARKER-T037', body)  # the marker is written by s8_state only
 
 
 class CheckArgs(unittest.TestCase):

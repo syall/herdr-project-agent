@@ -27,7 +27,9 @@ check = int(args.pop(0)) if mode == "watch" else None
 S, SESSION = args[0].rstrip("/"), args[1]
 core = args[2] if len(args) > 2 else ""
 core_began = args[3] if len(args) > 3 else ""
-if not (S.startswith(("/tmp/", "/private/tmp/", "/var/folders/")) and len(S.split("/")) > 2):
+ROOTS = ("/tmp/", "/private/tmp/", "/var/folders/", "/private/var/folders/")
+REAL = os.path.realpath(S)  # t-112 §10: /tmp/../etc, or a /tmp link to another folder, is not a temp folder
+if not (S.startswith(ROOTS[:3]) and len(S.split("/")) > 2 and REAL.startswith(ROOTS) and len(REAL.split("/")) > 2):
     sys.stderr.write("refusing: {} is not a temp folder\n".format(S))
     sys.exit(2)
 RECORD = S + "/reap.started"
