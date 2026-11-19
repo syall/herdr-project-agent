@@ -1019,6 +1019,65 @@ cases["P-hidden-ledger-fails"] = async () => { // AC8.5: a ledger that fails, ha
   }
 };
 
+// ---- t-020 J6 (AC9.1, VP14): every recorded, unremoved worktree of a task, with its job ----
+const t5 = { id: "t-5", title: "five", state: "in-progress", updated: "2026-11-16T12:00:00Z",
+  worktree: "/p/worktrees/t-5-main/repo",
+  worktrees: [
+    { path: "/p/worktrees/t-5-main/repo/", job: "first", created: "2026-11-16T09:00:00Z" }, // the main one named: counted once, its entry unchanged
+    { path: "/p/worktrees/t-5-billing/repo", job: "Billing Script", created: "2026-11-16T09:10:00Z" },
+    { path: "/p/worktrees/t-5-gone/repo", job: "gone", created: "2026-11-16T09:20:00Z", removed: "2026-11-16T10:00:00Z" },
+    { path: "/p/worktrees/t-5-again/repo", job: "billing-script", created: "2026-11-16T09:30:00Z" }, // the job taken: -2
+    { path: "", job: "blank" }, "not an entry"],
+  extraWorktrees: ["/p/worktrees/t-5-gone/repo", "/p/worktrees/t-5-billing/repo", "/p/worktrees/t-5-tool/repo", "/b/t-5-guard", 7] };
+const t6 = { id: "t-6", title: "six", state: "in-progress", updated: "2026-11-16T11:30:00Z", worktree: null, worktrees: [{ path: "/q/wt-6", job: "panel" }] };
+const t7 = { id: "t-7", title: "seven", state: "done", updated: "2026-11-16T11:20:00Z", worktree: null, worktrees: [{ path: "/q/wt-7", job: "x", removed: "2026-11-16T11:00:00Z" }], extraWorktrees: ["/q/wt-7"] };
+const t5Trees = [
+  { task: "t-5", path: "/p/worktrees/t-5-main/repo", title: "five" },
+  { task: "t-5", path: "/p/worktrees/t-5-billing/repo", title: "five", job: "billing-script" },
+  { task: "t-5", path: "/p/worktrees/t-5-again/repo", title: "five", job: "billing-script-2" },
+  { task: "t-5", path: "/p/worktrees/t-5-tool/repo", title: "five", job: "tool" },
+  { task: "t-5", path: "/b/t-5-guard", title: "five", job: "guard" }];
+const jobSpot = (x, path, job) => ({ label: `${x.id} worktree · ${job}`, detail: x.title, path, group: "Project Agent", task: x.id, job });
+cases["P-worktrees-jobs"] = async () => { // AC9.1: project-agent.worktrees lists the R1 set: main first, exactly {task, path, title}; others with job
+  world({ machine: M });
+  g.__files[`${M}:${RDIR}/ledger.json`] = tasksWith([t5, t6, t7, t1]);
+  remoteCards(1);
+  await mount(); await settle();
+  const want = [...t5Trees, { task: "t-6", path: "/q/wt-6", title: "six", job: "panel" }, { task: "t-1", path: "/wt/1", title: "one" }];
+  check(JSON.stringify(g.__shared["project-agent.worktrees"]?.[RS]) === JSON.stringify(want), `worktrees (got ${JSON.stringify(g.__shared["project-agent.worktrees"]?.[RS])})`);
+  // Only the old field: the main one, nothing else.
+  world({ machine: M });
+  g.__files[`${M}:${RDIR}/ledger.json`] = tasksWith([{ ...t7, extraWorktrees: [] }, { ...t1, worktrees: [] }]);
+  remoteCards(1);
+  await mount(); await settle();
+  check(JSON.stringify(g.__shared["project-agent.worktrees"]?.[RS]) === JSON.stringify([{ task: "t-1", path: "/wt/1", title: "one" }]), `an old ledger is as before (got ${JSON.stringify(g.__shared["project-agent.worktrees"]?.[RS])})`);
+};
+
+cases["P-files-job-shortcuts"] = async () => { // AC9.1: a Files shortcut per worktree, the job ones after the task's main one, shown and hidden
+  const trees = (spots) => (spots ?? []).filter((x) => / worktree/.test(x.label));
+  const want = [wtSpot({ ...t5 }), jobSpot(t5, "/p/worktrees/t-5-billing/repo", "billing-script"), jobSpot(t5, "/p/worktrees/t-5-again/repo", "billing-script-2"),
+    jobSpot(t5, "/p/worktrees/t-5-tool/repo", "tool"), jobSpot(t5, "/b/t-5-guard", "guard"), jobSpot(t6, "/q/wt-6", "panel"), wtSpot(t1)];
+  world({ machine: M });
+  g.__files[`${M}:${RDIR}/ledger.json`] = tasksWith([t1, t7, t6, t5]);
+  remoteCards(1);
+  g.__execOut = { [`${M}:evidence`]: { stdout: "t-5\ta.md\n" } };
+  await mount(); await settle();
+  const spots = g.__shared["my-files.places"]?.[RS] ?? [];
+  check(JSON.stringify(trees(spots)) === JSON.stringify(want), `shown: worktree shortcuts (got ${JSON.stringify(trees(spots))})`);
+  const at = (label) => spots.findIndex((x) => x.label === label);
+  check(at("t-5 evidence · 1 file") >= 0 && at("t-5 evidence · 1 file") < at("t-5 worktree") && at("t-5 worktree · guard") < at("t-6 worktree · panel"), `each task's evidence, then its worktrees (got ${JSON.stringify(spots.map((x) => x.label))})`);
+  // While hidden, the ledger alone writes them the same way.
+  world({ machine: M });
+  g.__files[`${M}:${RDIR}/ledger.json`] = tasksWith([t1]);
+  remoteCards(1);
+  g.__layout = panelLayout("changes");
+  await mount(); await settle();
+  g.__files[`${M}:${RDIR}/ledger.json`] = tasksWith([t1, t7, t6, t5]);
+  await step(10000); await fire(10000);
+  check(JSON.stringify(trees(g.__shared["my-files.places"]?.[RS])) === JSON.stringify(want), `hidden: worktree shortcuts (got ${JSON.stringify(trees(g.__shared["my-files.places"]?.[RS]))})`);
+  check(JSON.stringify(g.__shared["project-agent.worktrees"]?.[RS]) === JSON.stringify([...t5Trees, { task: "t-6", path: "/q/wt-6", title: "six", job: "panel" }, { task: "t-1", path: "/wt/1", title: "one" }].sort((a, b) => ["t-1", "t-6", "t-5"].indexOf(a.task) - ["t-1", "t-6", "t-5"].indexOf(b.task))), `hidden: worktrees in ledger order (got ${JSON.stringify(g.__shared["project-agent.worktrees"]?.[RS])})`);
+};
+
 cases["P-hidden-overlap"] = async () => { // AC8.2 (review P-M3): of two overlapping hidden reads, the older one ending last writes nothing
   world({ machine: M });
   remoteCards(3);
