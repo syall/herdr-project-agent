@@ -419,14 +419,17 @@ to the bottom; the last 20 `moves`), compare-and-write, locally or on the space'
 writes it. A ↑ makes every task above it yours, so ↑ is exactly one step. An unreadable file is
 ignored as a whole, with the line `task order unreadable: <why>; the Project Agent's order is used` and
 a **Reset order** button. Tasks you have not placed keep the Project Agent's order (`taskOrder` in its
-ledger; a new task lands at the bottom of Queued, above the ones you sent to the bottom) and show a dim
+ledger, first seeded with the order work stood in: tasks in flight first, then by its priorities and
+your standing words; a new task lands below the tasks in flight, at the bottom of Queued above the
+ones you sent to the bottom, unless your standing words place it higher) and show a dim
 `PA` chip; a task it raised because you asked in chat ("do it now") shows `PA · your words` until your
 next move. Follow-ups of one task (`followUpOf` in the ledger) fold into one Queued line, `▸ 3
 follow-ups of t-083 · first #4`. The Project Agent reads it every pass with `pa-places tasks` and takes
-the next ready task from the top; the waiting list follows it, until a task order exists (a readable
+the next ready task from the top (Queued, In progress, Investigating or Review; a parked, Needs
+decision or done task gets no new job); the waiting list follows it, until a task order exists (a readable
 `task-order.json` or the ledger's `taskOrder`) the jobs keep the order the agent added them in. A task
-in progress or in review ranks only by its place, so its next job can wait behind a higher queued
-task's job until you raise it; a job of a task outside the ranking (a done task's cleanup) waits behind every
+in progress or in review ranks only by its place, so its next job waits behind a queued task's job
+only when you, or your standing words, placed that task higher; a job of a task outside the ranking (a done task's cleanup) waits behind every
 ranked task's jobs. The person's task order never answers a card, approves a rule, lifts a hold, raises
 a limit, or starts a task before its `after` tasks. It only says which ready task goes first.
 

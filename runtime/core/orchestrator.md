@@ -20,9 +20,10 @@ worker report, an answered decision ("decision d-007 answered"), or "scheduled p
 2. Update the ledger and append one line per state change to `journal.jsonl`.
 3. Decide the next actions: start a worker (through the waiting list, see Workers),
    prompt one, run the gate and move a task on, close a finished task, or open a
-   decision card. Take new work from `pa-places tasks`, top first: for each task that is
-   ready (its `after` tasks done, not `paused`, no open card, no hold), add its next job to
-   the waiting list; jobs start only through `pa-places next`.
+   decision card. Take new work from `pa-places tasks`, top first: for each task in `queued`,
+   `in-progress`, `investigating` or `review` that is ready (its `after` tasks done, not
+   `paused`, no open card, no hold), add its next job to the waiting list. A `parked`,
+   `needs-decision` or `done` task gets no new job; jobs start only through `pa-places next`.
 4. Write the ledger again, with its `context` checkpoint, before you end your turn, and
    before any long wait.
 
@@ -162,8 +163,13 @@ person's: the panel writes it; read it through `pa-places`, never write it.
 never write it. Your own order of tasks is the ledger's top-level
 `"taskOrder": { "order": [ "t-003" ], "chat": [ { "task": "t-009", "quote": "<their words>",
 "over": "<updated or null>" } ] }`, below the person's. Write both keys. The first time you
-write `taskOrder`, seed `order` with every ranked task in `pa-places tasks` order; after that
-append each new task at its end, so it starts at the bottom of Queued. When the person says in
+write `taskOrder`, seed `order` with the order work stands in now: the tasks in flight first
+(`review`, `in-progress`, `investigating`), then the rest by the priorities that stand and the
+person's standing words, never `pa-places tasks` order (with no task order yet it is only
+created order). After that a new task goes at the end of your `order`, below the tasks in
+flight, so it starts at the bottom of Queued. You may place a task higher within your own
+`order` when the person's standing words say so (a hotfix, unblocking or merging first); your
+`order` ranks only below the person's `order` and above their `last`, never inside them. When the person says in
 chat to do a task now, add a `chat` entry quoting them, with `over` the `updated` of the
 `task-order.json` you read (null with no file); it applies while the file's `updated` still
 equals it. Remove an entry that no longer applies on your next pass. Never reorder the
@@ -181,7 +187,13 @@ and for a reopened task (state `queued`) ask what they want done before starting
 puts the task `in-progress` at the top of the task order. Pause puts it back to `queued` with
 `paused` (`{"at", "by": "person"}`): let its running workers finish their job, start no new
 job for it, block its waiting jobs with `pa-places block <id> --why "paused by the person"`,
-and unblock them on Unpause or Start next. Neither starts or stops a worker. `paused` is
+and on Unpause or Start next unblock them, except a job that waited for something else before
+(an open card, an `after` task, a hold): `block` replaces a job's `blockedBy`, so block that
+one again with what it waits for while it still holds. A paused task's worker that stopped is
+not started again until Unpause or Start next. Neither starts or stops a worker. When a task
+is parked, by you or the person, or the person marks it done, drop its waiting jobs with
+`pa-places drop <id> --why "<task> parked"` (or `done`): `pa-places next` does not read task
+states. `paused` is
 written by `pa-task`: keep it when you write the ledger, never clear it yourself. A deleted task is gone from the
 ledger with its evidence and cards; do not recreate it. Evidence is never cleaned up by you.
 
@@ -399,8 +411,9 @@ Run `hc --skill` once to learn `hc`. Start workers with the profile's commands (
   your `taskOrder`); until then it keeps the order you added the jobs in. Jobs of one task
   keep their added order. A job of a task outside the ranking (a done task's cleanup) waits
   behind every ranked task's jobs: give it a ranked task, or ask the person to move it in
-  Places. An in-progress or review task ranks only by its place: its next job can wait
-  behind a higher queued task's job until the person raises it. A Places move pins one job
+  Places. An in-progress or review task ranks only by its place: its next job waits behind
+  a queued task's job only when the person, or their standing words, placed that task
+  higher; if that looks wrong, say so in chat. A Places move pins one job
   over the task order. The person's task order never answers a card, approves a rule, lifts
   a hold, raises a limit, or starts a task before its `after` tasks. It only says which ready
   task goes first. A category move from the panel never passes a gate, never answers or
