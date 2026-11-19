@@ -13,7 +13,7 @@ One file, selected by the name it is invoked as (symlinks in ~/.local/bin):
   pa-pass --pause | --resume                     pause or resume scheduled passes for the space
   pa-cleanup [--kill] [--dry-run] [--space ID]   remove finished workers whose evidence is recorded
   pa-doctor [--space ID]                         check a space's state files; exit 1 if any is broken
-  pa-task list|done|reopen|park|delete|restore|purge|archive   the person's own changes to tasks (see pa-task --help)
+  pa-task list|done|reopen|park|next|pause|unpause|delete|restore|purge|archive   the person's own changes to tasks
   pa-decide <card> --answer LABEL|Other --quote TEXT   record a decision the person made in conversation
   pa-decide <card> --withdraw --why TEXT         close a card the conversation made moot (or answered Other)
   pa-sync --on MACHINE [--dry-run]               copy core/, tools/ and profiles/ to another Herdr machine
@@ -4375,6 +4375,31 @@ def archive_cards(directory, args):
         print("Left in decisions/, changed while it was moved: {}".format(", ".join(back)))
 
 
+def open_cards(directory):
+    """{task id: the first open card's id} from decisions/ (by file name); archived cards are never open."""
+    out = {}
+    folder = os.path.join(directory, "decisions")
+    for name in sorted(os.listdir(folder)) if os.path.isdir(folder) else []:
+        if not name.endswith(".json"):
+            continue
+        card = read_json_safe(os.path.join(folder, name))
+        if isinstance(card, dict) and card.get("status") == "open" and isinstance(card.get("task"), str):
+            out.setdefault(card["task"], str(card.get("id") or name[:-5]))
+    return out
+
+
+# t-097 R18, R19, R21: the state each new move takes a task from and to, and the notice the Project Agent gets.
+TASK_MOVES = {"next": (("queued",), "in-progress", "only a queued task"),
+              "pause": (("in-progress", "investigating"), "queued", "only an in-progress or investigating task")}
+TASK_NOTICES = {
+    "next": "The person asked to start task {id} next: its next job goes first in the waiting list. Its after tasks, "
+            "cards and holds still apply; no worker was started.",
+    "pause": "The person paused task {id}: let its running workers finish their job; start no new job for it, and block "
+             "its waiting jobs (\"paused by the person\"), until they start it again.",
+    "unpause": "The person unpaused task {id}: unblock its waiting jobs paused by the person; its turn comes at its place "
+               "in the task order."}
+
+
 def cmd_task(args):
     """The person's own changes to tasks, from the panel or a terminal. The orchestrator is told,
     so it re-reads the ledger instead of writing an old copy over the change.
@@ -4439,6 +4464,11 @@ def cmd_task(args):
             if not task:
                 raise Problem("no task {} in the ledger".format(args.task))
             before = task.get("state")
+            if args.action in ("done", "park", "pause", "next") and before == "needs-decision":  # t-097 R17
+                card = open_cards(directory).get(args.task)
+                if card:
+                    raise Problem("{} is waiting on decision {}. Answer {} first, or ask the Project Agent to withdraw it. "
+                                  "Nothing was changed.".format(args.task, card, card))
             if args.action == "delete":
                 terms = live_terminals() or {}
                 busy = [w.get("address") for w in task.get("workers") or [] if w.get("address") in terms]
@@ -4463,6 +4493,23 @@ def cmd_task(args):
                     note = "Its worktree {} was left in place.".format(trees[0]["given"])
                 elif trees:
                     note = "Its worktrees were left in place: {}.".format(", ".join("{} ({})".format(w["given"], w["job"]) for w in trees))
+            elif args.action in TASK_MOVES:
+                sources, after, only = TASK_MOVES[args.action]
+                if before not in sources:
+                    raise Problem("{} is {}; pa-task {} moves {}. Nothing was changed.".format(args.task, before, args.action, only))
+                task["state"], task["updated"] = after, stamp
+                if args.action == "next":
+                    task.pop("paused", None)
+                else:
+                    task["paused"] = {"at": stamp, "by": "person"}
+            elif args.action == "unpause":
+                if not task.get("paused"):
+                    print("{} is not paused.".format(args.task))
+                    return
+                after = before
+                task.pop("paused", None)
+                task["updated"] = stamp
+                note = "It is no longer paused."
             else:
                 after = {"done": "done", "park": "parked", "reopen": "queued"}[args.action]
                 if before == after:
@@ -4482,8 +4529,10 @@ def cmd_task(args):
         print("(The Project Agent is not running; it reads the ledger when it starts.)")
     else:
         try:
-            call(["hc", "send", agent["terminal"], "The person changed task {} from {} to {} in the panel. Re-read ledger.json before you "
-                  "write it again, and do not undo this.".format(args.task, before, after)])
+            notice = TASK_NOTICES[args.action].format(id=args.task) if args.action in TASK_NOTICES else (
+                "The person changed task {} from {} to {} in the panel. Re-read ledger.json before you "
+                "write it again, and do not undo this.".format(args.task, before, after))
+            call(["hc", "send", agent["terminal"], notice])
         except Problem:
             print("(The Project Agent could not be told right now; it reads the ledger on its next pass.)")
 
@@ -4761,11 +4810,14 @@ def main():
         return cmd_doctor(parser.parse_args())
     if kind == "pa-task":
         parser.description = ("list: tasks with their evidence size, and the trash. done / park / reopen <id>: change a task's state. "
+                              "next <id>: a queued task to in-progress (start it next; no worker is started). pause <id>: an "
+                              "in-progress or investigating task to queued, marked paused (nothing is stopped). unpause <id>: clear "
+                              "the mark. A needs-decision task with an open card is not marked done, parked, paused or started. "
                               "delete <id>: move the task, its evidence and its decision cards to the trash. restore <id>: bring it back. "
                               "purge [<id>]: permanently delete what is in the trash. archive [--days N] [--dry-run]: move answered and withdrawn "
                               "decision cards older than N days (default 14) to decisions-archive/; open cards and the cards of a task that is not "
                               "done or parked stay; nothing is deleted.")
-        parser.add_argument("action", choices=("list", "done", "reopen", "park", "delete", "restore", "purge", "archive"))
+        parser.add_argument("action", choices=("list", "done", "reopen", "park", "next", "pause", "unpause", "delete", "restore", "purge", "archive"))
         parser.add_argument("task", nargs="?")
         parser.add_argument("--space")
         parser.add_argument("--days", type=float, default=ARCHIVE_DAYS, help="archive: cards answered more than this many days ago (default {})".format(ARCHIVE_DAYS))

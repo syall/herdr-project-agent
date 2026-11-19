@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Worker places, the Project Agent's waiting list and the person's start order (t-083 J1). Python standard library
-only (3.7+).
+"""Worker places, the Project Agent's waiting list, the person's start order (t-083 J1) and the task order (t-097 J1).
+Python standard library only (3.7+).
 
   pa-places show [--json]                     places with their limits and holders, then the waiting list
   pa-places next [--json]                     the waiting jobs in effective order, each `start` or why not
   pa-places limits [--json]                   the limits per kind, the rule each comes from, ignored values
+  pa-places tasks [--json]                    the task ranking (the person's task order over the Project Agent's)
   pa-places add <task> --job J --kind K --role R [--source pa|queue] [--blocked-by LINE]   wait at the end
   pa-places block <id> --why LINE | unblock <id> | drop <id> --why LINE
   pa-places start <id> --worker ADDR          take it off the list; prints the place to record in the ledger
@@ -16,8 +17,9 @@ stay within `working`; all holders within `working` + `no-test`; suite holders w
 
 waiting.json, in the space's state folder, is written by this tool only, under <state>/.places.lock, whole (temp file
 and rename); each change appends one journal line ("trigger": "places"). Workers' shells are refused the writes.
-start-order.json is the person's (the panel writes it); rules.json is the person's: this tool reads both and writes
-neither. The hold: the last journal line with a "hold" key ("on" or "off") decides; when that cannot be told,
+start-order.json and task-order.json are the person's (the panel writes them); rules.json is the person's: this tool
+reads them and writes none of them. The waiting list's movable jobs follow their task's place in the task ranking
+(task-order.json over the ledger's taskOrder, then created order); the start order's pins then move single jobs. The hold: the last journal line with a "hold" key ("on" or "off") decides; when that cannot be told,
 `hold unknown` and nothing starts.
 """
 import argparse
@@ -25,6 +27,7 @@ import contextlib
 import fcntl
 import json
 import os
+import re
 import sys
 import time
 
@@ -34,6 +37,7 @@ import pa_hooks  # noqa: E402
 
 WAITING_FILE = "waiting.json"
 ORDER_FILE = "start-order.json"
+TASK_ORDER_FILE = "task-order.json"
 RULES_FILE = "rules.json"
 LOCK_FILE = ".places.lock"
 LOCK_WAIT = 30  # seconds a write command waits for another one
@@ -42,8 +46,16 @@ DEFAULTS = {"working": 4, "no-test": 0, "suite": None}  # suite None: no cap bey
 SOURCES = ("pa", "queue")
 ORDER_WHY = {"missing": "no start order yet", "empty": "start-order.json is empty",
              "not-json": "start-order.json is not JSON", "not-object": "start-order.json is not a JSON object",
-             "version": "start-order.json is not version 1",
-             "order": "start-order.json's order is not a list of job ids"}
+             "version": "start-order.json is not version 1 or 2",
+             "order": "start-order.json's order is not a list of job ids",
+             "pins": "start-order.json's pins are not a list of {id, slot}"}
+TASK_ORDER_WHY = {"empty": "task-order.json is empty", "not-json": "task-order.json is not JSON",
+                  "not-object": "task-order.json is not a JSON object", "version": "task-order.json is not version 1",
+                  "order": "task-order.json's order is not a list of task ids",
+                  "last": "task-order.json's last is not a list of task ids"}
+RANKED = ("in-progress", "investigating", "review", "queued")  # their sections show ranks and move buttons
+HIDDEN = ("needs-decision", "parked")  # in the ranking with a hidden rank: no number, no buttons, no jobs for parked
+MOVES = ("up", "down", "top", "bottom")
 HOLD_WHY = {"on": "hold on", "unknown": "hold unknown", "no-terminals": "terminal list unavailable"}
 LABEL = {"working": "working", "no-test": "no-test extra", "suite": "suite"}
 
@@ -84,24 +96,35 @@ def limits_from(doc):
     return limits, sources, notes
 
 
+def strings(value):
+    return isinstance(value, list) and all(isinstance(i, str) for i in value)
+
+
 def read_order(text):
-    """(order ids, error code or None, why or None) from start-order.json's text (None: no file)."""
+    """(start, error code or None, why or None) from start-order.json's text (None: no file). start, when readable:
+    {"version": 1, "order": [job ids]} (t-083's whole list) or {"version": 2, "pins": [{id, slot}]} (t-097 R10)."""
     if text is None:
-        return [], "missing", ORDER_WHY["missing"]
+        return None, "missing", ORDER_WHY["missing"]
     if not text.strip():
-        return [], "empty", ORDER_WHY["empty"]
+        return None, "empty", ORDER_WHY["empty"]
     try:
         doc = json.loads(text)
     except ValueError:
-        return [], "not-json", ORDER_WHY["not-json"]
+        return None, "not-json", ORDER_WHY["not-json"]
     if not isinstance(doc, dict):
-        return [], "not-object", ORDER_WHY["not-object"]
-    if doc.get("version") != 1 or isinstance(doc.get("version"), bool):
-        return [], "version", ORDER_WHY["version"]
-    order = doc.get("order")
-    if not isinstance(order, list) or not all(isinstance(i, str) for i in order):
-        return [], "order", ORDER_WHY["order"]
-    return order, None, None
+        return None, "not-object", ORDER_WHY["not-object"]
+    version = doc.get("version")
+    if isinstance(version, bool) or version not in (1, 2):
+        return None, "version", ORDER_WHY["version"]
+    if version == 1:
+        if not strings(doc.get("order")):
+            return None, "order", ORDER_WHY["order"]
+        return {"version": 1, "order": doc["order"]}, None, None
+    pins = doc.get("pins")
+    if not isinstance(pins, list) or not all(isinstance(p, dict) and isinstance(p.get("id"), str) and whole(p.get("slot"))
+                                             for p in pins):
+        return None, "pins", ORDER_WHY["pins"]
+    return {"version": 2, "pins": [{"id": p["id"], "slot": p["slot"]} for p in pins]}, None, None
 
 
 def order_line(code):
@@ -112,19 +135,186 @@ def order_line(code):
     return "start order unreadable: {}; the Project Agent's order is used".format(ORDER_WHY[code])
 
 
-def effective_order(jobs, order):
-    """The jobs in effective order: queue jobs keep their index; the movable slots take the movable jobs the
-    person's order names, in that order, then the others in the Project Agent's order. Unknown ids are ignored."""
+def job_task(j):
+    return j.get("task") if isinstance(j.get("task"), str) else j["id"].partition("/")[0]
+
+
+def effective_order(jobs, start, rank=None):
+    """The jobs in effective order (t-097 R9, R10). Queue jobs keep their index. The movable jobs are sorted by their
+    task's place in `rank` (the ranked task ids, top first; one task's jobs and the jobs of unranked tasks keep their
+    added order, unranked after ranked); then the start order's pins apply oldest first, each taking its job out and
+    putting it at `slot` among the movable jobs (clamped to the end; a pin whose job is not a waiting movable job is
+    ignored). A version 1 start order is read as pins 0, 1, 2 ... over its ids that are waiting, so it keeps t-083's
+    meaning (those jobs first, in its order, then the others)."""
     movable = [j for j in jobs if j.get("source") != "queue"]
-    by_id = {j["id"]: j for j in movable}
-    ordered, seen = [], set()
-    for i in order:
-        if i in by_id and i not in seen:
-            seen.add(i)
-            ordered.append(by_id[i])
-    ordered += [j for j in movable if j["id"] not in seen]
-    it = iter(ordered)
+    if rank:
+        place = {}
+        for k, tid in enumerate(rank):
+            place.setdefault(tid, k)
+        movable.sort(key=lambda j: place.get(job_task(j), len(place)))  # stable
+    waiting = {j["id"] for j in movable}
+    if start and start.get("version") == 1:
+        named = []
+        for i in start["order"]:
+            if i in waiting and i not in named:
+                named.append(i)
+        pins = [(i, k) for k, i in enumerate(named)]
+    else:
+        pins = [(p["id"], p["slot"]) for p in (start or {}).get("pins") or []]
+    for i, slot in pins:
+        at = next((k for k, j in enumerate(movable) if j["id"] == i), None)
+        if at is None:
+            continue
+        j = movable.pop(at)
+        movable.insert(min(slot, len(movable)), j)
+    it = iter(movable)
     return [j if j.get("source") == "queue" else next(it) for j in jobs]
+
+
+# ---- pure: the person's task order (the shared cases in tests/samples/task-order-cases.json) ---------------------
+
+def read_task_order(text):
+    """(doc, error code or None, why or None) from task-order.json's text (None: no file; t-097 R1, R2). doc, when
+    readable: {order, last, updated}; an unreadable file gives None: nothing of it is used, never the readable part."""
+    if text is None:
+        return None, "missing", None
+    if not text.strip():
+        return None, "empty", TASK_ORDER_WHY["empty"]
+    try:
+        doc = json.loads(text)
+    except ValueError:
+        return None, "not-json", TASK_ORDER_WHY["not-json"]
+    if not isinstance(doc, dict):
+        return None, "not-object", TASK_ORDER_WHY["not-object"]
+    if doc.get("version") != 1 or isinstance(doc.get("version"), bool):
+        return None, "version", TASK_ORDER_WHY["version"]
+    if not strings(doc.get("order")):
+        return None, "order", TASK_ORDER_WHY["order"]
+    last = doc.get("last", [])
+    if not strings(last):
+        return None, "last", TASK_ORDER_WHY["last"]
+    updated = doc.get("updated") if isinstance(doc.get("updated"), str) else None
+    return {"order": doc["order"], "last": last, "updated": updated}, None, None
+
+
+def task_order_line(code):
+    """The order line both sides say (R2); None when readable (each side words its own: the person's / yours)."""
+    if code is None:
+        return None
+    if code == "missing":
+        return "order: the Project Agent's"
+    return "task order unreadable: {}; the Project Agent's order is used".format(TASK_ORDER_WHY[code])
+
+
+def id_key(tid):
+    """Task ids by number: t-9 before t-10."""
+    return [int(p) if p.isdigit() else p for p in re.split(r"(\d+)", tid)]
+
+
+def task_order_parts(task_order):
+    """(order ids, chat entries, shape ok) from the ledger's taskOrder; anything not of its shape counts as empty."""
+    if task_order is None:
+        return [], [], True
+    if not isinstance(task_order, dict):
+        return [], [], False
+    order, chat = task_order.get("order", []), task_order.get("chat", [])
+    ok = isinstance(order, list) and isinstance(chat, list)
+    order = [i for i in order if isinstance(i, str)] if isinstance(order, list) else []
+    chat = [e for e in chat if isinstance(e, dict) and isinstance(e.get("task"), str)] if isinstance(chat, list) else []
+    return order, chat, ok
+
+
+def effective_tasks(tasks, task_order, doc):
+    """The task ranking, top first (t-097 R3): [{id, state, source, quote?}]. tasks: the ledger's; task_order: its
+    taskOrder; doc: read_task_order's doc (None: no file or unreadable, J1-D2). Ranked: the ranked and hidden-rank
+    states. Chat entries that apply (over == the file's updated, null for no file), the file's order, the Project
+    Agent's (taskOrder.order, then created oldest first, undated after, then id by number), the file's last."""
+    by_id = {}
+    for t in tasks or []:
+        if isinstance(t, dict) and isinstance(t.get("id"), str) and t.get("state") in RANKED + HIDDEN:
+            by_id.setdefault(t["id"], t)
+    out, placed = [], set()
+
+    def put(tid, source, quote=None):
+        if tid in by_id and tid not in placed:
+            placed.add(tid)
+            r = {"id": tid, "state": by_id[tid]["state"], "source": source}
+            if source == "chat":
+                r["quote"] = quote
+            out.append(r)
+
+    order, chat, _ok = task_order_parts(task_order)
+    updated = doc["updated"] if doc else None
+    for e in chat:
+        if e.get("over") == updated:
+            put(e["task"], "chat", e.get("quote"))
+    for tid in (doc or {}).get("order", []):
+        put(tid, "person")
+    last = set((doc or {}).get("last", []))
+    for tid in order:
+        if tid not in last:
+            put(tid, "agent")
+    dated = lambda t: isinstance(t.get("created"), str)
+    rest = sorted((t for t in by_id.values() if t["id"] not in placed and t["id"] not in last),
+                  key=lambda t: (not dated(t), t["created"] if dated(t) else "", id_key(t["id"])))
+    for t in rest:
+        put(t["id"], "agent")
+    for tid in (doc or {}).get("last", []):
+        put(tid, "person")
+    return out
+
+
+def move_task(ranking, section, tid, move, order, last):
+    """The reference for the panel's moveTask (t-097 R7, J1-D1; no command uses it): the new {order, last} after a
+    move of task `tid` in the section of state `section`, or None for a no-op. ranking: [{id, state, source}], top
+    first; order, last: the readable file's (empty when there is none). The neighbour is the nearest task of the same
+    state; other tasks keep their places. up/down/top write the ranking from the top down to the lower moved place
+    into order (the person's ids below stay after it, last keeps only the ids below it); bottom sends the task to the
+    end of last. Every write also puts the chat tasks at the top into order (R12). Pure: the inputs are not changed."""
+    ids = [r["id"] for r in ranking]
+    if tid not in ids or section in HIDDEN or section not in RANKED:
+        return None
+    i = ids.index(tid)
+    if ranking[i]["state"] != section:
+        return None
+    same = [k for k, r in enumerate(ranking) if r["state"] == section]
+    pos = same.index(i)
+    seq = list(ids)
+    chats = sum(1 for r in ranking if r["source"] == "chat")
+    if move == "up" or move == "top":
+        if pos == 0:
+            return None
+        if move == "up":
+            j = same[pos - 1]
+            seq[i], seq[j] = seq[j], seq[i]
+            end = i
+        else:
+            end = same[0]
+            seq.insert(end, seq.pop(i))
+    elif move == "down" or move == "bottom":
+        if pos == len(same) - 1:
+            return None
+        if move == "down":
+            j = same[pos + 1]
+            seq[i], seq[j] = seq[j], seq[i]
+            end = j
+        else:
+            seq.pop(i)
+            end = -1
+    else:
+        return None
+    prefix = seq[:max(end, chats - 1) + 1] if move != "bottom" else [x for x in ids[:chats] if x != tid]
+    new_order = list(prefix)
+    for x in order:
+        if x not in new_order and not (move == "bottom" and x == tid):
+            new_order.append(x)
+    new_last = []
+    for x in last:
+        if x not in prefix and x not in new_last and x != (tid if move == "bottom" else None):
+            new_last.append(x)
+    if move == "bottom":
+        new_last.append(tid)
+    return {"order": new_order, "last": new_last}
 
 
 def counts(holders):
@@ -282,12 +472,20 @@ class State:
         self.directory = directory
         self.waiting = load_waiting(directory)
         self.limits, self.sources, self.notes = load_rules(directory)
-        self.order, self.order_error, _ = read_order(read_text(os.path.join(directory, ORDER_FILE)))
+        self.start, self.order_error, _ = read_order(read_text(os.path.join(directory, ORDER_FILE)))
+        ledger = pa_hooks.read_ledger(directory)
+        ledger = ledger if isinstance(ledger, dict) else {}
+        self.tasks = [t for t in ledger.get("tasks") or [] if isinstance(t, dict)] if isinstance(ledger.get("tasks"), list) else []
+        self.task_order_doc, self.task_order_error, _ = read_task_order(read_text(os.path.join(directory, TASK_ORDER_FILE)))
+        self.task_order = ledger.get("taskOrder")
+        if not task_order_parts(self.task_order)[2]:
+            self.notes = self.notes + ["ledger taskOrder is not {order, chat}; ignored"]
+        self.ranking = effective_tasks(self.tasks, self.task_order, self.task_order_doc)
         live = pa.live_terminals()
         self.terminals = live is not None
-        self.holders = holders_from(pa_hooks.read_ledger(directory), live or {}, skip)
+        self.holders = holders_from(ledger, live or {}, skip)
         self.hold = hold_state(read_text(os.path.join(directory, "journal.jsonl"))) if self.terminals else "no-terminals"
-        self.jobs = effective_order(self.waiting["jobs"], self.order)
+        self.jobs = effective_order(self.waiting["jobs"], self.start, [r["id"] for r in self.ranking])
         self.reasons = allocate(self.jobs, self.limits, [h["place"] for h in self.holders], self.hold)
         for r in self.reasons:
             if r["action"] == "hold":
@@ -519,14 +717,54 @@ def cmd_limits(args):
     return 0
 
 
-COMMANDS = {"show": cmd_show, "next": cmd_next, "limits": cmd_limits, "add": cmd_add, "block": cmd_block,
-            "unblock": cmd_unblock, "drop": cmd_drop, "start": cmd_start}
+def task_rows(st):
+    """One row per ranked task (R24): rank (its place in the whole ranking), id, state, source, paused, the after
+    tasks not done (an id not in the ledger counts as not done), its first open card, hidden, quote."""
+    states = {t.get("id"): t.get("state") for t in st.tasks}
+    by_id = {}
+    for t in st.tasks:
+        by_id.setdefault(t.get("id"), t)
+    cards = pa.open_cards(st.directory)
+    rows = []
+    for k, r in enumerate(st.ranking, 1):
+        t = by_id[r["id"]]
+        after = t.get("after") if isinstance(t.get("after"), list) else []
+        rows.append({"rank": k, "id": r["id"], "state": r["state"], "source": r["source"], "paused": bool(t.get("paused")),
+                     "after": [a for a in after if isinstance(a, str) and states.get(a) != "done"],
+                     "card": cards.get(r["id"]), "hidden": r["state"] in HIDDEN, "quote": r.get("quote")})
+    return rows
+
+
+def cmd_tasks(args):
+    st = State(space(args))
+    rows = task_rows(st)
+    line = task_order_line(st.task_order_error)
+    if args.json:
+        updated = st.task_order_doc["updated"] if st.task_order_doc else None
+        print(json.dumps({"order": {"error": st.task_order_error, "line": line, "updated": updated},
+                          "notes": [n for n in st.notes if n.startswith("ledger taskOrder")], "tasks": rows}, indent=2))
+        return 0
+    out = [line or "order: the person's"]
+    out += [n for n in st.notes if n.startswith("ledger taskOrder")]
+    if not rows:
+        out.append("no ranked tasks")
+    for r in rows:
+        extra = (["paused"] if r["paused"] else []) + (["waits for {} (after)".format(", ".join(r["after"]))] if r["after"] else [])
+        extra += (["card " + r["card"]] if r["card"] else []) + (["hidden rank"] if r["hidden"] else [])
+        extra += (['"{}"'.format(r["quote"])] if r["source"] == "chat" and r["quote"] else [])
+        out.append("{}. {} {} {}".format(r["rank"], r["id"], r["state"], r["source"]) + "".join(" · " + x for x in extra))
+    print("\n".join(out))
+    return 0
+
+
+COMMANDS = {"show": cmd_show, "next": cmd_next, "limits": cmd_limits, "tasks": cmd_tasks, "add": cmd_add,
+            "block": cmd_block, "unblock": cmd_unblock, "drop": cmd_drop, "start": cmd_start}
 
 
 def parser():
-    p = argparse.ArgumentParser(prog="pa-places", description="Worker places and the waiting list of a space (t-083).")
+    p = argparse.ArgumentParser(prog="pa-places", description="Worker places, the waiting list and the task order of a space (t-083, t-097).")
     sub = p.add_subparsers(dest="command")
-    for name in ("show", "next", "limits"):
+    for name in ("show", "next", "limits", "tasks"):
         s = sub.add_parser(name)
         s.add_argument("--json", action="store_true")
         s.add_argument("--space")

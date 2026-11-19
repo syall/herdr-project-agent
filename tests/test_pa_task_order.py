@@ -262,7 +262,7 @@ class Unchanged(TaskBase):  # R6, R20, R1: the order file is never written; done
         self.ok("pause", "t-1")
         self.ok("park", "t-1")
         self.ok("reopen", "t-1")
-        self.assertEqual(raw(path), text)
+        self.assertEqual(raw(path), text.encode())
 
     def test_done_park_reopen_as_today(self):
         self.task("in-progress")
