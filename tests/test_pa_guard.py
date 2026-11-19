@@ -929,7 +929,13 @@ D7_ALLOWED = ["pa-costs prices", "pa-costs prices --space sp1", "pa-costs report
               "python3 -m tests.test_pa_costs prices fetch", "python3 -m unittest tests.test_pa_costs.T070_Net",
               "python3 -m mypa_costs prices fetch", "python3 -m pa_costs_x prices fetch",
               "python3 -m tools.pa_costs prices --space sp1", "python3 -c 'import pa_costs; print(pa_costs.__file__)'",
-              "python3 -c 'print(1)' prices fetch", "python3 -m json.tool prices fetch"]
+              "python3 -c 'print(1)' prices fetch", "python3 -m json.tool prices fetch",
+              # t-070 J2 round 4 (REVIEW J2 round 3 M1): a quoted word holding a newline is judged, not an exception
+              "git commit -m 't-070: line one\n\nline two'", "hc send t1dr 'done\nsee REVIEW.md'",
+              "python3 -c 'import os\nprint(os.getcwd())'", "python3 -c 'import pa_costs\nprint(pa_costs.__file__)'"]
+D7_NEWLINE_FORMS = ["python3 -m pa_costs 'a\nb' prices fetch", "python3 -m tools.pa_costs prices fetch -x 'one\ntwo'",
+                    "git commit -m 'a\nb' && python3 -mpa_costs prices fetch",
+                    "python3 -c 'import pa_costs\npa_costs.main()' prices fetch"]
 
 
 class T070Prices(GuardTest):
@@ -943,6 +949,11 @@ class T070Prices(GuardTest):
         for line in D7_ALLOWED:
             with self.subTest(line=line):
                 self.assertIsNone(self.check(line))
+
+    def test_d7_newline_forms(self):  # t-070 J2 round 4: still refused when another word holds a newline
+        for line in D7_NEWLINE_FORMS:
+            with self.subTest(line=line):
+                self.assertIn(D7.split("{}")[1], str(self.check(line)))  # D7's text after the line shown
 
 
 if __name__ == "__main__":
