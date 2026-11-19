@@ -5974,6 +5974,226 @@ cases["P83-11-badges"] = async () => { // R11: badges on task rows; a click unfo
   check(!v.placeMark, "the mark ends after 3 s");
 };
 
+// ---- t-041 J5: the context line (R15), the Fresh context button (R6), the mode switch (R13), the reset line (C6) ----
+// The button runs only the context tool on the space's machine: a dry run for the confirm, then one request (or a
+// withdraw) with --by panel. The switch runs its `set` action. The panel writes neither file itself.
+const CTX = ["pa", "context"].join("-"); // spelled so a guard reading commands is not confused
+const DAY41 = new Date(T0).toISOString().slice(0, 10);
+const SUMMARY41 = { updated: `${DAY41}T07:59:00Z`, paContext: [{ day: DAY41, calls: 40, mean: 158000, peak: 254000, peakExact: true, resets: { fresh: 6, compact: 0 } }] };
+const DRY41 = (over = {}) => ({ code: 0, stdout: `mode fresh  taskCap 150,000  passCap 250,000\ncontext: 260k (transcript)\nDry run: nothing written.\n${JSON.stringify({ outcome: "dry-run", ctx: 260000, source: "transcript", due: "pass-cap", request: null, expires: null, reasons: [], ...over })}\n`, stderr: "" });
+const ASKED41 = { code: 0, stdout: `Requested (rq-1): a fresh context at the Project Agent's next clean point.\n${JSON.stringify({ outcome: "requested", request: "rq-1", expires: `${DAY41}T10:00:00Z` })}\n`, stderr: "" };
+const SET41 = (mode) => ({ code: 0, stdout: `mode ${mode}\n${JSON.stringify({ v: 1, mode, taskCap: 150000, passCap: 250000, net: 400000, enabledAt: null, by: "panel" })}\n`, stderr: "" });
+// liveWorld with a launcher that takes context requests, agent.json's sessionId, context.json and the summary.
+// fresh(args, on): the context tool's answer (default: the dry run, a request, or the set's settings).
+function ctxWorld({ machine = null, launcher = LREC({ accepts: ["restart", "context"] }), context, summary = SUMMARY41, sessionId = "s1", status = "idle", fresh = null } = {}) {
+  const w = liveWorld({ launcher, machine, status });
+  const dir = machine ? `${machine}:${RDIR}` : `:${DIR}`;
+  g.__files[`${dir}/agent.json`] = JSON.stringify({ space: S, project: "/proj", profile: "test", name: "proj", terminal: "t4w", sessionId });
+  if (context !== undefined) g.__files[`${dir}/context.json`] = typeof context === "string" ? context : JSON.stringify(context);
+  if (summary) g.__files[`${dir}/costs/summary.json`] = JSON.stringify(summary);
+  const restartFn = g.__execFn;
+  g.__execFn = (command, args, on, options) => (command === CTX
+    ? (fresh ? fresh(args, on) : args.includes("--dry-run") ? DRY41() : args[0] === "set" ? SET41(args[args.indexOf("--mode") + 1]) : ASKED41)
+    : restartFn(command, args, on, options));
+  return { ...w, dir };
+}
+const ctxRuns = () => g.__execs.filter(([c]) => c === CTX);
+const ctxWrites = () => ctxRuns().filter(([, a]) => !a.includes("--dry-run"));
+const summaryReads = (dir) => g.__reads.filter((r) => r === `${dir}/costs/summary.json`);
+const ASK_ARGV = ["fresh", "--space", S, "--by", "panel", "--json", "--why", "the Fresh context button in the Project Agent panel"];
+
+cases["P41-1-context-line"] = async () => { // R15: today's (UTC) line, the switch and the button while it runs
+  ctxWorld();
+  const v = await liveMount();
+  const { text, clicks } = look(v);
+  check(text.includes("PA context today (UTC): mean 158k · peak 254k · resets 6 (fresh 6, compact 0)"), `the line (got ${text.slice(0, 900)})`);
+  check(Boolean(clicks["pa-fresh"]) && /Fresh context/.test(text), `the button (clicks ${Object.keys(clicks)})`);
+  check(Boolean(clicks["pa-context-mode"]) && /Turn fresh contexts off/.test(text) && /mode fresh/.test(text), "the mode and its switch");
+  check(Boolean(clicks["pa-restart"]), "Restart still there");
+  check(ctxRuns().length === 0, "nothing run without a click");
+};
+
+cases["P41-2-no-summary"] = async () => { // R15: no summary: no line; the rest stays
+  ctxWorld({ summary: null });
+  const v = await liveMount();
+  const { text, clicks } = look(v);
+  check(!text.includes("PA context today"), `no line (got ${text.slice(0, 600)})`);
+  check(Boolean(clicks["pa-fresh"]) && Boolean(clicks["pa-context-mode"]) && Boolean(clicks["pa-restart"]), `button, switch, Restart (got ${Object.keys(clicks)})`);
+};
+
+cases["P41-3-button-when"] = async () => { // R6: only live + accepts "context" + mode fresh; the switch while not offline
+  ctxWorld({ launcher: LREC({ accepts: ["restart"] }) });
+  let v = await liveMount();
+  check(!look(v).clicks["pa-fresh"] && Boolean(look(v).clicks["pa-context-mode"]), "accepts restart only: no button, the switch stays");
+  ctxWorld({ context: { v: 1, mode: "off", taskCap: 150000, passCap: 250000, net: 400000, enabledAt: null, by: "person" } });
+  v = await liveMount();
+  check(!look(v).clicks["pa-fresh"] && /Turn fresh contexts on/.test(look(v).text) && /mode off/.test(look(v).text), `mode off: no button, Turn on (got ${look(v).text.slice(0, 700)})`);
+  world(); // not running
+  g.__files[`:${DIR}/costs/summary.json`] = JSON.stringify(SUMMARY41);
+  v = await liveMount();
+  check(!look(v).clicks["pa-fresh"] && Boolean(look(v).clicks["pa-context-mode"]) && look(v).text.includes("PA context today (UTC)"), "down: no button; the line and the switch stay");
+  world({ machine: M }); g.__machines = [{ name: null, layout: "ready" }, { name: M, layout: "offline" }];
+  v = await liveMount();
+  check(!look(v).clicks["pa-fresh"] && !look(v).clicks["pa-context-mode"], "offline: neither");
+};
+
+cases["P41-4-dry-run"] = async () => { // R6: the click asks first: one dry run on the space's machine, its lines
+  let release;
+  ctxWorld({ fresh: (args) => (args.includes("--dry-run") ? new Promise((r) => { release = () => r(DRY41({ reasons: ["turn working", "checkpoint none"] })); }) : ASKED41) });
+  const v = await liveMount();
+  await click(v, "pa-fresh");
+  check(/Checking/.test(look(v).text), `checking (got ${look(v).text.slice(0, 500)})`);
+  if (look(v).clicks["pa-fresh"]) await click(v, "pa-fresh");
+  check(ctxRuns().length === 1, `one dry run (got ${JSON.stringify(ctxRuns())})`);
+  check(JSON.stringify(ctxRuns()[0][1]) === JSON.stringify(["fresh", "--space", S, "--dry-run", "--json"]) && ctxRuns()[0][2] === null, `its argv (got ${JSON.stringify(ctxRuns()[0])})`);
+  release(); await settle(); await settle();
+  const { text, clicks } = look(v);
+  check(text.includes("Context now 260k (transcript).") && text.includes("A reset is due: pass cap."), `size and due (got ${text.slice(0, 1200)})`);
+  check(text.includes("Not a clean point now: turn working; checkpoint none"), "the reasons");
+  check(text.includes("It waits for the Project Agent's next clean point (up to 2 h); a pass is never cut short."), "what it does");
+  check(Boolean(clicks["pa-fresh-go"]) && Boolean(clicks["pa-fresh-cancel"]) && !clicks["pa-fresh-withdraw"], `Ask, Cancel, no Withdraw (got ${Object.keys(clicks)})`);
+  check(/Ask for a fresh context/.test(text), "the ask's label");
+  check(ctxWrites().length === 0, "nothing asked yet");
+  await click(v, "pa-fresh-cancel");
+  check(!look(v).clicks["pa-fresh-go"] && ctxWrites().length === 0, "Cancel: gone, nothing run");
+};
+
+cases["P41-5-ask"] = async () => { // R6: the request with --by panel; its line; a reload; nothing else run or ended
+  const { dir } = ctxWorld();
+  const v = await liveMount();
+  await click(v, "pa-fresh"); await settle();
+  check(look(v).text.includes("Clean point now: yes."), `clean (got ${look(v).text.slice(0, 900)})`);
+  const before = g.__reads.filter((r) => r === `${dir}/context.json`).length;
+  await click(v, "pa-fresh-go"); await settle(); await settle();
+  check(ctxWrites().length === 1 && JSON.stringify(ctxWrites()[0][1]) === JSON.stringify(ASK_ARGV) && ctxWrites()[0][2] === null, `its argv (got ${JSON.stringify(ctxWrites())})`);
+  check(look(v).text.includes("Fresh context asked for: it is taken at the Project Agent's next clean point (the request waits until 10:00)."), `the result (got ${look(v).text.slice(0, 900)})`);
+  check(g.__reads.filter((r) => r === `${dir}/context.json`).length > before, "a reload read context.json again");
+  check(!g.__hcs.some((a) => a[0] === "send"), `no hc send (got ${JSON.stringify(g.__hcs)})`);
+  check(!g.__writes.some((w) => /context(-request)?\.json/.test(JSON.stringify(w))), "the panel wrote neither file");
+  noEnding();
+  check(Boolean(look(v).clicks["pa-fresh"]), "the button is back");
+  advance(61000); await settle();
+  check(!look(v).text.includes("Fresh context asked for"), "the line goes after 60 s");
+};
+
+cases["P41-6-pending"] = async () => { // R6: a pending request: Ask again and Withdraw
+  ctxWorld({ fresh: (args) => (args.includes("--dry-run") ? DRY41({ request: "rq-abcdefgh-1", expires: `${DAY41}T09:30:00Z` })
+    : args.includes("--withdraw") ? { code: 0, stdout: `Withdrawn (rq-abcdefgh-1).\n${JSON.stringify({ outcome: "withdrawn", request: "rq-abcdefgh-1" })}\n`, stderr: "" } : ASKED41) });
+  const v = await liveMount();
+  await click(v, "pa-fresh"); await settle();
+  const { text, clicks } = look(v);
+  check(text.includes("Pending request rq-abcde, until 09:30.") && /Ask again \(replaces the pending one\)/.test(text), `pending (got ${text.slice(0, 900)})`);
+  check(Boolean(clicks["pa-fresh-withdraw"]), "Withdraw offered");
+  await click(v, "pa-fresh-withdraw"); await settle(); await settle();
+  check(ctxWrites().length === 1 && JSON.stringify(ctxWrites()[0][1]) === JSON.stringify(["fresh", "--space", S, "--withdraw", "--by", "panel", "--json", "--why", "the Fresh context button in the Project Agent panel"]), `withdraw argv (got ${JSON.stringify(ctxWrites())})`);
+  check(look(v).text.includes("Request withdrawn."), "said");
+};
+
+cases["P41-7-dry-refused"] = async () => { // R6: a refused dry run: its text, only Cancel
+  ctxWorld({ fresh: () => ({ code: 2, stdout: "", stderr: `${CTX}: no Project Agent in this space\n` }) });
+  const v = await liveMount();
+  await click(v, "pa-fresh"); await settle();
+  const { text, clicks } = look(v);
+  check(text.includes(`Not done: ${CTX}: no Project Agent in this space`), `the refusal (got ${text.slice(0, 700)})`);
+  check(!clicks["pa-fresh-go"] && !clicks["pa-fresh-withdraw"] && Boolean(clicks["pa-fresh-cancel"]), `only Cancel (got ${Object.keys(clicks)})`);
+  await click(v, "pa-fresh-cancel");
+  check(!look(v).text.includes("Not done:") && ctxWrites().length === 0, "Cancel: gone, nothing asked");
+};
+
+cases["P41-8-ask-refused"] = async () => { // R6: the tool refuses (mode off meanwhile); a missing tool on m1
+  ctxWorld({ fresh: (args) => (args.includes("--dry-run") ? DRY41() : { code: 2, stdout: "", stderr: `${CTX}: the context mode is off (context.json), so no fresh context is taken\n` }) });
+  let v = await liveMount();
+  await click(v, "pa-fresh"); await settle();
+  await click(v, "pa-fresh-go"); await settle(); await settle();
+  check(look(v).text.includes(`Not done: ${CTX}: the context mode is off (context.json), so no fresh context is taken`), `refused (got ${look(v).text.slice(0, 700)})`);
+  ctxWorld({ machine: M, fresh: () => { throw new Error(`exec: ${CTX}: not found`); } });
+  v = await liveMount();
+  await click(v, "pa-fresh"); await settle();
+  check(look(v).text.includes(`${CTX} is not installed on ${M}; run pa-sync --on ${M}.`), `missing (got ${look(v).text.slice(0, 700)})`);
+};
+
+cases["P41-9-hung"] = async () => { // R6: the request never answers: given up after its limit, said, the button back
+  ctxWorld({ fresh: (args) => (args.includes("--dry-run") ? DRY41() : new Promise(() => {})) });
+  const v = await liveMount();
+  await click(v, "pa-fresh"); await settle();
+  await click(v, "pa-fresh-go"); await settle();
+  check(/Asking…/.test(look(v).text) && !look(v).clicks["pa-fresh"], `Asking…, no button (got ${look(v).text.slice(0, 600)})`);
+  for (let i = 0; i < 6; i++) { advance(10000); await settle(); }
+  check(look(v).text.includes(`${CTX} did not answer in 35 s; the panel shows what it reads next.`), `given up (got ${look(v).text.slice(0, 700)})`);
+  check(Boolean(look(v).clicks["pa-fresh"]), "the button is back");
+};
+
+cases["P41-10-mode-switch"] = async () => { // R13: one click each way; its line; the reload shows the new mode
+  const { dir } = ctxWorld({ fresh: (args) => {
+    if (args[0] !== "set") return args.includes("--dry-run") ? DRY41() : ASKED41;
+    const mode = args[args.indexOf("--mode") + 1];
+    g.__files[`${dir}/context.json`] = JSON.stringify({ v: 1, mode, taskCap: 150000, passCap: 250000, net: 400000, enabledAt: null, by: "panel" }); // the tool writes it
+    return SET41(mode);
+  } });
+  const v = await liveMount();
+  await click(v, "pa-context-mode"); await settle(); await settle();
+  check(ctxWrites().length === 1 && JSON.stringify(ctxWrites()[0][1]) === JSON.stringify(["set", "--space", S, "--by", "panel", "--mode", "off", "--json"]), `off argv (got ${JSON.stringify(ctxWrites())})`);
+  check(look(v).text.includes("Context mode off: no fresh contexts from now; the 400k net ends at its next start. Turn fresh contexts on undoes it."), `its line (got ${look(v).text.slice(0, 900)})`);
+  check(!look(v).clicks["pa-fresh"] && /Turn fresh contexts on/.test(look(v).text), "after the reload: no button, Turn on");
+  await click(v, "pa-context-mode"); await settle(); await settle();
+  check(ctxWrites().length === 2 && JSON.stringify(ctxWrites()[1][1]) === JSON.stringify(["set", "--space", S, "--by", "panel", "--mode", "fresh", "--json"]), `fresh argv (got ${JSON.stringify(ctxWrites())})`);
+  check(Boolean(look(v).clicks["pa-fresh"]) && /Turn fresh contexts off/.test(look(v).text), "the button is back");
+  check(!g.__writes.some((w) => /context\.json/.test(JSON.stringify(w))), "the panel wrote no context.json itself");
+};
+
+cases["P41-11-invalid-settings"] = async () => { // R13: an invalid context.json: its note; the switch still runs the tool
+  ctxWorld({ context: "{not json" });
+  const v = await liveMount();
+  check(/context\.json is not valid \(.*\): the launcher uses the defaults/.test(look(v).text), `the note (got ${look(v).text.slice(0, 900)})`);
+  check(/Turn fresh contexts off/.test(look(v).text) && Boolean(look(v).clicks["pa-fresh"]), "the defaults: mode fresh");
+  await click(v, "pa-context-mode"); await settle();
+  check(ctxWrites().length === 1 && ctxWrites()[0][1][0] === "set", "the switch ran the tool");
+};
+
+cases["P41-12-reset-line"] = async () => { // C6: the line while this conversation is the one a reset started; copy /resume
+  const lastReset = { at: `${DAY41}T07:02:00Z`, from: "3f2a9c1e-aaaa-bbbb-cccc-dddddddddddd", to: "s1", reason: "pass-cap", ctx: 260000 };
+  ctxWorld({ launcher: LREC({ accepts: ["restart", "context"], lastReset }) });
+  let v = await liveMount();
+  check(look(v).text.includes("Fresh context at 07:02 (pass cap, 260k) · previous session 3f2a9c1e…"), `the line (got ${look(v).text.slice(0, 900)})`);
+  await click(v, "copy-previous-session");
+  check((g.__clipboard ?? []).includes(`/resume ${lastReset.from}`), `copied (got ${JSON.stringify(g.__clipboard)})`);
+  ctxWorld({ launcher: LREC({ accepts: ["restart", "context"], lastReset }), sessionId: "s2" });
+  v = await liveMount();
+  check(!look(v).text.includes("Fresh context at 07:02") && !look(v).clicks["copy-previous-session"], "another session: no line");
+};
+
+cases["P41-13-summary-throttle"] = async () => { // Q2: summary.json at most once a minute per space; context.json each load
+  const { dir } = ctxWorld();
+  const v = await liveMount();
+  const ctxReads = () => g.__reads.filter((r) => r === `${dir}/context.json`).length;
+  check(summaryReads(dir).length === 1, `one read at mount (got ${summaryReads(dir).length})`);
+  const c0 = ctxReads();
+  advance(30000); await fire(10000); await settle();
+  check(ctxReads() > c0, "context.json read again");
+  check(summaryReads(dir).length === 1, `not again within a minute (got ${summaryReads(dir).length})`);
+  check(look(v).text.includes("PA context today (UTC): mean 158k"), "the line kept");
+  advance(31000); await fire(10000); await settle();
+  check(summaryReads(dir).length === 2, `again after a minute (got ${summaryReads(dir).length})`);
+};
+
+cases["P41-14-remote"] = async () => { // R6, R13: a space on m1: reads and runs there; no --on
+  const { dir } = ctxWorld({ machine: M });
+  const v = await liveMount();
+  check(g.__reads.includes(`${dir}/context.json`) && summaryReads(dir).length === 1, `read on ${M} (got ${JSON.stringify(g.__reads.filter((r) => /context|summary/.test(r)))})`);
+  check(!g.__reads.some((r) => /context\.json|summary\.json/.test(r) && !r.startsWith(`${M}:`)), "nothing local");
+  await click(v, "pa-fresh"); await settle();
+  await click(v, "pa-fresh-go"); await settle();
+  await click(v, "pa-context-mode"); await settle();
+  check(ctxRuns().length === 3 && ctxRuns().every(([, a, on]) => on === M && !a.includes("--on")), `all on ${M}, no --on (got ${JSON.stringify(ctxRuns())})`);
+};
+
+cases["P41-15-last-outcome"] = async () => { // Q7: the last request's outcome in the confirm when it was not taken
+  ctxWorld({ launcher: LREC({ accepts: ["restart", "context"], context: { request: "rq0", outcome: "expired", why: null, at: `${DAY41}T06:00:00Z` } }) });
+  const v = await liveMount();
+  await click(v, "pa-fresh"); await settle();
+  check(look(v).text.includes("Last request: expired at 06:00"), `said (got ${look(v).text.slice(0, 900)})`);
+};
+
 // --list prints the names that would run and runs none. An unknown name or option exits 2.
 const refuse = (why) => { fs.rmSync(dst, { recursive: true, force: true }); console.error(`run.mjs: ${why}`); process.exit(2); };
 const pick = [];

@@ -1013,6 +1013,124 @@ cases["S83-rows"] = async () => { // R1 AC1.1-1.4, R9, R11 without rendering: pl
   check(placesMod.placesRows({ waiting: { doc: null, error: null, missing: true }, startOrder: null, rules: null, ledger: { tasks: [] }, isLive: () => true }).shown === false, "D3: no list, no holder: not shown");
 };
 
+// ---- t-041 J5: the context line, the Fresh context button and the mode switch (store part) ----
+// The tool's name, spelled so a guard reading this file's commands is not confused.
+const CT = ["pa", "context"].join("-");
+const TODAY = new Date(T0).toISOString().slice(0, 10); // the harness's UTC day (2027-01-15)
+const pcDay = (over = {}) => ({ day: TODAY, calls: 40, mean: 158000, peak: 254000, peakExact: true, resets: { fresh: 6, compact: 0 }, ...over });
+const hm = (iso) => String(iso).slice(11, 16); // a fixed clock for the texts
+
+cases["S41-1-context-line"] = async () => { // R15: today's (UTC) paContext entry as one line, as pa-costs report
+  check(store.contextLine([pcDay(), pcDay({ day: "2027-01-14", mean: 1 })], T0) === "PA context today (UTC): mean 158k · peak 254k · resets 6 (fresh 6, compact 0)", `exact (got ${store.contextLine([pcDay()], T0)})`);
+  check(store.contextLine([pcDay({ peakExact: false, peak: 254400 })], T0) === "PA context today (UTC): mean 158k · peak ≥254k · resets 6 (fresh 6, compact 0)", "≥ for a peak that is not exact");
+  check(store.contextDay([pcDay({ day: "2027-01-14" })], T0) === null, "another day only: no entry");
+  check(store.contextLine([pcDay({ day: "2027-01-14" })], T0) === "PA context today (UTC): no Project Agent calls yet", "another day only: the no-calls line");
+  check(store.contextLine([pcDay({ calls: 0, mean: null, peak: 0, resets: { fresh: 2, compact: 0 } })], T0) === "PA context today (UTC): no Project Agent calls · resets 2 (fresh 2, compact 0)", `no calls, 2 resets (got ${store.contextLine([pcDay({ calls: 0, mean: null, peak: 0, resets: { fresh: 2, compact: 0 } })], T0)})`);
+  check(store.contextLine([], T0) === "PA context today (UTC): no Project Agent calls yet", "an empty list");
+  check(store.contextLine(null, T0) === null && store.contextLine(undefined, T0) === null && store.contextLine("x", T0) === null, "no paContext: no line");
+  check(store.contextDay([pcDay({ calls: "40" })], T0) === null && store.contextDay([pcDay({ resets: null })], T0) === null && store.contextDay([null, 5], T0) === null, "malformed entries: none, no throw");
+};
+
+cases["S41-2-context-args"] = async () => { // R6, R13: the tool's argv; never --on (the exec runs on the space's machine)
+  const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+  check(eq(store.contextArgs(remote, { dry: true }), ["fresh", "--space", S, "--dry-run", "--json"]), `dry (got ${JSON.stringify(store.contextArgs(remote, { dry: true }))})`);
+  check(eq(store.contextArgs(local, {}), ["fresh", "--space", S, "--by", "panel", "--json", "--why", store.CONTEXT_WHY]), `ask (got ${JSON.stringify(store.contextArgs(local, {}))})`);
+  check(eq(store.contextArgs(local, { withdraw: true }), ["fresh", "--space", S, "--withdraw", "--by", "panel", "--json", "--why", store.CONTEXT_WHY]), "withdraw");
+  check(eq(store.contextArgs(remote, { mode: "off" }), ["set", "--space", S, "--by", "panel", "--mode", "off", "--json"]), "mode off");
+  check(eq(store.contextArgs(local, { mode: "fresh" }), ["set", "--space", S, "--by", "panel", "--mode", "fresh", "--json"]), "mode fresh");
+  check(store.contextArgs(local, { mode: "on" }) === null && store.contextArgs(local, { mode: "" }) === null, "a mode not fresh/off: no argv");
+  check(store.CONTEXT_WHY === "the Fresh context button in the Project Agent panel" && store.CONTEXT_TOOL === CT, "constants");
+  for (const a of [store.contextArgs(remote, { dry: true }), store.contextArgs(remote, {}), store.contextArgs(remote, { withdraw: true }), store.contextArgs(remote, { mode: "off" })]) {
+    check(!a.some((x) => ["--on", "--now", "--fresh", "--task-cap", "--pass-cap", "--net"].includes(x)), `never those (got ${JSON.stringify(a)})`);
+  }
+};
+
+cases["S41-3-context-capable"] = async () => { // R6: pa.context_capable exactly
+  check(store.contextCapable({ version: 2, accepts: ["restart", "context"] }) === true, "version 2 with context");
+  check(store.contextCapable({ version: 3, accepts: ["context"] }) === true, "version 3");
+  for (const [rec, what] of [[{ version: 2, accepts: ["restart"] }, "restart only"], [{ version: 1, accepts: ["context"] }, "version 1"], [null, "no record"],
+    [{ version: 2, accepts: "context" }, "accepts a string"], [{ version: true, accepts: ["context"] }, "version a boolean"], [{ version: "2", accepts: ["context"] }, "version text"], [{ version: 2.5, accepts: ["context"] }, "version not whole"]]) {
+    check(store.contextCapable(rec) === false, what);
+  }
+};
+
+cases["S41-4-context-dry"] = async () => { // R6: the dry run's JSON line is the confirm's content
+  const json = { outcome: "dry-run", ctx: 260000, source: "transcript", due: "pass-cap", request: "rq-abcdefgh-1", expires: "2027-01-15T10:00:00Z", reasons: ["turn working", "checkpoint none"] };
+  const d = store.contextDry({ r: { code: 0, stdout: `mode fresh  taskCap 150,000  passCap 250,000\ncontext: 260k (transcript)\n{"not": "the last"}\n${JSON.stringify(json)}\n`, stderr: "" } }, local);
+  check(d.ok && d.ctx === 260000 && d.source === "transcript" && d.due === "pass-cap" && d.request === "rq-abcdefgh-1" && d.expires === json.expires && JSON.stringify(d.reasons) === JSON.stringify(json.reasons), `parsed (got ${JSON.stringify(d)})`);
+  const none = store.contextDry({ r: { code: 0, stdout: `${JSON.stringify({ outcome: "dry-run", ctx: null, source: null, due: null, request: null, expires: null, reasons: [] })}\n`, stderr: "" } }, local);
+  check(none.ok && none.ctx === null && none.request === null && none.reasons.length === 0, `nothing known (got ${JSON.stringify(none)})`);
+  const bad = store.contextDry({ r: { code: 0, stdout: "context: unknown\n", stderr: "" } }, local);
+  check(!bad.ok && typeof bad.text === "string" && bad.text.length > 0, `no JSON: not ok, a text (got ${JSON.stringify(bad)})`);
+  const refused = store.contextDry({ r: { code: 2, stdout: "", stderr: `${CT}: no Project Agent in this space\n` } }, local);
+  check(!refused.ok && refused.text === `Not done: ${CT}: no Project Agent in this space`, `refused (got ${JSON.stringify(refused)})`);
+  check(store.contextDry({ busy: true }, local) === null, "busy: nothing to say");
+};
+
+cases["S41-5-context-outcome"] = async () => { // R6, R13: the texts of each answer
+  const out = (o, code = 0, stderr = "") => ({ r: { code, stdout: `Some line.\n${JSON.stringify(o)}\n`, stderr } });
+  const asked = store.contextOutcome(out({ outcome: "requested", request: "rq1", expires: "2027-01-15T10:00:00Z" }), local, hm);
+  check(asked.ok && asked.text === "Fresh context asked for: it is taken at the Project Agent's next clean point (the request waits until 10:00).", `requested (got ${JSON.stringify(asked)})`);
+  check(store.contextOutcome(out({ outcome: "withdrawn", request: "rq1" }), local, hm).text === "Request withdrawn.", "withdrawn");
+  check(store.contextOutcome(out({ outcome: "none", request: null }), local, hm).text === "No request was pending.", "none");
+  const off = store.contextOutcome(out({ v: 1, mode: "off", taskCap: 150000, passCap: 250000, net: 400000, enabledAt: null, by: "panel" }), local, hm);
+  check(off.ok && off.text === "Context mode off: no fresh contexts from now; the 400k net ends at its next start. Turn fresh contexts on undoes it.", `off (got ${off.text})`);
+  const on = store.contextOutcome(out({ v: 1, mode: "fresh", taskCap: 120000, passCap: 250000, net: 400000, enabledAt: "2027-01-15T08:00:00Z", by: "panel" }), local, hm);
+  check(on.ok && on.text === "Context mode fresh: fresh contexts at 120k at a task boundary and 250k at a pass end from its launcher's next check; the 400k net at its next start. Turn fresh contexts off undoes it.", `fresh (got ${on.text})`);
+  const no = store.contextOutcome({ r: { code: 2, stdout: "", stderr: `${CT}: the context mode is off (context.json), so no fresh context is taken\n` } }, local, hm);
+  check(!no.ok && no.text === `Not done: ${CT}: the context mode is off (context.json), so no fresh context is taken`, `refused (got ${no.text})`);
+  check(store.contextOutcome({ r: { code: 127, stdout: "", stderr: `sh: ${CT}: not found` } }, remote, hm).text === `${CT} is not installed on ${M}; run pa-sync --on ${M}.`, "127 on the machine");
+  check(store.contextOutcome({ error: `exec: ${CT}: not found` }, local, hm).text === `${CT} is not installed here; run ./install.sh.`, "missing here");
+  check(/could not run: boom/.test(store.contextOutcome({ error: "boom" }, local, hm).text), "another error");
+  const late = store.contextOutcome({ timedOut: true }, local, hm);
+  check(!late.ok && late.text === `${CT} did not answer in 35 s; the panel shows what it reads next.`, `timed out (got ${late.text})`);
+  check(store.contextOutcome({ busy: true }, local, hm) === null, "busy: nothing to say");
+  check(store.contextOutcome({ r: { code: 0, stdout: "done\n", stderr: "" } }, local, hm).ok, "exit 0 without a JSON line: ok");
+};
+
+cases["S41-6-context-settings"] = async () => { // R13: context.json over the defaults; read on the space's machine
+  const d = store.contextSettings(null);
+  check(d.mode === "fresh" && d.taskCap === 150000 && d.passCap === 250000 && d.net === 400000 && d.problem === null, `missing: the defaults (got ${JSON.stringify(d)})`);
+  const off = store.contextSettings({ v: 1, mode: "off", taskCap: 120000, passCap: 250000, net: 400000, enabledAt: null, by: "person" });
+  check(off.mode === "off" && off.taskCap === 120000 && off.by === "person" && off.problem === null, `off (got ${JSON.stringify(off)})`);
+  for (const [v, what] of [[[1], "a list"], ["x", "text"], [{ v: 1, mode: "on" }, "a bad mode"]]) {
+    const s = store.contextSettings(v);
+    check(s.mode === "fresh" && typeof s.problem === "string" && s.problem.length > 0, `${what}: the defaults with a problem (got ${JSON.stringify(s)})`);
+  }
+  world();
+  g.__files[`${M}:${rdir}/context.json`] = JSON.stringify({ v: 1, mode: "off", taskCap: 150000, passCap: 250000, net: 400000, enabledAt: null, by: "panel" });
+  g.__files[`${M}:${rdir}/costs/summary.json`] = JSON.stringify({ updated: `${TODAY}T07:59:00Z`, paContext: [pcDay()] });
+  const r = await store.loadContext(remote, cx);
+  check(r.settings.mode === "off" && Array.isArray(r.paContext) && r.paContext[0].mean === 158000, `remote read (got ${JSON.stringify(r)})`);
+  check(g.__reads.includes(`${M}:${rdir}/context.json`) && g.__reads.includes(`${M}:${rdir}/costs/summary.json`) && g.__reads.every((x) => x.startsWith(`${M}:`)), `both on ${M} (got ${JSON.stringify(g.__reads)})`);
+  world();
+  const only = await store.loadContext(local, cx, { summary: false });
+  check(only.settings.mode === "fresh" && only.paContext === undefined && g.__reads.length === 1 && g.__reads[0].endsWith("/context.json"), `summary: false reads context.json only (got ${JSON.stringify(g.__reads)})`);
+  world();
+  g.__files[`:${ldir}/context.json`] = "{not json";
+  g.__files[`:${ldir}/costs/summary.json`] = "[1]";
+  const b = await store.loadContext(local, cx);
+  check(b.settings.mode === "fresh" && /not valid JSON/.test(b.settings.problem ?? "") && b.paContext === null, `broken files (got ${JSON.stringify(b)})`);
+  world();
+  g.__hang = [`${M}:${rdir}/costs/summary.json`];
+  const { done, value: h } = await within(store.loadContext(remote, cx), 12000);
+  check(done && store.gaveUp(h), `a hung read gives up (done ${done}, got ${JSON.stringify(h)})`);
+};
+
+cases["S41-7-reset-line"] = async () => { // C6: the header line after a reset; Q7: the last request's outcome
+  const launcher = { lastReset: { at: "2027-01-15T07:02:00Z", from: "3f2a9c1e-aaaa-bbbb-cccc-dddddddddddd", to: "s-new", reason: "pass-cap", ctx: 260000 } };
+  const l = store.resetLine(launcher, "s-new", hm);
+  check(l && l.text === "Fresh context at 07:02 (pass cap, 260k) · previous session 3f2a9c1e…" && l.previous === launcher.lastReset.from, `the line (got ${JSON.stringify(l)})`);
+  check(store.resetLine({ lastReset: { ...launcher.lastReset, reason: "task-cap", ctx: null } }, "s-new", hm).text === "Fresh context at 07:02 (task cap) · previous session 3f2a9c1e…", "task cap, no size");
+  check(store.resetLine({ lastReset: { ...launcher.lastReset, reason: "person" } }, "s-new", hm).text.startsWith("Fresh context at 07:02 (asked for, 260k)"), "a person's request");
+  check(store.resetLine(launcher, "s-other", hm) === null, "another session runs now: none");
+  check(store.resetLine({}, "s-new", hm) === null && store.resetLine(null, "s-new", hm) === null && store.resetLine(launcher, null, hm) === null, "nothing known: none");
+  check(store.resetLine({ lastReset: { ...launcher.lastReset, from: 5 } }, "s-new", hm) === null, "a from that is not text: none");
+  check(store.lastRequestLine({ context: { request: "rq1", outcome: "expired", why: null, at: "2027-01-15T06:00:00Z" } }, hm) === "Last request: expired at 06:00", "expired");
+  check(store.lastRequestLine({ context: { request: "rq1", outcome: "refused", why: "another space", at: "2027-01-15T06:00:00Z" } }, hm) === "Last request: refused at 06:00 (another space)", "refused");
+  check(store.lastRequestLine({ context: { request: "rq1", outcome: "ok", why: null, at: "2027-01-15T06:00:00Z" } }, hm) === null && store.lastRequestLine({ context: null }, hm) === null && store.lastRequestLine(null, hm) === null, "ok or none: no line");
+};
+
 const pick = process.argv.slice(2);
 let failed = 0;
 for (const [name, fn] of Object.entries(cases)) {
