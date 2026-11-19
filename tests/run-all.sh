@@ -1,6 +1,7 @@
 #!/bin/sh
 # All of this repo's tests. Exits non-zero if any part fails.
-#   tests/run-all.sh             full suite: Python 3.7 parse check, unit tests (each tests/test_*.py its own part),
+#   tests/run-all.sh             full suite: Python 3.7 parse check, unit tests (each tests/test_*.py its own part;
+#                                the long ones in unit_shards below are several parts, each case in exactly one),
 #                                keeper harness, panel harness (four parts: run.mjs --shard=1/4 .. 4/4, each case in
 #                                exactly one), store harness, and the pa-session integration check against a
 #                                private hc core
@@ -25,6 +26,7 @@ set -u
 worker=${HC_TERMINAL_ID:-}  # named to a run waiting for the slot (read before it is dropped below)
 # Never reach the person's hc core from a test: drop every variable that names it.
 unset HC_TERMINAL_ID HC_SOCKET HC_TERMINAL_SOCKET HC_SCOPE CLAUDECODE
+unset PA_UNIT_SHARD  # set below for one shard part only (t-078), never inherited
 here=$(cd "$(dirname "$0")" && pwd)
 repo=$(cd "$here/.." && pwd)
 cd "$repo" || exit 2
@@ -40,7 +42,7 @@ if [ "$affected" = 1 ] && [ -n "${PA_CHANGED_FILES:-}" ]; then
   want_py=0 want_keeper=0 want_panel=0 want_store=0
   for f in $PA_CHANGED_FILES; do
     case "$f" in
-      *runtime/tools/*|*tests/test_*.py|*tests/run-all.sh) want_py=1 ;;
+      *runtime/tools/*|*tests/*.py|*tests/run-all.sh) want_py=1 ;;  # the test helpers too (queue_fixtures.py ...)
     esac
     case "$f" in
       *mods/project-agent/*|*tests/keeper/*|*tests/run-all.sh) want_keeper=1 ;;
@@ -58,6 +60,12 @@ fi
 parse37() { "$PY" -c "import ast,sys
 for f in sys.argv[1:]: ast.parse(open(f).read(), feature_version=(3,7)); print(f, 'parses as Python 3.7')" runtime/tools/pa.py runtime/tools/pa_hooks.py runtime/tools/pa_guard.py runtime/tools/pa_costs.py runtime/tools/pa_push.py runtime/tools/pa_queue.py; }
 units() { "$PY" -m unittest discover -s tests -p "$1.py" -v; }  # one module: the same loader and top folder
+# The long unit modules run as several parts (t-078): <module>:<n> runs the module n times at once, the k-th with
+# PA_UNIT_SHARD=k/n, which its load_tests (tests/unit_shards.py) turns into every n-th test from the k-th, so each
+# test runs in exactly one part and a test added later needs no edit here. A part's argument is <module>@<k>.
+unit_shards="test_pa_queue:4 test_pa_worker:2"
+shards_of() { for s in $unit_shards; do [ "${s%%:*}" = "$1" ] && { echo "${s#*:}"; return 0; }; done; echo 1; }
+shard() { sm=${1%@*} sk=${1##*@}; PA_UNIT_SHARD="$sk/$(shards_of "$sm")" "$PY" -m unittest discover -s tests -p "$sm.py" -v; }
 keeper() { [ -n "$NODE" ] || { echo "no node found (set NODE)"; return 1; }; "$NODE" tests/keeper/run.mjs; }
 # The panel harness is one part per shard (t-031): its time is nearly all short real timers, not CPU, so its
 # shards running at once divide its wall time. $1 is the shard, 1..panel_parts.
@@ -74,7 +82,8 @@ integration() {
 
 # The parts to run, in the order they are printed: part_<i> is the function, name_<i> its name, arg_<i> its
 # argument. Each unit test module is its own part (they share no state: each makes its own temp folder and
-# homes), so they run at once; every tests/test_*.py, as discover found them, so each test runs once.
+# homes), so they run at once; every tests/test_*.py, as discover found them, so each test runs once; a module in
+# unit_shards is one part per shard.
 count=0
 add() { count=$((count + 1)); eval "part_$count=\$1; name_$count=\$2; arg_$count=\${3:-}"; }
 if [ "$want_py" = 1 ]; then
@@ -82,7 +91,10 @@ if [ "$want_py" = 1 ]; then
   for f in tests/test_*.py; do
     [ -f "$f" ] || continue
     m=${f#tests/}; m=${m%.py}
-    add units "unit tests: $m" "$m"
+    n=$(shards_of "$m")
+    if [ "$n" = 1 ]; then add units "unit tests: $m" "$m"; continue; fi
+    k=1
+    while [ "$k" -le "$n" ]; do add shard "unit tests: $m $k/$n" "$m@$k"; k=$((k + 1)); done
   done
 fi
 [ "$want_keeper" = 1 ] && add keeper "keeper harness"

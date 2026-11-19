@@ -1,7 +1,7 @@
 """Unit tests for pa-queue (t-052 J2): the merge queue's plan, add, show, out, restack, verify and refresh, and the
 gate's content check with the queue (onto from queue.json; change lines only moved, with a short review).
 
-Run: python3 -m unittest -v tests/test_pa_queue.py
+Run: python3 -m unittest -v tests/test_pa_queue.py (all of it; tests/run-all.sh runs it in shards, tests/unit_shards.py)
 Every case runs in scratch repositories under a mkdtemp folder and a fake space (tests/queue_fixtures.py).
 """
 import fcntl
@@ -16,6 +16,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from queue_fixtures import *  # noqa: F401,F403
 from queue_fixtures import setUpModule, tearDownModule  # noqa: F401
+from unit_shards import load_tests  # noqa: F401 (tests/run-all.sh runs this module in shards, t-078)
 
 
 def review_text(tip, reviewer, start=None, end=None, verdict="pass", checked=True):

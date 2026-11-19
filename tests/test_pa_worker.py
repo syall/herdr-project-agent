@@ -1,6 +1,6 @@
 """Unit tests for pa-worker close / keep / close --leftovers, the worktree check and its card (t-008).
 
-Run: python3 -m unittest -v tests/test_pa_worker.py
+Run: python3 -m unittest -v tests/test_pa_worker.py (all of it; tests/run-all.sh runs it in shards, tests/unit_shards.py)
 No hc calls and no real homes: HERDR_PA_HOME, CLAUDE_CONFIG_DIR and HERDR_APP_HOME point at a temp
 folder while pa.py is loaded, hc is a stub (a dict of terminals), and git runs only on repositories
 made under that temp folder, with no global or system git config.
@@ -22,6 +22,8 @@ import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TOOLS = os.path.join(HERE, "..", "runtime", "tools")
+sys.path.insert(0, HERE)
+from unit_shards import load_tests  # noqa: E402,F401 (tests/run-all.sh runs this module in shards, t-078)
 TMP = tempfile.mkdtemp(prefix="t008-unit-")
 
 # Load pa.py and pa_hooks.py with the temp homes, then give the environment back, so the other test
