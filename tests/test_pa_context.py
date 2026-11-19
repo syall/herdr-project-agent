@@ -1240,6 +1240,16 @@ class J4Clean(J4Base):  # R2, AC2.1, AC2.2, AC8.2
         write(os.path.join(self.dir, "evidence", "t-1", "handoff-build.md"), "Do the job.\n")
         self.assertEqual(self.clean(), (True, []))
 
+    def test_c7c_terminal_list_unavailable(self):  # REVIEW J4 MF-J4-2: (d) refuses when hc ls fails
+        self.ledger(dict(self.ledger(), tasks=[{"id": "t-1", "workers": [{"address": "t5", "name": "t-1-build"}]}]))
+        self.terms["t5"] = {"state": "live"}
+        pa.live_terminals = lambda: None
+        ok, reasons = self.clean()
+        self.assertFalse(ok)
+        self.assertIn(("d", "terminal list unavailable"), reasons)
+        self.ledger(dict(self.ledger(), tasks=[]))  # no worker at all: still unknown, still refused
+        self.assertIn(("d", "terminal list unavailable"), self.clean()[1])
+
     def test_c7b_a_worker_whose_name_names_no_job(self):  # Q4: refused
         self.ledger(dict(self.ledger(), tasks=[{"id": "t-1", "workers": [{"address": "t5", "name": "helper"}]}]))
         self.terms["t5"] = {"state": "live"}
@@ -1654,6 +1664,21 @@ class J4Request(J4Base):  # R6, AC6.1
         code, _o, err = self.cli("fresh", "--on", "m2")
         self.assertEqual(code, 2)
 
+    def test_q10b_on_inside_claude_checks_first(self):  # REVIEW J4 MF-J4-1
+        calls = []
+        pa.relay = lambda argv: calls.append(list(argv)) or 0
+        os.environ["CLAUDECODE"] = "1"
+        code, _o, err = self.cli("fresh", "--on", "m2", "--space", "sp1")
+        self.assertEqual(code, 2)
+        self.assertIn("--why", err)
+        code, _o, err = self.cli("fresh", "--on", "m2", "--space", "sp1", "--by", "panel", "--why", "x")
+        self.assertEqual(code, 2)
+        self.assertIn("--by panel", err)
+        self.assertEqual(calls, [])
+        code, _o, err = self.cli("fresh", "--on", "m2", "--space", "sp1", "--why", "the person: 'start fresh'")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(calls), 1)
+
 
 class J4Settings(J4Base):  # R13, resets part
     def test_k9_mode_off_while_running(self):
@@ -1692,6 +1717,17 @@ class J4Settings(J4Base):  # R13, resets part
         self.assertEqual(words[words.index("--mode") + 1], "off")
         self.assertEqual(words[words.index("--by") + 1], "panel")
         self.assertFalse(os.path.exists(os.path.join(self.dir, "context.json")))
+
+    def test_k12b_on_inside_claude_refused(self):  # REVIEW J4 MF-J4-1: set is the person's, also with --on
+        calls = []
+        pa.relay = lambda argv: calls.append(list(argv)) or 0
+        for var in ("CLAUDECODE", "CODEX_SANDBOX"):
+            os.environ[var] = "1"
+            code, _o, err = self.cli("set", "--on", "m2", "--space", "sp1", "--mode", "off")
+            self.assertEqual(code, 2)
+            self.assertIn("person's command", err)
+            os.environ.pop(var)
+        self.assertEqual(calls, [])
 
 
 class J4Records(J4Base):  # R16
