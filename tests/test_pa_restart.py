@@ -2890,6 +2890,7 @@ class T77_EndWrapper(EndTerminal, T77Fakes):
                     ["python3", "/x/tools/pa.py", "session", "--space", SP]):
             with self.subTest(cmd=cmd):
                 self.term["argv"] = hc_wrapper(*cmd)
+                self.procs[T77_TERM] = (23551, ps_zsh(" ".join(cmd)))  # round 2: ps must show the same wrapper
                 self.passes()
 
     def test_ac4_each_ps_form(self):  # hc gives no argv; ps of hc's pid shows the branch it ran
@@ -2955,6 +2956,96 @@ class T77_EndWrapper(EndTerminal, T77Fakes):
         c, out, err = self.run_end()
         self.assertEqual(c, 0, out + err)
         self.assertEqual(self.kills(), [["hc", "kill", "t1"]])
+
+
+# round 2 (REVIEW.md finding 1): hc's argv is the tab's start argv; after the wrapped program ends, the wrapper's
+# login shell execs "$0" -li in the same pid, so ps of hc's pid must show the live wrapper running the same command
+T77_AFTER_EXEC = ("/bin/zsh -li", "-zsh", "/usr/bin/fish -li", "sh -i", "/bin/bash -li")
+T77_TYPED_CHILD = "python3 /Users/u/.local/bin/pa-session --space " + SP
+
+
+class T77_LiveWrapper(Command, T77Fakes):
+    """pa-restart (in place): hc says the wrapper, ps of hc's pid says the person's shell (R4, d-161)."""
+
+    def setUp(self):
+        super().setUp()
+        self.t77_setup(["pa-session", "--space", SP])
+        dump(dict(self.rec, pid=T77_LAUNCHER), os.path.join(self.dir, "launcher.json"))
+
+    def refused(self):
+        code, out, err = self.run_cmd(dry_run=True)
+        self.assertEqual(code, 2, out + err)
+        self.assertIn("pid", err)
+        self.one_line(err)
+        self.assertIsNone(self.request_file())
+        self.no_ending_calls()
+        return err
+
+    def test_launcher_typed_in_the_shell_after_the_wrapper_exec(self):
+        self.procs[T77_LAUNCHER] = (T77_TERM, T77_TYPED_CHILD)  # typed in the leftover shell: its child
+        for ps in T77_AFTER_EXEC:
+            with self.subTest(ps=ps):
+                self.procs[T77_TERM] = (23551, ps)
+                self.refused()
+
+    def test_hc_and_ps_disagree_on_the_wrapped_command(self):
+        for ps in (ps_zsh("pa-session --space sp9"), ps_zsh("pa-session --ask"), ps_fish("other " + SP),
+                   ps_zsh("pa-session --space {} --x".format(SP))):
+            with self.subTest(ps=ps):
+                self.procs[T77_TERM] = (23551, ps)
+                self.refused()
+
+    def test_hc_pid_cannot_be_read(self):
+        del self.procs[T77_TERM]
+        self.refused()
+
+
+class T77_LiveEndWrapper(EndTerminal, T77Fakes):
+    """pa-restart --end-terminal: the same case would end the person's shell tab (R4, d-161)."""
+
+    def setUp(self):
+        super().setUp()
+        self.t77_setup(["pa-session", "--space", SP, "--project", "/p"])
+
+    def refused(self):
+        c, out, err = self.run_end(dry_run=True)
+        self.assertEqual(c, 2, out + err)
+        self.assertIn("not this space's pa-session", err)
+        self.one_line(err)
+        self.assertEqual(self.kills(), [])
+        self.nothing_written()
+        return err
+
+    def test_shell_after_the_wrapper_exec_without_a_launcher_record(self):
+        for ps in T77_AFTER_EXEC:
+            with self.subTest(ps=ps):
+                self.procs[T77_TERM] = (23551, ps)
+                self.refused()
+
+    def test_shell_after_the_wrapper_exec_with_the_exited_launchers_record(self):
+        dump(dict(self.rec, pid=T77_LAUNCHER), os.path.join(self.dir, "launcher.json"))
+        del self.procs[T77_LAUNCHER]  # the wrapped launcher exited; its heartbeat is still fresh
+        for ps in T77_AFTER_EXEC:
+            with self.subTest(ps=ps):
+                self.procs[T77_TERM] = (23551, ps)
+                self.refused()
+
+    def test_shell_with_a_typed_launcher_after_the_wrapper_exec(self):
+        dump(dict(self.rec, version=1, accepts=None, pid=T77_LAUNCHER), os.path.join(self.dir, "launcher.json"))
+        self.procs[T77_LAUNCHER] = (T77_TERM, T77_TYPED_CHILD)
+        self.procs[T77_TERM] = (23551, "/bin/zsh -li")
+        self.refused()
+
+    def test_hc_and_ps_disagree_on_the_wrapped_command(self):
+        for ps in (ps_zsh("pa-session --space sp9 --project /p"), ps_zsh("pa-session --space " + SP),
+                   ps_star("x --space {} --project /p".format(SP))):
+            with self.subTest(ps=ps):
+                self.procs[T77_TERM] = (23551, ps)
+                self.refused()
+
+    def test_hc_pid_cannot_be_read(self):
+        del self.procs[T77_TERM]
+        self.refused()
 
 
 class T77_Units(Base):
