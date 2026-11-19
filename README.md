@@ -364,7 +364,11 @@ declares none, so the command says "declares no price source"):
   scope with no region (the other files' equal rows are named in `refs.<kind>.sameIn`; a region whose
   row differs gets a scope of its own); every other endpoint gets one scope per region. Existing rows
   are never edited or removed: a changed price is a new row from the source's `effectiveDate` (or from
-  today when that is not after your latest row, so earlier days keep their prices); a null from the
+  today when that is not after your latest row, so earlier days keep their prices). A scope's first row
+  of a model that a wider row priced before starts today (or at a later source date), and when the
+  fetch changes the default scope the rows that priced that scope are copied into it, marked `carried`
+  and kept at their dates, so every earlier day keeps its figure; a model no wider row priced starts
+  at the source's date. A null from the
   source never removes a price; models the source lacks, or the profile's `models` limits leave out,
   stay as they are. A file without `defaultScope` gets the declared one on its first fetch (the diff
   says so). Each new row carries `source`, `fetched` (url, version, publicationDate, sha256) and `refs`.

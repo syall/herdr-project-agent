@@ -3846,10 +3846,41 @@ def _same_prices(a, b):
     return set(a["kinds"]) == set(b["kinds"]) and all(a["kinds"][k]["price"] == b["kinds"][k]["price"] for k in a["kinds"])
 
 
-def plan_changes(raw, batches, source, name, today, at, legacy_default):
+def _priced_before(old_table, scope, model, before):
+    """[(validFrom, entry, from scope)] the file before the fetch priced for sessions whose facts are `scope`, one per
+    date its price changes, for days before `before` (t-070 J1). Built on lookup itself, at every validFrom the model's
+    rows have in any scope (a superset of the dates where lookup's answer can change)."""
+    if not old_table:
+        return []
+    scopes = [old_table["models"]] + [e["models"] for e in old_table.get("scoped") or []]
+    dates = set()
+    for models in scopes:
+        key = scope_key(old_table, models, model)
+        for e in (models.get(key) or []) if key is not None else []:
+            if e["validFrom"] < before:
+                dates.add(e["validFrom"])
+    out, last = [], None
+    for d in sorted(dates):
+        entry, how = lookup(old_table, model, d, scope)
+        if entry is not None and entry is not last:
+            out.append((d, entry, tuple(None if v == "*" else v for v in how["scope"])))
+            last = entry
+    return out
+
+
+def _reaches_after(from_scope, scope, old_default, new_default):
+    """Whether the old scope from_scope still prices `scope` after the fetch (t-070 J1). Scopes are never removed; only
+    the default scope's meaning changes (the A-P1 migration), so the old default's rows are the new default's."""
+    mapped = new_default if from_scope == old_default else from_scope
+    return _matches(mapped, scope, new_default[0])
+
+
+def plan_changes(raw, batches, source, name, today, at, legacy_default, old_table=None):
     """(raw after, diff lines, notes, number of changes). raw is the target file's parsed JSON, changed in place; batches
     are the reader runs [{key, region, url, lines, done, sha256}], the default region first. R-F4 per (scope, model),
-    A-F3 for several regions, A-F4 model limits. Existing rows are never edited or removed."""
+    A-F3 for several regions, A-F4 model limits. Existing rows are never edited or removed. old_table: the file's table
+    before the fetch (load_prices), None when there is no file: a new scope's first row beneath a wider row that priced
+    it starts today, and that row's prices are carried into the scope when the fetch changes the default (t-070 J1)."""
     diff, notes = [], []
     free = set(source.get("regionFree") or [])
     limits = source.get("models") or {}
@@ -3918,6 +3949,8 @@ def plan_changes(raw, batches, source, name, today, at, legacy_default):
             placements.append(((gk[0], gk[1], b["region"], gk[2]), gk[3], g, b))
 
     default_changed = False
+    old_default = old_table["defaultScope"] if old_table else legacy_default
+    started, carried_total = 0, 0
     for scope, model, g, batch in placements:
         where = "{} / {}".format(scope_text(scope), model)
         base = {k: (g["kinds"][k]["price"] if k in g["kinds"] else None) for k in KINDS}
@@ -3927,9 +3960,37 @@ def plan_changes(raw, batches, source, name, today, at, legacy_default):
         existing = _rows_of(models_of(scope, False) or {}, model)
         latest = sorted(existing, key=lambda e: e.get("validFrom") or "")[-1] if existing else None
         eff = g["eff"]
+        carried = []
         if latest is None:
             row, valid = dict(base), eff
-            diff.append("{}: added (validFrom {}): {}".format(where, eff, ", ".join("{} {}".format(k, _price_text(base[k])) for k in KINDS)))
+            prices_text = ", ".join("{} {}".format(k, _price_text(base[k])) for k in KINDS)
+            past = _priced_before(old_table, scope, model, today)
+            if not past:
+                diff.append("{}: added (validFrom {}): {}".format(where, eff, prices_text))
+            else:  # t-070 J1 (d-162): beneath a wider row, the new scope starts today; earlier days keep their prices
+                valid = max(eff, today)
+                froms = []
+                for p in past:
+                    if scope_text(p[2]) not in froms:
+                        froms.append(scope_text(p[2]))
+                diff.append("{}: added (validFrom {}, source effective {}; earlier days keep the prices of {}): {}".format(
+                    where, valid, eff, ", ".join(froms), prices_text))
+                started += 1
+                if any(not _reaches_after(p[2], scope, old_default, default) for p in past):
+                    for d, entry, frm in _priced_before(old_table, scope, model, valid):
+                        c = json.loads(json.dumps(entry))
+                        c["validFrom"] = d
+                        c.update({"provider": scope[0], "endpoint": scope[1], "region": scope[2],
+                                  "carried": {"from": scope_text(frm), "at": at}})
+                        carried.append(dict([("validFrom", d)] + [(k, v) for k, v in c.items() if k != "validFrom"]))
+                    cfroms = []
+                    for c in carried:
+                        if c["carried"]["from"] not in cfroms:
+                            cfroms.append(c["carried"]["from"])
+                    notes.append("{}: {} row{} carried from {} (validFrom {}) so days before {} keep their prices".format(
+                        where, len(carried), "" if len(carried) == 1 else "s", ", ".join(cfroms),
+                        ", ".join(c["validFrom"] for c in carried), valid))
+                    carried_total += len(carried)
         else:
             changed = []
             for k in KINDS:
@@ -3994,7 +4055,8 @@ def plan_changes(raw, batches, source, name, today, at, legacy_default):
         target = models_of(scope, True)
         if model in target and not isinstance(target[model], list):
             target[model] = [target[model]]
-        target.setdefault(model, []).append(row)
+        target.setdefault(model, []).extend(carried)
+        target[model].append(row)
         changes += 1
         if scope == default:
             default_changed = True
@@ -4010,6 +4072,9 @@ def plan_changes(raw, batches, source, name, today, at, legacy_default):
         notes.append("not in source (kept): {}".format(", ".join(sorted(missing))))
     if excluded:
         notes.append("excluded by the profile (left as they are): {}".format(", ".join(excluded)))
+    if started:
+        notes.append("{} new scope row(s) beneath a wider row start today or later{}".format(
+            started, "; {} row(s) carried (the file's default scope changed)".format(carried_total) if carried_total else ""))
     if default_changed:
         d = default_batch["done"]["source"]
         raw["source"] = "{}: {} (version {}, published {})".format(source["label"], default_batch["url"], d["version"], d["publicationDate"])
@@ -4133,7 +4198,7 @@ def _prices_fetch(source_name, into, dry_run, yes, profile_name, opener, now, as
 
 
 def _fetch_in(folder, profile, name, src, path, installed, dry_run, yes, opener, now, ask, clock):
-    old_bytes, old_raw = None, None
+    old_bytes, old_raw, table = None, None, None
     if os.path.lexists(path):
         if not os.path.isfile(path):
             raise FetchFailed(1, "{} is not a file".format(path))
@@ -4191,7 +4256,7 @@ def _fetch_in(folder, profile, name, src, path, installed, dry_run, yes, opener,
         base = json.loads(json.dumps(old_raw))
     else:
         base = {"v": 1, "currency": src["currency"], "unit": "per-1M-tokens", "models": {}}
-    new_raw, diff, notes, changes = plan_changes(base, batches, src, name, iso(now)[:10], iso(now), legacy)
+    new_raw, diff, notes, changes = plan_changes(base, batches, src, name, iso(now)[:10], iso(now), legacy, old_table=table)
     for line in diff:
         print(line)
     for line in notes:
