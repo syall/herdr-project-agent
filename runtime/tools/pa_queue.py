@@ -1481,6 +1481,10 @@ def cmd_card(args):
                        "since was clean (or moved or union with its short review), the gate passes at its tip, and its own "
                        "suite passed on its tree. Nothing is pushed: the push card follows.")
         context.append(args.limits.strip())
+        text = "\n".join(context)
+        if len(text) > pa_hooks.CONTEXT_MAX:  # t-109 MF-1, AC10.3: a Recorded limit is never cut from the card
+            raise Refused("the card's facts and --limits come to {} characters, over the card's {}: list fewer entries "
+                          "or shorten the limits (name a file with them), no limit is cut".format(len(text), pa_hooks.CONTEXT_MAX))
         tasks = [label(e) for e, _n in chosen]
         options = [{"label": ALL, "detail": ", ".join(tasks), "count": len(tasks)}]
         options += [{"label": "Merge up to " + tasks[k - 1], "detail": ", ".join(tasks[:k]), "count": k} for k in range(len(tasks) - 1, 0, -1)]
@@ -1488,7 +1492,7 @@ def cmd_card(args):
         card = {"id": cid, "task": chosen[0][0]["task"], "kind": "queue",
                 "question": "Merge {} queued change{} into {} of {}, in order?".format(len(tasks), "" if len(tasks) == 1 else "s",
                                                                                    rec["main"], os.path.basename(ctx.repo)),
-                "context": pa_hooks.cut("\n".join(context), pa_hooks.CONTEXT_MAX), "options": options,
+                "context": text, "options": options,
                 "evidence": ["REVIEW.md"], "recommendation": ALL, "status": "open", "answer": None, "note": None,
                 "created": now(), "answered": None,
                 "queue": {"version": 1, "repo": ctx.repo, "common": rec["common"], "mainBefore": main_tip, "entries": entries}}
