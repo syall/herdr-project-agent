@@ -1451,7 +1451,9 @@ export default class ProjectAgent extends View {
     const pushAnswered = push && c.status === "open" ? this.push.answeredHere(space.id, entry.id) ?? (m?.unknown ? null : m?.label) ?? null : null; // a run from here (or another window) answered it
     const open = c.status === "open", busy = Boolean(this.busy[entry.id]) || Boolean(running) || (push && (this.push.locked(space.id, entry.id) || Boolean(m)));
     const task = c.task && (this.data?.ledger?.tasks ?? []).find((x) => x.id === c.task);
-    const picked = open ? this.choice[entry.id] ?? null : null;
+    // t-100: a push card's run keeps its answer chosen: the label in flight, then the one a run from here answered.
+    // A refused or unknown run has neither, and answerPush cleared the choice: nothing chosen, as before.
+    const picked = !open ? null : (push && (running ?? this.push.answeredHere(space.id, entry.id))) || (this.choice[entry.id] ?? null);
     // Other (t-046): the field is the answer; Submit needs words, at most OTHER_MAX.
     const words = picked === OTHER ? (this.notes[noteKey(space.id, entry.id)]?.value() ?? "").trim() : "";
     const wordsOk = picked !== OTHER || (words.length > 0 && words.length <= OTHER_MAX);
