@@ -1426,8 +1426,21 @@ class T86TipLine(unittest.TestCase):
         self.assertIsNone(pa_queue.region_of(2, None, regions))
 
 
-class T86HeldApproval(U3RestackConflict):
-    """RL-J3c-V2, V3: what keeps a held approval held."""
+class T86HeldApproval(UBase):
+    """RL-J3c-V2, V3: what keeps a held approval held. U3's setUp: t-B left on a restack conflict, its approval
+    resumable."""
+
+    def setUp(self):
+        super().setUp()
+        self.task("t-A", [("fa.txt", "a\n")])
+        self.add("t-A")
+        self.task("t-B", [("a.txt", (2, "two B")), ("fb.txt", "b\n")])
+        self.add("t-B")
+        self.set_entries(lambda r: r["entries"][1].update(approval=dict(APPROVAL)))
+        self.on_main("a.txt", (2, "two M"))
+        code, out, err = self.queue("restack", "--repo", self.proj)
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual([e["task"] for e in self.entries()], ["t-A"])
 
     def test_v2_must_fix_review_written_before_add_keeps_the_approval_held(self):
         self.resolve("t-B", "t-A-x", "a.txt", union_text("two B", "two M"))
@@ -1442,13 +1455,10 @@ class T86HeldApproval(U3RestackConflict):
         """A passing reviews.jsonl line for t-B's tip that answered another question (or none)."""
         tip = self.tip("t-B")
         self.add_worker("t-B", "t-Bs", "reviewer")
-        run = pa_hooks.content_git(pa_hooks.git)
         line = {"kind": "short-review", "at": pa.now(), "task": "t-B", "job": None, "repo": self.proj,
-                "common": self.qrepo()["common"] if "common" in self.qrepo() else None, "branch": "t-B-x", "tip": tip,
+                "common": self.qrepo()["common"], "branch": "t-B-x", "tip": tip,
                 "tree": sh(self.proj, "git", "rev-parse", tip + "^{tree}"), "file": "SHORT-REVIEW-t-B-1.md",
                 "worker": "t-Bs", "started": pa.now(), "ended": pa.now(), "seconds": 1.0, "verdict": "pass"}
-        if line["common"] is None:
-            line["common"] = pa_hooks.common_dir(run, self.proj)[1]
         if about:
             line["about"] = about
         path = os.path.join(self.dir, "content", "reviews.jsonl")
