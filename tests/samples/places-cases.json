@@ -151,6 +151,26 @@
     {"name": "both full for a suite job: the suite cap is named",
      "jobs": [{"id": "A", "kind": "suite"}],
      "limits": {"working": 2, "no-test": 0, "suite": 2}, "holders": ["suite", "suite"], "hold": "off",
-     "expect": [{"id": "A", "action": "skip", "place": null, "full": {"kind": "suite", "used": 2, "limit": 2}}]}
+     "expect": [{"id": "A", "action": "skip", "place": null, "full": {"kind": "suite", "used": 2, "limit": 2}}]},
+    {"name": "pooled total: a no-test holder in a working place fills the pool for a working job (default limits)",
+     "jobs": [{"id": "A", "kind": "working"}],
+     "limits": {"working": 4, "no-test": 0, "suite": null}, "holders": ["working", "working", "working", "no-test"], "hold": "off",
+     "expect": [{"id": "A", "action": "skip", "place": null, "full": {"kind": "working", "used": 4, "limit": 4}}]},
+    {"name": "pooled total: working and extra places all taken, a working job is skipped",
+     "jobs": [{"id": "A", "kind": "working"}],
+     "limits": {"working": 4, "no-test": 1, "suite": null}, "holders": ["working", "working", "working", "no-test", "no-test"], "hold": "off",
+     "expect": [{"id": "A", "action": "skip", "place": null, "full": {"kind": "working", "used": 4, "limit": 4}}]},
+    {"name": "pooled total: no-test jobs started first take working places from the working jobs after them",
+     "jobs": [{"id": "N1", "kind": "no-test"}, {"id": "N2", "kind": "no-test"}, "A", "B", "C"],
+     "limits": {"working": 4, "no-test": 0, "suite": null}, "holders": [], "hold": "off",
+     "expect": [{"id": "N1", "action": "start", "place": "working", "full": null},
+                {"id": "N2", "action": "start", "place": "working", "full": null},
+                {"id": "A", "action": "start", "place": "working", "full": null},
+                {"id": "B", "action": "start", "place": "working", "full": null},
+                {"id": "C", "action": "skip", "place": null, "full": {"kind": "working", "used": 4, "limit": 4}}]},
+    {"name": "pooled total: a suite job under its cap is skipped when the pool is full, working named",
+     "jobs": [{"id": "A", "kind": "suite"}],
+     "limits": {"working": 4, "no-test": 0, "suite": 2}, "holders": ["working", "working", "working", "no-test"], "hold": "off",
+     "expect": [{"id": "A", "action": "skip", "place": null, "full": {"kind": "working", "used": 4, "limit": 4}}]}
   ]
 }

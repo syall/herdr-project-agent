@@ -371,6 +371,19 @@ class Commands(Base):
         self.assertEqual(self.ids(), ["t-1/build"])
         self.assertEqual(self.journal("start"), [])
 
+    def test_start_refused_when_the_pool_is_full(self):  # D3, D4: a no-test holder in a working place counts
+        dump({"rules": [{"id": "r-four", "text": "x", "status": "active", "order": 1, "places": {"working": 4}}]},
+             self.path("rules.json"))
+        self.live = {"a", "b", "c", "d"}
+        self.workers(("a", "t-a", "working", False), ("b", "t-b", "working", False), ("c", "t-c", "working", False),
+                     ("d", "t-d", "no-test", False))
+        self.add("t-1", "build")
+        code, out, err = self.run_main("start", "t-1/build", "--worker", "t60")
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("kind full: working 4 of 4", err)
+        self.assertEqual(self.ids(), ["t-1/build"])
+        self.assertEqual(self.journal("start"), [])
+
     def test_start_refused_under_a_hold(self):  # D4, AC7.4
         self.add("t-1", "build")
         with open(self.path("journal.jsonl"), "a") as f:
