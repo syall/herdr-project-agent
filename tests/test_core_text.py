@@ -1117,5 +1117,109 @@ class T083Places(unittest.TestCase):
         self.assertEqual(section(read("runtime", "core", "worker.md"), "## Safety"), WORKER_SAFETY)
 
 
+# t-097 J3 (R22, R23, R25, R26, R27; J1's RL-1, RL-2, RL-3, VERIFY RL-1 and round 2 RL-3): the person's task order
+T097_ORDER = ("The person's task order never answers a card, approves a rule, lifts a hold, raises a limit, or starts a "
+              "task before its `after` tasks. It only says which ready task goes first.")
+T097_MOVES = ("A category move from the panel never passes a gate, never answers or withdraws a card, and never starts "
+              "or stops a worker by itself.")
+
+
+class T097TaskOrder(unittest.TestCase):
+    def setUp(self):
+        self.raw = read("runtime", "core", "orchestrator.md")
+        self.passes = part(self.raw, "## The pass", "## After a restart or a compaction")
+        self.files = part(self.raw, "## Files", "## Decision cards")
+        self.workers = part(self.raw, "## Workers", "## Phases and gates")
+        readme = read("README.md")
+        order = readme.find("**Task order**")  # -1 before J3: the tests then fail on their assertions, not in setUp
+        costs = readme.index("**The Costs view**")
+        self.readme = flat(readme[order:costs]) if order >= 0 else ""
+        self.places = flat(readme[readme.index("**Places**"):order if order >= 0 else costs])
+        self.recipe = flat(read("RECIPE.md"))
+
+    def test_r25_sentences_verbatim(self):
+        for where in (self.workers, self.readme):
+            self.assertIn(T097_ORDER, where)
+            self.assertIn(T097_MOVES, where)
+        self.assertIn(T083_R10, self.workers)  # the start-order sentence stays beside it
+
+    def test_r23_pass_reads_the_order(self):
+        self.assertIn("`pa-places tasks` (the task order: each ranked task, top first, with its source, state, "
+                      "`after`, open card and `paused`)", self.passes)
+        self.assertIn("Take new work from `pa-places tasks`, top first: for each task that is ready (its `after` tasks "
+                      "done, not `paused`, no open card, no hold), add its next job to the waiting list; jobs start "
+                      "only through `pa-places next`.", self.passes)
+
+    def test_r26_files(self):
+        self.assertIn("`task-order.json` is the person's too: the panel writes it; read it through `pa-places tasks`, "
+                      "never write it.", self.files)
+        for words in ('"taskOrder": { "order": [ "t-003" ], "chat": [ { "task": "t-009", "quote": "<their words>", '
+                      '"over": "<updated or null>" } ] }',
+                      "Write both keys.",
+                      "Never reorder the person's `order` or `last`; if you think their order is wrong, say so in chat.",
+                      '`followUpOf` ("<task id>") marks a follow-up of that task',
+                      "`paused` is written by `pa-task`: keep it when you write the ledger, never clear it yourself."):
+            self.assertIn(words, self.files)
+
+    def test_rl3_seed_the_whole_ranking(self):  # REVIEW J1 round 2 RL-3, Nit-3
+        self.assertIn("The first time you write `taskOrder`, seed `order` with every ranked task in `pa-places tasks` "
+                      "order; after that append each new task at its end, so it starts at the bottom of Queued.",
+                      self.files)
+
+    def test_r12_chat_entry(self):
+        self.assertIn("When the person says in chat to do a task now, add a `chat` entry quoting them, with `over` the "
+                      "`updated` of the `task-order.json` you read (null with no file); it applies while the file's "
+                      "`updated` still equals it. Remove an entry that no longer applies on your next pass.",
+                      self.files)
+
+    def test_r22_order_journal_line(self):
+        self.assertIn('{"trigger":"task-order","by":"person","orderUpdated":"<updated>","why":"<the moves since the '
+                      'last such line, from the file\'s moves>"}', self.files)
+        self.assertIn("A `task order changed` notice is a message: run the pass as usual.", self.workers)
+
+    def test_r26_person_changes(self):  # and VERIFY J1 RL-1: the re-read covers the three new moves
+        self.assertIn("The person can change a task themselves from the panel or with `pa-task` (mark it done, park it, "
+                      "reopen it, delete it, start it next, pause it, unpause it). You get a message when they do. "
+                      "Their change stands: re-read the ledger before you write it again, never set the task back",
+                      self.files)
+        self.assertIn("`pa-task next`, `pause` and `unpause` are the person's; never run them yourself.", self.files)
+
+    def test_r19_pause_blocks_waiting_jobs(self):
+        self.assertIn("block its waiting jobs with `pa-places block <id> --why \"paused by the person\"`, and unblock "
+                      "them on Unpause or Start next", self.files)
+        self.assertIn("Neither starts or stops a worker.", self.files)
+
+    def test_verify_rl3_until_a_task_order_exists(self):  # VERIFY J1 round 2 RL-3, R27, J1-D10
+        self.assertIn("The waiting list follows the task order once one exists (a readable `task-order.json` or your "
+                      "`taskOrder`); until then it keeps the order you added the jobs in.", self.workers)
+        self.assertIn("until a task order exists", self.readme)
+
+    def test_rl1_jobs_outside_the_ranking(self):  # REVIEW J1 RL-1
+        self.assertIn("A job of a task outside the ranking (a done task's cleanup) waits behind every ranked task's "
+                      "jobs: give it a ranked task, or ask the person to move it in Places.", self.workers)
+
+    def test_rl2_in_flight_tasks_rank_too(self):  # REVIEW J1 RL-2
+        self.assertIn("An in-progress or review task ranks only by its place: its next job can wait behind a higher "
+                      "queued task's job until the person raises it.", self.workers)
+        self.assertIn("in progress", self.readme)
+
+    def test_readme_paragraph(self):
+        for words in ("`task-order.json`", "↑ ↓ ⤒ ⤓", "`PA`", "Start next", "Pause", "Unpause", "Mark done",
+                      "`pa-places tasks`", "`taskOrder`", "follow-ups", "Reset order", "no tool writes"):
+            self.assertIn(words, self.readme)
+        self.assertIn("pins", self.places)  # R10: a Places move pins one job
+
+    def test_recipe_tasks_bullet(self):
+        for words in ("rank order", "↑ ↓ ⤒ ⤓", "`PA`", "Start next", "Pause", "Unpause",
+                      "Answer d-xxx first, or ask the Project Agent to withdraw it.", "Done merges nothing",
+                      "follow-ups of"):
+            self.assertIn(words, self.recipe)
+        self.assertNotIn("one section per state (finished ones start folded), newest first", self.recipe)
+
+    def test_safety_unchanged(self):
+        self.assertEqual(section(self.raw, "## Safety"), ORCHESTRATOR_SAFETY)
+        self.assertEqual(section(read("runtime", "core", "worker.md"), "## Safety"), WORKER_SAFETY)
+
+
 if __name__ == "__main__":
     unittest.main()
