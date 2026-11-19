@@ -13,6 +13,7 @@ Nothing leaves this Mac: hc is tests/stub-hc (a machine is a temp folder), the m
   x8  setup failures -> the Mac in the same call                     x18 docs and help
   x9  every remote argv a fixed form under /tmp/pa-suite-<run>      x19 the profile's hooks/tests.sh full (d-222)
                                                                      x20 each probed tool is the one that runs
+                                                                     x21 the suite itself run on a suite machine
 """
 import json
 import os
@@ -809,6 +810,35 @@ class X20ProbedTools(Remote):
         self.assertEqual(line.get("machine"), "box-1", out)
         self.assertEqual(line["tools"]["python3"]["path"], os.path.join(good, "python3"), line)
         self.assertEqual(line["tools"]["git"]["path"], os.path.join(gitdir, "git"), line)
+
+
+class X21InsideARemoteRun(Remote):
+    """J2 round 4: the suite itself running on a suite machine. There the PATH starts with the outer run's
+    /tmp/pa-suite-<outer>/bin links, so the probe finds every tool under that real folder; stub-hc must not move those
+    paths into its fake machine, or every fake setup fails and the run falls back to the Mac."""
+
+    def test_x21_an_outer_runs_tool_links_are_not_mapped_into_the_fake_machine(self):
+        outer = "/tmp/pa-suite-" + os.urandom(6).hex()
+        self.assertFalse(os.path.lexists(outer), outer)
+        os.makedirs(os.path.join(outer, "bin"))
+        self.addCleanup(shutil.rmtree, outer, True)
+        tools = {"python3": sys.executable}
+        for tool in ("git", "sh", "node"):
+            if shutil.which(tool):
+                tools[tool] = shutil.which(tool)
+        for tool, where in tools.items():
+            os.symlink(where, os.path.join(outer, "bin", tool))
+        self.setenv(PATH=os.pathsep.join([os.path.join(outer, "bin"), os.environ["PATH"]]))
+        code, out = self.main()
+        self.assertEqual(code, 0, out)
+        line = self.lines()[-1]
+        self.assertEqual(line.get("machine"), "box-1", out)
+        self.assertEqual(line["tools"]["python3"]["path"], os.path.join(outer, "bin", "python3"), line)
+        text = self.output(self.run_id(out))
+        ran = re.search(r"python3 ran: (\S+)", text)
+        self.assertTrue(ran, text)
+        self.assertEqual(os.path.realpath(ran.group(1)), os.path.realpath(sys.executable), text)
+        self.assertTrue(os.path.isdir(os.path.join(outer, "bin")), "the outer run's folder is left alone")
 
 
 if __name__ == "__main__":
