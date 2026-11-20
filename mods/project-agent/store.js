@@ -313,6 +313,16 @@ export function codeState(launcher, installed, terminal) {
   if (older.length) return out(`older (${older.join(", ")})`, `runs tools ${tools.slice(0, 12)} core ${core.slice(0, 12)}; installed tools ${String(asText(installed.tools) ?? "").slice(0, 12)} core ${String(asText(installed.core) ?? "").slice(0, 12)}`);
   return out("current", `tools ${tools.slice(0, 12)} core ${core.slice(0, 12)}`);
 }
+// t-195 R3.2: whether the launcher loads installed tools by itself (launcher.json accepts "swap"), and whether its
+// last try failed for the tools installed now: { kind: "auto" | "failed" | "none", why, at }. A failure recorded for
+// another installed hash is an older one (the next install is tried again).
+export function swapState(launcher, installed) {
+  const l = asObj(launcher), none = { kind: "none", why: null, at: null };
+  if (!Array.isArray(l.accepts) || !l.accepts.includes("swap")) return none;
+  const f = asObj(l.swapFailed), tools = asText(asObj(installed).tools);
+  if (isObj(l.swapFailed) && tools && f.installed === tools) return { kind: "failed", why: asText(f.why), at: asText(f.at) };
+  return { kind: "auto", why: null, at: null };
+}
 // The header's words: nothing for current (or nothing read yet).
 export function codeBadge(state) {
   if (!state) return null;

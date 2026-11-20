@@ -2336,35 +2336,39 @@ def error_wait(address, problem, ctx=None):
     call(["hc", "label", address, "herdr.pa.error="], check=False)  # `key=` removes the label
 
 
-def cmd_session(args):
+def cmd_session(args, ctx=None):
+    """ctx: a swap's (take_swap, t-195): until its adopted Claude has ended nothing reaches the terminal, so an error
+    first waits for that Claude (swap_wait_out), and no "starting" label is set (the tab never stopped running)."""
     address = os.environ.get("HC_TERMINAL_ID")
     info = hc_get(address)
     labels = info.get("labels") or {}
     space = local_id(args.space or labels.get("herdr.space"))
     project = os.path.realpath(os.path.expanduser(args.project or os.getcwd()))
-    ctx = {"directory": None, "beat": False}
+    ctx = ctx if ctx is not None else {"directory": None, "beat": False}
     if args.auto or not address or not space or not sys.stdin.isatty():
         return run_session(args, address, labels, space, project, ctx)  # no one to show an error to: as before
     try:
         while True:
             # Tell the keeper this launcher has begun, before the slow steps (hc calls, the launch
             # lock, another launcher's heartbeat), so a slow start is not taken for a plain shell.
-            if not args.ask:  # a new space's first tab asks first; it is never a restore
+            if not args.ask and not ctx.pop("swapNoLabel", False):  # a new space's first tab asks first; never a restore
                 call(["hc", "label", address, "herdr.pa.starting=" + space], check=False)
             try:
                 return run_session(args, address, labels, space, project, ctx)
             except (Problem, OSError) as e:
+                swap_wait_out(ctx)  # t-195: never over a running adopted Claude
                 error_wait(address, e, ctx)
                 if ctx.get("after"):  # a restart taken while it waited: the exec now (returns only when it failed)
                     take_after(ctx, ctx.get("project") or project, ctx.get("directory"), address)
     except KeyboardInterrupt:  # the person stops it (in error-wait or before): the tab's shell takes over
         sys.exit(2)
     finally:  # however it ends, it no longer says it is starting or waiting
+        swap_wait_out(ctx)  # t-195: an adopted Claude that still runs keeps its terminal until it ends
         reset_tty()  # t-193 R3.1: before the tab's shell gets the terminal
         call(["hc", "label", address, "herdr.pa.error=", "herdr.pa.starting="], check=False)
 
 
-def restarted_session(args):
+def restarted_session(args, ctx=None):
     """pa-session exec'd by a restart (t-037 R6; round 2, VERIFY MF4). The new code passed the self-check but may
     still raise later, on the session path: any exception goes to error_wait (the tab says what failed and how to
     recover) instead of ending the process, its terminal and the workers tied to it. Enter execs the installed
@@ -2373,13 +2377,14 @@ def restarted_session(args):
     start is not exec'd, the tab says why and waits again."""
     address = os.environ.get("HC_TERMINAL_ID")
     try:
-        return cmd_session(args)
+        return cmd_session(args) if ctx is None else cmd_session(args, ctx)
     except Exception as e:  # noqa: BLE001 - whatever the new code raises, the terminal stays
+        swap_wait_out(ctx)  # t-195: a swap's adopted Claude has ended before anything is printed
         if not address:
             raise
         traceback.print_exc()
         failure = e
-    argv = [sys.executable, os.path.join(ROOT, "tools", "pa.py"), "session"] + sys.argv[1:]
+    argv = [sys.executable, os.path.join(ROOT, "tools", "pa.py"), "session"] + without_swap_flags(sys.argv[1:])
     message = ("the restarted launcher failed: {}: {}. Its terminal and workers stay. Install a fixed pa.py (install.sh "
                "or pa-sync), then press Enter: it loads the installed launcher again".format(type(failure).__name__, failure))
     try:
@@ -2400,6 +2405,23 @@ def restarted_session(args):
                 message = "the installed launcher could not be exec'd: {}. Its terminal and workers stay. Press Enter to try again".format(e)
     except KeyboardInterrupt:  # the person stops it: the tab's shell takes over (as cmd_session)
         sys.exit(2)
+
+
+def without_swap_flags(words):
+    """argv words without --swap-child / --swap-id (and a separate value word): a reload after a failure is a start."""
+    out, skip = [], False
+    for w in words:
+        if skip:
+            skip = False
+            if not w.startswith("-"):
+                continue
+        if w in ("--swap-child", "--swap-id"):
+            skip = True
+            continue
+        if w.startswith(("--swap-child=", "--swap-id=")):
+            continue
+        out.append(w)
+    return out
 
 
 # ---- the stamp: what is installed (installed.json) and what a launcher loaded (launcher.json), t-037 J1 ----------
@@ -2515,7 +2537,7 @@ def as_text(value):
 
 
 LAUNCHER_VERSION = 2  # version 2: the launcher takes requests (accepts); a version-1 record is from J1 code
-ACCEPTS = ["restart", "context"]  # t-041 J4: a context request (context-request.json)
+ACCEPTS = ["restart", "context", "swap"]  # t-041 J4: a context request (context-request.json); t-195: the swap
 
 
 def restart_capable(record):
@@ -2561,7 +2583,14 @@ def launcher_start(ctx, address, space, directory, p):
                   "started": ctx.get("startedAt") or ctx.setdefault("startedAt", now()),
                   "code": {"tools": tools, "file": me, "installed": as_text(installed.get("tools")), "commit": commit},
                   "profile": profile_record(p),
-                  "session": None, "restart": None, "restartedFrom": None, "context": None, "lastReset": None}
+                  "session": None, "restart": None, "restartedFrom": None, "context": None, "lastReset": None,
+                  "swap": None, "swapFailed": None}  # t-195 R1.3
+        adopt = ctx.get("adopt")
+        if adopt:  # t-195 R2.5.4: exec'd by a swap: the same launcher (instance, start, session) on the installed code
+            carry = as_dict(adopt.get("carry"))
+            for key in ("session", "restart", "restartedFrom", "context", "lastReset"):
+                record[key] = carry.get(key)
+            record["swap"] = {"at": now(), "fromTools": adopt.get("fromTools"), "count": adopt.get("count", 0) + 1}
         restarted = ctx.get("restarted")
         if restarted:  # this process was exec'd by a restart (R6): what it came from
             record["restartedFrom"] = restarted.get("from")
@@ -2711,6 +2740,9 @@ def run_session(args, address, labels, space, project, ctx):
         call(["hc", "label", address, "herdr.pa.restarting="], check=False)
         session_log(directory, "restarted request={} from={} by={}".format(restarted["request"], restarted.get("from"),
                                                                            restarted.get("by")))
+    notes = ctx.pop("swapNotes", None)
+    if notes is not None:  # t-195 R2.5.4: exec'd by a swap
+        swap_started(ctx, directory, address, notes)
     # The heartbeat the previous launcher left: the only sign that a killed session ran. Kept from
     # this launcher's first claim; on a retry the file holds this launcher's own beats.
     ctx.setdefault("previous", previous)
@@ -2876,6 +2908,62 @@ def child_lock(ctx):
     return ctx.setdefault("childLock", threading.Lock())
 
 
+def exit_code(status):
+    """A waitpid status as subprocess gives it: the exit code, or -signal for a signal."""
+    if os.WIFSIGNALED(status):
+        return -os.WTERMSIG(status)
+    if os.WIFEXITED(status):
+        return os.WEXITSTATUS(status)
+    return status
+
+
+class AdoptedChild:
+    """t-195 R2.7: the Claude a swap's new image adopted. The exec kept the pid, so the Claude the old image started is
+    still this process's child: it is waited for by pid (WNOHANG polls, under one lock, so the main thread's wait and
+    end_child's from the watcher never lose the code to each other) and signalled only while not reaped (a reaped
+    pid may belong to someone else). Shaped as the Popen handle end_child and settle_child use."""
+
+    def __init__(self, pid, group, tty, returncode=None):
+        self.pid, self.pa_group, self.pa_tty, self.returncode = pid, group, bool(tty), returncode
+        self.args = ["claude (adopted pid {})".format(pid)]
+        self._lock = threading.Lock()
+
+    def poll(self):
+        with self._lock:
+            if self.returncode is None:
+                try:
+                    got, status = os.waitpid(self.pid, os.WNOHANG)
+                except ChildProcessError:  # reaped by another waiter of this process: its code is lost (as Popen's)
+                    self.returncode = 0
+                else:
+                    if got:
+                        self.returncode = exit_code(status)
+            return self.returncode
+
+    def wait(self, timeout=None):
+        end = None if timeout is None else time.monotonic() + timeout
+        while True:
+            code = self.poll()
+            if code is not None:
+                return code
+            left = None if end is None else end - time.monotonic()
+            if left is not None and left <= 0:
+                raise subprocess.TimeoutExpired(self.args, timeout)
+            time.sleep(0.05 if left is None else min(0.05, left))
+
+    def send_signal(self, sig):
+        with self._lock:
+            if self.returncode is not None:
+                return
+            try:
+                os.kill(self.pid, sig)
+            except ProcessLookupError:
+                pass
+
+    def kill(self):
+        self.send_signal(signal.SIGKILL)
+
+
 def group_size(group):
     """How many live (not zombie) processes are in `group`, from `ps` (read-only); None when ps cannot tell."""
     try:
@@ -2891,20 +2979,29 @@ def group_size(group):
     return n
 
 
-def run_child(ctx, argv, cwd):
+def run_child(ctx, argv, cwd, adopted=None):
     """subprocess.call(argv, cwd=cwd), keeping the handle in ctx["child"] while it runs (same exceptions at start).
     When a restart was taken before the start, nothing starts: None, ended "restart" (the loop execs).
     It returns only when the child's group is gone (t-184 R2, R5): after an end the launcher took, once end_child
-    has finished; after an exit of its own, it ends what the child left in its group (logged)."""
+    has finished; after an exit of its own, it ends what the child left in its group (logged).
+    t-195: it waits in slices of SWAP_EVERY s and, between two, swap_once may load the installed code in place (an
+    exec that does not return); adopted: the Claude a swap's new image adopted (AdoptedChild), already running."""
     with child_lock(ctx):
-        if ctx.get("after"):
-            ctx["ended"] = "restart"
-            return None
-        done = threading.Event()
-        child = spawn(argv, cwd)
+        if adopted is not None:
+            child, done = adopted, ctx.get("childDone") or threading.Event()
+        else:
+            if ctx.get("after"):
+                ctx["ended"] = "restart"
+                return None
+            done = threading.Event()
+            child = spawn(argv, cwd)
         ctx["child"], ctx["childGroup"], ctx["childDone"] = child, getattr(child, "pa_group", None), done
     try:
-        return child.wait()
+        while True:
+            try:
+                return child.wait(timeout=SWAP_EVERY)
+            except subprocess.TimeoutExpired:
+                swap_once(ctx, child)  # never raises; returns when no swap happened
     except BaseException:  # as subprocess.call: the child does not outlive an error here
         child.kill()
         child.wait()
@@ -3481,9 +3578,8 @@ def agent_turn(address):
     return "idle" if word else "unknown"
 
 
-def restart_argv(ctx, rid, by, fresh, project, directory):
-    """The exec's argv (R6): the installed pa.py with every value as --flag=value, so no value is read as a flag
-    (round 2, REVIEW A M1). The pre-check's self-check parses exactly this argv (REVIEW B M3)."""
+def session_argv_base(ctx, project, directory):
+    """The installed pa.py as pa-session runs it for this space, every value as --flag=value (restart_argv, swap_argv)."""
     agent = as_dict(read_json_safe(os.path.join(directory, "agent.json")))
     record = as_dict(ctx.get("launcher"))
     argv = [sys.executable, os.path.join(ROOT, "tools", "pa.py"), "session",
@@ -3491,6 +3587,14 @@ def restart_argv(ctx, rid, by, fresh, project, directory):
             "--profile=" + (as_text(agent.get("profile")) or as_text(as_dict(record.get("profile")).get("name")) or "")]
     if as_text(agent.get("name")):
         argv.append("--name=" + agent["name"])
+    return argv
+
+
+def restart_argv(ctx, rid, by, fresh, project, directory):
+    """The exec's argv (R6): the installed pa.py with every value as --flag=value, so no value is read as a flag
+    (round 2, REVIEW A M1). The pre-check's self-check parses exactly this argv (REVIEW B M3)."""
+    record = as_dict(ctx.get("launcher"))
+    argv = session_argv_base(ctx, project, directory)
     argv += ["--restarted=" + rid, "--from-instance=" + (as_text(record.get("instance")) or ""), "--restart-by=" + by]
     if fresh:
         argv.append("--fresh")
@@ -3726,6 +3830,413 @@ def reload_after_exit(ctx, project, directory, address, space):
                  project, directory, address)
 
 
+# ---- the swap: a running launcher loads the installed code in place (t-195) ----------------------------------------
+# While its Claude runs, run_child waits in slices of SWAP_EVERY s; between two, swap_once (main thread) checks whether
+# installed.json names other tools than this image runs, whether that install has settled and whether nothing else
+# is pending (a restart, a context reset, an end), then runs the restart's pre-check with the swap's own argv and
+# execs the installed pa.py in this process. execve keeps the pid, so the running Claude stays this process's child:
+# the new image adopts it (take_swap, AdoptedChild), keeps the launcher instance and its records, and waits for the
+# same Claude. Claude is never signalled and nothing is written to its terminal; a check that fails is said once per
+# installed hash (session.log and launcher.json swapFailed) and retried after SWAP_RETRY s. Same machine only: no ssh,
+# no hc (R4).
+
+SWAP_EVERY = 30  # seconds between two swap checks while Claude runs (R2.1)
+SWAP_SETTLE = 60  # an install younger than this is not loaded yet (pa-sync may still be writing)
+SWAP_RETRY = 600  # seconds before a failed swap is tried again for the same installed tools (monotonic clock)
+SWAP_FILE = "launcher-swap.json"  # the old image's state for the new one (R2.4); optional
+SWAP_STATE_MAX = 64 * 1024
+SWAP_CHILD = re.compile(r"([1-9]\d{0,9}):([1-9]\d{0,9})", re.ASCII)  # fullmatch: ASCII digits only, no sign, no space
+PID_MAX = 2 ** 31 - 1
+TOOLS_HASH = re.compile(r"[0-9a-f]{64}", re.ASCII)
+SWAP_MISSING = "\0missing"  # argparse: --swap-child / --swap-id given without a value
+SWAP_REPEATED = "\0repeated"  # argparse: given twice
+SWAP_HOOK = None  # tests only: called right before the exec, under the locks
+
+
+class SwapOnce(argparse.Action):
+    """--swap-child / --swap-id: one value each; a repeat is recorded (and refused by parse_swap_args), never the
+    last one silently kept."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        setattr(namespace, self.dest, SWAP_REPEATED if getattr(namespace, self.dest, None) is not None else values)
+
+
+def parse_swap_args(child, swap_id):
+    """((pid, pgid, id), None) for a well-formed swap argv; (None, why) otherwise (R2.5.1)."""
+    if not isinstance(child, str) or child in (SWAP_MISSING, SWAP_REPEATED):
+        return None, "--swap-child is missing, empty or given twice"
+    m = SWAP_CHILD.fullmatch(child)
+    if not m:
+        return None, "--swap-child {!r} is not <pid>:<pgid>".format(child[:40])
+    pid, pgid = int(m.group(1)), int(m.group(2))
+    if pid > PID_MAX or pgid > PID_MAX:
+        return None, "--swap-child {!r} is out of range".format(child[:40])
+    if pid in (1, os.getpid(), os.getppid()):
+        return None, "--swap-child names pid {}: init, this launcher or its parent".format(pid)
+    if not isinstance(swap_id, str) or swap_id in (SWAP_MISSING, SWAP_REPEATED) or not REQUEST_ID.fullmatch(swap_id):
+        return None, "--swap-id is missing, given twice or not an id"
+    return (pid, pgid, swap_id), None
+
+
+def swap_argv(ctx, swap_id, project, directory, child):
+    """The swap's exec argv (R2.3): restart_argv's base, the child to adopt and the state file's id."""
+    group = getattr(child, "pa_group", None) or child.pid
+    return session_argv_base(ctx, project, directory) + ["--swap-child={}:{}".format(child.pid, group),
+                                                          "--swap-id=" + swap_id]
+
+
+def swap_settled(installed, path):
+    """R2.2.2: installed.json's `at` (this machine's clock) is SWAP_SETTLE s old; an `at` that cannot be used (garbled,
+    or more than SWAP_SETTLE s ahead) is replaced by the file's mtime, read now."""
+    at = parse_time(as_text(installed.get("at")) or "")
+    now_ = time.time()
+    if at is not None and at <= now_ + SWAP_SETTLE:
+        return now_ - at >= SWAP_SETTLE
+    mtime = mtime_or_none(path)
+    return mtime is not None and now_ - mtime >= SWAP_SETTLE
+
+
+def swap_blocked(ctx, directory):
+    """R2.2.3: something else is pending: never a swap then."""
+    if any(ctx.get(k) for k in ("after", "restarting", "waitingFor", "ended", "freshNext")):
+        return True
+    return any(os.path.lexists(os.path.join(directory, n)) for n in (REQUEST, CONTEXT_REQUEST))
+
+
+def swap_failed(ctx, directory, target, why):
+    """Said once per installed hash (R2.2.4): one session.log line and launcher.json swapFailed."""
+    if ctx.get("swapSaid") == target:
+        return
+    ctx["swapSaid"] = target
+    why = " ".join(str(why).split())[:300]
+    session_log(directory, "swap not done (installed tools {}): {}".format(target[:12], why))
+    entry = {"at": now(), "installed": target, "why": why}
+    launcher_update(ctx, directory, lambda r: r.__setitem__("swapFailed", entry))
+
+
+def swap_once(ctx, child):
+    """One swap check (R2.2), on the main thread between two wait slices. Never raises: a check that cannot run is
+    logged once per reason and the wait goes on. Returns only when no exec happened."""
+    try:
+        swap_try(ctx, child)
+    except Exception as e:  # noqa: BLE001 - the swap never stops the launcher
+        why = "{}: {}".format(type(e).__name__, e)[:200]
+        if ctx.get("swapError") != why and ctx.get("directory"):
+            ctx["swapError"] = why
+            try:
+                session_log(ctx["directory"], "swap check failed: " + why)
+            except OSError:
+                pass
+
+
+def swap_try(ctx, child):
+    directory, record = ctx.get("directory"), ctx.get("launcher")
+    if not record or not directory:
+        return
+    mine = as_text(as_dict(record.get("code")).get("tools"))
+    path = os.path.join(ROOT, "installed.json")
+    installed = as_dict(installed_stamp())
+    target = as_text(installed.get("tools"))
+    if not mine or not TOOLS_HASH.fullmatch(mine) or not target or not TOOLS_HASH.fullmatch(target):
+        return
+    if target == mine:
+        if record.get("swapFailed") is not None:
+            launcher_update(ctx, directory, lambda r: r.__setitem__("swapFailed", None))
+        ctx.pop("swapSaid", None)
+        return
+    if not swap_settled(installed, path) or swap_blocked(ctx, directory):
+        return
+    tried = ctx.setdefault("swapTried", {})
+    if target in tried and time.monotonic() - tried[target] < SWAP_RETRY:
+        return
+    # An install half done is no failure: nothing is tried until the files match installed.json.
+    if (hash_or_none(os.path.join(ROOT, "tools"), top_py_only=True) != target
+            or hash_or_none(os.path.join(ROOT, "core")) != installed.get("core")):
+        return
+    agent = as_dict(read_json_safe(os.path.join(directory, "agent.json")))
+    space = as_text(agent.get("space")) or os.path.basename(directory)
+    profile = as_text(agent.get("profile")) or as_text(as_dict(record.get("profile")).get("name"))
+    project = ctx.get("project") or as_text(agent.get("project")) or os.getcwd()
+    swap_id = str(uuid.uuid4())
+    argv = swap_argv(ctx, swap_id, project, directory, child)
+    tried[target] = time.monotonic()
+    pre, why = restart_precheck(ctx, space, profile, argv)
+    if not pre:
+        return swap_failed(ctx, directory, target, why)
+    failed = swap_exec(ctx, child, directory, space, argv, swap_id, pre)
+    if failed is None:  # not tried after all (something came up under the locks): the next slice looks again
+        tried.pop(target, None)
+    else:
+        swap_failed(ctx, directory, target, failed)
+
+
+def swap_exec(ctx, child, directory, space, argv, swap_id, pre):
+    """R2.2.6-7: under the child lock (no restart is taken meanwhile), the launch lock (pa-restart withdraws under
+    it) and the launcher.json lock, the last checks, the state file and the exec. Returns None when it did not try,
+    else why the exec failed (it returned: the old image goes on)."""
+    with child_lock(ctx):
+        try:
+            lock = launch_lock(space, wait=2)
+        except (Problem, OSError):
+            return None
+        try:
+            with ctx.setdefault("launcherLock", threading.Lock()):
+                if swap_blocked(ctx, directory) or child.poll() is not None:
+                    return None
+                if hash_or_none(os.path.join(ROOT, "tools"), top_py_only=True) != pre.get("tools"):
+                    return None
+                write_swap_state(ctx, directory, swap_id, child)
+                failed = "exec returned"
+                sys.stdout.flush()
+                sys.stderr.flush()
+                previous = signal.signal(signal.SIGINT, signal.SIG_IGN)  # as across a restart's exec
+                try:
+                    if SWAP_HOOK is not None:
+                        SWAP_HOOK(ctx, child)
+                    os.execv(sys.executable, argv)
+                except (OSError, ValueError, TypeError) as e:
+                    failed = "exec: {}".format(e)
+                finally:  # only when the exec did not happen
+                    signal.signal(signal.SIGINT, previous)
+                remove_swap_state(directory, swap_id)
+                return failed
+        finally:
+            lock.close()
+
+
+def write_swap_state(ctx, directory, swap_id, child):
+    """R2.4: what the new image carries (written atomically, mode 0600 by write_text's mkstemp)."""
+    record = as_dict(ctx.get("launcher"))
+    running = as_dict(ctx.get("running"))
+    launch = as_dict(ctx.get("launchInfo"))
+    previous = ctx.get("previous")
+    count = as_dict(record.get("swap")).get("count")
+    state = {"version": 1, "id": swap_id, "pid": child.pid, "pgid": getattr(child, "pa_group", None),
+             "tty": bool(getattr(child, "pa_tty", False)), "instance": record.get("instance"),
+             "startedAt": ctx.get("startedAt"), "started": ctx.get("started"),
+             "previous": list(previous) if isinstance(previous, (list, tuple)) else None,
+             "running": {"since": running.get("since"), "session": running.get("session"),
+                         "marked": bool(running.get("marked"))},
+             "began": launch.get("began"), "resume": launch.get("resume"), "why": launch.get("why"),
+             "quick": launch.get("quick"), "quickResumeFails": launch.get("quickResumeFails"),
+             "session": record.get("session"), "restartedFrom": record.get("restartedFrom"),
+             "restart": record.get("restart"), "context": record.get("context"), "lastReset": record.get("lastReset"),
+             "formerInstances": sorted(x for x in ctx.get("formerInstances", ()) if isinstance(x, str)),
+             "swapCount": count if isinstance(count, int) and not isinstance(count, bool) else 0,
+             "fromTools": as_text(as_dict(record.get("code")).get("tools")), "at": now()}
+    write_json(os.path.join(directory, SWAP_FILE), state)
+
+
+def read_swap_state(directory, swap_id):
+    """The state file for this swap, or None: not a regular file of this user (a symlink is not followed, a FIFO
+    never blocks), larger than SWAP_STATE_MAX, not a JSON object, or another swap's id."""
+    try:
+        fd = os.open(os.path.join(directory, SWAP_FILE),
+                     os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_size > SWAP_STATE_MAX:
+            return None
+        data = b""
+        while len(data) <= SWAP_STATE_MAX:
+            chunk = os.read(fd, SWAP_STATE_MAX + 1 - len(data))
+            if not chunk:
+                break
+            data += chunk
+        if len(data) > SWAP_STATE_MAX:
+            return None
+        value = json.loads(data.decode("utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+    finally:
+        os.close(fd)
+    if not isinstance(value, dict) or value.get("id") != swap_id:
+        return None
+    return value
+
+
+def remove_swap_state(directory, swap_id):
+    """Deletes the state file only when it is this swap's (a file with another id stays)."""
+    if not directory or read_swap_state(directory, swap_id) is None:
+        return False
+    try:
+        os.remove(os.path.join(directory, SWAP_FILE))
+        return True
+    except OSError:
+        return False
+
+
+def swap_number(value, minimum=0.0):
+    return (float(value) if isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value) and value > minimum else None)
+
+
+def swap_count(value):
+    return value if isinstance(value, int) and not isinstance(value, bool) and 0 <= value < 10 ** 6 else 0
+
+
+def swap_silence(ctx):
+    """While the adopted Claude has the terminal, nothing this image prints may reach it (R2.5.3)."""
+    if "swapStdio" not in ctx:
+        sink = open(os.devnull, "w")
+        ctx["swapStdio"] = (sys.stdout, sys.stderr, sink)
+        sys.stdout = sys.stderr = sink
+
+
+def swap_loud(ctx):
+    saved = ctx.pop("swapStdio", None)
+    if saved:
+        sys.stdout, sys.stderr = saved[0], saved[1]
+        saved[2].close()
+
+
+def take_swap(args, quiet=True):
+    """The new image's first step (R2.5.1-2, R2.6): the ctx for cmd_session. With a well-formed argv naming its own
+    child, ctx["adopt"] (the AdoptedChild and what the state file carries); else ctx["reapFirst"]: every child of its
+    own is reaped before its first Claude start. Never raises; writes nothing (the notes go to session.log once the
+    space is claimed)."""
+    ctx = {"directory": None, "beat": False, "restartNext": True, "swapNoLabel": True, "swapNotes": []}
+    if quiet:
+        swap_silence(ctx)
+    notes = ctx["swapNotes"]
+    parsed, why = parse_swap_args(getattr(args, "swap_child", None), getattr(args, "swap_id", None))
+    if not parsed:
+        notes.append("swap not adopted: " + why)
+        ctx["reapFirst"] = True
+        return ctx
+    pid, pgid, swap_id = parsed
+    try:
+        group_now = os.getpgid(pid)
+    except OSError:
+        group_now = None
+    try:
+        got, status = os.waitpid(pid, os.WNOHANG)
+    except ChildProcessError:
+        notes.append("swap not adopted: pid {} is not a child of this launcher".format(pid))
+        ctx["reapFirst"] = True
+        return ctx
+    except OSError as e:
+        notes.append("swap not adopted: pid {}: {}".format(pid, e))
+        ctx["reapFirst"] = True
+        return ctx
+    code = exit_code(status) if got else None
+    group = (pgid if pgid != os.getpgrp() and (group_now == pgid or (got and group_now is None and pgid == pid))
+             else None)
+    if group is None:
+        notes.append("swap: pgid {} is not the adopted child's own group (its group: {}): adopted without it".format(
+            pgid, group_now))
+    space = local_id(getattr(args, "space", None) or "")
+    directory = os.path.join(ROOT, "spaces", space) if space and ID.match(space) else None
+    state = read_swap_state(directory, swap_id) if directory else None
+    if state is None:
+        notes.append("swap: no usable state file (adopted from the argv, with defaults)")
+    s = as_dict(state)
+    tty = s.get("tty")
+    if not isinstance(tty, bool):
+        try:
+            tty = group is not None and os.isatty(0) and os.tcgetpgrp(0) == group
+        except OSError:
+            tty = False
+    instance = as_text(s.get("instance"))
+    if instance and len(instance) <= 200 and all(c.isprintable() and not c.isspace() for c in instance):
+        ctx["instance"] = instance
+    if as_text(s.get("startedAt")) and parse_time(s["startedAt"]) is not None:
+        ctx["startedAt"] = s["startedAt"]
+    if swap_number(s.get("started")) is not None:
+        ctx["started"] = swap_number(s["started"])
+    prev = s.get("previous")
+    ctx["previous"] = (tuple(prev) if isinstance(prev, list) and len(prev) == 2 and isinstance(prev[0], int)
+                       and not isinstance(prev[0], bool) and isinstance(prev[1], str) else None)
+    former = s.get("formerInstances")
+    if isinstance(former, list) and all(isinstance(x, str) for x in former):
+        ctx["formerInstances"] = set(former[:50])
+    agent = as_dict(read_json_safe(os.path.join(directory, "agent.json"))) if directory else {}
+    began = swap_number(s.get("began")) or time.time()
+    run = as_dict(s.get("running"))
+    running = {"since": swap_number(run.get("since")) or began,
+               "session": as_text(run.get("session")) if "session" in run else as_text(agent.get("sessionId")),
+               "marked": run.get("marked") if isinstance(run.get("marked"), bool) else False}
+    if not isinstance(s.get("running"), dict):
+        running["session"] = as_text(agent.get("sessionId"))
+    carry = {"session": s.get("session") if isinstance(s.get("session"), dict) else None,
+             "restart": s.get("restart") if isinstance(s.get("restart"), dict) else None,
+             "restartedFrom": as_text(s.get("restartedFrom")),
+             "context": s.get("context") if isinstance(s.get("context"), dict) else None,
+             "lastReset": s.get("lastReset") if isinstance(s.get("lastReset"), dict) else None}
+    from_tools = as_text(s.get("fromTools"))
+    child = AdoptedChild(pid, group, tty, code)
+    ctx["adopt"] = {"child": child, "id": swap_id, "pid": pid, "pgid": group, "running": running, "began": began,
+                    "resume": s.get("resume") if isinstance(s.get("resume"), bool) else True,
+                    "why": as_text(s.get("why")) or "swap", "quick": swap_count(s.get("quick")),
+                    "quickResumeFails": swap_count(s.get("quickResumeFails")), "carry": carry,
+                    "count": swap_count(s.get("swapCount")),
+                    "fromTools": (from_tools if from_tools and len(from_tools) <= 128
+                                  and all(c.isprintable() and not c.isspace() for c in from_tools) else None)}
+    ctx["adoptedChild"] = child
+    return ctx
+
+
+def swap_started(ctx, directory, address, notes):
+    """After the new image claimed its space (R2.5.4): its notes, the restarting label cleared, the adoption line, the
+    state file deleted (only its own)."""
+    for note in notes:
+        session_log(directory, note)
+    adopt = ctx.get("adopt")
+    if not adopt:
+        return
+    call(["hc", "label", address, "herdr.pa.restarting="], check=False)
+    tools = as_text(as_dict(as_dict(ctx.get("launcher")).get("code")).get("tools"))
+    session_log(directory, "swap adopted pid={} pgid={} from={} to={}".format(
+        adopt["pid"], adopt["pgid"] if adopt["pgid"] is not None else "none", (adopt.get("fromTools") or "none")[:12],
+        (tools or "none")[:12]))
+    remove_swap_state(directory, adopt["id"])
+
+
+def reap_children(directory):
+    """R2.6: every child of this process (what an exec it could not adopt from left) waited for, each exit logged."""
+    while True:
+        try:
+            pid, status = os.waitpid(-1, 0)
+        except ChildProcessError:
+            return
+        except InterruptedError:
+            continue
+        if directory:
+            try:
+                session_log(directory, "swap: reaped pid={} code={}".format(pid, exit_code(status)))
+            except OSError:
+                pass
+
+
+def swap_wait_out(ctx):
+    """Before anything of the new image may reach the terminal (an error's text, the reset of the terminal): the
+    adopted Claude, or the children it could not adopt, have ended (waited for silently); then stdout is back."""
+    if ctx is None:
+        return
+    child = ctx.get("adoptedChild")
+    if child is not None and child.poll() is None:
+        child.wait()
+    if ctx.pop("reapFirst", False):
+        reap_children(ctx.get("directory"))
+    swap_loud(ctx)
+
+
+def swap_notes(launcher):
+    """pa-doctor's lines for launcher.json swap / swapFailed (R3.3)."""
+    rec, out = as_dict(launcher), []
+    swap, failed = rec.get("swap"), rec.get("swapFailed")
+    if isinstance(swap, dict) and as_text(swap.get("at")):
+        count = swap.get("count")
+        out.append("loaded the installed code in place at {} ({}×)".format(
+            " ".join(swap["at"].split())[:40], count if isinstance(count, int) and not isinstance(count, bool) else "?"))
+    if isinstance(failed, dict) and as_text(failed.get("at")):
+        out.append("could not load the installed code in place at {}: {}".format(
+            " ".join(failed["at"].split())[:40], " ".join((as_text(failed.get("why")) or "no reason recorded").split())[:300]))
+    return out
+
+
 def run_agent(args, address, project, p, directory, agent, ctx, started):
     running = ctx.setdefault("running", {"since": None, "session": None, "marked": False})
     ctx["directory"], ctx["project"] = directory, project
@@ -3766,94 +4277,121 @@ def run_agent(args, address, project, p, directory, agent, ctx, started):
             wake.clear()
     space = agent.get("space") or os.path.basename(directory)
     child_lock(ctx)  # made before the watcher thread exists
+    # t-195 R2.5.5: a swap's new image: the adopted Claude is this launcher's running child before the watcher can
+    # take a restart (end_child then ends it), with the run's records as the old image kept them.
+    adopt = ctx.pop("adopt", None)
+    if adopt:
+        with child_lock(ctx):
+            ctx["child"], ctx["childGroup"] = adopt["child"], adopt["child"].pa_group
+            ctx["childDone"] = threading.Event()
+        running.update(adopt["running"])
     if not ctx["beat"]:  # one heartbeat thread, also when a start is retried after an error
         threading.Thread(target=beat, daemon=True).start()
+    if ctx.pop("reapFirst", False):  # t-195 R2.6: before the watcher (its pre-checks are children too) and any start
+        reap_children(directory)
+        swap_loud(ctx)
+    if not ctx["beat"]:
         if ctx.get("launcher"):  # the request watcher (t-037 R6); a separate thread keeps the heartbeat's pace
             threading.Thread(target=lambda: watcher(ctx, directory, address, space), daemon=True).start()
         ctx["beat"] = True
-    quick, quick_resume_fails = 0, 0
+    quick, quick_resume_fails = (adopt["quick"], adopt["quickResumeFails"]) if adopt else (0, 0)
     while True:
-        take_after(ctx, project, directory, address)  # a restart taken while no Claude ran (returns if it failed)
-        fresh_next = ctx.pop("freshNext", None)  # t-041 J4: a fresh context was taken
-        fresh = reload_profile(p)
-        agent = read_json(os.path.join(directory, "agent.json"), agent)
-        resume, why = should_resume(agent, directory, project, before=started, heartbeat=ctx.get("previous"))
-        if args.fresh or fresh_next:
-            resume, why = False, "fresh" if args.fresh else "context"
-        if not resume:
-            old = agent.get("sessionId")
-            if why in ("fresh", "context") and isinstance(old, str) and old:  # the person can /resume it
-                previous = [s for s in agent.get("previousSessions") or [] if isinstance(s, str) and s != old]
-                agent["previousSessions"] = ([old] + previous)[:PREVIOUS_MAX]
-            agent["sessionId"], agent["sessionStarted"] = str(uuid.uuid4()), False
-        prompt = (fresh_prompt(directory, resets_today(directory) + 1, fresh_next.get("reason"), fresh_next.get("from"))
-                  if fresh_next else None)
-        args.fresh = False
-        agent["updated"] = now()
-        write_json(os.path.join(directory, "agent.json"), agent)
-        held, adopted = p, False
-        if fresh is not p:
-            # The re-read profile is used only when a launch can be built from it (t-033 round 2): a file that
-            # loads but has a wrong shape in a key read here (models a list, path a number, ...) keeps the old one.
+        if adopt:  # its first pass: wait for the adopted Claude; then on as after any exit
+            resume, why, began = adopt["resume"], adopt["why"], adopt["began"]
+            agent = read_json(os.path.join(directory, "agent.json"), agent)
+            ctx["launchInfo"] = {"began": began, "resume": resume, "why": why, "quick": quick,
+                                 "quickResumeFails": quick_resume_fails}
             try:
-                snap, ver = snapshot_flag(fresh, ctx), cc_version(fresh, ctx)  # t-041 J3: the version gates the net
-                argv, model = launch_command(fresh, agent, resume, directory, snapshot=snap, version=ver, prompt=prompt)
-                p, adopted = fresh, fresh != held
-            except Exception:  # noqa: BLE001 - a restart never fails because of the reload
-                fresh = p
-        if fresh is p:
-            snap, ver = snapshot_flag(p, ctx), cc_version(p, ctx)  # t-041 J3: the version gates the net
-            argv, model = launch_command(p, agent, resume, directory, snapshot=snap, version=ver, prompt=prompt)
-
-        def starting(model):  # what is written as a launch starts; returns its start time
-            ttl, by = cache_in_effect(p, os.environ)  # t-040: the cache lifetime this start asks for
-            plan = context_launch(directory, ver)  # t-041 J3: what this start asks for (net=, idle=); notes once, before
-            said = ctx.setdefault("contextSaid", set())
-            for note in plan["notes"]:
-                if note not in said:
-                    said.add(note)
-                    session_log(directory, note)
-            if fresh_next and not fresh_next.get("recorded"):  # t-041 J4: before the start line (it stays last)
-                fresh_next["recorded"] = True
-                fresh_records(ctx, directory, address, fresh_next, agent["sessionId"], prompt)
-            session_log(directory, "start resume={} session={} reason={} cache={} cacheBy={} net={} idle={}".format(
-                resume, agent["sessionId"], why, ttl, by, plan["net"] or ("off" if plan["mode"] == "off" else "none"),
-                "off" if plan["idle"] else "kept"))
-            began = time.time()
-            running.update(since=began, session=agent["sessionId"], marked=False)
-            wake.set()  # the heartbeat times this session's RAN mark from now
-            launcher_session(ctx, directory, agent, resume, snapshot=snap)
-            if adopted:  # t-033's re-read profile is the one running now (J1 Recorded limit L1)
-                launcher_update(ctx, directory, lambda r: r.__setitem__("profile", profile_record(p)))
-            costs = costs_module()
-            if costs:
+                code = run_child(ctx, None, project, adopted=adopt["child"])
+            finally:
+                ctx.pop("adoptedChild", None)
+                swap_loud(ctx)
+            adopt = None
+        else:
+            take_after(ctx, project, directory, address)  # a restart taken while no Claude ran (returns if it failed)
+            fresh_next = ctx.pop("freshNext", None)  # t-041 J4: a fresh context was taken
+            fresh = reload_profile(p)
+            agent = read_json(os.path.join(directory, "agent.json"), agent)
+            resume, why = should_resume(agent, directory, project, before=started, heartbeat=ctx.get("previous"))
+            if args.fresh or fresh_next:
+                resume, why = False, "fresh" if args.fresh else "context"
+            if not resume:
+                old = agent.get("sessionId")
+                if why in ("fresh", "context") and isinstance(old, str) and old:  # the person can /resume it
+                    previous = [s for s in agent.get("previousSessions") or [] if isinstance(s, str) and s != old]
+                    agent["previousSessions"] = ([old] + previous)[:PREVIOUS_MAX]
+                agent["sessionId"], agent["sessionStarted"] = str(uuid.uuid4()), False
+            prompt = (fresh_prompt(directory, resets_today(directory) + 1, fresh_next.get("reason"), fresh_next.get("from"))
+                      if fresh_next else None)
+            args.fresh = False
+            agent["updated"] = now()
+            write_json(os.path.join(directory, "agent.json"), agent)
+            held, adopted = p, False
+            if fresh is not p:
+                # The re-read profile is used only when a launch can be built from it (t-033 round 2): a file that
+                # loads but has a wrong shape in a key read here (models a list, path a number, ...) keeps the old one.
                 try:
-                    costs.record_agent_start(directory, agent, address, project, model, resume, profile=p, command=argv)
-                except Exception:  # noqa: BLE001 - never stops the Project Agent
-                    pass
-            return began
-        if ctx.get("after"):  # taken while this launch was built (the --help probe): the exec, before any Claude starts
-            take_after(ctx, project, directory, address)
-            continue
-        end_leftovers(ctx, address)  # t-193 R1.1: what an earlier launch left on this terminal, before every start
-        began = starting(model)
-        try:
-            code = run_child(ctx, argv, project)
-        except (OSError, ValueError, TypeError) as e:
-            # t-033 round 4: a changed profile whose program the exec could not start (a raise, not an exit code:
-            # a lone surrogate, a folder or non-program as claude, an argument list too long, ...) does not stop
-            # the launcher: this launch uses the profile in hand. Its own build and start are not guarded, so a
-            # failure there is raised as before.
-            if not adopted:
-                raise
-            session_log(directory, "the re-read profile did not start ({}); launching with the profile in hand"
-                        .format(ascii(e)[:200]))
-            p, adopted = held, False
-            snap, ver = snapshot_flag(p, ctx), cc_version(p, ctx)  # t-041 J3: the version gates the net
-            argv, model = launch_command(p, agent, resume, directory, snapshot=snap, version=ver, prompt=prompt)
-            end_leftovers(ctx, address)
+                    snap, ver = snapshot_flag(fresh, ctx), cc_version(fresh, ctx)  # t-041 J3: the version gates the net
+                    argv, model = launch_command(fresh, agent, resume, directory, snapshot=snap, version=ver, prompt=prompt)
+                    p, adopted = fresh, fresh != held
+                except Exception:  # noqa: BLE001 - a restart never fails because of the reload
+                    fresh = p
+            if fresh is p:
+                snap, ver = snapshot_flag(p, ctx), cc_version(p, ctx)  # t-041 J3: the version gates the net
+                argv, model = launch_command(p, agent, resume, directory, snapshot=snap, version=ver, prompt=prompt)
+
+            def starting(model):  # what is written as a launch starts; returns its start time
+                ttl, by = cache_in_effect(p, os.environ)  # t-040: the cache lifetime this start asks for
+                plan = context_launch(directory, ver)  # t-041 J3: what this start asks for (net=, idle=); notes once, before
+                said = ctx.setdefault("contextSaid", set())
+                for note in plan["notes"]:
+                    if note not in said:
+                        said.add(note)
+                        session_log(directory, note)
+                if fresh_next and not fresh_next.get("recorded"):  # t-041 J4: before the start line (it stays last)
+                    fresh_next["recorded"] = True
+                    fresh_records(ctx, directory, address, fresh_next, agent["sessionId"], prompt)
+                session_log(directory, "start resume={} session={} reason={} cache={} cacheBy={} net={} idle={}".format(
+                    resume, agent["sessionId"], why, ttl, by, plan["net"] or ("off" if plan["mode"] == "off" else "none"),
+                    "off" if plan["idle"] else "kept"))
+                began = time.time()
+                running.update(since=began, session=agent["sessionId"], marked=False)
+                # t-195 R2.4: what a swap during this run carries to the new image
+                ctx["launchInfo"] = {"began": began, "resume": resume, "why": why, "quick": quick,
+                                     "quickResumeFails": quick_resume_fails}
+                wake.set()  # the heartbeat times this session's RAN mark from now
+                launcher_session(ctx, directory, agent, resume, snapshot=snap)
+                if adopted:  # t-033's re-read profile is the one running now (J1 Recorded limit L1)
+                    launcher_update(ctx, directory, lambda r: r.__setitem__("profile", profile_record(p)))
+                costs = costs_module()
+                if costs:
+                    try:
+                        costs.record_agent_start(directory, agent, address, project, model, resume, profile=p, command=argv)
+                    except Exception:  # noqa: BLE001 - never stops the Project Agent
+                        pass
+                return began
+            if ctx.get("after"):  # taken while this launch was built (the --help probe): the exec, before any Claude starts
+                take_after(ctx, project, directory, address)
+                continue
+            end_leftovers(ctx, address)  # t-193 R1.1: what an earlier launch left on this terminal, before every start
             began = starting(model)
-            code = run_child(ctx, argv, project)
+            try:
+                code = run_child(ctx, argv, project)
+            except (OSError, ValueError, TypeError) as e:
+                # t-033 round 4: a changed profile whose program the exec could not start (a raise, not an exit code:
+                # a lone surrogate, a folder or non-program as claude, an argument list too long, ...) does not stop
+                # the launcher: this launch uses the profile in hand. Its own build and start are not guarded, so a
+                # failure there is raised as before.
+                if not adopted:
+                    raise
+                session_log(directory, "the re-read profile did not start ({}); launching with the profile in hand"
+                            .format(ascii(e)[:200]))
+                p, adopted = held, False
+                snap, ver = snapshot_flag(p, ctx), cc_version(p, ctx)  # t-041 J3: the version gates the net
+                argv, model = launch_command(p, agent, resume, directory, snapshot=snap, version=ver, prompt=prompt)
+                end_leftovers(ctx, address)
+                began = starting(model)
+                code = run_child(ctx, argv, project)
         running["since"] = None
         lasted = time.time() - began
         ended = ctx.pop("ended", None)  # the launcher ended it (end_child): not a crash, not a quick exit
@@ -5334,6 +5872,7 @@ def cmd_doctor(args):
     if word == "unknown" and running and not os.path.exists(os.path.join(directory, "launcher.json")):
         detail += "; or launcher.json could not be written (see session.log)"
     notes.append("code: {} ({})".format(word, detail))
+    notes.extend(swap_notes(read_json_safe(os.path.join(directory, "launcher.json"))))  # t-195 R3.3
     print("{} ({})".format(agent.get("name"), directory))
     for n in notes:
         print("  " + n)
@@ -5950,9 +6489,20 @@ def main():
         parser.add_argument("--restarted", help=argparse.SUPPRESS)  # the request id that exec'd this process
         parser.add_argument("--from-instance", help=argparse.SUPPRESS)
         parser.add_argument("--restart-by", help=argparse.SUPPRESS)
+        # t-195: exec'd by a swap: the running Claude to adopt and the state file's id (nargs "?": an option-like
+        # next word never makes the parser exit; a missing or repeated value is refused by parse_swap_args)
+        parser.add_argument("--swap-child", nargs="?", const=SWAP_MISSING, action=SwapOnce, help=argparse.SUPPRESS)
+        parser.add_argument("--swap-id", nargs="?", const=SWAP_MISSING, action=SwapOnce, help=argparse.SUPPRESS)
         args = parser.parse_args()
+        swapping = args.swap_child is not None or args.swap_id is not None
         if args.self_check:
+            if swapping:  # R2.5.1: the old image never execs a launcher that would refuse its own argv
+                _parsed, why = parse_swap_args(args.swap_child, args.swap_id)
+                if why:
+                    raise Problem("--self-check: " + why)
             return cmd_self_check(args)
+        if swapping:
+            return restarted_session(args, take_swap(args))
         if args.restarted:
             return restarted_session(args)
         return cmd_session(args)

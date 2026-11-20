@@ -445,7 +445,8 @@ class S1_S2_SwapWhileClaudeRuns(unittest.TestCase):
 
     def setUp(self):
         r = self.run_ = Pty(self, stub_run=8, stub_exit=7).start()
-        self.assertTrue(wait_until(lambda: len(r.starts()) == 1 and b"tick 1" in r.text(), 20), r.explain())
+        # installed 2 s into the run: an exit measured from the swap instead of the real start would read <= 6 s
+        self.assertTrue(wait_until(lambda: len(r.starts()) == 1 and b"tick 10" in r.text(), 20), r.explain())
         self.before = r.record()
         self.agent_before = load(os.path.join(r.space, "agent.json"))
         self.stub = r.starts()[0]
@@ -466,6 +467,7 @@ class S1_S2_SwapWhileClaudeRuns(unittest.TestCase):
         self.assertEqual(after["swap"]["fromTools"], r.old_tools)
         self.assertIsNone(after["swapFailed"])
         self.assertEqual(after["code"]["installed"], r.new_tools)
+        wait_until(lambda: "swap adopted" in r.log(), 5)  # logged right after launcher.json is written
         self.assertIn("swap adopted pid={} pgid={} from={} to={}".format(
             self.stub["pid"], self.stub["pgrp"], r.old_tools[:12], r.new_tools[:12]), r.log())
         self.assertEqual(len(r.starts()), 1, "no second Claude")
@@ -521,6 +523,7 @@ class S8_RequestInTheWindow(unittest.TestCase):
         r.install_new()
         self.assertTrue(wait_until(lambda: (r.record().get("restart") or {}).get("request") == "r-window"
                                    and r.record()["restart"].get("outcome") == "ok", 25), r.explain())
+        wait_until(lambda: "restarted request=r-window" in r.log(), 5)  # logged right after launcher.json
         log = r.log()
         self.assertIn("swap adopted", log)
         self.assertLess(log.index("swap adopted"), log.index("restart taken request=r-window"))
@@ -545,7 +548,8 @@ class S9_RestartAfterASwap(unittest.TestCase):
         self.assertTrue(wait_until(lambda: (r.record().get("restart") or {}).get("request") == "r-after"
                                    and r.record()["restart"].get("outcome") == "ok", 25), r.explain())
         sigs = [s["sig"] for s in r.signals()]
-        self.assertEqual(sigs[:1], ["SIGTERM"], sigs)
+        self.assertIn("SIGTERM", sigs)  # with t-193's SIGCONT; macOS may deliver the CONT first
+        self.assertLessEqual(set(sigs), {"SIGTERM", "SIGCONT"}, sigs)
         self.assertFalse(alive(stub["pid"]), "the adopted Claude was ended")
         log = r.log()
         self.assertRegex(log, r"exit code=143 after=\d+s ended=restart")
@@ -562,6 +566,9 @@ class S9_RestartAfterASwap(unittest.TestCase):
 
 
 # ---- in-process: the swap's checks (S4) ---------------------------------------------------------------------------
+
+MISSING = object()
+
 
 class Execd(BaseException):  # not an Exception: swap_once's own guard must not swallow the recorded exec
     pass
@@ -602,8 +609,9 @@ class Base(unittest.TestCase):
         os.makedirs(self.project, exist_ok=True)
         dump({"version": 1, "space": SP, "project": self.project, "profile": "test", "name": "proj", "terminal": "t1",
               "terminals": ["t1"], "sessionId": SID, "sessionStarted": True}, os.path.join(self.dir, "agent.json"))
-        self.saved = {k: pa.__dict__.get(k) for k in ("call", "hc_get", "live_terminals", "__file__", "restart_precheck",
-                                                       "SWAP_RETRY", "SWAP_SETTLE", "SWAP_EVERY", "SWAP_HOOK")}
+        self.saved = {k: pa.__dict__.get(k, MISSING) for k in ("call", "hc_get", "live_terminals", "__file__",
+                                                                "restart_precheck", "SWAP_RETRY", "SWAP_SETTLE",
+                                                                "SWAP_EVERY", "SWAP_HOOK")}
         self.calls = []
         pa.call = lambda argv, check=True: self.calls.append(list(argv)) or ""
         pa.hc_get = lambda address: {}
@@ -621,7 +629,7 @@ class Base(unittest.TestCase):
     def restore(self):
         os.execv = self.saved_exec
         for k, v in self.saved.items():
-            if v is None:
+            if v is MISSING:
                 pa.__dict__.pop(k, None)
             else:
                 setattr(pa, k, v)
@@ -864,7 +872,7 @@ class S4_WhenItSwaps(Base):
 # ---- the argv (S5) ------------------------------------------------------------------------------------------------
 
 HOSTILE_CHILD = ["abc", "", "12", "12:", ":12", "-5:5", "5:-5", "0:0", "1:1", "+12:12", " 12:12", "12:12 ", "12 :12",
-                 "012:12", "١٢:١٢", "12:12:12", "99999999999:1", "2147483648:1", "1:2147483648",
+                 "012:12", "١٢:١٢", "1١:1١", "12:1٢", "12:12:12", "99999999999:1", "2147483648:1", "1:2147483648",
                  "12:12\n"]
 HOSTILE_ID = ["-x", "../a", "", "a" * 81, "a b"]
 

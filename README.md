@@ -133,6 +133,15 @@ resuming the same conversation. Its launcher (`pa-session`) ends its own Claude 
   "(core)", or "(tools, core)", or "started before restart support"; after an install,
   `pa-peers --older` lists the Project Agents still running older code. `/exit` in the Project Agent's
   tab also reloads the code when the installed tools changed.
+- **Installed tools load by themselves:** while Claude runs, the launcher looks every 30 s; once
+  `installed.json` names other tools, is a minute old and matches the installed files, and no restart or
+  fresh context is pending, it runs the restart's pre-check and execs the installed `pa.py` in its own
+  process. Claude keeps running (the same pid stays its parent), is never signalled, and its terminal is
+  never written to; the new code takes over its heartbeat, restarts and next start, with the same
+  launcher instance. `session.log` says `swap adopted …`; `launcher.json` keeps `swap` (when, from which
+  tools, how often) or `swapFailed` (why), and `pa-doctor` and the panel's notice say which. A new core
+  text still needs a Restart (it is part of Claude's prompt), and launchers started before this one
+  load once by a Restart.
 - **Launchers from before restart support** cannot take a restart. The panel's button reads "Restart
   (ends workers)"; it shows `pa-restart --space <id> --end-terminal` (with `--on <machine>` for a remote
   space) to copy and run yourself. That ends the terminal and its workers, after it asks; the panel never

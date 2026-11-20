@@ -1470,7 +1470,7 @@ class AC9_1_OnlyTheOwnChild(unittest.TestCase):
                             and node.func.attr in ("send_signal", "kill", "terminate")):
                         found.append(fn.name)
         self.assertTrue(found)
-        self.assertEqual(set(found) - {"end_child", "run_child", "signal_pid", "kill"}, set(), found)  # t-193: signal_pid; t-195: AdoptedChild.kill
+        self.assertEqual(set(found) - {"end_child", "run_child", "signal_pid", "send_signal", "kill"}, set(), found)  # t-193: signal_pid; t-195: AdoptedChild's
 
 
 # ---- J2 round 2: the seven Must fix items (REVIEW J2 A M1-M5, B M1-M3; VERIFY J2 MF1-MF4; handoff-fix-j2.md) -------

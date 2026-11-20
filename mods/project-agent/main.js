@@ -17,7 +17,7 @@ import { View, div } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, ScrollHandle } from "gpui-base";
 import { spaces, panes, agents, terminals, machines, theme, run, props, home, notify, shared, setShared, closeOverlay, openOverlay, window, layout } from "herdr";
 import { Host, gaveUp, read as hostRead, run as hostRun, watch, refusalLine, QUIET_MS } from "./host.js";
-import { loadSpace, loadLedger, loadQueue, loadWaiting, loadStartOrder, writeStartOrder, loadMachines, loadTaskOrder, writeTaskOrder, loadProfile, loadDecisions, loadRules, TIMED_OUT, READ_LIMIT, answerDecision, notifyOrchestrator, changeRules, touched, localId, paHome, stateDir, taskActions, taskLinks, evidenceTasks, cardEvidence, staleInstructions, liveTarget, lookAlike, OPEN_REQUESTS, keeperJudging, startingLabels, OTHER, OTHER_MAX, OTHER_TOO_LONG, isOther, oneLine, codeState, codeBadge, loadCode, restartArgs, runRestart, restartOutcome, endTerminalLine, RESTART_MARK, RESTART_MARK_TTL, RESTARTED_FOR, RESTART_TIMEOUT, DRY_TIMEOUT, contextSettings, loadContext, contextLine, contextAt, contextArgs, runContext, contextOutcome, resetLine, CONTEXT_FOR } from "./store.js";
+import { loadSpace, loadLedger, loadQueue, loadWaiting, loadStartOrder, writeStartOrder, loadMachines, loadTaskOrder, writeTaskOrder, loadProfile, loadDecisions, loadRules, TIMED_OUT, READ_LIMIT, answerDecision, notifyOrchestrator, changeRules, touched, localId, paHome, stateDir, taskActions, taskLinks, evidenceTasks, cardEvidence, staleInstructions, liveTarget, lookAlike, OPEN_REQUESTS, keeperJudging, startingLabels, OTHER, OTHER_MAX, OTHER_TOO_LONG, isOther, oneLine, codeState, codeBadge, swapState, loadCode, restartArgs, runRestart, restartOutcome, endTerminalLine, RESTART_MARK, RESTART_MARK_TTL, RESTARTED_FOR, RESTART_TIMEOUT, DRY_TIMEOUT, contextSettings, loadContext, contextLine, contextAt, contextArgs, runContext, contextOutcome, resetLine, CONTEXT_FOR } from "./store.js";
 import { RulesPane, arm, armHolds, fieldState, noticeText as rulesNotice, mergeNotices as mergeRuleNotices } from "./rules.js"; // arm, armHolds: the two-click Delete (ARM_WAIT, 10 s)
 import { queueRows, queueLabel, renderQueue, at as atZone } from "./queue.js"; // t-055: the Queue view (read only)
 import { placesRows, renderPlaces, pinsAfter, orderText, NOTICE as ORDER_NOTICE } from "./places.js"; // t-083 J2: places and the start order (Tasks)
@@ -146,6 +146,19 @@ function taskTrees(x) {
   return out;
 }
 const when = (iso) => { const d = new Date(iso); return Number.isNaN(d.getTime()) ? "" : d.toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }); };
+
+// t-195 R3.2: what the notice says will happen. Only the tools older (no instructions changed, the core text the same):
+// a launcher that swaps loads them by itself, or says why it could not; else (and for older launchers) Restart.
+function changeNote(changed, code) {
+  const today = "Restart reloads them (or /exit in its tab).";
+  if (changed.length !== 1 || changed[0] !== "tools") return today;
+  const swap = swapState(code?.launcher, code?.installed);
+  if (swap.kind === "auto") return "It loads the installed tools by itself within a few minutes, without ending its turn (or Restart now).";
+  if (swap.kind !== "failed") return today;
+  const at = swap.at ? new Date(swap.at) : null;
+  const clock = at && !Number.isNaN(at.getTime()) ? `, at ${String(at.getHours()).padStart(2, "0")}:${String(at.getMinutes()).padStart(2, "0")}` : "";
+  return `It could not load the installed tools by itself (${swap.why ?? "no reason recorded"}${clock}). Restart reloads them.`;
+}
 
 export default class ProjectAgent extends View {
   init(_props, cx) {
@@ -1757,7 +1770,7 @@ export default class ProjectAgent extends View {
           .child(div().min_w(0).child(`· ${counts}${passesOn ? ` · pass ${data.ledger?.passCount ?? 0}` : ""}${this.inFlight(space.id) && now - this.dataAt > CACHE_OLD ? " · updating…" : ""}`))))
       // Its instructions or its tools changed since its launcher started (R14): Restart reloads them (R7: /exit too).
       .when(changed.length > 0 && Boolean(live), (el) => el.child(h_flex().px(12).py(6).gap(8).items_center().border_b(1).border_color(t.border).bg(t.working + "1a").text_size(11.5).text_color(t.foreground)
-        .child(div().flex_1().min_w(0).child(`Its instructions or tools changed since it started (${changed.join(", ")}). Restart reloads them (or /exit in its tab).${code?.prompt === "recorded" ? " Restart in place keeps the core text this conversation began with; Restart in a new conversation loads it." : ""}`))
+        .child(div().flex_1().min_w(0).child(`Its instructions or tools changed since it started (${changed.join(", ")}). ${changeNote(changed, data.code)}${code?.prompt === "recorded" ? " Restart in place keeps the core text this conversation began with; Restart in a new conversation loads it." : ""}`))
         .when(restartable, (e) => e.child(this.restartButton(t, space, code, "pa-restart-notice")))))
       .child(h_flex().px(8).py(6).gap(4).flex_none().border_b(1).border_color(t.border)
         .child(tab("decisions", openCards.length ? `Decisions · ${openCards.length}` : "Decisions"))
