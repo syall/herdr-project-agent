@@ -214,7 +214,8 @@ export const InputState = { new: (o = {}) => {
     fire(event) { for (const fn of on[event] ?? []) fn({}, cx); }, handlers: (event) => (on[event] ?? []).length };
 } };
 export const Input = { new: () => make("input") };
-export const ScrollHandle = { new: () => ({ scroll_to_item() {} }) };
+// t-160: a handle keeps the indexes it was asked to scroll to (calls), in order.
+export const ScrollHandle = { new: () => { const calls = []; return { calls, scroll_to_item(i) { calls.push(i); } }; } };
 // TextView (t-026): selectable text. Its html is kept, its text is the html without the one <span> and with
 // & < > " decoded, and .selectable(v) is recorded as style.selectable. inspect() and findText() read its
 // text as its wrapper's own: a row found by its text is still the styled div around it.

@@ -507,7 +507,7 @@ cases["P2-worker-chips"] = async () => { // a closed worker is not drawn (t-011)
   check(!/t31/.test(text), `no chip for the closed worker (got ${text.slice(0, 400)})`);
   check(/reviewer t32 · kept ↗/.test(text), `kept chip, still live (got ${text.slice(0, 400)})`);
   check(/verifier t33 ↗/.test(text) && !/verifier t33 · kept/.test(text), "a live worker unchanged");
-  check(/build t34 \(ended\)/.test(text), "a gone worker that was not closed still reads (ended)");
+  check(!/t34/.test(text), `t-160 R1: a gone worker that was not closed is not drawn (got ${text.slice(0, 400)})`);
 };
 
 // ---- t-012 Part P: a slow remote, a cache per space, timeouts, and the panel while hidden ----
@@ -6092,7 +6092,7 @@ cases["Q84-1-worker"] = async () => { // R1: the entry's open worker on its work
   const v = await queueWorld(q84Doc(), { ledger: q84Ledger(), opts: { extraTerms: [q84Term("t70"), q84Term("t68")] } });
   const { text } = look(v);
   check(text.includes("queue t70 ↗"), `the worker chip (got ${text})`);
-  check(text.includes("verifier t67 (ended)"), `an unfinished worker whose terminal is gone: dim (got ${text})`);
+  check(!/t67/.test(text), `t-160 R1: an unfinished worker whose terminal is gone is not drawn (got ${text})`);
   check(!/t68/.test(text), `a worker on another worktree is not the entry's (got ${text})`);
   const ids = queueClicks(v, /^queue-worker-/);
   check(ids.length === 1, `one link: the live worker (got ${ids})`);
@@ -6189,7 +6189,7 @@ cases["Q154-2-worker-items"] = async () => { // R2: the entry's workers are the 
   check(P142.dot(item)?.bg === "#blocked", `its dot the terminal's status (got ${JSON.stringify(P142.dot(item))})`);
   check(!/reviewer t71/.test(text) && !P142.find(root, `queue-worker-${Q154.key(0)}-3`), `the closed reviewer t71 is not drawn (got ${text})`);
   check(!/worker t72|t72 \(ended\)|t72 \(closed\)/.test(text), `t72 (no ledger record, no terminal) is not drawn (got ${text})`);
-  check(text.includes("verifier t73 (ended)"), `an unfinished recorded worker with no terminal stays, dim (got ${text})`);
+  check(!/t73/.test(text), `t-160 R1: an unfinished recorded worker with no terminal is not drawn (got ${text})`);
   check(text.includes("reviewer t74 (closed)"), `finished, no closed stamp: (closed), as the task card (got ${text})`);
   const dim = P142.find(root, `queue-worker-${Q154.key(0)}-1`);
   check(P142.dot(dim)?.bg === "#dim", `not live: the dim dot (got ${JSON.stringify(P142.dot(dim))})`);
@@ -7890,6 +7890,43 @@ cases["P157-4-uncapped-headings"] = async () => { // R1, R2: nothing archived: t
   await click(v, "view-tasks");
   const h = P157.all(v, "tasks-done");
   check(/done \| 3$/.test(h) && !/shown|archived/.test(h), `done (got ${h})`);
+};
+
+// ---- t-160: the show request moves only its own copy (R2); the Places rule link scrolls its rule into view (R3) ----
+cases["P160-2-show-one-copy"] = async () => { // R2: a task link in one copy moves that copy only, not another nor a later one
+  const { v } = await costsWorld();
+  const other = await mount(); await settle();
+  await click(other, "view-costs"); await settle();
+  await click(v, "costs-link-task-0"); await settle();
+  look(v); look(other);
+  check(v.view === "tasks" && v.open.has("t-1"), `the copy clicked shows Tasks with t-1 open (view ${v.view}, open ${[...v.open]})`);
+  check(other.view === "costs" && !other.open.has("t-1"), `another copy on the same space stays on Costs (view ${other.view}, open ${[...other.open]})`);
+  const later = await mount(); await settle();
+  look(later);
+  check(later.view !== "tasks" && !later.open.has("t-1"), `a copy made after the click does not take it (view ${later.view}, open ${[...later.open]})`);
+  // A request with no copy (another mod) is still taken by a copy showing the space.
+  g.__shared["project-agent.show"] = { space: S, task: "t-1", at: Date.now() + 5 };
+  look(other);
+  check(other.view === "tasks" && other.open.has("t-1"), `a request from another mod still opens (view ${other.view})`);
+};
+
+cases["P160-3-rule-scroll"] = async () => { // R3: the rule link brings its rule into view in the Rules list, once
+  const filler = Array.from({ length: 10 }, (_, i) => ({ id: `r-fill-${i}`, title: `Filler ${i}`, text: "f", status: "active", order: 100 - i }));
+  const rules = JSON.stringify({ version: 1, rules: [...filler,
+    { id: "r-places-6", title: "Six places", text: "x", status: "active", order: 50, places: { working: 6 } },
+    { id: "r-places-suite-4", title: "Suite four", text: "y", status: "active", order: 40, places: { suite: 4 } }] });
+  const { v } = await placesWorld({ rules });
+  const { clicks } = look(v);
+  check(Boolean(clicks["places-rule-r-places-suite-4"]), `the link (have ${Object.keys(clicks).filter((k) => k.startsWith("places-rule"))})`);
+  clicks["places-rule-r-places-suite-4"]({}, cx); await flush(); await settle();
+  const list = () => { let el = null; const walk = (x) => { if (el || !x || typeof x !== "object") return; if (x.key === "pa-rules") { el = x; return; } for (const k of x.kids ?? []) walk(k); }; walk(v.render(cx)); return el; };
+  const el = list(), handle = el?.style?.track_scroll?.[0];
+  check(v.view === "rules" && Boolean(el), `the Rules view (view ${v.view})`);
+  check(Boolean(handle) && Array.isArray(handle.calls), `the list tracks a scroll handle (style ${JSON.stringify(Object.keys(el?.style ?? {}))})`);
+  const at = handle.calls[0];
+  check(handle.calls.length === 1 && el.kids[at]?.key === "rule-r-places-suite-4", `scrolled once to the rule's row (calls ${JSON.stringify(handle.calls)}, child ${el.kids[at]?.key})`);
+  list(); list();
+  check(handle.calls.length === 1, `later renders do not scroll again (calls ${JSON.stringify(handle.calls)})`);
 };
 
 // --list prints the names that would run and runs none. An unknown name or option exits 2.
