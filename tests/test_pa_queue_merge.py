@@ -545,6 +545,21 @@ class M6M8Refresh(MBase):
         self.assertEqual(self.merged(), [])
         self.assertEqual(self.ref("main"), self.m0)
         self.assertEqual(self.approval("t-A")["card"], "d-queue-1")
+        self.assertIn("d-queue-1 ({}): approved t-A, t-B, t-C".format(ALL), out)  # t-146 RL-146-1
+
+    def test_m6c_a_busy_push_lock_keeps_merge_card_lines(self):
+        """t-146 RL-146-1: pa-queue merge finding the push lock busy still prints the card answers it just recorded
+        ('d-queue-N (answer): approved ...') with the refusal, and refuses (exit 1)."""
+        self.three()
+        self.approve()
+        self.suite("t-A", 0)
+        with mock.patch.object(pa_push, "push_lock", side_effect=pa_push.Refused("C2", "another push for this space is running")):
+            code, out, err = self.merge()
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("another push for this space is running", err)
+        self.assertIn("d-queue-1 ({}): approved t-A, t-B, t-C".format(ALL), out)
+        self.assertEqual(self.merged(), [])
+        self.assertEqual(self.approval("t-A")["card"], "d-queue-1")
 
     def test_m8_approved_while_checking_merged_by_refresh(self):
         self.joined("t-A", "fa.txt")
