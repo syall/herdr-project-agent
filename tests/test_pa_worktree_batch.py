@@ -1636,16 +1636,23 @@ class T192HolderRemove(HolderBase):
         self.assertIn("Removed the test workspace worktree {} with {} (rule r-holder)".format(os.path.realpath(h), os.path.realpath(pkg)), out)
 
     def test_h6_8_the_rule_not_active(self):
-        for i, (kw, raw_text) in enumerate(((dict(status="proposed"), None), (dict(status="retired"), None),
-                                             (dict(rid="R-holder"), None), ({}, "{not json"))):
-            with self.subTest(kw=kw, raw=raw_text):
+        for i, kw in enumerate((dict(status="proposed"), dict(status="retired"), dict(rid="R-holder"))):
+            with self.subTest(kw=kw):
                 h, (pkg,) = self.one("t-03{}".format(i))
-                self.rules(raw_text=raw_text, **kw)
-                if os.path.exists(self.hlog):
-                    os.remove(self.hlog)
+                self.rules(**kw)
                 code, out, err = self.standing()
                 self.assertEqual(code, 0, out + err)
                 self.stays(h, pkg, out, "rule r-holder is not active")
+
+    def test_h6_8_rules_json_unreadable_on_a_card_answer(self):  # remove --standing itself stops on it
+        h, (pkg,) = self.one("t-039")
+        code, out, err = self.check()
+        self.assertEqual(code, 0, out + err)
+        self.answer(next(f[:-5] for f in self.files() if f.startswith("d-wt-t-039")), "Delete")
+        self.rules(raw_text="{not json")
+        code, out, err = self.run_cmd("pa-worktree", "remove", "t-039", "--space", "sp1")
+        self.assertEqual(code, 0, out + err)
+        self.stays(h, pkg, out, "rule r-holder is not active")
 
     def test_h6_1_another_package_recorded_by_a_task_in_progress(self):
         h, (p1, p2) = self.holder("t-040-x", ("Pkg", "Two"), merged=("Pkg",))  # Two: no commits (so "merged")
