@@ -1166,6 +1166,8 @@ class RunAll(unittest.TestCase):
 # real script refuses a bad --part or scratch before anything is written and before any hc call) ----
 
 CHECK_SCRIPT = os.path.join(HERE, "pa_session_check.sh")
+SETUP_SCRATCH = os.path.join(HERE, "setup-scratch.sh")
+REAP_SCRIPT = os.path.join(HERE, "pa_session_reap.sh")
 STEP_NAME = r"(?:S[1-9][0-9]*[a-z]?|R)"
 CONTROLS = ["S9", "R"]  # the per-core controls, last in every part (R4)
 
@@ -1462,6 +1464,40 @@ class PartState(unittest.TestCase):
         no_replay = self.text.replace(m.group(0), 'replays="S13:S8:s8_state"')
         self.assertTrue([p for p in folder_problems(no_replay) if "S12" in p and "proj12" in p], folder_problems(no_replay))
 
+    def runner(self, text, steps):
+        """The script's runner loop (from `ran=" "` to its `done`) run by sh with its replays line and stub step_
+        and helper functions that print their names: the lines it printed (t-123, t-112 VERIFY L1)."""
+        loop = re.search(r'^ran=" "\n.*?^done$', text, re.M | re.S).group(0)
+        replays = re.search(r'^replays="[^"]*"$', text, re.M).group(0)
+        helpers = sorted({r.split(":")[2] for r in replays.split('"')[1].split()})
+        names = sorted(set(re.findall(r"^step_([A-Za-z0-9]+)\(\) \{", text, re.M)))
+        script = "\n".join(["set -u", replays] + ["{0}() {{ echo 'helper {0}'; }}".format(h) for h in helpers]
+                           + ["step_{0}() {{ echo 'step {0}'; }}".format(n) for n in names]
+                           + ["steps='{}'".format(steps), loop, ""])
+        r = subprocess.run(["sh", "-c", script], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           universal_newlines=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stdout)
+        return r.stdout.splitlines()
+
+    def test_t5_the_runner_replays_a_maker_from_another_part_only(self):
+        parts = dict((l.split(":", 1)[0].strip(), l.split(":", 1)[1].strip()) for l in
+                     re.search(r"^part_table='\n(.*?)^'$", self.text, re.M | re.S).group(1).splitlines() if l.strip())
+        whole = re.search(r'^steps_all="([^"]*)"$', self.text, re.M).group(1)
+        for name, steps, before in (("part 1", parts["1"], {"S12": "s11_folders"}), ("part 2", parts["2"], {}),
+                                    ("part 3", parts["3"], {"S13": "s8_state"}), ("whole run", whole, {}),
+                                    ("maker first", "S11 S12 S8 S13", {})):
+            with self.subTest(run=name):
+                want = []
+                for step in steps.split():
+                    if step in before:
+                        want.append("helper " + before[step])
+                    want.append("step " + step)
+                got = self.runner(self.text, steps)
+                self.assertEqual([l for l in got if l.startswith(("helper ", "step "))], want, got)
+                for step, helper in before.items():
+                    self.assertIn("{} starts from {}'s state (t-112 R3: {})".format(
+                        step, "S11" if step == "S12" else "S8", helper), got)
+
 
 class CheckArgs(unittest.TestCase):
     """The real pa_session_check.sh with a scratch that has the two files it looks for, an hc first on PATH that
@@ -1524,6 +1560,41 @@ class CheckArgs(unittest.TestCase):
         for args in ([], [""], ["", "--part", "1"]):
             with self.subTest(args=args):
                 self.refused(args)
+
+    def test_a4_setup_scratch_and_the_reaper_check_the_resolved_folder(self):
+        # t-123 (t-112 REVIEW 2): the Q7 checks, as given and once resolved, before anything is written.
+        os.symlink("/usr", os.path.join(self.tmp, "out"))
+        os.makedirs(self.s, exist_ok=True)
+        for tool, extra in ((SETUP_SCRATCH, []), (REAP_SCRIPT, ["list", None, "pa-t001-x", "", ""])):
+            for bad in ("/tmp/../etc", os.path.join(self.tmp, "out"), os.path.join(self.tmp, "out", "lib")):
+                with self.subTest(tool=os.path.basename(tool), folder=bad):
+                    before = self.tree()
+                    argv = [a if a is not None else bad for a in extra] if extra else [bad]
+                    r = subprocess.run(["sh", tool] + argv, cwd=self.tmp, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                       stderr=subprocess.STDOUT, universal_newlines=True, timeout=120)
+                    self.assertEqual(r.returncode, 2, r.stdout)
+                    self.assertIn("is not a temp folder", r.stdout)
+                    self.assertEqual(self.tree(), before)
+        # the controls: the same tools take a real temp folder
+        r = subprocess.run(["sh", REAP_SCRIPT, "list", self.s, "pa-t001-x", "", ""], cwd=self.tmp, stdin=subprocess.DEVNULL,
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stdout)
+        good = os.path.join(self.tmp, "good")
+        os.makedirs(good)
+        r = subprocess.run(["sh", SETUP_SCRATCH, good], cwd=self.tmp, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, universal_newlines=True, timeout=300)
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertIn("scratch ready: " + good, r.stdout)
+
+    def test_a5_setup_scratch_names_a_folder_that_does_not_exist(self):
+        # t-123 (t-112 REVIEW 1): the caller makes the folder (mktemp -d); a missing one is said as missing, not as
+        # outside the temp roots, and nothing is made.
+        missing = os.path.join(self.tmp, "not-made", "s")
+        r = subprocess.run(["sh", SETUP_SCRATCH, missing], cwd=self.tmp, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, universal_newlines=True, timeout=60)
+        self.assertEqual(r.returncode, 2, r.stdout)
+        self.assertIn("refusing: {} does not exist (make it with mktemp -d)".format(missing), r.stdout)
+        self.assertFalse(os.path.exists(os.path.dirname(missing)))
 
     def test_a3_a_good_part_reaches_the_gate_with_its_name(self):
         # The control: the same scratch with a good --part gets past the arguments, says its part and steps

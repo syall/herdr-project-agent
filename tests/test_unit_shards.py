@@ -166,7 +166,7 @@ class Shards(unittest.TestCase):
         # Each module in run-all.sh's table: its n shards are disjoint, none is empty, and together they are the
         # module's whole id list (as listed with no shard).
         shards = table()
-        self.assertEqual(sorted(shards), ["test_pa_queue", "test_pa_queue_merge", "test_pa_worker"])
+        self.assertEqual(sorted(shards), ["test_pa_queue", "test_pa_queue_merge", "test_pa_suite_remote", "test_pa_worker"])
         for module, n in sorted(shards.items()):
             with self.subTest(module=module):
                 whole = self.listed(HERE, module)

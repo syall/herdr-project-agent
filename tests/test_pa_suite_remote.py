@@ -22,6 +22,9 @@ retried, else partial (R6); x33 a failed cleanup after a setup failure stays for
 holder's running row is swept (R8); x35 PREFER_WAIT is waited out (R9); x36 a second TERM during cleanup (R10);
 x37 machine names (R11); x38 merge_parts's types (R12); x39 python3 3.8 (R13); x40 the remote place's own seconds
 (R15); x41 a tree whose run-all.sh has no place flags stays here (R16); x42 docs.
+t-123 (earlier limits): x17d/x17e --json's own line and peek's lock (t-119), x25e facts.json counted, x25f a secret
+in the history, x26a/x26g each refusal's reason, x26c the probe's missing lines, x27c a step run (t-106 J1).
+Run in 2 shards by tests/run-all.sh (unit_shards).
 """
 import json
 import os
@@ -39,6 +42,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import test_pa_suite as tps  # noqa: E402 (its fixture: only names bound here are collected)
 from test_pa_suite import pa, pa_hooks, pa_suite, dump, write, sh  # noqa: E402
+from unit_shards import load_tests  # noqa: E402,F401 (tests/run-all.sh runs this module in shards, t-123)
 
 REPO = os.path.realpath(os.path.join(HERE, ".."))
 STUB = os.path.join(HERE, "stub-hc")
@@ -693,7 +697,34 @@ class X17Places(Remote):
     def test_x17d_json_needs_places(self):
         code, out = self.main("--json")
         self.assertEqual(code, 2, out)
-        self.assertIn("--json", out)
+        self.assertIn("pa-full-suite: --json goes with --places (pa-full-suite --places --json)", out)  # t-123 (t-119 V1)
+
+    def test_x17e_peek_takes_no_lock_on_a_free_slot(self):
+        """t-123 (t-119 REVIEW R2): a free slot (its file empty: release truncates it) is read without a flock, so a
+        try_slot at that instant is never turned away; a held slot is a holder; a stale holder line on a free slot is
+        not one (flock still decides a non-empty file)."""
+        import fcntl
+        folder = os.path.join(self.tmp, "peek")
+        os.makedirs(folder)
+        write(os.path.join(folder, "slot-0"), "")
+        write(os.path.join(folder, "slot-2"), json.dumps({"task": "t-9", "pid": 1}))
+        held = open(os.path.join(folder, "slot-1"), "a+")
+        self.addCleanup(held.close)
+        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        held.write(json.dumps({"task": "t-8", "pid": os.getpid()}))
+        held.flush()
+        locked = []
+        real = pa_suite.fcntl.flock
+
+        def flock(f, op):
+            locked.append((os.path.basename(f.name), op))
+            return real(f, op)
+        self.addCleanup(setattr, pa_suite.fcntl, "flock", real)
+        pa_suite.fcntl.flock = flock
+        holders = pa_suite.peek(folder, 4)
+        pa_suite.fcntl.flock = real
+        self.assertEqual([h.get("task") for h in holders], ["t-8"], holders)
+        self.assertNotIn("slot-0", [name for name, _ in locked], locked)
 
 
 class X18Docs(unittest.TestCase):
@@ -1322,7 +1353,8 @@ class X25Sent(StepBase):
                 sh(self.wt, "git", "add", "-f", name)
                 sh(self.wt, "git", "commit", "-q", "-m", "a secret")
                 self.fresh_log()
-                self.check_refused_on("never sent")
+                out = self.check_refused_on("never sent")
+                self.assertIn(name, out)
                 self.assertFalse([c for c in self.calls() if c[0] == "file"], self.calls())
                 sh(self.wt, "git", "rm", "-q", "--cached", name)
                 os.remove(path)
@@ -1370,6 +1402,33 @@ class X25Sent(StepBase):
         self.assertIn("too large", str(e.exception))
         self.assertFalse([c for c in self.calls() if c[:2] == ["file", "write"] and "b" * 12 in c[-1]])
         pa_suite.cleanup("box-1", "b" * 12)
+        # t-123 (t-106 J1 R3): facts.json counts too: a limit one under all three refuses (M7 kills this).
+        pa_suite.BUNDLE_MAX = sum(sent.values()) - 1
+        with self.assertRaises(pa_suite.SetupFailed) as e:
+            pa_suite.ship(pa_hooks, "box-1", "c" * 12, pin, tools, self.wt, step=step)
+        self.assertIn("too large", str(e.exception))
+        pa_suite.cleanup("box-1", "c" * 12)
+        pa_suite.BUNDLE_MAX = sum(sent.values())  # the control: exactly all three ships
+        pa_suite.ship(pa_hooks, "box-1", "d" * 12, pin, tools, self.wt, step=step)
+        pa_suite.cleanup("box-1", "d" * 12)
+
+    def test_x25f_a_secret_in_the_history_is_never_sent(self):
+        """t-123 (t-106 J1 REVIEW RL1): the bundle carries HEAD's whole history, so a secret committed and deleted
+        later is refused too, by its path."""
+        dot = "."
+        for name in (dot + "env", dot + "claude/y.json"):
+            with self.subTest(path=name):
+                path = os.path.join(self.wt, name)
+                write(path, "x\n")
+                sh(self.wt, "git", "add", "-f", name)
+                sh(self.wt, "git", "commit", "-q", "-m", "a secret")
+                sh(self.wt, "git", "rm", "-q", name)
+                sh(self.wt, "git", "commit", "-q", "-m", "gone from HEAD")
+                self.assertNotIn(name, sh(self.wt, "git", "ls-tree", "-r", "--name-only", "HEAD"))
+                self.fresh_log()
+                out = self.check_refused_on("never sent")
+                self.assertIn(name, out)
+                self.assertFalse([c for c in self.calls() if c[0] == "file"], self.calls())
 
 
 class X26Prepare(StepBase):
@@ -1381,39 +1440,67 @@ class X26Prepare(StepBase):
         self.setenv(FAKE_PREPARE=path)
 
     def test_x26a_prepare_output_h_cases(self):
+        """Each case is refused for its own reason (t-123, t-106 J1 R1: the reason text, not only "prepare"). The
+        spec's "keep path with a newline" H-case cannot be given: a CR or LF ends the line before any check reads
+        it (hc's text read turns a CR into a line break), so the rest is a progress line."""
         lay = "mkdir -p box/src && mv w box/src/pkg\n"
         cwd = "echo 'cwd box/src/pkg'\n"
+        rel, plain = "is not a relative path of plain parts", "is not an absolute path of at least two plain parts"
+        inside, home, run_ = "is not a folder inside the run folder", "is the machine user's HOME or a folder above it", \
+            "is the run folder, in it or above it"
         cases = {
-            "cwd /abs": lay + "echo 'cwd /abs'\n",
-            "cwd ../x": lay + "echo 'cwd ../x'\n",
-            "cwd w/../..": "echo 'cwd w/../..'\n",
-            "cwd empty": lay + "echo 'cwd '\n",
-            "no cwd": lay,
-            "two cwd": lay + cwd + cwd,
-            "missing folder": lay + "echo 'cwd nothere'\n",
-            "symlink out": "ln -s / out\necho 'cwd out'\n",
-            "symlink up": "ln -s .. up\necho 'cwd up'\n",
-            "keep relative": "echo 'keep relative/path'\n" + lay + cwd,
-            "keep /": "echo 'keep /'\n" + lay + cwd,
-            "keep /tmp": "echo 'keep /tmp'\n" + lay + cwd,
-            "keep HOME": "echo \"keep $PA_STEP_REAL_HOME\"\n" + lay + cwd,
-            "keep above HOME": "echo \"keep $(dirname \"$PA_STEP_REAL_HOME\")\"\n" + lay + cwd,
-            "keep ..": "echo \"keep $PA_STEP_REAL_HOME/a/../b\"\n" + lay + cwd,
-            "keep space": "echo \"keep $PA_STEP_REAL_HOME/a b\"\n" + lay + cwd,
-            "keep tab": "printf 'keep %s/a\\tb\\n' \"$PA_STEP_REAL_HOME\"\n" + lay + cwd,
-            "keep under run": "echo \"keep $PA_STEP_RUN/k\"\n" + lay + cwd,
-            "keep the run": "echo \"keep $PA_STEP_RUN\"\n" + lay + cwd,
-            "two keep": "echo \"keep $PA_STEP_REAL_HOME/k\"; echo \"keep $PA_STEP_REAL_HOME/k2\"\n" + lay + cwd,
-            "keep not first": "echo progress\n" + lay + "echo \"keep $PA_STEP_REAL_HOME/k\"\n" + cwd,
-            "bad kept": "echo \"keep $PA_STEP_REAL_HOME/k\"; echo 'kept maybe'\n" + lay + cwd,
-            "bad home": lay + "echo 'home a b'\n" + cwd,
+            "cwd /abs": (lay + "echo 'cwd /abs'\n", rel),
+            "cwd ../x": (lay + "echo 'cwd ../x'\n", rel),
+            "cwd w/../..": ("echo 'cwd w/../..'\n", rel),
+            "cwd empty": (lay + "echo 'cwd '\n", rel),
+            "no cwd": (lay, "no cwd line"),
+            "two cwd": (lay + cwd + cwd, "two cwd lines"),
+            "missing folder": (lay + "echo 'cwd nothere'\n", inside),
+            "symlink out": ("ln -s / out\necho 'cwd out'\n", inside),
+            "symlink up": ("ln -s .. up\necho 'cwd up'\n", inside),
+            "keep relative": ("echo 'keep relative/path'\n" + lay + cwd, plain),
+            "keep /": ("echo 'keep /'\n" + lay + cwd, plain),
+            "keep /tmp": ("echo 'keep /tmp'\n" + lay + cwd, plain),
+            "keep HOME": ("echo \"keep $PA_STEP_REAL_HOME\"\n" + lay + cwd, home),
+            "keep above HOME": ("echo \"keep $(dirname \"$PA_STEP_REAL_HOME\")\"\n" + lay + cwd, home),
+            "keep ..": ("echo \"keep $PA_STEP_REAL_HOME/a/../b\"\n" + lay + cwd, plain),
+            "keep space": ("echo \"keep $PA_STEP_REAL_HOME/a b\"\n" + lay + cwd, plain),
+            "keep tab": ("printf 'keep %s/a\\tb\\n' \"$PA_STEP_REAL_HOME\"\n" + lay + cwd, plain),
+            "keep under run": ("echo \"keep $PA_STEP_RUN/k\"\n" + lay + cwd, run_),
+            "keep the run": ("echo \"keep $PA_STEP_RUN\"\n" + lay + cwd, run_),
+            "two keep": ("echo \"keep $PA_STEP_REAL_HOME/k\"; echo \"keep $PA_STEP_REAL_HOME/k2\"\n" + lay + cwd,
+                         "a keep line that is not its first line"),
+            "keep not first": ("echo progress\n" + lay + "echo \"keep $PA_STEP_REAL_HOME/k\"\n" + cwd,
+                               "a keep line that is not its first line"),
+            "bad kept": ("echo \"keep $PA_STEP_REAL_HOME/k\"; echo 'kept maybe'\n" + lay + cwd, "a kept line 'kept maybe'"),
+            "kept, no keep": ("echo 'kept created'\n" + lay + cwd, "a kept line with no keep line"),
+            "bad home": (lay + "echo 'home a b'\n" + cwd, "a home line 'home a b'"),
         }
-        for name, text in cases.items():
+        for name, (text, why) in cases.items():
             with self.subTest(case=name):
                 self.snippet(text)
                 self.fresh_log()
                 out = self.check_refused_on("prepare")
+                self.assertIn("the step's prepare: ", out)
+                self.assertIn(why, out)
                 self.assertEqual(os.listdir(os.path.join(self.stub, "box-1", "tmp")), [], out)
+
+    def test_x26g_check_keep_each_rule_on_its_own(self):
+        """t-123 (t-106 J1 R1): check_keep with a real machine's layout (HOME /home/users/u, the run folder under /tmp), so
+        a keep above HOME is refused by that rule only (the stub's run folder is under HOME's parent: there the run
+        folder rule refuses it too)."""
+        run, home = "/tmp/pa-suite-aaaaaaaaaaaa", "/home/users/u"
+        for keep, why in (("/home/users", "the machine user's HOME or a folder above it"),
+                          ("/home/users/u", "the machine user's HOME or a folder above it"),
+                          ("/home", "not an absolute path of at least two plain parts"),
+                          ("/tmp", "not an absolute path of at least two plain parts"),
+                          ("/tmp/pa-suite-aaaaaaaaaaaa/k", "the run folder, in it or above it"),
+                          ("/tmp/x/../pa", "not an absolute path of at least two plain parts")):
+            with self.subTest(keep=keep):
+                self.assertIn(why, pa_suite.check_keep(keep, run, run, home) or "")
+        for keep in ("/home/users/u/.cache/k", "/opt/keep/k", "/home/users/other", "/home/other"):
+            with self.subTest(ok=keep):
+                self.assertIsNone(pa_suite.check_keep(keep, run, run, home))
 
     def test_x26b_prepare_exit_is_a_setup_failure_and_falls_back(self):
         self.setenv(FAKE_PREPARE_EXIT="3")
@@ -1427,13 +1514,18 @@ class X26Prepare(StepBase):
         self.assertIn("fake whole run on this Mac", self.output(self.run_id(out)))
 
     def test_x26c_probe_missing_tool_or_exit_is_a_setup_failure(self):
-        for env in ({"FAKE_STEP_PROBE": "missing stubtool"}, {"FAKE_STEP_PROBE_EXIT": "1"},
-                    {"FAKE_STEP_PROBE": "tool stubtool relative/path 1"}):
+        for env, why in (({"FAKE_STEP_PROBE": "missing stubtool"}, "the step's probe: missing stubtool"),
+                         ({"FAKE_STEP_PROBE_EXIT": "1"}, "the step's probe exited 1"),
+                         ({"FAKE_STEP_PROBE": "tool stubtool relative/path 1"}, "a bad tool line"),
+                         # t-123 (t-106 J1 N1): its missing lines are the reason, whatever its exit
+                         ({"FAKE_STEP_PROBE": "tool stubtool /bin/sh 1.0\nmissing other", "FAKE_STEP_PROBE_EXIT": "1"},
+                          "the step's probe: missing other")):
             with self.subTest(env=env):
                 self.setenv(FAKE_STEP_PROBE=None, FAKE_STEP_PROBE_EXIT=None)
                 self.setenv(**env)
                 self.fresh_log()
-                self.check_refused_on("probe")
+                out = self.check_refused_on("probe")
+                self.assertIn(why, out)
                 self.assertNotIn("prepare", [c[0] for c in self.step_calls()])
 
     def test_x26d_each_action_has_the_scratch_home_and_the_step_variables(self):
@@ -1509,8 +1601,13 @@ class X27Record(StepBase):
     def test_x27c_no_local_part_runs(self):
         code, out = self.main()
         self.assertEqual(code, 0, out)
-        self.assertNotIn("fake local part", self.output(self.run_id(out)))
+        run = self.run_id(out)
+        text = self.output(run)
+        self.assertIn("stub step run in ", text)  # t-123 (t-106 J1 N2): it is a step run
+        self.assertNotIn("fake local part", text)
         self.assertNotIn("this Mac", out.splitlines()[-1])
+        local = os.path.join(self.dir, "evidence", "t-1", "full-suite-{}-local.out".format(run))
+        self.assertFalse(os.path.exists(local), pa.read_text(local))  # no --only-integration child ran
 
     def test_x27d_lost_machine_is_124(self):
         self.setenv(STUB_HC_FAIL="lost:box-1", FAKE_GO=os.path.join(self.tmp, "go"))

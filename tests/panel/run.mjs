@@ -6961,13 +6961,13 @@ cases["P119-1-lines"] = async () => { // R1, R4: each machine, reachable or why 
 cases["P119-2-link"] = async () => { // R5: a holder opens its worker; its own id; one without a live worker has none
   const { v } = await placesWorld({ exec: suiteExec(P119.doc()) });
   const { clicks } = look(v);
-  check(Boolean(clicks["places-slot-box-1-0"]) && !clicks["places-slot-local-0"], `ids (got ${Object.keys(clicks).filter((k) => k.startsWith("places-")).join(", ")})`);
+  check(Boolean(clicks["places-slot-box-1-0"]) && !clicks["places-slot-@local-0"], `ids (got ${Object.keys(clicks).filter((k) => k.startsWith("places-")).join(", ")})`);
   g.__runs = [];
   await click(v, "places-slot-box-1-0");
   check(g.__runs.some(([n, a]) => n === "terminal.peek" && a?.terminal === "t53"), `opens t53 (got ${JSON.stringify(g.__runs)})`);
   const none = P119.doc({ local: { cap: 1, holders: [P119.holder("t-041", null)] } });
   const w = await placesWorld({ exec: suiteExec(none) });
-  check(look(w.v).text.includes("t-041 · no worker recorded · since 11-19 10:05") && !look(w.v).text.includes("sh tests/run-all.sh") && !look(w.v).clicks["places-slot-local-0"], `no worker: plain text, no command (t-155) (got ${look(w.v).text.slice(0, 1200)})`);
+  check(look(w.v).text.includes("t-041 · no worker recorded · since 11-19 10:05") && !look(w.v).text.includes("sh tests/run-all.sh") && !look(w.v).clicks["places-slot-@local-0"], `no worker: plain text, no command (t-155) (got ${look(w.v).text.slice(0, 1200)})`);
 };
 
 cases["P119-3-remote"] = async () => { // R2, R5: on the space's machine; the holder through the machine's address
@@ -7520,7 +7520,7 @@ cases["P142-2-slot-item"] = async () => { // R1, R2: a Suite machines holder is 
   check(P142.dot(slot)?.bg === "#blocked", `its worker's status (got ${JSON.stringify(P142.dot(slot))})`);
   const [local] = stubs.findText(root, "t77 · t-041 · ? · since 11-19 10:05"); // t-155: the worker item's text
   check(Boolean(local) && JSON.stringify(P142.shape(local)) === JSON.stringify(P142.shape(card)) && P142.dot(local)?.bg === "#dim", `not live: the item, dim (got ${JSON.stringify(P142.shape(local))} ${JSON.stringify(P142.dot(local))})`);
-  check(!look(v).clicks["places-slot-local-0"], "not live: no link");
+  check(!look(v).clicks["places-slot-@local-0"], "not live: no link");
   check(look(v).text.includes("box-1 · reachable · 1 of 2 slots held") && look(v).text.includes("t53 · t-020 verify · verifier · since 11-19 10:05 ↗"), "heads and texts kept (t-155: no command)");
 };
 
@@ -7543,7 +7543,7 @@ cases["P155-1-no-command"] = async () => { // a long, multi-line command: the on
   check(Boolean(slot) && JSON.stringify(P155.strings(slot)) === JSON.stringify(["t53 · t-020 verify · verifier · since 11-19 10:05 ↗"]),
     `box-1's holder: worker, task and job, role, since, a link (got ${JSON.stringify(P155.strings(slot))})`);
   const [local] = stubs.findText(root, "t54 · t-041 review · reviewer · since 11-19 10:05");
-  check(Boolean(local) && JSON.stringify(P155.strings(local)) === JSON.stringify(["t54 · t-041 review · reviewer · since 11-19 10:05"]) && !look(v).clicks["places-slot-local-0"],
+  check(Boolean(local) && JSON.stringify(P155.strings(local)) === JSON.stringify(["t54 · t-041 review · reviewer · since 11-19 10:05"]) && !look(v).clicks["places-slot-@local-0"],
     `this Mac's holder, its worker not live: the ledger's job and role, no link (got ${JSON.stringify(local && P155.strings(local))})`);
   for (const el of [slot, local].filter(Boolean)) check(P155.strings(el).every((s) => !/[\n\r]/.test(s)), `one line (got ${JSON.stringify(P155.strings(el))})`);
   for (const head of ["box-1 · reachable · 1 of 2 slots held", "box-2 · not reachable (needs_login) · 0 of 1 slots held", "this Mac · 1 of 1 slots held"]) {
@@ -7553,6 +7553,23 @@ cases["P155-1-no-command"] = async () => { // a long, multi-line command: the on
   const at = (s) => text.indexOf(s, text.indexOf("Suite machines")); // inside the block: t53 is also drawn under Working above it
   check(at("Suite machines") >= 0 && at("box-1 · reachable") >= 0 && at("box-1 · reachable") < at("t53 · t-020 verify") && at("t53 · t-020 verify") < at("box-2 ·") && at("box-2 ·") < at("this Mac ·") && at("this Mac ·") < at("t54 · t-041 review"),
     `each holder under its machine (got ${text.slice(at("Suite machines"), at("Suite machines") + 600)})`);
+};
+
+cases["P123-1-local-machine"] = async () => { // t-123 (t-119 REVIEW R1): a suite machine named `local` and this Mac's slots never share an id or a key
+  const doc = P119.doc({ local: { cap: 1, holders: [P119.holder("t-041", "t54")] } });
+  doc.machines = [{ machine: "local", cap: 1, reachable: true, reason: null, os: "Linux", arch: "x86_64", seconds: 0.4, holders: [P119.holder("t-020", "t53")] }];
+  const PL = await import(path.join(dst, "places.js"));
+  const rows = PL.machinesRows({ doc, error: null, at: 0 }, { isLive: () => true });
+  const hs = rows.places.flatMap((p) => p.holders);
+  check(hs.length === 2 && new Set(hs.map((h) => h.id)).size === 2 && new Set(hs.map((h) => h.key)).size === 2, `two ids, two keys (got ${JSON.stringify(hs.map((h) => [h.id, h.key]))})`);
+  check(JSON.stringify(hs.map((h) => h.id)) === JSON.stringify(["places-slot-local-0", "places-slot-@local-0"]), `the machine's id, then this Mac's (got ${JSON.stringify(hs.map((h) => h.id))})`);
+  const { v } = await placesWorld({ exec: suiteExec(doc) });
+  g.__runs = [];
+  await click(v, "places-slot-local-0");
+  check(g.__runs.some(([n, a]) => n === "terminal.peek" && a?.terminal === "t53"), `the machine's holder opens t53 (got ${JSON.stringify(g.__runs)})`);
+  g.__runs = [];
+  await click(v, "places-slot-@local-0");
+  check(g.__runs.some(([n, a]) => n === "terminal.peek" && a?.terminal === "t54"), `this Mac's holder opens t54 (got ${JSON.stringify(g.__runs)})`);
 };
 
 cases["P155-2-remote"] = async () => { // on the space's machine: the same item, through the machine's address, no command
