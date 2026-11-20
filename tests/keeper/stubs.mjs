@@ -13,6 +13,8 @@
 //   __notes   [notification]                                every notify() call
 //   __reads   ["<machine>:<path>"]                          every readTextFile() call
 //   __writes  ["<machine>:<path>"]                          every file write
+//   __writeCalls ["<machine>:<path>"]                       every writeTextFile call, written or not (t-116)
+//   __hangWrite ["<machine>:<path>"]                        writeTextFile of these settles only once the path leaves the list (t-116)
 //   __hcs     [[args]]                                      every hc() call (hc send ... included)
 //   __hcFail  ["<address>"]                                 hc send to these exits 1
 //   __onHc    fn(args)                                      called inside each hc() call, before it settles
@@ -56,7 +58,13 @@ export const readTextFile = async (path, options = {}) => {
 };
 
 export const writeTextFile = async (path, text, expected) => {
-  const files = (g.__files ??= {}), k = key(path, null), current = files[k] ?? null;
+  const k = key(path, null);
+  (g.__writeCalls ??= []).push(k);
+  if ((g.__hangWrite ?? []).includes(k)) { // t-116: a hung write (as a hung read): settles once the case takes it off the list, or the world ends
+    const gen = g.__gen;
+    while ((g.__hangWrite ?? []).includes(k)) { if (g.__gen !== gen) throw new Error("an old world"); await new Promise((r) => setTimeout(r, 1)); }
+  }
+  const files = (g.__files ??= {}), current = files[k] ?? null;
   if (current !== expected) throw new Error("stale snapshot: the file changed");
   files[k] = text;
   (g.__writes ??= []).push(k);

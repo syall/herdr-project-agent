@@ -12,6 +12,7 @@ fs.copyFileSync(path.join(here, "stubs.mjs"), path.join(dst, "stubs.mjs"));
 for (const f of ["keeper.js", "store.js", "timer.js", "zone.js", "host.js"].filter((n) => fs.existsSync(path.join(src, n)))) fs.writeFileSync(path.join(dst, f), fs.readFileSync(path.join(src, f), "utf8").replace(/from "herdr"/g, 'from "./stubs.mjs"'));
 const stubs = await import(path.join(dst, "stubs.mjs"));
 const { Keeper } = await import(path.join(dst, "keeper.js"));
+const { Host } = await import(path.join(dst, "host.js"));
 const timer = await import(path.join(dst, "timer.js"));
 const { cx, flush } = stubs;
 const g = globalThis;
@@ -46,7 +47,7 @@ function world({ machine = null, tabPresent = true, termLive = true, program = s
   g.__terminals = [...(termLive ? [{ address: q("t1"), state: "live", argv, ...(created === undefined ? {} : { created_ms: created }), ...(report === undefined ? {} : { report }), ...(foreground === undefined ? {} : { foreground }), labels: { "herdr.pa": S, "herdr.pa.name": "proj", "herdr.pa.project": "/proj", "herdr.pa.profile": "test" }, status, program }] : []),
     ...extraTerms, { address: q("t9"), state: "live", argv: ["zsh"], labels: {}, status: null, program: shell }];
   g.__shared = { "project-agent.tabs": record ? { [tb]: { space: sid, project: "/proj", profile: "test", name: "proj", terminal: q("t1") } } : {} };
-  g.__files = {}; g.__fail = []; g.__hang = [];
+  g.__files = {}; g.__fail = []; g.__hang = []; g.__hangWrite = []; g.__writeCalls = [];
   const f = (name) => `${machine ?? ""}:${dir}/${name}`;
   if (config === "open") g.__files[f("agent.json")] = JSON.stringify({ space: S, project: "/proj", profile: "test", name: "proj", terminal: "t1" });
   if (config === "closed") g.__files[f("agent.json")] = JSON.stringify({ space: S, project: "/proj", profile: "test", name: "proj", closed: { at: "x", by: "person" } });
@@ -986,6 +987,22 @@ cases["K53-beats-single-flight"] = async () => { // R5: a heartbeat read that ha
   for (let i = 0; i < 50; i++) { g.__now += 15000; k.readBeats(cx); await flush(); }
   const beats = g.__reads.filter((r) => r === f("heartbeat")).length;
   check(beats === 1, `one heartbeat read in flight (got ${beats})`);
+};
+
+// ---- t-116 (t-053 RL-1): the keeper's lock writes keyed and capped through the copy's Host ----
+cases["K116-lock-write-hung"] = async () => { // a lock write that never answers: one pending write per lock, however many take windows pass; the lock reads busy
+  const w = world();
+  const lock = `:${w.dir}/keeper.lock`;
+  g.__hangWrite = [lock];
+  const k = new Keeper("me", new Host());
+  k.readBeats(cx); await flush();
+  let busy = 0;
+  await sim(k, 120000, () => { if (k.locks[S]?.state === "busy") busy++; });
+  const writes = g.__writeCalls.filter((x) => x === lock).length;
+  check(writes === 1, `one lock write in flight over 120 s of 20 s take windows (got ${writes})`);
+  check(busy > 0, "the lock reads busy while its write is still pending");
+  check(splits().length === 0, "no restore without the lock");
+  g.__hangWrite = [];
 };
 
 // ---- t-037 J4 (R15, AC15.1): a launcher restarting in place (herdr.pa.restarting) is a launcher at work ----
