@@ -8,7 +8,8 @@
 // The Costs view (costs.js, t-009) reads costs/summary.json only while it is shown, and runs the
 // read-only `pa-costs billed compare`; its Refresh, Reconstruct and Turn off run `pa-costs` on a click.
 // Restart (t-037 J4) runs `pa-restart --dry-run` on its click and `pa-restart` (in place, once) on its confirm, on the
-// space's machine; never `--end-terminal`: the panel ends no terminal.
+// space's machine; never `--end-terminal`: the panel ends no terminal. A launcher that is not running (t-193 R5.3): Start it
+// again runs the restart tool's recover there (the tool ends what is left of it), then files the keeper's open request.
 // Fresh contexts (t-041 J5, t-145): one on/off switch in the head row runs the context tool's `set` on its click, on the
 // space's machine, with --by panel. The panel no longer asks for a fresh context itself (the tool still can).
 
@@ -82,6 +83,17 @@ const noteKey = (spaceId, cardId) => `${spaceId}\0${cardId}`; // note fields are
 const ANSWERING = "project-agent.answering", ANSWERING_TTL = 120000;
 // A push run in flight carries its own (t-045 round 2); a push run whose result is unknown never expires: it goes only when
 // a check reads the card open (openedPush) or a read shows the card no longer open (resolveMarks), t-045 round 3.
+// t-193 R5.3: the recover run's argv (after the tool's name) and the tool's JSON answer line.
+const RECOVER_WHY = "the Start it again button in the Project Agent panel";
+const RECOVER_TIMEOUT = 60000; // ms: two heartbeat reads 10 s apart, then up to 25 s of ending
+const recoverArgs = (space, fresh) => ["--space", localId(space.id), "--recover", "--json", "--by", "panel", "--why", RECOVER_WHY, ...(fresh ? ["--fresh"] : [])];
+const jsonLine = (stdout) => {
+  for (const line of String(stdout ?? "").split("\n").reverse()) {
+    if (!line.trim().startsWith("{")) continue;
+    try { const v = JSON.parse(line); if (v && typeof v === "object" && !Array.isArray(v)) return v; } catch { /* not this line */ }
+  }
+  return null;
+};
 const ttlOf = (x) => (x?.unknown === true ? Infinity : typeof x?.ttl === "number" ? Math.min(x.ttl, RUN_TIMEOUT + GRACE + ANSWERING_TTL) : ANSWERING_TTL);
 const isoAt = (ms) => new Date(ms).toISOString().replace(/\.\d+Z$/, "Z");
 
@@ -699,6 +711,7 @@ export default class ProjectAgent extends View {
       if (res.r && res.r.code === 0) ask.lines = String(res.r.stdout ?? "").split("\n").filter((l) => l.trim() && !/^Dry run/.test(l));
       else { ask.refused = true; ask.lines = [res.r ? String(res.r.stderr || res.r.stdout || `exit ${res.r.code}`).trim() : restartOutcome(res, space)?.text ?? "The check did not answer; try again."]; }
       if (ask.refused && /started before restart support/.test(ask.lines.join(" "))) ask.capable = false;
+      if (ask.refused && /its launcher is not running/.test(ask.lines.join(" "))) ask.down = true; // t-193 R5.3
       ask.busy = false;
       cx.notify();
     }, { what: "the restart check", background: false });
@@ -733,15 +746,60 @@ export default class ProjectAgent extends View {
     if (!started) end({ ok: false, text: "The restart was not started: too many calls waiting. Try again." }, cx);
   }
 
+  // t-193 R5.3: its launcher is not running. One recover run per space at a time (the restart's mark, here and in other
+  // windows); on recovered or nothing, the keeper's open request; on a refusal, its why, and nothing filed.
+  recoverAgent(space, agent, fresh, cx) {
+    if (this.restartBusy(space)) return;
+    delete this.restartAsk[space.id];
+    delete this.restartMsg[space.id];
+    const mark = { at: Date.now(), instance: null, recover: true };
+    this.restarting[space.id] = mark;
+    this.shareRestart(space, { by: this.me, at: mark.at, instance: null });
+    cx.notify();
+    const end = (msg, cx) => {
+      if (this.restarting[space.id] === mark) delete this.restarting[space.id];
+      this.shareRestart(space, null);
+      if (msg) this.restartMsg[space.id] = { ...msg, at: Date.now() };
+      cx.notify();
+    };
+    const started = this.host.spawn(cx, async (cx) => {
+      let msg = null, open = false;
+      try {
+        const res = await runRestart(this.host.ctx(cx, { origin: "restart", background: false }), space, recoverArgs(space, fresh), RECOVER_TIMEOUT);
+        const out = res?.r ? jsonLine(res.r.stdout) : null;
+        if (out && (out.outcome === "recovered" || out.outcome === "nothing")) open = true;
+        else if (out && out.outcome === "refused") msg = { ok: false, text: `Not started again: ${String(out.why ?? "refused").slice(0, 300)}` };
+        else msg = res?.r && res.r.code === 0 ? { ok: false, text: "Not started again: the tool gave no answer." } : restartOutcome(res, space) ?? { ok: false, text: "Not started again: try again." };
+      } catch (e) { msg = { ok: false, text: `Not started again: ${String(e?.message ?? e)}` }; }
+      end(msg, cx);
+      if (open) this.requestOpen(space, agent, cx, false);
+      this.reload(cx);
+    }, { what: "the recover", background: false });
+    if (!started) end({ ok: false, text: "Not started again: too many calls waiting. Try again." }, cx);
+  }
+
+  recoverButtons(t, space, agent, ids) {
+    return h_flex().gap(6)
+      .child(this.button(t, ids[0], "Start it again", (_e, cx) => this.recoverAgent(space, agent, false, cx), true))
+      .child(this.button(t, ids[1], "Start it again in a new conversation", (_e, cx) => this.recoverAgent(space, agent, true, cx)));
+  }
+
   // The confirm box, the run in flight, or the result.
-  restartBox(t, space, live) {
+  restartBox(t, space, live, agent = null) {
     const ask = this.restartAsk[space.id], box = () => v_flex().px(12).py(8).gap(4).flex_none().border_b(1).border_color(t.border).text_size(11.5).text_color(t.foreground);
+    if (this.restarting[space.id]?.recover) return box().bg(t.working + "1a").child(div().child("Starting it again…"));
     if (this.restarting[space.id]) return box().bg(t.working + "1a").child(div().child(["working", "blocked"].includes(live?.status) ? "Restarting… (waiting for its turn to end)" : "Restarting…"));
     if (this.restartElsewhere(space)) return box().child(div().child("Restarting… (from another panel window)"));
     if (ask) {
       const b = box().bg(t.working + "1a");
       if (ask.busy) return b.child(div().text_color(t.dim).child("Checking what a restart does…"));
       const lines = b.children(ask.lines.map((l, i) => div().child(sel(`pa-restart-line-${i}`, l))));
+      if (ask.refused && ask.down) { // t-193 R5.3: not only Cancel
+        return lines.child(div().child("Its launcher is not running."))
+          .child(div().text_color(t.dim).child("Start it again ends what is left of it on its machine (a stopped launcher, its old Claude) and opens it in its tab; a new conversation leaves the previous one in /resume."))
+          .child(this.recoverButtons(t, space, agent, ["pa-recover", "pa-recover-fresh"])
+            .child(this.button(t, "pa-restart-cancel", "Cancel", (_e, cx) => { delete this.restartAsk[space.id]; cx.notify(); })));
+      }
       if (ask.refused) {
         const line = endTerminalLine(space);
         return lines
@@ -1665,7 +1723,8 @@ export default class ProjectAgent extends View {
     // t-037 J4 (R14): what the launcher runs against what is installed; the Restart button (R13) while it is live.
     const code = this.codeOf(space, data), badge = codeBadge(code), restartable = known === "live" && !this.restartBusy(space);
     const older = /^older/.test(code?.word ?? ""), changed = [...(data.stale ?? []).slice(0, 3), ...(/tools/.test(older ? code.word : "") ? ["tools"] : []), ...(/core/.test(older ? code.word : "") && !(data.stale ?? []).length ? ["core text"] : [])];
-    const restartBox = this.restartBox(t, space, live);
+    const restartBox = this.restartBox(t, space, live, a);
+    const recoverable = known === "down" && !waiting && Boolean(data.code?.launcher) && typeof data.code.launcher === "object"; // t-193 R5.3
     const costsContext = view === "costs" ? this.costsContext(t, space, data, known) : null;
     const contextToggle = this.contextToggle(t, space, data, known), contextFailed = this.contextFailed(t, space), awake = this.awake.button(t); // t-145: beside the status
     return root
@@ -1676,7 +1735,8 @@ export default class ProjectAgent extends View {
         .when(Boolean(contextToggle), (el) => el.child(contextToggle)) // t-145: fresh contexts on or off
         .when(Boolean(badge) && known !== "down", (el) => el.child(div().text_size(11).text_color(older || !code?.capable ? t.working : t.dim).child(badge ?? "")))
         .when(restartable, (el) => el.child(this.restartButton(t, space, code, "pa-restart")))
-        .when(known === "down", (el) => el.child(this.openButton(t, space, a, "pa-open", waiting)))))
+        .when(recoverable && !this.restartBusy(space), (el) => el.child(this.recoverButtons(t, space, a, ["pa-recover-head", "pa-recover-head-fresh"])))
+        .when(known === "down" && !recoverable, (el) => el.child(this.openButton(t, space, a, "pa-open", waiting)))))
       .when(Boolean(restartBox), (el) => el.child(restartBox))
       .when(Boolean(contextFailed), (el) => el.child(contextFailed))
       .when((known === "down" || known === "restoring") && Boolean(startingNow?.error), (el) => el.child(div().px(12).py(6).border_b(1).border_color(t.border).text_size(11.5).text_color(t.blocked)

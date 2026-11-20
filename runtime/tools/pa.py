@@ -38,6 +38,7 @@ card that pushes (t-140).
 """
 import argparse
 import datetime
+import errno
 import fcntl
 import json
 import os
@@ -2271,16 +2272,34 @@ def ask_setup(p, project, address):
         print("Not one of the choices above.")
 
 
+def read_terminal(read):
+    """read() of fd 0 (t-193 R2.3): with SIGTTIN ignored, a read while this launcher is not the terminal's foreground
+    group gets EIO instead of stopping it: take the terminal back and read once more; a second EIO sleeps 3 s and
+    gives None (the caller loops; it never exits)."""
+    for attempt in (0, 1):
+        try:
+            return read()
+        except OSError as e:
+            if e.errno != errno.EIO:
+                raise
+            if attempt == 0:
+                give_tty(os.getpgrp())
+    time.sleep(3)
+    return None
+
+
 def wait_enter(ctx=None):
     """Waits for Enter: True. A launcher with a record (its watcher may take a restart meanwhile, t-037 round 2)
     also stops waiting, False, as soon as a restart is taken (ctx["after"]), so the exec happens now rather than at
     the next Enter. A closed stdin waits 60 s, as input()'s EOFError did."""
     if not ctx or not ctx.get("launcher"):
-        try:
-            input()
-        except EOFError:
-            time.sleep(60)
-        return True
+        while True:
+            try:
+                if read_terminal(input) is None:
+                    continue
+            except EOFError:
+                time.sleep(60)
+            return True
     until = None
     while True:
         if ctx.get("after"):
@@ -2296,7 +2315,10 @@ def wait_enter(ctx=None):
             until = time.time() + 60
             continue
         if ready:
-            if sys.stdin.readline():
+            line = read_terminal(sys.stdin.readline)
+            if line is None:
+                continue
+            if line:
                 return True
             until = time.time() + 60  # end of input
 
@@ -2338,6 +2360,7 @@ def cmd_session(args):
     except KeyboardInterrupt:  # the person stops it (in error-wait or before): the tab's shell takes over
         sys.exit(2)
     finally:  # however it ends, it no longer says it is starting or waiting
+        reset_tty()  # t-193 R3.1: before the tab's shell gets the terminal
         call(["hc", "label", address, "herdr.pa.error=", "herdr.pa.starting="], check=False)
 
 
@@ -2692,6 +2715,15 @@ def run_session(args, address, labels, space, project, ctx):
     # this launcher's first claim; on a retry the file holds this launcher's own beats.
     ctx.setdefault("previous", previous)
     signal.signal(signal.SIGINT, signal.SIG_IGN)  # Ctrl-C belongs to the agent, not this wrapper
+    # t-193 R2.1: no terminal access by anything in this launcher's group can stop it (a stopped launcher is a tab
+    # whose shell took the terminal back); child_setup gives its Claude the defaults again.
+    for sig in JOB_SIGNALS:
+        signal.signal(sig, signal.SIG_IGN)
+    if "restartNext" not in ctx:  # t-193 R5.2: pa-restart --recover --fresh asked for a new conversation
+        ctx["restartNext"] = True
+        if take_restart_next(directory):
+            args.fresh = True
+            session_log(directory, "restart-next: this start is a new conversation (pa-restart --recover --fresh)")
     run_agent(args, address, project, p, directory, agent, ctx, started)
 
 
@@ -2781,6 +2813,7 @@ def launch_command(p, agent, resume, directory, snapshot=False, version=None, pr
 END_GRACE = 20  # seconds between SIGTERM and SIGKILL to the launcher's own Claude child's group
 KILL_WAIT = 5  # seconds end_child waits for the group after SIGKILL before it logs what is left and goes on
 GROUP_POLL = 0.1  # seconds between two looks at the group
+JOB_SIGNALS = (signal.SIGTTOU, signal.SIGTTIN, signal.SIGTSTP)  # ignored by the launcher, the defaults in its child (t-193)
 
 
 def foreground_tty():
@@ -2809,8 +2842,14 @@ def give_tty(group):
 def child_setup(tty):
     """The child's first steps after the fork, before the exec: a process group of its own and, when the launcher
     had the terminal, that group in the foreground. Only setpgid / sigmask / tcsetpgrp (no lock the launcher's
-    threads could hold). A failure starts the child as before rather than not at all."""
+    threads could hold). A failure starts the child as before rather than not at all. t-193 R2.2: first the job-control
+    signals the launcher ignores (run_session) back to their defaults (an ignored signal stays ignored across exec)."""
     def setup():
+        for sig in JOB_SIGNALS:
+            try:
+                signal.signal(sig, signal.SIG_DFL)
+            except (OSError, ValueError):
+                pass
         try:
             os.setpgid(0, 0)
         except OSError:
@@ -2885,6 +2924,13 @@ def settle_child(ctx, child, done):
         return
     if getattr(child, "pa_tty", False):
         give_tty(os.getpgrp())
+    try:
+        settle_group(ctx, group, done)
+    finally:
+        reset_tty()  # t-193 R3.1: once the group is gone, what it left on in the terminal is turned off
+
+
+def settle_group(ctx, group, done):
     if ctx.get("ended"):  # the launcher is ending it (end_child, the watcher thread): wait until that has finished
         done.wait(END_GRACE + KILL_WAIT + 5)
         return
@@ -2921,7 +2967,8 @@ def end_child(ctx, why, grace=None):
     (END_GRACE) from the TERM; then SIGKILL to what is left and a short bounded wait (KILL_WAIT), after which it logs
     what is still there and goes on (never hangs). Returns the handle's exit code, or None when no child runs.
     why=None: what a child that exited by itself left in its group (no ended mark, the handle not signalled).
-    The only code in pa.py that signals a process; never the launcher's own group, never a pid looked up."""
+    With end_leftovers (t-193; its steps end_pids, also pa-restart --recover's) the only code in pa.py that signals a
+    process; this one never the launcher's own group, never a pid looked up."""
     child = ctx.get("child")
     if child is None:
         return None
@@ -2967,6 +3014,7 @@ def end_child(ctx, why, grace=None):
                 pass
         if group:
             to_group(signal.SIGTERM)
+            to_group(signal.SIGCONT)  # t-193 R1.4: a stopped member acts on the SIGTERM now, not at SIGKILL
         try:
             code = child.wait(timeout=max(0.0, began + limit - time.time()))
         except subprocess.TimeoutExpired:
@@ -2995,6 +3043,294 @@ def end_child(ctx, why, grace=None):
     finally:
         if done is not None:
             done.set()
+
+
+# ---- what an earlier launch left on the launcher's terminal (t-193) ------------------------------------------------
+# A Claude started before t-184 ran in the launcher's own group; ending only its wrapper left it there, on the tab's
+# terminal. When the next Claude took the terminal's foreground, that leftover's next terminal access stopped the
+# launcher's whole group (SIGTTOU) and the tab's shell took the terminal back (spec R1-R3). run_agent therefore ends,
+# before every Claude start, what is on its terminal and is neither this launcher, its ancestors (the tab's shell) nor
+# its descendants (its own calls): end_leftovers. With end_child it is the only code here that signals a process
+# (pa-restart --recover reuses its steps, end_pids). It runs only in a Herdr tab (HC_TERMINAL_ID names the launcher's
+# terminal) with fd 0 a terminal, so a test runner's own terminal is never swept.
+
+SWEEP_PS = ["ps", "-A", "-o", "pid=", "-o", "ppid=", "-o", "pgid=", "-o", "uid=", "-o", "tty=", "-o", "stat=",
+            "-o", "etime=", "-o", "lstart="]
+ARGV_PS = ["ps", "-A", "-ww", "-o", "pid=", "-o", "command="]
+PS_TIMEOUT = 5
+NO_TTY = ("", "?", "??", "-")
+
+
+def run_ps(argv):
+    """ps's stdout, or None when it is missing, fails, or takes longer than PS_TIMEOUT."""
+    try:
+        r = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                           universal_newlines=True, timeout=PS_TIMEOUT)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    return r.stdout if r.returncode == 0 else None
+
+
+def etime_seconds(text):
+    """ps's elapsed time ([[dd-]hh:]mm:ss) in seconds, or None."""
+    days, _, rest = text.rpartition("-")
+    parts = rest.split(":")
+    if not 2 <= len(parts) <= 3 or not all(p.isdigit() for p in parts) or (days and not days.isdigit()):
+        return None
+    seconds = 0
+    for p in parts:
+        seconds = seconds * 60 + int(p)
+    return seconds + (int(days) * 86400 if days else 0)
+
+
+def ps_rows(argv=False):
+    """Every process on this machine from one ps read (Linux and macOS print the same columns): a list of
+    {pid, ppid, pgid, uid, tty, stat, etime, lstart, at}, `at` the read instant. A malformed line is skipped (never
+    read as pid 0 or -1); None when ps cannot be read. argv=True adds `argv` (a list; Linux: /proc/<pid>/cmdline,
+    else ps's command split on whitespace)."""
+    at = time.time()
+    out = run_ps(SWEEP_PS)
+    if out is None:
+        return None
+    rows = []
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) != 12 or not all(p.isdigit() for p in parts[:4]):
+            continue
+        pid, ppid, pgid, uid = (int(p) for p in parts[:4])
+        etime = etime_seconds(parts[6])
+        if pid <= 0 or etime is None:
+            continue
+        rows.append({"pid": pid, "ppid": ppid, "pgid": pgid, "uid": uid, "tty": parts[4], "stat": parts[5],
+                     "etime": etime, "lstart": " ".join(parts[7:]), "at": at})
+    if argv:
+        commands = {}
+        for line in (run_ps(ARGV_PS) or "").splitlines():
+            head, _, command = line.strip().partition(" ")
+            if head.isdigit():
+                commands[int(head)] = command.split()
+        for r in rows:
+            r["argv"] = proc_argv(r["pid"]) or commands.get(r["pid"]) or []
+    return rows
+
+
+def proc_argv(pid):
+    """A process's argv elements from /proc (Linux), or None."""
+    try:
+        with open("/proc/{}/cmdline".format(pid), "rb") as f:
+            data = f.read()
+    except OSError:
+        return None
+    if not data:
+        return None
+    return [a.decode("utf-8", "replace") for a in data.rstrip(b"\0").split(b"\0")]
+
+
+def launcher_tty():
+    """fd 0's terminal as ps names it (pts/3, ttys003), or None when fd 0 is not a terminal."""
+    try:
+        if not os.isatty(0):
+            return None
+        name = os.ttyname(0)
+    except OSError:
+        return None
+    return name[len("/dev/"):] if name.startswith("/dev/") else name
+
+
+def ancestors_of(pid, by_pid):
+    seen, here = set(), by_pid.get(pid)
+    while here and here["ppid"] > 0 and here["ppid"] not in seen and len(seen) < 1000:
+        seen.add(here["ppid"])
+        here = by_pid.get(here["ppid"])
+    return seen
+
+
+def descendants_of(pids, rows):
+    """Every process below `pids` by ppid (not pids themselves)."""
+    kids = {}
+    for r in rows:
+        kids.setdefault(r["ppid"], []).append(r["pid"])
+    found, todo = set(), list(pids)
+    while todo:
+        for k in kids.get(todo.pop(), ()):
+            if k not in found and k not in pids:
+                found.add(k)
+                todo.append(k)
+    return found
+
+
+def leftover_targets(rows, me, tty, uid):
+    """(targets, foreign) of R1.1 from one ps read: on terminal `tty` (compared exactly), not `me`, its ancestors or its
+    live descendants, pid > 1, not a zombie; with what each started (any tty). foreign: those of another uid (never
+    signalled, R1.5)."""
+    if not tty or tty in NO_TTY:
+        return [], []
+    rows = [r for r in rows if isinstance(r.get("pid"), int) and r["pid"] > 1 and not str(r.get("stat", "")).startswith("Z")]
+    by_pid = {r["pid"]: r for r in rows}
+    spared = {me} | ancestors_of(me, by_pid) | descendants_of({me}, rows)
+    first = {r["pid"] for r in rows if r.get("tty") == tty and r["pid"] not in spared}
+    chosen = first | (descendants_of(first, rows) - spared)
+    picked = [by_pid[p] for p in sorted(chosen)]
+    return [r for r in picked if r.get("uid") == uid], [r for r in picked if r.get("uid") != uid]
+
+
+def signal_pid(pid, sig):
+    """The one call that signals a leftover (tests replace it). Never pid <= 1 or this process."""
+    if not isinstance(pid, int) or pid <= 1 or pid == os.getpid():
+        raise ProcessLookupError(pid)
+    os.kill(pid, sig)
+
+
+def started_utc(r):
+    try:
+        return iso_time(r["at"] - r["etime"])
+    except (KeyError, TypeError, ValueError, OverflowError, OSError):
+        return "unknown"
+
+
+def end_pids(targets, directory, label, extra=None):
+    """R1.2's steps for `targets` (ps rows): SIGTERM, SIGCONT, a wait up to END_GRACE, SIGKILL to what is left, a wait up
+    to KILL_WAIT. Before every signal the pid is read again and signalled only with the same start time and tty.
+    One session.log line per pid: `<label> ended pid= tty= started= how=term|kill`, `<label> left ... why=` or `<label>
+    not signalled pid= tty=: another process has its pid now`. extra(r): words added to each line. Returns (ended,
+    left) as lists of rows."""
+    extra = extra or (lambda r: "")
+    ended, left, live = [], [], list(targets)
+
+    def line(text):
+        if directory:
+            try:
+                session_log(directory, text)
+            except OSError:
+                pass
+
+    def tag(r):
+        more = extra(r)
+        return "pid={} tty={} started={}{}".format(r["pid"], r.get("tty") or "?", started_utc(r), " " + more if more else "")
+
+    def now_rows():
+        rows = ps_rows()
+        return None if rows is None else {r["pid"]: r for r in rows}
+
+    def same(r, cur):
+        c = cur.get(r["pid"])
+        return bool(c) and c.get("lstart") == r.get("lstart") and c.get("tty") == r.get("tty") and not str(c.get("stat", "")).startswith("Z")
+
+    def send(sigs, how):
+        cur = now_rows()
+        if cur is None:
+            for r in live:
+                left.append(r)
+                line("{} left {} why=ps-unreadable".format(label, tag(r)))
+            live[:] = []
+            return
+        keep = []
+        for r in live:
+            c = cur.get(r["pid"])
+            if not c or str(c.get("stat", "")).startswith("Z"):
+                ended.append(dict(r, how=how))
+                line("{} ended {} how={}".format(label, tag(r), how))
+                continue
+            if not same(r, cur):
+                line("{} not signalled pid={} tty={}: another process has its pid now".format(label, r["pid"], r.get("tty") or "?"))
+                continue
+            try:
+                for sig in sigs:
+                    signal_pid(r["pid"], sig)
+            except ProcessLookupError:
+                ended.append(dict(r, how=how))
+                line("{} ended {} how={}".format(label, tag(r), how))
+                continue
+            except PermissionError:
+                left.append(r)
+                line("{} left {} why=not-permitted".format(label, tag(r)))
+                continue
+            except OSError as e:
+                left.append(r)
+                line("{} left {} why={}".format(label, tag(r), e.errno))
+                continue
+            keep.append(r)
+        live[:] = keep
+
+    def wait(until, how):
+        while live:
+            cur = now_rows()
+            if cur is not None:
+                for r in list(live):
+                    if not same(r, cur):
+                        live.remove(r)
+                        ended.append(dict(r, how=how))
+                        line("{} ended {} how={}".format(label, tag(r), how))
+            if not live or time.time() >= until:
+                return
+            time.sleep(GROUP_POLL * 2)
+
+    def how(sig):  # the log's how=: term, kill
+        return sig.name[len("SIG"):].lower()
+    send((signal.SIGTERM, signal.SIGCONT), how(signal.SIGTERM))
+    wait(time.time() + END_GRACE, how(signal.SIGTERM))
+    if live:
+        send((signal.SIGKILL,), how(signal.SIGKILL))
+        wait(time.time() + KILL_WAIT, how(signal.SIGKILL))
+    for r in live:
+        left.append(r)
+        line("{} left {} why=still-running".format(label, tag(r)))
+    return ended, left
+
+
+def end_leftovers(ctx, address):
+    """R1.1-R1.5: before a Claude start, ends what an earlier launch left on this launcher's terminal (see above).
+    Never raises; the start goes on whatever it could not end."""
+    directory = ctx.get("directory")
+
+    def once(why):
+        said = ctx.setdefault("sweepSaid", set())
+        if why in said or not directory:
+            return
+        said.add(why)
+        try:
+            session_log(directory, "leftovers: not swept: " + why)
+        except OSError:
+            pass
+    try:
+        if not address or os.environ.get("HC_TERMINAL_ID") != address:
+            return once("not in a Herdr tab (HC_TERMINAL_ID does not name this launcher's terminal)")
+        tty = launcher_tty()
+        if not tty:
+            return once("fd 0 is not a terminal")
+        rows = ps_rows()
+        if rows is None:
+            return once("ps could not be read")
+        targets, foreign = leftover_targets(rows, os.getpid(), tty, os.getuid())
+        for r in foreign:
+            if directory:
+                session_log(directory, "leftover left pid={} tty={} started={} why=another-user".format(
+                    r["pid"], r.get("tty") or "?", started_utc(r)))
+        if targets:
+            end_pids(targets, directory, "leftover")
+    except Exception as e:  # noqa: BLE001 - never stops the start (R2 outranks R1)
+        once("{}: {}".format(type(e).__name__, e))
+
+
+# ---- the terminal after a child (t-193 R3) -------------------------------------------------------------------------
+
+TTY_RESET = ("\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1004l\x1b[?2004l\x1b[<u"
+             "\x1b[?25h\x1b[?1049l")  # mouse modes, focus, bracketed paste off; kitty keyboard pop; cursor; main screen
+TTY_SETTLE = 0.2  # seconds for the terminal's late replies before the input is flushed
+
+
+def reset_tty():
+    """Turns off what a Claude left on in the terminal (mouse reports, focus, paste) and drops replies not read, so
+    the tab's shell or the next Claude never reads them as typed input. Nothing when fd 0 is not a terminal."""
+    try:
+        if not os.isatty(0):
+            return
+        os.write(0, TTY_RESET.encode())
+        time.sleep(TTY_SETTLE)
+        import termios
+        termios.tcflush(0, termios.TCIFLUSH)
+    except Exception:  # noqa: BLE001 - OSError, termios.error: never stops the launcher
+        pass
 
 
 # ---- the restart in place (t-037 R4, R6, R7; spec S1-S5) ---------------------------------------------------------
@@ -3498,6 +3834,7 @@ def run_agent(args, address, project, p, directory, agent, ctx, started):
         if ctx.get("after"):  # taken while this launch was built (the --help probe): the exec, before any Claude starts
             take_after(ctx, project, directory, address)
             continue
+        end_leftovers(ctx, address)  # t-193 R1.1: what an earlier launch left on this terminal, before every start
         began = starting(model)
         try:
             code = run_child(ctx, argv, project)
@@ -3513,6 +3850,7 @@ def run_agent(args, address, project, p, directory, agent, ctx, started):
             p, adopted = held, False
             snap, ver = snapshot_flag(p, ctx), cc_version(p, ctx)  # t-041 J3: the version gates the net
             argv, model = launch_command(p, agent, resume, directory, snapshot=snap, version=ver, prompt=prompt)
+            end_leftovers(ctx, address)
             began = starting(model)
             code = run_child(ctx, argv, project)
         running["since"] = None
@@ -3933,7 +4271,7 @@ def journal_caller(entry):
 
 def restart_flags(args):
     flags = ["--space", args.space]
-    for name in ("now", "fresh", "dry_run", "json"):
+    for name in ("now", "fresh", "dry_run", "json", "recover"):
         if getattr(args, name, False):
             flags.append("--" + name.replace("_", "-"))
     if args.why is not None:
@@ -3952,6 +4290,10 @@ def cmd_restart(args):
     space's launcher, says what runs now and which workers keep running, writes restart-request.json and waits for
     what the new launcher loaded. It ends nothing itself; the launcher ends its own Claude and execs."""
     in_claude = os.environ.get("CLAUDECODE") not in (None, "", "0")
+    if getattr(args, "recover", False) and (args.now or getattr(args, "expect_instance", None) is not None
+                                             or getattr(args, "end_terminal", False) or getattr(args, "anyway", False)):
+        raise Problem("--recover is used alone or with --fresh, --json, --dry-run, --why, --on (not --now, "
+                      "--expect-instance, --end-terminal or --anyway)")
     if getattr(args, "end_terminal", False):  # t-037 J3, R10: the person's command only, also with --on
         if in_agent():  # every agent marker, as pa-task (round 2, RL-J3-2)
             raise Problem("pa-restart --end-terminal is the person's command: it ends the Project Agent's terminal and "
@@ -3985,6 +4327,8 @@ def cmd_restart(args):
         if code:
             sys.exit(code)
         return
+    if getattr(args, "recover", False):  # t-193 R5: on the space's machine (--on relayed above)
+        return cmd_recover(args, "panel" if by_panel else "orchestrator" if in_claude else "pa-restart")
     directory, agent = space_for_command(args.space)
     record, term = identify_launcher(directory, agent)
     space, terminal = agent.get("space"), agent.get("terminal")
@@ -4062,6 +4406,221 @@ def cmd_restart(args):
         wait, "it is mid-turn" if agent_turn(terminal) in ("working", "blocked") else "the launcher did not answer",
         "the request was withdrawn" if removed else "a newer request is waiting"), file=sys.stderr)
     sys.exit(1)
+
+
+# ---- pa-restart --recover: a launcher that is not running (t-193 R5) -----------------------------------------------
+# A launcher stopped by its terminal (or killed) writes no heartbeat, so pa-restart refuses ("its launcher is not
+# running") and no request can reach it. --recover, on the space's machine, ends what is left of it (its stopped
+# launchers with their groups, the other processes on their terminals but the tab's shell, and the orphaned Claudes of
+# the space's sessions) by end_pids' steps; then the panel files the keeper's open request. It never ends a launcher
+# that runs (not stopped) while its heartbeat is stale: that one is reported. With --fresh the next start (within 10
+# min) is a new conversation (restart-next.json, read by run_session).
+
+RECOVER_GAP = 10  # seconds between the two heartbeat reads
+RECOVER_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+SESSION_FLAGS = ("--session-id", "--resume")
+RESTART_NEXT = "restart-next.json"
+RESTART_NEXT_LIFE = 600  # seconds after `at` that a launcher's first start still reads it
+USER_INITS = ("launchd",)  # an orphan's parent besides pid 1 (also `systemd --user`)
+
+
+def recover_wait():
+    time.sleep(RECOVER_GAP)
+
+
+def recover_heartbeat(directory):
+    """The heartbeat's epoch, read the way read_heartbeat reads it, but only from a regular file in the state folder
+    (never a symlink followed, never a FIFO opened): None when missing or not `<epoch> <address>` (H17)."""
+    import stat
+    path = os.path.join(directory, "heartbeat")
+    try:
+        if not stat.S_ISREG(os.lstat(path).st_mode):
+            return None
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+        with os.fdopen(fd, "rb") as f:
+            parts = f.read(4096).decode("utf-8", "replace").split()
+        return int(parts[0]) if len(parts) >= 2 else None
+    except (OSError, ValueError):
+        return None
+
+
+def launcher_form(argv, space):
+    """argv is a launcher of `space` (the spec's launcher form): python running <...>/tools/pa.py session, or
+    <...>/pa-session (run by python or itself), with one --space value element exactly `space`."""
+    if not isinstance(argv, list) or not argv or not all(isinstance(a, str) for a in argv):
+        return False
+    if not isinstance(space, str) or not RECOVER_ID.match(space):
+        return False
+    base = os.path.basename(argv[0])
+    if base == "pa-session":
+        rest = argv[1:]
+    elif re.match(r"(?i)python[0-9.]*$", base) and len(argv) >= 2 and os.path.basename(argv[1]) == "pa-session":
+        rest = argv[2:]
+    elif (re.match(r"(?i)python[0-9.]*$", base) and len(argv) >= 3 and os.path.basename(argv[1]) == "pa.py"
+          and argv[2] == "session"):
+        rest = argv[3:]
+    else:
+        return False
+    values, i = [], 0
+    while i < len(rest):
+        if rest[i] == "--space":
+            if i + 1 >= len(rest):
+                return False
+            values.append(rest[i + 1])
+            i += 2
+            continue
+        if rest[i].startswith("--space="):
+            values.append(rest[i][len("--space="):])
+        i += 1
+    return values == [space]
+
+
+def session_flag(argv, ids):
+    """argv has --session-id or --resume followed by (or `=`) an element exactly one of ids (H13)."""
+    if not isinstance(argv, list):
+        return False
+    ids = {i for i in ids if isinstance(i, str) and i}
+    for i, a in enumerate(argv):
+        if not isinstance(a, str):
+            continue
+        if a in SESSION_FLAGS and i + 1 < len(argv) and argv[i + 1] in ids:
+            return True
+        for flag in SESSION_FLAGS:
+            if a.startswith(flag + "=") and a[len(flag) + 1:] in ids:
+                return True
+    return False
+
+
+def user_init(r, by_pid):
+    """The process was orphaned: its parent is pid 1, or the user's init (systemd --user, launchd)."""
+    if r.get("ppid") == 1:
+        return True
+    parent = by_pid.get(r.get("ppid")) or {}
+    words = parent.get("argv") or []
+    name = os.path.basename(words[0]) if words else ""
+    return name in USER_INITS or (name == "systemd" and "--user" in words)
+
+
+def recover_targets(rows, space, ids, me):
+    """From one ps read (with argv): {"ended": rows with `what`, "running": launchers of `space` that are not stopped}.
+    ended: (a) the stopped launchers of `space` and their groups, (b) the other processes on their terminals but the
+    session leaders there and the launchers' ancestors, (c) orphans of this uid naming one of `ids`; with their
+    descendants. Never `me`, its ancestors or descendants, its group, pid <= 1, another uid or a zombie."""
+    uid = os.getuid()
+    rows = [r for r in rows if isinstance(r.get("pid"), int) and r["pid"] > 1 and not str(r.get("stat", "")).startswith("Z")]
+    by_pid = {r["pid"]: r for r in rows}
+    spared = {me} | ancestors_of(me, by_pid) | descendants_of({me}, rows)
+    own_group = os.getpgrp() if me == os.getpid() else None
+    launchers = [r for r in rows if r.get("uid") == uid and launcher_form(r.get("argv"), space)]
+    stopped = [r for r in launchers if str(r.get("stat", "")).startswith("T")]
+    running = [r for r in launchers if not str(r.get("stat", "")).startswith("T")]
+    what = {}
+    for r in stopped:
+        what[r["pid"]] = "launcher"
+    for r in stopped:
+        spared |= ancestors_of(r["pid"], by_pid)
+    groups = {r["pgid"] for r in stopped if isinstance(r.get("pgid"), int) and r["pgid"] > 1}
+    for r in rows:
+        if r.get("pgid") in groups:
+            what.setdefault(r["pid"], "launcher group")
+    ttys = {r.get("tty") for r in stopped} - set(NO_TTY) - {None}
+    leaders = {r["pid"] for r in rows if r.get("tty") in ttys and "s" in str(r.get("stat", ""))}
+    for p in set(leaders):
+        spared |= {p} | ancestors_of(p, by_pid)
+    for r in rows:
+        if r.get("tty") in ttys:
+            what.setdefault(r["pid"], "terminal")
+    for r in rows:
+        if r.get("uid") == uid and user_init(r, by_pid) and session_flag(r.get("argv"), ids):
+            what.setdefault(r["pid"], "orphan")
+    for p in descendants_of(set(what), rows):
+        what.setdefault(p, "started by one")
+    ended = []
+    for p in sorted(what):
+        r = by_pid.get(p)
+        if not r or p in spared or r.get("uid") != uid or (own_group is not None and r.get("pgid") == own_group):
+            continue
+        ended.append(dict(r, what=what[p]))
+    return {"ended": ended, "running": running}
+
+
+def take_restart_next(directory):
+    """R5.2: True when restart-next.json asks for a fresh first start (`fresh` true, `at` within RESTART_NEXT_LIFE s
+    before now); the file is removed either way (also a symlink, which is never followed)."""
+    import stat
+    if not directory:
+        return False
+    path = os.path.join(directory, RESTART_NEXT)
+    try:
+        mode = os.lstat(path).st_mode
+    except OSError:
+        return False
+    value = None
+    if stat.S_ISREG(mode):
+        try:
+            fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+            with os.fdopen(fd) as f:
+                value = json.loads(f.read(65536))
+        except (OSError, ValueError):
+            value = None
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+    if not isinstance(value, dict) or value.get("fresh") is not True or not isinstance(value.get("at"), str):
+        return False
+    at = parse_time(value["at"])
+    return at is not None and -60 <= time.time() - at <= RESTART_NEXT_LIFE
+
+
+def cmd_recover(args, by):
+    """pa-restart --recover (R5.1, R5.2). Prints the answer (JSON with --json); exits 2 when refused."""
+    def answer(outcome, why, ended=(), left=(), code=0):
+        result = {"outcome": outcome, "ended": [{"pid": r["pid"], "what": r.get("what")} for r in ended],
+                  "left": [{"pid": r["pid"], "what": r.get("what")} for r in left], "why": why}
+        print("Recover {}: {}{}".format(outcome, why, "".join(
+            "\n  {} pid {} ({})".format("would end" if args.dry_run else "ended", r["pid"], r.get("what")) for r in ended)))
+        if args.json:
+            print(json.dumps(result))
+        if code:
+            sys.exit(code)
+        return result
+    space = args.space
+    if not isinstance(space, str) or not RECOVER_ID.match(space):
+        raise Problem("--recover needs --space <id> (letters, digits, - and _; not starting with -): {!r}".format(space))
+    directory, agent = space_for_command(space)
+    if agent.get("space") not in (None, space):
+        raise Problem("agent.json in {} is for space {!r}, not {!r}".format(directory, agent.get("space"), space))
+    first = recover_heartbeat(directory)
+    if first is not None and time.time() - first <= FRESH:
+        return answer("refused", "its launcher is running: the heartbeat is {:.0f} s old".format(time.time() - first),
+                      code=2)
+    recover_wait()
+    second = recover_heartbeat(directory)
+    if second is not None and time.time() - second <= FRESH:
+        return answer("nothing", "its launcher came back: the heartbeat is {:.0f} s old".format(time.time() - second))
+    rows = ps_rows(argv=True)
+    if rows is None:
+        return answer("refused", "ps could not be read on this machine", code=2)
+    ids = {s for s in [agent.get("sessionId")] + list(agent.get("previousSessions") or []) if isinstance(s, str) and s}
+    found = recover_targets(rows, space, ids, os.getpid())
+    if found["running"]:
+        return answer("refused", "its launcher runs but does not beat: pid {}; look at its tab".format(
+            ", ".join(str(r["pid"]) for r in found["running"])), code=2)
+    targets = found["ended"]
+    if args.dry_run:
+        return answer("recovered" if targets else "nothing", "dry run: nothing ended or written", ended=targets)
+    ended, left = end_pids(targets, directory, "recover", extra=lambda r: "what=" + str(r.get("what")).replace(" ", "-")) if targets else ([], [])
+    why = (args.why or "").strip() or "its launcher was not running"
+    with open(os.path.join(directory, "journal.jsonl"), "a") as journal:
+        journal.write(json.dumps({"at": now(), "by": by, "trigger": "recover", "why": "recover: " + why,
+                                  "ended": len(ended), "left": len(left)}) + "\n")
+    session_log(directory, "recover by={} ended={} left={}".format(by, len(ended), len(left)))
+    if args.fresh:
+        write_json(os.path.join(directory, RESTART_NEXT), {"fresh": True, "at": now(), "by": by})
+    outcome = "recovered" if ended else "nothing"
+    return answer(outcome, "{} ended, {} left; open it again".format(len(ended), len(left)) if targets
+                  else "nothing of its launcher is left; open it again", ended=ended, left=left)
 
 
 # ---- pa-restart --end-terminal: the one-time bridge for a launcher from before restart support, t-037 R10 ----------
@@ -5472,6 +6031,9 @@ def main():
         parser.add_argument("--relay-token", help=argparse.SUPPRESS)  # its one-time token, for the bound run
         parser.add_argument("--expect-instance", help=argparse.SUPPRESS)  # t-037 J4: the panel's click, bound
         parser.add_argument("--by", choices=("panel",), help=argparse.SUPPRESS)  # t-037 J4: the request's `by`
+        parser.add_argument("--recover", action="store_true",
+                            help="its launcher is not running (a stale heartbeat): end what is left of it (a stopped "
+                                 "launcher, orphaned Claudes of its sessions), then open it again (t-193)")
         return cmd_restart(parser.parse_args())
     if kind == "pa-context":
         parser.description = ("set: the Project Agent's context settings (context.json; the person's command, applied at "

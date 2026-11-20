@@ -137,6 +137,25 @@ resuming the same conversation. Its launcher (`pa-session`) ends its own Claude 
   (ends workers)"; it shows `pa-restart --space <id> --end-terminal` (with `--on <machine>` for a remote
   space) to copy and run yourself. That ends the terminal and its workers, after it asks; the panel never
   ends a terminal.
+- **Before every Claude start** the launcher ends what an earlier launch left on its terminal: processes
+  on that tty that are neither the launcher, its ancestors (the tab's shell) nor its descendants (its own
+  calls), with what they started (SIGTERM and SIGCONT, then SIGKILL after 20 s; each pid read again
+  before each signal). Each one is a `leftover ended pid=… tty=… started=… how=term|kill` line in
+  `session.log` (or `leftover left …`). This runs only in a Herdr tab with a terminal. The launcher also
+  ignores SIGTTOU, SIGTTIN and SIGTSTP (its Claude gets the defaults back), so terminal access from the
+  background can never stop it and hand the tab to its shell; after each Claude it turns off mouse
+  reporting, focus events and bracketed paste and drops terminal replies not read yet.
+- **When its launcher is not running** (a stale heartbeat: `pa-restart` refuses with "its launcher is not
+  running"), the panel offers **Start it again** and **Start it again in a new conversation**, in the
+  restart box and in the header (for a space with a `launcher.json`). They run
+  `pa-restart --space <id> --recover [--fresh]` on the space's machine, then file the open request
+  below. `--recover` acts only when the heartbeat is missing or stale on two reads 10 s apart; it ends
+  the space's stopped launchers (argv `pa.py session --space=<id>` or `pa-session --space <id>`, state T)
+  with their groups, the other processes on their terminals (never the tab's shell), and orphaned
+  Claudes started with `--session-id`/`--resume` of the space's sessions. It refuses a launcher that runs
+  but does not beat ("look at its tab"). `--fresh` writes `restart-next.json`, read by the next start
+  within 10 minutes. It writes only its `session.log` and journal lines; `--dry-run` lists and ends
+  nothing.
 
 ## Open requests: `project-agent.openAgent`
 
