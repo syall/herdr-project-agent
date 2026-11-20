@@ -3380,6 +3380,30 @@ def recorded_paths(directory, agent):
     under pa.ROOT/spaces whose agent.json names the same project folder; unreadable: [(space, why)] for a same-project
     space whose ledger cannot be read, or whose agent.json is there but cannot be read (t-131: it may be on this project),
     as [(space, why, "ledger" | "agent.json")] (D5: then nothing is listed as unrecorded)."""
+    folders, unreadable = project_folders(directory, agent)
+    paths = set()
+    for folder in folders:
+        try:
+            ledger = pa.read_json(os.path.join(folder, "ledger.json"), {}) or {}
+            tasks = ledger.get("tasks") or [] if isinstance(ledger, dict) else None
+            if not isinstance(tasks, list):
+                raise ValueError("no task list")
+        except (OSError, ValueError) as e:
+            unreadable.append((os.path.basename(folder), clean(e)[:200], "ledger"))
+            continue
+        for task in tasks:
+            if not isinstance(task, dict):
+                continue
+            paths.update(t["path"] for t in pa.task_worktrees(task))
+            entries = task.get("worktrees") if isinstance(task.get("worktrees"), list) else []
+            paths.update(os.path.realpath(os.path.expanduser(e["path"])) for e in entries
+                         if isinstance(e, dict) and isinstance(e.get("path"), str) and e["path"].strip())
+    return sorted(paths), unreadable
+
+
+def project_folders(directory, agent):
+    """(folders, unreadable): this space's folder and every space under pa.ROOT/spaces whose agent.json names the same
+    project folder; unreadable as recorded_paths gives it, for an agent.json that cannot be read."""
     project = agent.get("project") if isinstance(agent.get("project"), str) and agent.get("project").strip() else None
     project = os.path.realpath(os.path.expanduser(project)) if project else None
     folders, unreadable = [directory], []
@@ -3401,24 +3425,7 @@ def recorded_paths(directory, agent):
             theirs = other.get("project")
             if isinstance(theirs, str) and theirs.strip() and os.path.realpath(os.path.expanduser(theirs)) == project:
                 folders.append(folder)
-    paths = set()
-    for folder in folders:
-        try:
-            ledger = pa.read_json(os.path.join(folder, "ledger.json"), {}) or {}
-            tasks = ledger.get("tasks") or [] if isinstance(ledger, dict) else None
-            if not isinstance(tasks, list):
-                raise ValueError("no task list")
-        except (OSError, ValueError) as e:
-            unreadable.append((os.path.basename(folder), clean(e)[:200], "ledger"))
-            continue
-        for task in tasks:
-            if not isinstance(task, dict):
-                continue
-            paths.update(t["path"] for t in pa.task_worktrees(task))
-            entries = task.get("worktrees") if isinstance(task.get("worktrees"), list) else []
-            paths.update(os.path.realpath(os.path.expanduser(e["path"])) for e in entries
-                         if isinstance(e, dict) and isinstance(e.get("path"), str) and e["path"].strip())
-    return sorted(paths), unreadable
+    return folders, unreadable
 
 
 def guess_task(name, ids):
@@ -3818,7 +3825,7 @@ def remove_one(directory, row, card, path, owner, profile):
         withdraw_answered(directory, path, card, task, "the worktree changed since the person answered {!r}: {}".format(card.get("answer"), changed))
         raise pa.Problem(changed + "; the card is withdrawn and the next `pa-worktree check --open-cards` asks again. Nothing was removed")
     try:
-        done = remove_worktree(row["path"], facts)
+        done, more, holder = remove_with_holder(directory, row, profile, facts)
     except pa.Problem as e:
         if not os.path.lexists(row["path"]):  # it failed, but the folder is gone: the ledger must not name it
             spend_card(directory, path, card)
@@ -3826,10 +3833,13 @@ def remove_one(directory, row, card, path, owner, profile):
         raise RemoveFailed(str(e))
     spend_card(directory, path, card)
     print(done + " (card {})".format(card["id"]))
+    for line in more:
+        print(line)
     tidy = remove_container(row["given"])
     if tidy:
         print(tidy)
-    mark_removed_everywhere(directory, row, "removed the worktree {} (card {})".format(row["path"], card["id"]))
+    mark_removed_everywhere(directory, row, "removed the worktree {} (card {}){}".format(
+        row["path"], card["id"], "; " + done if holder else ""))
     return True
 
 
@@ -4203,9 +4213,9 @@ def standing_delete_rule(directory, space, rule_id):
     return rule, entry["standing"]
 
 
-def merged_and_pushed(path, profile):
-    """True when HEAD is reachable from a remote-tracking ref of a main branch (local refs, no fetch, Q8): every commit
-    is merged into main and on the remote. A squash merge or a picked commit is not."""
+def merged_and_pushed(path, profile, rev="HEAD"):
+    """True when HEAD (or rev) is reachable from a remote-tracking ref of a main branch (local refs, no fetch, Q8): every
+    commit is merged into main and on the remote. A squash merge or a picked commit is not."""
     names = {"main", "master", "trunk"}
     for b in (profile or {}).get("mainBranches") or []:
         names.add(str(b).split("/", 1)[-1] if str(b).startswith("origin/") else str(b))
@@ -4217,7 +4227,7 @@ def merged_and_pushed(path, profile):
         return False
     for ref in out.splitlines():
         parts = ref[len("refs/remotes/"):].split("/", 1)
-        if len(parts) == 2 and parts[1] in names and git(path, "merge-base", "--is-ancestor", "HEAD", ref)[0] == 0:
+        if len(parts) == 2 and parts[1] in names and git(path, "merge-base", "--is-ancestor", rev, ref)[0] == 0:
             return True
     return False
 
@@ -4428,7 +4438,7 @@ def remove_standing(directory, space, agent, profile, rule_id, env=None, ancs=No
         entries = ledger_tasks(directory)
         listing = card_listing(directory)
         holds = worktree_holds(directory, listing, entries)
-        removed, paths, left, failed = [], [], [], None
+        removed, paths, left, failed, notes = [], [], [], None, []
         for row in rows.values():
             owner = card_owner(row)
             why, _rule, _desc = candidate_why(row, profile, owner)
@@ -4443,7 +4453,8 @@ def remove_standing(directory, space, agent, profile, rule_id, env=None, ancs=No
             cid, cpath, card = card_for(directory, row, owner[0], entries.get(owner[0]), listing)
             try:
                 # Clean, just checked again: its counts are 0, and they go as 0 so the removal is never forced (R15).
-                done = remove_worktree(row["path"], dict(row["facts"], uncommitted=0, unpushed=0))
+                done, more, holder = remove_with_holder(directory, row, profile, dict(row["facts"], uncommitted=0, unpushed=0))
+                notes += ([done] if holder else []) + more
                 if os.path.lexists(row["path"]):
                     raise pa.Problem("the folder is still there after its removal")
             except pa.Problem as e:
@@ -4464,6 +4475,8 @@ def remove_standing(directory, space, agent, profile, rule_id, env=None, ancs=No
         line = "Removed {} worktrees on rule {}: {}".format(len(removed), rule_id, ", ".join(removed) or "nothing is clean")
         if left:
             line += "; {} not clean, left for cards: {}".format(len(left), ", ".join(left))
+        if notes:  # t-192 R6, R7: what became of each removed worktree's holder and branch
+            line += "; " + "; ".join(n.rstrip(".") for n in notes)
         if failed:
             line += "; then {}: the rule is stopped, and resuming it is the person's".format(failed)
         if removed:
@@ -4568,6 +4581,170 @@ def changed_since_card(snapshot):
         if new:
             return "{} has uncommitted files that were not on the card: {}".format(path, ", ".join(new[:5]) + (", +{} more".format(len(new) - 5) if len(new) > 5 else ""))
     return None
+
+
+# ---- t-192 R6: removing a package of a holder removes the holder too, on the profile's rule ------------------------
+HOLDER_STATUS_LIMIT = 60  # seconds for the profile's status script on a holder
+HOLDER_REMOVE_LIMIT = 900  # seconds for the profile's remove script on a holder
+
+
+def rule_active(directory, rule_id):
+    """True when rules.json, read now, has a rule whose id is exactly rule_id and whose status is exactly active."""
+    try:
+        data = pa.read_json(os.path.join(directory, "rules.json"), None)
+    except Exception:  # noqa: BLE001 - unreadable is never active
+        return False
+    rules = data.get("rules") if isinstance(data, dict) else None
+    return isinstance(rules, list) and any(isinstance(r, dict) and r.get("id") == rule_id and r.get("status") == "active"
+                                           for r in rules)
+
+
+def holder_status(h, profile):
+    """The profile's status script's JSON for the holder h, read now (HOLDER_STATUS_LIMIT), or None when it fails."""
+    custom = profile["worktree"]
+    script = custom["status"] if os.path.isabs(custom["status"]) else os.path.join(profile.get("_folder") or "", custom["status"])
+    try:
+        r = subprocess.run([script, h], stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True,
+                           timeout=HOLDER_STATUS_LIMIT)
+        facts = json.loads(r.stdout) if r.returncode == 0 else None
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+    return facts if isinstance(facts, dict) else None
+
+
+def holder_why(directory, profile, h, p, status):
+    """Why the holder h must stay when its package p is removed (R6.2 b-e and a, all read now), or None when it may go
+    with it. status: holder_status(h) (None: the script failed). Fails closed."""
+    import fnmatch
+    custom, parts = profile["worktree"], holder_glob(profile)
+    if os.path.basename(h).startswith("-"):
+        return "its name starts with '-' (it would read as an option)"
+    # b: no terminal in it, the Project Agent's own included
+    live = pa.live_terminals()
+    if live is None:
+        return "the terminal list cannot be read"
+    here = sorted(a for a, info in live.items() if inside(info.get("cwd"), h) or inside((info.get("foreground") or {}).get("cwd"), h))
+    if here:
+        return "a terminal is working in it: " + ", ".join(clean(a) for a in here)
+    # c: no other task records a path in it
+    agent = pa.read_json_safe(os.path.join(directory, "agent.json")) or {}
+    folders, unreadable = project_folders(directory, agent if isinstance(agent, dict) else {})
+    if unreadable:
+        return "cannot read {} of space {}".format(unreadable[0][2], clean(unreadable[0][0]))
+    for folder in folders:
+        try:
+            ledger = pa.read_json(os.path.join(folder, "ledger.json"), {}) or {}
+            tasks = ledger.get("tasks") if isinstance(ledger, dict) else None
+            if not isinstance(tasks, list):
+                raise ValueError("no task list")
+        except (OSError, ValueError):
+            return "cannot read the ledger of space {}".format(clean(os.path.basename(folder)))
+        for task in tasks:
+            for t in pa.task_worktrees(task) if isinstance(task, dict) else []:
+                if inside(t["path"], h) and os.path.realpath(t["path"]) != p:
+                    return "task {} records {} in it".format(clean(task.get("id")), clean(t["path"]))
+    # e: the remove script would run without --force
+    if status is None:
+        return "the profile's status script failed"
+    try:
+        dirty, ahead = int(status.get("uncommitted", 0)), int(status.get("unpushed", 0))
+    except (TypeError, ValueError):
+        return "the profile's status script gave counts it cannot read"
+    if dirty or ahead:
+        return "its status script counts {} uncommitted and {} unpushed".format(dirty, ahead)
+    listed = {os.path.realpath(r) for r in status.get("repos") or [] if isinstance(r, str) and os.path.isabs(r)}
+    # d and a: its top level holds only the marker, the packages' folders and the profile's own names; every entry on
+    # the way to the packages is a package folder; every package is a git repository the status script lists, inside
+    # it, clean, merged and pushed
+    own = [n for n in custom.get("own") or [] if isinstance(n, str)]
+    repos = []
+
+    def walk(folder, depth):
+        for entry in sorted(os.listdir(folder)):
+            path = os.path.join(folder, entry)
+            if depth == 0 and (entry == custom["marker"] or entry in own):
+                continue
+            if not fnmatch.fnmatchcase(entry, parts[depth]):
+                return "{} is in it{}".format(clean(os.path.relpath(path, h)), " (not the profile's own)" if depth == 0 else "")
+            if os.path.islink(path) or not inside(path, h):
+                return "{} links out of it".format(clean(os.path.relpath(path, h)))
+            if depth == len(parts) - 1:
+                repos.append(os.path.realpath(path))
+            elif os.path.isdir(path):
+                why = walk(path, depth + 1)
+                if why:
+                    return why
+            else:
+                return "{} is in it".format(clean(os.path.relpath(path, h)))
+        return None
+    try:
+        why = walk(h, 0)
+    except OSError as e:
+        return "cannot list it ({})".format(clean(e)[:200])
+    if why:
+        return why
+    if p not in repos:
+        return "{} is not one of its packages".format(clean(p))
+    for extra in sorted(listed - set(repos)):
+        return "its status script lists {}, which is not one of its packages".format(clean(extra))
+    branch = status.get("branch") if isinstance(status.get("branch"), str) else None
+    for repo in repos:
+        name = os.path.relpath(repo, h)
+        if repo not in listed:
+            return "{} is not listed by the profile's status script".format(clean(name))
+        code, top, _err = git(repo, "rev-parse", "--path-format=absolute", "--show-toplevel")
+        if code or os.path.realpath(top) != repo:
+            return "{} is not a git repository".format(clean(name))
+        files = status_files(repo)
+        if files is None:
+            return "cannot read {} (git status failed)".format(clean(name))
+        if files:
+            return "{} uncommitted or untracked file(s) in {}".format(len(files), clean(name))
+        if not merged_and_pushed(repo, profile):
+            return "not every commit is merged into main and pushed in {}".format(clean(name))
+        if branch and git(repo, "rev-parse", "--verify", "-q", "refs/heads/" + branch)[0] == 0 and \
+                not merged_and_pushed(repo, profile, "refs/heads/" + branch):
+            return "branch {} is not merged into main and pushed in {}".format(clean(branch), clean(name))
+    return None
+
+
+def remove_with_holder(directory, row, profile, facts):
+    """Removes the worktree of a row (remove_worktree) and, for a package of a holder (holder_of) on the profile's
+    rule (worktree.holderRule, active in rules.json now), the holder with it when holder_why finds nothing to keep:
+    the profile's remove script on the holder, never --force (R6). (done, lines, holder or None): lines say what became
+    of the holder. Raises pa.Problem as remove_worktree does."""
+    hold = None if facts.get("remove") else holder_of(row["path"], profile)
+    if not hold:
+        return remove_worktree(row["path"], facts), [], None
+    h, p = hold
+    custom = profile["worktree"]
+    rid = custom.get("holderRule") if isinstance(custom.get("holderRule"), str) and custom.get("holderRule") else None
+    status = holder_status(h, profile)
+    kind = clean(status.get("kind")) if status and isinstance(status.get("kind"), str) and status["kind"].strip() else \
+        "worktree that holds it"
+    if not rid:
+        why = "the profile names no rule for it"
+    elif not rule_active(directory, rid):
+        why = "rule {} is not active".format(clean(rid))
+    else:
+        why = holder_why(directory, profile, h, p, status)
+    lines = []
+    if why is None:
+        script = custom["remove"] if os.path.isabs(custom["remove"]) else os.path.join(profile.get("_folder") or "", custom["remove"])
+        try:
+            r = subprocess.run([script, h], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True,
+                               timeout=HOLDER_REMOVE_LIMIT)
+            out, code = r.stdout, r.returncode
+        except (OSError, subprocess.TimeoutExpired) as e:
+            out, code = str(e), 1
+        if not code and not os.path.lexists(h):
+            return "Removed the {} {} with {} (rule {}).".format(kind, h, p, rid), [], h
+        lines.append("the {} {} stays: its remove script did not remove it:\n{}".format(kind, h, tail(out, 15)))
+        if not os.path.lexists(row["path"]):
+            return "The worktree {} is gone with the failed removal of the {} {}.".format(row["path"], kind, h), lines, None
+    else:
+        lines.append("the {} {} stays: {}".format(kind, h, why))
+    return remove_worktree(row["path"], facts), lines, None
 
 
 def remove_worktree(path, facts):
