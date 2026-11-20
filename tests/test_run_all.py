@@ -464,6 +464,27 @@ class RunAll(unittest.TestCase):
                     self.assertIn("  {}: ok".format(name), self.summary(out))
                 self.assertNotIn("integration", out)
 
+    def test_t065_affected_panel_or_mod_change_runs_their_two_unit_modules(self):
+        # t-065 (t-060 RL-3, t-069 item 2): a tests/panel/* or mods/* change also runs tests/test_panel_shards.py and
+        # tests/test_mod_imports.py (they read run.mjs, the stand-ins and the mod), not every Python module.
+        for name in ("test_panel_shards", "test_mod_imports"):
+            write(os.path.join(self.repo, "tests", name + ".py"), UNITS)
+        for changed, harnesses in (("tests/panel/run.mjs", SHARDS), ("tests/panel/gpui-kit.mjs", SHARDS),
+                                   ("mods/project-agent/awake.js", ["keeper harness"] + SHARDS + ["store harness"]),
+                                   ("tests/panel/run.mjs mods/project-agent/main.js", ["keeper harness"] + SHARDS + ["store harness"])):
+            with self.subTest(changed=changed):
+                code, out = self.run_all("--affected", PA_CHANGED_FILES=changed)
+                self.assertEqual(code, 0, out)
+                parts = re.findall(r"(?m)^  (.+): ok \(", self.summary(out).split("=== parts", 1)[-1])
+                self.assertEqual(sorted(parts), sorted(["unit tests: test_panel_shards", "unit tests: test_mod_imports"]
+                                                       + harnesses), out)
+        code, out = self.run_all("--affected", PA_CHANGED_FILES="tests/panel/run.mjs runtime/tools/pa.py")
+        self.assertEqual(code, 0, out)
+        for name in ("python 3.7 parse", "unit tests: test_stub", "unit tests: test_panel_shards", "unit tests: test_mod_imports"):
+            self.assertEqual(self.summary(out).count("  {}: ok".format(name)), 1, out)  # all of them, each once
+        code, out = self.run_all("--affected", PA_CHANGED_FILES="tests/keeper/run.mjs")
+        self.assertNotIn("unit tests", out)  # the keeper harness alone maps to no unit module
+
     def test_r10_panel_in_four_shards(self):
         # Four panel parts at once (shard 1 and 4 each wait until the other has started), each run once with its
         # own --shard=<k>/4; a failing shard is named, with its failing cases, in the last 40 lines.
