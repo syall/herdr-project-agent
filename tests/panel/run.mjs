@@ -51,6 +51,7 @@ function world({ agent = true, agentTerminal = "t30", records = {}, extraPanes =
   g.__shared = { "project-agent.tabs": records, "project-agent.timer": { id: "K", at: T0 }, "project-agent.keeper": { id: "K", at: T0 } };
   g.__files = {}; g.__fail = []; g.__hang = [];
   g.__remoteDelay = 0; g.__execHang = []; g.__batchFail = {}; g.__issued = []; g.__timers = []; g.__layout = {}; g.__execs = []; g.__execOut = {}; g.__sleepHang = false; g.__execFail = []; g.__execFn = null;
+  g.__themeNames = false; g.__focus = null; // t-142
   g.__pool = null; g.__watchers = null; g.__hangOn = []; g.__delayOn = {}; g.__als = null; g.__cardReads = { live: 0, peak: 0 }; // t-053: off unless a case sets them
   if (agent) {
     const dir = machine ? `${machine}:.config/herdr-pa/spaces/${S}` : `:${DIR}`, home = machine ? `${machine}:.config/herdr-pa` : ":/home/u/.config/herdr-pa";
@@ -68,7 +69,17 @@ async function mount() {
 const look = (v) => inspect(v.render(cx));
 // Time passes while the keeper (in another copy) keeps running: its lease and its mark stay fresh.
 const advance = (ms) => { g.__now += ms; for (const k of ["project-agent.timer", "project-agent.keeper"]) if (g.__shared[k]?.id === "K") g.__shared[k] = { id: "K", at: g.__now }; };
+// t-142: a task's moves and Start next are drawn while it is hovered or focused; a click on one hovers its task first.
+async function hoverTask(v, id, on = true) {
+  let el = null;
+  const walk = (x) => { if (el || !x || typeof x !== "object") return; if (x.key === `task-${id}`) { el = x; return; } for (const k of x.kids ?? []) walk(k); };
+  walk(v.render(cx));
+  el?.style?.on_hover?.[0]?.(on, cx); await flush();
+  return look(v);
+}
 async function click(v, id) {
+  const task = /^(?:tmove-[a-z]+-|next-)(.+)$/.exec(id)?.[1];
+  if (task && !look(v).clicks[id]) await hoverTask(v, task);
   const { clicks } = look(v);
   check(Boolean(clicks[id]), `a click target ${id} (have ${Object.keys(clicks).join(", ")})`);
   clicks[id]({}, cx); await flush();
@@ -6296,7 +6307,7 @@ cases["P97-2-line-markers"] = async () => { // R2, R13, R15: the order line, the
 cases["P97-3-move"] = async () => { // R7, R8: a move writes task-order.json by compare-and-write; drawn in the new order; one notice
   const tasks = [tq("t-1", "queued", 1), tq("t-2", "queued", 2), tq("t-3", "queued", 3), tq("t-9", "done", 9)];
   const { v, path } = await orderWorld({ tasks });
-  const c = look(v).clicks;
+  const c1 = (await hoverTask(v, "t-1")).clicks, c3 = (await hoverTask(v, "t-3")).clicks, c = { ...Object.fromEntries(Object.entries(c1).filter(([k]) => k.endsWith("-t-1"))), ...c3 };
   check(!c["tmove-up-t-1"] && !c["tmove-top-t-1"] && c["tmove-down-t-1"] && c["tmove-bottom-t-1"] && c["tmove-up-t-3"] && c["tmove-top-t-3"] && !c["tmove-down-t-3"] && !c["tmove-bottom-t-3"], `buttons only where a move does something (have ${Object.keys(c).filter((k) => k.startsWith("tmove"))})`);
   await click(v, "tmove-top-t-3"); await settle();
   const doc = JSON.parse(g.__files[path]);
@@ -6347,6 +6358,7 @@ cases["P97-7-start-next"] = async () => { // R18: the rank first (to the very to
   const tasks = [tq("t-1", "in-progress", 1), tq("t-2", "queued", 2), tq("t-3", "queued", 3, { after: ["t-1"] })];
   let { v, path } = await orderWorld({ tasks });
   check(look(v).text.includes("waits for t-1 (after)"), `the row says what it waits for (got ${look(v).text})`);
+  await hoverTask(v, "t-3");
   check(Boolean(look(v).clicks["next-t-3"]) && !look(v).clicks["next-t-1"] && Boolean(look(v).clicks["pause-t-1"]) && !look(v).clicks["pause-t-3"], "Start next on Queued, Pause on In progress");
   await click(v, "next-t-3"); await settle();
   check(JSON.stringify(JSON.parse(g.__files[path]).order) === '["t-3"]' && JSON.parse(g.__files[path]).moves.at(-1).move === "next", `the rank (got ${g.__files[path]})`);
@@ -6364,6 +6376,7 @@ cases["P97-8-pause"] = async () => { // R19: Pause runs pa-task pause, the rank 
   check(Boolean(look(v).clicks["pause-t-4"]) && !look(v).clicks["pause-t-3"] && !look(v).clicks["next-t-3"], "Pause on investigating; review: neither (R21)");
   await click(v, "pause-t-1"); await settle();
   check(paTask("pause").length === 1 && paTask("pause")[0][1][1] === "t-1" && g.__files[path] === undefined, `pa-task pause, no order write (got ${JSON.stringify(g.__execs)})`);
+  await hoverTask(v, "t-2");
   check(look(v).text.includes(" | paused | ") && Boolean(look(v).clicks["unpause-t-2"]) && Boolean(look(v).clicks["next-t-2"]), `the paused row (got ${look(v).text})`);
   await click(v, "unpause-t-2"); await settle();
   check(paTask("unpause").length === 1 && paTask("unpause")[0][1][1] === "t-2", "pa-task unpause");
@@ -6403,7 +6416,7 @@ cases["P97-11-fold"] = async () => { // R14: the follow-ups of one origin fold i
   let text = look(v).text;
   check(text.includes("▸ 3 follow-ups of t-8 · first #2") && JSON.stringify(heads(v)) === '["t-1","t-5"]', `folded (got ${text}; ${JSON.stringify(heads(v))})`);
   await click(v, "fold-queued-t-8");
-  text = look(v).text;
+  text = look(v).text; await hoverTask(v, "t-3");
   check(text.includes("▾ 3 follow-ups of t-8 · first #2") && JSON.stringify(heads(v)) === '["t-1","t-2","t-3","t-4","t-5"]' && Boolean(look(v).clicks["tmove-up-t-3"]), `unfolded: normal rows (got ${JSON.stringify(heads(v))})`);
 };
 
@@ -7182,6 +7195,84 @@ cases["P131-main-job-collides"] = async () => { // t-020 J6 RL-M2: the main work
   await mount(); await settle();
   const got = JSON.stringify(g.__shared["project-agent.worktrees"]?.[S]);
   check(got === JSON.stringify([{ task: "t-8", path: "/w/t-8-a", title: "eight" }, { task: "t-8", path: "/w/t-8-b", title: "eight", job: "api-2" }]), `the other entry gets api-2 (got ${got})`);
+};
+
+// ---- t-142: Places worker lines drawn as the task card's worker item; a task's moves and Start next on hover or focus ----
+const P142 = {
+  find: (root, key) => { let hit = null; const walk = (x) => { if (hit || !x || typeof x !== "object") return; if (x.key === key) { hit = x; return; } for (const k of x.kids ?? []) walk(k); }; walk(root); return hit; },
+  // The item's box (the task card's styles) and its status dot.
+  shape: (el) => el && { kind: el.kind, box: Object.fromEntries(["flex_none", "px", "h", "gap", "items_center", "rounded", "border", "border_color", "text_size"].map((k) => [k, JSON.stringify(el.style?.[k] ?? null)])) },
+  dot: (el) => { const d = (el?.kids ?? []).find((k) => k && typeof k === "object" && k.style?.size); return d ? { size: JSON.stringify(d.style.size), rounded: JSON.stringify(d.style.rounded), bg: d.style.bg?.[0] ?? null } : null; },
+  status: (address, status) => { const x = g.__terminals.find((t) => t.address === address); x.status = status; },
+};
+
+cases["P142-1-places-item"] = async () => { // R1, R2: a Places holder is the task card's worker item, its dot the terminal's status color
+  const { v } = await placesWorld();
+  g.__themeNames = true;
+  P142.status("t53", "blocked"); P142.status("t54", "idle"); // t51 stays working
+  await click(v, "task-head-t-020"); // the task card's own worker items
+  const root = v.render(cx), card = P142.find(root, "worker-t-020-0"), place = P142.find(root, "places-holder-t51");
+  check(Boolean(card) && Boolean(place), `both items drawn (got card ${Boolean(card)}, place ${Boolean(place)})`);
+  check(JSON.stringify(P142.shape(place)) === JSON.stringify(P142.shape(card)), `the same box (place ${JSON.stringify(P142.shape(place))}, card ${JSON.stringify(P142.shape(card))})`);
+  check(JSON.stringify(P142.dot(place)) === JSON.stringify(P142.dot(card)) && P142.dot(place)?.bg === "#working", `the same dot, working (place ${JSON.stringify(P142.dot(place))}, card ${JSON.stringify(P142.dot(card))})`);
+  check(P142.dot(P142.find(root, "places-holder-t53"))?.bg === "#blocked", `t53 blocked (got ${JSON.stringify(P142.dot(P142.find(root, "places-holder-t53")))})`);
+  check(P142.dot(P142.find(root, "places-holder-t54"))?.bg === "#idle", `t54 idle (got ${JSON.stringify(P142.dot(P142.find(root, "places-holder-t54")))})`);
+  const t53 = P142.find(root, "places-holder-t53"), card53 = P142.find(root, "worker-t-020-1");
+  check(P142.dot(card53)?.bg === "#blocked" && JSON.stringify(P142.shape(t53)) === JSON.stringify(P142.shape(card53)), "the suite step holder too, as its card item");
+  P142.status("t54", null);
+  check(P142.dot(P142.find(v.render(cx), "places-holder-t54"))?.bg === "#idle", "no status: idle, as the task card draws it");
+  check(look(v).text.includes("t53 · t-020 verify · verifier · suite step · since 11-19 10:02 ↗"), `the line's text and link mark kept (got ${look(v).text.slice(0, 900)})`);
+};
+
+cases["P142-2-slot-item"] = async () => { // R1, R2: a Suite machines holder is the same item; one with no live worker: the dim dot, no link
+  const { v } = await placesWorld({ exec: suiteExec(P119.doc()) });
+  g.__themeNames = true;
+  P142.status("t53", "blocked");
+  await click(v, "task-head-t-020");
+  const root = v.render(cx), card = P142.find(root, "worker-t-020-1"), slot = P142.find(root, "places-slot-box-1-0");
+  check(Boolean(slot) && JSON.stringify(P142.shape(slot)) === JSON.stringify(P142.shape(card)), `the same box (slot ${JSON.stringify(P142.shape(slot))}, card ${JSON.stringify(P142.shape(card))})`);
+  check(P142.dot(slot)?.bg === "#blocked", `its worker's status (got ${JSON.stringify(P142.dot(slot))})`);
+  const [local] = stubs.findText(root, "t-041 · worker t77 · since 11-19 10:05");
+  check(Boolean(local) && JSON.stringify(P142.shape(local)) === JSON.stringify(P142.shape(card)) && P142.dot(local)?.bg === "#dim", `not live: the item, dim (got ${JSON.stringify(P142.shape(local))} ${JSON.stringify(P142.dot(local))})`);
+  check(!look(v).clicks["places-slot-local-0"], "not live: no link");
+  check(look(v).text.includes("box-1 · reachable · 1 of 2 slots held") && look(v).text.includes("t-020 · worker t53 · since 11-19 10:05 · sh tests/run-all.sh ↗"), "heads and texts kept");
+};
+
+const moveIds = (clicks, id) => Object.keys(clicks).filter((k) => k.endsWith(`-${id}`) && /^(tmove-|next-)/.test(k)).sort();
+
+cases["P142-3-hover"] = async () => { // R4: a task's moves and Start next only while the pointer is over it
+  const tasks = [tq("t-1", "queued", 1), tq("t-2", "queued", 2), tq("t-3", "queued", 3), tq("t-4", "in-progress", 4)];
+  const { v } = await orderWorld({ tasks });
+  let { clicks } = look(v);
+  check(!Object.keys(clicks).some((k) => /^(tmove-|next-)/.test(k)), `none without a hover (have ${Object.keys(clicks).filter((k) => /^(tmove|next)/.test(k))})`);
+  check(Boolean(clicks["pause-t-4"]), "Pause is not hidden");
+  clicks = (await hoverTask(v, "t-2")).clicks;
+  check(JSON.stringify(moveIds(clicks, "t-2")) === JSON.stringify(["next-t-2", "tmove-bottom-t-2", "tmove-down-t-2", "tmove-top-t-2", "tmove-up-t-2"]), `t-2 hovered: its moves and Start next (have ${moveIds(clicks, "t-2")})`);
+  check(!moveIds(clicks, "t-1").length && !moveIds(clicks, "t-3").length, "the others: none");
+  clicks = (await hoverTask(v, "t-3")).clicks;
+  check(moveIds(clicks, "t-3").length === 3 && !moveIds(clicks, "t-2").length, `the pointer moves on: t-3's only (have ${Object.keys(clicks).filter((k) => /^(tmove|next)/.test(k))})`);
+  clicks = (await hoverTask(v, "t-3", false)).clicks;
+  check(!Object.keys(clicks).some((k) => /^(tmove-|next-)/.test(k)), "the pointer leaves: none");
+};
+
+cases["P142-4-focus"] = async () => { // R4: and while the task or one of those buttons has keyboard focus
+  const tasks = [tq("t-1", "queued", 1), tq("t-2", "queued", 2), tq("t-3", "queued", 3)];
+  const { v } = await orderWorld({ tasks });
+  look(v); await settle(); // the focus handles are made after the first draw
+  const head = P142.find(v.render(cx), "task-head-t-2")?.style?.track_focus?.[0];
+  check(Boolean(head?.focus) && Boolean(P142.find(v.render(cx), "task-head-t-2")?.style?.tab_index), "the task's head takes keyboard focus");
+  head.focus();
+  let { clicks } = look(v);
+  check(moveIds(clicks, "t-2").length === 5 && !moveIds(clicks, "t-1").length, `the head focused: its buttons (have ${moveIds(clicks, "t-2")})`);
+  const up = P142.find(v.render(cx), "tmove-up-t-2")?.style?.track_focus?.[0];
+  check(Boolean(up?.focus) && up !== head, "a button takes keyboard focus of its own");
+  up.focus();
+  check(moveIds(look(v).clicks, "t-2").length === 5, "a button focused: they stay");
+  const next = P142.find(v.render(cx), "next-t-2")?.style?.track_focus?.[0];
+  next.focus();
+  check(moveIds(look(v).clicks, "t-2").length === 5, "Start next focused: they stay");
+  g.__focus = null;
+  check(!Object.keys(look(v).clicks).some((k) => /^(tmove-|next-)/.test(k)), "focus elsewhere: none");
 };
 
 // --list prints the names that would run and runs none. An unknown name or option exits 2.

@@ -143,6 +143,8 @@ export function makeCx(extra = {}) {
     },
     notify() { g.__notifies = (g.__notifies ?? 0) + 1; }, // counted (t-028 A4): a redraw asked for
     write_to_clipboard(text) { (g.__clipboard ??= []).push(text); },
+    // t-142: a focus handle; focus() makes it the one focused handle (__focus), is_focused() answers for it.
+    focus_handle() { const h = { focus() { g.__focus = h; }, is_focused: () => g.__focus === h, release: () => true }; return h; },
     ...extra,
   };
   return c;
@@ -151,7 +153,9 @@ export const cx = makeCx();
 
 export const agents = () => g.__agents ?? [];
 export const props = () => g.__als?.getStore()?.props ?? g.__props ?? {};
-export const theme = () => new Proxy({}, { get: () => "#808080" });
+// __themeNames (t-142): each color is "#<its name>" (so a case can tell t.working from t.blocked); an unknown status key
+// (t[null]) is undefined, as in the app. Unset: every color is "#808080", as before.
+export const theme = () => new Proxy({}, { get: (_t, k) => (!g.__themeNames ? "#808080" : typeof k !== "string" || k === "null" || k === "undefined" ? undefined : `#${k}`) });
 export const window = () => ({ platform: g.__platform ?? "macos" }); // __platform (t-060): "linux" | "windows" for a case
 export const layout = () => g.__layout ?? {};
 // Never changes, unless a case keeps __watchers (t-053): then each call waits for a batch the case gives it.
