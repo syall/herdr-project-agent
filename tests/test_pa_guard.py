@@ -327,10 +327,33 @@ class T025Robust(GuardTest):  # AC4.3
         lines = (base * 2)[:170] + padded * 2  # 200 lines, 30 of them about 10 kB
         self.assertEqual(len(lines), 200)
         for line in lines:  # CPU time, not wall time: no pathological line, even with 40 suite parts at once (t-089 R22)
+            spent = self.cpu(line)
+            if spent >= self.BOUND:  # t-165: a loaded machine runs the same Python slower: measured again, scaled
+                spent = min([spent] + [self.cpu(line) for _ in range(2)])
+                bound = self.BOUND * max(1.0, self.reference() / self.REFERENCE_IDLE)
+                self.assertLess(spent, bound, line[:60])
+
+    BOUND = 0.05  # CPU seconds a line may take on an idle machine
+    # t-165: the CPU time of reference() on an idle Linux suite machine core (0.0049 s; the Mac's is lower, so it gets the
+    # bare bound). At load 40-64 on 32 cores the same loop took 0.0104-0.0116 s and the guard's slowest line
+    # ("a;" * 5000) 0.045-0.052 s against 0.025 s idle: the bound scales by the reference's slowdown now.
+    REFERENCE_IDLE = 0.0049
+
+    def cpu(self, line):
+        start = time.process_time()
+        self.check(line)
+        return time.process_time() - start
+
+    @staticmethod
+    def reference():
+        """The best of 3 CPU times of a fixed pure-Python loop (no guard code): how fast this core runs now."""
+        best = None
+        for _ in range(3):
             start = time.process_time()
-            self.check(line)
+            sum(i * i for i in range(100000))
             spent = time.process_time() - start
-            self.assertLess(spent, 0.05, line[:60])
+            best = spent if best is None else min(best, spent)
+        return best
 
 
 REMOVED_BOTH = ["ALLOWLIST", "READS", "NEVER_ADD", "profile_rows", "guardAllow", "OFF_TABLE", "NOT_PLAIN", "VARIABLE",

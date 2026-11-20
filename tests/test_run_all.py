@@ -1038,7 +1038,8 @@ class RunAll(unittest.TestCase):
             run = subprocess.Popen(["sh", os.path.join(self.repo, "tests", "run-all.sh"), "--affected"], cwd=self.tmp,
                                    env=self.env_for(), stdin=subprocess.DEVNULL, stdout=f, stderr=subprocess.STDOUT)
         try:
-            row = self.until(lambda: [r for r in self.progress() if r.get("state") == "waiting"])
+            # t-165: the row says "waiting" first and for whom in a later write (once it read the holders): wait for that
+            row = self.until(lambda: [r for r in self.progress() if r.get("state") == "waiting" and "waiting_for" in r])
             self.assertTrue(row, (self.progress(), pa_text(log)))
             self.assertIn("t-holder", row[-1]["waiting_for"])
             self.assertIn(str(p.pid), row[-1]["waiting_for"])

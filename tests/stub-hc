@@ -89,6 +89,26 @@ def options(args, flags, valued):
     return got, []
 
 
+def anywhere(args, flags, valued):
+    """(options, rest) as hc file takes them (t-165): options before or after the path (the watcher's
+    `file read --on M <path> --offset N`); options() stops at the path, so --offset was not seen and every read
+    gave the whole file from line 1."""
+    got, rest, i = {}, [], 0
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            return got, rest + args[i + 1:]
+        if a in flags:
+            got[a] = True
+        elif a in valued and i + 1 < len(args):
+            got.setdefault(a, []).append(args[i + 1])
+            i += 1
+        else:
+            rest.append(a)
+        i += 1
+    return got, rest
+
+
 def one(got, key):
     return got[key][-1] if key in got else None
 
@@ -270,7 +290,7 @@ def cmd_ls(args):
 def cmd_file(args):
     if not args or args[0] not in ("read", "write"):
         fail("stub-hc: file {} not known".format(args[:1]), 2)
-    got, rest = options(args[1:], ("--json",), ("--on", "--cwd", "--offset", "--limit"))
+    got, rest = anywhere(args[1:], ("--json",), ("--on", "--cwd", "--offset", "--limit"))
     machine = one(got, "--on")
     path = rest[0] if rest else ""
     if machine:
@@ -296,7 +316,7 @@ def cmd_file(args):
             lines = f.read().splitlines(True)
     except OSError as e:
         fail("cannot read {}: {}".format(rest[0] if rest else "", e.strerror))
-    if "--offset" not in args:  # a whole read: the last copy (t-103 R6; the watcher's reads give --offset)
+    if "--offset" not in got:  # a whole read: the last copy (t-103 R6; the watcher's reads give --offset)
         count = os.path.join(ROOT, machine or "local", "fullreads")
         n = len(open(count).read()) if os.path.exists(count) else 0
         with open(count, "a") as f:

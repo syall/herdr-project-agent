@@ -218,6 +218,15 @@ setcode() { echo "$2" > "$out/$1.code.new" && mv "$out/$1.code.new" "$out/$1.cod
 untilend() {
   while [ ! -f "$out/$1.end" ] && [ ! -f "$out/$1.hung" ] && kill -0 "$2" 2>/dev/null; do sleep 1; done
 }
+# Until part $1 (pid $2) wrote its .end or .hung, or its process is gone or a zombie, by polling (t-165): a trapped
+# signal that comes as `wait <pid>` starts can go unseen until that child ends (bash 4.2: 8 of 3000 under load),
+# and a hung part never ends, so the run would not stop. A signal is taken after the poll's next command (<= 0.2 s).
+untilout() {
+  while [ ! -f "$out/$1.end" ] && [ ! -f "$out/$1.hung" ] && kill -0 "$2" 2>/dev/null; do
+    case $(ps -o stat= -p "$2" 2>/dev/null) in *Z*) return 0 ;; esac
+    sleep 0.2
+  done
+}
 inpart() {
   date +%s > "$out/$1.start"
   TMPDIR="$out/$1.tmp"; export TMPDIR; mkdir "$TMPDIR" || { echo 1 > "$out/$1.code"; date +%s > "$out/$1.end"; return 1; }
@@ -275,6 +284,7 @@ if [ "${PA_SERIAL:-}" = 1 ]; then
     pids=$!
     echo "$pids" > "$out/$i.pid"
     set +m 2>/dev/null
+    untilout "$i" "$pids"
     wait "$pids"
     [ -s "$out/$i.code" ] || { untilend "$i" "$pids"; wait "$pids" 2>/dev/null; }
     pids=
@@ -301,6 +311,7 @@ else
     eval "pid=\$pid_$i; name=\$name_$i"
     # wait only reaps the part and waits for it to end; its code is the one it wrote. No file: it was stopped
     # (hung, or a signal) before it wrote one, so wait's status when that is not 0, else 1.
+    untilout "$i" "$pid"
     wait "$pid"
     code=$?
     [ -s "$out/$i.code" ] || untilend "$i" "$pid"

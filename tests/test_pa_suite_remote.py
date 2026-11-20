@@ -72,6 +72,7 @@ case "${1:-}" in
     exit "${FAKE_REMOTE_EXIT:-0}" ;;
   --only-integration)
     echo "fake local part in $(pwd) slot=${PA_SUITE_SLOT:-}"
+    if [ -n "${FAKE_LOCAL_STARTED:-}" ]; then : > "$FAKE_LOCAL_STARTED"; fi
     if [ -n "${FAKE_SLOT_PROBE:-}" ]; then "$FAKE_PY" "$FAKE_SLOT_PROBE" slot --for "tests/run-all.sh --only-integration" -- sh -c 'echo "hold: $PA_SUITE_HOLD"'; fi
     if [ -n "${FAKE_MAC_SLOT:-}" ]; then "$FAKE_PY" -c "import fcntl,sys
 f=open(sys.argv[1],'a+')
@@ -123,7 +124,7 @@ class Remote(tps.Base):
                     STUB_HC_MACHINES="box-1 box-2", PA_SUITE_REMOTE_POLL="0.2", PA_SUITE_PREFER_WAIT="1",
                     PA_SUITE_LOST_GRACE="1.5", PA_SUITE_HEARTBEAT="60", FAKE_PY=sys.executable)
         for k in ("STUB_HC_FAIL", "STUB_HC_SUB", "FAKE_GO", "FAKE_LINES", "FAKE_REMOTE_EXIT", "FAKE_LOCAL_EXIT",
-                  "FAKE_LOCAL_HOLD", "FAKE_EXIT", "FAKE_SLOT_PROBE", "FAKE_MAC_SLOT", "PA_SUITE_SLOT", "PA_SUITE_CAP"):
+                  "FAKE_LOCAL_HOLD", "FAKE_LOCAL_STARTED", "FAKE_EXIT", "FAKE_SLOT_PROBE", "FAKE_MAC_SLOT", "PA_SUITE_SLOT", "PA_SUITE_CAP"):
             self.setenv(**{k: None})
         if self.machines is not None:
             self.configure(self.machines)
@@ -2032,11 +2033,22 @@ class X40PlaceSeconds(Remote):
     """t-103 R15: a remote place's seconds are its own run's (t1 - t0 there), not the wall until the local part ends."""
 
     def test_x40_a_short_remote_part_beside_a_long_local_part(self):
-        hold = os.path.join(self.tmp, "hold")
-        self.setenv(FAKE_LOCAL_HOLD=hold)
-        timer = threading.Timer(4, lambda: write(hold, ""))
-        timer.start()
-        self.addCleanup(timer.cancel)
+        # t-165: the hold's 4 s count from the local part's own start (its marker), not from before main(): its
+        # seconds are its own run's, so setup time under load must not come out of the hold
+        hold, started = os.path.join(self.tmp, "hold"), os.path.join(self.tmp, "local-started")
+        self.setenv(FAKE_LOCAL_HOLD=hold, FAKE_LOCAL_STARTED=started)
+        done = threading.Event()
+
+        def release():
+            end = time.time() + 120
+            while not os.path.exists(started) and time.time() < end and not done.is_set():
+                time.sleep(0.05)
+            if not done.wait(4):
+                write(hold, "")
+        holder = threading.Thread(target=release, daemon=True)
+        holder.start()
+        self.addCleanup(holder.join, 10)
+        self.addCleanup(done.set)
         code, out = self.main()
         self.assertEqual(code, 0, out)
         places = {p["place"]: p for p in self.lines()[-1]["places"]}
