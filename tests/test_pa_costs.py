@@ -8248,7 +8248,7 @@ class T177_Summary(Collecting):
              "passes": [], "byDayModel": []}
         self.assertTrue(pa_costs.shrink(s))
         self.assertEqual(len(s["sessions"]), 2)
-        self.assertNotIn("accounts", s["sessions"][0])
+        self.assertEqual(s["sessions"][0]["accounts"], 2)  # round 3: the list's count says it was dropped (DECISIONS D11)
         self.assertEqual(s["sessions"][1]["account"], "x")
         self.assertTrue(pa_costs.shrink(s))
         self.assertEqual(len(s["sessions"]), 1)
