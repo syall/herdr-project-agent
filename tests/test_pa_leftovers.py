@@ -599,8 +599,9 @@ class H7_H10_NoSweep(Guarded):
         self.assertEqual(len(lines), 1, self.log())
 
     def run_twice(self):
+        ctx = {"directory": self.dir}  # one launcher: said once
         for _ in range(2):
-            pa.end_leftovers({"directory": self.dir}, "t1")
+            pa.end_leftovers(ctx, "t1")
 
     def test_h7_ps_missing_failing_or_slow(self):
         pa.launcher_tty = lambda: "pts/7"
@@ -774,6 +775,14 @@ class R1_4_EndChildSigcont(unittest.TestCase):
             time.sleep(0.05)
         self.assertIsNotNone(grandchild)
         self.addCleanup(kill_quietly, grandchild)
+        # A member whose parent is in another group of this session keeps the group from being orphaned once the
+        # wrapper exits (an orphaned group with a stopped member gets SIGHUP + SIGCONT from the kernel, which would
+        # end the stopped member without end_child's SIGCONT); the launcher's own Claude group is never orphaned.
+        group = ctx["childGroup"]
+        anchor = subprocess.Popen(["sh", "-c", "trap '' TERM; exec sleep 300"], preexec_fn=lambda: os.setpgid(0, group))
+        time.sleep(0.2)  # its trap is set
+        self.addCleanup(anchor.wait)
+        self.addCleanup(kill_quietly, anchor.pid)
         end = time.time() + 5
         while time.time() < end:  # the member has stopped itself
             st = subprocess.run(["ps", "-o", "stat=", "-p", str(grandchild)], stdout=subprocess.PIPE,
@@ -782,10 +791,13 @@ class R1_4_EndChildSigcont(unittest.TestCase):
                 break
             time.sleep(0.05)
         began = time.time()
-        pa.end_child(ctx, "restart")
+        ender = threading.Thread(target=pa.end_child, args=(ctx, "restart"), daemon=True)
+        ender.start()
+        while alive(grandchild) and time.time() - began < 5:
+            time.sleep(0.05)
         took = time.time() - began
-        self.assertFalse(alive(grandchild))
-        self.assertLess(took, 3, "a stopped member took {:.1f} s: no SIGCONT".format(took))
+        self.assertLess(took, 3, "a stopped member took {:.1f} s to end: no SIGCONT".format(took))
+        ender.join(20)
         t.join(10)
 
 

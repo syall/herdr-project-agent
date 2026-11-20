@@ -39,7 +39,7 @@ pa = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(pa)
 assert pa.ROOT.startswith(TMP) and pa.CLAUDE_HOME.startswith(TMP), "pa.py must use the temp homes"
 
-SP = "sp1deab0c0ffee"
+SP = "sp1deab" + __import__("uuid").uuid4().hex[:10]  # one per run: a stand-in left by another run never matches
 CUR = "abcdefab-cdef-4abc-8def-abcdefabcdef"
 PREV = "fedcbafe-dcba-4fed-8cba-fedcbafedcba"
 
@@ -221,16 +221,24 @@ class Recover(unittest.TestCase):
             argv = [sys.executable, path, "--space", space]
         with open(path, "w") as f:
             f.write(body)
-        p = subprocess.Popen(argv, start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        self.procs.append(p.pid)
+        pid = self.detached(argv)
         end = time.time() + 10
         while time.time() < end:
-            st = state(p.pid)
+            st = state(pid)
             if (stopped and st.startswith("T")) or (not stopped and st):
                 break
             time.sleep(0.05)
-        self.addCleanup(self.reap, p)
-        return p.pid
+        return pid
+
+    def detached(self, argv):
+        """argv run in a session of its own and re-parented (its starter exits), as a launcher left in a tab is: not
+        a descendant of this test process (which --recover, run here, never ends)."""
+        out = subprocess.run(["/bin/sh", "-c", '"$0" -c "import os, sys; os.setsid(); os.execv(sys.argv[1], sys.argv[1:])" "$@" '
+                              '</dev/null >/dev/null 2>&1 & echo $!', sys.executable] + argv,
+                             stdout=subprocess.PIPE, universal_newlines=True, timeout=10).stdout
+        pid = int(out.strip())
+        self.procs.append(pid)
+        return pid
 
     def orphan(self, session):
         out = subprocess.run(["/bin/sh", "-c", '"$0" -c "import time; time.sleep(300)" --session-id "$1" >/dev/null 2>&1 & echo $!',
@@ -330,12 +338,9 @@ class Recover(unittest.TestCase):
         self.beat(120)
         other = self.launcher(space=SP + "0")
         prefix = self.launcher(space=SP[:5])
-        mention = subprocess.Popen([sys.executable, "-c", "import os, signal, time; os.kill(os.getpid(), signal.SIGSTOP); time.sleep(300)",
-                                    "--space=" + SP, os.path.join(pa.ROOT, "spaces", SP, "session.log")],
-                                   start_new_session=True)
-        self.procs.append(mention.pid)
-        self.addCleanup(self.reap, mention)
-        time.sleep(0.3)
+        mention = types.SimpleNamespace(pid=self.detached([sys.executable, "-c", "import os, signal, time; os.kill(os.getpid(), signal.SIGSTOP); time.sleep(300)",
+                                                          "--space=" + SP, os.path.join(pa.ROOT, "spaces", SP, "session.log")]))
+        time.sleep(0.5)
         code, answer, text = self.run_tool()
         self.assertEqual(code, 0, text)
         self.assertEqual(answer["outcome"], "nothing", answer)
