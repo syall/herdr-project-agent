@@ -1890,8 +1890,11 @@ class RemoteWatcher(threading.Thread):
             self.code = rc
 
     def stop(self):
+        """Ends the watcher; safe when a signal cut start() short (t-144): a thread never started is not joined
+        (join would raise), and one that starts later sees stopping set at its first check and ends."""
         self.stopping.set()
-        self.join(30)
+        if self.is_alive():
+            self.join(30)
 
     def final(self):
         """The remote output whole, replacing the copy (checked against the remote line count): a note, or None."""

@@ -317,10 +317,16 @@ def tree_to_run(h, top, commit=None, overlay=None, secrets=None):
         else:
             copied = False
             if real_index and os.path.isfile(real_index):  # read only: its stat data spares rehashing every file
-                try:  # copy2 keeps the index's mtime: git re-hashes a racy entry (mtime not older than the index)
+                try:  # the copy keeps the index's mtime: git re-hashes a racy entry (mtime not older than the index)
                     # only while the copy is as old as the real index; a fresh mtime would stage HEAD's blob for a
-                    # same-size edit made in the second of the checkout (t-130)
-                    shutil.copy2(real_index, env["GIT_INDEX_FILE"])
+                    # same-size edit made in the second of the checkout (t-130). The data and the mtime come from
+                    # one open file (t-144 N-1): git replaces the index by rename, so a write between the two
+                    # cannot pair old data with the new file's mtime, as copy2's second stat of the path could
+                    with open(real_index, "rb") as src:
+                        st = os.fstat(src.fileno())
+                        with open(env["GIT_INDEX_FILE"], "wb") as dst:
+                            shutil.copyfileobj(src, dst)
+                    os.utime(env["GIT_INDEX_FILE"], ns=(st.st_atime_ns, st.st_mtime_ns))
                     copied = True
                 except OSError:
                     pass
