@@ -927,7 +927,7 @@ class NoteStops(Standing):
     def resume(self):
         """The person turns the rule off and on in the panel: a later person change; earlier stops no longer count."""
         self.rule(history=[{"at": "2026-11-01T00:00:00Z", "by": "person", "change": "created"},
-                           {"at": "2099-01-01T00:00:00Z", "by": "person", "change": "resumed"}])
+                           {"at": "2099-01-01T00:00:00Z", "by": "person", "change": "turned on"}])
 
     def kept(self, *fragments):
         code, out, err = self.standing()
