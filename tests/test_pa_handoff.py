@@ -365,6 +365,88 @@ class Refusals(Base):
         self.assertIn("terminal", self.refused("check", "t-1"))
 
 
+class Round2(Base):
+    """t-169 round 2: RL1 test commits by the files they touch, RL2 queue from pa-queue's entry, N1 the pass form."""
+
+    def test_rl1_test_commits_by_files(self):
+        c3 = commit(self.wt, "widget.py", "y = 3\n", "t-1: the widget, failing-first test fixed (failing-test commit)")
+        c4 = commit(self.wt, "tests/test_v.py", "v = 1\n", "t-1 more tests")
+        write(os.path.join(self.wt, "tests", "test_w.py"), "x = 9\n")
+        write(os.path.join(self.wt, "widget.py"), "y = 9\n")
+        git(self.wt, "add", "tests/test_w.py", "widget.py")
+        git(self.wt, "commit", "-q", "-m", "t-1 tests and code (failing at {})".format(c4))
+        _p, text, _ = self.ok("check", "t-1")
+        self.assertIn("(tests {}, {}; base main {})".format(self.c["C1"], c4, self.c["C0"]), text)
+        self.assertIn("Failing-first: the tests of {}, {} fail at".format(self.c["C1"], c4), text)
+        where = next(l for l in text.splitlines() if l.startswith("Worktree "))
+        self.assertNotIn(c3, where)
+
+    def queue_entry(self, job=None):
+        repo = os.path.join(self.tmp, "main-checkout")
+        entry = {"task": "t-1", "job": job, "branch": "t-1-widget", "worktree": os.path.join(self.tmp, "jwt"),
+                 "onto": "main", "state": "checking"}
+        write(os.path.join(self.space, "queue.json"),
+              json.dumps({"version": 1, "repos": {repo: {"common": repo, "main": "main", "entries": [entry],
+                                                         "planned": [], "left": [], "merged": []}}}))
+        return repo
+
+    def fake_brief(self):
+        seen = []
+
+        def fake(directory, repo, task, job):
+            seen.append((repo, task, job))
+            return "t-1 (position 1 of 1)"
+        old, pa_handoff.queue_brief = pa_handoff.queue_brief, fake
+        self.addCleanup(setattr, pa_handoff, "queue_brief", old)
+        return seen
+
+    def test_rl2_queue_without_ledger_worktree(self):
+        repo = self.queue_entry(None)
+        gone = os.path.join(self.tmp, "gone")
+        self.task("t-1")["worktree"] = gone
+        self.task("t-1")["worktrees"] = [{"path": gone, "job": "main"}, {"path": gone, "job": "J7"}]
+        self.write_ledger()
+        seen = self.fake_brief()
+        path, text, _ = self.ok("queue", "t-1")
+        self.assertEqual(path, os.path.join(self.ev("t-1"), "handoff-queue.md"))
+        self.assertTrue(text.startswith("t-1 (position 1 of 1)\n"), text)
+        self.assertEqual(seen, [(repo, "t-1", None)])
+
+    def test_rl2_queue_job_from_entry(self):
+        repo = self.queue_entry("J7")
+        self.task("t-1")["worktrees"] = []
+        self.task("t-1")["worktree"] = None
+        self.write_ledger()
+        seen = self.fake_brief()
+        path, _text, _ = self.ok("queue", "t-1")
+        self.assertEqual(seen, [(repo, "t-1", "J7")])
+        self.assertTrue(path.endswith("handoff-queue-J7.md"), path)
+
+    def passed_review(self):
+        full = git(self.wt, "rev-parse", "HEAD")
+        write(os.path.join(self.ev("t-1"), "REVIEW.md"),
+              "# Review\n\n## Must fix\nNone.\n\n## Recorded limits\n- RL1 x\n\nChecked: {}\nVerdict: pass\n".format(full))
+
+    def test_n1_fix_after_a_pass(self):
+        self.passed_review()
+        _p, text, _ = self.ok("fix", "t-1", "--items", "RL1 only.")
+        self.assertIn("The check at {} passed with Recorded limits to fix: read {}/REVIEW.md '## Recorded limits' "
+                      "(and Nits). Also read plan.md".format(self.c["C2"], self.ev("t-1")), text)
+        self.assertIn("\nFix only the Recorded limits and Nits named here; nothing else. RL1 only.\n", text)
+        self.assertNotIn("Must fix", text)
+
+    def test_n1_recheck_after_a_pass(self):
+        self.passed_review()
+        self.c["C3"] = commit(self.wt, "tests/test_w.py", "x = 2\n", "t-1 round 2 test (failing at {})".format(self.c["C2"]))
+        self.c["C4"] = commit(self.wt, "widget.py", "y = 2\n", "t-1 round 2 fix (REVIEW RL1)")
+        _p, text, _ = self.ok("recheck", "t-1", "--round", "2", "--logic")
+        self.assertIn("The round 1 check at {} passed with Recorded limits to fix (read {}/REVIEW.md '## Recorded "
+                      "limits'); round 2 fixed them: read FINDINGS.md".format(self.c["C2"], self.ev("t-1")), text)
+        self.assertIn("4. Review: each Recorded limit to fix is closed and nothing else changed.", text)
+        self.assertIn("Must-fix bar: breaks a fix, a verification point, safety or security.", text)
+        self.assertNotIn("'## Must fix'", text)
+
+
 class QueueWiring(unittest.TestCase):
     def test_q1_queue_brief_calls_pa_queue_brief(self):
         calls = []
