@@ -8584,6 +8584,27 @@ cases["P116-costs-refused"] = async () => { // RL-2 (the class): a pa-costs call
   check(text.includes("Refresh failed: not started: too many calls waiting") && !text.includes("skipped"), `the plain line (got ${text.slice(0, 600)})`);
 };
 
+cases["P116-turnoff-hung-compare"] = async () => { // RL-3: Turn off beside a compare that never answers: disable's own result at once, never "did not answer"
+  const h = hold(); let n = 0, off = false;
+  const { v } = await costsWorld({ tool: {
+    "billed compare": () => { n++; if (n === 2) return h.p.then(() => json0(noRows(statusOn()))); return json0(off ? noRows() : noRows(statusOn())); },
+    "billed disable": () => { off = true; return { code: 0, stdout: "off", stderr: "" }; } } });
+  check(costsView(v).text.includes("Billing query: on"), `on at first (got ${costsView(v).text.slice(-400)})`);
+  advance(61000); v.reload(cx); await settle(); // a later read: its compare (the 2nd) never answers
+  check(n === 2, `the 2nd compare is in flight (got ${n})`);
+  await click(v, "costs-billing-off"); await settle();
+  let text = costsView(v).text;
+  check(costsExecs("billed disable").length === 1, "disable ran once");
+  check(text.includes("The billing query is off") && !text.includes("Billing query: on") && !text.includes("Turning off"), `disable's own result within one tick (got ${text.slice(-500)})`);
+  for (let s = 0; s < 45; s++) {
+    advance(1000); await fire(1000);
+    text = costsView(v).text;
+    check(!text.includes("did not answer") && !text.includes("Billing query: on"), `${s + 1} s on: never "did not answer", never on again (got ${text.slice(-500)})`);
+  }
+  check(n === 2, `nothing waits on the hung compare: no compare started beside it (got ${n})`);
+  h.release(); await settle(); await settle();
+};
+
 // --list prints the names that would run and runs none. An unknown name or option exits 2.
 const refuse = (why) => { fs.rmSync(dst, { recursive: true, force: true }); console.error(`run.mjs: ${why}`); process.exit(2); };
 const pick = [];
