@@ -6019,7 +6019,8 @@ cases["P37-confirm-dry-run"] = async () => { // R13: the click asks first: one d
   const { text, clicks } = look(v);
   check(text.includes("w1 t-1-build: keeps running") && text.includes("restarts when this turn ends"), `its lines shown (got ${text.slice(0, 900)})`);
   check(Boolean(clicks["pa-restart-go"]) && Boolean(clicks["pa-restart-now"]) && Boolean(clicks["pa-restart-cancel"]), `Restart, Restart now, Cancel (got ${Object.keys(clicks)})`);
-  check(!clicks["pa-restart-fresh"], "no new-conversation choice while the prompt is current");
+  check(Boolean(clicks["pa-restart-fresh"]), `t-187: a new-conversation choice also while the prompt is current (got ${Object.keys(clicks)})`);
+  check(text.includes("A new conversation loads the current core text; the previous one stays in /resume."), `t-187: the help line says what a new conversation does (got ${text.slice(0, 900)})`);
   check(realRuns().length === 0, "nothing restarted yet");
   await click(v, "pa-restart-cancel");
   check(!look(v).clicks["pa-restart-go"] && realRuns().length === 0, "Cancel: gone, nothing run");
@@ -6063,6 +6064,19 @@ cases["P37-restart-now"] = async () => { // R13: Restart now adds --now and noth
   check(realRuns().length === 1, "one run");
   const args = realRuns()[0][1];
   check(args[args.length - 1] === "--now" && args.filter((x) => x === "--now").length === 1 && !args.includes("--fresh"), `--now (got ${JSON.stringify(args)})`);
+};
+
+cases["P37-fresh-always"] = async () => { // t-187: a current prompt (nothing recorded, no older core): Restart in a new conversation runs --fresh
+  liveWorld();
+  const v = await liveMount();
+  await click(v, "pa-restart"); await settle();
+  check(Boolean(look(v).clicks["pa-restart-fresh"]), `a new-conversation choice (got ${Object.keys(look(v).clicks)})`);
+  check(/previous one stays in \/resume/.test(look(v).text), "it says the previous conversation stays");
+  await click(v, "pa-restart-fresh"); await settle();
+  check(realRuns().length === 1, `one run (got ${JSON.stringify(realRuns())})`);
+  const args = realRuns()[0][1];
+  check(args[args.length - 1] === "--fresh" && args.filter((x) => x === "--fresh").length === 1 && !args.includes("--now"), `--fresh (got ${JSON.stringify(args)})`);
+  noEnding();
 };
 
 cases["P37-restart-waiting"] = async () => { // R13: mid-turn, the wait says so
