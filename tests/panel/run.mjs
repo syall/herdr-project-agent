@@ -6263,6 +6263,19 @@ cases["P84-2-holder-remote"] = async () => { // R5: on a remote space, through t
   check(g.__runs.some(([n, a]) => n === "terminal.peek" && a?.terminal === `${M}/t53`), `opens ${M}/t53 (got ${JSON.stringify(g.__runs)})`);
 };
 
+cases["P172-suite-row"] = async () => { // t-172: a Suite step row (its holder also drawn under Working) has its own id and opens its worker
+  const { v } = await placesWorld();
+  const ids = [], walk = (x) => { if (!x || typeof x !== "object") return; if (x.key !== null && x.key !== undefined) ids.push(String(x.key)); for (const k of x.kids ?? []) walk(k); };
+  walk(v.render(cx));
+  const dup = ids.filter((id, i) => /^places-/.test(id) && ids.indexOf(id) !== i);
+  check(dup.length === 0, `each Places row its own id (duplicates: ${JSON.stringify(dup)})`);
+  for (const id of ["places-suite-t53", "places-holder-t53"]) {
+    g.__runs = [];
+    await click(v, id);
+    check(g.__runs.some(([n, a]) => n === "terminal.peek" && a?.terminal === "t53"), `${id} opens t53 (got ${JSON.stringify(g.__runs)})`);
+  }
+};
+
 // ---- t-032 J3g: the billed block compares every account label in the space (limit 3, R-A5) and, where billed rows carry
 // endpoint/region, each pair (D8, A-V3). A comparison without `others` or `byScope` draws exactly as before (J3G_OLD:
 // captured from the 1ed3c5e code). ----
