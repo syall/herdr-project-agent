@@ -8254,18 +8254,27 @@ class T177_Summary(Collecting):
         self.assertEqual(len(s["sessions"]), 1)
 
     def test_t4b_shrink_never_leaves_a_mixed_session_as_one_account(self):
-        # Review Must fix 1: DECISIONS D2 keeps `account` (the largest scope's) beside `accounts` on a mixed session; when
-        # shrink drops the list, the one label must go with it, or the session reads as wholly that account.
-        mixed = {"key": "s1", "tokens": 100, "money": 10.0, "account": "acct-a", "accounts": [
+        # Review Must fix 1 (rounds 1 and 2): DECISIONS D2 keeps `account` (the largest scope's) beside `accounts` on a
+        # mixed session. That `account` is also t-032's scope fact (the panel's factsOf: the largest scope's words and
+        # By scope's drill), so shrink keeps it and puts the list's count in its place: the count says the list was
+        # dropped, and both readers (entry_parts here, entryAccounts in the panel) read it as no parts, so the session
+        # never reads as wholly that account.
+        mixed = {"key": "s1", "tokens": 100, "money": 10.0, "scopes": 2, "account": "acct-a", "accounts": [
             {"key": "acct-a", "tokens": 60, "money": 6.0, "calls": 1}, {"key": "acct-b", "tokens": 40, "money": 4.0, "calls": 1}]}
         one = {"key": "s2", "tokens": 5, "money": 0.5, "account": "acct-b"}
         s = {"sessions": [mixed, one], "byTask": [], "passes": [], "byDayModel": []}
         self.assertTrue(pa_costs.shrink(s))
         self.assertEqual(len(s["sessions"]), 2)
-        self.assertNotIn("accounts", s["sessions"][0])
-        self.assertNotIn("account", s["sessions"][0])
+        self.assertEqual(s["sessions"][0]["account"], "acct-a")
+        self.assertEqual(s["sessions"][0]["accounts"], 2)
         self.assertEqual(pa_costs.entry_parts(s["sessions"][0]), [])
-        self.assertEqual(s["sessions"][1]["account"], "acct-b")
+        self.assertEqual(s["sessions"][1], {"key": "s2", "tokens": 5, "money": 0.5, "account": "acct-b"})
+        self.assertEqual(pa_costs.entry_parts(s["sessions"][1])[0]["key"], "acct-b")
+        # the step is done once: the next one shortens the sessions (it terminates)
+        self.assertTrue(pa_costs.shrink(s))
+        self.assertEqual(len(s["sessions"]), 1)
+        self.assertEqual(s["sessions"][0]["accounts"], 2)
+        self.assertEqual(pa_costs.merge_accounts([s["sessions"][0]]), {})
 
     def test_c4_a_summary_at_the_real_size_still_fits(self):
         self.prices()

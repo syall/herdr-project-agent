@@ -4619,6 +4619,35 @@ cases["P177-billed"] = async () => { // R16: the not-recorded part is one dim li
   check(!costsView(plain).text.includes("Account not recorded"), "absent without notRecorded");
 };
 
+cases["P177-shrunk"] = async () => { // t-177 round 3 (review Must fix 1): shrink keeps a mixed session's account (its largest scope's, t-032's scope fact) and puts its list's count in place of the list: the session keeps its largest scope's words and By scope drill, and has no parts (no chip)
+  const base = costsSummary(), part = (key, tokens, money, calls = 1) => ({ key, tokens, money, calls });
+  const pe = { provider: "provider-a", endpoint: "global" };
+  const s = acctSummary({
+    byAccount: [part("acct-a", 600, 7.5, 3), part("acct-b", 100, 1, 1), { ...part(NRK, 300, 4, 3), notRecorded: true }],
+    byScope: [{ key: "provider-a · global · ? · acct-a", scope: A177_SCOPE_A, tokens: 600, money: 7.5, calls: 3, pricedAs: [], by: {} },
+      { key: "provider-a · global · ? · acct-b", scope: ["provider-a", "global", null, "acct-b"], tokens: 100, money: 1, calls: 1, pricedAs: [], by: {} },
+      { key: `provider-a · global · ? · ${NRK}`, scope: A177_SCOPE_N, tokens: 300, money: 4, calls: 3, pricedAs: [], by: { accountBy: "not-recorded" } }],
+    scopes: 3,
+    // aaaa1111: rows in acct-a (the largest) and acct-b, as `shrink` leaves it (its accounts list replaced by its count)
+    sessions: [{ ...base.sessions[0], ...pe, account: "acct-a", accounts: 2, scopes: 2 }, { ...base.sessions[1], ...pe, account: NRK },
+      { ...base.sessions[2], ...pe, account: "acct-b" }],
+  });
+  const { v } = await costsWorld({ summary: s });
+  const scope = (t) => section(t, "| By scope (provider · endpoint · region · account) | Copy", ["| By day"]);
+  await click(v, "costs-scope-0"); await settle();
+  let { text, clicks } = costsView(v);
+  check(/Sessions: \| ◌ aaaa1111 [^|]*\(provider provider-a, endpoint global, account acct-a, no region recorded\)[^|]* · rows in 2 scopes \(the largest shown\)/.test(scope(text)),
+    `the largest scope's drill keeps the session, in its words (got ${scope(text)})`);
+  check(!clicks["costs-acct-scope-0-0"], `no account chip on a session whose list was dropped (have ${Object.keys(clicks).filter((k) => k.startsWith("costs-acct-scope-0-"))})`);
+  await click(v, "costs-scope-2"); await settle();
+  ({ text } = costsView(v));
+  check(/Sessions: \| [^|]*bbbb2222 /.test(scope(text)) && !scope(text).includes("aaaa1111"), `not under the not-recorded scope (got ${scope(text)})`);
+  await click(v, "costs-task-0"); await settle();
+  ({ text } = costsView(v));
+  check(/aaaa1111 [^|]*account acct-a/.test(text) && !/aaaa1111 [^|]*account recorded/.test(text) && !/aaaa1111 [^|]*· 2 accounts/.test(text),
+    `never "account not recorded", never a 2 accounts chip without its parts (got ${text})`);
+};
+
 // ---- t-045: a decision card stays answered once the person submits (Wanted 1-4) ----
 // The card's write on m1 (python3 -c REMOTE_WRITE) held until release(); `after` runs when it is called.
 function holdWrite({ reply = null, after = null } = {}) {
