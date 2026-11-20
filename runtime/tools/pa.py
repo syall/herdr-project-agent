@@ -1212,7 +1212,7 @@ RULES_LINE_MAX = 1600  # characters of the start pack's active-rules line (t-041
 RULE_TITLE_MAX = 100  # characters of one rule's title in a list
 RULE_TEXT_MAX = 1200  # characters of one rule's text where a list gives it in full
 RULE_ID = re.compile(r"^[\w.-]{1,80}$")
-RULE_NEW = ("created", "approved", "edited and approved", "approved in conversation")  # T1: the rule's text is new
+RULE_NEW = ("created", "approved", "edited and approved", "approved in conversation", "edited", "imported")  # T1, t-192 R5.2: the rule's text is new
 RULE_NEW_SECONDS = 86400
 REST = "… (read the rest in rules.json)"
 
