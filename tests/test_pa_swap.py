@@ -1524,5 +1524,92 @@ class L1_FailedExec(unittest.TestCase):
                          "the launch after the failed exec started without the terminal's foreground" + r.explain())
 
 
+# take_tty_back on a pty of its own: the session leader (a helper process) loads pa.py, a group of its own holds the
+# foreground (alive, or exited), and the helper calls take_tty_back; it prints the foreground before and after.
+TAKE_BACK = r"""
+import fcntl, importlib.util, json, os, signal, sys, termios, time
+pa_py, case = sys.argv[1], sys.argv[2]
+os.setsid()
+fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+spec = importlib.util.spec_from_file_location("pa", pa_py)
+pa = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(pa)
+signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+kid = os.fork()
+if kid == 0:
+    os.setpgid(0, 0)
+    time.sleep(0.5 if case == "dead" else 30)
+    os._exit(0)
+os.setpgid(kid, kid)
+os.tcsetpgrp(0, kid)
+if case == "dead":
+    os.waitpid(kid, 0)
+before = os.tcgetpgrp(0)
+pa.take_tty_back({kid} if case == "ended" else set())
+after = os.tcgetpgrp(0)
+if case != "dead":
+    os.kill(kid, signal.SIGKILL)
+    os.waitpid(kid, 0)
+sys.stderr.write(json.dumps({"kid": kid, "me": os.getpgrp(), "before": before, "after": after}) + "\n")
+"""
+
+
+class L1_TakeBackNeverFromALiveGroup(unittest.TestCase):
+    """take_tty_back (round 2, L1): from a group that ended (reaped, or no live member) the terminal comes back and is
+    reset; from a live group not named as ended it takes nothing and writes nothing."""
+
+    def run_case(self, case):
+        base = os.path.realpath(tempfile.mkdtemp(dir=TMP))
+        write(os.path.join(base, "take.py"), TAKE_BACK)
+        master, slave = pty.openpty()
+        self.addCleanup(os.close, master)
+        proc = subprocess.Popen([sys.executable, os.path.join(base, "take.py"), PA_PY, case], stdin=slave, stdout=slave,
+                                stderr=subprocess.PIPE, universal_newlines=True, env=os.environ.copy())
+        os.close(slave)
+        os.set_blocking(master, False)  # macOS: a read of a master whose slave is closed can block
+        got = []  # read while it runs: on macOS a tty's last close waits for its output to be read
+
+        def reader():
+            while True:
+                try:
+                    if not select.select([master], [], [], 0.1)[0]:
+                        if proc.poll() is not None:
+                            return
+                        continue
+                    chunk = os.read(master, 65536)
+                except OSError:  # EIO once the slave is closed (Linux), EAGAIN
+                    return
+                if not chunk:
+                    return
+                got.append(chunk)
+        t = threading.Thread(target=reader, daemon=True)
+        t.start()
+        try:
+            _out, err = proc.communicate(timeout=60)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+        t.join(5)
+        self.assertEqual(proc.returncode, 0, err)
+        return json.loads(err.strip().splitlines()[-1]), b"".join(got)
+
+    def test_live_group_is_left_alone(self):
+        got, shown = self.run_case("live")
+        self.assertEqual(got["before"], got["kid"])
+        self.assertEqual(got["after"], got["kid"], "the terminal was taken from a live group")
+        self.assertNotIn(TTY_RESET.encode(), shown, "the terminal was written while a live group held it")
+
+    def test_ended_group_is_taken_back(self):
+        got, shown = self.run_case("ended")
+        self.assertEqual(got["after"], got["me"])
+        self.assertIn(TTY_RESET.encode(), shown)
+
+    def test_empty_group_is_taken_back(self):
+        got, shown = self.run_case("dead")
+        self.assertEqual(got["after"], got["me"])
+        self.assertIn(TTY_RESET.encode(), shown)
+
+
 if __name__ == "__main__":
     unittest.main()
