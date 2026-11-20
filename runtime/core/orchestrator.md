@@ -356,8 +356,11 @@ Run `hc --skill` once to learn `hc`. Start workers with the profile's commands (
   `$HC_TERMINAL_ID` is its own. Codex workers get no standing instructions, so their
   handoff starts: "Read <core folder>/worker.md first." Write it first to
   `evidence/<task-id>/handoff-<job>.md` and give `hc run` the prompt "Read <path> and do
-  the job it describes." Take every number a rule sets (mutations, tiers, places) from the
-  active rules, never from an older handoff.
+  the job it describes." Write check, recheck, fix, verify, review and queue handoffs with
+  `pa-handoff <kind> <task>` (it fills in the ledger, git, rule numbers and known flakes from
+  `flakes.txt`) and add only your judgement with `--items`; never copy them from an old handoff.
+  Take every number a rule sets (mutations, tiers, places) from the active rules, never from
+  an older handoff.
 - Scope: the handoff lists the requirements the job builds. A requirement that appears
   after the build starts, from the person, from a finding outside the must-fix bar, or
   from you, becomes a new task, unless the person chooses on a card to widen this one.

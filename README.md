@@ -772,6 +772,27 @@ the space's folder (`.hook-starts/`, readable by you only); a record that is mis
 or a worktree too big to snapshot in 20 s means the tests run. A worktree whose hooks were installed before this
 has no session-start hook: run `pa-hooks install` in it again to get it.
 
+## Handoffs (`pa-handoff`)
+
+The Project Agent writes the handoffs of checks, fixes and queue reviewers with `pa-handoff`, so their numbers
+come from the space's state, not from an older handoff's text:
+
+```sh
+pa-handoff check t-12 --public --items "Judge D2."    # low tier: full check of the merge-base with main..HEAD
+pa-handoff fix t-12 --items "M1 only"                 # the next round, from REVIEW.md's last Checked: and Verdict:
+pa-handoff recheck t-12 --logic                       # low tier: the diff from the checked commit to HEAD
+pa-handoff verify t-30 --job j2                       # normal or high tier (review is the same; --diff for a recheck)
+pa-handoff queue t-12                                 # wraps `pa-queue brief` with the reviewer's lines
+```
+
+It reads the ledger task (title, tier, the job's worktree, its evidence folder, the round from its build workers),
+git in that worktree (branch, HEAD, base, the failing-test commits), the active `r-few-mutations` (its `mutations`
+field `{low, normal, high, recheck}`, else the numbers in its text) and `r-test-runs`, the known flakes in the
+space's `flakes.txt` (one per line, `#` for comments) and the address in `agent.json`. It writes
+`evidence/<task>/handoff-<kind>[-<job>][-r<round>].md`, prints its path, keeps an existing one unless `--force`,
+and writes nothing else: no ledger change, no worker started. `--items` (or `--items-file`) adds the judgement
+lines; `--public` adds the public-repository rule; `--no-mutations` is for docs-only or test-only changes.
+
 ## Licence
 
 Apache License 2.0; see `LICENSE` and `NOTICE`.

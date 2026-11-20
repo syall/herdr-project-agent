@@ -138,7 +138,7 @@ class Base(unittest.TestCase):
         self.write_rules(RULES)
         write(os.path.join(self.space, "flakes.txt"),
               "# known flakes, one per line\ntest_a test_x1\n\ntest_b test_y (a race)\n")
-        log = git(self.wt, "log", "--format=%h", "--reverse", "--abbrev=7", "main~0", "t-1-widget").split()
+        log = git(self.wt, "log", "--format=%h", "--reverse", "--topo-order", "--abbrev=7", "t-1-widget").split()
         self.c = {"C0": log[0], "C1": log[1], "C2": log[2]}
         self.ledger = {"version": 1, "tasks": [
             {"id": "t-1", "title": "Widget: one thing", "tier": "low", "worktree": self.wt,

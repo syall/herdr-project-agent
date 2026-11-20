@@ -31,6 +31,7 @@ for n in pa-gate pa-hooks pa-hook pa-full-suite pa-run pa-worktree pa-worker pa-
 for n in pa-costs; do ln -sfn "$PA/tools/pa_costs.py" "$HOME/.local/bin/$n"; done
 for n in pa-queue; do ln -sfn "$PA/tools/pa_queue.py" "$HOME/.local/bin/$n"; done
 for n in pa-places; do ln -sfn "$PA/tools/pa_places.py" "$HOME/.local/bin/$n"; done
+for n in pa-handoff; do ln -sfn "$PA/tools/pa_handoff.py" "$HOME/.local/bin/$n"; done
 for n in pa-push-main pa-push-allow; do ln -sfn "$PA/tools/pa_push.py" "$HOME/.local/bin/$n"; done
 "$HOME/.local/bin/pa-core-check"
 # Last: installed.json, the hashes of what is installed now, and the commit it came from (t-037).
