@@ -3524,6 +3524,13 @@ def identify_launcher(directory, agent):
             raise Problem("cannot restart: terminal {} runs pid {} ({}), launcher.json says pid {}: not the launcher "
                           "that wrote it{}".format(terminal, term.get("pid"), seen_text(term.get("argv")),
                                                    record.get("pid"), instead))
+        named = any(w == "--space" or w.startswith("--space=") for w in wrapped)
+        if not launcher_words(wrapped) or (named and not pa_session_argv(wrapped, space)):
+            # d-187 (t-065): the wrapper itself must run a launcher of this space (or a --ask first tab, d-181 O1),
+            # not something else whose child happens to be one (a pa-session exec'd in a wrapped shell)
+            raise Problem("cannot restart: terminal {} runs pid {} ({}), launcher.json says pid {}: the wrapper runs "
+                          "no launcher of this space{}".format(terminal, term.get("pid"), seen_text(None, wrapped),
+                                                               record.get("pid"), instead))
         why = child_link(term.get("pid"), record.get("pid"))
         if why:  # R1 (a), (b): the record's pid is the wrapper's live launcher child, or it is refused
             raise Problem("cannot restart: terminal {} runs pid {} ({}), launcher.json says pid {}: {}{}".format(
