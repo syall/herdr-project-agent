@@ -7387,7 +7387,7 @@ cases["P41-1-context-line"] = async () => { // R15, J5-D1: the line from the Cos
   check(ctxRuns().length === 0, "nothing run without a click");
   await click(v, "view-costs"); await settle();
   check(summaryReads(dir).length === 1, `the Costs view's one read (got ${summaryReads(dir).length})`);
-  check(look(v).text.includes("PA context today (UTC): mean 158k · peak 254k · resets 6 (fresh 6, compact 0) (as of 07:59)"), `the line, as of the summary's updated (MF-J5r2-1) (got ${look(v).text.slice(0, 900)})`);
+  check(look(v).text.includes("PA context today (UTC): mean 158k · peak 254k · resets 6 (fresh 6, compact 0) (as of 07:59 UTC)"), `the line, as of the summary's updated (MF-J5r2-1) (got ${look(v).text.slice(0, 900)})`);
 };
 
 cases["P41-2-no-summary"] = async () => { // R15, J5-D1: no summary: no line once the Costs view has read; the rest stays
@@ -7481,13 +7481,13 @@ cases["P41-16-cross-midnight"] = async () => { // MF-J5-1: a read from an earlie
   const v = await liveMount();
   g.__now = T0 + (15 * 60 + 50) * 60000; // 23:50 UTC on DAY41
   await click(v, "view-costs"); await settle();
-  check(look(v).text.includes("PA context today (UTC): mean 158k · peak 254k · resets 6 (fresh 6, compact 0) (as of 23:50)"), `at read time (got ${look(v).text.slice(0, 900)})`);
+  check(look(v).text.includes("PA context today (UTC): mean 158k · peak 254k · resets 6 (fresh 6, compact 0) (as of 23:50 UTC)"), `at read time (got ${look(v).text.slice(0, 900)})`);
   await click(v, "view-tasks"); await settle();
   advance(20 * 60000); await fire(1000); await settle(); // 00:10 UTC the next day; the Costs view is not shown
   v.view = "costs"; // t-145: the line is in the Costs tab; drawn from the read already made
   const text = look(v).text;
   check(!text.includes("no Project Agent calls yet") && !text.includes("PA context today"), `not today's, not "no calls" (got ${text.slice(0, 900)})`);
-  check(text.includes(`PA context ${DAY41} (UTC): mean 158k · peak 254k · resets 6 (fresh 6, compact 0) (as of ${DAY41.slice(5)} 23:50)`), `the read's day named (got ${text.slice(0, 900)})`);
+  check(text.includes(`PA context ${DAY41} (UTC): mean 158k · peak 254k · resets 6 (fresh 6, compact 0) (as of ${DAY41.slice(5)} 23:50 UTC)`), `the read's day named (got ${text.slice(0, 900)})`);
 };
 
 cases["P41-17-summary-yesterday"] = async () => { // MF-J5r2-1: the summary's own time, not the read's: written DAY41 23:50, read 00:10
@@ -7499,7 +7499,7 @@ cases["P41-17-summary-yesterday"] = async () => { // MF-J5r2-1: the summary's ow
   v.view = "costs"; // t-145: the line is in the Costs tab; drawn from the read already made
   const text = look(v).text;
   check(!text.includes("no Project Agent calls yet") && !text.includes("PA context today"), `not today's, not "no calls" (got ${text.slice(0, 900)})`);
-  check(text.includes(`PA context ${DAY41} (UTC): mean 158k · peak 254k · resets 6 (fresh 6, compact 0) (as of ${DAY41.slice(5)} 23:50)`), `the summary's day and time (got ${text.slice(0, 900)})`);
+  check(text.includes(`PA context ${DAY41} (UTC): mean 158k · peak 254k · resets 6 (fresh 6, compact 0) (as of ${DAY41.slice(5)} 23:50 UTC)`), `the summary's day and time (got ${text.slice(0, 900)})`);
 };
 
 cases["P41-18-no-updated"] = async () => { // MF-J5r2-1: no updated, or one that is not a time: the Costs view's read time, as before
@@ -7509,11 +7509,11 @@ cases["P41-18-no-updated"] = async () => { // MF-J5r2-1: no updated, or one that
     const v = await liveMount();
     g.__now = T0 + (15 * 60 + 50) * 60000; // 23:50 UTC on DAY41
     await click(v, "view-costs"); await settle();
-    check(look(v).text.includes("PA context today (UTC): mean 158k · peak 254k · resets 6 (fresh 6, compact 0) (as of 23:50)"), `${updated}: at read time (got ${look(v).text.slice(0, 900)})`);
+    check(look(v).text.includes("PA context today (UTC): mean 158k · peak 254k · resets 6 (fresh 6, compact 0) (as of 23:50 UTC)"), `${updated}: at read time (got ${look(v).text.slice(0, 900)})`);
     await click(v, "view-tasks"); await settle();
     advance(20 * 60000); await fire(1000); await settle(); // 00:10 UTC the next day
     v.view = "costs"; // t-145: the line is in the Costs tab; drawn from the read already made
-    check(look(v).text.includes(`PA context ${DAY41} (UTC): mean 158k · peak 254k · resets 6 (fresh 6, compact 0) (as of ${DAY41.slice(5)} 23:50)`), `${updated}: the read's day (got ${look(v).text.slice(0, 900)})`);
+    check(look(v).text.includes(`PA context ${DAY41} (UTC): mean 158k · peak 254k · resets 6 (fresh 6, compact 0) (as of ${DAY41.slice(5)} 23:50 UTC)`), `${updated}: the read's day (got ${look(v).text.slice(0, 900)})`);
   }
 };
 
@@ -7535,6 +7535,21 @@ cases["P41-19-not-read-yet"] = async () => { // RL-J5-1: the Costs tab shown, it
   g.__fail = [];
   advance(11000); v.reload(cx); await settle(); await settle();
   check(look(v).text.includes("PA context today (UTC): mean 158k · peak 254k") && !look(v).text.includes(NOT_READ41), `read again: the figures (got ${look(v).text.slice(0, 900)})`);
+};
+
+cases["P41-20-utc-asof"] = async () => { // RL-J5-3: the "as of" in UTC like the day, whatever the panel's zone (here +09:00)
+  ctxWorld({ summary: { ...SUMMARY41, updated: `${DAY41}T23:50:00Z` } });
+  setZone(() => 540, "Asia/Tokyo");
+  const v = await liveMount();
+  g.__now = T0 + (15 * 60 + 55) * 60000; // 23:55 UTC on DAY41 (08:55 the next day in the zone)
+  await click(v, "view-costs"); await settle();
+  let text = look(v).text;
+  check(text.includes("PA context today (UTC): mean 158k · peak 254k · resets 6 (fresh 6, compact 0) (as of 23:50 UTC)") && !text.includes("08:50"), `today's figures as of 23:50 UTC, not 08:50 (got ${text.slice(0, 900)})`);
+  await click(v, "view-tasks"); await settle();
+  advance(20 * 60000); await fire(1000); await settle(); // 00:15 UTC the next day
+  v.view = "costs";
+  text = look(v).text;
+  check(text.includes(`PA context ${DAY41} (UTC): mean 158k · peak 254k · resets 6 (fresh 6, compact 0) (as of ${DAY41.slice(5)} 23:50 UTC)`), `an earlier UTC day: its date in UTC (got ${text.slice(0, 900)})`);
 };
 
 // ---- t-119: the suite machines' slots in the Places section (pa-full-suite --places --json) ----
@@ -8362,7 +8377,7 @@ cases["P145-3-context-rows-in-costs"] = async () => { // I2: the context size li
   check(!look(v).text.includes("Fresh context at 07:02") && !look(v).clicks["copy-previous-session"], `not above the tabs (got ${look(v).text.slice(0, 700)})`);
   await click(v, "view-costs"); await settle();
   let text = look(v).text;
-  check(text.includes("PA context today (UTC): mean 158k · peak 254k · resets 6 (fresh 6, compact 0) (as of 07:59)"), `the size line in Costs (got ${text.slice(0, 900)})`);
+  check(text.includes("PA context today (UTC): mean 158k · peak 254k · resets 6 (fresh 6, compact 0) (as of 07:59 UTC)"), `the size line in Costs (got ${text.slice(0, 900)})`);
   check(text.includes("Fresh context at 07:02 (pass cap, 260k) · previous session 3f2a9c1e…") && Boolean(look(v).clicks["copy-previous-session"]), `the reset line and its Copy in Costs (got ${text.slice(0, 900)})`);
   await click(v, "view-tasks");
   check(!look(v).text.includes("PA context today"), "not in another tab");
