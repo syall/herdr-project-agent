@@ -140,15 +140,23 @@ class T1_WholeTreeEnds(Base):
         self.assertTrue(alive(grandchild))
         child = ctx["child"]
         self.pids.append(child.pid)
+        self.assertEqual(pa.END_GRACE, 20)
+        began = time.time()
         pa.end_child(ctx, "restart")
+        took = time.time() - began
         self.assertFalse(alive(grandchild), "the wrapper's grandchild outlived end_child (orphaned Claude)")
+        # verify r1 RL1: the SIGTERM goes to the group, so a grandchild that ends on TERM is gone long before the
+        # 20 s grace (TERM to the handle only: the grace runs out and the group gets SIGKILL)
+        self.assertLess(took, 5, "end_child took {:.1f} s: the group got no SIGTERM".format(took))
         t.join(10)
         self.assertFalse(t.is_alive())
         self.assertEqual(result.get("code"), 255, result)
         self.assertEqual(ctx.get("ended"), "restart")
 
     def test_run_child_returns_only_when_the_group_is_gone(self):
-        argv, pidfile = self.wrapper()
+        # verify r1 RL2: a grandchild that takes ~1.5 s to end on TERM (like a Claude shutting down); run_child
+        # must wait for end_child, not return as soon as the wrapper's handle exits
+        argv, pidfile = self.wrapper(grandchild="(trap 'sleep 1.5; exit 0' TERM; while :; do sleep 0.1; done)")
         ctx, t, result = self.start(argv)
         grandchild = read_pid(pidfile)
         self.pids.append(grandchild)
@@ -158,6 +166,25 @@ class T1_WholeTreeEnds(Base):
         self.assertFalse(t.is_alive())
         self.assertFalse(alive(grandchild), "run_child returned while the launch's group still ran")
         ender.join(30)
+
+
+class T6_CallStdin(unittest.TestCase):
+    """review r1 RL1: call() never gives its command the launcher's terminal as stdin (pa.py is a background group
+    while Claude has the foreground; a command reading the terminal there would be stopped)."""
+
+    def test_call_gives_its_command_dev_null_as_stdin(self):
+        r, w = os.pipe()
+        saved = os.dup(0)
+        os.dup2(r, 0)  # this process's stdin: a pipe, standing in for the terminal
+
+        def restore():
+            os.dup2(saved, 0)
+            for fd in (saved, r, w):
+                os.close(fd)
+        self.addCleanup(restore)
+        probe = ("import os, sys; a, b = os.fstat(0), os.stat(os.devnull); "
+                 "print('devnull' if (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino) else 'other')")
+        self.assertEqual(pa.call([sys.executable, "-c", probe]).strip(), "devnull")
 
 
 class T2_KillAfterGrace(Base):
