@@ -187,6 +187,24 @@ class W1Record(Base):
             {"name": "panel harness 1/4", "ok": True, "seconds": 30}])
         self.assertEqual(pa_suite.parse_parts("no summary here\n  x: ok\n"), [])
 
+    def test_w1c_only_the_lines_after_the_last_parts_marker(self):
+        """t-103 R14: run-all.sh prints `=== parts` right before its part list; a failed part's tail above it (with
+        part-shaped lines, a marker of a run inside it) is not read. Text with no marker is read whole (old trees)."""
+        text = ("--- keeper harness: FAILED (no failing test named; its last 40 lines:)\n"
+                "  inner: ok (1s)\n  === parts\n  inner two: FAILED (2s)\n=== parts\n"
+                "  unit tests: test_a: ok (3s)\n  keeper harness: FAILED (7s)\n=== 1 part(s) failed: keeper harness\n")
+        self.assertEqual(pa_suite.parse_parts(text), [{"name": "unit tests: test_a", "ok": True, "seconds": 3},
+                                                      {"name": "keeper harness", "ok": False, "seconds": 7}])
+        self.assertEqual([p["name"] for p in pa_suite.parse_parts("=== parts\n  early: ok (1s)\n=== parts\n"
+                                                                    "  late: ok (2s)\n")], ["late"])
+        self.assertEqual(len(pa_suite.parse_parts(SUMMARY)), 4)
+
+    def test_w1e_a_local_runs_record_has_the_list_after_the_marker(self):
+        self.set_command("printf '  fixture: ok (1s)\\n=== parts\\n  unit tests: test_a: ok (3s)\\n'")
+        code, out = self.main()
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.lines()[-1]["parts"], [{"name": "unit tests: test_a", "ok": True, "seconds": 3}])
+
     def test_w1b_one_record_with_the_new_fields(self):
         self.set_command(self.counting())
         code, out = self.main()

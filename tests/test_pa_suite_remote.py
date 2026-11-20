@@ -17,6 +17,11 @@ Nothing leaves this Mac: hc is tests/stub-hc (a machine is a temp folder), the m
 t-106 J1, a profile's step run (tests.remoteFull): x22 when it applies (R1), x23 the entry's H-cases (R2), x24 the
 facts hook's H-cases (R3), x25 what is sent (R5), x26 probe and prepare, prepare's H-cases (R6, R7), x27 exit,
 record and output (R13-R15), x28 cleanup (R16), x29 generic words and docs (R17), x30 no step: today's run.
+t-103 J1 (its spec's R-numbers): x31 a run there that died without a code ends at once, 124 (R5); x32 the last copy
+retried, else partial (R6); x33 a failed cleanup after a setup failure stays for the sweep (R7); x34 a killed
+holder's running row is swept (R8); x35 PREFER_WAIT is waited out (R9); x36 a second TERM during cleanup (R10);
+x37 machine names (R11); x38 merge_parts's types (R12); x39 python3 3.8 (R13); x40 the remote place's own seconds
+(R15); x41 a tree whose run-all.sh has no place flags stays here (R16); x42 docs.
 """
 import json
 import os
@@ -25,6 +30,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 import unittest
 
@@ -1566,6 +1572,404 @@ class X30NoStepUnchanged(Remote):
         run_call = [c for c in self.calls() if c[0] == "run"][0]
         self.assertEqual(run_call[run_call.index("--cwd") + 1], "/tmp/pa-suite-{}/w".format(run))
         self.assertEqual(run_call[-1], pa_suite.run_script("/tmp/pa-suite-" + run, line["tools"]))
+
+
+def dead_pid():
+    """The pid of a process that has ended (reaped)."""
+    p = subprocess.Popen(["true"])
+    p.wait()
+    return p.pid
+
+
+def remote_sh(stub, machine="box-1"):
+    """The pid of the run's sh in the fake machine's one running terminal (the supervisor's child), or None."""
+    folder = os.path.join(stub, machine, "terminals")
+    for name in sorted(os.listdir(folder)) if os.path.isdir(folder) else []:
+        try:
+            with open(os.path.join(folder, name)) as f:
+                supervisor = json.load(f).get("pid")
+        except (OSError, ValueError):
+            continue
+        if supervisor:
+            out = subprocess.run(["pgrep", "-P", str(supervisor)], stdout=subprocess.PIPE,
+                                 universal_newlines=True).stdout.split()
+            if out:
+                return int(out[0])
+    return None
+
+
+class X31Dead(Remote):
+    """t-103 R5: the run's sh there killed without writing its code, while the machine answers: the run ends within a
+    few polls with 124 and the note, not after REMOTE_TIMEOUT; a code written is still read (AC5.3)."""
+
+    def test_x31a_a_killed_remote_run_ends_at_once_with_124(self):
+        self.setenv(FAKE_GO=os.path.join(self.tmp, "go"))
+        p, log = self.background()
+        self.assertTrue(self.until(lambda: RUN.search(pa.read_text(log) or "")), pa.read_text(log))
+        run = self.run_id(pa.read_text(log))
+        self.assertTrue(self.until(lambda: "fake remote part" in (self.output(run) or "")), pa.read_text(log))
+        pid = self.until(lambda: remote_sh(self.stub))
+        self.assertTrue(pid, os.listdir(os.path.join(self.stub, "box-1")))
+        os.kill(pid, signal.SIGKILL)
+        began = time.time()
+        try:
+            code = p.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            self.fail("still waiting {:.0f} s after the run there was killed: {}".format(time.time() - began,
+                                                                                      pa.read_text(log)))
+        self.assertEqual(code, 124, pa.read_text(log))
+        self.assertIn("the run on box-1 ended without an exit code after", self.output(run))
+        self.assertIn("ended without an exit code", self.progress(run).get("note") or "")
+        self.assertEqual(self.progress(run).get("exit"), 124)
+        line = self.lines()[-1]
+        self.assertEqual((line["exit"], line["places"][0]["place"], line["places"][0]["exit"]), (124, "box-1", 124))
+        self.assertFalse(os.path.exists(self.remote_folder(run)))
+        self.assertTrue(self.progress(run).get("cleaned"))
+
+    def watcher_on(self, pid, code=None):
+        run = "abcdef012345"
+        folder = self.remote_folder(run)
+        os.makedirs(folder)
+        write(os.path.join(folder, "out"), "a line\n")
+        write(os.path.join(folder, "pid"), "{}\n".format(pid))
+        if code is not None:
+            write(os.path.join(folder, "code"), "{}\n".format(code))
+        w = pa_suite.RemoteWatcher("box-1", "/tmp/pa-suite-" + run, os.path.join(self.tmp, "w.out"), None, None)
+        w.tick()
+        return w
+
+    def test_x31b_a_run_that_wrote_its_code_and_ended_is_not_dead(self):
+        w = self.watcher_on(dead_pid(), 0)
+        self.assertEqual(w.code, 0)
+        self.assertIsNone(getattr(w, "dead", None))
+
+    def test_x31c_a_live_pid_without_a_code_is_still_running(self):
+        w = self.watcher_on(os.getpid())
+        self.assertIsNone(w.code)
+        self.assertIsNone(getattr(w, "dead", None))
+
+    def test_x31d_a_dead_pid_without_a_code_is_dead(self):
+        w = self.watcher_on(dead_pid())
+        self.assertIsNone(w.code)
+        self.assertIsNotNone(getattr(w, "dead", None))
+
+
+class X32Partial(Remote):
+    """t-103 R6: the last copy is read again once when it fails or is short; still short: partial, no remote parts,
+    the exit is the run's own."""
+
+    def test_x32a_a_failed_last_read_is_retried(self):
+        self.setenv(STUB_HC_FAIL="fullfail:1", FAKE_LINES="50")
+        code, out = self.main()
+        self.assertEqual(code, 0, out)
+        run = self.run_id(out)
+        text = self.output(run)
+        self.assertNotIn("the last read of the remote output failed", text)
+        self.assertIn("line 49\n", text)
+        line = self.lines()[-1]
+        self.assertNotIn("partial", line)
+        self.assertNotIn("note", line)
+        self.assertEqual(sorted(p["name"] for p in line["parts"] if p["place"] == "box-1"),
+                         ["unit tests: test_a", "unit tests: test_b"])
+
+    def test_x32b_a_short_last_copy_twice_is_partial(self):
+        self.setenv(STUB_HC_FAIL="fullshort", FAKE_LINES="50")
+        code, out = self.main()
+        self.assertEqual(code, 0, out)
+        run = self.run_id(out)
+        line = self.lines()[-1]
+        self.assertIs(line.get("partial"), True, line)
+        self.assertIn("copied", line.get("note") or "")
+        self.assertEqual([p for p in line["parts"] if p["place"] == "box-1"], [], line["parts"])
+        self.assertEqual([p["name"] for p in line["parts"] if p["place"] == "local"],
+                         ["pa-session integration (private hc core)"])
+        self.assertEqual(line["places"][0]["exit"], 0)
+        self.assertIn("copied", self.output(run))
+
+    def test_x32c_a_short_copy_keeps_a_failing_runs_exit(self):
+        self.setenv(STUB_HC_FAIL="fullshort", FAKE_REMOTE_EXIT="1")
+        code, out = self.main()
+        self.assertEqual(code, 1, out)
+        line = self.lines()[-1]
+        self.assertIs(line.get("partial"), True, line)
+        self.assertEqual(line["exit"], 1)
+
+
+class X33Leftover(Remote):
+    """t-103 R7: setup fails and the folder's rm -rf fails too: the row keeps `leftover` (not `cleaned`), and the next
+    run on that machine removes it; a cleanup that worked is `cleaned` as before."""
+
+    def test_x33a_a_failed_cleanup_is_left_for_the_next_run(self):
+        self.setenv(STUB_HC_FAIL="match:clone,match:rm -rf")
+        code, out = self.main()
+        self.assertEqual(code, 0, out)
+        run = self.run_id(out)
+        self.assertIn("now on this Mac", out)
+        row = self.progress(run)
+        self.assertNotEqual(row.get("cleaned"), True, row)
+        self.assertEqual(row.get("leftover"), {"machine": "box-1", "folder": "/tmp/pa-suite-" + run, "terminal": None})
+        self.assertTrue(os.path.isdir(self.remote_folder(run)))
+        self.setenv(STUB_HC_FAIL=None)
+        code, out = self.main("--again")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.lines()[-1].get("machine"), "box-1")
+        self.assertFalse(os.path.exists(self.remote_folder(run)))
+        row = self.progress(run)
+        self.assertIs(row.get("cleaned"), True, row)
+        self.assertFalse(row.get("leftover"), row)
+
+    def test_x33b_a_cleanup_that_worked_is_cleaned(self):
+        self.setenv(STUB_HC_FAIL="match:clone")
+        code, out = self.main()
+        self.assertEqual(code, 0, out)
+        row = self.progress(self.run_id(out))
+        self.assertIs(row.get("cleaned"), True, row)
+        self.assertFalse(row.get("leftover"), row)
+
+    def test_x33c_a_leftover_names_its_machine_and_its_own_folder_only(self):
+        other = "bbbbbbbbbbbb"
+        os.makedirs(self.remote_folder(other))
+        os.makedirs(self.remote_folder(other, "box-2"))
+        dump({"run": other, "kind": "pa-full-suite", "state": "done", "pid": 1, "machine": None, "remote": None,
+              "leftover": {"machine": "box-2", "folder": "/tmp/pa-suite-" + other, "terminal": None}},
+             os.path.join(pa_suite.runs_dir(), other + ".json"))
+        bad = "cccccccccccc"
+        os.makedirs(self.remote_folder(bad))
+        dump({"run": bad, "kind": "pa-full-suite", "state": "done", "pid": 1,
+              "leftover": {"machine": "box-1", "folder": "/tmp/elsewhere", "terminal": None}},
+             os.path.join(pa_suite.runs_dir(), bad + ".json"))
+        code, out = self.main()
+        self.assertEqual(code, 0, out)
+        self.assertTrue(os.path.isdir(self.remote_folder(other)))  # box-2's leftover: not this machine's
+        self.assertTrue(os.path.isdir(self.remote_folder(bad)))  # a folder that is not its run's: never touched
+        for c in self.calls():
+            self.assertNotIn("/tmp/elsewhere", " ".join(c))
+
+
+class X34SweepRunning(Remote):
+    """t-103 R8: a row left `running` by a holder killed with SIGKILL (its pid dead) is swept; a live one is not."""
+
+    def test_x34_a_dead_holders_running_row_is_swept(self):
+        rows = {"dddddddddddd": dead_pid(), "eeeeeeeeeeee": os.getpid()}
+        for run, pid in rows.items():
+            os.makedirs(self.remote_folder(run))
+            dump({"run": run, "kind": "pa-full-suite", "state": "running", "pid": pid, "machine": "box-1",
+                  "place": "box-1", "remote": {"folder": "/tmp/pa-suite-" + run, "terminal": None}},
+                 os.path.join(pa_suite.runs_dir(), run + ".json"))
+        code, out = self.main()
+        self.assertEqual(code, 0, out)
+        self.assertFalse(os.path.exists(self.remote_folder("dddddddddddd")))
+        self.assertIs(self.progress("dddddddddddd").get("cleaned"), True)
+        self.assertTrue(os.path.isdir(self.remote_folder("eeeeeeeeeeee")))
+        self.assertFalse(self.progress("eeeeeeeeeeee").get("cleaned"))
+
+
+class X35PreferWait(Remote):
+    """t-103 R9 (t-089 VERIFY J2 M1): a machine slot that frees before PA_SUITE_PREFER_WAIT takes the run; this Mac's
+    slot is not taken before then."""
+
+    def test_x35_a_slot_that_frees_before_prefer_wait_takes_the_run(self):
+        self.setenv(PA_SUITE_PREFER_WAIT="30", FAKE_MAC_SLOT=os.path.join(pa_suite.slot_dir(), "slot-0"))
+        holder = self.hold(self.machine_slot("box-1"))
+        timer = threading.Timer(1.5, holder.kill)
+        timer.start()
+        self.addCleanup(timer.cancel)
+        code, out = self.main()
+        self.assertEqual(code, 0, out)
+        self.assertIn("waiting for a slot on box-1", out)
+        self.assertNotIn("now on this Mac", out)
+        self.assertEqual(self.lines()[-1].get("machine"), "box-1")
+        self.assertIn("mac slot free", self.output(self.run_id(out)))
+
+
+class X36SecondSignal(Remote):
+    """t-103 R10: a second TERM while the first one's cleanup runs: still 143, no traceback, the folder removed."""
+
+    def test_x36_a_second_term_during_cleanup(self):
+        self.setenv(FAKE_GO=os.path.join(self.tmp, "go"), STUB_HC_FAIL="slow:kill")
+        p, log = self.background()
+        self.assertTrue(self.until(lambda: RUN.search(pa.read_text(log) or "")), pa.read_text(log))
+        run = self.run_id(pa.read_text(log))
+        self.assertTrue(self.until(lambda: "fake remote part" in (self.output(run) or "")), pa.read_text(log))
+        p.send_signal(signal.SIGTERM)
+        self.assertTrue(self.until(lambda: [c for c in self.calls() if c[0] == "kill"]), pa.read_text(log))
+        time.sleep(0.5)  # inside the stub's 3 s kill
+        p.send_signal(signal.SIGTERM)
+        self.assertEqual(p.wait(timeout=60), 143, pa.read_text(log))
+        self.assertNotIn("Traceback", pa.read_text(log))
+        self.assertFalse(os.path.exists(self.remote_folder(run)), pa.read_text(log))
+        self.assertEqual(self.progress(run).get("exit"), 143)
+
+
+class X37MachineNames(Remote):
+    """t-103 R11: a machine name starts with a letter or digit: `.`, `..` and `-x` are bad entries."""
+
+    def test_x37a_dot_dotdot_and_a_dash_are_named_once(self):
+        good, bad = pa_suite.machines({"suiteMachines": [{"machine": "."}, {"machine": ".."}, {"machine": "-x"},
+                                                         {"machine": "box-1"}, {"machine": "a.b"}]})
+        self.assertEqual([m["machine"] for m in good], ["box-1", "a.b"])
+        self.assertEqual(len(bad), 3, bad)
+        self.configure([{"machine": "."}, {"machine": ".."}, {"machine": "-x"}, {"machine": "box-1"}])
+        code, out = self.main()
+        self.assertEqual(code, 0, out)
+        for name in ("'.'", "'..'", "'-x'"):
+            self.assertEqual(out.count("machine {} is not".format(name)), 1, (name, out))
+        self.assertEqual(self.lines()[-1].get("machine"), "box-1")
+
+    def test_x37b_the_slot_folder_of_a_bad_name_is_not_a_callers(self):
+        for name in (".", "..", "-x"):
+            self.assertIsNone(pa_suite.MACHINE.match(name), name)
+        for name in ("box-1", "a.b", "A_1", "9" * 64):
+            self.assertTrue(pa_suite.MACHINE.match(name), name)
+        self.assertIsNone(pa_suite.MACHINE.match("9" * 65))
+        self.assertEqual(pa_suite.cleanup("-x", "abcdef012345"), ["not cleaned: bad machine or run id"])
+
+
+class X38MergeParts(unittest.TestCase):
+    """t-103 R12: a remote progress row's parts of a wrong shape count as absent."""
+
+    def test_x38_wrong_shapes_are_ignored(self):
+        # total/done whole numbers (not bool); failed/hung lists of names; running a list of objects (the Watcher's)
+        wrong = {"total": "3", "done": True, "running": "xy", "failed": {"a": 1}, "hung": None}
+        mixed = {"total": 2.5, "done": None, "running": ["r", 3], "failed": [None], "hung": "h"}
+        good = {"total": 4, "done": 1, "running": [{"name": "p"}], "failed": ["f"], "hung": ["h"]}
+        self.assertEqual(pa_suite.merge_parts(wrong, mixed, None, "text", good),
+                         {"total": 4, "done": 1, "running": [{"name": "p"}], "failed": ["f"], "hung": ["h"]})
+        self.assertEqual(pa_suite.merge_parts({"total": False, "done": 0}, {"total": 3, "done": 2}),
+                         {"total": 3, "done": 2, "running": [], "failed": [], "hung": []})
+
+    def test_x38b_the_local_watchers_running_rows_still_merge(self):
+        # the local part's own Watcher writes running as a list of dicts (name, since, ...): kept
+        local = {"total": 3, "done": 1, "running": [{"name": "pa-session integration 1/3", "since": 1}],
+                 "failed": [], "hung": []}
+        self.assertEqual(pa_suite.merge_parts(None, local)["running"], local["running"])
+
+
+FAKE_PYTHON3 = r"""#!{python}
+# t-103 R13: a python3 that runs the probe's -c code with sys.version_info set to FAKE_PY_VERSION
+import os, sys, types
+if sys.argv[1:2] != ["-c"] or "version_info" not in sys.argv[2]:  # stub-hc itself (env python3), ...
+    os.execv({python!r}, [{python!r}] + sys.argv[1:])
+code = sys.argv[2]
+version = tuple(int(x) for x in os.environ["FAKE_PY_VERSION"].split(".")) + ("final", 0)
+sys.modules["sys"] = types.SimpleNamespace(version_info=version, exit=sys.exit, argv=sys.argv)
+exec(code, {{"__name__": "__main__"}})
+"""
+
+
+class X39Python38(Remote):
+    """t-103 R13: the probe needs python3 3.8 or later (the suite's tests parse with feature_version)."""
+
+    def fake(self, version):
+        folder = os.path.join(self.tmp, "py-" + version)
+        write(os.path.join(folder, "python3"), FAKE_PYTHON3.format(python=sys.executable))
+        os.chmod(os.path.join(folder, "python3"), 0o755)
+        self.setenv(PATH=folder + os.pathsep + os.environ["PATH"], FAKE_PY_VERSION=version)
+        return os.path.join(folder, "python3")
+
+    def test_x39a_37_is_not_reachable(self):
+        path = self.fake("3.7.9")
+        found = pa_suite.probe("box-1")
+        self.assertFalse(found["ok"], found)
+        self.assertIn("missing python3 (3.8 or later; {} is 3.7.9)".format(path), found["reason"])
+
+    def test_x39b_38_is_reachable(self):
+        path = self.fake("3.8.0")
+        found = pa_suite.probe("box-1")
+        self.assertTrue(found["ok"], found)
+        self.assertEqual(found["tools"]["python3"], {"path": path, "version": "3.8.0"})
+
+
+class X40PlaceSeconds(Remote):
+    """t-103 R15: a remote place's seconds are its own run's (t1 - t0 there), not the wall until the local part ends."""
+
+    def test_x40_a_short_remote_part_beside_a_long_local_part(self):
+        hold = os.path.join(self.tmp, "hold")
+        self.setenv(FAKE_LOCAL_HOLD=hold)
+        timer = threading.Timer(4, lambda: write(hold, ""))
+        timer.start()
+        self.addCleanup(timer.cancel)
+        code, out = self.main()
+        self.assertEqual(code, 0, out)
+        places = {p["place"]: p for p in self.lines()[-1]["places"]}
+        self.assertLessEqual(places["box-1"]["seconds"], 2, places)
+        self.assertGreaterEqual(places["local"]["seconds"], 3, places)
+
+    def test_x40b_t1_is_written_before_the_code(self):
+        tools = {t: {"path": "/bin/" + t} for t in pa_suite.TOOLS}
+        for script in (pa_suite.run_script("/tmp/pa-suite-abcdef012345", tools),
+                       pa_suite.run_script("/tmp/pa-suite-abcdef012345", tools, command="x", cwd="w")):
+            lines = script.splitlines()
+            t1 = [i for i, l in enumerate(lines) if "t1" in l]
+            code = [i for i, l in enumerate(lines) if "code.new" in l]
+            self.assertTrue(t1 and code and t1[0] < code[0], script)
+            self.assertEqual(lines[0], "echo $$ > /tmp/pa-suite-abcdef012345/pid", script)  # R5: its pid first
+
+
+OLD_RUN_ALL = """#!/bin/sh
+# a tests/run-all.sh from before the remote mode: no place flags
+echo "fake old whole run on this Mac"
+echo "  unit tests: test_a: ok (9s)"
+exit 0
+"""
+
+
+class X41OldRunAll(Remote):
+    """t-103 R16: a commit whose tests/run-all.sh has no --except-integration stays on this Mac with the reason
+    (exit 2 with --on); nothing is sent."""
+
+    def setUp(self):
+        super().setUp()
+        write(os.path.join(self.wt, "tests", "run-all.sh"), OLD_RUN_ALL)
+        sh(self.wt, "git", "commit", "-q", "-am", "old run-all")
+
+    def test_x41a_it_runs_here_with_the_reason(self):
+        code, out = self.main()
+        self.assertEqual(code, 0, out)
+        run = self.run_id(out)
+        self.assertIn("has no --except-integration", out)
+        self.assertIn("rebase onto main", out)
+        self.assertIn("fake old whole run on this Mac", self.output(run))
+        self.assertEqual(self.calls(), [])  # not even a probe
+        self.assertIn("rebase onto main", self.lines()[-1].get("note") or "")
+        self.assertIn("rebase onto main", self.build_log())
+
+    def test_x41b_on_is_exit_2(self):
+        code, out = self.main("--on", "box-1")
+        self.assertEqual(code, 2, out)
+        self.assertIn("has no --except-integration", out)
+        self.assertEqual(self.calls(), [])
+        self.assertEqual(self.lines(), [])
+
+    def test_x41c_a_commit_that_has_both_flags_still_goes(self):
+        write(os.path.join(self.wt, "tests", "run-all.sh"), FAKE_RUN_ALL)
+        sh(self.wt, "git", "commit", "-q", "-am", "new run-all")
+        code, out = self.main()
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.lines()[-1].get("machine"), "box-1")
+
+
+class X42Docs(unittest.TestCase):
+    """t-103: README and the docstrings say what J1 changed."""
+
+    def read(self, *path):
+        with open(os.path.join(REPO, *path)) as f:
+            return " ".join(f.read().split())
+
+    def test_x42a_readme(self):
+        readme = self.read("README.md")
+        for words in ("ended without an exit code", "partial: true", "leftover", "python3 3.8", "=== parts",
+                      "rebase onto main", "starts with a letter or digit"):
+            self.assertIn(words, readme)
+
+    def test_x42b_docstrings_and_the_exit_comment(self):
+        doc = " ".join(pa_suite.__doc__.split())
+        self.assertIn("python3 >= 3.8", doc)
+        self.assertIn("ended without an exit code", doc)
+        run = self.read("runtime", "tools", "pa_run.py")
+        self.assertIn("ended without an exit code", run[run.index("Exit:"):run.index('"""', run.index("Exit:"))])
+        text = self.read("tests", "run-all.sh")
+        self.assertIn("ended without an exit code", text[text.index("# Exit:"):text.index("# Node:")])
 
 
 if __name__ == "__main__":

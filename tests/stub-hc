@@ -13,6 +13,9 @@
                       kill         every `kill` fails
                       garble:<n>   a `file write` of a file named <n> (p.b64: the patch, t-107) writes the base64 of a
                                    text that is no patch, so the apply there fails
+                      fullfail:<n> the first <n> whole `file read`s (no --offset: the last copy, t-103 R6) fail
+                      fullshort    every whole `file read` leaves out its last line (t-103 R6)
+                      slow:<cmd>   every <cmd> call (kill, ls, exec, ...) sleeps 3 s first (t-103 R10)
   STUB_HC_SUB       old=new: replaced in every exec's output (a remote that answers with another id)
   STUB_HC_ENVLOG    one JSON line per call: {argv: [command], env: the HC_* and PA_SUITE_HC_* it saw} (t-107 R13)
   STUB_HC_KEEP      a folder: each `file write` also keeps a copy there under the file's name (t-107: the bundle
@@ -293,6 +296,16 @@ def cmd_file(args):
             lines = f.read().splitlines(True)
     except OSError as e:
         fail("cannot read {}: {}".format(rest[0] if rest else "", e.strerror))
+    if "--offset" not in args:  # a whole read: the last copy (t-103 R6; the watcher's reads give --offset)
+        count = os.path.join(ROOT, machine or "local", "fullreads")
+        n = len(open(count).read()) if os.path.exists(count) else 0
+        with open(count, "a") as f:
+            f.write("x")
+        for f in FAILS:
+            if f.startswith("fullfail:") and n < int(f[9:]):
+                fail("stub failure of a whole read")
+        if "fullshort" in FAILS:
+            lines = lines[:-1]
     start = int(one(got, "--offset") or 1)
     limit = one(got, "--limit")
     chosen = lines[start - 1:] if limit is None else lines[start - 1:start - 1 + int(limit)]
@@ -312,6 +325,9 @@ def main():
         with open(envlog, "a") as f:
             f.write(json.dumps({"argv": args[:1], "env": {k: v for k, v in os.environ.items() if k.startswith(
                 ("HC_", "PA_SUITE_HC_"))}}) + "\n")
+    for f in FAILS:
+        if f.startswith("slow:") and args[:1] == [f[5:]]:
+            time.sleep(3)
     commands = {"exec": cmd_exec, "run": cmd_run, "kill": cmd_kill, "rm": cmd_rm, "ls": cmd_ls, "file": cmd_file}
     if not args or args[0] not in commands:
         fail("stub-hc: command {} not known".format(args[:1]), 2)

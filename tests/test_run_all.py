@@ -6,7 +6,8 @@ t-076: a part past its limit (3x its median, at least PA_PART_LIMIT) is stopped 
 has a progress file under HERDR_PA_HOME/suite-runs (p1-p2), --module runs one unit part (m1); t-079: a wait that
 answers at once for a running part waits for its end (r2d), a killed slot step stops the run (r8c), the run's own
 limit after the slot (s10, s11), git link guards (g5, g6); t-117: the slot step's own variables are not the parts'
-(s12, R16), an inherited PA_SUITE_HC_SCOPE without HC_SCOPE reaches no hc call (h3, R19). The real script runs
+(s12, R16), an inherited PA_SUITE_HC_SCOPE without HC_SCOPE reaches no hc call (h3, R19); t-103: the part list
+after its `=== parts` line, a failed part's tail never read as parts (f1, R14). The real script runs
 in a temp copy of the repo whose parts are stubs (stub.sh, chosen per part by STUB_<part>), so no real suite runs here."""
 import json
 import fcntl
@@ -50,6 +51,7 @@ case "$m" in
   fail) echo "PASS ok-case"; echo "FAIL K-x: boom"; echo "FAIL K-y: bang"; echo "end $k" >> "$STUB_DIR/events"; exit 1 ;;
   crash) i=1; while [ $i -le 50 ]; do echo "$k line $i"; i=$((i + 1)); done; exit 3 ;;
   quiet) exit 1 ;;
+  parts) echo "  inner part: ok (1s)"; echo "  inner other: FAILED (2s)"; echo "=== parts"; exit 3 ;;
   sleep:*) sleep "${m#sleep:}" ;;
   child) sleep 300 & c=$!
     echo "$$ $c" > "$STUB_DIR/$k.pids.new"; mv "$STUB_DIR/$k.pids.new" "$STUB_DIR/$k.pids"; wait ;;
@@ -318,6 +320,22 @@ class RunAll(unittest.TestCase):
         self.assertEqual(code, 1, out)
         self.assertIn("--- store harness: FAILED (no failing test named; its last 40 lines:)", self.summary(out))
         self.assertTrue(out.rstrip().splitlines()[-1].startswith("=== 1 part(s) failed: store harness (outputs: "), out)
+
+    def test_f1_a_failed_parts_tail_is_not_read_as_parts(self):
+        """t-103 R14: a failing part whose last lines look like parts (and hold a marker of their own): the record's
+        parts (parse_parts) are the summary's list only, which comes right after the last `=== parts` line."""
+        code, out = self.run_all(keeper="parts")
+        self.assertEqual(code, 1, out)
+        lines = out.rstrip().splitlines()
+        self.assertIn("    inner part: ok (1s)", lines)  # the tail, as before
+        self.assertEqual(lines[-len(NAMES) - 2], "=== parts", out)
+        spec = importlib.util.spec_from_file_location("pa_suite_f1", os.path.join(HERE, "..", "runtime", "tools",
+                                                                                "pa_suite.py"))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        parts = module.parse_parts(out)
+        self.assertEqual([p["name"] for p in parts], NAMES, parts)
+        self.assertEqual([p["name"] for p in parts if not p["ok"]], ["keeper harness"])
 
     def test_r3_fixed_order(self):
         code, out = self.run_all(keeper="sleep:2")

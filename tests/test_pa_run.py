@@ -31,6 +31,8 @@ t-117 (the limits from t-107 J1 and J2; spec R-numbers):
   q11 R11: a patch too large to send: this Mac with "mac" (saying why), 125 with "none"
   q12 R12: --overlay words are literal paths
   q13 R13: suiteMachines with no usable entry and "none": 125
+t-103 J1: j1a a run there that died without its code ends at once, 124 (R5); j1b-c a failed cleanup after a setup
+failure is left for the next run's sweep (R7)
 """
 import base64
 import contextlib
@@ -1268,6 +1270,69 @@ class Q13NoUsableMachine(Run):
         self.assertEqual(code, 0, out)
         self.assertIn("remote unset", out)
         self.assertIn("bad name!", out)
+
+
+class J1Dead(Run):
+    """t-103 R5 (AC5.2): the run's sh there killed without writing its code: pa-run ends within a few polls with 124
+    (as a lost machine) and the note, not after REMOTE_TIMEOUT; cleaned and recorded."""
+
+    def test_j1a_a_killed_remote_run_ends_at_once_with_124(self):
+        go = os.path.join(self.tmp, "never")
+        self.addCleanup(lambda: write(go, "go\n"))
+        log = os.path.join(self.tmp, "bg.out")
+        with open(log, "w") as f:
+            p = subprocess.Popen([sys.executable, PA_RUN, "--", "sh", "probe.sh", "wait=" + go], cwd=self.wt,
+                                 stdin=subprocess.DEVNULL, stdout=f, stderr=subprocess.STDOUT)
+        self.addCleanup(lambda: (p.poll() is None and p.kill(), p.wait()))
+        self.assertTrue(self.until(lambda: RUN.search(pa.read_text(log) or "")), pa.read_text(log))
+        run = self.run_id(pa.read_text(log))
+        self.assertTrue(self.until(lambda: os.path.exists(os.path.join(self.remote_folder(run), "t0"))))
+        pid = self.until(lambda: tpr.remote_sh(self.stub))
+        self.assertTrue(pid)
+        os.kill(pid, signal.SIGKILL)
+        try:
+            code = p.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            self.fail("pa-run still waits after the run there was killed: " + (pa.read_text(log) or ""))
+        self.assertEqual(code, 124, pa.read_text(log))
+        self.assertIn("the run on box-1 ended without an exit code after", pa.read_text(log))
+        row = self.run_rows()[-1]
+        self.assertEqual((row["run"], row["exit"], row["place"]), (run, 124, "box-1"))
+        self.assertIn("ended without an exit code", row.get("note") or "")
+        self.assertFalse(os.path.exists(self.remote_folder(run)))
+        self.assertEqual(self.progress(run).get("exit"), 124)
+
+
+class J1Leftover(Run):
+    """t-103 R7 (AC7.1, AC7.2) for pa-run: setup fails and the rm -rf fails: `leftover`, not `cleaned`, and the next
+    run on the machine removes the folder; a cleanup that worked is `cleaned`, no `leftover`."""
+
+    def test_j1b_a_failed_cleanup_is_left_for_the_next_run(self):
+        self.setenv(STUB_HC_FAIL="match:clone,match:rm -rf")
+        code, out = self.pa_run("--", "sh", "probe.sh")
+        self.assertEqual(code, 0, out)
+        run = self.run_id(out)
+        self.assertIn("this Mac", out)
+        row = self.progress(run)
+        self.assertNotEqual(row.get("cleaned"), True, row)
+        self.assertEqual(row.get("leftover"), {"machine": "box-1", "folder": "/tmp/pa-suite-" + run, "terminal": None})
+        self.assertTrue(os.path.isdir(self.remote_folder(run)))
+        self.setenv(STUB_HC_FAIL=None)
+        code, out = self.pa_run("--", "sh", "probe.sh")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.run_rows()[-1]["place"], "box-1")
+        self.assertFalse(os.path.exists(self.remote_folder(run)), out)
+        row = self.progress(run)
+        self.assertIs(row.get("cleaned"), True, row)
+        self.assertFalse(row.get("leftover"), row)
+
+    def test_j1c_a_cleanup_that_worked_is_cleaned(self):
+        self.setenv(STUB_HC_FAIL="match:clone")
+        code, out = self.pa_run("--", "sh", "probe.sh")
+        self.assertEqual(code, 0, out)
+        row = self.progress(self.run_id(out))
+        self.assertIs(row.get("cleaned"), True, row)
+        self.assertFalse(row.get("leftover"), row)
 
 
 if __name__ == "__main__":
