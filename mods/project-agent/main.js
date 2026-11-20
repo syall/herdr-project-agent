@@ -15,7 +15,7 @@
 import { View, div } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, ScrollHandle } from "gpui-base";
 import { spaces, panes, agents, terminals, machines, theme, run, props, home, notify, shared, setShared, closeOverlay, openOverlay, window, layout } from "herdr";
-import { Host, gaveUp, read as hostRead, run as hostRun, watch, refusalLine } from "./host.js";
+import { Host, gaveUp, read as hostRead, run as hostRun, watch, refusalLine, QUIET_MS } from "./host.js";
 import { loadSpace, loadLedger, loadQueue, loadWaiting, loadStartOrder, writeStartOrder, loadMachines, loadTaskOrder, writeTaskOrder, loadProfile, loadDecisions, loadRules, TIMED_OUT, READ_LIMIT, answerDecision, notifyOrchestrator, changeRules, touched, localId, paHome, stateDir, taskActions, taskLinks, evidenceTasks, cardEvidence, staleInstructions, liveTarget, lookAlike, OPEN_REQUESTS, keeperJudging, startingLabels, OTHER, OTHER_MAX, OTHER_TOO_LONG, isOther, oneLine, codeState, codeBadge, loadCode, restartArgs, runRestart, restartOutcome, endTerminalLine, RESTART_MARK, RESTART_MARK_TTL, RESTARTED_FOR, RESTART_TIMEOUT, DRY_TIMEOUT, contextSettings, loadContext, contextLine, contextAt, contextArgs, runContext, contextOutcome, resetLine, CONTEXT_FOR } from "./store.js";
 import { RulesPane, arm, armHolds, fieldState, noticeText as rulesNotice, mergeNotices as mergeRuleNotices } from "./rules.js"; // arm, armHolds: the two-click Delete (ARM_WAIT, 10 s)
 import { queueRows, queueLabel, renderQueue, at as atZone } from "./queue.js"; // t-055: the Queue view (read only)
@@ -39,6 +39,7 @@ const TASK_FOCUS = ["head", "top", "up", "down", "bottom", "next"]; // t-142: a 
 const OPEN_WAIT = 30000; // an Open request with nothing started by then: say why, offer the button again
 const OPEN_SLOW = 180000; // its new tab is recorded but its launcher has not started by then: say so
 const paRecords = (spaceId) => Object.values(shared("project-agent.tabs") ?? {}).filter((r) => r?.space === spaceId);
+const WATCH_BACKOFF_MAX = 60000; // t-116: a refused folder watch is tried again at most this far apart
 const LOAD_LIMIT = READ_LIMIT + 1000; // a load with no read settled or timed out for this long is given up: a new one may start
 const CACHE_MAX = 8; // spaces whose last load is kept (in memory), the least recently shown dropped first
 const CACHE_OLD = 60000; // a kept load older than this says "updating…" while its refresh runs
@@ -247,10 +248,21 @@ export default class ProjectAgent extends View {
     cx.timer.every(10000, (cx) => { this.reload(cx, BG); this.resend(cx); });
     cx.timer.every(1000, (cx) => { this.wake(cx); this.costsDue(cx); this.deferredDue(cx); if ((this.armed && !this.armedTask(this.space, this.armed.what ?? "delete")) || (this.rules.armed && !this.rules.armedRule(this.space))) cx.notify(); if (this.placeMark && Date.now() >= this.placeMark.until) { this.placeMark = null; cx.notify(); } }); // shown again (render may not run for a hidden copy); an armed Delete timed out; a badge's mark ended
     // Changes under spaces/ (one watch, D3): a batch reloads only for what the panel shows (watched()), coalesced.
+    // t-116 (t-053 RL-6): a watch the runtime refused (or that threw) is started again after a back-off: QUIET_MS, doubling
+    // up to WATCH_BACKOFF_MAX, back to QUIET_MS after a batch. One sleep at a time, counted by the Host; a sleep the runtime
+    // refuses ends the loop (the 10 s timer still reloads).
     this.host.spawn(cx, async (cx) => {
+      let backoff = QUIET_MS;
       for (;;) {
         let paths;
-        try { paths = await watch(`${paHome(null)}/spaces`, this.host); } catch { return; }
+        try { paths = await watch(`${paHome(null)}/spaces`, this.host); }
+        catch {
+          const end = this.host.hold();
+          try { await cx.sleep(backoff); } catch { return; } finally { end(); }
+          backoff = Math.min(backoff * 2, WATCH_BACKOFF_MAX);
+          continue;
+        }
+        backoff = QUIET_MS;
         if (this.watched(paths)) this.reload(cx, BG);
       }
     }, { what: "the folder watch", background: false });
