@@ -437,6 +437,15 @@ class R7Stack(Limits):
         need = self.stacked_need("t-C")
         self.assertEqual((need["oldBase"], need["newBase"]), (self.m0, self.tip("t-B")), need)
 
+    def test_r7_a_pre_ship_entry_below_ends_the_walk_with_no_pair(self):
+        # Round 2 (REVIEW.md finding 1): t-B was queued before stackedOn existed; t-C stacked on it gets no partial
+        # pair (t-B's change only) but waits for a card
+        self.three()
+        self.set_entries(lambda r: [e.pop("stackedOn", None) for e in r["entries"] if e["task"] == "t-B"])
+        self.passed("t-A", "t-B", "t-C")
+        self.assertIsNone(self.stacked_need("t-C"), self.entry("t-C"))
+        self.assertIsNone(pa_queue.stack_pair(self.qrepo(), self.entry("t-C")))
+
     def test_r7_two_entries_keep_todays_pair(self):
         a, b = self.two()
         self.smerge()
@@ -467,6 +476,21 @@ class R15Unstacked(Limits):
         code, out, err = self.smerge()
         self.assertEqual(self.standing_merged(), ["t-A"], out + err)
         self.assertIn("waits at t-B: stacked: waiting for its independence review", out)
+
+    def test_r15_the_entry_below_merged_and_main_moved_restack_onto_main_unstacks_it(self):
+        # Round 2 (VERIFY.md RL-v1): Q3's literal reading: t-A merged, then main moved by another commit; restack
+        # rebases t-B straight onto main, so it is no longer stacked: no stacked review, its suite runs again
+        self.two()
+        code, out, err = self.smerge()
+        self.assertEqual(self.standing_merged(), ["t-A"], out + err)
+        self.on_main("other.txt", "other\n")
+        code, out, err = self.refresh("--no-merge")
+        self.assertEqual(code, 0, out + err)
+        e = self.entry("t-B")
+        self.assertEqual((e["onto"], e.get("stacked"), e.get("stackedOn")), ("main", False, None), e)
+        self.assertNotIn("stacked", e.get("needs") or {}, e)
+        self.assertFalse(((e.get("needs") or {}).get("independence") or {}).get("standing"), e)
+        self.assertEqual((e["state"], e["suite"]), ("checking", None), e)
 
 
 # ---- R8: only the current Project Agent terminal ------------------------------------------------------------
