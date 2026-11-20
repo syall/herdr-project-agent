@@ -7318,6 +7318,51 @@ cases["P134-4-merge-copies"] = async () => { // t-085 nit: mergeNotices leaves t
   check(JSON.stringify(b.rules) === JSON.stringify(["r-b", "r-a"]), `the later one too (got ${JSON.stringify(b)})`);
 };
 
+// t-134 round 2: a form belongs to the space it was opened in. ruleSpace2(): a second space B with its own rules.
+function ruleSpace2() {
+  const S2 = "sp2", D2 = "/home/u/.config/herdr-pa/spaces/sp2", R2 = `:${D2}/rules.json`;
+  g.__spaces.push({ id: S2, name: "other", machine: null, folder: "/other", active: false, tabs: [{ id: "tb2", index: 1, name: "1", named: false }] });
+  g.__files[`:${D2}/agent.json`] = JSON.stringify({ space: S2, project: "/other", profile: "test", name: "other" });
+  g.__files[`:${D2}/ledger.json`] = JSON.stringify({ tasks: [] });
+  g.__files[R2] = JSON.stringify({ rules: [rule("r-one", "Other one")] });
+  return { S2, R2 };
+}
+
+cases["P134-5-refill-not-in-other-space"] = async () => { // a write refused in A after a switch to B: no A form in B, nothing written in B
+  const v = await ruleWorld();
+  const { S2, R2 } = ruleSpace2(), b = g.__files[R2];
+  await press(v, "rule-add");
+  for (const [k, s] of Object.entries({ title: "Late", text: "Late text", id: "r-late" })) v.rules.form.inputs[k].set(s);
+  const d2 = ruleDoc(); d2.rules.push(rule("r-late", "Someone else's")); g.__files[RULES] = JSON.stringify(d2); // taken meanwhile: the write is refused
+  g.__hang = [RULES];
+  await press(v, "rule-save"); await settle();
+  show(S2); v.reload(cx); await settle();
+  check(v.space === S2 && look(v).text.includes("Other one"), `B's Rules view is shown (got ${v.space})`);
+  g.__hang = []; await settle(); await settle();
+  check(!v.rules.form, `no A form kept for B (got ${JSON.stringify(v.rules.form && { id: v.rules.form.id, space: v.rules.form.space })})`);
+  check(!look(v).clicks["rule-save"] && !look(v).text.includes("New rule"), "no form drawn in B");
+  check(look(v).text.includes("Other one") && !look(v).text.includes("Someone else's"), `B's view still lists B's rules, not A's (got ${look(v).text.slice(0, 300)})`);
+  await press(v, "rule-add"); v.rules.form.inputs.title.set("In B"); v.rules.form.inputs.text.set("B text");
+  await press(v, "rule-save"); await settle();
+  check(g.__files[R2] !== b && JSON.parse(g.__files[R2]).rules.map((r) => r.id).join(",") === "r-in-b,r-one", `only B's own form writes B (got ${g.__files[R2]})`);
+  check(!JSON.parse(g.__files[R2]).rules.some((r) => r.id === "r-late"), "no A rule in B");
+};
+
+cases["P134-6-open-form-not-saved-in-other-space"] = async () => { // an A form left open across a switch to B is never saved into B
+  const v = await ruleWorld();
+  const { S2, R2 } = ruleSpace2(), b = g.__files[R2], a = g.__files[RULES];
+  await press(v, "rule-edit-r-one"); v.rules.form.inputs.text.set("One, typed in A");
+  show(S2); v.reload(cx); await settle();
+  check(v.space === S2, `B shown (got ${v.space})`);
+  check(!look(v).clicks["rule-save"] && !look(v).text.includes("Edit r-one"), "the A form is not drawn in B");
+  if (v.rules.form) { v.rules.submit(g.__spaces.find((s) => s.id === S2), cx, () => {}); await settle(); } // even asked directly
+  check(g.__files[R2] === b, `B's rules.json untouched (got ${g.__files[R2]})`);
+  check(g.__files[RULES] === a, "nor A's");
+  await press(v, "rule-add"); v.rules.form.inputs.title.set("In B"); v.rules.form.inputs.text.set("B text");
+  await press(v, "rule-save"); await settle();
+  check(JSON.parse(g.__files[R2]).rules.map((r) => r.id).join(",") === "r-in-b,r-one", `a form opened in B saves into B (got ${g.__files[R2]})`);
+};
+
 // ---- t-131: limits from t-100, t-061/t-054 (t-064), t-046 J3 (t-075) and t-020 J6 ----------------------------------
 cases["P131-push-chosen-slow-reload"] = async () => { // t-100 RL1: after a Push from here, before the slow reload reads it answered, Push is drawn chosen
   let file;
