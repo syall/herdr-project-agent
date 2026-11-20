@@ -30,6 +30,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -1288,13 +1289,23 @@ class X25Sent(StepBase):
         run = self.run_id(out)
         folder = "/tmp/pa-suite-" + run
         actions = []
+        # The fixture's own temp roots are random (mkdtemp under TMPDIR) and may hold "x1" (t-158): blank them,
+        # longest first, so the check below sees only words the run chose, never a path the fixture drew.
+        roots = set()
+        for root in (tps.TMP, os.environ.get("TMPDIR"), tempfile.gettempdir()):
+            if root and root.rstrip("/"):
+                roots.update((root.rstrip("/"), os.path.realpath(root)))
+        roots = sorted(roots, key=len, reverse=True)
         for c in self.calls():
             text = c[-1] if c and c[0] in ("exec", "run") else ""
             for m in re.finditer(r"(\S+/step) (\w+) (\S+)", text):
                 self.assertEqual((m.group(1), m.group(3)), (folder + "/step", folder), text)
                 actions.append(m.group(2))
-            self.assertNotIn("x1", " ".join(c))
-            self.assertNotIn("Flavour", " ".join(c))
+            sent = " ".join(c)
+            for root in roots:
+                sent = sent.replace(root, "<tmp>")
+            self.assertNotIn("x1", sent)
+            self.assertNotIn("Flavour", sent)
         self.assertEqual(actions, ["probe", "prepare", "run"])
         run_call = [c for c in self.calls() if c[0] == "run"][0]
         self.assertEqual(run_call[run_call.index("--cwd") + 1], folder)
