@@ -708,6 +708,23 @@ class A11Merge(Standing):
         self.assertEqual([(x.get("card"), x.get("standing")) for x in m], [(None, RULE), (None, RULE)])
         self.assertIn("--standing " + RULE, out)
 
+    def test_a11_1b_the_independence_review_sees_what_it_is_stacked_on(self):  # fix round 2, REVIEW-2 MF-1
+        a, b = self.two()
+        code, out, err = self.smerge()
+        self.assertEqual(self.standing_merged(), ["t-A"], out + err)
+        need = self.entry("t-B")["needs"]["independence"]
+        self.assertNotEqual(need["oldBase"], need["newBase"], need)
+        self.assertEqual((need["oldBase"], need["newBase"]), (self.m0, a), need)
+        stacked_on = sh(self.proj, "git", "diff", "--name-only", need["oldBase"], need["newBase"]).split()
+        self.assertEqual(stacked_on, ["fa.txt"])
+        change = sh(self.proj, "git", "diff", "--name-only", need["newBase"], need["tip"]).split()
+        self.assertEqual(change, ["fb.txt"])
+        self.assertIn("what it is stacked on: git diff {} {}".format(self.m0, a), out)
+        question = [l for l in out.splitlines() if l.strip().startswith("question:")]
+        self.assertEqual(len(question), 1, out)
+        self.assertIn("stacked on", question[0])
+        self.assertNotIn("since its passing suite", question[0])
+
     def test_a11_2_rule_not_in_force(self):
         self.two()
         self.rules([person_rule(status="off")])
@@ -811,6 +828,25 @@ class A13Stops(Standing):
         self.refused("hold")
         self.assertEqual(len(self.stops()), 1)
 
+    def raw_journal(self, *lines):
+        with open(os.path.join(self.dir, "journal.jsonl"), "a", encoding="utf-8") as f:
+            for line in lines:
+                f.write(line + "\n")
+
+    def test_a13_1b_a_torn_hold_line_stops_as_pa_places_reads_it(self):  # fix round 2, REVIEW-2 MF-2
+        self.raw_journal('{"by": "person", "hold": "o')
+        self.refused("hold is unknown")
+        self.assertEqual(len(self.stops()), 1)
+
+    def test_a13_1c_a_broken_line_after_the_last_hold_line_stops(self):  # fix round 2, REVIEW-2 MF-2
+        pa_hooks.append_journal(self.dir, {"by": "person", "hold": "off"})
+        self.raw_journal("not json")
+        code, out = self.spush()
+        self.assertEqual((code, out["refusal"]["check"]), (1, "C0"), out)
+        self.assertIn("hold is unknown", out["refusal"]["message"])
+        self.assertEqual(len(self.stops()), 1)
+        self.assertEqual(self.merged(), [])
+
     def test_a13_2_an_other_answer_on_any_card(self):
         dump({"id": "d-8", "task": "t-Z", "status": "answered", "answer": "Other", "other": True, "note": "wait",
               "answered": pa.now(), "question": "Q?", "options": []}, os.path.join(self.dir, "decisions-archive", "d-8.json"))
@@ -874,6 +910,13 @@ class A14Push(Standing):
         self.merged_two()
         code, out = self.spush(env=PERSON_ENV, tree=PANEL_TREE)
         self.assertEqual((code, out["refusal"]["check"]), (1, "C0"), out)
+        self.assertEqual(self.remote(), "refs/heads/main " + self.m0)
+
+    def test_a14_2c_a_person_in_the_pas_terminal_is_not_an_agent(self):  # fix round 2, VERIFY MF-1
+        self.merged_two()
+        code, out = self.spush(env=dict(PERSON_ENV, HC_TERMINAL_ID="t0"), tree=PANEL_TREE)
+        self.assertEqual((code, out["refusal"]["check"]), (1, "C0"), out)
+        self.assertIn("not an agent", out["refusal"]["message"])
         self.assertEqual(self.remote(), "refs/heads/main " + self.m0)
 
     def test_a14_3_rule_not_in_force_or_stopped(self):
