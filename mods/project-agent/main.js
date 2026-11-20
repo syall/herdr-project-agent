@@ -820,8 +820,10 @@ export default class ProjectAgent extends View {
     // is named, and so is the date in its "as of". One time gives both the day and the "as of".
     const now = Date.now(), at = costs && costs.readAt ? contextAt(costs.summary, costs.readAt) : null;
     const read = at !== null ? contextLine(costs.summary?.paContext, at, now) : null;
+    // t-116 (RL-J5-3): the "as of" in UTC, as the day is: "07:59 UTC", with its date ("11-18 23:50 UTC") when that UTC day
+    // is not today's. The person's zone is not used for this line (the reset line keeps the panel's clock).
     const readIso = at !== null ? new Date(at).toISOString() : null;
-    const asOf = readIso && readIso.slice(0, 10) !== new Date(now).toISOString().slice(0, 10) ? atZone(readIso) : clock(readIso);
+    const asOf = readIso ? `${readIso.slice(0, 10) !== new Date(now).toISOString().slice(0, 10) ? `${readIso.slice(5, 10)} ` : ""}${readIso.slice(11, 16)} UTC` : null;
     // t-116 (RL-J5-1): no read of the Costs view has answered yet (it runs, or it failed): said, never silent. A read
     // that answered with no summary draws no line; a later read that failed keeps the old figures and their "as of".
     const line = read ? `${read} (as of ${asOf})` : !costs?.readAt ? NOT_READ_LINE : null;
