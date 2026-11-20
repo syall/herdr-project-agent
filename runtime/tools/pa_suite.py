@@ -2473,6 +2473,7 @@ def run_remote(h, args, record, directory, command, evidence, build_log, where, 
     start, load, began = pa.now(), load_now(), time.time()
     terminal, child, watcher, side, notes = None, None, None, None, []
     saved, prep, step_tools, ran_from, ran_there = {}, None, {}, None, None
+    wrote = {"log": False, "record": False}  # t-180: what the catch-all must not write twice
 
     def on_signal(sig, frame):
         raise Interrupted(SIGNAL_EXIT.get(sig, 1))
@@ -2601,6 +2602,7 @@ def run_remote(h, args, record, directory, command, evidence, build_log, where, 
         with open(build_log, "a") as f:
             f.write("=== {} full suite: `{}` in {} on {} ({}) -> exit {} after {:.0f}s ===\n{}\n".format(
                 end, command, root, machine, os_name, code, seconds, h.tail(out, 200)))
+        wrote["log"] = True
         partial = watcher.partial  # t-103 R6: no parts from an incomplete copy
         parts = ([] if partial else [dict(p, place=machine) for p in parse_parts(remote_text)]) + \
                 [dict(p, place="local") for p in parse_parts(local_text)]
@@ -2618,6 +2620,7 @@ def run_remote(h, args, record, directory, command, evidence, build_log, where, 
         if change:
             extra["moved"] = True
         try:
+            wrote["record"] = True  # tried: a record written before an error that follows is not written again
             h.suite_record(directory, record, command, code, seconds, found, extra)
             recorded = "recorded in " + where
         except OSError as e:
@@ -2652,6 +2655,35 @@ def run_remote(h, args, record, directory, command, evidence, build_log, where, 
         update_progress(progress, state="done", exit=e.code, end=pa.now(), note="interrupted",
                         cleaned=not [n for n in left if n.startswith("rm -rf")])
         return e.code
+    except SetupFailed:  # nothing ran there; cleaned above; the caller goes this Mac's way
+        raise
+    except BaseException as e:  # t-180 (pa-run's t-117 R5): anything else: end and clean the run there, record it
+        try:                    # (exit 1, never 0) unless that was done, then raise the first error
+            hush()
+            if child is not None and child.poll() is None:
+                stop_group(child)
+            if watcher is not None:
+                watcher.stop()
+            left = cleanup(machine, run, terminal)
+            for n in left:
+                log("pa-full-suite: cleanup on {}: {}".format(machine, n))
+            note = "pa-full-suite failed: {}: {}".format(type(e).__name__, e)
+            if wrote["record"]:
+                update_progress(progress, cleaned=not [n for n in left if n.startswith("rm -rf")])
+            else:
+                seconds, end = round(time.time() - began, 1), pa.now()
+                update_progress(progress, state="done", exit=1, end=end, note=note,
+                                cleaned=not [n for n in left if n.startswith("rm -rf")])
+                if not wrote["log"]:
+                    with open(build_log, "a") as f:
+                        f.write("=== {} full suite: `{}` in {} on {} ({}) -> exit 1 after {:.0f}s ===\n{}\n".format(
+                            end, command, root, machine, os_name, seconds, note))
+                h.suite_record(directory, record, command, 1, seconds, found, {
+                    "run": run, "start": start, "end": end, "waited": waited, "load": load, "parts": [],
+                    "output": output, "machine": machine, "os": os_name, "note": note})
+        except Exception:  # noqa: BLE001 - the first error is the one raised
+            pass
+        raise
     finally:
         for sig, old in saved.items():
             signal.signal(sig, old)
