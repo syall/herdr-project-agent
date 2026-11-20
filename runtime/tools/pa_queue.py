@@ -795,11 +795,14 @@ def restack(ctx, data, rec, dry=False):
 def record_reviews(ctx, rec):
     """refresh (a): a short review file the tool named, valid, becomes one line of content/reviews.jsonl."""
     have = pa_hooks.review_runs(ctx.directory)
-    for e, need in [(e, (e.get("needs") or {}).get(k)) for e in rec["entries"] for k in ("shortReview", "independence")]:
+    for e, need in [(e, (e.get("needs") or {}).get(k)) for e in rec["entries"] for k in ("shortReview", "independence", "stacked")]:
         tip = ctx.tip(e["branch"])
         ind = bool(need) and need.get("kind") == "independent"  # r-disjoint-carry's review is recorded apart (d-202)
+        # t-140 R12 (fix round 3): the rule's stacked review is recorded apart from the carry review, with its pair
+        mark = (bool(need.get("standing")), need.get("oldBase"), need.get("newBase")) if ind and need.get("standing") else (False,)
         if not need or need.get("tip") != tip or any(r.get("task") == e["task"] and r.get("tip") == tip and
-                                                     (r.get("about") == "independent") == ind for r in have):
+                                                     (r.get("about") == "independent") == ind and review_mark(r) == mark
+                                                     for r in have):
             continue
         path = os.path.join(ctx.directory, "evidence", e["task"], need["file"])
         if not os.path.isfile(path):
@@ -845,12 +848,20 @@ def record_reviews(ctx, rec):
                 "verdict": "pass" if verdict[-1] == "pass" else "must fix", "about": need.get("kind") or "moved"}
         if ind:
             line["independent"] = independent[-1].lower() == "yes"
+        if mark[0]:
+            line.update(standing=True, oldBase=need.get("oldBase"), newBase=need.get("newBase"))
         os.makedirs(pa_hooks.content_dir(ctx.directory), exist_ok=True)
         with open(os.path.join(pa_hooks.content_dir(ctx.directory), REVIEWS_FILE), "a") as f:
             f.write(json.dumps(line) + "\n")
         have.append(line)
         ctx.event("review", e, file=need["file"], verdict=line["verdict"], started=line["started"], ended=line["ended"],
                   seconds=line["seconds"], worker=address)
+
+
+def review_mark(r):
+    """What a reviews.jsonl line answered: (False,) for every review but the rule's stacked one, which carries
+    (True, oldBase, newBase): the change of the entry it was stacked on (t-140 R12)."""
+    return (True, r.get("oldBase"), r.get("newBase")) if r.get("standing") else (False,)
 
 
 # ---- printing -----------------------------------------------------------------------------------
@@ -1202,7 +1213,7 @@ def carry(ctx, rec, e, tip, tree, task, d, suites, reviews):
         return no("a file of the change changed under it since its check: " + ", ".join(shared[:5]))
     r = latest(reviews, lambda x: x.get("task") == e["task"] and (x.get("job") or None) == (e.get("job") or None)
                and x.get("common") == rec["common"] and x.get("tip") == tip and tree and x.get("tree") == tree
-               and x.get("about") == "independent")
+               and x.get("about") == "independent" and not x.get("standing"))
     out = {"ok": False, "eligible": True, "suite": run, "from": at, "fromBase": at_base, "review": r}
     if not r:
         return dict(out, why="waiting for its independence review (r-disjoint-carry)")
@@ -1807,11 +1818,14 @@ def stacked(e, rec):
     return any(isinstance(r, dict) and r.get("onto") and r.get("onto") != rec["main"] for r in e.get("rebases") or [])
 
 
-def independence_passed(ctx, rec, e, tip, reviews):
+def independence_passed(ctx, rec, e, tip, reviews, below):
+    """The rule's stacked review of e at tip (R12): a line recorded for needs.stacked, for this tip and tree, that
+    compared it with below (stacked_on's pair). A carry review (r-disjoint-carry) answers another question and pair:
+    it never counts here (fix round 3, REVIEW-r2-1 MF-1)."""
     tree = ctx.tree(tip)
     r = latest(reviews, lambda x: x.get("task") == e["task"] and (x.get("job") or None) == (e.get("job") or None)
                and x.get("common") == rec["common"] and x.get("tip") == tip and tree and x.get("tree") == tree
-               and x.get("about") == "independent")
+               and x.get("about") == "independent" and below is not None and review_mark(x) == (True,) + tuple(below))
     return r, tree
 
 
@@ -1827,12 +1841,12 @@ def stacked_on(rec, e):
 
 
 def standing_need(ctx, rec, e, tip, below):
-    """The independence review the rule asks of a stacked entry, for its tip (R12), recorded as needs.independence (as
-    r-disjoint-carry's): record_reviews takes it, pa-queue brief hands it to a reviewer. below: stacked_on's pair, the
-    change of the entry it was stacked on."""
+    """The independence review the rule asks of a stacked entry, for its tip (R12), recorded as a need (as
+    r-disjoint-carry's, but as needs.stacked, beside a carry need it never replaces): record_reviews takes it, pa-queue
+    brief hands it to a reviewer. below: stacked_on's pair, the change of the entry it was stacked on."""
     n = max(1, len(e.get("rebases") or []))
     return {"tip": tip, "tree": ctx.tree(tip), "since": now(), "kind": "independent", "standing": True,
-            "file": "SHORT-REVIEW-{}{}-{}.md".format(e["task"], "-" + e["job"] if e.get("job") else "", n),
+            "file": "SHORT-REVIEW-{}{}-stacked-{}.md".format(e["task"], "-" + e["job"] if e.get("job") else "", n),
             "oldBase": below[0], "newBase": below[1]}
 
 
@@ -1895,8 +1909,10 @@ def stop_cause(why, void):
 def merge_standing(ctx, data, rec, rule, binding, space_id):
     """R11: under both locks, from the front: an entry with a card approval merges as today (its push card follows);
     else an entry eligible under R12 gets a standing approval and merges; the first that is not ends the run. A cause
-    the rule names writes the stop line (pa_push.write_stop). (lines, stopped)."""
-    lines, card_merged, rule_merged, stopped = [], [], [], None
+    the rule names writes the stop line (pa_push.write_stop). One order for each entry on the rule (fix round 3): the
+    rule's waits (R12), then merge_check (a stop cause stops, else a wait), then, for a stacked entry, the stacked
+    review of its checked tip against what it was stacked on, then the merge. (lines, stopped)."""
+    lines, merged, stopped = [], [], None
     suites, reviews = pa_hooks.suite_runs(ctx.directory), pa_hooks.review_runs(ctx.directory)
     rid, sha = rule["id"], binding["standing"]["textSha"]
     while rec["entries"]:
@@ -1909,32 +1925,9 @@ def merge_standing(ctx, data, rec, rule, binding, space_id):
                 stop_at(ctx, e, why, void, main_tip, lines)
                 break
             merged_record(ctx, data, rec, e, main_tip, suite, lines)
-            card_merged.append(e)
+            merged.append((e, False))
             continue
-        task = ctx.task(e["task"])
-        wait = standing_wait(ctx, rec, e, task)
-        tip = ctx.tip(e["branch"])
-        if not wait and stacked(e, rec):
-            r, _tree = independence_passed(ctx, rec, e, tip, reviews)
-            if r and (r.get("verdict") != "pass" or r.get("independent") is not True):
-                stopped = "{}: its independence review did not find it independent".format(e["task"])
-                lines.append("stopped at {}: {}".format(label(e), stopped))
-                break
-            if not r:
-                need = (e.get("needs") or {}).get("independence")
-                below = stacked_on(rec, e)
-                if not below:
-                    wait = "stacked: what it was stacked on cannot be told from the merged entries (no merged entry " \
-                           "ends at its base {}); open a queue card".format(short(e.get("base")))
-                elif not (isinstance(need, dict) and need.get("tip") == tip
-                          and (not need.get("standing") or (need.get("oldBase"), need.get("newBase")) == below)):
-                    need = standing_need(ctx, rec, e, tip, below)
-                    e["needs"] = dict(e.get("needs") or {}, independence=need)
-                    ctx.event("standing-need", e, file=need["file"], tip=tip, rule=rid)
-                    save(ctx, data, rec)
-                    lines += standing_lines(e, need)
-                if below:
-                    wait = "stacked: waiting for its independence review {}".format(need["file"])
+        wait = standing_wait(ctx, rec, e, ctx.task(e["task"]))
         if wait:
             lines.append("waits at {}: {}".format(label(e), wait))
             break
@@ -1943,23 +1936,45 @@ def merge_standing(ctx, data, rec, rule, binding, space_id):
                          "option": None, "card": None, "commit": c.get("commit"), "change": c.get("change"),
                          "sequence": c.get("sequence"), "added": e.get("added"), "instance": e.get("instance"), "void": None}
         why, void, suite = merge_check(ctx, rec, e, main_tip, suites, reviews)
+        if why and stop_cause(why, void):
+            stop_at(ctx, e, why, True, main_tip, lines)
+            stopped = "{}: {}".format(e["task"], why)
+            break
+        if not why and stacked(e, rec):
+            tip = e["tip"]  # the checked tip: merge_check found the branch at it
+            below = stacked_on(rec, e)
+            r = independence_passed(ctx, rec, e, tip, reviews, below)[0] if below else None
+            if r and (r.get("verdict") != "pass" or r.get("independent") is not True):
+                stopped = "{}: its independence review did not find it independent".format(e["task"])
+                stop_at(ctx, e, "its independence review did not find it independent", True, main_tip, lines)
+                break
+            if not below:
+                why = "stacked: what it was stacked on cannot be told from the merged entries (no merged entry " \
+                      "ends at its base {}); open a queue card".format(short(e.get("base")))
+            elif not r:
+                need = (e.get("needs") or {}).get("stacked")
+                if not (isinstance(need, dict) and need.get("tip") == tip and need.get("standing")
+                        and (need.get("oldBase"), need.get("newBase")) == below):
+                    e["approval"] = None  # never saved with the need
+                    need = standing_need(ctx, rec, e, tip, below)
+                    e["needs"] = dict(e.get("needs") or {}, stacked=need)
+                    ctx.event("standing-need", e, file=need["file"], tip=tip, rule=rid)
+                    save(ctx, data, rec)
+                    lines += standing_lines(e, need)
+                why = "stacked: waiting for its independence review {}".format(need["file"])
         why = why or ff_merge(ctx, rec, e, e["tip"])
         if why:
-            if stop_cause(why, void):
-                stop_at(ctx, e, why, True, main_tip, lines)
-                stopped = "{}: {}".format(e["task"], why)
-            else:
-                e["approval"] = None  # a wait: the standing approval is not kept (R11 (5))
-                lines.append("waits at {}: {}".format(label(e), why))
+            e["approval"] = None  # a wait: the standing approval is not kept (R11 (5))
+            lines.append("waits at {}: {}".format(label(e), why))
             break
         merged_record(ctx, data, rec, e, main_tip, suite, lines, standing=rid, textSha=sha)
-        rule_merged.append(e)
+        merged.append((e, True))
         limits = recorded_limits(ctx.directory, e["task"])
         lines.append("report: merged {} into {} on rule {}{}".format(label(e), rec["main"], rid, "; Recorded limits: " +
                                                                      " | ".join(limits) if limits else "; no Recorded limits"))
-    if card_merged:
-        lines += push_card(ctx, rec, (rule_merged or card_merged)[-1]["task"])
-    elif rule_merged and not stopped:
+    if any(not on_rule for _e, on_rule in merged):
+        lines += push_card(ctx, rec, merged[-1][0]["task"])  # D13: the push card is for the last merge of the run
+    elif merged and not stopped:
         lines.append("next: pa-push-main run --standing {} --repo {} --space {} (pushes the rule's merges; then "
                      "pa-install-all as r-pa-installs says)".format(rid, ctx.repo, space_id))
     return lines, stopped
@@ -2045,9 +2060,9 @@ def cmd_brief(args):
         need = (e.get("needs") or {}).get("shortReview")
         if n["content"] in ("moved", "union") and need and not (n["review"] and n["review"].get("verdict") == "pass"):
             lines += handoff_lines(e, need)
-        ind = (e.get("needs") or {}).get("independence") or {}
-        if ind.get("standing") and ind.get("tip") == n["tip"] and isinstance(rec, dict) and \
-                not independence_passed(ctx, rec, e, n["tip"], pa_hooks.review_runs(directory))[0]:
+        ind = (e.get("needs") or {}).get("stacked") or {}
+        if ind.get("standing") and ind.get("tip") == n["tip"] and isinstance(rec, dict) and not independence_passed(
+                ctx, rec, e, n["tip"], pa_hooks.review_runs(directory), (ind.get("oldBase"), ind.get("newBase")))[0]:
             lines += standing_lines(e, ind)  # t-140 R12: the person's rule asks it of a stacked entry
             what = "independence review (the standing rule)"
         if what not in ("none", "-"):
