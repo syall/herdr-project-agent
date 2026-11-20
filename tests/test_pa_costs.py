@@ -3011,13 +3011,17 @@ class CC_StatusLine(CCBase):
 # statusline's own CPU mixing compile with other work (stdlib imports, the record write) that need not scale exactly
 # as the unit: on that Mac's efficiency cores (a slower CPU) the overhead grew 2.3-2.6x and the unit 2.8x; 1.1 allows
 # a spread of that size the other way.
-CS4_LIMIT = 0.15
+# t-135: 0.06 s (was 0.15 s): with t-111's cache the overhead is 0.014-0.020 s (this Mac, the cloud machine). The unit
+# is still a compile workload although a warm run compiles nothing: it gauges the machine's CPU speed, which is what
+# the scale is for, not the work timed.
+CS4_LIMIT = 0.06
 CS4_UNIT_SRC = ("''.join('def f{0}(a, b={0}, *c, **d):\\n    x = [i * a for i in range(b) if i % 3]\\n"
                 "    return {{\\'k{0}\\': (x, a + b, c, d), \\'s\\': \\'v\\' * {0}}}\\n'.format(i) for i in range(2000))")
 CS4_UNIT_REF = 0.060
 CS4_MARGIN = 1.1
 # t-111: the scale is capped, so a very slow or very busy machine cannot stretch the bound without end (4x: the
-# efficiency cores here are 2.8x, the cloud machine under another suite about 3x).
+# efficiency cores here are 2.8x, the cloud machine under another suite about 3x). With CS4_MARGIN the bound is at
+# most 4.4x CS4_LIMIT (t-135).
 CS4_SCALE_CAP = 4.0
 # t-111: Claude Code's status line command, as pa.cc_statusline_setting writes it (the launcher, not pa_costs.py).
 STATUSLINE = [sys.executable, os.path.join(TOOLS, "pa_statusline.py"), "statusline"]
@@ -3074,7 +3078,7 @@ class CC_Script(CCBase):
         self.assertEqual(self.script(["--space"], b"")[0], b"")
         self.assertEqual(self.script(["--space", "sp1", "--then"], cc_bytes())[0], b"")
 
-    def test_cs4_overhead_is_at_most_150_ms(self):
+    def test_cs4_overhead_is_at_most_60_ms(self):
         # t-063: a wall-clock bound alone failed under machine load (0.18 s at load 13 on 14 cores). Load barely moves
         # the child's CPU time, so that is the main bound; wall time is bounded as overhead over a bare python3 that
         # runs the same inner command in the same rounds.
@@ -3087,7 +3091,8 @@ class CC_Script(CCBase):
         # CPU-bound work that a slower or busier CPU inflates far more than a bare interpreter start (cloud machine:
         # bare python3 1.3x this Mac, the overhead 2.7x). So the bound is in this machine's units: a fixed compile
         # workload (CS4_UNIT_SRC, not the repo's code) is timed in the same rounds, and both bounds are
-        # CS4_LIMIT * max(1, unit / CS4_UNIT_REF) * CS4_MARGIN. On the reference Mac that is 150 ms * CS4_MARGIN.
+        # CS4_LIMIT * max(1, unit / CS4_UNIT_REF) * CS4_MARGIN. On the reference Mac that is CS4_LIMIT * CS4_MARGIN.
+        # t-135: CS4_LIMIT is 60 ms now that a warm run compiles nothing (t-111); the best round is a warm one.
         import resource
         noop = shutil.which("true")
         env = dict(os.environ)
@@ -3137,6 +3142,8 @@ class CC_Script(CCBase):
     def test_cs4_scale_is_capped(self):
         # t-111: the bound above can grow with the machine's unit, but not past CS4_SCALE_CAP
         self.assertEqual(CS4_SCALE_CAP, 4.0)
+        self.assertEqual(CS4_LIMIT, 0.06)  # t-135: ~3-4x the warm overhead (0.014-0.020 s), was 0.15 s
+        self.assertAlmostEqual(cs4_limit(CS4_UNIT_REF * 40), CS4_LIMIT * 4.4)  # the effective cap: scale 4 x margin 1.1
         self.assertAlmostEqual(cs4_limit(0.0), CS4_LIMIT * CS4_MARGIN)
         self.assertAlmostEqual(cs4_limit(CS4_UNIT_REF * 2), CS4_LIMIT * 2 * CS4_MARGIN)
         self.assertAlmostEqual(cs4_limit(CS4_UNIT_REF * 4), CS4_LIMIT * 4 * CS4_MARGIN)
@@ -3189,6 +3196,7 @@ class SL_Cache(CCBase):
         folder = os.path.join(TMP, name)
         shutil.rmtree(folder, ignore_errors=True)
         os.makedirs(folder)
+        os.chmod(folder, 0o700)  # t-135: a private parent whatever the suite's umask (002 on user-private-group logins)
         return folder
 
     def test_sc1_prints_records_and_caches_outside_tools(self):
@@ -3348,6 +3356,146 @@ class SL_Cache(CCBase):
             self.assertIsNone(pa.cc_statusline_setting(p, "sp1"))
         finally:
             pa.STATUSLINE_FILE = saved
+
+
+    # ---- t-135: the limits t-111 recorded ----
+
+    def test_sc8_tmp_dir_is_private_under_umask_002(self):
+        # REVIEW R3: the tests' own folders are private too, so sc2-sc5 pass where the umask is 002
+        m = sl_module()
+        old = os.umask(0o002)
+        try:
+            folder = self.tmp_dir("sc8")
+            self.assertEqual(os.stat(folder).st_mode & 0o777, 0o700)
+            self.assertIsNotNone(m.private(os.path.join(folder, "pycache")))
+        finally:
+            os.umask(old)
+
+    def probe_launcher(self, tools, out):
+        """Runs the launcher's main() in a child that counts the compiles of tools files; writes what it saw to out."""
+        code = ("import builtins, importlib.util, json, os, sys\n"
+                "tools, out, stub = sys.argv[1:4]\n"
+                "spec = importlib.util.spec_from_file_location('sl_probe', os.path.join(tools, 'pa_statusline.py'))\n"
+                "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n"
+                "seen, real = [], builtins.compile\n"
+                "def counting(source, filename, *a, **k):\n"
+                "    seen.append(str(filename)); return real(source, filename, *a, **k)\n"
+                "builtins.compile = counting\n"
+                "def done(c): raise SystemExit(c)\n"
+                "os._exit = done\n"
+                "try:\n"
+                "    m.main(['statusline', '--space', 'sp1', '--then', stub])\n"
+                "except SystemExit:\n"
+                "    pass\n"
+                "mine = sorted(os.path.basename(f) for f in seen if os.path.dirname(os.path.realpath(f)) == os.path.realpath(tools))\n"
+                "with open(out, 'w') as f:\n"
+                "    json.dump({'compiled': [n for n in mine if n in ('pa.py', 'pa_costs.py')],\n"
+                "               'same': sys.modules['pa_costs'].pa is sys.modules['pa']}, f)\n")
+        r = subprocess.run([sys.executable, "-c", code, tools, out, cc_stub("ok")], input=cc_bytes(), stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, env=self.env(), timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        with open(out) as f:
+            return json.load(f)
+
+    def test_sc9_pa_is_loaded_once_and_a_warm_run_compiles_nothing(self):
+        # VERIFY R1 (M12): pa first, so pa_costs' `import pa` finds the launcher's pa, not a second copy from source
+        tools = tools_copy("sc9-tools")
+        out = os.path.join(self.tmp_dir("sc9"), "seen.json")
+        self.assertEqual(self.probe_launcher(tools, out), {"compiled": ["pa.py", "pa_costs.py"], "same": True})
+        self.assertEqual(self.probe_launcher(tools, out), {"compiled": [], "same": True})
+
+    def test_sc10_the_file_name_depends_on_the_install_path(self):
+        # VERIFY R2 (M9): two installs keep two files per module, never one they rewrite in turn
+        for name in ("sc10-a", "sc10-b"):
+            self.assertEqual(self.run_launcher(tools_copy(name)), (0, b"STATUS-LINE ok", b""))
+        names = sorted(os.listdir(self.cache()))
+        self.assertEqual(len(names), 4, names)
+        self.assertEqual(len({n.split(".")[0] for n in names}), 4, names)
+
+    def test_sc11_a_stray_temp_file_is_removed_after_a_minute(self):
+        # VERIFY N2 (M14): a temp file left by a killed writer goes at the next write once older than STRAY s
+        m = sl_module()
+        self.assertEqual(m.STRAY, 60)
+        folder = self.tmp_dir("sc11")
+        cache = m.private(os.path.join(self.tmp_dir("sc11-cache"), "pycache"))
+        old, new = os.path.join(cache, "x.pyc.old.tmp"), os.path.join(cache, "x.pyc.new.tmp")
+        write(old, "a")
+        write(new, "b")
+        os.utime(old, (time.time() - 61, time.time() - 61))
+        os.utime(new, (time.time() - 50, time.time() - 50))
+        write(os.path.join(folder, "sl_toy11.py"), "X = 11\n")
+        self.addCleanup(sys.modules.pop, "sl_toy11", None)
+        self.assertEqual(m.load("sl_toy11", folder, cache).X, 11)
+        names = sorted(os.listdir(cache))
+        self.assertEqual(len(names), 2, names)
+        self.assertIn("x.pyc.new.tmp", names)
+        self.assertNotIn("x.pyc.old.tmp", names)
+
+    def test_sc12_optimized_runs_have_their_own_file(self):
+        # REVIEW N4: python3 -O and python3 do not rewrite one file in turn
+        folder = self.tmp_dir("sc12")
+        cache = os.path.join(self.tmp_dir("sc12-cache"), "pycache")
+        write(os.path.join(folder, "sl_toy12.py"), "X = 12\n")
+        code = ("import importlib.util, sys\n"
+                "spec = importlib.util.spec_from_file_location('sl', sys.argv[1])\n"
+                "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n"
+                "print(m.load('sl_toy12', sys.argv[2], m.private(sys.argv[3])).X)\n")
+        for flags in ([], ["-O"], [], ["-O"]):
+            r = subprocess.run([sys.executable] + flags + ["-c", code, os.path.join(TOOLS, "pa_statusline.py"), folder, cache],
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=self.env(), timeout=30)
+            self.assertEqual((r.returncode, r.stdout, r.stderr), (0, b"12\n", b""))
+        tag = re.escape(sys.implementation.cache_tag)
+        names = sorted(os.listdir(cache))
+        self.assertEqual(len(names), 2, names)
+        self.assertRegex(names[0], r"^sl_toy12-[0-9a-f]{16}\." + tag + r"\.opt-1\.pyc$")
+        self.assertRegex(names[1], r"^sl_toy12-[0-9a-f]{16}\." + tag + r"\.pyc$")
+
+    def test_sc13_run_all_parses_the_launcher_as_3_7(self):
+        # REVIEW N2: run-all.sh's 3.7 parse check lists pa_statusline.py too
+        with open(os.path.join(HERE, "run-all.sh")) as f:
+            line = [ln for ln in f.read().splitlines() if "feature_version=(3,7)" in ln][0]
+        self.assertIn("runtime/tools/pa_statusline.py", line.split())
+
+    def doctor_notes(self):
+        import argparse
+        _result, out, _err = self.run_cmd(pa.cmd_doctor, argparse.Namespace(space="sp1"))
+        return [ln.strip() for ln in out.splitlines() if "status line cache" in ln]
+
+    def test_sc14_doctor_says_whether_the_cache_is_used(self):
+        # spec Q2: a cache folder the launcher refuses (an old group-writable cache/) is reported, with the fix
+        self.assertEqual(self.doctor_notes(), ["status line cache: none yet"])
+        self.assertFalse(os.path.exists(os.path.dirname(self.cache())))  # the check makes no folder
+        self.assertEqual(self.run_launcher(tools_copy("sc14-tools")), (0, b"STATUS-LINE ok", b""))
+        self.assertEqual(self.doctor_notes(), ["status line cache: used, 2 file(s) in " + self.cache()])
+        top = os.path.dirname(self.cache())
+        os.chmod(top, 0o775)
+        self.addCleanup(os.chmod, top, 0o700)
+        self.assertEqual(self.doctor_notes(), ["status line cache: NOT used: {} is writable by group or others; "
+                                               "the status line compiles its code on every run (fix: chmod 700 {})".format(top, top)])
+        os.chmod(top, 0o700)
+        os.chmod(self.cache(), 0o777)
+        self.assertEqual(self.doctor_notes(), ["status line cache: NOT used: {} is writable by group or others; "
+                                               "the status line compiles its code on every run (fix: chmod 700 {})".format(
+                                                   self.cache(), self.cache())])
+        os.chmod(self.cache(), 0o700)
+        shutil.rmtree(self.cache())
+        os.symlink(self.tmp_dir("sc14-elsewhere"), self.cache())
+        [note] = self.doctor_notes()
+        self.assertTrue(note.startswith("status line cache: NOT used: {} is not a real directory".format(self.cache())), note)
+
+    def test_sc15_costs_module_writes_no_cache_in_tools(self):
+        # VERIFY R4 / spec Q6: pa-* loading pa_costs leaves tools/ free of __pycache__
+        tools = tools_copy("sc15-tools")
+        code = ("import sys\n"
+                "sys.dont_write_bytecode = True\n"
+                "sys.path.insert(0, sys.argv[1])\n"
+                "import pa\n"
+                "sys.dont_write_bytecode = False\n"
+                "print(pa.costs_module() is not None)\n")
+        r = subprocess.run([sys.executable, "-c", code, tools], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           env=self.env(), timeout=30)
+        self.assertEqual((r.returncode, r.stdout, r.stderr), (0, b"True\n", b""))
+        self.assertFalse(os.path.exists(os.path.join(tools, "__pycache__")), all_files(tools))
 
 
 HANG_SCRIPT = "#!/bin/sh\ncat > /dev/null\nsleep 30 &\necho $$ $! > \"$1.part\"\nmv \"$1.part\" \"$1\"\nwait\n"
