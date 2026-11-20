@@ -9,6 +9,8 @@ import path from "path";
 const here = path.dirname(new URL(import.meta.url).pathname);
 const src = path.join(here, "..", "..", "mods", "project-agent");
 const dst = fs.mkdtempSync(path.join(os.tmpdir(), "t003-panel-"));
+// t-065 (t-060 RL-4): every exit removes the temp copy, a load error or a top-level throw included.
+process.on("exit", () => { try { fs.rmSync(dst, { recursive: true, force: true }); } catch { /* nothing to remove */ } });
 fs.copyFileSync(path.join(here, "..", "keeper", "stubs.mjs"), path.join(dst, "keeper-stubs.mjs"));
 fs.copyFileSync(path.join(here, "stubs.mjs"), path.join(dst, "stubs.mjs"));
 // gpui-kit and gpui-base each from its own file (t-049): a name taken from the wrong module fails to load, as in Herdr.
@@ -17,7 +19,11 @@ for (const f of fs.readdirSync(src).filter((n) => n.endsWith(".js"))) {
   fs.writeFileSync(path.join(dst, f), fs.readFileSync(path.join(src, f), "utf8").replace(/from "herdr"/g, 'from "./stubs.mjs"').replace(/from "(gpui-kit|gpui-base)"/g, 'from "./$1.mjs"'));
 }
 const stubs = await import(path.join(dst, "stubs.mjs"));
-const { default: ProjectAgent } = await import(path.join(dst, "main.js"));
+// t-065 (t-060 RL-4): a mod module that does not load (awake.js missing, say) fails every case by name with the reason
+// (the runner below), instead of ending the run at load; --list still lists them.
+const loadErrors = [];
+const load = (f) => import(path.join(dst, f)).catch((e) => { loadErrors.push(`mods/project-agent/${f} did not load: ${String(e?.message ?? e).split("\n")[0]}`); return null; });
+const { default: ProjectAgent } = (await load("main.js")) ?? {};
 const { cx: baseCx, flush, inspect } = stubs;
 // The person's timezone (t-036): zone.js's offsetAt/name, UTC in every world unless a case sets its own (never the machine's).
 const zoneMod = await import(path.join(dst, "zone.js")).catch(() => null);
@@ -5749,7 +5755,7 @@ cases["P53-grep-host-calls"] = async () => { // AC1.3, AC6.2: no cx.sleep outsid
 // temp folder that only waits for its -w pid). Defined here, not in a module of their own, so --list, --shard and
 // tests/test_panel_shards.py see them as they see every other case (t-060 round 2).
 const { execFileSync } = await import("child_process");
-const AW = await import(path.join(dst, "awake.js"));
+const AW = await load("awake.js"); // null when it did not load: every case fails (loadErrors)
 // A Map-backed stand-in for the runtime's bare `localStorage` (a file that survives a restart).
 function awFakeStorage(init = {}) {
   const m = new Map(Object.entries(init));
@@ -8277,8 +8283,8 @@ if (list) { for (const [name] of chosen) console.log(name); fs.rmSync(dst, { rec
 let failed = 0;
 for (const [name, fn] of chosen) {
   g.__rejected = [];
-  let why = null;
-  try { await fn(); } catch (e) { why = e instanceof Failed ? e.message : e.stack; }
+  let why = loadErrors.length ? loadErrors.join("; ") : null; // t-065: the mod did not load: not run, failed by name
+  if (!why) try { await fn(); } catch (e) { why = e instanceof Failed ? e.message : e.stack; }
   // This case's views stop: their delayed reads end, every call they still make fails, and they start nothing new.
   g.__gen = (g.__gen ?? 0) + 1; g.__draining = true; await settle(); await settle();
   // A task of this case that threw (a stale cx, say) fails it; without this it would end the whole run.
