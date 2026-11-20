@@ -1240,8 +1240,8 @@ def context_summary(settings, saved):
 
 # ---- the fresh reset (t-041 J4, R1-R4, R6, R10, R16) ----------------------------------------------------------
 # The watcher thread looks every CONTEXT_EVERY s: the context size from the transcript's tail (R1); when a cap is
-# crossed or the person asked (R3, R6) and the PA is at a clean point (R2), it ends its own Claude child by its
-# handle (end_child) and leaves ctx["after"] of kind "fresh"; the loop then starts Claude in a new session with the
+# crossed or the person asked (R3, R6) and the PA is at a clean point (R2), it ends its own Claude child and its
+# group (end_child) and leaves ctx["after"] of kind "fresh"; the loop then starts Claude in a new session with the
 # start prompt (R4, R10). The terminal, its address, its labels and its workers stay.
 
 CONTEXT_REQUEST = "context-request.json"
@@ -1713,7 +1713,7 @@ def context_once(ctx, directory, address, space, at=None):
 
 
 def begin_fresh(ctx, directory, address, plan):
-    """Takes the reset: ctx["after"] of kind fresh, then ends this launcher's own Claude child by its handle."""
+    """Takes the reset: ctx["after"] of kind fresh, then ends this launcher's own Claude child and its group."""
     with child_lock(ctx):
         if ctx.get("after") or ctx.get("restarting"):
             return False
@@ -2564,16 +2564,66 @@ def launch_command(p, agent, resume, directory, snapshot=False, version=None, pr
     return argv, model
 
 
-# ---- the launcher's own Claude child (t-037 J2, R6/R9; the hooks t-041 J4 uses) -------------------------------
-# run_child starts Claude with a Popen handle kept in ctx["child"]; end_child ends that child, and only it, by the
-# handle (never a pid looked up). ctx["ended"] tells the loop the exit was ours, not a crash; ctx["after"] is what
-# the loop does once that child has exited ({"kind": "exec", ...} for a restart; t-041 adds "fresh").
+# ---- the launcher's own Claude child (t-037 J2, R6/R9; the hooks t-041 J4 uses; its group t-184) -----------------
+# run_child starts Claude with a Popen handle kept in ctx["child"], in a process group of its own (spawn; its pgid,
+# the child's pid, in ctx["childGroup"]); end_child ends that group, and only it: the handle and the pgid spawn made
+# (never a pid or group looked up). A wrapper between pa.py and Claude that exits on SIGTERM without ending what it
+# started no longer leaves that Claude running on the terminal (t-184). With a terminal, the child's group is its
+# foreground group while it runs; the launcher takes the terminal back when it ends (R3). ctx["ended"] tells the
+# loop the exit was ours, not a crash; ctx["after"] is what the loop does once that child has exited
+# ({"kind": "exec", ...} for a restart; t-041 adds "fresh").
 
-END_GRACE = 20  # seconds between SIGTERM and SIGKILL to the launcher's own Claude child
+END_GRACE = 20  # seconds between SIGTERM and SIGKILL to the launcher's own Claude child's group
+KILL_WAIT = 5  # seconds end_child waits for the group after SIGKILL before it logs what is left and goes on
+GROUP_POLL = 0.1  # seconds between two looks at the group
+
+
+def foreground_tty():
+    """True when fd 0 is a terminal and this process's group is its foreground group (then the child gets it)."""
+    try:
+        return os.isatty(0) and os.tcgetpgrp(0) == os.getpgrp()
+    except OSError:
+        return False
+
+
+def give_tty(group):
+    """Makes `group` the terminal's foreground group; SIGTTOU blocked for the call (a background group calling
+    tcsetpgrp gets it otherwise), the mask restored after. Never raises."""
+    try:
+        previous = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTTOU})
+    except (OSError, ValueError, AttributeError):
+        return
+    try:
+        os.tcsetpgrp(0, group)
+    except OSError:
+        pass
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+
+
+def child_setup(tty):
+    """The child's first steps after the fork, before the exec: a process group of its own and, when the launcher
+    had the terminal, that group in the foreground. Only setpgid / sigmask / tcsetpgrp (no lock the launcher's
+    threads could hold). A failure starts the child as before rather than not at all."""
+    def setup():
+        try:
+            os.setpgid(0, 0)
+        except OSError:
+            return
+        if tty:
+            give_tty(os.getpgrp())
+    return setup
 
 
 def spawn(argv, cwd):
-    return subprocess.Popen(argv, cwd=cwd)
+    tty = foreground_tty()
+    child = subprocess.Popen(argv, cwd=cwd, preexec_fn=child_setup(tty))
+    try:
+        os.setpgid(child.pid, child.pid)  # the race-free pair with the child's own call (EACCES after its exec)
+    except OSError:
+        pass
+    child.pa_group, child.pa_tty = child.pid, tty
+    return child
 
 
 def child_lock(ctx):
@@ -2582,15 +2632,33 @@ def child_lock(ctx):
     return ctx.setdefault("childLock", threading.Lock())
 
 
+def group_size(group):
+    """How many live (not zombie) processes are in `group`, from `ps` (read-only); None when ps cannot tell."""
+    try:
+        out = subprocess.run(["ps", "-A", "-o", "pgid=", "-o", "stat="], stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, universal_newlines=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    n = 0
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[0] == str(group) and not parts[1].startswith("Z"):
+            n += 1
+    return n
+
+
 def run_child(ctx, argv, cwd):
     """subprocess.call(argv, cwd=cwd), keeping the handle in ctx["child"] while it runs (same exceptions at start).
-    When a restart was taken before the start, nothing starts: None, ended "restart" (the loop execs)."""
+    When a restart was taken before the start, nothing starts: None, ended "restart" (the loop execs).
+    It returns only when the child's group is gone (t-184 R2, R5): after an end the launcher took, once end_child
+    has finished; after an exit of its own, it ends what the child left in its group (logged)."""
     with child_lock(ctx):
         if ctx.get("after"):
             ctx["ended"] = "restart"
             return None
+        done = threading.Event()
         child = spawn(argv, cwd)
-        ctx["child"] = child
+        ctx["child"], ctx["childGroup"], ctx["childDone"] = child, getattr(child, "pa_group", None), done
     try:
         return child.wait()
     except BaseException:  # as subprocess.call: the child does not outlive an error here
@@ -2598,7 +2666,32 @@ def run_child(ctx, argv, cwd):
         child.wait()
         raise
     finally:
-        ctx["child"] = None
+        try:
+            settle_child(ctx, child, done)
+        finally:
+            ctx["child"] = None
+
+
+def settle_child(ctx, child, done):
+    """After the child's wait (any end): the terminal back to the launcher when the child had it (R3), then its
+    group gone (R2, R5). Only for a child spawn put in a group (a test's stand-in has none)."""
+    group = ctx.get("childGroup")
+    if not group or getattr(child, "pa_group", None) != group:
+        return
+    if getattr(child, "pa_tty", False):
+        give_tty(os.getpgrp())
+    if ctx.get("ended"):  # the launcher is ending it (end_child, the watcher thread): wait until that has finished
+        done.wait(END_GRACE + KILL_WAIT + 5)
+        return
+    left = group_size(group)
+    if left:
+        end_child(ctx, None)
+        directory = ctx.get("directory")
+        if directory:
+            try:
+                session_log(directory, "exit left {} in group: ended".format(left))
+            except OSError:
+                pass
 
 
 def mark_started(ctx):
@@ -2618,25 +2711,85 @@ def mark_started(ctx):
 
 
 def end_child(ctx, why, grace=None):
-    """Ends the launcher's own Claude child by its handle: SIGTERM, then SIGKILL to the same handle after `grace`
-    seconds. Returns its exit code, or None when no child runs. The only code in pa.py that signals a process."""
+    """Ends the launcher's own Claude child and its process group (the pgid spawn made, t-184): SIGTERM to the
+    handle and the group; after the handle's exit, waits for the group's last member until `grace` seconds
+    (END_GRACE) from the TERM; then SIGKILL to what is left and a short bounded wait (KILL_WAIT), after which it logs
+    what is still there and goes on (never hangs). Returns the handle's exit code, or None when no child runs.
+    why=None: what a child that exited by itself left in its group (no ended mark, the handle not signalled).
+    The only code in pa.py that signals a process; never the launcher's own group, never a pid looked up."""
     child = ctx.get("child")
     if child is None:
         return None
-    ctx["ended"] = why
+    group = ctx.get("childGroup") if getattr(child, "pa_group", None) == ctx.get("childGroup") else None
+    done = ctx.get("childDone") if group else None
+    if why is not None:
+        ctx["ended"] = why
+        try:
+            mark_started(ctx)
+        except (OSError, ValueError):
+            pass
+    if group == os.getpgrp():  # never this launcher's own group (a failed setpgid in the child)
+        group = None
+
+    def to_group(sig):
+        try:
+            os.killpg(group, sig)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:  # a member it may not signal: count it as there
+            return True
+        except OSError:
+            return False
+
+    def group_gone(until):
+        looks = 0
+        while to_group(0):
+            looks += 1
+            if looks % 10 == 0 and group_size(group) == 0:  # only zombies left, waiting for their reaper
+                return True
+            if time.time() >= until:
+                return False
+            time.sleep(GROUP_POLL)
+        return True
     try:
-        mark_started(ctx)
-    except (OSError, ValueError):
-        pass
-    try:
-        child.send_signal(signal.SIGTERM)
-    except OSError:
-        pass
-    try:
-        return child.wait(timeout=END_GRACE if grace is None else grace)
-    except subprocess.TimeoutExpired:
-        child.kill()
-        return child.wait()
+        began = time.time()
+        limit = END_GRACE if grace is None else grace
+        if why is not None:
+            try:
+                child.send_signal(signal.SIGTERM)
+            except OSError:
+                pass
+        if group:
+            to_group(signal.SIGTERM)
+        try:
+            code = child.wait(timeout=max(0.0, began + limit - time.time()))
+        except subprocess.TimeoutExpired:
+            code = None
+        if group is None:
+            if code is None:
+                child.kill()
+                code = child.wait()
+            return code
+        if code is not None and group_gone(began + limit):
+            return code
+        if code is None:
+            child.kill()
+        to_group(signal.SIGKILL)
+        if code is None:
+            code = child.wait()
+        if not group_gone(time.time() + KILL_WAIT):
+            directory = ctx.get("directory")
+            if directory:
+                try:
+                    session_log(directory, "end: {} processes still in group {} after SIGKILL".format(
+                        group_size(group), group))
+                except OSError:
+                    pass
+        return code
+    finally:
+        if done is not None:
+            done.set()
 
 
 # ---- the restart in place (t-037 R4, R6, R7; spec S1-S5) ---------------------------------------------------------

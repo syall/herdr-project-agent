@@ -1426,9 +1426,17 @@ class AC9_1_OnlyTheOwnChild(unittest.TestCase):
         with open(os.path.join(REPO, "runtime", "tools", "pa.py")) as f:
             text = f.read()
         self.assertNotIn("os.kill(", text)
-        self.assertNotIn("killpg", text)
         self.assertEqual(text.count('"kill"'), 2, "hc kill only in cmd_cleanup and end_terminal (spec AC9.1, R10)")
         tree = ast.parse(text)
+        # t-184 R6: end_child also signals the launch's own process group (os.killpg, the pgid spawn made); no other
+        # code in pa.py calls killpg.
+        def killpgs(node):
+            return [n for n in ast.walk(node) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                    and n.func.attr == "killpg"]
+        ends = [fn for fn in ast.walk(tree) if isinstance(fn, ast.FunctionDef) and fn.name == "end_child"]
+        self.assertEqual(len(ends), 1)
+        self.assertTrue(killpgs(ends[0]))
+        self.assertEqual(len(killpgs(tree)), len(killpgs(ends[0])), "killpg outside end_child")
         hc_kill = set()
         for fn in ast.walk(tree):
             if isinstance(fn, ast.FunctionDef):
