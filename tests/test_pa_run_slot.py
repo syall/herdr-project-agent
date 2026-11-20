@@ -12,7 +12,8 @@ machine), and the temp HERDR_PA_HOME, space and worktree come from test_pa_run's
   s6  R13: the slot step's hc calls get PA_SUITE_HC_*; the command gets neither HC_* nor PA_SUITE_HC_*
   s7  R19, T1: one test-runs.jsonl line per slot-step run (remote and local); pa-full-suite writes a full line
   s8  R14, R15: hook_affected's deadline and its could-not-run message; a run that started and did not end (the
-      hook's own 900 s, the deadline during the run) is a failure to fix, never "could not run" (MF-J2-1)
+      hook's own limit, the deadline during the run) is a failure to fix, never "could not run" (MF-J2-1); t-079 I2:
+      the hook's limit is a whole slot wait plus a whole run (s8a, s8i)
   s9  TERM during a remote slot-step run: 143, cleaned
   n1  the machine's node a script that finds its real binary beside $0: pa-run -- node runs it
   k1  T1: the kind inferred when --for is not given; --for wins
@@ -344,12 +345,27 @@ class S8Hook(Slot):
         write(path, body)
         return path
 
-    def test_s8a_the_command_gets_a_deadline_870_s_on(self):
+    def test_s8a_the_command_gets_a_deadline_1710_s_on_and_a_run_limit_of_870_s(self):
+        # t-079 I2: the hook's limit is the slot wait's (840 s) plus the run's own 900 s; the deadline is 30 s before
+        # it, and the run's own limit (870 s, counted from when the slot is taken) comes in PA_SUITE_RUN_LIMIT
         seen = os.path.join(self.tmp, "deadline")
         began = time.time()
-        code, _ = self.hook(self.script('echo "$PA_SUITE_DEADLINE" > {}\nexit 0\n'.format(seen)))
+        code, _ = self.hook(self.script('echo "$PA_SUITE_DEADLINE $PA_SUITE_RUN_LIMIT" > {}\nexit 0\n'.format(seen)))
         self.assertEqual(code, 0)
-        self.assertAlmostEqual(int(pa.read_text(seen).strip()), began + 870, delta=5)
+        at, run = pa.read_text(seen).split()
+        self.assertAlmostEqual(int(at), began + 1710, delta=5)
+        self.assertEqual(run, "870")
+
+    def test_s8i_the_hooks_limit_holds_a_whole_wait_and_a_whole_run(self):
+        # t-079 I2 (t-072 RL-5): a run that waited the slot step's whole wait still has its own budget, and the
+        # installed hook timeouts are over the hook's own limit
+        self.assertEqual(pa_hooks.AFFECTED_WAIT, pa_suite.SLOT_WAIT_LIMIT)
+        self.assertEqual(pa_hooks.AFFECTED_LIMIT, pa_hooks.AFFECTED_WAIT + pa_hooks.AFFECTED_RUN)
+        self.assertGreaterEqual(pa_hooks.AFFECTED_RUN, 900)
+        settings = pa_hooks.hook_settings()
+        for event in ("TaskCompleted", "Stop"):
+            with self.subTest(event=event):
+                self.assertEqual(settings[event][0]["hooks"][0]["timeout"], pa_hooks.AFFECTED_LIMIT + 30)
 
     def test_s8b_a_failure_keeps_todays_message(self):
         code, err = self.hook(self.script("echo FAIL x\nexit 1\n"))

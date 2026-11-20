@@ -3,7 +3,9 @@ every part and every failure, PA_SERIAL=1, --affected; J9: TERM, INT and HUP sto
 and each unit test module (tests/test_*.py) is its own part; t-031: the panel harness runs as four parts, one per
 shard (run.mjs --shard=<k>/4), each named in the summary; t-072: every run takes pa-full-suite's slot (s1-s7);
 t-076: a part past its limit (3x its median, at least PA_PART_LIMIT) is stopped and named hung (h1-h3), every run
-has a progress file under HERDR_PA_HOME/suite-runs (p1-p2), --module runs one unit part (m1). The real script runs
+has a progress file under HERDR_PA_HOME/suite-runs (p1-p2), --module runs one unit part (m1); t-079: a wait that
+answers at once for a running part waits for its end (r2d), a killed slot step stops the run (r8c), the run's own
+limit after the slot (s10, s11), git link guards (g5, g6). The real script runs
 in a temp copy of the repo whose parts are stubs (stub.sh, chosen per part by STUB_<part>), so no real suite runs here."""
 import json
 import fcntl
@@ -57,7 +59,8 @@ try:
 except OSError:
     sys.exit(0)
 print('FAIL slot: free during the run'); sys.exit(1)" "$HERDR_PA_HOME/suite-slots/slot-0" || exit 1 ;;
-  envs) env | grep -E '^(HC_|PA_SUITE_HC_)' | sort > "$STUB_DIR/$k.env" ;;
+  envs) env | grep -E '^(HC_|PA_SUITE_HC_)' | sort > "$STUB_DIR/$k.env"
+    env | grep -E '^PA_SUITE_RUN_LIMIT=' > "$STUB_DIR/$k.runenv" ;;
   git) { echo "git=$(command -v git)"; echo "python3=$(command -v python3)"; echo "path=$PATH"; } > "$STUB_DIR/$k.git" ;;
   wait:*) other=${m#wait:}; n=0
     until grep -q "start $other" "$STUB_DIR/events"; do
@@ -244,6 +247,7 @@ class RunAll(unittest.TestCase):
             self.assertIn("{}: ok".format(name), tail)
         self.outputs(out)
 
+    @unittest.skipUnless(os.path.exists("/bin/bash"), "needs /bin/bash (its stand-in sh is bash with BASH_ENV)")
     def test_r2c_a_part_wait_cannot_find_keeps_its_own_code(self):
         # t-113: on a Linux machine (sh is bash there) `wait <pid>` said "pid N is not a child of this shell"
         # (127) for parts that had passed, and run-all.sh marked them FAILED. Here run-all.sh runs under a `sh` that
@@ -277,6 +281,33 @@ class RunAll(unittest.TestCase):
                     store = [line.split("\t")[0] for line in f if line.split("\t")[1] == "store harness"][0]
                 with open(os.path.join(folder, store + ".code")) as f:
                     self.assertEqual(f.read().strip(), "3")  # the part's own code, not wait's 127
+
+    @unittest.skipUnless(os.path.exists("/bin/bash"), "needs /bin/bash (its stand-in sh is bash with BASH_ENV)")
+    def test_r2d_a_wait_that_answers_at_once_for_a_running_part_waits_for_its_end(self):
+        # t-079 I4 (t-115 L1, t-113 REVIEW L1): `wait` in run-all.sh answers 127 at once, reaping nothing, while the
+        # part still runs: the run must wait for the part's end and take its own code, not mark it FAILED and move on.
+        bin_dir = os.path.join(self.tmp, "bin")
+        lose = os.path.join(self.tmp, "lose.sh")
+        write(lose, 'wait() {\n'
+                    '  [ "${0##*/}" = run-all.sh ] && [ $# = 1 ] || { builtin wait "$@"; return $?; }\n'
+                    '  echo "wait: pid $1 is not a child of this shell" >&2; return 127\n'
+                    '}\n')
+        write(os.path.join(bin_dir, "sh"), '#!/bin/bash\nBASH_ENV="{}" exec /bin/bash "$@"\n'.format(lose), 0o755)
+        path = bin_dir + os.pathsep + os.environ.get("PATH", "")
+        for serial in ("", "1"):
+            with self.subTest(serial=serial):
+                write(self.events, "")
+                env = dict(self.env_for(PA_SERIAL=serial, keeper="sleep:2", store="crash"), PATH=path)
+                r = subprocess.run(["sh", os.path.join(self.repo, "tests", "run-all.sh")], cwd=self.tmp, env=env,
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True,
+                                   timeout=120)
+                out = r.stdout
+                self.assertIn("is not a child of this shell", out)  # the stand-in wait did answer at once
+                tail = self.summary(out)
+                for name in NAMES:
+                    self.assertIn("  {}: {}".format(name, "FAILED" if name == "store harness" else "ok"), tail)
+                self.assertEqual(r.returncode, 1, out)
+                self.assertIn("=== keeper harness\nkeeper says hello\nkeeper done\n--- keeper harness: ok\n", out)
 
     def test_r2b_quiet_failure(self):
         code, out = self.run_all(store="quiet")
@@ -446,6 +477,55 @@ class RunAll(unittest.TestCase):
             if proc.poll() is None:
                 proc.kill()
                 proc.wait()
+
+    def test_r8c_a_run_whose_slot_step_is_killed_stops_its_parts(self):
+        # t-079 I3 (t-072 RL-1): the slot step (pa_suite.py slot, run-all.sh's parent under the slot) killed with
+        # SIGKILL frees the slot (the kernel drops its flock); the run under it must not go on without the slot: it
+        # stops every part and their children, and says why. In parallel and in PA_SERIAL=1 mode.
+        for serial in ("", "1"):
+            with self.subTest(serial=serial):
+                pids_file = os.path.join(self.tmp, "keeper.pids")
+                if os.path.exists(pids_file):
+                    os.remove(pids_file)
+                log = os.path.join(self.tmp, "orphan.out")
+                with open(log, "w") as out:
+                    proc = subprocess.Popen(["sh", os.path.join(self.repo, "tests", "run-all.sh")], cwd=self.tmp,
+                                            env=self.env_for(PA_SERIAL=serial, keeper="child"),
+                                            stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
+                                            start_new_session=True)
+                pids = []
+                try:
+                    end = time.time() + 30
+                    while not os.path.exists(pids_file) and time.time() < end:
+                        time.sleep(0.05)
+                    with open(pids_file) as f:
+                        pids = [int(p) for p in f.read().split()]  # the part's shell and the child it started
+                    os.kill(proc.pid, signal.SIGKILL)  # run-all.sh exec'd the slot step: this pid is the step
+                    proc.wait()
+                    end = time.time() + 20
+                    while time.time() < end and any(alive(p) for p in pids):
+                        time.sleep(0.1)
+                    left = [p for p in pids if alive(p)]
+                    end = time.time() + 5
+                    while time.time() < end and "=== interrupted" not in pa_text(log):
+                        time.sleep(0.1)
+                    text = pa_text(log)
+                    self.assertEqual(left, [], "part processes still running after the slot step was killed: " + text)
+                    self.assertIn("run-all.sh: the slot step (pid {}) is gone: stopping the parts".format(proc.pid), text)
+                    self.assertIn("=== interrupted (outputs so far: ", text)
+                finally:
+                    for p in pids:
+                        try:
+                            g = os.getpgid(p)
+                            if g != os.getpgrp():
+                                os.killpg(g, signal.SIGKILL)
+                            os.kill(p, signal.SIGKILL)
+                        except OSError:
+                            pass
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)  # the session it started: run-all.sh and its watchdog
+                    except OSError:
+                        pass
 
     def test_r9_one_part_per_unit_module(self):
         # Each tests/test_*.py is its own part, run once, all at once; a failing module is named in the last 40
@@ -751,6 +831,63 @@ class RunAll(unittest.TestCase):
         spec.loader.exec_module(module)
         self.assertLess(module.SLOT_WAIT_LIMIT, 900)
 
+    def test_s10_a_run_past_its_run_limit_after_the_slot_is_ended_and_said_not_finished(self):
+        # t-079 I2 (t-072 RL-5): the affected-tests hook gives the run its own limit, counted from when the slot is
+        # taken (PA_SUITE_RUN_LIMIT): the slot step ends a run on this Mac past it (its parts stopped), its last line
+        # `run-all.sh: did not finish on this Mac: ...` (the hook reads that as a failure to fix), exit 124. The wait
+        # before it does not count.
+        p = self.holder()
+        log = os.path.join(self.tmp, "s10.out")
+        pids_file = os.path.join(self.tmp, "keeper.pids")
+        with open(log, "w") as f:
+            run = subprocess.Popen(["sh", os.path.join(self.repo, "tests", "run-all.sh"), "--affected"], cwd=self.tmp,
+                                   env=self.env_for(keeper="child", PA_SUITE_RUN_LIMIT="4"), stdin=subprocess.DEVNULL,
+                                   stdout=f, stderr=subprocess.STDOUT, start_new_session=True)
+        pids = []
+        try:
+            end = time.time() + 20
+            while "waiting for the suite slot" not in pa_text(log) and time.time() < end:
+                time.sleep(0.05)
+            time.sleep(5)  # longer than the run limit, waiting: not counted
+            self.assertIsNone(run.poll(), pa_text(log))
+            p.kill()
+            p.wait()
+            end = time.time() + 30
+            while not os.path.exists(pids_file) and time.time() < end:
+                time.sleep(0.05)
+            with open(pids_file) as f:
+                pids = [int(x) for x in f.read().split()]
+            took = time.time()
+            code = run.wait(timeout=60)
+            took = time.time() - took
+            end = time.time() + 5
+            while time.time() < end and any(alive(x) for x in pids):
+                time.sleep(0.05)
+            text = pa_text(log)
+            self.assertEqual(code, 124, text)
+            self.assertLess(took, 20, text)
+            self.assertEqual([x for x in pids if alive(x)], [], text)
+            last = text.rstrip().splitlines()[-1]
+            self.assertTrue(last.startswith("run-all.sh: did not finish on this Mac: "), last)
+            self.assertIn("4 s", last)
+            self.assertTrue(self.slot_free())
+        finally:
+            for x in pids:
+                try:
+                    os.killpg(os.getpgid(x), signal.SIGKILL)
+                except OSError:
+                    pass
+            if run.poll() is None:
+                run.kill()
+                run.wait()
+
+    def test_s11_the_run_limit_is_not_passed_on_to_the_run(self):
+        # t-079 I2: PA_SUITE_RUN_LIMIT is the slot step's own; a run started under it (a nested run-all.sh) gets none
+        code, out = self.run_all("--affected", keeper="envs", PA_SUITE_RUN_LIMIT="300")
+        self.assertEqual(code, 0, out)
+        with open(os.path.join(self.tmp, "keeper.runenv")) as f:
+            self.assertEqual(f.read().strip(), "", out)
+
     # ---- t-076: the per-part limit, the progress file, --module ----
 
     def progress(self):
@@ -906,16 +1043,17 @@ class RunAll(unittest.TestCase):
     # puts a folder holding only a link named git to it (and links to its prefix's other folders) first on PATH for
     # the parts. Here a fake xcrun first on PATH names a fake prefix, whose bin also holds a python3 that must not
     # shadow the caller's. Without xcrun, or when it fails or names no <prefix>/bin/git, PATH is unchanged.
-    def git_run(self, xcrun="ok", *args, **stubs):
+    def git_run(self, xcrun="ok", *args, git_mode=0o755, path=None, **stubs):
         fake = os.path.join(self.tmp, "fakebin")
         write(os.path.join(fake, "xcrun"), '#!/bin/sh\necho "$*" >> "$STUB_DIR/xcrun-calls"\n'
               'case "$STUB_xcrun:$*" in\n  ok:"--find git") echo "$STUB_DIR/prefix/bin/git" ;;\n'
               '  odd:*) echo "$STUB_DIR/prefix/git" ;;\n  *) echo "xcrun: error: no such tool" >&2; exit 1 ;;\nesac\n', 0o755)
         for name in ("git", "python3"):
-            write(os.path.join(self.tmp, "prefix", "bin", name), "#!/bin/sh\necho fake {}\n".format(name), 0o755)
+            write(os.path.join(self.tmp, "prefix", "bin", name), "#!/bin/sh\necho fake {}\n".format(name),
+                  git_mode if name == "git" else 0o755)
         write(os.path.join(self.tmp, "prefix", "git"), "#!/bin/sh\necho odd git\n", 0o755)
         os.makedirs(os.path.join(self.tmp, "prefix", "libexec", "git-core"))
-        path = fake + os.pathsep + os.environ["PATH"]
+        path = path or fake + os.pathsep + os.environ["PATH"]
         env = self.env_for(xcrun=xcrun, **stubs)
         env["PATH"] = path
         r = subprocess.run(["sh", os.path.join(self.repo, "tests", "run-all.sh")] + list(args), cwd=self.tmp, env=env,
@@ -954,6 +1092,37 @@ class RunAll(unittest.TestCase):
     def test_g3_when_xcrun_names_no_prefix_bin_git_the_path_is_unchanged(self):
         path, out, seen = self.git_run("odd", keeper="git")
         self.assertEqual(seen["keeper"]["path"], path, out)
+
+    def test_g5_when_xcrun_names_a_git_that_cannot_run_the_path_is_unchanged(self):
+        # t-079 I8 (t-102, t-093 REVIEW R1: mutant m4, the `-x "$real"` check dropped): a <prefix>/bin/git of mode
+        # 0644 is not linked and PATH is as it was
+        path, out, seen = self.git_run("ok", keeper="git", integration2="git", git_mode=0o644)
+        self.assertEqual(sorted(seen), ["integration2", "keeper"], out)
+        for part, s in seen.items():
+            with self.subTest(part=part):
+                self.assertEqual(s["path"], path)
+        self.assertFalse(os.path.exists(os.path.join(self.outputs(out), "git")), out)
+
+    def test_g6_without_xcrun_on_path_the_path_is_unchanged(self):
+        # t-079 I8 (t-102, t-093 REVIEW R2): a PATH of links to the tools run-all.sh, its stubs and pa_suite.py use,
+        # and no xcrun (on a Mac /usr/bin holds one, so /usr/bin is not on it): PATH is as it was, no git link made
+        tools = os.path.join(self.tmp, "tools")
+        os.makedirs(tools)
+        for name in ("sh", "dirname", "basename", "mktemp", "cat", "date", "mkdir", "tail", "head", "grep", "cut",
+                     "sed", "wc", "tr", "sleep", "mv", "rm", "ps", "ln", "ls", "sort", "env", "printf", "true",
+                     "uname", "touch"):
+            found = shutil.which(name)
+            if found:
+                os.symlink(found, os.path.join(tools, name))
+        os.symlink(sys.executable, os.path.join(tools, "python3"))
+        self.assertIsNone(shutil.which("xcrun", path=tools))
+        path, out, seen = self.git_run("ok", keeper="git", integration2="git", path=tools)
+        self.assertEqual(sorted(seen), ["integration2", "keeper"], out)
+        for part, s in seen.items():
+            with self.subTest(part=part):
+                self.assertEqual(s["path"], tools)
+        self.assertFalse(os.path.exists(os.path.join(self.outputs(out), "git")), out)
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "xcrun-calls")), out)
 
     def test_g4_xcrun_is_asked_once_per_run(self):
         self.git_run("ok")
