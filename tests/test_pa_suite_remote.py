@@ -26,7 +26,11 @@ t-123 (earlier limits): x17d/x17e --json's own line and peek's lock (t-119), x25
 in the history, x26a/x26g each refusal's reason, x26c the probe's missing lines, x27c a step run (t-106 J1).
 Run in 2 shards by tests/run-all.sh (unit_shards).
 t-165: x43 stub-hc's file read takes --offset and --limit after the path (the watcher's form).
+t-180: x44 an unexpected error in the remote run: cleaned there, one record exit 1 (not two), the error raised.
 """
+import contextlib
+import fcntl
+import io
 import json
 import os
 import re
@@ -38,6 +42,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -2161,6 +2166,88 @@ class X43StubFileRead(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(self.root, "box-1", "fullreads")), "an offset read is not whole")
         self.assertEqual(self.read("--on", "box-1", log), "".join("line {}\n".format(n) for n in range(1, 6)))
         self.assertTrue(os.path.exists(os.path.join(self.root, "box-1", "fullreads")), "a read without --offset is")
+
+
+class X44Unexpected(Remote):
+    """t-180 (t-152 RL-1): run_remote's catch-all, as pa-run's (t-117 R5): an error there that is neither SetupFailed
+    nor Interrupted ends and cleans the run on the machine (folder and terminal), writes one record and one build.log
+    line with exit 1 (never 0) unless the record was already written, releases the machine slot, and the first error
+    is the one raised."""
+
+    def broken_main(self, start=None, record=None):
+        """pa-full-suite in this process with the RemoteWatcher's Thread.start replaced by start(real, thread) and
+        pa_hooks.suite_record by record(real, ...) when given: (the error raised, the output)."""
+        real_start, real_record = threading.Thread.start, pa_hooks.suite_record
+
+        def patched(thread):
+            if type(thread).__name__ == "RemoteWatcher" and start:
+                return start(real_start, thread)
+            return real_start(thread)
+        out, saved, sys.argv = io.StringIO(), sys.argv, ["pa-full-suite"]
+        threading.Thread.start = patched
+        try:
+            with mock.patch.object(pa_hooks, "suite_record", (lambda *a, **k: record(real_record, *a, **k)) if record
+                                   else real_record), contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+                with self.assertRaises(RuntimeError) as caught:
+                    pa_hooks.main()
+        finally:
+            threading.Thread.start = real_start
+            sys.argv = saved
+        return caught.exception, out.getvalue()
+
+    def check_cleaned(self, run, out):
+        self.assertTrue([c for c in self.calls() if c[0] == "exec" and "-rf" in c], out)  # the cleanup was tried
+        self.assertFalse(os.path.exists(self.remote_folder(run)), out)
+        terms = os.path.join(self.stub, "box-1", "terminals")
+        self.assertEqual([n for n in os.listdir(terms) if n.endswith(".json")], [], out)
+        with open(self.machine_slot("box-1"), "a+") as f:  # released: free to lock
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+    def check_failed(self, run, out, error):
+        self.check_cleaned(run, out)
+        rows = self.lines()
+        self.assertEqual([(r.get("run"), r["exit"], r.get("machine")) for r in rows], [(run, 1, "box-1")], rows)
+        self.assertIn("pa-full-suite failed: RuntimeError: " + error, rows[0].get("note") or "", rows)
+        log = [l for l in (self.build_log() or "").splitlines() if " full suite: " in l]
+        self.assertEqual(len(log), 1, self.build_log())
+        self.assertIn("-> exit 1 ", log[0])
+        self.assertEqual((self.progress(run).get("state"), self.progress(run).get("exit")), ("done", 1))
+
+    def test_x44a_a_watcher_start_that_raises_after_the_terminal_started(self):
+        def start(real, thread):
+            raise RuntimeError("can't start new thread")
+        error, out = self.broken_main(start=start)
+        self.assertEqual(str(error), "can't start new thread", out)
+        run = self.run_id(out)
+        self.check_failed(run, out, "can't start new thread")
+
+    def test_x44b_the_last_read_that_raises_after_the_run_ended_there(self):
+        def broken_final():
+            raise RuntimeError("the last read broke")
+
+        def start(real, thread):
+            thread.final = broken_final
+            return real(thread)
+        error, out = self.broken_main(start=start)
+        self.assertEqual(str(error), "the last read broke", out)
+        run = self.run_id(out)
+        self.check_failed(run, out, "the last read broke")
+
+    def test_x44c_an_error_after_the_record_writes_no_second_one(self):
+        def record(real, *args, **kwargs):
+            real(*args, **kwargs)
+            raise RuntimeError("after the record")
+        error, out = self.broken_main(record=record)
+        self.assertEqual(str(error), "after the record", out)
+        run = self.run_id(out)
+        self.check_cleaned(run, out)
+        rows = self.lines()
+        self.assertEqual([(r.get("run"), r["exit"]) for r in rows], [(run, 0)], rows)
+        log = [l for l in (self.build_log() or "").splitlines() if " full suite: " in l]
+        self.assertEqual(len(log), 1, self.build_log())
+        self.assertIn("-> exit 0 ", log[0])
+        self.assertEqual((self.progress(run).get("state"), self.progress(run).get("exit")), ("done", 0))
 
 
 if __name__ == "__main__":
