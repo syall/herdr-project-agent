@@ -436,9 +436,12 @@ suite places are not the machine's suite slot: the suite places limit how many o
 are at the full-suite step, while the slot (`PA_SUITE_CAP`, default 1, see Checks) lets that many suite
 runs at once on the machine, across every space. Below the kinds, **Suite machines** shows those slots, read
 only, as `pa-full-suite --places` does (the panel runs `pa-full-suite --places --json` on the space's
-machine, at most once a minute while the section is open in the Tasks tab): each configured machine,
-reachable or why not, how many of its cap are held and by whom (task, worker, since when, what), then
-this Mac's own slot. A holder whose worker's terminal is live opens it in the Agents view.
+machine, at most once a minute while the section is open in the Tasks tab, and also when the section has
+nothing else to show yet, since its answer decides whether the section is drawn): each configured machine,
+reachable or why not, how many of its cap are held and by whom (worker, task and job, role, since when;
+never the holder's command), then this Mac's own slot. A holder whose worker's terminal is live opens it in
+the Agents view. The read takes no slot; a free slot is read without a lock, so it never delays a run that
+takes that slot.
 
 **Task order** (the Tasks tab's ranked sections). One ranking of the space's tasks, shown within each
 section: Review, In progress, Investigating and Queued list their tasks in rank order, numbered, with

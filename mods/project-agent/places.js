@@ -206,7 +206,10 @@ function limitsOf(rules) {
 // holder line: { key, id, worker, live, status, text }; id and worker only when its worker's terminal is live (a link, R5). shown:
 // a configured machine or a slot holder (R6). t-155: the text is the one-line worker item, as the other Places rows
 // (worker, task and job, role, since the slot's start), its job and role from the ledger worker of the holder's task
-// with that address, live or not; the holder's command (`what`) is never shown.
+// with that address, live or not; the holder's command (`what`) is never shown. t-123 (t-119 REVIEW R1): this Mac's
+// slots are `@local` in ids and keys, a word no machine name can be (it starts with a letter or digit, t-103 R11), so a
+// suite machine named `local` never shares an id or a key with them.
+const LOCAL = "@local";
 const SLOT_ID = (place, i) => `places-slot-${place}-${i}`;
 function ledgerWorker(ledger, task, address) {
   const t = (Array.isArray(ledger?.tasks) ? ledger.tasks : []).find((x) => obj(x) && x.id === task);
@@ -234,7 +237,7 @@ export function machinesRows(m, { isLive = () => false, statusOf = () => null, h
     const state = x.reachable ? "reachable" : `not reachable${x.reason ? ` (${x.reason})` : ""}`;
     out.places.push({ name, head: `${name} · ${state} · ${holders.length} of ${x.cap ?? "?"} slots held`, over: !x.reachable, holders });
   }
-  const local = slotLines("local", doc.local?.holders, isLive, statusOf, ledger);
+  const local = slotLines(LOCAL, doc.local?.holders, isLive, statusOf, ledger);
   out.places.push({ name: "local", head: slotHead(here, doc.local?.cap, local.length), over: false, holders: local });
   out.shown = doc.machines.length > 0 || out.places.some((p) => p.holders.length > 0);
   return out;

@@ -280,11 +280,17 @@ def try_slot(folder, limit_slots, info):
 
 
 def peek(folder, limit_slots):
-    """The holders of folder's slots now, taking none."""
+    """The holders of folder's slots now, taking none. t-123 (t-119 REVIEW R2): a slot whose file is empty is free
+    (release truncates it before it unlocks) and is read without a flock, so a try_slot at that instant is never
+    turned away by a peek (the panel's read, once a minute); only a non-empty file (held, or a stale holder line) is
+    asked by flock. A holder between its flock and its write shows as free for that instant: a view, never a slot."""
     holders = []
     for i in range(limit_slots):
         path = os.path.join(folder, "slot-{}".format(i))
-        if not os.path.exists(path):
+        try:
+            if os.path.getsize(path) == 0:
+                continue
+        except OSError:
             continue
         with open(path, "a+") as f:
             try:
@@ -1555,13 +1561,20 @@ def step_full(h, command, agent, profile, root, entry):
 
 def never_sent(h, root, secrets):
     """t-106 R5 (t-107 R8's list): why the HEAD tree may not be sent (a path under .claude/ or matching a secret
-    pattern), or None."""
+    pattern), or None. t-123 (t-106 J1 RL1): the bundle carries HEAD's whole history, so every path any commit of it
+    added, changed or deleted is checked too (git log --name-only, merges against each parent), after HEAD's tree."""
     code, out, err = h.git(root, "ls-tree", "-r", "-z", "--name-only", "HEAD")
     if code:
         return "git ls-tree: " + first_line(err, "exit {}".format(code))
-    for p in out.split("\0"):
-        if not p:
+    code, history, err = h.git(root, "log", "--format=", "--name-only", "--no-renames", "-z", "-m", "HEAD")
+    if code:
+        return "git log: " + first_line(err, "exit {}".format(code))
+    seen = set()
+    for p in out.split("\0") + history.split("\0"):
+        p = p.strip("\n")
+        if not p or p in seen:
             continue
+        seen.add(p)
         if p.startswith(".claude/") or "/.claude/" in "/" + p:
             return "{} is under .claude/ (the worker's own settings): never sent".format(p)
         for pattern, what in secrets:
@@ -1760,20 +1773,19 @@ def probe_step(machine, folder, tools, real_home):
     """t-106 R6: the step's probe there: {"step:<name>": {path, version}}. A missing tool, a bad line or a non-zero
     exit is a setup failure (not "unreachable": the step is not on the machine before ship)."""
     code, out, err = step_action(machine, folder, tools, real_home, "probe", 60)
+    found = {}
+    missing = [CONTROL.sub(" ", l[len("missing "):])[:64] for l in out.split("\n") if l.startswith("missing ")]
+    if missing:  # t-123 (t-106 J1 N1): its missing lines are the reason, whatever its exit
+        raise SetupFailed("the step's probe: missing " + ", ".join(missing))
     if code:
         raise SetupFailed("the step's probe exited {}: {}".format(code, first_line(err or out, "no message")))
-    found, missing = {}, []
     for line in out.split("\n"):
-        if line.startswith("missing "):
-            missing.append(CONTROL.sub(" ", line[len("missing "):])[:64])
-        elif line.startswith("tool "):
+        if line.startswith("tool "):
             bits = line.split(" ", 3)
             if (len(bits) != 4 or not TOOL_NAME.fullmatch(bits[1]) or not (bits[2] == "-" or TOOL_PATH.fullmatch(bits[2]))
                     or CONTROL.search(bits[3]) or len(bits[3]) > 200):
                 raise SetupFailed("the step's probe printed a bad tool line {!r}".format(line[:200]))
             found["step:" + bits[1]] = {"path": bits[2], "version": bits[3].strip()}
-    if missing:
-        raise SetupFailed("the step's probe: missing " + ", ".join(missing))
     return found
 
 

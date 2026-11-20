@@ -9,7 +9,10 @@ set -eu
 S=${1:?usage: setup-scratch.sh <scratch dir>}
 case "$S" in /tmp/*|/private/tmp/*|/var/folders/*) ;; *) echo "refusing: $S is not a temp folder" >&2; exit 2 ;; esac
 # Once resolved too (t-112 §10): /tmp/../etc, or a /tmp link to another folder, is not a temp folder.
-real_s=$(cd "$S" 2>/dev/null && pwd -P) || { echo "refusing: $S is not a temp folder (no such folder)" >&2; exit 2; }
+# t-123 (t-112 REVIEW 1): the caller makes it (mktemp -d); it is not made here, since a mkdir through a /tmp link would
+# write outside the roots before the check below.
+[ -d "$S" ] || { echo "refusing: $S does not exist (make it with mktemp -d)" >&2; exit 2; }
+real_s=$(cd "$S" 2>/dev/null && pwd -P) || { echo "refusing: $S is not a temp folder (cannot enter it)" >&2; exit 2; }
 case "$real_s" in /tmp/*|/private/tmp/*|/var/folders/*|/private/var/folders/*) ;; *) echo "refusing: $S is not a temp folder (resolved: $real_s)" >&2; exit 2 ;; esac
 here=$(cd "$(dirname "$0")" && pwd)
 repo=$(cd "$here/.." && pwd)

@@ -9,7 +9,11 @@
 # (today's code, moved). A step whose start state another part's step makes today starts from it through the same
 # helper (replays: S13 from S8's s8_state, S12 from S11's s11_folders). Without --part,
 # every step runs in today's order (steps_all) in one core (session pa-t001-<pid>): for debugging and for
-# failing-first runs. The first output line names the part and its steps. Any other argument, or a scratch that is
+# failing-first runs. A part runs with less incidental state than the whole run (t-123, t-112 VERIFY L2): fewer other
+# spaces on $S/proj, fewer terminals, less core load; no assertion reads that state, but S8 and S14 then no longer run
+# next to the earlier steps' spaces, so run the whole run (no --part) by hand before a release that changes pa.py's
+# adoption (init_state, find_orphan). The runner's replays are unit-tested (test_run_all.py PartState t5).
+# The first output line names the part and its steps. Any other argument, or a scratch that is
 # not under /tmp, /private/tmp or /var/folders as given and once resolved (pwd -P), is refused (exit 2) before
 # anything is written.
 # Every hc call goes through scratch(): its own HC_SESSION and XDG folders under the scratch dir,

@@ -199,7 +199,7 @@ export default class ProjectAgent extends View {
     // t-083 J2: the Places section of the Tasks view (open unless folded), a start-order write in flight per space, its
     // refusal line, and the line a task-row badge marks for 3 s ({ space, key, until }).
     this.placesFolded = false; this.placesBusy = {}; this.placesError = {}; this.placeMark = null;
-    this.machines = {}; // t-119: space id -> { doc, error, at, asked, busy }: the suite machines' slots as last read
+    this.machines = {}; // t-119: space id -> { doc, error, at, asked }: the suite machines' slots as last read
     // t-097 J2: a task-order.json write in flight per space, its refusal, and the follow-up folds the person opened.
     this.taskOrderBusy = {}; this.taskOrderError = {}; this.foldOpen = new Set();
     this.unsent = []; // [{ spaceId, message, why? }] notices the orchestrator hasn't had yet (its terminal is looked up when sending)
@@ -484,21 +484,21 @@ export default class ProjectAgent extends View {
   }
 
   // t-119 R3: the suite machines' slots (store.js loadMachines), read only while the Tasks view shows Places unfolded on
-  // screen, at most every MACHINES_EVERY and one at a time per space. A give-up keeps what is shown; an error keeps the
-  // last good answer with the error.
+  // screen, at most every MACHINES_EVERY and one at a time per space: the read's host key (`machines:<machine>`) starts
+  // none while one is pending (t-123, t-119 VERIFY V2: no flag of its own besides). A give-up keeps what is shown; an
+  // error keeps the last good answer with the error.
   machinesWant(space, cx) {
     if (this.view !== "tasks" || this.placesFolded || !onScreen()) return;
-    const m = (this.machines[space.id] ??= { doc: null, error: null, at: 0, asked: 0, busy: false }), now = Date.now();
-    if (m.busy || (m.asked && now - m.asked < MACHINES_EVERY)) return;
-    m.busy = true; m.asked = now;
-    const started = this.host.spawn(cx, async (cx) => {
+    const m = (this.machines[space.id] ??= { doc: null, error: null, at: 0, asked: 0 }), now = Date.now();
+    if (m.asked && now - m.asked < MACHINES_EVERY) return;
+    m.asked = now;
+    this.host.spawn(cx, async (cx) => {
       try {
         const r = await loadMachines(space, this.host.ctx(cx, { origin: "machines", background: true }));
         if (!gaveUp(r)) { if (r.error) m.error = r.error; else { m.doc = r.doc; m.error = null; m.at = Date.now(); } }
       } catch (e) { m.error = String(e?.message ?? e); }
-      finally { m.busy = false; cx.notify(); }
+      finally { cx.notify(); }
     }, { what: "the suite machines read" });
-    if (!started) m.busy = false;
   }
 
   // The Costs view chosen: a reread or a billed compare asked for while it was left starts once it is shown (costs.js due()).
