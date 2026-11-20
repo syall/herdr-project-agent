@@ -353,7 +353,7 @@ class Worker(unittest.TestCase):
 
     def test_t034_restart_continues_own_job(self):  # t-034 intent item 5
         self.assertIn("- If your session restarts or is compacted, continue your own job without asking: read your "
-                      "evidence folder and your worktree (`git status`, `git log`) for what you wrote and committed "
+                      "handoff and its rules' text, your evidence folder and your worktree (`git status`, `git log`) for what you wrote and committed "
                       "before, and go on from there. If you were started for a job whose worker stopped, read what "
                       "that worker left the same way first.", self.text)
         rules = self.raw[self.raw.index("## Rules of the job"):self.raw.index("## Roles")]
@@ -966,8 +966,9 @@ class T041DiskState(unittest.TestCase):  # t-041 J2: R7, R8, R9 (text), R10 (AC1
         self.assertIn("1. Read `ledger.json`, `rules.json` (only `active` rules apply, highest `order` first), "
                       "`standing.md`, every decision in `decisions/` whose status changed, and the new messages.", p)
         restart = self.part("## After a restart or a compaction", "## What must be on disk")
-        self.assertIn("Before anything else: run `pa-doctor`, read the ledger, `standing.md`, the last 30 journal "
-                      "lines and the open decisions, and run `hc ls` to see which workers still exist.", restart)
+        self.assertIn("Before anything else: run `pa-doctor`, read the ledger, `rules.json` (every active rule's text), "
+                      "`standing.md`, the last 30 journal lines and the open decisions, and run `hc ls` to see which "
+                      "workers still exist.", restart)  # t-190 R1
         rule = ("The person's words in `standing.md` stand as they said them; a standing quote never answers a card, "
                 "never approves a rule, and never stands in for an explicit yes to anything irreversible or "
                 "outward-facing.")
@@ -1022,8 +1023,8 @@ class T041Tune(unittest.TestCase):  # t-041 J7 (card d-274): R2, R4 (a, b), R5 (
 
     def test_t7_3_numbers_from_the_active_rules(self):
         text = flat(section(self.raw, "## Workers"))
-        self.assertIn("Take every number a rule sets (mutations, tiers, places) from the active rules, never from an "
-                      "older handoff.", text)
+        self.assertIn("Never copy a handoff, or a number a rule sets (mutations, tiers, places), from an older "
+                      "one.", text)  # t-190 R4
 
     def test_t7_4_each_pass_adds_one(self):
         text = flat(section(self.raw, "## The pass"))
@@ -1396,8 +1397,8 @@ class T101RulesNotice(unittest.TestCase):  # t-101 R6: what the Project Agent do
     def test_r6_core_paragraph(self):
         self.assertIn("A `rules changed: <rule ids>` notice means the person changed those rules in the Rules view "
                       "(added, edited, deleted, turned on or off, reordered or imported them): re-read `rules.json`, "
-                      "send each running worker any change that applies to its job (`hc send`: what changed and what "
-                      "stays the same), and journal it with `\"trigger\":\"rules\",\"by\":\"person\",\"rules\":[\"<id>\"]`; "
+                      "send each running worker any change that applies to its job (`hc send`: the rule's id and "
+                      "new text, or that it is off, and what stays the same), and journal it with `\"trigger\":\"rules\",\"by\":\"person\",\"rules\":[\"<id>\"]`; "
                       "then run the pass as usual.", self.workers)
         # next to the task-order notice
         at = self.workers.index("A `task order changed` notice is a message: run the pass as usual.")
@@ -1454,6 +1455,79 @@ class T131WorktreesShape(unittest.TestCase):  # t-131 (t-020 J6 RL1): RECIPE.md 
         for words in ("`project-agent.worktrees` (space id -> a list: per task its main worktree first, exactly `{ task, path, title }`,",
                       "then each other worktree it records, `{ task, path, title, job }`"):
             self.assertIn(words, text)
+
+
+CORE_LINES_AT_BASE = {"orchestrator.md": 646, "worker.md": 112, "sdlc.md": 55}  # main 9928f7f, before t-190
+CORE_GROWTH_MAX = 12  # t-190 R9
+T190_STEP3 = ("decision card. Check each against the text of the active rules that govern it (a new task, a "
+              "handoff's numbers, a merge, a card). Take new work from `pa-places tasks`")
+T190_RESTART = ("A rule `pa-doctor` lists as changed since your checkpoint is a `rules changed` notice you have not "
+                "handled: handle it as Workers says.")
+T190_RULES = ("- Follow every `active` rule as its `text` says; the id and title only name it. When two conflict, the "
+              "higher `order` wins. An active rule outranks a default in this file, `worker.md`, `sdlc.md` or a "
+              "tool's handoff wording; nothing outranks the safety section below.")
+T190_WORKERS = ("Write check, recheck, fix, verify, review and queue handoffs with `pa-handoff <kind> <task>` (it fills "
+                "in the ledger, git, known flakes from `flakes.txt` and the space's rules for the job) and add only your "
+                "judgement with `--items`. Every other handoff (design, build, plan, investigation) carries the block "
+                "`pa-handoff rules <task> --role <role>` prints. A second try of a stopped worker's job gets its "
+                "handoff written again the same way. Never copy a handoff, or a number a rule sets (mutations, tiers, "
+                "places), from an older one.")
+T190_WORKER_BULLET = ("- Your handoff lists the space's active rules for your job (`rules.json` in the Project Agent's "
+                      "state folder). Read each one's text before you start and follow it. An active rule outranks a "
+                      "default in this file; it never lowers the Safety rules. Where your handoff and an active rule "
+                      "disagree, follow the rule and say so in your report.")
+T190_SDLC = ("- A space's active rules bind every phase and outrank these defaults (never the Safety rules): each "
+             "handoff carries the ones for its job.")
+
+
+class T190RulesFollowed(unittest.TestCase):  # t-190 R1-R5, R8, R9: the space's rules are read and followed
+    def setUp(self):
+        self.raw = read("runtime", "core", "orchestrator.md")
+        self.worker = read("runtime", "core", "worker.md")
+        self.sdlc = read("runtime", "core", "sdlc.md")
+
+    def test_r2_pass_step3_checks_the_rules(self):
+        self.assertIn(T190_STEP3, part(self.raw, "## The pass", "## After a restart or a compaction"))
+
+    def test_r1_r6_restart_reads_rules_json(self):
+        restart = part(self.raw, "## After a restart or a compaction", "## What must be on disk")
+        self.assertIn("read the ledger, `rules.json` (every active rule's text), `standing.md`", restart)
+        self.assertIn(T190_RESTART, restart)
+        self.assertLess(restart.index("to see which workers still exist."), restart.index(T190_RESTART))
+
+    def test_r2_rules_outrank_core_defaults(self):
+        rules = part(self.raw, "## Rules", "## Workers")
+        self.assertIn(T190_RULES, rules)
+        self.assertNotIn("- Follow every `active` rule. When two conflict", rules)
+        self.assertEqual(ORCHESTRATOR_SAFETY, section(self.raw, "## Safety"))
+
+    def test_r3_r4_handoffs_carry_the_rules(self):
+        workers = part(self.raw, "## Workers", "## Phases and gates")
+        self.assertIn(T190_WORKERS, workers)
+        self.assertNotIn("Take every number a rule sets", workers)
+        self.assertNotIn("rule numbers and known flakes", workers)
+
+    def test_r8_notice_carries_the_text(self):
+        workers = part(self.raw, "## Workers", "## Phases and gates")
+        self.assertIn("(`hc send`: the rule's id and new text, or that it is off, and what stays the same)", workers)
+        self.assertNotIn("what changed and what stays the same", workers)
+
+    def test_r2_r5_worker_reads_and_follows(self):
+        rules = part(self.worker, "## Rules of the job", "## Roles")
+        self.assertIn(T190_WORKER_BULLET, rules)
+        first = "- Do exactly the task in the handoff. Touch only what its scope allows."
+        self.assertLess(rules.index(first), rules.index(T190_WORKER_BULLET))
+        self.assertLess(rules.index(T190_WORKER_BULLET), rules.index("- Work only in the folder you were started in"))
+        self.assertIn("read your handoff and its rules' text, your evidence folder and your worktree", rules)
+        self.assertEqual(WORKER_SAFETY, section(self.worker, "## Safety"))
+
+    def test_r2_sdlc_practice(self):
+        text = part(self.sdlc, "## Practices", "Separation of duties")
+        self.assertIn("- Skills advise, hooks enforce: a policy that must always hold gets a hook. " + T190_SDLC, text)
+
+    def test_r9_core_stays_short(self):
+        grown = {name: len(read("runtime", "core", name).splitlines()) - n for name, n in CORE_LINES_AT_BASE.items()}
+        self.assertLessEqual(sum(grown.values()), CORE_GROWTH_MAX, grown)
 
 
 if __name__ == "__main__":
