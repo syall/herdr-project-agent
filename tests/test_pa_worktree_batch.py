@@ -919,6 +919,95 @@ class NoteStops(Standing):
         dump(card, self.path(cid))
         code, out, err = self.standing()
         self.assertEqual(code, 0, err)
+        self.assertEqual(self.stops(), [])  # the rule does not stop (R13) ...
+        self.assertTrue(os.path.isdir(self.trees["t-003"]))  # ... and the worktree is left for its card (round 4)
+        self.assertIn("its card d-wt-t-003 carries the person's note", out)
+
+    # ---- round 4 MF1: the person's note or Keep holds each worktree on it, also once the rule is resumed ----
+    def resume(self):
+        """The person turns the rule off and on in the panel: a later person change; earlier stops no longer count."""
+        self.rule(history=[{"at": "2026-11-01T00:00:00Z", "by": "person", "change": "created"},
+                           {"at": "2099-01-01T00:00:00Z", "by": "person", "change": "resumed"}])
+
+    def kept(self, *fragments):
+        code, out, err = self.standing()
+        self.assertEqual(code, 0, out + err)
+        self.assertTrue(all(os.path.isdir(p) for p in self.trees.values()), out)
+        for f in fragments:
+            self.assertIn(f, out)
+        return out
+
+    def test_v13_11h_keep_all_with_a_note_then_resume(self):  # review r3 probe A, after a resume
+        self.two_on_a_batch("keep", "keep t-004")
+        self.assertEqual(self.remove_card()[0], 2)
+        self.refused(self.standing(), "card d-wt-batch-1 carries a note", stop=True)
+        self.resume()
+        self.kept("Removed 0 worktrees", "its card d-wt-batch-1 carries the person's note")
+        self.check()  # asked again on d-wt-batch-2, the note carried; still open
+        self.assertEqual(self.dec("d-wt-batch-2")["status"], "open")
+        self.kept("Removed 0 worktrees", "its card d-wt-batch-2 carries the person's note")
+
+    def test_v13_11i_delete_all_with_a_note_then_resume(self):  # review r3 probe B, after a resume
+        self.two_on_a_batch("all", "but keep t-004")
+        self.assertEqual(self.remove_card()[0], 2)
+        self.refused(self.standing(), "card d-wt-batch-1 carries a note", stop=True)
+        self.resume()
+        self.kept("Removed 0 worktrees", "its card d-wt-batch-1 carries the person's note")
+        self.check()
+        self.kept("Removed 0 worktrees", "its card d-wt-batch-2 carries the person's note")
+
+    def test_v13_11j_answered_with_a_note_then_resume(self):  # a batch card and a single card, not yet acted on
+        self.two_on_a_batch("all", "but keep t-004")
+        self.refused(self.standing(), "card d-wt-batch-1 has a note written in the panel", stop=True)
+        self.resume()
+        self.kept("Removed 0 worktrees", "its card d-wt-batch-1 carries the person's note")
+
+    def test_v13_11k_single_card_answered_delete_with_a_note_then_resume(self):
+        self.clean("t-003")
+        self.check()
+        self.answer("d-wt-t-003", "Delete", note="wait, keep it")
+        self.refused(self.standing(), "card d-wt-t-003 has a note written in the panel", stop=True)
+        self.resume()
+        self.kept("Removed 0 worktrees", "its card d-wt-t-003 carries the person's note")
+
+    def test_v13_11l_single_card_withdrawn_with_a_note_then_resume(self):
+        self.clean("t-003")
+        self.check()
+        cid = "d-wt-t-003"
+        card = self.answer(cid, "Delete", note="wait, keep it")
+        pa.keep_previous(card, card["answer"])
+        card.update(status="withdrawn", answer=None, answered=pa.now(), answeredBy="pa-worktree remove: withdrawn", note="Withdrawn")
+        dump(card, self.path(cid))
+        self.refused(self.standing(), "card d-wt-t-003 carries a note", stop=True)
+        self.resume()
+        self.kept("Removed 0 worktrees", "its card d-wt-t-003 carries the person's note")
+        card.update(status="open", answer=None, note=None, answered=None, answeredBy=None)  # asked again, the note carried
+        dump(card, self.path(cid))
+        self.kept("Removed 0 worktrees", "its card d-wt-t-003 carries the person's note")
+
+    def test_v13_11m_a_keep_withdrawn_without_a_note_still_holds(self):
+        self.clean("t-003")
+        self.check()
+        cid = "d-wt-t-003"
+        card = self.answer(cid, "Keep")
+        pa.keep_previous(card, card["answer"])
+        card.update(status="open", answer=None, note=None, answered=None, answeredBy=None)  # asked again, Keep carried
+        dump(card, self.path(cid))
+        self.kept("Removed 0 worktrees", "its card d-wt-t-003 carries the person's answer 'Keep'")
+        self.assertEqual(self.stops(), [])
+
+    def test_v13_11n_a_later_delete_answer_replaces_the_carried_note(self):
+        self.clean("t-003")
+        self.check()
+        cid = "d-wt-t-003"
+        card = self.answer(cid, "Delete", note="old words")
+        card.update(answered="2026-10-01T00:00:00Z")
+        pa.keep_previous(card, card["answer"])
+        card.update(status="open", answer=None, note=None, answered=None, answeredBy=None)
+        dump(card, self.path(cid))
+        self.answer(cid, "Delete")  # the person answers the card asked again: Delete, no note
+        code, out, err = self.standing()
+        self.assertEqual(code, 0, err)
         self.assertFalse(os.path.isdir(self.trees["t-003"]))
 
 
