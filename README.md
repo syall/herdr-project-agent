@@ -219,8 +219,9 @@ with the commits that hold them.
 
 ## Pushing main from the panel
 
-Off by default. No agent pushes a main branch: not the Project Agent, not a worker. For the
-repositories you name, a **push card** lets you push it yourself with one click in the panel.
+Off by default. No agent pushes a main branch: not a worker, and not the Project Agent, except
+under your own standing rule (below). For the repositories you name, a **push card** lets you
+push it yourself with one click in the panel.
 
 - **The allowlist** is `~/.config/herdr-pa/push-allow.json` (under `HERDR_PA_HOME` when that is
   set), one per machine; a remote space uses the one on its machine. Only you write it, by hand or
@@ -239,8 +240,9 @@ repositories you name, a **push card** lets you push it yourself with one click 
   the commit; a non-zero exit refuses the push. Placeholders: `{path}` (that clone), `{repo}` (the
   main checkout), `{commit}`, `{url}`, `{branch}`.
 - **`pa-push-allow`**: `show [--json]` (anyone, read-only); `add --path P --space S [--url U]
-  [--branch B] [--pre-push ARG...]`, `remove --path P --space S`, `on` and `off` (you only: it
-  refuses agent shells).
+  [--branch B] [--pre-push ARG...] [--standing <rule id>]`, `set --path P --space S --standing
+  <rule id> | --unbind`, `remove --path P --space S`, `on` and `off` (you only: it refuses agent
+  shells).
 - **The push card.** Once a task for a listed repository has passed its gate, you have approved
   the card that asks to publish or merge it (the one that lists every Recorded limit), and nothing
   was committed after the gate, the Project Agent may open a push card with `pa-push-main plan
@@ -257,6 +259,21 @@ repositories you name, a **push card** lets you push it yourself with one click 
   then pushes exactly the gated commit to the allowlist's URL (never a remote name), with the
   repository's hooks off and no `GIT_*` variables. It never forces. A second run of the same card
   pushes nothing. The result goes on the card and in the journal.
+- **A queue card that pushes.** Where pushing is set up for the repository, the merge queue's card
+  (`pa-queue card`) words its merge options "... and push": that one answer merges, in the panel's
+  own run of `pa-push-main`, the entries that can merge now and pushes exactly those commits, with
+  every check above. The card shows what would merge and what would be pushed, read when you look.
+  A push it cannot make leaves the merges standing and opens a push card; nothing is retried.
+- **A standing rule to merge and push.** A rule you wrote (or approved) can be your standing
+  approval to merge and push in one space: it stands in for the queue card and the push card. It
+  counts only while it is active, yours (no later change by anyone else), and bound by you on the
+  allowlist entry with its text unchanged: `pa-push-allow set --path P --space S --standing <rule
+  id>` in your own terminal (`--unbind` removes it; any edit of the rule's text ends it until you
+  bind again). Then the Project Agent merges passed entries with `pa-queue merge --standing` and
+  pushes them with `pa-push-main run --standing`, with every check above except that no card is
+  shown; high tier entries still get a card. A hold, an Other answer or a note on any card, a
+  failed check or gate, a commit after the checked commit, or a refused push stops it and the
+  cards come back; you resume it by turning the rule off and on in the panel.
 - **Turning it off:** set `"enabled": false` on the file or on an entry, run `pa-push-allow off`,
   or delete the file. It applies at the next check: open push cards show the refusal. Nothing
   else needs undoing.

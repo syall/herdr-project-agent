@@ -243,6 +243,17 @@ class A2Check(Base):
         self.assertEqual(snapshot(self.dir), before)
         self.assertEqual(self.refs(), refs)
 
+    def test_a2_6_the_tool_run_as_a_script(self):  # D15: run as a script, the queue tool shares this module
+        import subprocess
+        self.two()
+        self.assertEqual(self.make_card(LIMITS)[0], 0)
+        r = subprocess.run([sys.executable, os.path.join(TOOLS, "pa_push.py"), "main", "check", "d-queue-1", "--space", SPACE, "--json"],
+                           cwd=self.tmp, env=dict(os.environ, HERDR_PA_HOME=pa.ROOT), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           universal_newlines=True)
+        out = json.loads(r.stdout or "{}")
+        self.assertTrue(out.get("ok"), r.stdout + r.stderr)
+        self.assertEqual(out["options"][0]["mergeNow"], ["t-A", "t-B"])
+
     def test_a2_5_a_queue_card_that_does_not_push(self):
         os.environ["PATH"] = self.saved_path
         self.two()
@@ -900,7 +911,7 @@ class A14Push(Standing):
     def test_a14_4_remote_not_an_ancestor(self):
         self.merged_two()
         other = os.path.join(self.tmp, "other-clone")
-        sh(self.tmp, "git", "clone", "-q", self.url, other)
+        sh(self.tmp, "git", "clone", "-q", "-b", "main", self.url, other)
         sh(other, "git", "config", "user.name", "t")
         sh(other, "git", "config", "user.email", "t@example.invalid")
         write(os.path.join(other, "z.txt"), "z\n")

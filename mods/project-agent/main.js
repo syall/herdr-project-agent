@@ -24,7 +24,7 @@ import { readTaskOrder, effectiveTasks, hasTaskOrder, moveTask, startNextOrder, 
 import { SetupPane } from "./setup.js";
 import { Keeper, idleShell } from "./keeper.js";
 import { WorkerPane } from "./worker.js";
-import { PushCards, isPush, shownOnly, PUSH, PUSH_OPTIONS, RUN_TIMEOUT, GRACE } from "./push.js";
+import { PushCards, isPush, shownOnly, PUSH, pushOptions, runsLabel, RUN_TIMEOUT, GRACE } from "./push.js";
 import { CostsPane } from "./costs.js";
 import { Copier, sel } from "./copy.js";
 import { tick, cadence, holdReason, setSchedule, requestPass, PRESETS, MIN_MINUTES } from "./timer.js";
@@ -1425,7 +1425,7 @@ export default class ProjectAgent extends View {
 
   // A decision card as plain text lines (its Copy, t-026). A push card's facts are the lines its block drew.
   cardText(c, entry, evidence, pushLines) {
-    const open = c.status === "open", options = (isPush(c) ? PUSH_OPTIONS : c.options ?? []).filter((o) => !ownOther(o));
+    const open = c.status === "open", options = (isPush(c) ? pushOptions(c) : c.options ?? []).filter((o) => !ownOther(o));
     const earlier = earlierLine(c);
     return [
       [entry.id, c.task, open ? "open" : c.status === "withdrawn" ? "withdrawn" : `answered: ${c.answer}`, when(open ? c.created : c.answered)].filter(Boolean).join(" · "),
@@ -1469,9 +1469,9 @@ export default class ProjectAgent extends View {
     // Submit stays on for Other and an empty click is refused with the hint (answer(), answerPush()).
     const live = typeof this.notes[noteKey(space.id, entry.id)]?.on === "function";
     const wordsOk = picked !== OTHER || (live ? words.length > 0 && words.length <= OTHER_MAX : true);
-    const ready = Boolean(picked) && wordsOk && !busy && !(push && shownOnly(entry)) && (!push || picked !== PUSH || this.push.canSubmit(space.id, entry.id)); // Push: a fresh check that passed; a shown-only card: never
+    const ready = Boolean(picked) && wordsOk && !busy && !(push && shownOnly(entry)) && (!push || !runsLabel(c, picked) || this.push.canSubmit(space.id, entry.id)); // Push (or a merge option of a queue card that pushes, t-140): a fresh check that passed; a shown-only card: never
     // The rows: the card's options but its own Other (each keeps its index in the id), then the panel's Other row.
-    const listed = (push ? PUSH_OPTIONS : c.options ?? []).map((o, i) => [o, i]).filter(([o]) => !ownOther(o));
+    const listed = (push ? pushOptions(c) : c.options ?? []).map((o, i) => [o, i]).filter(([o]) => !ownOther(o));
     const otherDetail = (push ? null : (c.options ?? []).find(ownOther)?.detail) || OTHER_DETAIL;
     const earlier = earlierLine(c);
     const evidence = Boolean(c.task) && Boolean(this.data?.evidence?.has(c.task)) ? cardEvidence(c, this.data?.evidence?.get(c.task)) ?? `${c.task} evidence` : null;
@@ -1504,7 +1504,7 @@ export default class ProjectAgent extends View {
           // On a push card, picking Push checks it again (push.js).
           .when(open && !busy, (el) => el.cursor_pointer().hover((s) => s.bg(t.hover)).on_click((_e, cx) => {
             this.choice[entry.id] = picked === o.label ? null : o.label;
-            if (push && this.choice[entry.id] === PUSH) this.push.check(space, entry, cx);
+            if (push && runsLabel(c, this.choice[entry.id])) this.push.check(space, entry, cx);
             cx.notify();
           }))
           .when(open, (el) => el.child(div().flex_none().size(12).rounded(6).border(1).border_color(chosen ? t.accent : t.input).bg(chosen ? t.accent : t.background)))
@@ -1517,8 +1517,8 @@ export default class ProjectAgent extends View {
           .child(div().id(`submit-${entry.id}`).flex_none().px(12).h(28).flex().items_center().rounded(7).text_size(12.5).font_semibold()
             .bg(ready ? t.solid : t.raised).text_color(ready ? t.solid_foreground : t.dim)
             .when(ready, (b) => b.cursor_pointer().hover((s) => s.opacity(0.88)).on_click((_e, cx) => this.answer(space, entry, picked, cx)))
-            .child(running === PUSH ? "Pushing…" : busy ? "Saving…" : picked ? `Submit answer: ${picked}` : "Submit answer"))
-          .child(div().flex_1().min_w(0).text_size(10.5).text_color(t.dim).child(push && picked === PUSH && !ready && !busy ? "Push needs a check that passed, under 2 minutes old, that says this panel may push."
+            .child(running && runsLabel(c, running) ? (running === PUSH ? "Pushing…" : "Merging and pushing…") : busy ? "Saving…" : picked ? `Submit answer: ${picked}` : "Submit answer"))
+          .child(div().flex_1().min_w(0).text_size(10.5).text_color(t.dim).child(push && runsLabel(c, picked) && !ready && !busy ? `${picked === PUSH ? "Push" : "This answer"} needs a check that passed, under 2 minutes old, that says this panel may push.`
             : picked === OTHER ? (!words ? OTHER_EMPTY : words.length > OTHER_MAX ? OTHER_TOO_LONG : OTHER_HINT)
             : picked ? "Add a note above if you want; it is sent with the answer." : "Pick an option, add a note if you want, then submit."))))
       // Closed from the conversation: say so, with the words that decided it (or why it was withdrawn).

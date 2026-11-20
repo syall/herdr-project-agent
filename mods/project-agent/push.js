@@ -12,11 +12,11 @@
 
 import { div } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
-import { isPush, isOther, oneLine, OTHER, localId, capped, gaveUp, TIMED_OUT } from "./store.js";
+import { isPush, isQueuePush, isOther, oneLine, OTHER, localId, capped, gaveUp, TIMED_OUT } from "./store.js";
 import { run as hostRun } from "./host.js";
 import { sel } from "./copy.js";
 
-export { isPush };
+export { isPush, isQueuePush };
 export const PUSH = "Push", NOT_NOW = "Not now";
 const OTHER_SAID = "Answered Other: nothing was pushed."; // t-046: a push card answered in the person's own words
 export const CHECK_EVERY = 30000; // checks not asked for by a click: at most one per card this often
@@ -30,6 +30,17 @@ export const PUSH_OPTIONS = [
   { label: PUSH, detail: "Push exactly what is listed above, as a fast-forward. No force." },
   { label: NOT_NOW, detail: "Nothing is pushed. The card closes." },
 ];
+
+// t-140 R4: a queue card that pushes shows its own options (pa-push-main run checks the label against the card, and the
+// option's count is what approves); a push card shows PUSH_OPTIONS whatever its file says.
+export const pushOptions = (card) => (isQueuePush(card) ? (Array.isArray(card.options) ? card.options : []).filter((o) => o && typeof o.label === "string") : PUSH_OPTIONS);
+// Whether answering `label` merges or pushes (so it needs a passed, fresh check and its seen token): Push on a push card,
+// an option with a count above 0 on a queue card that pushes. Not now and Other never do.
+export const runsLabel = (card, label) => {
+  if (!label || label === NOT_NOW || label === OTHER) return false;
+  if (isQueuePush(card)) return pushOptions(card).some((o) => o.label === label && Number.isInteger(o.count) && o.count > 0);
+  return label === PUSH;
+};
 
 const short = (sha) => (typeof sha === "string" && sha ? sha.slice(0, 7) : "none");
 const clock = (iso, seconds = true) => { const d = new Date(iso); return Number.isNaN(d.getTime()) ? "?" : d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", ...(seconds ? { second: "2-digit" } : {}) }); };
@@ -153,10 +164,11 @@ export class PushCards {
     // Other pushes nothing: it is run like Not now, with the person's words as --note (one argv element), never --seen.
     const closes = label === NOT_NOW || label === OTHER;
     if (closes && st.busy && !st.running) { st.notNowWait = label; cx.notify(); return false; }
-    if (this.locked(space.id, entry.id) || st.busy || (label !== PUSH && !closes)) return false; // never a second run from here
+    const card = entry.card, queue = isQueuePush(card), runs = runsLabel(card, label);
+    if (this.locked(space.id, entry.id) || st.busy || (!runs && !closes)) return false; // never a second run from here
     if (label === OTHER && !String(note ?? "").trim()) return false; // an Other answer is its words
-    if (label === PUSH && !this.canSubmit(space.id, entry.id)) { st.stale = true; cx.notify(); return false; }
-    const args = ["run", entry.id, "--answer", label, "--space", localId(space.id), ...(label === PUSH ? ["--seen", st.check.seen] : []), "--json", ...(note ? ["--note", note] : [])];
+    if (runs && !this.canSubmit(space.id, entry.id)) { st.stale = true; cx.notify(); return false; }
+    const args = ["run", entry.id, "--answer", label, "--space", localId(space.id), ...(runs ? ["--seen", st.check.seen] : []), "--json", ...(note ? ["--note", note] : [])];
     st.running = label; st.result = null; st.error = null; st.errorFor = label; st.unknown = null; st.stale = false; st.notNowWait = false;
     st.note = label === OTHER ? note : null;
     this.share(space.id, entry.id, label, true, false, st.note);
@@ -167,10 +179,12 @@ export class PushCards {
       const out = error ? null : printed(r);
       // The answer the card has, as the tool says (t-045): a card answered before this run (Push, say, when Not now
       // was asked) is shown and told as that answer, never as the label asked.
-      const answer = r?.code === 0 && [PUSH, NOT_NOW, OTHER].includes(out?.answer) ? out.answer : label;
-      // Exit 0 of a Push is done only when the tool's JSON says so (ok, done, and its result).
-      const pushedSaid = out?.ok === true && out.done === true && out.result !== null && typeof out.result === "object";
-      if (error || ![0, 1, 2].includes(r?.code) || (r.code !== 0 && out?.ok !== false) || (r.code === 0 && answer === PUSH && !pushedSaid)) {
+      const known = queue ? [...pushOptions(card).map((o) => o.label), OTHER] : [PUSH, NOT_NOW, OTHER];
+      const answer = r?.code === 0 && known.includes(out?.answer) ? out.answer : label;
+      // Exit 0 of a Push is done only when the tool's JSON says so (ok, done, and its result). A queue card's merge answer
+      // (t-140) is answered when the tool says ok with its result; done says whether it pushed.
+      const pushedSaid = out?.ok === true && (queue || out.done === true) && out.result !== null && typeof out.result === "object";
+      if (error || ![0, 1, 2].includes(r?.code) || (r.code !== 0 && out?.ok !== false) || (r.code === 0 && runsLabel(card, answer) && !pushedSaid)) {
         st.unknown = error ?? `pa-push-main run exited with ${r?.code}${r?.code === 0 ? " without a result that says it pushed" : ""}${said(r) ? `: ${said(r)}` : ""}`;
         st.check = null;
         st.kept = true; // the tool may have saved the card answered before it failed: keep it shown with the check's verdict
@@ -178,11 +192,12 @@ export class PushCards {
         notice = `decision ${entry.id} answered ${label}; result unknown (${st.unknown}); the panel checks the card again`;
       } else {
         if (r.code === 0) {
-          st.result = { ...(out ?? {}), label: answer }; st.kept = answer === PUSH;
+          st.result = { ...(out ?? {}), label: answer }; st.kept = runsLabel(card, answer);
           this.share(space.id, entry.id, answer, false, false, answer === OTHER ? st.note : null);
           let what = String(out?.message || resultLine(out?.result) || "pushed");
           if (what.startsWith(`${entry.id}: `)) what = what.slice(entry.id.length + 2); // the tool's message starts with the card id
           notice = answer !== label ? `decision ${entry.id} was already answered ${answer}; ${what}`
+            : queue && runsLabel(card, label) ? `decision ${String(out?.message || `${entry.id} answered ${label}`)}`
             : label === PUSH ? `decision ${entry.id} answered Push; result: ${what}`
             : label === OTHER ? `decision ${entry.id} answered Other (nothing was pushed), in the person's own words: "${oneLine(note)}"` : `decision ${entry.id} answered Not now`;
         } else {
@@ -214,7 +229,7 @@ export class PushCards {
     const only = shownOnly(entry);
     if (only) return box.child(line(only, t.blocked)); // never checked or run: nothing else to show
     if (!open) {
-      const r = c.push?.result;
+      const r = isQueuePush(c) ? null : c.push?.result, qr = isQueuePush(c) ? c.queue.push.result : null;
       if (st?.result) this.shown(t, box, st, {}, lines, entry.id);
       // The last check found the card open, and it has closed since (another route, t-028): that verdict is old.
       if (st?.unknown && !st.busy && st.check?.ok === true) box.child(line(`The result was unknown (${st.unknown}); the card was open when checked and has closed since.`, t.blocked));
@@ -224,12 +239,14 @@ export class PushCards {
         if (st.busy) box.child(line("Checking…", t.dim));
         else if (st.check) box.child(line(st.check.ok === true ? "The check found the card open." : `The check found (${text(st.check.refusal?.check)}): ${text(st.check.refusal?.message)}`));
       }
-      if (!(isOther(c) && st?.result)) box.child(small(r ? `Recorded on the card: pushed ${text(r.url)} ${text(r.branch)} ${short(r.from)}..${short(r.to)} at ${stamp(r.at)}` : isOther(c) ? OTHER_SAID : "Nothing was pushed from this card."));
+      if (qr && typeof qr === "object" && !st?.result) box.child(small(`Recorded on the card: ${text(qr.message) || text(qr.state)}`));
+      else if (!(isOther(c) && st?.result)) box.child(small(r ? `Recorded on the card: pushed ${text(r.url)} ${text(r.branch)} ${short(r.from)}..${short(r.to)} at ${stamp(r.at)}` : isOther(c) ? OTHER_SAID : "Nothing was pushed from this card."));
       if (st?.kept) box.child(div().id(`push-done-${entry.id}`).flex_none().text_size(11.5).text_color(t.accent).cursor_pointer().on_click(onDone).child("Done"));
       return box;
     }
     const chk = st?.check, f = chk?.facts ?? {}, busy = Boolean(st?.busy), now = Date.now();
     if (chk) box.child(small(`Read now by pa-push-main check (not from the card file), at ${clock(st.at)}`));
+    if (isQueuePush(c)) return this.queueBlock(t, box, entry, st, chk, f, busy, now, line, small, sub, onCheck);
     if (f.path) box.child(line(`Repository: ${text(f.path)}`));
     const entryOn = f.allow?.entry;
     if (f.url) box.child(line(`Pushes to: ${text(f.url)}${entryOn ? `, on your allowlist (entry ${entryOn.enabled ? "on" : "off"}, file changed ${stamp(f.allow.mtime)})` : ""}`));
@@ -267,9 +284,49 @@ export class PushCards {
     return box;
   }
 
+  // t-140 R2, R4: the open queue card that pushes: what its options merge now, what waits, the commits each would push,
+  // and why a push would not run now, all from the check (never the card file's context).
+  queueBlock(t, box, entry, st, chk, f, busy, now, line, small, sub, onCheck) {
+    if (f.path) box.child(line(`Repository: ${text(f.path)}`));
+    if (f.url) box.child(line(`Pushes to: ${text(f.url)} ${text(f.branch)}${f.allow?.entry ? ", on your allowlist" : ""}`));
+    if (f.branch && f.remoteNow) box.child(line(`Remote ${text(f.branch)} now: ${short(f.remoteNow)}; local ${text(f.branch)}: ${short(f.localNow)} (checked ${clock(st.at)})`));
+    for (const o of Array.isArray(chk?.options) ? chk.options : []) {
+      box.child(line(`${text(o.label)}:`));
+      box.child(sub(`Merges now: ${(o.mergeNow ?? []).map(text).join(", ") || "nothing"}`, t.muted));
+      if (o.waits) box.child(sub(`Waits: ${text(o.waits.task)}: ${text(o.waits.why)}`, t.working));
+      const p = o.push ?? {}, commits = Array.isArray(p.commits) ? p.commits : [];
+      if (p.ok) {
+        box.child(sub(`Commits to push (${Number.isFinite(p.count) ? p.count : commits.length}):`, t.muted));
+        for (const x of commits.slice(0, COMMITS_SHOWN)) box.child(sub(`  ${short(x?.sha)} ${text(x?.subject)} — ${text(x?.author)}`, t.muted, 11));
+        if (commits.length > COMMITS_SHOWN) box.child(sub(`  … and ${commits.length - COMMITS_SHOWN} more`, t.dim, 11));
+      } else if ((o.mergeNow ?? []).length) box.child(sub(`Not pushed now: ${text(p.refusal?.message)}; the merges would still run and a push card would follow`, t.blocked));
+    }
+    if (chk?.caller) box.child(line(chk.caller.ok ? "This panel may push: yes" : `This panel may push: no (${text(chk.caller.why)})`, chk.caller.ok ? t.muted : t.blocked));
+    if (st?.result) this.shown(t, box, st, f, [], entry.id);
+    if (st?.error) box.child(line(`Not saved: ${st.error}`, t.blocked));
+    if (st?.unknown) box.child(line(`The result is unknown (${st.unknown}); checking the card again.`, t.blocked));
+    if (st?.notNowWait) box.child(line(`${st.notNowWait === OTHER ? OTHER : NOT_NOW} was not saved: a check was running. Submit it again.`, t.blocked));
+    if (busy) box.child(line("Checking…", t.dim));
+    else if (!chk) box.child(small(st?.running ? "" : "Not checked yet."));
+    else if (chk.ok !== true) box.child(line(`Merging and pushing are not possible now (${text(chk.refusal?.check)}): ${text(chk.refusal?.message)}`, t.blocked));
+    else if (now - st.at >= FRESH) box.child(line("This check is over 2 minutes old: Check again before answering.", t.blocked));
+    else if (!chk.seen) box.child(line("The check gave no seen token: Check again.", t.blocked));
+    else if (chk.caller?.ok === true && !st?.result) box.child(line("Ready: a merge option merges and pushes exactly what is listed above.", t.done));
+    if (st?.stale && !busy) box.child(line("A merge option needs a check that passed, under 2 minutes old: Check again.", t.blocked));
+    if (!st?.running && !busy) box.child(div().id(`push-check-${entry.id}`).flex_none().text_size(11.5).text_color(t.accent).cursor_pointer().on_click(onCheck).child("Check again"));
+    return box;
+  }
+
   // What this copy's run printed: the result line and the tail of git's output.
   shown(t, box, st, f, lines = [], cardId = "") {
     const r = st.result.result;
+    if (r && typeof r === "object" && typeof r.state === "string") { // t-140: a queue card's run
+      const said = st.result.label === OTHER ? "Answered Other: nothing was merged or pushed." : st.result.label === NOT_NOW ? "Answered Not now: nothing was merged or pushed."
+        : text(st.result.message) || text(r.message) || text(r.state);
+      lines.push(said);
+      box.child(div().text_size(12).text_color(r.state === "pushed" || r.state === "already" ? t.done : t.blocked).child(sel(`sel-push-${cardId}-${lines.length}`, said)));
+      return;
+    }
     const where = `${text(r?.url ?? f.url)} ${text(r?.branch ?? f.branch)}`;
     const said = st.result.label === OTHER ? OTHER_SAID : st.result.label !== PUSH ? "Answered Not now: nothing was pushed."
       : r?.how && r.how !== "pushed" ? `Already on the remote: ${where} is at ${short(r?.to)} (recorded at ${clock(r?.at, false)})`

@@ -10,16 +10,28 @@ Selected by the name it is invoked as (symlinks in ~/.local/bin):
   pa-push-main run <card> --answer Push|"Not now"|Other --space ID [--seen TOKEN] [--note T] [--json]
                                                  the person's answer, run by the Project panel on their click:
                                                  every check again under a lock, then a fast-forward push of
-                                                 exactly the gated commit to the allowlist URL (never a force)
+                                                 exactly the gated commit to the allowlist URL (never a force).
+                                                 On a queue card that pushes (d-queue-N with queue.push, t-140 Part
+                                                 A), check reads what each merge option would merge and push now, and
+                                                 run (--answer <the card's label>) takes the queue lock, then the push
+                                                 lock, merges the option's entries and pushes exactly those commits
+  pa-push-main run --standing <rule id> --repo <main checkout> --space ID [--json]
+                                                 the Project Agent's push of the queue's merges made on the person's
+                                                 standing rule (t-140 Part B): only while the rule is in force (active,
+                                                 the person's, bound on the allowlist with its text unchanged) and not
+                                                 stopped; every check of run but the card's; a refusal stops the rule
   pa-push-allow show [--json] [--space ID]       the push allowlist (<PA home>/push-allow.json): valid or why not,
                                                  on or off, its SHA-256 and time, each entry
-  pa-push-allow add --path P --space S [--url U] [--branch B] [--note T] [--pre-push ARG...]
+  pa-push-allow add --path P --space S [--url U] [--branch B] [--note T] [--pre-push ARG...] [--standing RULE]
+  pa-push-allow set --path P --space S --standing RULE | --unbind
+                                                 bind (or unbind) the person's standing rule: its id and its text's SHA
   pa-push-allow remove --path P --space S
   pa-push-allow on|off [--path P --space S]      the person's commands: change the allowlist (refused for agents)
 
-Off by default: with no push-allow.json, or "enabled": false, nothing here pushes. Agents never push: the
-person-only commands refuse an agent's shell (its variables, a claude or codex ancestor process, or a failed
-ps). That fence stops agents that follow their rules; it does not prove a human.
+Off by default: with no push-allow.json, or "enabled": false, nothing here pushes. Agents never push, but for the
+Project Agent's --standing run under the person's bound rule: the person-only commands refuse an agent's shell (its
+variables, a claude or codex ancestor process, or a failed ps). That fence stops agents that follow their rules; it
+does not prove a human.
 """
 import argparse
 import contextlib
@@ -37,6 +49,8 @@ import tempfile
 import time
 
 sys.dont_write_bytecode = True  # keep tools/ free of caches
+if __name__ == "__main__":  # run as pa-push-main: pa_queue's import finds this module, not a second copy
+    sys.modules.setdefault("pa_push", sys.modules[__name__])
 import pa  # noqa: E402
 import pa_hooks  # noqa: E402
 
@@ -44,7 +58,21 @@ ALLOW_FILE = "push-allow.json"
 MAX_REPOS = 50
 NOTE_MAX = 200
 TOP_KEYS = ("version", "enabled", "repos")
-ENTRY_KEYS = ("path", "url", "branch", "space", "enabled", "prePush", "note")
+ENTRY_KEYS = ("path", "url", "branch", "space", "enabled", "prePush", "note", "standing")
+STANDING_KEYS = ("rule", "textSha")  # t-140 R10: the person's binding of their standing rule to this entry
+_QUEUE = [None]
+
+
+def use_queue(module):
+    """pa_queue registers itself when it loads (t-140): the queue card's check and run use that module."""
+    _QUEUE[0] = module
+
+
+def queue_tool():
+    if _QUEUE[0] is None:
+        import pa_queue  # noqa: F401 (it registers itself with use_queue)
+        _QUEUE[0] = _QUEUE[0] or pa_queue
+    return _QUEUE[0]
 ENTRY_REQUIRED = ("path", "url", "branch", "space", "enabled")
 URL = re.compile(r"^(ssh://\S+|[A-Za-z0-9._-]+@[A-Za-z0-9.-]+:\S+|https://\S+|file:///\S+)$")
 PLACEHOLDERS = ("path", "repo", "commit", "url", "branch")
@@ -141,6 +169,11 @@ def entry_problem(e):
                         name, ", ".join("{" + p + "}" for p in PLACEHOLDERS))
     if "note" in e and (not isinstance(e["note"], str) or len(e["note"]) > NOTE_MAX):
         return "note must be a string of at most {} characters".format(NOTE_MAX)
+    if "standing" in e:
+        b = e["standing"]
+        if not isinstance(b, dict) or sorted(b) != sorted(STANDING_KEYS) or not isinstance(b.get("rule"), str) or \
+                not pa.ID.match(b["rule"]) or not isinstance(b.get("textSha"), str) or not re.match(r"^[0-9a-f]{64}$", b["textSha"]):
+            return "standing must be {\"rule\": <rule id>, \"textSha\": <SHA-256 of its text>} (pa-push-allow set --standing)"
     return None
 
 
@@ -339,6 +372,13 @@ def allow_parser():
     add.add_argument("--branch")
     add.add_argument("--note")
     add.add_argument("--pre-push", nargs="+", dest="pre_push")
+    add.add_argument("--standing", help="bind the person's standing rule to merge and push (its id in the space's rules.json)")
+    bind = sub.add_parser("set", help="bind or unbind the person's standing rule on an entry (the person's command)")
+    bind.add_argument("--path", required=True)
+    bind.add_argument("--space", required=True)
+    how = bind.add_mutually_exclusive_group(required=True)
+    how.add_argument("--standing", help="the rule's id in the space's rules.json; its text's SHA-256 is stored with it")
+    how.add_argument("--unbind", action="store_true", help="remove the binding")
     remove = sub.add_parser("remove", help="remove an entry (the person's command)")
     remove.add_argument("--path", required=True)
     remove.add_argument("--space", required=True)
@@ -405,11 +445,31 @@ def allow_change(args, env=None, ancestors=None):
                 entry["prePush"] = args.pre_push
             if args.note:
                 entry["note"] = args.note
+            if getattr(args, "standing", None):
+                binding, why = binding_for(space, args.standing)
+                if why:
+                    print("pa-push-allow: not changed: " + why, file=sys.stderr)
+                    return 1
+                entry["standing"] = binding
             data["repos"].append(entry)
             what = "added: " + json.dumps(entry)
         elif not found:
             print("pa-push-allow: no entry for {} in space {}".format(args.path, space), file=sys.stderr)
             return 1
+        elif args.action == "set":
+            if getattr(args, "unbind", False):
+                for e in found:
+                    e.pop("standing", None)
+                what = "the entry for {} in space {} has no standing rule".format(args.path, space)
+            else:
+                binding, why = binding_for(space, args.standing)
+                if why:
+                    print("pa-push-allow: not changed: " + why, file=sys.stderr)
+                    return 1
+                for e in found:
+                    e["standing"] = binding
+                what = "the entry for {} in space {} is bound to rule {} (text sha256 {})".format(
+                    args.path, space, binding["rule"], binding["textSha"])
         elif args.action == "remove":
             data["repos"] = [e for e in data["repos"] if e not in found]
             what = "removed the entry for {} in space {}".format(args.path, space)
@@ -425,6 +485,31 @@ def allow_change(args, env=None, ancestors=None):
     pa.write_json(allow_path(), data)
     print("{} ({}).".format(what, allow_path()))
     return 0
+
+
+def binding_for(space, rule_id):
+    """({rule, textSha}, None) for the rule of that id in the space's rules.json, or (None, why not): the person binds
+    the rule as its text stands now (t-140 R10 (1))."""
+    if not isinstance(rule_id, str) or not pa.ID.match(rule_id):
+        return None, "--standing needs a rule id"
+    directory = os.path.join(pa.ROOT, "spaces", space)
+    rules = space_rules(directory)
+    if rules is None:
+        return None, "space {} has no valid rules.json".format(space)
+    found = [r for r in rules if r.get("id") == rule_id]
+    if len(found) != 1 or not isinstance(found[0].get("text"), str):
+        return None, "space {} has {} rule(s) with the id {} (and a text); bind one".format(space, len(found), rule_id)
+    return {"rule": rule_id, "textSha": text_sha(found[0]["text"])}, None
+
+
+def text_sha(text):
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def space_rules(directory):
+    data = pa.read_json_safe(os.path.join(directory, "rules.json"))
+    rules = data.get("rules") if isinstance(data, dict) else None
+    return [r for r in rules if isinstance(r, dict)] if isinstance(rules, list) else None
 
 
 def default_url(path):
@@ -621,10 +706,12 @@ def main_settings_refusal(s, path):
     return None
 
 
-def gather(s, directory, space, push, facts, plan=False):
+def gather(s, directory, space, push, facts, plan=False, ontos=None):
     """Checks C6-C11 in order, filling facts as it goes. Raises Refused at the first that fails. plan: the card does
     not exist yet, so its fields are taken from what is read now (and push is filled in), instead of compared.
-    Returns "already" when the remote branch is at the commit already, else None."""
+    ontos (t-140 R2, the check of a queue card that pushes, which writes nothing): C8h also takes the branch of an
+    entry ahead that the card's own merge would put on main first. Returns "already" when the remote branch is at
+    the commit already, else None."""
     path = push["path"]
     real = os.path.realpath(path)
     facts["path"] = path
@@ -734,7 +821,7 @@ def gather(s, directory, space, push, facts, plan=False):
     # checked on a queued entry's branch merges through pa-queue after that entry, never by its own push card.
     onto = [e.get("onto") for e in now_gate.get("content") or [] if isinstance(e, dict) and isinstance(e.get("common"), str)
             and os.path.realpath(e["common"]) == common]
-    if onto != [branch]:
+    if onto != [branch] and not (ontos and len(onto) == 1 and onto[0] in ontos):
         raise Refused("C8h", "the full gate for {} {}; it merges through pa-queue after the task of that branch".format(
             task_id, "did not compare this repository's commit against {}".format(branch) if not onto or not isinstance(onto[0], str)
             else "says its checks compared it against {}".format(pa_hooks.clean(onto[0])) if len(onto) == 1
@@ -980,6 +1067,8 @@ def blank_facts():
 def check_card(directory, space, card_id, env, ancs):
     """pa-push-main check: the facts, the first failing check and the seen token. Reads only: no lock, no write
     in the space (git may fetch the remote branch into FETCH_HEAD to compare it)."""
+    if is_queue_card(directory, card_id):
+        return check_queue_card(directory, space, card_id, env, ancs)
     why = caller_refusal(env, ancs)
     report = {"card": card_id, "ok": False, "refusal": None, "caller": {"ok": why is None, "why": why, "ancestors": ancestor_names(ancs)},
               "status": None, "done": False, "result": None, "facts": blank_facts(), "seen": None}
@@ -1174,6 +1263,17 @@ def cmd_check(args):
     report = check_card(directory, space, args.card, os.environ, ancestors())
     if args.json:
         print(json.dumps(report, indent=2))
+    elif report.get("kind") == "queue":
+        print("{}: {}".format(args.card, "ready" if report["ok"] else "refused ({}): {}".format(report["refusal"]["check"], report["refusal"]["message"])))
+        for o in report["options"]:
+            p = o["push"]
+            print("  {}: merges now {}{}; {}".format(o["label"], ", ".join(o["mergeNow"]) or "nothing",
+                                                    " (waits: {}: {})".format(o["waits"]["task"], o["waits"]["why"]) if o["waits"] else "",
+                                                    "pushes {} commit(s) to {}".format(p["count"], short(p["commit"])) if p["ok"]
+                                                    else "not pushed now: " + (p["refusal"] or {}).get("message", "")))
+        print("caller: {}".format("this caller may answer" if report["caller"]["ok"] else "refused: " + report["caller"]["why"]))
+        if report["seen"]:
+            print("seen: " + report["seen"])
     else:
         f = report["facts"]
         print("{}: {}".format(args.card, "ready: Push would push {} {}..{} to {}".format(f["branch"], short(f["remoteNow"]), short(f["commit"]), f["url"])
@@ -1220,6 +1320,11 @@ def run_push(space, card_id, answer, note, seen, env, ancs, deadline=None):
     directory = os.path.join(pa.ROOT, "spaces", space) if pa.ID.match(space) else None
     if not directory or not os.path.isfile(os.path.join(directory, "agent.json")):
         return 1, refused(Refused("C1", "no Project Agent state for space {}".format(space)), answer)
+    if is_queue_card(directory, card_id):  # t-140 R3: the queue lock, then the push lock
+        try:
+            return run_queue(directory, space, card_id, answer, note, seen, deadline)
+        except Refused as r:
+            return 1, refused(r, answer)
     try:
         with push_lock(directory):
             return run_locked(directory, space, card_id, answer, note, seen, deadline)
@@ -1396,10 +1501,636 @@ def act(s, directory, card, note, facts):
     return finish(s, directory, card, note, facts, "pushed", merged, output)
 
 
+def read_remote(s, path, url, branch):
+    """The remote branch's commit, read now with ls-remote, or None."""
+    code, out, _err = s.git(path, ["ls-remote", url, "refs/heads/" + branch], 30)
+    remote = next((l.split()[0] for l in out.splitlines() if l.split()[1:2] == ["refs/heads/" + branch]), None) if not code else None
+    return remote if remote and HEX.match(remote) else None
+
+
+def push_exact(s, facts):
+    """The push of exactly facts' commit to the allowlist URL and branch (--porcelain, no force, no tags), then a read
+    back: ("pushed", output) or ("unknown", output); a refused push raises Refused("push") with the remote read again.
+    Never a local fast-forward: the queue merged local main already (t-140 R3 (7))."""
+    path, url, branch, commit = facts["path"], facts["url"], facts["branch"], facts["commit"]
+    code, out, err = s.git(path, ["push", "--porcelain", "--no-follow-tags", "--recurse-submodules=no", url, commit + ":refs/heads/" + branch], 120)
+    if code:
+        raise Refused("push", "failed: git push was refused: {}. The remote {} is at {}.".format(
+            tail(err + "\n" + out, 5) or "exit {}".format(code), branch, short(read_remote(s, path, url, branch))))
+    remote = read_remote(s, path, url, branch)
+    if remote != commit:
+        return "unknown", out + err, "the push reported success but {} {} is {}, not {}; look at the remote".format(
+            url, branch, short(remote) if remote else "unreadable", short(commit))
+    return "pushed", out + err, "pushed {} {} {}..{} ({} commits)".format(url, branch, short(facts.get("remoteNow")), short(commit), facts.get("count"))
+
+
+# ---- t-140 Part A: a queue card that also pushes (R1-R9) ---------------------------------------------------
+
+QUEUE_PUSH_SUFFIX = " and push"
+QUEUE_CONTEXT = "Your answer also pushes the merged commits; the panel shows what it would push, read now."
+
+
+def tool_installed():
+    return shutil.which("pa-push-main") is not None
+
+
+def queue_card_push(directory, repo):
+    """For pa-queue card (R1): where pushing is set up for the main checkout repo in this space (the allowlist valid
+    and on, exactly one enabled entry for it and this space, and the push tool on PATH), the card's push fields; else
+    None, and the card is today's. The fields are for display and routing only: check and run read everything again."""
+    data, problem, _sha, _mtime = load_allow()
+    if problem or not isinstance(data, dict) or data.get("enabled") is not True or not tool_installed():
+        return None
+    agent = pa.read_json_safe(os.path.join(directory, "agent.json")) or {}
+    space = pa.local_id(agent.get("space") or os.path.basename(directory))
+    real = os.path.realpath(repo)
+    mine = [e for e in data["repos"] if os.path.realpath(e["path"]) == real and e["space"] == space]
+    if len(mine) != 1 or mine[0].get("enabled") is not True:
+        return None
+    e = mine[0]
+    return {"fields": {"push": {"version": 1, "path": real, "url": e["url"], "branch": e["branch"]}},
+            "suffix": QUEUE_PUSH_SUFFIX, "contextLine": QUEUE_CONTEXT, "url": e["url"]}
+
+
+def is_queue_card(directory, card_id):
+    if not isinstance(card_id, str) or not pa.ID.match(card_id):
+        return False
+    card = pa.read_json_safe(card_file(directory, card_id))
+    return isinstance(card, dict) and card.get("kind") == "queue" and not isinstance(card.get("push"), dict)
+
+
+def pushing_queue(card):
+    """True for a queue card that pushes (its queue has a push object): pa-decide and the panel route it here."""
+    q = card.get("queue") if isinstance(card, dict) else None
+    return isinstance(card, dict) and card.get("kind") == "queue" and isinstance(q, dict) and isinstance(q.get("push"), dict)
+
+
+def load_queue_card(directory, card_id):
+    """The pushing queue card (C3), or Refused."""
+    card = pa.read_json_safe(card_file(directory, card_id))
+    if not isinstance(card, dict) or card.get("kind") != "queue" or not isinstance(card.get("queue"), dict):
+        raise Refused("C3", "{} is not a queue card".format(card_id))
+    q = card["queue"]
+    if not isinstance(q.get("push"), dict):
+        raise Refused("C3", "{} is not a pushing queue card (it was made where pushing was not set up); it is answered as "
+                            "a queue card".format(card_id))
+    if q["push"].get("version") != 1:
+        raise Refused("C3", "{} has queue push version {}; this pa-push-main knows version 1".format(card_id, q["push"].get("version")))
+    if not isinstance(q.get("repo"), str) or not os.path.isabs(q["repo"]) or not isinstance(q.get("entries"), list):
+        raise Refused("C3", "{} is not a pushing queue card (its repo or entries are missing)".format(card_id))
+    return card
+
+
+def merge_options(card):
+    return [o for o in card.get("options") or [] if isinstance(o, dict) and isinstance(o.get("count"), int)
+            and o["count"] > 0 and isinstance(o.get("label"), str)]
+
+
+def dry_merge(Q, ctx, rec, card, option, now_at):
+    """R2: the longest front prefix of the option's entries that would merge now, each read as if the ones ahead of it
+    had merged (merge_check with the tip and branch of the entry ahead), and the first that would not, with why.
+    Writes nothing: each entry is probed on a copy with the approval the answer would record."""
+    suites, reviews = pa_hooks.suite_runs(ctx.directory), pa_hooks.review_runs(ctx.directory)
+    real = ctx.tip(rec["main"])
+    prev_tip, prev_branch, merged = real, None, []
+    listed = [x for x in card["queue"]["entries"] if isinstance(x, dict)][:option["count"]]
+    for k, x in enumerate(listed):
+        e, why = Q.listed_entry(rec, x)
+        if e is None:
+            return merged, {"task": x.get("task"), "why": why}
+        if rec["entries"].index(e) != k:
+            ahead = rec["entries"][k]["task"] if k < len(rec["entries"]) else "?"
+            return merged, {"task": e["task"], "why": "an entry ahead of it ({}) is not on this card; it merges first".format(ahead)}
+        probe = dict(e, approval=Q.approval_for(card.get("id"), dict(card, answered=now_at, answer=option["label"]), e))
+        why, _void, _suite = Q.merge_check(ctx, rec, probe, prev_tip, suites, reviews, onto=prev_branch, expected=real)
+        if why:
+            return merged, {"task": e["task"], "why": why}
+        merged.append(e)
+        prev_tip, prev_branch = e["tip"], e["branch"]
+    return merged, None
+
+
+def queue_facts(s, Q, ctx, data, rec, directory, space, card):
+    """The facts of a pushing queue card, read now (R2): {facts, options, seen}; Refused when the card's queue cannot
+    be read. Shared by check and run, so the token the person saw is the one the run compares."""
+    q, repo = card["queue"], ctx.repo
+    now_at = pa.now()
+    adata, problem, asha, amtime = load_allow()
+    entry = None
+    if adata and not problem:
+        mine = [e for e in adata["repos"] if os.path.realpath(e["path"]) == repo and e["space"] == space]
+        entry = mine[0] if len(mine) == 1 else None
+    url, branch = (entry or q["push"]).get("url"), (entry or q["push"]).get("branch")
+    local = ctx.tip(rec["main"])
+    remote = read_remote(s, repo, url, branch) if isinstance(url, str) and isinstance(branch, str) and not branch_problem(branch) else None
+    facts = {"path": repo, "url": url, "branch": branch, "localNow": local, "remoteNow": remote, "main": rec["main"],
+             "allow": {"file": allow_path(), "sha": asha, "mtime": amtime, "entry": entry}, "checkedAt": None}
+    extra = []
+    if remote and local and remote != local and s.sha(repo, remote) == remote and s.is_ancestor(repo, remote, local):
+        code, out, _ = s.git(repo, ["rev-list", remote + ".." + local])
+        extra = out.split() if not code else []
+    options = []
+    for o in merge_options(card):
+        merged, waits = dry_merge(Q, ctx, rec, card, o, now_at)
+        listed = [x for x in q["entries"] if isinstance(x, dict)][:o["count"]]
+        item = {"label": o["label"], "count": o["count"], "entries": [{"task": x.get("task"), "job": x.get("job"), "instance": x.get("instance"),
+                                                                        "tip": x.get("tip")} for x in listed],
+                "mergeNow": [e["task"] for e in merged], "waits": waits, "extra": extra,
+                "push": {"ok": False, "refusal": None, "commit": None, "commits": [], "count": 0}}
+        if merged:
+            push = {"version": 1, "space": space, "task": merged[-1]["task"], "path": repo}
+            pf = blank_facts()
+            ahead = {e["branch"] for e in merged[:-1]}
+            try:
+                gather(s, directory, space, push, pf, plan=True, ontos=ahead)
+                if extra:
+                    raise Refused("R6", extra_message(rec["main"], len(extra)))
+                item["push"].update(ok=True, commit=pf["commit"], commits=pf["commits"], count=pf["count"])
+            except Refused as r:
+                item["push"].update(refusal={"check": r.check, "message": r.message}, commit=pf.get("commit"),
+                                    commits=pf.get("commits") or [], count=pf.get("count") or 0)
+        else:
+            item["push"]["refusal"] = {"check": "none", "message": "nothing would merge now, so nothing would be pushed"}
+        options.append(item)
+    value = [card.get("id"), repo, url, branch, asha, local, remote,
+             [[o["label"], [[x["task"], x["job"], x["instance"], x["tip"]] for x in o["entries"]], o["mergeNow"],
+               [c.get("sha") for c in o["push"]["commits"]], (o["push"]["refusal"] or {}).get("check")] for o in options]]
+    return {"facts": facts, "options": options, "seen": hashlib.sha256(json.dumps(value).encode()).hexdigest()}
+
+
+def extra_message(main, n):
+    return "local {} has commits that are not from this card: {}; a push card lists them".format(main, n)
+
+
+def queue_context(directory, card):
+    """(Q, ctx, data, rec) for the card's repository; the caller closes ctx. sync_main runs in memory only."""
+    Q = queue_tool()
+    ctx = Q.Ctx(directory, card["queue"]["repo"])
+    try:
+        data = Q.load_queue(directory)
+        rec = data["repos"].get(ctx.repo)
+        if not isinstance(rec, dict) or rec.get("common") != card["queue"].get("common"):
+            raise Refused("C3", "the queue of {} is not the one this card was made for".format(ctx.repo))
+        for k in ("planned", "entries", "left", "merged"):
+            if not isinstance(rec.get(k), list):
+                rec[k] = []
+        Q.sync_main(ctx, rec)
+    except Q.Refused as r:
+        ctx.close()
+        raise Refused("C10a", str(r))
+    except Refused:
+        ctx.close()
+        raise
+    return Q, ctx, data, rec
+
+
+def check_queue_card(directory, space, card_id, env, ancs):
+    """pa-push-main check of a pushing queue card (R2): read only, no lock, nothing written in the space."""
+    why = caller_refusal(env, ancs)
+    report = {"card": card_id, "kind": "queue", "ok": False, "refusal": None,
+              "caller": {"ok": why is None, "why": why, "ancestors": ancestor_names(ancs)},
+              "status": None, "done": False, "result": None, "facts": {}, "options": [], "seen": None}
+    s = Session(deadline=time.monotonic() + 55)
+    ctx = None
+    try:
+        card = load_queue_card(directory, card_id)
+        q = card["queue"]
+        report.update(status=card.get("status"), result=q["push"].get("result"))
+        if card.get("status") != "open" or q.get("applied"):
+            raise Refused("C4", "{} is {}; nothing to do".format(card_id, card.get("status") if card.get("status") != "open" else "applied"))
+        Q, ctx, data, rec = queue_context(directory, card)
+        got = queue_facts(s, Q, ctx, data, rec, directory, space, card)
+        report.update(facts=got["facts"], options=got["options"], seen=got["seen"], ok=True)
+    except Refused as r:
+        report["refusal"] = {"check": r.check, "message": r.message}
+    except pa_hooks.ContentError as e:
+        report["refusal"] = {"check": "C10a", "message": str(e)}
+    finally:
+        if ctx is not None:
+            ctx.close()
+        s.close()
+        report["facts"]["checkedAt"] = pa.now()
+    return report
+
+
+def run_queue(directory, space, card_id, answer, note, seen, deadline):
+    """R3: the queue lock, then the push lock (pa-queue merge's order), then the card's answer."""
+    Q = queue_tool()
+    hold = Q.queue_lock(directory)
+    try:
+        hold.__enter__()
+    except Q.Refused:
+        raise Refused("C2", "another queue command is running; try again")
+    try:
+        with push_lock(directory):
+            return run_queue_locked(Q, directory, space, card_id, answer, note, seen, deadline)
+    finally:
+        hold.__exit__(None, None, None)
+
+
+def queue_journal(directory, card, why, push=None):
+    line = {"by": "person", "trigger": "panel", "task": card.get("task"), "decision": card["id"], "why": why}
+    if push:
+        line["push"] = push
+    pa_hooks.append_journal(directory, line)
+
+
+def run_queue_locked(Q, directory, space, card_id, answer, note, seen, deadline):
+    card = load_queue_card(directory, card_id)  # C3
+    card["id"] = card_id
+    q = card["queue"]
+    if card.get("status") != "open" or q.get("applied"):
+        raise Refused("C4", "{} is {}; nothing was merged or pushed".format(card_id, card.get("status") if card.get("status") != "open" else "applied"))
+    labels = [o.get("label") for o in card.get("options") or [] if isinstance(o, dict)]
+    if answer != pa.OTHER and answer not in labels:
+        raise Refused("C5", "--answer must be one of: " + ", ".join([str(l) for l in labels] + [pa.OTHER]))
+    if answer == pa.OTHER:
+        words = (note or "").strip()
+        if not words:
+            raise Refused("C5", "an Other answer needs --note with the person's own words")
+        if len(words) > pa.OTHER_MAX:
+            raise Refused("C5", pa.OTHER_TOO_LONG)
+        answered(card, pa.OTHER, words)
+        card["other"] = True
+        save_card(directory, card)
+        queue_journal(directory, card, "answered Other: " + pa_hooks.cut(pa_hooks.clean(words), 200))
+        return 0, outcome(True, False, pa.OTHER, message="{} answered Other; nothing was merged or pushed.".format(card_id))
+    option = next(o for o in card["options"] if isinstance(o, dict) and o.get("label") == answer)
+    if not (isinstance(option.get("count"), int) and option["count"] > 0):
+        answered(card, answer, note)
+        save_card(directory, card)
+        queue_journal(directory, card, "answered " + answer)
+        return 0, outcome(True, False, answer, message="{} answered {}; nothing was merged or pushed.".format(card_id, answer))
+    s = Session(deadline)
+    Q_, ctx, data, rec = queue_context(directory, card)
+    try:
+        got = queue_facts(s, Q, ctx, data, rec, directory, space, card)
+        if not seen:
+            raise Refused("C12", "--seen is required (the token of the facts the person looked at)")
+        if seen != got["seen"]:
+            raise Refused("C12", "the facts changed since you looked; look at the card again")
+        return queue_merge_and_push(s, Q, ctx, data, rec, directory, space, card, option, note)
+    except Refused as r:
+        q["attempts"] = (list(q.get("attempts") or []) + [{"at": pa.now(), "check": r.check, "message": r.message}])[-ATTEMPTS_KEPT:]
+        save_card(directory, card)
+        queue_journal(directory, card, "not answered: " + r.message)
+        raise
+    finally:
+        ctx.close()
+        s.close()
+
+
+def queue_merge_and_push(s, Q, ctx, data, rec, directory, space, card, option, note):
+    """R3 (5)-(8), R5, R6: the answer, its approvals, the merges of the option's entries, then the push of exactly the
+    merged commits, or why not and the push card that follows. Nothing is retried."""
+    card_id, label, repo = card["id"], option["label"], ctx.repo
+    answered(card, label, note)
+    save_card(directory, card)
+    Q.apply_cards(ctx, rec)  # the approvals, bound as a card's (task, job, instance, added, checked digests)
+    main_before = ctx.tip(rec["main"])
+    only = [(x.get("task"), x.get("job") or None) for x in card["queue"]["entries"][:option["count"]] if isinstance(x, dict)]
+    lines, merged = Q.merge_front(ctx, data, rec, only=only)
+    Q.save(ctx, data, rec)
+    card = pa.read_json_safe(card_file(directory, card_id)) or card  # apply_cards wrote it again
+    card["id"] = card_id
+    stop = next((l for l in lines if l.startswith("stopped at")), None)
+    result = {"at": pa.now(), "state": "none", "from": None, "to": None, "commits": 0, "check": None, "message": "",
+              "merged": [e["task"] for e in merged], "pushCard": None}
+    push_line = None
+    if not merged:
+        result["message"] = "nothing merged now{}; nothing was pushed".format(": " + stop if stop else "")
+    else:
+        facts = blank_facts()
+        push = {"version": 1, "space": space, "task": merged[-1]["task"], "path": repo}
+        try:
+            try:
+                gather(s, directory, space, push, facts, plan=True)
+            except Refused as r:
+                if r.check != "C11b" or facts.get("remoteNow") != facts.get("commit"):
+                    raise
+                result.update(state="already", to=facts.get("commit"), message="already on the remote")
+            if result["state"] != "already":
+                if facts.get("merge") or facts.get("localNow") != facts.get("commit"):
+                    raise Refused("C10a", "local {} is at {}, not at the merged commit {}; nothing was pushed".format(
+                        facts["branch"], short(facts.get("localNow")), short(facts.get("commit"))))
+                if facts["remoteNow"] != main_before:
+                    n = s.git(repo, ["rev-list", "--count", "{}..{}".format(facts["remoteNow"], main_before)])[1].strip()
+                    raise Refused("R6", extra_message(rec["main"], int(n) if n.isdigit() else "some"))
+                entry = facts["allow"]["entry"]
+                if entry.get("prePush"):
+                    pre_push(s, entry, facts)
+                if s.left() < PUSH_RESERVE:
+                    raise Refused("deadline", "ran out of time before pushing; nothing was pushed")
+                state, output, message = push_exact(s, facts)
+                result.update(state=state, message=message, output=tail(output))
+                push_line = journal_push(dict(push, url=facts["url"], branch=facts["branch"], commit=facts["commit"]), facts["remoteNow"], False)
+        except Refused as r:
+            result.update(state="failed" if r.check == "push" else "refused", check=r.check, message=r.message)
+        result.update(**{"from": facts.get("remoteNow"), "to": facts.get("commit"), "commits": facts.get("count") or 0})
+        if result["state"] in ("refused", "failed"):
+            before = {i for i, _c in open_push_cards(directory, repo)}
+            said = Q.push_card(ctx, rec, merged[-1]["task"])  # R5 rows 3-4: one more click, never a retry
+            new = [i for i, _c in open_push_cards(directory, repo) if i not in before]
+            result["pushCard"] = new[-1] if new else None
+            result["message"] += "; " + "; ".join(said)
+    done = "merged {} ({} {}..{})".format(", ".join(result["merged"]), rec["main"], short(main_before), short(ctx.tip(rec["main"]))) \
+        if merged else "merged nothing"
+    if result["state"] == "pushed":
+        tail_words = "pushed {} {} {}..{}".format(card["queue"]["push"].get("url"), card["queue"]["push"].get("branch"),
+                                                   short(result["from"]), short(result["to"]))
+    elif result["state"] == "already":
+        tail_words = "already on the remote"
+    elif result["state"] == "none":
+        tail_words = result["message"]
+    else:
+        tail_words = "not pushed: {}".format(result["message"])
+    message = "{} answered {}: {}; {}".format(card_id, label, done, tail_words)
+    if stop and merged:
+        message += " ({})".format(stop)
+    card["queue"]["push"]["result"] = result
+    save_card(directory, card)
+    queue_journal(directory, card, message, push_line)
+    return 0, outcome(True, result["state"] in ("pushed", "already"), label, result=result, message=message)
+
+
+# ---- t-140 Part B: the person's rule as their standing approval (R10, R13, R14) ----------------------------
+
+def standing_rule(directory, space, repo, rule_id):
+    """(rule, allowlist entry) when the person's standing rule rule_id is in force for the main checkout repo in this
+    space (R10 1-5), read now; else Refused("standing", why not). The binding is on the allowlist, which only the
+    person's command writes; rules.json alone never counts."""
+    def no(why):
+        raise Refused("standing", why)
+    if not isinstance(rule_id, str) or not pa.ID.match(rule_id):
+        no("--standing needs the rule's id")
+    data, problem, _sha, _mtime = load_allow()
+    if data is None and problem is None:
+        no("no push allowlist ({}): the rule is not bound".format(allow_path()))
+    if problem:
+        no("the push allowlist is not valid: {}".format(problem))
+    if not data["enabled"]:
+        no("the push allowlist is turned off (enabled: false)")
+    real = os.path.realpath(repo)
+    bound = [e for e in data["repos"] if os.path.realpath(e["path"]) == real and e["space"] == space
+             and (e.get("standing") or {}).get("rule") == rule_id]
+    if len(bound) != 1:
+        no("no allowlist entry for {} in space {} is bound to rule {} (not bound): the person binds it with pa-push-allow "
+           "set --path {} --space {} --standing {}".format(repo, space, rule_id, repo, space, rule_id))
+    entry = bound[0]
+    if not entry["enabled"]:
+        no("the allowlist entry for {} is turned off".format(repo))
+    rules = space_rules(directory)
+    if rules is None:
+        no("this space has no valid rules.json")
+    found = [r for r in rules if r.get("id") == rule_id]
+    if not found:
+        no("no rule {} in this space's rules.json".format(rule_id))
+    if len(found) > 1:
+        no("{} rules have the id {}".format(len(found), rule_id))
+    rule = found[0]
+    if rule.get("status") != "active":
+        no("rule {} is {}, not active".format(rule_id, rule.get("status")))
+    if not isinstance(rule.get("text"), str) or text_sha(rule["text"]) != entry["standing"]["textSha"]:
+        no("the text of rule {} changed since the person bound it (text changed); they bind it again".format(rule_id))
+    why = not_persons(rule)
+    if why:
+        no("rule {} is not the person's: {}".format(rule_id, why))
+    if rule.get("appliesTo") not in ("all", "release"):
+        no("rule {} applies to {}, not all or release".format(rule_id, rule.get("appliesTo")))
+    return rule, entry
+
+
+def not_persons(rule):
+    """None when the rule is the person's (R10 (4)): source person and created by them, or source orchestrator and
+    approved by them; and every history entry after that is theirs. Else why not."""
+    history = [h for h in rule.get("history") or [] if isinstance(h, dict)]
+    if not history:
+        return "it has no history"
+    if rule.get("source") == "person":
+        if history[0].get("by") != "person" or history[0].get("change") != "created":
+            return "its first history entry is not its creation by the person"
+        start = 0
+    elif rule.get("source") == "orchestrator":
+        start = next((i for i, h in enumerate(history) if h.get("by") == "person" and str(h.get("change") or "").startswith("approved")), None)
+        if start is None:
+            return "the person never approved it"
+    else:
+        return "its source is {}".format(rule.get("source"))
+    later = [h for h in history[start + 1:] if h.get("by") != "person"]
+    if later:
+        return "a later change by {} ({})".format(later[0].get("by"), later[0].get("change"))
+    return None
+
+
+def since_of(rule):
+    """The rule's last change by the person (R13: the Other/note window starts there; a stop before it is resumed, Q4)."""
+    times = [pa.parse_time(str(h.get("at"))) for h in rule.get("history") or [] if isinstance(h, dict) and h.get("by") == "person"]
+    times = [t for t in times if t is not None]
+    return max(times) if times else None
+
+
+def journal_lines(directory):
+    path = os.path.join(directory, "journal.jsonl")
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError:
+        return [], False
+    out, doubt = [], False
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        try:
+            value = json.loads(line)
+        except ValueError:
+            doubt = True
+            continue
+        if isinstance(value, dict):
+            out.append(value)
+    return out, doubt
+
+
+def standing_stops(directory, rule):
+    """What stops the rule now (R13), as (why, fresh) or None. fresh is False for a stop already written (it stays until
+    the person changes the rule, Q4)."""
+    since = since_of(rule)
+    after = lambda at: since is None or (pa.parse_time(str(at)) or 0) > since
+    lines, _doubt = journal_lines(directory)
+    for l in reversed(lines):
+        if l.get("standing") == "stopped" and l.get("rule") == rule.get("id") and after(l.get("at")):
+            return ("the rule stopped at {}: {}; the person resumes it by turning it off and on in the panel".format(
+                l.get("at"), pa_hooks.cut(pa_hooks.clean(str(l.get("why"))), 200)), False)
+    hold = "off"
+    for l in lines:
+        if "hold" in l:
+            v = l["hold"]
+            hold = "on" if v == "on" or v is True else "off" if v == "off" or v is False else "unknown"
+    if hold != "off":
+        return ("a hold is {} (the journal's last hold line)".format(hold), True)
+    for sub in ("decisions", pa.ARCHIVE):
+        folder = os.path.join(directory, sub)
+        for name in sorted(os.listdir(folder)) if os.path.isdir(folder) else []:
+            if not name.endswith(".json"):
+                continue
+            card = pa.read_json_safe(os.path.join(folder, name))
+            if not isinstance(card, dict) or card.get("status") != "answered" or not after(card.get("answered")):
+                continue
+            if pa.is_other(card):
+                return ("card {} was answered Other at {}".format(name[:-5], card.get("answered")), True)
+            if str(card.get("note") or "").strip() and str(card.get("answeredBy") or "").startswith("person, in the panel"):
+                return ("card {} has a note written in the panel ({})".format(name[:-5], card.get("answered")), True)
+    return None
+
+
+def write_stop(directory, rule_id, why, task=None):
+    """R13: the stop line. Both standing commands refuse while it stands (until the person changes the rule)."""
+    line = {"by": "agent" if pa_hooks.by_an_agent() else "person", "trigger": "standing", "standing": "stopped", "rule": rule_id,
+            "why": pa_hooks.cut(pa_hooks.clean(str(why)), 300)}
+    if task:
+        line["task"] = task
+    pa_hooks.append_journal(directory, line)
+
+
+STANDING_MSG = ("pa-push-main run --standing is the Project Agent's, under the person's standing rule to merge and push in "
+                "its own space; without it, the person answers a card in the panel. ({})")
+
+
+def is_agent(env, ancs):
+    if any(k in env for k in AGENT_VARS) or any(k.upper().startswith(AGENT_PREFIXES) for k in env):
+        return True
+    for a in ancs or []:
+        name = os.path.basename(str(a.get("comm") or "")).lower()
+        if name in AGENT_NAMES or (name == "node" and any(n in str(a.get("args") or "").lower() for n in AGENT_NAMES)):
+            return True
+    return False
+
+
+def standing_caller_refusal(env, ancs, cwd, directory):
+    """C0 for the --standing form only (R14): the caller is this space's Project Agent: an agent (its variables or an
+    agent ancestor), in one of the space's Project Agent terminals (agent.json), not a ledger worker's terminal, with no
+    task record above its folder or its project folder. The card form's C0 is unchanged. None, or why not."""
+    if ancs is None:
+        return "the process tree could not be read (ps failed), so the caller is unknown"
+    if not is_agent(env, ancs):
+        return "the caller is not an agent: the person or the panel answers a card instead"
+    for folder in (cwd, env.get("CLAUDE_PROJECT_DIR")):
+        record = pa_hooks.find_task(folder) if folder else None
+        if record:
+            return "a worker's folder (the worktree of task {}): workers never push".format(record.get("task"))
+    me = pa.local_id(env.get("HC_TERMINAL_ID") or "")
+    if not me:
+        return "not in a Herdr terminal: the space's Project Agent runs in one"
+    ledger = pa.read_json_safe(os.path.join(directory, "ledger.json")) or {}
+    for t in ledger.get("tasks") or [] if isinstance(ledger, dict) else []:
+        for w in t.get("workers") or [] if isinstance(t, dict) else []:
+            if isinstance(w, dict) and pa.local_id(str(w.get("address") or "")) == me:
+                return "{} is a worker of {} in the ledger: workers never push".format(me, t.get("id"))
+    agent = pa.read_json_safe(os.path.join(directory, "agent.json")) or {}
+    mine = {pa.local_id(str(x)) for x in [agent.get("terminal")] + list(agent.get("terminals") or []) if x}
+    if me not in mine:
+        return "{} is not this space's Project Agent terminal ({})".format(me, ", ".join(sorted(mine)) or "none recorded")
+    return None
+
+
+def run_standing(space, rule_id, repo, env, ancs, cwd=None, deadline=None):
+    """pa-push-main run --standing <rule> --repo <main checkout> --space S (R14), as (exit code, outcome): the push of
+    the queue's merges made on the person's rule, with every check of today's run but the card's (no seen token: the
+    binding stands in for it). A refusal after C0 writes the stop line (R13); the remote is never changed by one."""
+    deadline = deadline or time.monotonic() + BUDGET
+    if not space:
+        return 1, refused(Refused("C1", "pa-push-main run --standing needs --space <id>"))
+    space = pa.local_id(space)
+    directory = os.path.join(pa.ROOT, "spaces", space) if pa.ID.match(space) else None
+    if not directory or not os.path.isfile(os.path.join(directory, "agent.json")):
+        return 1, refused(Refused("C1", "no Project Agent state for space {}".format(space)))
+    why = standing_caller_refusal(env, ancs, cwd or os.getcwd(), directory)
+    if why:
+        return 1, refused(Refused("C0", STANDING_MSG.format(why)))
+    if not isinstance(repo, str) or not repo:
+        return 1, refused(Refused("C1", "pa-push-main run --standing needs --repo <main checkout>"))
+    repo = os.path.realpath(repo)
+    try:
+        with push_lock(directory):
+            try:
+                rule, binding = standing_rule(directory, space, repo, rule_id)
+            except Refused as r:
+                raise Refused("C0", STANDING_MSG.format("the rule is not in force: " + r.message))
+            stop = standing_stops(directory, rule)
+            if stop:
+                if stop[1]:
+                    write_stop(directory, rule_id, stop[0])
+                raise Refused("C0", STANDING_MSG.format("the rule stops here: " + stop[0]))
+            s = Session(deadline)
+            facts, task = blank_facts(), None
+            try:
+                common = os.path.realpath(os.path.join(repo, ".git"))
+                merged = queue_merged(directory, common)
+                last = merged[-1] if merged else None
+                if not last or last.get("standing") != rule_id:
+                    raise Refused("standing", "the last merge of {} was not made on rule {} ({}): commits not merged on the "
+                                              "rule; a push card lists them".format(repo, rule_id, "no merge" if not last else
+                                                                                   "approved by " + str(last.get("card") or last.get("by"))))
+                task = last.get("task")
+                push = {"version": 1, "space": space, "task": task, "path": repo}
+                try:
+                    gather(s, directory, space, push, facts, plan=True)
+                except Refused as r:
+                    if r.check == "C11b" and facts.get("remoteNow") and facts.get("remoteNow") == facts.get("commit"):
+                        return 0, outcome(True, True, None, result={"state": "already", "to": facts["commit"]},
+                                          message="already on the remote: {} {} is at {}".format(facts["url"], facts["branch"], short(facts["commit"])))
+                    raise
+                if facts.get("merge") or facts.get("localNow") != facts.get("commit"):
+                    raise Refused("C10a", "local {} is at {}, not at the merged commit {}; nothing is pushed on this path".format(
+                        facts["branch"], short(facts.get("localNow")), short(facts.get("commit"))))
+                labels, _batch = queue_labels(s, repo, facts["remoteNow"], facts["commit"],
+                                              [m for m in merged if m.get("standing") == rule_id])
+                foreign = [c["sha"] for c in facts["commits"] if c["sha"] not in labels]
+                if foreign or len(facts["commits"]) != facts["count"]:
+                    raise Refused("standing", "{} commit(s) of {}..{} not merged on the rule; a push card lists them".format(
+                        len(foreign) or "some", short(facts["remoteNow"]), short(facts["commit"])))
+                entry = facts["allow"]["entry"]
+                if entry.get("prePush"):
+                    pre_push(s, entry, facts)
+                if s.left() < PUSH_RESERVE:
+                    raise Refused("deadline", "ran out of time before pushing; nothing was pushed")
+                state, output, message = push_exact(s, facts)
+                jp = journal_push(dict(push, url=facts["url"], branch=facts["branch"], commit=facts["commit"]), facts["remoteNow"], False)
+                pa_hooks.append_journal(directory, {"by": "agent", "trigger": "standing", "task": task, "rule": rule_id,
+                                                    "textSha": binding["standing"]["textSha"], "why": message, "push": jp})
+                if state != "pushed":
+                    write_stop(directory, rule_id, message, task)
+                    return 1, outcome(False, False, None, refusal={"check": "verify", "message": message},
+                                      result={"state": state}, message="pa-push-main: " + message)
+                refresh_tracking(s, facts)
+                return 0, outcome(True, True, None, result={"state": "pushed", "from": facts["remoteNow"], "to": facts["commit"],
+                                                            "count": facts["count"], "output": tail(output)},
+                                  message="{} (rule {}); next: pa-install-all as r-pa-installs says".format(message, rule_id))
+            except Refused as r:
+                write_stop(directory, rule_id, "{} ({})".format(r.message, r.check), task)
+                raise
+            finally:
+                s.close()
+    except Refused as r:
+        return 1, refused(r)
+
+
 def cmd_run(args):
     for k in list(os.environ):  # this process's own git reads (the gate's) see no GIT_* either
         if k.upper().startswith("GIT_"):
             del os.environ[k]
+    if args.standing:
+        if args.card:
+            print("pa-push-main: run --standing takes no card", file=sys.stderr)
+            return 2
+        code, result = run_standing(args.space, args.standing, args.repo, os.environ, ancestors())
+        if args.json:
+            print(json.dumps(result, indent=2))
+        else:
+            print(result["message"], file=sys.stdout if code == 0 else sys.stderr)
+        return code
+    if not args.card or not args.answer:
+        print("pa-push-main: run needs a card and --answer (or --standing <rule id> --repo <main checkout>)", file=sys.stderr)
+        return 2
     code, result = run_push(args.space, args.card, args.answer, args.note, args.seen, os.environ, ancestors())
     if args.json:
         print(json.dumps(result, indent=2))
@@ -1421,8 +2152,10 @@ def main_parser():
     check.add_argument("--space")
     check.add_argument("--json", action="store_true")
     run = sub.add_parser("run", help="the person's answer, from the panel: checks everything again, then pushes")
-    run.add_argument("card")
-    run.add_argument("--answer", required=True)
+    run.add_argument("card", nargs="?")
+    run.add_argument("--answer")
+    run.add_argument("--standing", help="t-140 R14: the Project Agent's push of the queue's merges under the person's rule")
+    run.add_argument("--repo", help="with --standing: the repository's main checkout")
     run.add_argument("--space")
     run.add_argument("--note")
     run.add_argument("--seen")

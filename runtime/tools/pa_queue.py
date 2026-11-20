@@ -11,7 +11,9 @@
   pa-queue refresh --repo R [--no-merge]        record short reviews and answered queue cards, set passed or failed,
                                                 restack after a failure, then merge what is approved and passed
   pa-queue card --repo R --limits T             one queue card for the ready entries at the front (at most 4)
-  pa-queue merge --repo R                       fast-forward local main, entry by entry, through R9's tests
+  pa-queue merge --repo R [--standing RULE]     fast-forward local main, entry by entry, through R9's tests; with
+                                                --standing (t-140 R11), the passed entries the person's standing rule
+                                                covers, with no queue card (pa-push-main pushes them after)
   pa-queue brief <task> [--job J] --repo R      the carry-over handoff for one worker per entry (reads only)
 
 queue.json, in the space's state folder, is written by this tool only, under <state>/.queue.lock; each state change
@@ -42,6 +44,8 @@ sys.dont_write_bytecode = True  # keep tools/ free of caches
 import pa  # noqa: E402
 import pa_hooks  # noqa: E402
 import pa_push  # noqa: E402
+
+pa_push.use_queue(sys.modules[__name__])  # t-140: the push tool's queue card check and run use this module, as loaded
 
 QUEUE_FILE = "queue.json"
 LOCK_FILE = ".queue.lock"
@@ -1020,6 +1024,8 @@ def add(ctx, data, rec, tid, job):
              "added": now(), "base": upstream(ctx, rec, tip, onto_tip), "tip": tip, "checked": checked,
              "files": sorted(set((planned or {}).get("files") or []) | touched(ctx, checked["base"], checked["commit"])),
              "needs": None, "suite": None, "review": None, "rebases": [], "approval": None}
+    if onto != rec["main"]:
+        entry["stacked"] = True  # t-140 R12: the person's rule asks a stacked entry for its independence review
     lines = []
     if not ok and entry["base"] != onto_tip:
         raise Refused("the gate does not pass now: {} (a branch whose conflict was kept on both sides joins only from "
@@ -1348,6 +1354,7 @@ def cmd_verify(args):
 def cmd_refresh(args):
     with writing(args) as (ctx, data, rec):
         sync_main(ctx, rec)
+        void_standing(ctx, rec)  # t-140 R11 (5): refresh never merges on the rule
         record_reviews(ctx, rec)
         restored = restore_approvals(ctx, rec)
         restored += apply_cards(ctx, rec)  # approvals are recorded even with --no-merge; merging is what it skips
@@ -1444,6 +1451,7 @@ def ready_for_card(ctx, rec, e, n):
 def cmd_card(args):
     with writing(args) as (ctx, data, rec):
         sync_main(ctx, rec)
+        void_standing(ctx, rec)
         pairs = derive(ctx, rec)
         listed = {(x.get("task"), x.get("job") or None) for _i, c in queue_cards(ctx.directory, rec["common"], "open")
                   for x in c["queue"].get("entries") or [] if isinstance(x, dict)}
@@ -1477,30 +1485,65 @@ def cmd_card(args):
                            "evidence/{}/".format(i, label(e), e["branch"], e["onto"], short(n["tip"]), n["content"], short(c["commit"]),
                                                  short(c.get("verify")), short(c.get("review")), n["state"],
                                                  " ({})".format(n["why"]) if n["why"] else "", e["task"]))
+        pushing = pa_push.queue_card_push(ctx.directory, ctx.repo)  # t-140 R1: None where pushing is not set up
         context.append("At merge time pa-queue merge reads again, for each: the content is the one checked, every rebase "
                        "since was clean (or moved or union with its short review), the gate passes at its tip, and its own "
-                       "suite passed on its tree. Nothing is pushed: the push card follows.")
+                       "suite passed on its tree. " + (pushing["contextLine"] if pushing else "Nothing is pushed: the push card follows."))
         context.append(args.limits.strip())
         text = "\n".join(context)
         if len(text) > pa_hooks.CONTEXT_MAX:  # t-109 MF-1, AC10.3: a Recorded limit is never cut from the card
             raise Refused("the card's facts and --limits come to {} characters, over the card's {}: list fewer entries "
                           "or shorten the limits (name a file with them), no limit is cut".format(len(text), pa_hooks.CONTEXT_MAX))
         tasks = [label(e) for e, _n in chosen]
-        options = [{"label": ALL, "detail": ", ".join(tasks), "count": len(tasks)}]
-        options += [{"label": "Merge up to " + tasks[k - 1], "detail": ", ".join(tasks[:k]), "count": k} for k in range(len(tasks) - 1, 0, -1)]
-        options.append({"label": NOT_NOW, "detail": "Nothing merges.", "count": 0})
-        card = {"id": cid, "task": chosen[0][0]["task"], "kind": "queue",
-                "question": "Merge {} queued change{} into {} of {}, in order?".format(len(tasks), "" if len(tasks) == 1 else "s",
-                                                                                   rec["main"], os.path.basename(ctx.repo)),
+        main = rec["main"]
+        if pushing:
+            detail = lambda names: ("Merges {} into local {} in order, then pushes {} to {} as a fast-forward of exactly those "
+                                    "commits. No force.").format(", ".join(names), main, main, pushing["url"])
+            options = [{"label": ALL + pushing["suffix"], "detail": detail(tasks), "count": len(tasks)}]
+            options += [{"label": "Merge up to " + tasks[k - 1] + pushing["suffix"], "detail": detail(tasks[:k]), "count": k}
+                        for k in range(len(tasks) - 1, 0, -1)]
+            options.append({"label": NOT_NOW, "detail": "Nothing merges or is pushed.", "count": 0})
+            question = "Merge {} queued change{} into {} of {}, in order, and push {}?".format(
+                len(tasks), "" if len(tasks) == 1 else "s", main, os.path.basename(ctx.repo), main)
+        else:
+            options = [{"label": ALL, "detail": ", ".join(tasks), "count": len(tasks)}]
+            options += [{"label": "Merge up to " + tasks[k - 1], "detail": ", ".join(tasks[:k]), "count": k} for k in range(len(tasks) - 1, 0, -1)]
+            options.append({"label": NOT_NOW, "detail": "Nothing merges.", "count": 0})
+            question = "Merge {} queued change{} into {} of {}, in order?".format(len(tasks), "" if len(tasks) == 1 else "s",
+                                                                              main, os.path.basename(ctx.repo))
+        card = {"id": cid, "task": chosen[0][0]["task"], "kind": "queue", "question": question,
                 "context": text, "options": options,
-                "evidence": ["REVIEW.md"], "recommendation": ALL, "status": "open", "answer": None, "note": None,
+                "evidence": ["REVIEW.md"], "recommendation": options[0]["label"], "status": "open", "answer": None, "note": None,
                 "created": now(), "answered": None,
                 "queue": {"version": 1, "repo": ctx.repo, "common": rec["common"], "mainBefore": main_tip, "entries": entries}}
+        if pushing:
+            card["queue"].update(pushing["fields"])
         pa.put_card(ctx.directory, cid, card)
         ctx.event("card", chosen[0][0], card=cid, entries=[{"task": e["task"], "job": e.get("job")} for e, _n in chosen])
         save(ctx, data, rec)
     print("{} opened: {} ({})".format(cid, card["question"], ", ".join(tasks)))
     return 0
+
+
+def approval_for(cid, card, e):
+    """The approval a queue card's answer records for entry e (apply_cards; the push tool's dry run, t-140 R2)."""
+    c = e.get("checked") or {}
+    return {"card": cid, "answeredAt": card.get("answered"), "answeredBy": card.get("answeredBy") or "person, in the panel",
+            "option": card.get("answer"), "commit": c.get("commit"), "change": c.get("change"), "sequence": c.get("sequence"),
+            "added": e.get("added"), "instance": e.get("instance"), "void": None}
+
+
+def listed_entry(rec, x):
+    """The queue entry a card's listed entry x still names (task, job, instance id, when it joined, the checked digests),
+    or (None, why not)."""
+    e = next((e for e in rec["entries"] if same(e, x.get("task"), x.get("job"))), None)
+    c = (e or {}).get("checked") or {}
+    same_instance = e is not None and isinstance(x.get("instance"), str) and bool(x["instance"]) and x["instance"] == e.get("instance")
+    if e is None or not same_instance or (x.get("added"), x.get("commit"), x.get("change"), x.get("sequence")) != (
+            e.get("added"), c.get("commit"), c.get("change"), c.get("sequence")):
+        return None, "{}: {}".format(x.get("task"), "no longer queued" if e is None else
+                                     "not the entry the card asked about (it left and joined again, or its check changed)")
+    return e, None
 
 
 def apply_cards(ctx, rec):
@@ -1520,18 +1563,11 @@ def apply_cards(ctx, rec):
         k = option.get("count") if option and isinstance(option.get("count"), int) and option.get("label") != NOT_NOW else 0
         approved, skipped = [], []
         for x in listed[:max(0, min(k, len(listed)))]:
-            e = next((e for e in rec["entries"] if same(e, x.get("task"), x.get("job"))), None)
-            c = (e or {}).get("checked") or {}
-            same_instance = e is not None and isinstance(x.get("instance"), str) and bool(x["instance"]) and \
-                x["instance"] == e.get("instance")
-            if e is None or not same_instance or (x.get("added"), x.get("commit"), x.get("change"), x.get("sequence")) != (
-                    e.get("added"), c.get("commit"), c.get("change"), c.get("sequence")):
-                skipped.append("{}: {}".format(x.get("task"), "no longer queued" if e is None else
-                                               "not the entry the card asked about (it left and joined again, or its check changed)"))
+            e, why = listed_entry(rec, x)
+            if e is None:
+                skipped.append(why)
                 break
-            e["approval"] = {"card": cid, "answeredAt": card.get("answered"), "answeredBy": card.get("answeredBy") or "person, in the panel",
-                             "option": card.get("answer"), "commit": c["commit"], "change": c["change"], "sequence": c["sequence"],
-                             "added": e.get("added"), "instance": e.get("instance"), "void": None}
+            e["approval"] = approval_for(cid, card, e)
             approved.append({"task": e["task"], "job": e.get("job")})
             ctx.event("approve", e, card=cid, option=card.get("answer"))
         q["applied"] = {"at": now(), "approved": approved, "skipped": skipped}
@@ -1566,9 +1602,12 @@ def main_checkout(ctx, rec, expected):
     return "the main checkout: " + why if why else None
 
 
-def merge_check(ctx, rec, e, main_tip, suites, reviews):
+def merge_check(ctx, rec, e, main_tip, suites, reviews, onto=None, expected=None):
     """R9 (1)-(6) for the entry at the front, read from git and the files now: (why it may not merge or None, whether
-    the approval is void for it, the suite run that passed)."""
+    the approval is void for it, the suite run that passed). onto and expected (t-140 R2, the push tool's dry run of a
+    queue card): the entry is read as if the entries ahead of it had merged: main_tip is the tip of the entry ahead,
+    onto its branch (the one the entry sits on now), and expected where local main really is (R9 (6))."""
+    onto = onto or rec["main"]
     a = e.get("approval")
     if not isinstance(a, dict):
         return "not approved: no answered queue card approves it", False, None
@@ -1589,12 +1628,12 @@ def merge_check(ctx, rec, e, main_tip, suites, reviews):
     if bad:
         return "a rebase that was not clean ({}, at {})".format(bad[-1].get("result"), bad[-1].get("at")), True, None
     # (3) its onto is main (the entries ahead merged) and it sits on the commit main is at
-    if e.get("onto") != rec["main"]:
+    if e.get("onto") != onto:
         return "not on {} yet: it is stacked on {}, which merges first".format(rec["main"], e.get("onto")), False, None
     if ctx.merge_base(tip, main_tip) != main_tip:
         return "it does not sit on {} at {}: pa-queue restack".format(rec["main"], short(main_tip)), False, None
     # (1)-(2) its content now is the one checked, and the checks saw it
-    d = decide(ctx, c, tip, rec["main"], main_tip)
+    d = decide(ctx, c, tip, onto, main_tip)
     if d["result"] not in ("clean", "moved", "union"):
         return "content changed: " + (d["why"] or ", ".join(d["files"])), True, None
     task = ctx.task(e["task"])
@@ -1631,7 +1670,7 @@ def merge_check(ctx, rec, e, main_tip, suites, reviews):
             return "not passed: no passing suite on its tree {} yet{}".format(short(tree), " ({})".format(k["why"]) if k.get("why") else ""), False, None
         s = carried_run(k)
     # (6) the main checkout
-    why = main_checkout(ctx, rec, main_tip)
+    why = main_checkout(ctx, rec, main_tip if expected is None else expected)
     if why:
         return why, False, None
     return None, False, s
@@ -1677,46 +1716,270 @@ def merge_run(ctx, data, rec):
             stack.enter_context(pa_push.push_lock(ctx.directory))
         except pa_push.Refused as r:
             raise Refused("{}: nothing was merged (the approvals are recorded); merge again after it".format(r.message))
-        merged = []
-        suites, reviews = pa_hooks.suite_runs(ctx.directory), pa_hooks.review_runs(ctx.directory)
-        while rec["entries"]:
-            e = rec["entries"][0]
-            main_tip = ctx.tip(rec["main"])
-            why, void, suite = merge_check(ctx, rec, e, main_tip, suites, reviews)
-            if not why:
-                why = ff_merge(ctx, rec, e, e["tip"])
-            if why:
-                if void and valid_approval(e):
-                    e["approval"]["void"] = why
-                    ctx.event("void", e, why=why, card=e["approval"].get("card"))
-                ctx.event("merge-stopped", e, why=why, main=main_tip)
-                lines.append("stopped at {}: {}{}".format(label(e), why, "; its approval is void: open a new card for it" if void else ""))
-                break
-            tip = e["tip"]
-            count = ctx.out("rev-list", "--count", main_tip + ".." + tip)
-            record = {"task": e["task"], "job": e.get("job"), "tip": tip, "from": main_tip, "to": tip, "at": now(), "by": "queue",
-                      "card": e["approval"].get("card"), "commits": int(count) if count and count.isdigit() else None,
-                      "suite": dict({k: suite.get(k) for k in ("tree", "worker", "started", "ended")},
-                                    **({"carried": suite["carried"]} if suite.get("carried") else {}))}
-            rec["merged"].append(record)
-            rec["entries"].remove(e)
-            for other in rec["entries"]:
-                if other.get("onto") == e["branch"]:
-                    other["onto"] = rec["main"]
-            ctx.event("merge", e, tip=tip, **{"from": main_tip, "card": record["card"], "commits": record["commits"]})
-            save(ctx, data, rec)
-            merged.append(e)
-            lines.append("merged {} into {}: {} -> {} ({} commit{})".format(label(e), rec["main"], short(main_tip), short(tip),
-                                                                          record["commits"], "" if record["commits"] == 1 else "s"))
+        more, merged = merge_front(ctx, data, rec)
+        lines += more
         if merged:
             lines += push_card(ctx, rec, merged[-1]["task"])
     save(ctx, data, rec)
     return lines
 
 
-def cmd_merge(args):
+def merge_front(ctx, data, rec, only=None):
+    """Front to back while the entry holds R9 now, one fast-forward each; the caller holds the queue lock and the push
+    lock. The first entry that fails stops it; a failure of (1)-(3) voids its approval. only (t-140 R3, a queue card
+    that pushes): [(task, job)]: the front entry must be one of them, else nothing more merges. (lines, merged
+    entries, in order)."""
+    lines, merged = [], []
+    suites, reviews = pa_hooks.suite_runs(ctx.directory), pa_hooks.review_runs(ctx.directory)
+    while rec["entries"]:
+        e = rec["entries"][0]
+        if only is not None and (e["task"], e.get("job") or None) not in only:
+            if merged or valid_approval(e):
+                lines.append("stopped at {}: not an entry of this answer".format(label(e)))
+            break
+        main_tip = ctx.tip(rec["main"])
+        why, void, suite = merge_check(ctx, rec, e, main_tip, suites, reviews)
+        if not why:
+            why = ff_merge(ctx, rec, e, e["tip"])
+        if why:
+            stop_at(ctx, e, why, void, main_tip, lines)
+            break
+        merged_record(ctx, data, rec, e, main_tip, suite, lines)
+        merged.append(e)
+    return lines, merged
+
+
+def stop_at(ctx, e, why, void, main_tip, lines):
+    if void and valid_approval(e):
+        e["approval"]["void"] = why
+        ctx.event("void", e, why=why, card=e["approval"].get("card"))
+    ctx.event("merge-stopped", e, why=why, main=main_tip)
+    lines.append("stopped at {}: {}{}".format(label(e), why, "; its approval is void: open a new card for it" if void else ""))
+
+
+def merged_record(ctx, data, rec, e, main_tip, suite, lines, **extra):
+    """After the fast-forward of e: its merged[] record (extra: the rule and its text's SHA, t-140 R11), the entries
+    behind it onto main, the journal line, queue.json saved."""
+    tip = e["tip"]
+    count = ctx.out("rev-list", "--count", main_tip + ".." + tip)
+    record = {"task": e["task"], "job": e.get("job"), "tip": tip, "from": main_tip, "to": tip, "at": now(), "by": "queue",
+              "card": e["approval"].get("card"), "commits": int(count) if count and count.isdigit() else None,
+              "suite": dict({k: suite.get(k) for k in ("tree", "worker", "started", "ended")},
+                            **({"carried": suite["carried"]} if suite.get("carried") else {}))}
+    record.update(extra)
+    rec["merged"].append(record)
+    rec["entries"].remove(e)
+    for other in rec["entries"]:
+        if other.get("onto") == e["branch"]:
+            other["onto"] = rec["main"]
+    kw = {"from": main_tip, "card": record["card"], "commits": record["commits"]}
+    if extra.get("standing"):
+        kw.update(rule=extra["standing"], textSha=extra.get("textSha"))
+    ctx.event("merge", e, tip=tip, **kw)
+    save(ctx, data, rec)
+    lines.append("merged {} into {}: {} -> {} ({} commit{}){}".format(
+        label(e), rec["main"], short(main_tip), short(tip), record["commits"], "" if record["commits"] == 1 else "s",
+        " on rule {}".format(extra["standing"]) if extra.get("standing") else ""))
+    return record
+
+
+# ---- t-140 Part B: the person's rule as their standing approval to merge (R11, R12) ----------------------
+
+STANDING_VOID = "a standing approval is used only in the hold of the merge that recorded it"
+
+
+def void_standing(ctx, rec):
+    """R11 (5): a standing approval still on an entry (a run that died) is void now; never used again."""
+    for e in rec["entries"]:
+        a = e.get("approval")
+        if isinstance(a, dict) and a.get("standing") and not a.get("void"):
+            a["void"] = STANDING_VOID
+            ctx.event("void", e, why=STANDING_VOID, rule=a.get("standing"))
+
+
+def stacked(e, rec):
+    """The entry joined on another entry's branch, or was restacked onto one (R12): the rule asks for its independence."""
+    if e.get("stacked") or (e.get("onto") and e.get("onto") != rec["main"]):
+        return True
+    return any(isinstance(r, dict) and r.get("onto") and r.get("onto") != rec["main"] for r in e.get("rebases") or [])
+
+
+def independence_passed(ctx, rec, e, tip, reviews):
+    tree = ctx.tree(tip)
+    r = latest(reviews, lambda x: x.get("task") == e["task"] and (x.get("job") or None) == (e.get("job") or None)
+               and x.get("common") == rec["common"] and x.get("tip") == tip and tree and x.get("tree") == tree
+               and x.get("about") == "independent")
+    return r, tree
+
+
+def standing_need(ctx, rec, e, tip, base_tip):
+    """The independence review the rule asks of a stacked entry, for its tip (R12), recorded as needs.independence (as
+    r-disjoint-carry's): record_reviews takes it, pa-queue brief hands it to a reviewer."""
+    n = max(1, len(e.get("rebases") or []))
+    return {"tip": tip, "tree": ctx.tree(tip), "since": now(), "kind": "independent", "standing": True,
+            "file": "SHORT-REVIEW-{}{}-{}.md".format(e["task"], "-" + e["job"] if e.get("job") else "", n),
+            "oldBase": base_tip, "newBase": e.get("base")}
+
+
+def standing_lines(e, need):
+    t = e["task"]
+    return ["{}: a short review of independence is needed (the person's standing rule: stacked entries must first be "
+            "found independent): a fresh reviewer writes evidence/{}/{}".format(t, t, need["file"]),
+            "  the change: git diff {} {}; what it is stacked on: git diff {} {}".format(
+                need.get("newBase"), need["tip"], need.get("oldBase"), need.get("newBase")),
+            "  question: " + IND_QUESTION + "; then 'Verdict: pass' or 'Verdict: must fix (<n>)'.",
+            "  the file has the lines Start: <UTC time>, End: <UTC time>, Reviewer: <its address>, Independent: yes|no, "
+            "Checked: {}, and its Verdict: line".format(need["tip"])]
+
+
+def open_card_of(directory, tid):
+    folder = os.path.join(directory, "decisions")
+    for name in sorted(os.listdir(folder)) if os.path.isdir(folder) else []:
+        card = pa.read_json_safe(os.path.join(folder, name)) if name.endswith(".json") else None
+        if isinstance(card, dict) and card.get("status") == "open" and card.get("task") == tid:
+            return name[:-5]
+    return None
+
+
+LIMIT_LINE = re.compile(r"recorded limit", re.I)
+
+
+def recorded_limits(directory, tid):
+    """The Recorded limit lines of the task's REVIEW.md and VERIFY.md (Q3: the one-line report lists them)."""
+    out = []
+    for name in ("REVIEW.md", "VERIFY.md"):
+        for line in (pa.read_text(os.path.join(directory, "evidence", tid, name)) or "").splitlines():
+            line = pa_hooks.clean(line).strip(" -*#")
+            if LIMIT_LINE.search(line) and line.lower() not in ("recorded limit", "recorded limits") and line not in out:
+                out.append(pa_hooks.cut(line, 200))
+    return out[:5]
+
+
+def standing_wait(ctx, rec, e, task):
+    """Why the rule may not merge e now, beyond R9 (R12), as a wait (no stop), or None."""
+    if not task:
+        return None
+    if str(task.get("tier") or "normal").lower() == "high":
+        return "high tier: it still gets a queue card (d-265 Q2)"
+    if task.get("paused"):
+        return "its task is paused by the person"
+    if task.get("state") == "parked":
+        return "its task is parked"
+    cid = open_card_of(ctx.directory, e["task"])
+    if cid:
+        return "its task has an open card {}".format(cid)
+    return None
+
+
+def stop_cause(why, void):
+    """A merge_check refusal that stops the rule (R13): one that voids the approval, a failing gate, a failed suite."""
+    return void or why.startswith("the gate fails now") or why.startswith("not passed: the full suite exited") or \
+        why.startswith("short review:")
+
+
+def merge_standing(ctx, data, rec, rule, binding, space_id):
+    """R11: under both locks, from the front: an entry with a card approval merges as today (its push card follows);
+    else an entry eligible under R12 gets a standing approval and merges; the first that is not ends the run. A cause
+    the rule names writes the stop line (pa_push.write_stop). (lines, stopped)."""
+    lines, card_merged, rule_merged, stopped = [], [], [], None
+    suites, reviews = pa_hooks.suite_runs(ctx.directory), pa_hooks.review_runs(ctx.directory)
+    rid, sha = rule["id"], binding["standing"]["textSha"]
+    while rec["entries"]:
+        e = rec["entries"][0]
+        main_tip = ctx.tip(rec["main"])
+        if card_approval(e):
+            why, void, suite = merge_check(ctx, rec, e, main_tip, suites, reviews)
+            why = why or ff_merge(ctx, rec, e, e["tip"])
+            if why:
+                stop_at(ctx, e, why, void, main_tip, lines)
+                break
+            merged_record(ctx, data, rec, e, main_tip, suite, lines)
+            card_merged.append(e)
+            continue
+        task = ctx.task(e["task"])
+        wait = standing_wait(ctx, rec, e, task)
+        tip = ctx.tip(e["branch"])
+        if not wait and stacked(e, rec):
+            r, _tree = independence_passed(ctx, rec, e, tip, reviews)
+            if r and (r.get("verdict") != "pass" or r.get("independent") is not True):
+                stopped = "{}: its independence review did not find it independent".format(e["task"])
+                lines.append("stopped at {}: {}".format(label(e), stopped))
+                break
+            if not r:
+                need = (e.get("needs") or {}).get("independence")
+                if not (isinstance(need, dict) and need.get("tip") == tip):
+                    need = standing_need(ctx, rec, e, tip, main_tip)
+                    e["needs"] = dict(e.get("needs") or {}, independence=need)
+                    ctx.event("standing-need", e, file=need["file"], tip=tip, rule=rid)
+                    save(ctx, data, rec)
+                    lines += standing_lines(e, need)
+                wait = "stacked: waiting for its independence review {}".format(need["file"])
+        if wait:
+            lines.append("waits at {}: {}".format(label(e), wait))
+            break
+        c = e.get("checked") or {}
+        e["approval"] = {"standing": rid, "textSha": sha, "answeredAt": now(), "answeredBy": "the person's standing rule " + rid,
+                         "option": None, "card": None, "commit": c.get("commit"), "change": c.get("change"),
+                         "sequence": c.get("sequence"), "added": e.get("added"), "instance": e.get("instance"), "void": None}
+        why, void, suite = merge_check(ctx, rec, e, main_tip, suites, reviews)
+        why = why or ff_merge(ctx, rec, e, e["tip"])
+        if why:
+            if stop_cause(why, void):
+                stop_at(ctx, e, why, True, main_tip, lines)
+                stopped = "{}: {}".format(e["task"], why)
+            else:
+                e["approval"] = None  # a wait: the standing approval is not kept (R11 (5))
+                lines.append("waits at {}: {}".format(label(e), why))
+            break
+        merged_record(ctx, data, rec, e, main_tip, suite, lines, standing=rid, textSha=sha)
+        rule_merged.append(e)
+        limits = recorded_limits(ctx.directory, e["task"])
+        lines.append("report: merged {} into {} on rule {}{}".format(label(e), rec["main"], rid, "; Recorded limits: " +
+                                                                     " | ".join(limits) if limits else "; no Recorded limits"))
+    if card_merged:
+        lines += push_card(ctx, rec, (rule_merged or card_merged)[-1]["task"])
+    elif rule_merged and not stopped:
+        lines.append("next: pa-push-main run --standing {} --repo {} --space {} (pushes the rule's merges; then "
+                     "pa-install-all as r-pa-installs says)".format(rid, ctx.repo, space_id))
+    return lines, stopped
+
+
+def cmd_merge_standing(args):
     with writing(args) as (ctx, data, rec):
         sync_main(ctx, rec)
+        void_standing(ctx, rec)
+        directory = ctx.directory
+        space_id = pa.local_id((pa.read_json_safe(os.path.join(directory, "agent.json")) or {}).get("space") or os.path.basename(directory))
+        try:
+            with pa_push.push_lock(directory):
+                try:
+                    rule, binding = pa_push.standing_rule(directory, space_id, ctx.repo, args.standing)
+                except pa_push.Refused as r:
+                    raise Refused("the standing rule is not in force: {}; open a queue card".format(r.message))
+                stop = pa_push.standing_stops(directory, rule)
+                if stop:
+                    if stop[1]:  # a new cause: its stop line; one already written stands until the person resumes
+                        pa_push.write_stop(directory, rule["id"], stop[0], task=None)
+                    raise Refused("the standing rule {} stops here: {}; fall back to cards".format(rule["id"], stop[0]))
+                lines, stopped = merge_standing(ctx, data, rec, rule, binding, space_id)
+                if stopped:
+                    pa_push.write_stop(directory, rule["id"], stopped, task=stopped.split(":")[0])
+                save(ctx, data, rec)
+        except pa_push.Refused as r:
+            raise Refused("{}: nothing was merged; merge again after it".format(r.message))
+    print("\n".join(lines))
+    if stopped:
+        print("pa-queue: the standing rule {} stopped: {}; fall back to cards".format(args.standing, stopped), file=sys.stderr)
+        return 1
+    return 0
+
+
+def cmd_merge(args):
+    if getattr(args, "standing", None):
+        return cmd_merge_standing(args)
+    with writing(args) as (ctx, data, rec):
+        sync_main(ctx, rec)
+        void_standing(ctx, rec)
         lines = merge_run(ctx, data, rec)
     print("\n".join(lines))
     return 0
@@ -1761,6 +2024,11 @@ def cmd_brief(args):
         need = (e.get("needs") or {}).get("shortReview")
         if n["content"] in ("moved", "union") and need and not (n["review"] and n["review"].get("verdict") == "pass"):
             lines += handoff_lines(e, need)
+        ind = (e.get("needs") or {}).get("independence") or {}
+        if ind.get("standing") and ind.get("tip") == n["tip"] and isinstance(rec, dict) and \
+                not independence_passed(ctx, rec, e, n["tip"], pa_hooks.review_runs(directory))[0]:
+            lines += standing_lines(e, ind)  # t-140 R12: the person's rule asks it of a stacked entry
+            what = "independence review (the standing rule)"
         if what not in ("none", "-"):
             lines.append("report with hc send {} when done: what ran, its result, and the review file's path".format(
                 agent.get("terminal") or "<the orchestrator>"))
@@ -1801,6 +2069,9 @@ def parser():
             s.add_argument("--no-merge", action="store_true", help="record and restack only; merge nothing (Q-J3-3)")
         if name == "card":
             s.add_argument("--limits", required=True, help="the Recorded limits of each listed task ('none' for none)")
+        if name == "merge":
+            s.add_argument("--standing", help="the id of the person's standing rule to merge and push (t-140 R11): merge "
+                                              "the passed entries it covers, with no queue card")
     return p
 
 

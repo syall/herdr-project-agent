@@ -1854,7 +1854,7 @@ const queueCheck = (over = {}) => ({ card: QID, kind: "queue", ok: true, refusal
   options: [{ label: QLABEL, count: 1, entries: [{ task: "t-1", job: null, tip: PC }], mergeNow: ["t-1"], waits: null, extra: [],
     push: { ok: true, refusal: null, commit: PC, count: 1, commits: [{ sha: PC, subject: "the task's change", author: "A <a@x>" }] } }],
   seen: "queue-seen-1", ...over });
-async function queueWorld({ card = queueCardText(), tool = {} } = {}) {
+async function qpushWorld({ card = queueCardText(), tool = {} } = {}) {
   world();
   const file = `:${DIR}/decisions/${QID}.json`;
   g.__files[file] = card; g.__ls[`:${DIR}/decisions`] = [`${QID}.json`];
@@ -1867,7 +1867,7 @@ async function queueWorld({ card = queueCardText(), tool = {} } = {}) {
 
 cases["P-qpush-run"] = async () => { // A4.1: Submit of a merge option runs the push tool once with the card's own label; never answerDecision
   let file;
-  const { v, file: f } = await queueWorld({ tool: { run: () => { g.__files[file] = queueCardText(true, { status: "answered", answer: QLABEL, answered: "2026-11-16T10:01:00Z", answeredBy: "person, in the panel" });
+  const { v, file: f } = await qpushWorld({ tool: { run: () => { g.__files[file] = queueCardText(true, { status: "answered", answer: QLABEL, answered: "2026-11-16T10:01:00Z", answeredBy: "person, in the panel" });
     return json(0, { ok: true, done: true, answer: QLABEL, refusal: null, message: `d-queue-1 answered ${QLABEL}: merged t-1 (main aa22000..cc11000); pushed ${PURL} main aa22000..cc11000`,
       result: { at: "2026-11-16T10:01:00Z", state: "pushed", from: PR, to: PC, commits: 1, merged: ["t-1"], check: null, message: "pushed" } }); } } });
   file = f;
@@ -1890,7 +1890,7 @@ cases["P-qpush-run"] = async () => { // A4.1: Submit of a merge option runs the 
 };
 
 cases["P-qpush-check-failed"] = async () => { // A4.2: no passed check: a merge option cannot be submitted, and says why; Not now and Other can
-  const { v } = await queueWorld({ tool: { check: () => { throw new Error("no such tool"); } } });
+  const { v } = await qpushWorld({ tool: { check: () => { throw new Error("no such tool"); } } });
   await click(v, `opt-${QID}-0`); await settle();
   let { text, clicks } = look(v);
   check(!clicks[`submit-${QID}`], `Submit is off for the merge option (got ${Object.keys(clicks)})`);
@@ -1904,7 +1904,7 @@ cases["P-qpush-check-failed"] = async () => { // A4.2: no passed check: a merge 
 };
 
 cases["P-qpush-plain-queue-card"] = async () => { // A4.3: a queue card without queue.push is answered as today
-  const { v, file } = await queueWorld({ card: queueCardText(false) });
+  const { v, file } = await qpushWorld({ card: queueCardText(false) });
   check(pushExecs().length === 0, `no check (got ${JSON.stringify(pushExecs())})`);
   check(look(v).text.includes("CONTEXT FROM THE CARD FILE"), "its own context is shown");
   await click(v, `opt-${QID}-0`); await click(v, `submit-${QID}`); await settle();

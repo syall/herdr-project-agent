@@ -699,7 +699,11 @@ export async function replaceFile(path, text, expected, on, cx = null) {
 
 // A push card (t-007b): it has a push object, or kind "push". Its answer runs pa-push-main (push.js), which
 // writes the answer itself; answerDecision never writes one.
-export const isPush = (card) => Boolean(card && typeof card === "object" && ((card.push && typeof card.push === "object") || card.kind === "push"));
+// t-140 R4: a queue card made where pushing is set up (`queue.push` an object) is routed the same way: its merge
+// answer runs pa-push-main, which merges and pushes; the card file's push fields are never trusted for facts.
+export const isQueuePush = (card) => Boolean(card && typeof card === "object" && card.kind === "queue" && card.queue && typeof card.queue === "object"
+  && card.queue.push && typeof card.queue.push === "object" && !Array.isArray(card.queue.push));
+export const isPush = (card) => Boolean(card && typeof card === "object" && ((card.push && typeof card.push === "object") || card.kind === "push" || isQueuePush(card)));
 
 // t-046: every card also takes an answer in the person's own words. It is written `answer: "Other", other: true`
 // with the words in `note`; no tool acts on it. isOther is pa.is_other exactly (wide: the marker, or the label in any

@@ -33,7 +33,8 @@ In pa_costs.py (see its docstring), linked as pa-costs: cost tracking per space 
 reconstruct, prices, billed ...). Tokens are measured; money is an estimate from the profile's price table.
 
 In pa_push.py (see its docstring): pa-push-main plan|check|run, the person's push card, and
-pa-push-allow show|add|remove|on|off, the person's push allowlist. pa-decide refuses a push card.
+pa-push-allow show|add|set|remove|on|off, the person's push allowlist. pa-decide refuses a push card, and a queue
+card that pushes (t-140).
 """
 import argparse
 import datetime
@@ -4637,6 +4638,12 @@ def keep_previous(card, answer):
             card[key] = value
 
 
+def pushing_queue_card(card):
+    """t-140 R8: a queue card made where pushing is set up (its queue has a push object): its answer runs the push."""
+    q = card.get("queue") if isinstance(card, dict) else None
+    return isinstance(card, dict) and card.get("kind") == "queue" and isinstance(q, dict) and isinstance(q.get("push"), dict)
+
+
 def push_card_lock(directory):
     """The space's push lock (<space>/.push.lock, as pa_push.push_lock takes it): every write of a push card holds
     it, so pa-decide never writes one while pa-push-main runs. Returns the open file; close it to unlock."""
@@ -4663,7 +4670,7 @@ def cmd_decide(args):
     card = read_json(path)
     if not card:
         raise Problem("no decision card {}".format(args.card))
-    if not (card.get("push") or card.get("kind") == "push"):
+    if not (card.get("push") or card.get("kind") == "push" or pushing_queue_card(card)):
         return decide_card(directory, path, args)
     lock = push_card_lock(directory)
     try:
@@ -4695,6 +4702,8 @@ def decide_card(directory, path, args):
             raise Problem("a card that deletes a worktree is answered in the panel, not in conversation")
         if card.get("push") or card.get("kind") == "push":
             raise Problem("a push card is answered in the panel, not in conversation (its answer runs the push)")
+        if pushing_queue_card(card):
+            raise Problem("a queue card that pushes is answered in the panel, not in conversation (its answer runs the push)")
         if card.get("kind") == "leftovers":
             raise Problem("a card that closes workers is answered in the panel, not in conversation")
         labels = [o.get("label") for o in card.get("options") or []]
