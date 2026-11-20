@@ -4526,6 +4526,26 @@ class T136WaiterLimits(Base):
         self.assertIn("cancel", self.journal()[-1]["why"])
         self.assertNotClosed()
 
+    def test_rl3_a_waiter_that_locks_between_the_cancels_checks_is_seen(self):
+        # t-136 round 2 (REVIEW M1): the cancel's probe finds the lock free and lets go; the waiter then takes it and
+        # unlinks .starting before the cancel reads the marker. The cancel must still see a waiter.
+        import fcntl
+        write(self.marker(), "x\n")
+        real, state = fcntl.flock, {}
+
+        def flock(f, op):
+            real(f, op)
+            if op == fcntl.LOCK_UN and not state:  # the probe just let go: the waiter starts here
+                state["lock"] = self.hold_waiter_lock()
+                os.unlink(self.marker())
+        fcntl.flock = flock
+        self.addCleanup(setattr, fcntl, "flock", real)
+        code, out, err = self.cancel()
+        self.assertEqual(code, 0, err)
+        self.assertIn("cancelled; the worker stays open", out)
+        self.assertTrue(os.path.exists(os.path.join(self.dir, ".close-when-idle-t31.cancel")))
+        self.assertNotClosed()
+
     def test_rl3_then_the_waiter_closes_nothing(self):
         write(self.marker(), "x\n")
         self.assertEqual(self.cancel()[0], 0)
