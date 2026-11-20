@@ -1016,7 +1016,7 @@ HOOK_TIMEOUT = 10  # seconds, each hook command
 HOOK_STDIN_MAX = 1 << 20  # bytes a hook reads from its stdin
 PA_FILE = os.path.realpath(__file__)
 AGENT_VARS = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CODEX_SANDBOX", "CODEX_HOME_SESSION")
-VERSION = re.compile(r"(?<![\d.])(\d+)\.(\d+)\.(\d+)(?![\d.])")
+VERSION = re.compile(r"(?<![\d.])(\d+)\.(\d+)\.(\d+)(?:\.\d+)*(?![\d.])")  # t-190 T3: a build number may follow
 
 
 def context_problems(value):
@@ -1071,8 +1071,9 @@ def read_context(directory):
 
 
 def parse_cc_version(text):
-    """(major, minor, patch) from `claude --version` output: the first X.Y.Z on a line that names Claude Code, else on
-    the first line when that line starts with it (a wrapper's banner with its own version does not count); else None."""
+    """(major, minor, patch) from `claude --version` output: the first X.Y.Z (a build number .N after it is left out,
+    t-190 T3) on a line that names Claude Code, else on the first line when that line starts with it or with v and it
+    (a wrapper's banner with its own version does not count); else None."""
     if not isinstance(text, str):
         return None
     lines = text.splitlines()
@@ -1082,7 +1083,8 @@ def parse_cc_version(text):
             if m:
                 return tuple(int(g) for g in m.groups())
     if lines:
-        m = VERSION.match(lines[0].strip())
+        first = lines[0].strip()
+        m = VERSION.match(first[1:] if first[:1] in ("v", "V") else first)
         if m:
             return tuple(int(g) for g in m.groups())
     return None
