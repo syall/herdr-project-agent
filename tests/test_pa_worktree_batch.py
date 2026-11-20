@@ -1737,3 +1737,132 @@ class T192HolderRemove(HolderBase):
         self.assertTrue(os.path.isdir(h))
         self.assertFalse(os.path.exists(pkg))
 
+
+class T192Branch(Standing):
+    """R7 (VP9): after the git route removed a worktree, its branch is deleted when it still points where it did, every
+    commit is merged into main and pushed, no other worktree has it, no queue entry names it and it is not a main
+    branch name; else kept, said why. Never a remote ref or a tag."""
+
+    def refs(self, repo=None):
+        return sh(repo or self.proj, "git", "for-each-ref", "--format=%(refname) %(objectname)")
+
+    def branch(self, name):
+        return sh(self.proj, "git", "for-each-ref", "--format=%(objectname)", "refs/heads/" + name)
+
+    def card_remove(self, tid):
+        code, out, err = self.check()
+        self.assertEqual(code, 0, out + err)
+        self.answer(next(f[:-5] for f in self.files() if f.startswith("d-wt-" + tid)), "Delete")
+        return self.run_cmd("pa-worktree", "remove", tid, "--space", "sp1")
+
+    def test_vp9_standing_deletes_a_merged_pushed_branch_only(self):
+        path = self.clean("t-003")
+        sha = sh(path, "git", "rev-parse", "HEAD")
+        sh(self.proj, "git", "tag", "t-003", sha)  # H7.6: a tag and a remote branch of the same name stay
+        sh(self.proj, "git", "push", "-q", "origin", "t-003")
+        sh(self.proj, "git", "fetch", "-q", "origin")
+        sh(self.proj, "git", "config", "branch.t-003.description", "mine")
+        remote_before = self.refs(self.remote)
+        code, out, err = self.standing()
+        self.assertEqual(code, 0, out + err)
+        self.assertFalse(os.path.exists(path))
+        self.assertIn("Deleted branch t-003 (was {}), merged and pushed".format(sha[:7]), out)
+        self.assertEqual(self.branch("t-003"), "")
+        self.assertIn("refs/tags/t-003 " + sha, self.refs())
+        self.assertIn("refs/remotes/origin/t-003 " + sha, self.refs())
+        self.assertEqual(self.refs(self.remote), remote_before, "no remote ref changes")
+        self.assertNotIn("branch.t-003", sh(self.proj, "git", "config", "--list"))
+
+    def test_vp9_a_card_answer_deletes_it_too(self):
+        path = self.clean("t-004")
+        sha = sh(path, "git", "rev-parse", "HEAD")
+        code, out, err = self.card_remove("t-004")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("Deleted branch t-004 (was {}), merged and pushed".format(sha[:7]), out)
+        self.assertEqual(self.branch("t-004"), "")
+
+    def test_h7_7_merged_not_pushed_is_kept(self):
+        path = os.path.join(self.tmp, "worktrees", "t-005", "proj")
+        sh(self.proj, "git", "worktree", "add", "-q", "-b", "t-005", path, "main")
+        self.commit(path, "f5.txt", "5\n", "work of t-005")
+        sh(self.proj, "git", "merge", "-q", "--no-edit", "t-005")  # merged, never pushed
+        self.add_task("t-005", "done", path, [])
+        code, out, err = self.card_remove("t-005")
+        self.assertEqual(code, 0, out + err)
+        self.assertFalse(os.path.exists(path))
+        self.assertIn("Branch t-005 is kept: not every commit is merged into main and pushed", out)
+        self.assertNotEqual(self.branch("t-005"), "")
+
+    def test_h7_8_a_queue_entry_names_it(self):
+        path = self.clean("t-006")
+        dump({"version": 1, "repos": {"x": {"common": os.path.join(self.proj, ".git"), "main": "main",
+                                             "entries": [{"task": "t-099", "branch": "t-006"}]}}},
+             os.path.join(self.dir, "queue.json"))
+        code, out, err = self.standing()
+        self.assertEqual(code, 0, out + err)
+        self.assertFalse(os.path.exists(path))
+        self.assertIn("Branch t-006 is kept: a queue entry names it", out)
+        self.assertNotEqual(self.branch("t-006"), "")
+
+    def test_h7_5_checked_out_in_another_worktree(self):
+        path = self.clean("t-007")
+        other = os.path.join(self.tmp, "elsewhere")
+        sh(self.proj, "git", "worktree", "add", "-q", "--force", other, "t-007")
+        code, out, err = self.standing()
+        self.assertEqual(code, 0, out + err)
+        self.assertFalse(os.path.exists(path))
+        self.assertIn("Branch t-007 is kept: another worktree has it checked out", out)
+        self.assertNotEqual(self.branch("t-007"), "")
+
+    def test_h7_4_a_branch_that_moved_is_kept(self):
+        path = self.clean("t-008")
+        sha = sh(path, "git", "rev-parse", "HEAD")
+        real = pa_hooks.remove_worktree
+
+        def then_move(p, facts):
+            done = real(p, facts)
+            sh(self.proj, "git", "update-ref", "refs/heads/t-008", "main~1")  # moved after the facts were read
+            return done
+        with mock.patch.object(pa_hooks, "remove_worktree", then_move):
+            code, out, err = self.standing()
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("Branch t-008 is kept: it moved", out)
+        self.assertNotEqual(self.branch("t-008"), "")
+        self.assertNotEqual(self.branch("t-008"), sha)
+
+    def test_h7_1_main_branch_names_are_kept(self):
+        dump({"name": "test", "claude": ["true"], "codex": ["true"], "mainBranches": ["origin/stable"]},
+             os.path.join(pa.ROOT, "profiles", "test", "profile.json"))
+        sh(self.proj, "git", "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+        for name in ("trunk", "master", "stable"):
+            with self.subTest(name=name):
+                path = os.path.join(self.tmp, "worktrees", "w-" + name, "proj")
+                sh(self.proj, "git", "worktree", "add", "-q", "-b", name, path, "main")
+                self.add_task("t-" + name, "done", path, [])
+                code, out, err = self.standing()
+                self.assertEqual(code, 0, out + err)
+                self.assertFalse(os.path.exists(path))
+                self.assertIn("Branch {} is kept: a main branch name".format(name), out)
+                self.assertNotEqual(self.branch(name), "")
+
+    def test_h7_2_a_detached_head_has_no_branch(self):
+        path = os.path.join(self.tmp, "worktrees", "t-009", "proj")
+        sh(self.proj, "git", "worktree", "add", "-q", "--detach", path, "main")
+        self.add_task("t-009", "done", path, [])
+        before = self.refs()
+        code, out, err = self.standing()
+        self.assertEqual(code, 0, out + err)
+        self.assertFalse(os.path.exists(path))
+        self.assertIn("no branch to delete (detached HEAD)", out)
+        self.assertEqual(sorted(l for l in self.refs().splitlines() if l.startswith("refs/heads/")),
+                         sorted(l for l in before.splitlines() if l.startswith("refs/heads/")))
+
+    def test_h7_3_names_git_would_not_make(self):
+        sha = sh(self.proj, "git", "rev-parse", "main")
+        profile = pa.load_profile("test")
+        for name in ("-x", "refs/heads/x", "x..y", "a b", "HEAD", "", "x\ny"):
+            with self.subTest(name=name):
+                line = pa_hooks.branch_after(self.dir, {"repo": self.proj, "branch": name, "head": sha}, profile)
+                self.assertNotIn("Deleted", line)
+        self.assertNotEqual(self.branch("main"), "")
+
