@@ -8566,12 +8566,13 @@ cases["P116-push-refused"] = async () => { // RL-2: a run the runtime refused (n
   check(!v.push.locked(S, PID) && !v.push.kept(S, PID), "not locked, not kept");
   check(!(g.__shared["project-agent.answering"] ?? {})[PKEY], `no shared mark left (got ${JSON.stringify(g.__shared["project-agent.answering"])})`);
   check(pushExecs("check").length === checks, "no check after it: the card is as before the click");
-  check(Boolean(clicks[`submit-${PID}`]) && /Ready: Push pushes exactly this\./.test(text), `Submit is there again (have ${Object.keys(clicks).filter((k) => k.includes(PID))})`);
+  check(Boolean(clicks[`opt-${PID}-0`]) && /Ready: Push pushes exactly this\./.test(text), `Push can be picked and submitted again (have ${Object.keys(clicks).filter((k) => k.includes(PID))})`);
   refuse = false;
   if (!look(v).clicks[`submit-${PID}`]) await click(v, `opt-${PID}-0`);
   await click(v, `submit-${PID}`); await settle(); await settle();
   ({ text } = look(v));
   check(pushExecs("run").length === 1 && text.includes(`Pushed ${PURL} main`), `the next click runs it (runs ${pushExecs("run").length}; got ${text.slice(0, 1500)})`);
+  advance(11000); await fire(10000); await settle(); // a notice skipped in the quiet after the refusal is sent by the 10 s retry
   check(sends().length === 1 && sends()[0][2].startsWith(`decision ${PID} answered Push; result:`), `told once, for the run that ran (got ${JSON.stringify(sends())})`);
 };
 
