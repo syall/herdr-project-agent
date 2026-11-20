@@ -280,6 +280,25 @@ push it yourself with one click in the panel.
   or delete the file. It applies at the next check: open push cards show the refusal. Nothing
   else needs undoing.
 
+## Worktree cleanup
+
+**Worktree cleanup.** `pa-worktree check --open-cards` puts every worktree whose job is over on one
+Delete card (`d-wt-batch-<n>`), one line each; a single one keeps its own card. You answer it in the
+panel: Delete the ones where nothing is lost, Delete all, or Keep all. `pa-worktree remove --card
+<id>` then removes each one through the same checks and skips any that changed since. A note on your
+answer removes nothing: the card is withdrawn and the Project Agent asks which ones to keep. Files
+git ignores (build output, a local settings file) are not counted on any card.
+
+To let the Project Agent delete clean worktrees without a card (every commit merged into main and
+pushed, nothing uncommitted or untracked, no terminal in it, no keep), write or approve a rule that
+says so, then bind it in your own terminal: `pa-worktree-allow set --space S --standing <rule id>`.
+`pa-worktree-allow show` lists the bindings; `off` stops it. The rule counts only while it is
+active, applies to all, is yours with its text unchanged and is bound in `worktree-allow.json` (in
+the Project Agent's home; only your command writes it). A hold, an Other answer or a note on any
+card, or a failed removal stops it; you resume it by turning the rule off and on in the panel.
+Merged and pushed are read from local refs, with no fetch: a squash-merged branch is not clean here
+and goes to a card.
+
 ## Costs per space
 
 `pa-costs` adds up what each space spends, from the usage counters in the session files of the

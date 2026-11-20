@@ -718,12 +718,12 @@ class PushText(unittest.TestCase):
                 self.assertLess(text.index(rule), text.index(PUSH_OFF))
 
     def test_t168_batch_card_and_standing_delete(self):  # t-168 V17.1
-        workers = flat(part(self.raw, "## Workers", "## Phases and gates"))
+        workers = flat(part(self.orchestrator, "## Workers", "## Phases and gates"))
         self.assertIn(T168_BATCH, workers)
         self.assertIn(T168_STANDING, workers)
         self.assertNotIn("It opens a Delete/Keep card for each recorded worktree", workers)
         self.assertLess(workers.index(T168_BATCH), workers.index(T168_STANDING))
-        safety = flat(section(self.raw, "## Safety"))
+        safety = flat(section(self.orchestrator, "## Safety"))
         self.assertIn("or deleting the clean worktrees that their standing rule to delete them covers (Workers)", safety)
         readme = flat(read("README.md"))
         self.assertIn(README_WORKTREES, readme)

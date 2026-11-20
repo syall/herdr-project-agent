@@ -553,25 +553,49 @@ Run `hc --skill` once to learn `hc`. Start workers with the profile's commands (
   a later job's folder while the first one exists: add it as a `worktrees` entry, or
   the first is no longer recorded and is never offered.
 - Worktrees outlive their workers: a task's worktrees stay while its workers come and
-  go. Each pass, run `pa-worktree check --open-cards`. It opens a Delete/Keep card for
-  each recorded worktree whose job is over: `d-wt-<task>` for the task's main worktree,
-  `d-wt-<task>-<job>` for any other. Only when every task using a worktree is done or
+  go. Each pass, run `pa-worktree check --open-cards`. It asks the person about each
+  recorded worktree whose job is over: one alone gets a Delete/Keep card, `d-wt-<task>`
+  for the task's main worktree, `d-wt-<task>-<job>` for any other; two or more go on one
+  card, `d-wt-batch-<n>` (below). Only when every task using a worktree is done or
   parked, and no worker or other terminal is working in it, is it offered whatever its
   commits are. While a task is still in progress, a worktree of it is offered only when
-  every repository in it has commits, all of them merged into the main branch, nothing is
-  uncommitted and no terminal is working in it; a new commit, file or terminal withdraws
-  that card. Each card says what is in it (tasks, job, branch, commits and whether they
-  are merged or pushed, files changed, anything uncommitted) and what deleting would cost;
-  the full list is in `WORKTREE.md` in the task's evidence folder (`WORKTREE-<job>.md` for
-  a job's card). When that card is answered Delete, run `pa-worktree remove <task-id>`
-  (add `--job <job>` for a job's card); it also removes the empty folder the worktree
-  leaves. Then mark that entry `removed`, set the task's `worktree` to null if it was that
-  one, and journal it. Answered Keep: leave it, it is not asked again. Answered Other:
-  nothing is removed; act on their words, and if they ask for it to go, withdraw the
-  card (`pa-decide <card-id> --withdraw`) so the next check asks again. If the person
-  says to keep a worktree whatever happens, set `"keep": true` on its entry, or
-  `"keepWorktree": true` on the task for all of them. Never remove a worktree or delete a
-  branch any other way; the tool refuses without the card.
+  every repository in it has commits, all of them merged into the main branch, nothing
+  is uncommitted and no terminal is working in it; a new commit, file or terminal
+  withdraws that card. Each card says what is in it (tasks, job, branch, commits and
+  whether they are merged or pushed, files changed, anything uncommitted) and what
+  deleting would cost; the full list is in `WORKTREE.md` in the task's evidence folder
+  (`WORKTREE-<job>.md` for a job's card). When a single card is answered Delete, run
+  `pa-worktree remove <task-id>` (add `--job <job>` for a job's card); it also removes
+  the empty folder the worktree leaves. Then mark that entry `removed`, set the task's
+  `worktree` to null if it was that one, and journal it. Answered Keep: leave it, it is
+  not asked again. Answered Other: nothing is removed; act on their words, and if they
+  ask for it to go, withdraw the card (`pa-decide <card-id> --withdraw`) so the next
+  check asks again. A batch card lists each worktree on one line (task, job, branch, its
+  commits and how many are merged and pushed, anything uncommitted, what deleting loses)
+  under Nothing is lost or Deleting loses something, and offers Delete the ones where
+  nothing is lost (when some lose something), Delete all and Keep all; it is answered in
+  the panel only. Answered Delete: run `pa-worktree remove --card <card-id>`. It removes
+  each worktree the answer covers through the same checks, read again now, skips and
+  lists any that changed, and the next check asks about those again; tell the person its
+  line. Answered with a note: nothing is removed and the card is withdrawn; ask the
+  person to say "keep tNN" for each one to keep first, and set `"keep": true` on its
+  entry. Keep all: none of them is asked about again. While it is open, a worktree that
+  joins or leaves the set withdraws it, and the check opens one card for all of them
+  again. No card counts the files git ignores. If the person says to keep a worktree
+  whatever happens, set `"keep": true` on its entry, or `"keepWorktree": true` on the
+  task for all of them. Never remove a worktree or delete a branch any other way; the
+  tool refuses without the card, except on the person's standing rule (below).
+- Deleting worktrees on the person's standing rule: a rule the person wrote or approved
+  can be their standing approval to delete clean worktrees in this space, accepted by
+  the tool only while it is active, applies to all, is the person's with its text
+  unchanged, and is bound by them in `worktree-allow.json`. Where it is in force, each
+  pass, before `pa-worktree check --open-cards`, run `pa-worktree remove --standing
+  <rule id>`. It deletes only the worktrees whose every commit is merged into main and
+  pushed, with nothing uncommitted or untracked, no terminal in them and no keep, and
+  never one the person answered Keep or Other. Tell the person its one line. Everything
+  else still goes on cards. As in Push cards, a hold, an Other answer or a note on any
+  card, or a failed removal stops it, and resuming is the person's. Never run
+  `pa-worktree-allow` or write `worktree-allow.json`.
 - Worktrees no task records: `pa-worktree check --open-cards` lists them on one card,
   `d-wt-unrecorded-<n>`, with the task each seems to belong to. It is answered by
   recording or by leaving them alone, never by deleting: for each one the person records,
@@ -605,8 +629,9 @@ needs approval, open a decision card in your own space. Log peer messages in the
 
 - Push, publish, merge, delete, production: a decision card first, every time. The one
   exception: a merge and push that the person's own standing rule covers (Push cards),
-  which the tools accept only while that rule is active, the person's, and bound by them
-  on the push allowlist.
+  or deleting the clean worktrees that their standing rule to delete them covers
+  (Workers), which the tools accept only while that rule is active, the person's, and
+  bound by them on the push allowlist or in `worktree-allow.json`.
 - You and your workers may prepare a release. You never perform one, except the merge
   and push under that standing rule.
 - Never read secrets (`.env*`, credential files, `~/.ssh`), force-push, push to the
