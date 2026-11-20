@@ -2150,6 +2150,35 @@ class T190StartPack(J4Base):
         self.assertTrue(argv[-3].endswith("it is not a hold."), argv[-3][-80:])
 
 
+class T192RuleNew(J4Base):  # t-192 R5.2 (t-190 RL1): an edited or imported active rule's text is new
+    def fresh(self, *history, text="The new words."):
+        T190StartPack.rules(self, [{"id": "r-x", "title": "X", "status": "active", "text": text, "history": list(history)}])
+        return pa.fresh_prompt(self.dir, 1, "pass-cap", SID)
+
+    def test_r5_2_edited_now_after_created_long_ago(self):
+        text = self.fresh({"at": ago(30 * 86400), "by": "person", "change": "created"},
+                          {"at": ago(600), "by": "person", "change": "edited"})
+        self.assertIn("Rules approved in the last 24 h (their full text; read it before your next action):", text)
+        self.assertIn("- r-x: The new words.", text)
+
+    def test_r5_2_imported_now(self):
+        text = self.fresh({"at": ago(600), "by": "person", "change": "imported"})
+        self.assertIn("- r-x: The new words.", text)
+
+    def test_h5_1_h5_2_other_spellings_and_words_stay_out(self):
+        for word in ("Edited", " edited", "edited ", "Imported", "imported ", "turned on", "reordered", "proposed"):
+            with self.subTest(word=word):
+                text = self.fresh({"at": ago(30 * 86400), "change": "created"}, {"at": ago(600), "change": word})
+                self.assertNotIn("The new words.", text)
+
+    def test_h5_3_an_edited_time_not_utc_z_or_in_the_future(self):
+        future = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 3600))
+        for at in ("2026-11-20T10:00:00+01:00", "yesterday", future, ago(25 * 3600)):
+            with self.subTest(at=at):
+                text = self.fresh({"at": ago(30 * 86400), "change": "created"}, {"at": at, "change": "edited"})
+                self.assertNotIn("The new words.", text)
+
+
 # ---- t-190 R6, R7: pa-doctor lists the active rules, the ones changed since the checkpoint, handoffs without the block
 
 class T190Doctor(Doctor):
