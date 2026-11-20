@@ -234,7 +234,8 @@ class R1_Install(unittest.TestCase):
                         self.assertLessEqual(os.path.getmtime(p), stamp_at + 1e-6, p)
         link = os.path.join(home, ".local", "bin", "pa-stamp")
         self.assertTrue(os.path.islink(link))
-        self.assertEqual(os.path.realpath(link), os.path.realpath(os.path.join(root, "tools", "pa.py")))
+        # t-147: linked to pa_launch.py, which runs pa.py for it (test_pa_launch L1)
+        self.assertEqual(os.path.realpath(link), os.path.realpath(os.path.join(root, "tools", "pa_launch.py")))
         self.assertIn("pa-stamp", r.stdout + open(os.path.join(REPO, "install.sh")).read())
 
     def test_install_check_writes_no_stamp(self):

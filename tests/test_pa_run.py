@@ -789,7 +789,9 @@ class R13Docs(unittest.TestCase):
                            universal_newlines=True)
         for flag in ("--on", "--local", "--commit", "--overlay", "--cwd", "--for"):
             self.assertIn(flag, r.stdout)
-        self.assertIn("pa-run", self.read("install.sh"))
+        # t-147: install.sh links pa_launch.py's names; pa-run is one of them (pa_hooks.py runs it)
+        self.assertIn('ln -sfn "$PA/tools/pa_launch.py"', self.read("install.sh"))
+        self.assertIn(" pa-run ", self.read("runtime", "tools", "pa_launch.py"))
 
     def test_r13d_pa_run_parses_as_python_37(self):
         import ast
