@@ -2941,6 +2941,26 @@ class T77_Wrapper(Command, T77Fakes):
         err = self.refused("Herdr's login-shell wrapper running 'pa-session --space {}'".format(SP))
         self.assertNotIn("shell=", err)
 
+    def test_t065_wrapper_running_something_else_is_refused(self):  # d-187 (t-081): its child a launcher or not
+        for cmd in (["/bin/zsh", "-i"], ["vim"], ["pa-session", "--space", "sp9"], ["python3", "/x/pa.py", "restart"]):
+            with self.subTest(cmd=cmd):
+                self.term["argv"] = hc_wrapper(*cmd)
+                self.procs[T77_TERM] = (23551, ps_zsh(" ".join(cmd)))
+                err = self.refused("no launcher of this space")
+                self.assertIn("Herdr's login-shell wrapper running {!r}".format(" ".join(cmd)), err)
+                self.assertIn("--end-terminal", err)
+        self.term.pop("argv", None)  # ps only
+        self.procs[T77_TERM] = (23551, ps_fish("/bin/zsh -i"))
+        self.refused("no launcher of this space")
+
+    def test_t065_wrapped_launchers_still_pass(self):  # the accepted forms stay accepted (d-181 O1: --ask)
+        for cmd in (["pa-session", "--space", SP], ["pa-session", "--space=" + SP], ["pa-session", "--ask"],
+                    ["python3", "/x/pa.py", "session", "--space", SP], ["python3", "/x/pa-session", "--ask"]):
+            with self.subTest(cmd=cmd):
+                self.term["argv"] = hc_wrapper(*cmd)
+                self.procs[T77_TERM] = (23551, ps_zsh(" ".join(cmd)))
+                self.passes()
+
     def test_equal_pids_need_no_process_facts(self):  # R7, V4
         dump(dict(self.rec, pid=T77_TERM), os.path.join(self.dir, "launcher.json"))
         self.term["argv"] = ["pa-session", "--space", SP]
