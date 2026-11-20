@@ -1950,6 +1950,39 @@ def journal_lines(directory):
     return out, doubt
 
 
+def journal_hold(directory):
+    """The hold as pa-places reads it (hold_state below, R13): off | on | unknown. A journal that is there but
+    cannot be read is unknown (fail closed: the hold is the person's brake on the one path where an agent pushes)."""
+    path = os.path.join(directory, "journal.jsonl")
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except FileNotFoundError:
+        text = None
+    except OSError:
+        return "unknown"
+    return hold_state(text)
+
+
+def hold_state(text):
+    """pa_places.hold_state, word for word (a copy: the push tool loads only pa and pa_hooks): the last line
+    with a "hold" key decides; a line that is not JSON after it (or with none at all) means it cannot be told."""
+    state, doubt = "off", False
+    for line in (text or "").splitlines():
+        if not line.strip():
+            continue
+        try:
+            value = json.loads(line)
+        except ValueError:
+            doubt = True
+            continue
+        if isinstance(value, dict) and "hold" in value:
+            v = value["hold"]
+            state = "on" if v == "on" or v is True else "off" if v == "off" or v is False else "unknown"
+            doubt = False
+    return "unknown" if doubt else state
+
+
 def standing_stops(directory, rule):
     """What stops the rule now (R13), as (why, fresh) or None. fresh is False for a stop already written (it stays until
     the person changes the rule, Q4)."""
@@ -1960,13 +1993,9 @@ def standing_stops(directory, rule):
         if l.get("standing") == "stopped" and l.get("rule") == rule.get("id") and after(l.get("at")):
             return ("the rule stopped at {}: {}; the person resumes it by turning it off and on in the panel".format(
                 l.get("at"), pa_hooks.cut(pa_hooks.clean(str(l.get("why"))), 200)), False)
-    hold = "off"
-    for l in lines:
-        if "hold" in l:
-            v = l["hold"]
-            hold = "on" if v == "on" or v is True else "off" if v == "off" or v is False else "unknown"
+    hold = journal_hold(directory)
     if hold != "off":
-        return ("a hold is {} (the journal's last hold line)".format(hold), True)
+        return ("a hold is {} (the journal read as pa-places reads it)".format(hold), True)
     for sub in ("decisions", pa.ARCHIVE):
         folder = os.path.join(directory, sub)
         for name in sorted(os.listdir(folder)) if os.path.isdir(folder) else []:

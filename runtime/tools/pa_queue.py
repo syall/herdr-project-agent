@@ -71,6 +71,9 @@ MERGE_TIMEOUT = 120
 IND_QUESTION = ("do the change and what moved under it since its passing suite behave independently: does either one change, "
                 "call, define or shadow anything the other uses (names, imports, constants, files it reads, tests)? Write "
                 "'Independent: yes' or 'Independent: no' with one line of reason")
+STACKED_QUESTION = ("do the change and the entry it was stacked on (merged before it) behave independently: does either "
+                    "one change, call, define or shadow anything the other uses (names, imports, constants, files it reads, "
+                    "tests)? Write 'Independent: yes' or 'Independent: no' with one line of reason")
 DOC_QUESTION = ("is every conflict region only docstrings or comments, both sides kept word for word? 'yes' or 'no' per "
                 "region with one line of reason")
 QUESTION = ("for each place where the base's change lies within about 30 lines of the change, or where one calls, defines "
@@ -1812,13 +1815,25 @@ def independence_passed(ctx, rec, e, tip, reviews):
     return r, tree
 
 
-def standing_need(ctx, rec, e, tip, base_tip):
+def stacked_on(rec, e):
+    """What a stacked entry at the front was stacked on (R12): the merged entry whose tip is its base, as (the main tip
+    before that entry merged, its tip), so `git diff old new` is that entry's change. None when it cannot be told (no
+    merged entry ends at its base, or that diff would be empty): the rule then waits, it never asks an empty review."""
+    base = e.get("base")
+    for m in reversed(rec.get("merged") or []):
+        if isinstance(m, dict) and base and m.get("tip") == base and m.get("from") and m["from"] != base:
+            return m["from"], base
+    return None
+
+
+def standing_need(ctx, rec, e, tip, below):
     """The independence review the rule asks of a stacked entry, for its tip (R12), recorded as needs.independence (as
-    r-disjoint-carry's): record_reviews takes it, pa-queue brief hands it to a reviewer."""
+    r-disjoint-carry's): record_reviews takes it, pa-queue brief hands it to a reviewer. below: stacked_on's pair, the
+    change of the entry it was stacked on."""
     n = max(1, len(e.get("rebases") or []))
     return {"tip": tip, "tree": ctx.tree(tip), "since": now(), "kind": "independent", "standing": True,
             "file": "SHORT-REVIEW-{}{}-{}.md".format(e["task"], "-" + e["job"] if e.get("job") else "", n),
-            "oldBase": base_tip, "newBase": e.get("base")}
+            "oldBase": below[0], "newBase": below[1]}
 
 
 def standing_lines(e, need):
@@ -1827,7 +1842,7 @@ def standing_lines(e, need):
             "found independent): a fresh reviewer writes evidence/{}/{}".format(t, t, need["file"]),
             "  the change: git diff {} {}; what it is stacked on: git diff {} {}".format(
                 need.get("newBase"), need["tip"], need.get("oldBase"), need.get("newBase")),
-            "  question: " + IND_QUESTION + "; then 'Verdict: pass' or 'Verdict: must fix (<n>)'.",
+            "  question: " + STACKED_QUESTION + "; then 'Verdict: pass' or 'Verdict: must fix (<n>)'.",
             "  the file has the lines Start: <UTC time>, End: <UTC time>, Reviewer: <its address>, Independent: yes|no, "
             "Checked: {}, and its Verdict: line".format(need["tip"])]
 
@@ -1907,13 +1922,19 @@ def merge_standing(ctx, data, rec, rule, binding, space_id):
                 break
             if not r:
                 need = (e.get("needs") or {}).get("independence")
-                if not (isinstance(need, dict) and need.get("tip") == tip):
-                    need = standing_need(ctx, rec, e, tip, main_tip)
+                below = stacked_on(rec, e)
+                if not below:
+                    wait = "stacked: what it was stacked on cannot be told from the merged entries (no merged entry " \
+                           "ends at its base {}); open a queue card".format(short(e.get("base")))
+                elif not (isinstance(need, dict) and need.get("tip") == tip
+                          and (not need.get("standing") or (need.get("oldBase"), need.get("newBase")) == below)):
+                    need = standing_need(ctx, rec, e, tip, below)
                     e["needs"] = dict(e.get("needs") or {}, independence=need)
                     ctx.event("standing-need", e, file=need["file"], tip=tip, rule=rid)
                     save(ctx, data, rec)
                     lines += standing_lines(e, need)
-                wait = "stacked: waiting for its independence review {}".format(need["file"])
+                if below:
+                    wait = "stacked: waiting for its independence review {}".format(need["file"])
         if wait:
             lines.append("waits at {}: {}".format(label(e), wait))
             break
