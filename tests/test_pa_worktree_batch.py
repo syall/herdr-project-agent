@@ -1635,6 +1635,20 @@ class T192HolderRemove(HolderBase):
         self.gone(h, pkg, out)
         self.assertIn("Removed the test workspace worktree {} with {} (rule r-holder)".format(os.path.realpath(h), os.path.realpath(pkg)), out)
 
+    def test_r6_4_the_card_and_worktree_md_name_the_holder(self):
+        h, (pkg,) = self.one("t-021")
+        code, out, err = self.check()
+        self.assertEqual(code, 0, out + err)
+        cid = next(f[:-5] for f in self.files() if f.startswith("d-wt-t-021"))
+        card = self.dec(cid)
+        words = ("The test workspace worktree {} is deleted too when rule r-holder is active and everything in it is merged, "
+                 "pushed and clean; else it stays.".format(os.path.realpath(h)))
+        self.assertIn(words, card["context"])
+        self.assertIn("the branch t-021-x-pkg is deleted when every commit is merged and pushed, else kept", card["context"])
+        md = pa.read_text(os.path.join(self.dir, "evidence", "t-021", next(n for n in os.listdir(os.path.join(self.dir, "evidence", "t-021"))
+                                                                          if n.startswith("WORKTREE"))))
+        self.assertIn(words, md.replace("\n", " "))
+
     def test_h6_8_the_rule_not_active(self):
         for i, kw in enumerate((dict(status="proposed"), dict(status="retired"), dict(rid="R-holder"))):
             with self.subTest(kw=kw):
@@ -1865,4 +1879,36 @@ class T192Branch(Standing):
                 line = pa_hooks.branch_after(self.dir, {"repo": self.proj, "branch": name, "head": sha}, profile)
                 self.assertNotIn("Deleted", line)
         self.assertNotEqual(self.branch("main"), "")
+
+    def old_removed(self, tid, move=False, merged=True):
+        """A worktree removed before R7: its branch kept, its card spent, the ledger entry marked removed."""
+        path = os.path.join(self.tmp, "worktrees", tid, "proj")
+        sh(self.proj, "git", "worktree", "add", "-q", "-b", tid, path, "main")
+        self.commit(path, tid + ".txt", tid + "\n", "work of " + tid)
+        sha = sh(path, "git", "rev-parse", "HEAD")
+        if merged:
+            sh(self.proj, "git", "merge", "-q", "--no-edit", tid)
+            sh(self.proj, "git", "push", "-q", "origin", "main")
+        sh(self.proj, "git", "worktree", "remove", path)
+        if move:
+            sh(self.proj, "git", "update-ref", "refs/heads/" + tid, "main~1")
+        self.add_task(tid, "done", None, [], worktrees=[{"path": path, "job": "main", "removed": "2026-11-01T00:00:00Z"}])
+        dump({"id": "d-wt-" + tid, "task": tid, "worktree": os.path.realpath(path), "branch": tid, "status": "answered",
+              "answer": "Delete", "note": None, "answered": "2026-11-01T00:00:00Z", "snapshot": {"heads": {os.path.realpath(path): sha}},
+              "worktreeRemoved": "2026-11-01T00:00:00Z"}, self.path("d-wt-" + tid))
+        return sha
+
+    def test_q5_standing_deletes_old_merged_branches_of_removed_worktrees(self):
+        agent = load(os.path.join(self.dir, "agent.json"))
+        agent["project"] = self.proj  # the main checkout searched (no live worktree row names it)
+        dump(agent, os.path.join(self.dir, "agent.json"))
+        self.old_removed("t-030")
+        self.old_removed("t-031", move=True)
+        self.old_removed("t-032", merged=False)
+        code, out, err = self.standing()
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("deleted 1 merged and pushed branch of worktrees removed before: t-030", out)
+        self.assertEqual(self.branch("t-030"), "")
+        self.assertNotEqual(self.branch("t-031"), "", "moved since its card: kept")
+        self.assertNotEqual(self.branch("t-032"), "", "not merged: kept")
 

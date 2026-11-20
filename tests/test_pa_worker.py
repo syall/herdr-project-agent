@@ -1449,7 +1449,8 @@ class Describe(Base):
         self.assertIn("  Uncommitted: 1: M README", lines)
         self.assertIn("Workers: t-003-tests (closed)", lines)
         self.assertIn("No other terminal is working in it.", lines)
-        self.assertIn("Deleting: the branch t-003-x and its commits are kept; the 1 uncommitted files are DISCARDED.", lines)
+        self.assertIn("Deleting: the branch t-003-x is deleted when every commit is merged and pushed, else kept with its commits; "
+                      "the 1 uncommitted files are DISCARDED.", lines)  # t-192 R7.3
         self.assertEqual(lines[-1], "Full list: WORKTREE.md")
         self.assertEqual(card["evidence"], ["WORKTREE.md"])
         snap = card["snapshot"]
@@ -2543,7 +2544,8 @@ class JobCards(Base):
                       self.check()[1])
         code, out, err = self.remove("t-003", "--job", "billing")
         self.assertEqual(code, 0, err)
-        self.assertIn("Removed the worktree {}. Branch t-003-billing is kept. (card d-wt-t-003-billing)".format(os.path.realpath(self.bill)), out)
+        self.assertIn("Removed the worktree {}. (card d-wt-t-003-billing)\nBranch t-003-billing is kept: not every commit is merged "
+                      "into main and pushed".format(os.path.realpath(self.bill)), out)  # t-192 R7.2: merged, on no remote
         self.assertFalse(os.path.exists(self.bill))
         self.assertTrue(os.path.isdir(self.wt))
         # one worktree and no main one: remove without --job takes it

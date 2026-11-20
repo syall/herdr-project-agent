@@ -2156,10 +2156,13 @@ def worktree_facts(path, profile=None):
     files = status_files(path)
     _c, branch, _ = git(path, "rev-parse", "--abbrev-ref", "HEAD")
     _c, ahead, _ = git(path, "rev-list", "--count", "HEAD", "--not", "--remotes")
+    code3, head, _ = git(path, "rev-parse", "--verify", "-q", "HEAD")
+    code4, ref, _ = git(path, "symbolic-ref", "-q", "HEAD")  # the full name: --abbrev-ref says heads/x when a tag x exists
     if files is None:
         return {"unreadable": "git status failed"}
     return {"main": False, "repo": os.path.dirname(os.path.realpath(common)), "branch": branch,
-            "uncommitted": len(files), "unpushed": int(ahead) if ahead.isdigit() else 0}
+            "uncommitted": len(files), "unpushed": int(ahead) if ahead.isdigit() else 0,
+            "head": head if not code3 and head else None, "ref": ref if not code4 and ref else None}
 
 
 def inside(path, folder):
@@ -2499,7 +2502,9 @@ def deleting_text(facts, loss=None):
     if facts.get("removesBranches"):
         return "Deleting also deletes its branches ({}){}{}.".format(
             facts.get("branch"), "; the commits that are on no remote would be LOST" if loses_commits else "", lost)
-    return "Deleting: the branch {} and its commits are kept{}.".format(facts.get("branch"), lost or "; nothing uncommitted is lost")
+    holder = facts.get("holderNote") or ""
+    return "Deleting: the branch {} is deleted when every commit is merged and pushed, else kept with its commits{}.{}".format(
+        facts.get("branch"), lost or "; nothing uncommitted is lost", holder)
 
 
 def card_context(desc, row, facts, gone, extra=(), md_file="WORKTREE.md"):
@@ -2976,6 +2981,7 @@ def open_worktree_card(directory, row, facts, profile, owner, rule, gone, desc=N
     the worktree's own withdrawn card, asked again under it; else a new id no other card holds (new_card_id, t-073)."""
     task, job, main = owner
     named, extra = card_extra(row, owner, rule)
+    facts = dict(facts, holderNote=holder_note(row, profile))  # t-192 R6.4: its Deleting line names the holder
     if desc is None:
         desc = describe_safely(row, facts, profile)
     loss, dirty = card_loss(desc, facts)
@@ -3165,7 +3171,7 @@ def worktree_item(directory, cand, profile, on_card):
     The md file is the one its single card would use (md_for of that card's id), written once the card is fitted."""
     row, owner, rule, gone = cand["row"], cand["owner"], cand["rule"], cand["gone"]
     task, job, main = owner
-    facts = row["facts"]
+    facts = dict(row["facts"], holderNote=holder_note(row, profile))  # t-192 R6.4: its Deleting line names the holder
     _named, extra = card_extra(row, owner, rule)
     desc = cand.get("desc") or describe_safely(row, facts, profile)
     loss, dirty = card_loss(desc, facts)
@@ -3209,7 +3215,8 @@ def worktrees_card_text(items, total):
     deleting loses something; `total` candidates in all, the rest named as waiting."""
     def text(shown):
         n, more = len(shown), total - len(shown)
-        lines = ["{} worktrees whose jobs are over. Deleting removes each folder; branches are kept unless a line says otherwise. "
+        lines = ["{} worktrees whose jobs are over. Deleting removes each folder; a branch is deleted when every commit is merged "
+                 "and pushed, else kept, unless a line says otherwise. "
                  "Files git ignores are not counted.".format(n)]
         kept, lossy = [i for i in shown if i["lossless"]], [i for i in shown if not i["lossless"]]
         if kept:
@@ -4477,6 +4484,11 @@ def remove_standing(directory, space, agent, profile, rule_id, env=None, ancs=No
             line += "; {} not clean, left for cards: {}".format(len(left), ", ".join(left))
         if notes:  # t-192 R6, R7: what became of each removed worktree's holder and branch
             line += "; " + "; ".join(n.rstrip(".") for n in notes)
+        old = [] if failed else old_branches(directory, agent, profile, rows)  # t-192 Q5
+        if old:
+            line += "; deleted {} merged and pushed branch{} of worktrees removed before: {}{}".format(
+                len(old), "" if len(old) == 1 else "es", ", ".join(clean(b) for b in old[:10]),
+                " and {} more".format(len(old) - 10) if len(old) > 10 else "")
         if failed:
             line += "; then {}: the rule is stopped, and resuming it is the person's".format(failed)
         if removed:
@@ -4708,6 +4720,21 @@ def holder_why(directory, profile, h, p, status):
     return None
 
 
+def holder_note(row, profile):
+    """t-192 R6.4: for a package of a holder, what a card and WORKTREE.md say of the holder (a leading blank), else ''."""
+    hold = None if (row.get("facts") or {}).get("remove") else holder_of(row["path"], profile)
+    if not hold:
+        return ""
+    rid = profile["worktree"].get("holderRule")
+    status = holder_status(hold[0], profile)
+    kind = clean(status.get("kind")) if status and isinstance(status.get("kind"), str) and status["kind"].strip() else \
+        "worktree that holds it"
+    if not isinstance(rid, str) or not rid:
+        return " The {} {} stays (the profile names no rule for removing it).".format(kind, hold[0])
+    return (" The {} {} is deleted too when rule {} is active and everything in it is merged, pushed and clean; else it "
+            "stays.".format(kind, hold[0], clean(rid)))
+
+
 def remove_with_holder(directory, row, profile, facts):
     """Removes the worktree of a row (remove_worktree) and, for a package of a holder (holder_of) on the profile's
     rule (worktree.holderRule, active in rules.json now), the holder with it when holder_why finds nothing to keep:
@@ -4715,7 +4742,7 @@ def remove_with_holder(directory, row, profile, facts):
     of the holder. Raises pa.Problem as remove_worktree does."""
     hold = None if facts.get("remove") else holder_of(row["path"], profile)
     if not hold:
-        return remove_worktree(row["path"], facts), [], None
+        return git_route(directory, row, profile, facts, [])
     h, p = hold
     custom = profile["worktree"]
     rid = custom.get("holderRule") if isinstance(custom.get("holderRule"), str) and custom.get("holderRule") else None
@@ -4744,7 +4771,132 @@ def remove_with_holder(directory, row, profile, facts):
             return "The worktree {} is gone with the failed removal of the {} {}.".format(row["path"], kind, h), lines, None
     else:
         lines.append("the {} {} stays: {}".format(kind, h, why))
-    return remove_worktree(row["path"], facts), lines, None
+    return git_route(directory, row, profile, facts, lines)
+
+
+def git_route(directory, row, profile, facts, lines):
+    """remove_worktree, then (t-192 R7) for a git worktree its branch: deleted when merged and pushed (branch_after).
+    (done, lines, None) as remove_with_holder gives them."""
+    done = remove_worktree(row["path"], facts)
+    if facts.get("remove"):
+        return done, lines, None
+    kept = " Branch {} is kept.".format(facts.get("branch"))
+    if done.endswith(kept):
+        done = done[:-len(kept)]
+    return done, lines + [branch_after(directory, facts, profile)], None
+
+
+def old_branches(directory, agent, profile, rows):
+    """t-192 Q5 (remove --standing): the branches of worktrees removed before R7, deleted now on R7's checks
+    (branch_after): for each spent worktree card (single or a batch item) whose worktree the ledger records as removed
+    and is gone, its branch at the HEAD its snapshot recorded, in each main checkout known here (the rows' repositories,
+    the project folder or its src/* repositories) where that branch still points at that commit. Returns the names
+    deleted."""
+    removed = set()
+    for task in ledger_tasks(directory).values():
+        for e in task.get("worktrees") or [] if isinstance(task.get("worktrees"), list) else []:
+            if isinstance(e, dict) and e.get("removed") and isinstance(e.get("path"), str) and e["path"].strip():
+                removed.add(os.path.realpath(os.path.expanduser(e["path"])))
+    if not removed:
+        return []
+    listing = card_listing(directory)
+    views = []
+    for cid in sorted(listing):
+        if cid.startswith("d-wt-") and not is_batch_id(cid) and not cid.startswith(UNRECORDED):
+            card = pa.read_json_safe(pa.card_file(directory, cid))
+            if isinstance(card, dict):
+                views.append(card)
+    for cid, card in worktrees_cards(directory, listing).items():
+        views += [item_view(cid, card, i) for i in range(len(card["items"]))]
+    repos = {r["facts"]["repo"] for r in rows.values() if isinstance(r.get("facts"), dict) and isinstance(r["facts"].get("repo"), str)}
+    project = agent.get("project") if isinstance(agent.get("project"), str) and agent.get("project").strip() else None
+    if project:
+        project = os.path.realpath(os.path.expanduser(project))
+        src = os.path.join(project, "src")
+        for place in [project] + ([os.path.join(src, n) for n in sorted(os.listdir(src))] if os.path.isdir(src) else []):
+            code, top, _ = git(place, "rev-parse", "--path-format=absolute", "--show-toplevel")
+            if not code and os.path.realpath(top) == os.path.realpath(place):
+                repos.add(os.path.realpath(place))
+    deleted, seen = [], set()
+    for v in views:
+        path, b = card_tree(v), v.get("branch")
+        if not v.get("worktreeRemoved") or path not in removed or os.path.lexists(path) or not isinstance(b, str) or not b:
+            continue
+        heads = (v.get("snapshot") or {}).get("heads") if isinstance(v.get("snapshot"), dict) else None
+        heads = heads if isinstance(heads, dict) else {}
+        sha = heads.get(v.get("worktree")) or heads.get(path) or (next(iter(heads.values())) if len(heads) == 1 else None)
+        if not isinstance(sha, str) or not sha:
+            continue
+        for repo in sorted(repos):
+            if (repo, b) in seen:
+                continue
+            code, now, _ = git(repo, "rev-parse", "--verify", "-q", "refs/heads/" + b)
+            if code or now != sha:
+                continue
+            seen.add((repo, b))
+            if branch_after(directory, {"repo": repo, "branch": b, "ref": "refs/heads/" + b, "head": sha}, profile).startswith("Deleted"):
+                deleted.append(b)
+    return deleted
+
+
+def main_names(repo, profile):
+    """The names a main branch goes by here: main, master, trunk, the profile's mainBranches, origin/HEAD's target."""
+    names = {"main", "master", "trunk"}
+    for b in (profile or {}).get("mainBranches") or []:
+        names.add(str(b).split("/", 1)[-1] if str(b).startswith("origin/") else str(b))
+    code, target, _ = git(repo, "symbolic-ref", "--short", "refs/remotes/origin/HEAD")
+    if not code and "/" in target:
+        names.add(target.split("/", 1)[1])
+    return names
+
+
+def branch_after(directory, facts, profile):
+    """t-192 R7: after the git route removed a worktree, its branch B (facts["branch"], at facts["head"] when the facts
+    were read) is deleted from the repository (facts["repo"]) when, read now: B is a branch name git accepts, not a main
+    branch name; refs/heads/B still points at that commit; it is merged into a main branch and pushed; no other worktree
+    has it checked out; no queue.json entry names it. The ref goes by update-ref with that commit as its old value
+    (refused if B moved), then its config section. Never a remote ref, a tag or a push. Returns the line to print;
+    never raises."""
+    repo, b, sha = facts.get("repo"), facts.get("branch"), facts.get("head")
+    if "ref" in facts:  # read as refs/heads/<B> (worktree_facts): no short name a tag can make ambiguous
+        ref = facts["ref"]
+        b = ref[len("refs/heads/"):] if isinstance(ref, str) and ref.startswith("refs/heads/") else None
+    if not isinstance(b, str) or b in ("", "HEAD"):
+        return "The worktree had no branch to delete (detached HEAD)."
+    shown = clean(b)
+    try:
+        if b.startswith(("-", "refs/")) or any(c.isspace() for c in b) or git(repo, "check-ref-format", "--branch", b)[0] != 0:
+            return "Branch {} is kept: not a branch name git accepts".format(shown)
+        if b in main_names(repo, profile):
+            return "Branch {} is kept: a main branch name".format(shown)
+        code, now, _ = git(repo, "rev-parse", "--verify", "-q", "refs/heads/" + b)
+        if code or not now:
+            return "Branch {} is kept: it is not there any more".format(shown)
+        if not isinstance(sha, str) or now != sha:
+            return "Branch {} is kept: it moved since it was read ({} now)".format(shown, now[:7])
+        if not merged_and_pushed(repo, profile, sha):
+            return "Branch {} is kept: not every commit is merged into main and pushed".format(shown)
+        code, out, _ = git(repo, "worktree", "list", "--porcelain")
+        if code:
+            return "Branch {} is kept: cannot list the repository's worktrees".format(shown)
+        if "branch refs/heads/" + b in out.splitlines():
+            return "Branch {} is kept: another worktree has it checked out".format(shown)
+        queue_file = os.path.join(directory, "queue.json")
+        queue = pa.read_json_safe(queue_file)
+        recs = queue.get("repos") if isinstance(queue, dict) else None
+        if os.path.lexists(queue_file) and not isinstance(recs, dict):
+            return "Branch {} is kept: queue.json cannot be read".format(shown)
+        for rec in (recs or {}).values():
+            entries = rec.get("entries") if isinstance(rec, dict) and isinstance(rec.get("entries"), list) else []
+            if any(isinstance(e, dict) and e.get("branch") == b for e in entries):
+                return "Branch {} is kept: a queue entry names it".format(shown)
+        code, _out, err = git(repo, "update-ref", "-d", "refs/heads/" + b, sha)
+        if code:
+            return "Branch {} is kept: it moved (git update-ref refused: {})".format(shown, clean(err)[-200:])
+        git(repo, "config", "--remove-section", "branch." + b)
+        return "Deleted branch {} (was {}), merged and pushed".format(shown, sha[:7])
+    except Exception as e:  # noqa: BLE001 - a failed deletion never fails the removal (R7.2)
+        return "Branch {} is kept: {}".format(shown, clean(e)[:200])
 
 
 def remove_worktree(path, facts):
