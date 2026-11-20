@@ -474,8 +474,9 @@ class QueueWiring(unittest.TestCase):
 
 class Wiring(unittest.TestCase):
     def test_w1_install_links_pa_handoff(self):
-        lines = [l for l in read(os.path.join(REPO, "install.sh")).splitlines() if "pa_handoff.py" in l]
-        self.assertEqual(lines, ['for n in pa-handoff; do ln -sfn "$PA/tools/pa_handoff.py" "$HOME/.local/bin/$n"; done'])
+        # t-147: pa-handoff is linked to pa_launch.py, which runs pa_handoff.py (its table)
+        self.assertIn('ln -sfn "$PA/tools/pa_launch.py"', read(os.path.join(REPO, "install.sh")))
+        self.assertIn('"pa-handoff": "pa_handoff"', read(os.path.join(REPO, "runtime", "tools", "pa_launch.py")))
 
     def test_w2_core_tells_the_pa(self):
         text = read(os.path.join(REPO, "runtime", "core", "orchestrator.md"))

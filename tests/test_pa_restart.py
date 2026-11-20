@@ -1417,7 +1417,8 @@ class MainAndInstall(Base):
         self.assertEqual(r.returncode, 0, r.stdout[-2000:])
         link = os.path.join(home, ".local", "bin", "pa-restart")
         self.assertTrue(os.path.islink(link))
-        self.assertEqual(os.path.realpath(link), os.path.realpath(os.path.join(env["HERDR_PA_HOME"], "tools", "pa.py")))
+        # t-147: linked to pa_launch.py, which runs pa.py for it (test_pa_launch L1)
+        self.assertEqual(os.path.realpath(link), os.path.realpath(os.path.join(env["HERDR_PA_HOME"], "tools", "pa_launch.py")))
 
 
 class AC9_1_OnlyTheOwnChild(unittest.TestCase):

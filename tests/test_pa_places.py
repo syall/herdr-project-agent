@@ -1083,9 +1083,9 @@ class T120Reasons(Base):  # t-120 (t-097 J3 round 2 RL-2): a second block keeps 
 
 class Wiring(unittest.TestCase):
     def test_install_and_parse(self):
-        lines = [l for l in read(os.path.join(REPO, "install.sh")).splitlines() if "pa_places.py" in l]
-        self.assertEqual(len(lines), 1, lines)
-        self.assertIn("for n in pa-places; do", lines[0])
+        # t-147: pa-places is linked to pa_launch.py, which runs pa_places.py (its table)
+        self.assertIn('ln -sfn "$PA/tools/pa_launch.py"', read(os.path.join(REPO, "install.sh")))
+        self.assertIn('"pa-places": "pa_places"', read(os.path.join(REPO, "runtime", "tools", "pa_launch.py")))
         line = next(l for l in read(os.path.join(REPO, "tests", "run-all.sh")).splitlines() if "parses as Python 3.7" in l)
         self.assertIn("runtime/tools/pa_places.py", line)
 

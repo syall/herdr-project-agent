@@ -2807,7 +2807,10 @@ class I1_Install(unittest.TestCase):
     def test_i1_install_links_pa_costs(self):
         with open(os.path.join(HERE, "..", "install.sh")) as f:
             text = f.read()
-        self.assertRegex(text, r'for n in pa-costs; do ln -sfn "\$PA/tools/pa_costs.py" "\$HOME/.local/bin/\$n"; done')
+        # t-147: pa-costs is linked to pa_launch.py, which runs pa_costs.py (its table)
+        self.assertIn('ln -sfn "$PA/tools/pa_launch.py"', text)
+        with open(os.path.join(TOOLS, "pa_launch.py")) as f:
+            self.assertIn('"pa-costs": "pa_costs"', f.read())
         self.assertIn("chmod +x \"$PA\"/tools/*.py", text)  # pa_costs.py is made runnable with the others
 
 

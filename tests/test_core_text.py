@@ -882,9 +882,9 @@ class T035FolderTrust(unittest.TestCase):  # t-035 spec section 6, P1-P5 (with i
 
     def test_p5_tool_listed_and_linked(self):
         self.assertIn("pa-trust <address>", read("runtime", "tools", "pa_hooks.py").split('"""')[1])
-        line = [l for l in read("install.sh").splitlines() if "pa_hooks.py" in l and l.startswith("for n in")]
-        self.assertEqual(1, len(line))
-        self.assertIn(" pa-trust", line[0].split(";")[0])
+        # t-147: the pa-* commands are linked to pa_launch.py, which runs pa_hooks.py for pa-trust (its table)
+        self.assertIn('ln -sfn "$PA/tools/pa_launch.py"', read("install.sh"))
+        self.assertIn('"pa-trust": "pa_hooks"', read("runtime", "tools", "pa_launch.py"))
 
 
 class T041DiskState(unittest.TestCase):  # t-041 J2: R7, R8, R9 (text), R10 (AC10.2), R16 markers
