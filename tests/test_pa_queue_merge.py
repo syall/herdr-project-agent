@@ -1027,5 +1027,39 @@ class CarryNotClean(Carry):
         self.assertIn("carry-over: suite + short review", out)
 
 
+class T192R3QueueCardJobFiles(MBase):
+    """t-192 round 3 (RL1): a queue card lists the review file of each entry's own job as its evidence (a main-job entry: REVIEW.md, as
+    before, its tests unchanged)."""
+
+    def test_rl1_the_queue_card_names_each_entrys_review(self):
+        self.task("t-J", [("fj0.txt", "main job\n")], gate=False)
+        wt2 = os.path.join(self.tmp, "wt-t-J-2")
+        sh(self.proj, "git", "worktree", "add", "-q", "-b", "t-J-y", wt2, "main")
+        write(os.path.join(wt2, "fj.txt"), "j\n")
+        sh(wt2, "git", "add", "fj.txt")
+        sh(wt2, "git", "commit", "-q", "-m", "job two")
+        led = self.ledger()
+        t = next(t for t in led["tasks"] if t["id"] == "t-J")
+        t["worktrees"] = [{"path": self.trees["t-J"], "job": "main"}, {"path": wt2, "job": "j2"}]
+        self.set_ledger(led)
+        ev = self.evidence("t-J")
+        write(os.path.join(ev, "VERIFY-j2.md"), "text\nChecked: {}\nVerdict: pass\n".format(sh(wt2, "git", "rev-parse", "HEAD")))
+        write(os.path.join(ev, "REVIEW-j2.md"), "text\n")
+        code, out, err = self.run_main(pa_hooks, ["pa-gate", "t-J", "--job", "j2", "--space", SPACE])
+        self.assertEqual(code, 0, out + err)
+        code, out, err = self.queue("add", "t-J", "--job", "j2", "--repo", self.proj)
+        self.assertEqual(code, 0, out + err)
+        found = pa_suite_module.pins(types.SimpleNamespace(**vars(pa_hooks)), wt2)
+        stamp = pa.now()
+        pa_hooks.suite_record(self.dir, {"task": "t-J", "root": wt2}, "full", 0, 1.0, found, {"start": stamp, "end": stamp})
+        code, out, err = self.refresh("--no-merge")
+        self.assertEqual(code, 0, out + err)
+        code, out, err = self.make_card("Recorded limits: t-J none")
+        self.assertEqual(code, 0, out + err)
+        card = self.card(self.queue_cards()[0])
+        self.assertEqual([(e["task"], e["job"]) for e in card["queue"]["entries"]], [("t-J", "j2")], out)
+        self.assertEqual(card["evidence"], ["REVIEW-j2.md"])
+
+
 if __name__ == "__main__":
     unittest.main()

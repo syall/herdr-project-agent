@@ -1333,6 +1333,34 @@ class Clean(Standing):
         self.assertEqual(self.removals(), [])
         self.assertIn("1 uncommitted or untracked file(s) in B", out)
 
+    # round 3 MF1 (its class): a profile worktree on the rule reads the branches its removal deletes, fail closed
+    def profile_kept(self, kind, out, *why):
+        self.assertTrue(os.path.isdir(kind), out)
+        self.assertEqual(self.removals(), [], "the profile's remove script never ran")
+        for w in why:
+            self.assertIn(w, out)
+
+    def test_r3_mf1_profile_worktree_branch_named_after_it_unpushed(self):
+        kind = self.profile_tree()
+        sh(self.repos[1], "git", "branch", "t-003-pkg")  # the branch named after the worktree, HEAD stays on feat
+        sh(self.repos[1], "git", "checkout", "-q", "t-003-pkg")
+        self.commit(self.repos[1], "own.txt", "own\n", "on its own branch only")
+        sh(self.repos[1], "git", "checkout", "-q", "feat")
+        code, out, err = self.standing()
+        self.assertEqual(code, 0, err + out)
+        self.profile_kept(kind, out, "branch t-003-pkg is not merged into main and pushed in B")
+
+    def test_r3_mf1_profile_worktree_branch_text_it_cannot_read(self):
+        kind = self.profile_tree()
+        status = json.loads(sh(self.tmp, os.path.join(self.tmp, "status.sh")))
+        for branch in ("feat", "A:feat", "A:feat, B:nosuch", "A:feat, B:feat, C:feat", "", None):
+            with self.subTest(branch=branch):
+                write(os.path.join(self.tmp, "status.sh"), "#!/bin/sh\ncat <<'JSON'\n{}\nJSON\n".format(
+                    json.dumps(dict(status, branch=branch))))
+                code, out, err = self.standing()
+                self.assertEqual(code, 0, err + out)
+                self.profile_kept(kind, out)
+
     # MF1: the re-read right before the removal checks every loss fact the first read checked
     def changed_at_the_re_read(self, change, kind=None, before=False):
         """Runs the standing removal with `change(row)` applied right after refresh_busy's re-read (before it, when the
@@ -1446,7 +1474,17 @@ class OneRun(Standing):
 # ---- t-192 R3, R6, R7: a package worktree in a holder (a workspace-like worktree), its holder, its branch ----------
 HSTATUS = r"""#!/bin/sh
 [ -n "$HSTATUS_FAIL" ] && exit 1
-printf '{"uncommitted": %s, "unpushed": 0, "branch": "b", "kind": "test workspace worktree", "removesBranches": true, "repos": [' "${HSTATUS_UNCOMMITTED:-0}"
+# "branch" as the profile's status scripts print it: <Pkg>:<branch of its HEAD>, ... ('HEAD' when detached);
+# HSTATUS_BRANCH (a string) or HSTATUS_BRANCH_JSON (any JSON value) in its place
+branches=
+for d in "$1"/src/*; do
+  [ -d "$d" ] || continue
+  branches="$branches${branches:+, }${d##*/}:$(git -C "$d" rev-parse --abbrev-ref HEAD 2>/dev/null)"
+done
+[ -n "${HSTATUS_BRANCH+x}" ] && branches=$HSTATUS_BRANCH
+branch="\"$branches\""
+[ -n "${HSTATUS_BRANCH_JSON+x}" ] && branch=$HSTATUS_BRANCH_JSON
+printf '{"uncommitted": %s, "unpushed": 0, "branch": %s, "kind": "test workspace worktree", "removesBranches": true, "repos": [' "${HSTATUS_UNCOMMITTED:-0}" "$branch"
 sep=
 for d in "$1"/src/*; do
   [ -d "$d" ] || continue
@@ -1752,6 +1790,87 @@ class T192HolderRemove(HolderBase):
         self.assertFalse(os.path.exists(pkg))
 
 
+    # round 3 MF1: the branches the holder's removal deletes, read from the status script's real format
+    # ('<Pkg>:<branch>, ...') and from git; what cannot be read keeps the holder
+    def own_branch_holder(self, tid, merged_branch=False):
+        """<ws>/worktrees/<tid>-x whose package Pkg has the branch named after the worktree (<tid>-x, as the profile's
+        worktrees name their packages' branches) with one commit (merged into main and pushed when merged_branch, else
+        on no remote), its HEAD then on another branch at main, merged and pushed."""
+        name = tid + "-x"
+        h = os.path.join(self.ws, "worktrees", name)
+        write(os.path.join(h, "marker.txt"), "")
+        pkg = os.path.join(h, "src", "Pkg")
+        sh(self.proj, "git", "worktree", "add", "-q", "-b", name, pkg, "main")
+        self.commit(pkg, name + ".txt", name + "\n", "work of " + name)
+        if merged_branch:
+            sh(self.proj, "git", "merge", "-q", "--no-edit", name)
+            sh(self.proj, "git", "push", "-q", "origin", "main")
+        self.add_task(tid, "done", pkg, [])
+        return h, pkg, name
+
+    def test_r3_mf1_the_worktree_branch_off_head_unpushed_keeps_the_holder(self):
+        for i, move in enumerate(("other branch", "detached")):
+            with self.subTest(move=move):
+                h, pkg, name = self.own_branch_holder("t-12{}".format(i))
+                if move == "detached":
+                    sh(pkg, "git", "checkout", "-q", "--detach", "main")
+                else:
+                    sh(pkg, "git", "checkout", "-q", "-b", "t-12{}-other".format(i), "main")
+                code, out, err = self.standing()
+                self.assertEqual(code, 0, out + err)
+                self.stays(h, pkg, out, "branch {} is not merged into main and pushed in Pkg".format(name))
+                self.assertNotEqual(sh(self.proj, "git", "for-each-ref", "refs/heads/" + name), "", "its commit is kept")
+
+    def test_r3_mf1_the_worktree_branch_merged_and_pushed_lets_it_go(self):
+        h, pkg, _name = self.own_branch_holder("t-125", merged_branch=True)
+        sh(pkg, "git", "checkout", "-q", "--detach", "main")
+        code, out, err = self.standing()
+        self.assertEqual(code, 0, out + err)
+        self.gone(h, pkg, out)
+
+    def test_r3_mf1_a_named_branch_unpushed_keeps_the_holder(self):
+        h, (pkg,) = self.one("t-130")
+        sh(pkg, "git", "branch", "t-130-loose")
+        sh(self.proj, "git", "worktree", "add", "-q", os.path.join(self.tmp, "loose"), "t-130-loose")
+        self.commit(os.path.join(self.tmp, "loose"), "l.txt", "l\n", "loose work")
+        sh(self.proj, "git", "worktree", "remove", os.path.join(self.tmp, "loose"))
+        with mock.patch.dict(os.environ, {"HSTATUS_BRANCH": "Pkg:t-130-loose"}):
+            code, out, err = self.standing()
+        self.assertEqual(code, 0, out + err)
+        self.stays(h, pkg, out, "branch t-130-loose is not merged into main and pushed in Pkg")
+
+    def test_r3_mf1_a_branch_text_it_cannot_read_keeps_the_holder(self):
+        cases = (("HSTATUS_BRANCH", "b"), ("HSTATUS_BRANCH", ""), ("HSTATUS_BRANCH", "Pkg:nosuch"),
+                 ("HSTATUS_BRANCH", "Pkg:"), ("HSTATUS_BRANCH", "Other:t-14{i}-x-pkg"),
+                 ("HSTATUS_BRANCH", "Pkg:t-14{i}-x-pkg, Pkg:t-14{i}-x-pkg"), ("HSTATUS_BRANCH", "Pkg:t-14{i}-x-pkg,"),
+                 ("HSTATUS_BRANCH", "Pkg:t-14{i}-x-pkg, "), ("HSTATUS_BRANCH", "Pkg:heads/t-14{i}-x-pkg"),
+                 ("HSTATUS_BRANCH_JSON", "null"), ("HSTATUS_BRANCH_JSON", "7"), ("HSTATUS_BRANCH_JSON", '["Pkg:t-14{i}-x-pkg"]'))
+        for i, (key, value) in enumerate(cases):
+            with self.subTest(key=key, value=value):
+                h, (pkg,) = self.one("t-14{}".format(i))
+                with mock.patch.dict(os.environ, {key: value.format(i=i)}):
+                    code, out, err = self.standing()
+                self.assertEqual(code, 0, out + err)
+                self.stays(h, pkg, out)
+
+    def test_r3_mf1_a_package_the_branch_text_does_not_name_keeps_the_holder(self):
+        h, (p1, p2) = self.holder("t-160-x", ("Pkg", "Two"))
+        self.add_task("t-160", "done", p1, [])
+        with mock.patch.dict(os.environ, {"HSTATUS_BRANCH": "Pkg:t-160-x-pkg"}):
+            code, out, err = self.standing()
+        self.assertEqual(code, 0, out + err)
+        self.stays(h, p1, out, "Two")
+        self.assertTrue(os.path.isdir(p2))
+
+    def test_r3_mf1_several_packages_and_a_comma_in_a_branch_name(self):
+        h, (p1, p2) = self.holder("t-170,x", ("Pkg", "Two"))  # branches t-170,x-pkg and t-170,x-two: git takes ','
+        self.add_task("t-170", "done", p1, [])
+        code, out, err = self.standing()
+        self.assertEqual(code, 0, out + err)
+        self.gone(h, p1, out)
+        self.assertFalse(os.path.exists(p2))
+
+
 class T192Branch(Standing):
     """R7 (VP9): after the git route removed a worktree, its branch is deleted when it still points where it did, every
     commit is merged into main and pushed, no other worktree has it, no queue entry names it and it is not a main
@@ -1879,6 +1998,28 @@ class T192Branch(Standing):
                 line = pa_hooks.branch_after(self.dir, {"repo": self.proj, "branch": name, "head": sha}, profile)
                 self.assertNotIn("Deleted", line)
         self.assertNotEqual(self.branch("main"), "")
+
+    def test_r3_n1_a_symbolic_branch_ref_is_deleted_itself_not_its_target(self):
+        sha = sh(self.proj, "git", "rev-parse", "main")
+        sh(self.proj, "git", "branch", "t-180-target", "main")
+        sh(self.proj, "git", "symbolic-ref", "refs/heads/t-180", "refs/heads/t-180-target")
+        line = pa_hooks.branch_after(self.dir, {"repo": self.proj, "ref": "refs/heads/t-180", "head": sha}, pa.load_profile("test"))
+        self.assertEqual(self.branch("t-180-target"), sha, line)
+
+    def test_r3_n2_an_unreadable_src_folder_does_not_end_the_run(self):
+        if os.geteuid() == 0:
+            self.skipTest("root reads any folder")
+        project = os.path.join(self.tmp, "proj-src")
+        os.makedirs(os.path.join(project, "src"))
+        agent = load(os.path.join(self.dir, "agent.json"))
+        agent["project"] = project
+        dump(agent, os.path.join(self.dir, "agent.json"))
+        self.old_removed("t-033")
+        os.chmod(os.path.join(project, "src"), 0)
+        self.addCleanup(os.chmod, os.path.join(project, "src"), 0o755)
+        code, out, err = self.standing()
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("Removed 0 worktrees on rule r-wt", out)
 
     def old_removed(self, tid, move=False, merged=True):
         """A worktree removed before R7: its branch kept, its card spent, the ledger entry marked removed."""

@@ -536,5 +536,30 @@ class T192PushJob(unittest.TestCase):
         self.assertIsNone(pa_push.push_job(d, task, b), "GATE.json pins it: the main job")
 
 
+class T192R3PushCardJobFiles(Planned):
+    """t-192 round 3 (RL1): a push card for a job's gate names that job's files as its evidence."""
+
+    def test_rl1_the_push_card_of_a_job_names_its_gate_and_review(self):
+        self.ledger_task(worktree=os.path.join(self.tmp, "elsewhere"),
+                         worktrees=[{"path": os.path.join(self.tmp, "elsewhere"), "job": "main"}, {"path": self.wt, "job": "j2"}])
+        ev = os.path.join(self.dir, "evidence", TASK)
+        for name in ("VERIFY.md", "REVIEW.md"):
+            write(os.path.join(ev, name.replace(".md", "-j2.md")), pa.read_text(os.path.join(ev, name)))
+            os.unlink(os.path.join(ev, name))
+        os.unlink(os.path.join(ev, "GATE.json"))  # Planned's main-job gate: this task's gate is the job's
+        saved = sys.argv
+        sys.argv = ["pa-gate", TASK, "--job", "j2", "--space", SPACE]
+        try:
+            code, out, err = self.quiet(pa_hooks.main)
+        finally:
+            sys.argv = saved
+        self.assertIn(code, (0, None), out + err)
+        self.assertTrue(os.path.exists(os.path.join(ev, "GATE-j2.json")), out + err)
+        self.assertFalse(os.path.exists(os.path.join(ev, "GATE.json")))
+        code, out, err = self.plan()
+        self.assertIn(code, (0, None), out + err)
+        self.assertEqual(self.card()["evidence"], ["GATE-j2.json", "REVIEW-j2.md"])
+
+
 if __name__ == "__main__":
     unittest.main()
