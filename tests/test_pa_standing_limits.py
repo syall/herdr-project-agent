@@ -440,8 +440,11 @@ class R7Stack(Limits):
     def test_r7_a_pre_ship_entry_below_ends_the_walk_with_no_pair(self):
         # Round 2 (REVIEW.md finding 1): t-B was queued before stackedOn existed; t-C stacked on it gets no partial
         # pair (t-B's change only) but waits for a card
-        self.three()
+        self.joined("t-A", "fa.txt")
+        self.joined("t-B", "fb.txt")
         self.set_entries(lambda r: [e.pop("stackedOn", None) for e in r["entries"] if e["task"] == "t-B"])
+        self.joined("t-C", "fc.txt")
+        self.assertEqual(self.entry("t-C")["stackedOn"], {"task": "t-B", "job": None})
         self.passed("t-A", "t-B", "t-C")
         self.assertIsNone(self.stacked_need("t-C"), self.entry("t-C"))
         self.assertIsNone(pa_queue.stack_pair(self.qrepo(), self.entry("t-C")))
