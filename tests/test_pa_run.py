@@ -706,6 +706,35 @@ class R11Interrupt(Run):
         self.assertFalse(os.path.exists(self.remote_folder(run)))
         self.assertEqual(self.progress(run).get("exit"), 143)
 
+    def test_r11b_term_inside_watcher_start_is_143_and_cleans(self):
+        """t-144 V-1: the TERM comes while the watcher is being started (here before its thread runs, on purpose:
+        no timing). pa-run ends 143, not 1 from watcher.stop() joining a thread never started, and cleans up."""
+        import threading
+        go = os.path.join(self.tmp, "go")
+        self.addCleanup(lambda: write(go, "go\n"))  # the probe there, if it was left, ends
+        real = threading.Thread.start
+        hit = []
+
+        def start(thread):
+            if type(thread).__name__ == "RemoteWatcher" and not hit:
+                hit.append(thread)
+                os.kill(os.getpid(), signal.SIGTERM)
+                time.sleep(10)  # pa-run's handler raises here (PEP 475), so the real start never runs
+            return real(thread)
+        threading.Thread.start = start
+        try:
+            code, out = self.pa_run("--", "sh", "probe.sh", "wait=" + go)
+        except RuntimeError as e:  # what V-1 saw: watcher.stop() on a thread never started
+            code, out = None, "RuntimeError: {}".format(e)
+        finally:
+            threading.Thread.start = real
+        self.assertTrue(hit, out)
+        self.assertNotIn("RuntimeError", out)
+        self.assertEqual(code, 143, out)
+        run = self.run_id(out)
+        self.assertFalse(os.path.exists(self.remote_folder(run)), out)
+        self.assertEqual(self.progress(run).get("exit"), 143, out)
+
 
 class R12StartPoll(Run):
     def test_r12_a_short_run_is_back_within_seconds_with_a_slow_poll(self):
