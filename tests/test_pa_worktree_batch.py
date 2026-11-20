@@ -5,7 +5,9 @@ Run: python3 -m unittest -v tests/test_pa_worktree_batch.py
 Uses the fixture of tests/test_pa_worker.py (temp homes, a stub hc, git only under a temp folder). Only Base is bound in
 this module, so none of that file's tests run here a second time.
 """
+import contextlib
 import fcntl
+import io
 import json
 import os
 import shutil
@@ -1440,3 +1442,136 @@ class OneRun(Standing):
         fcntl.flock(lock, fcntl.LOCK_EX)
         with mock.patch.object(pa_hooks, "WORKTREE_LOCK_WAIT", 0.3):
             self.refused(self.standing(), "another pa-worktree remove is running")
+
+# ---- t-192 R3, R6, R7: a package worktree in a holder (a workspace-like worktree), its holder, its branch ----------
+HSTATUS = r"""#!/bin/sh
+[ -n "$HSTATUS_FAIL" ] && exit 1
+printf '{"uncommitted": 0, "unpushed": 0, "branch": "b", "kind": "test workspace worktree", "removesBranches": true, "repos": ['
+sep=
+for d in "$1"/src/*; do
+  [ -d "$d" ] || continue
+  case " ${HSTATUS_HIDE:-} " in *" ${d##*/} "*) continue ;; esac
+  printf '%s"%s"' "$sep" "$d"; sep=,
+done
+printf ']}\n'
+"""
+HREMOVE = r"""#!/bin/sh
+printf '%s\n' "$@" >> "$HREMOVE_LOG"
+echo "--" >> "$HREMOVE_LOG"
+[ -n "$HREMOVE_FAIL" ] && { echo "remove broke"; exit 1; }
+rm -rf "$1"
+"""
+
+
+class HolderBase(Standing):
+    """A profile (test2) whose worktree kind is a holder: <ws>/worktrees/<name> with marker.txt, packages at
+    src/<Pkg> (each a linked git worktree of proj), its status and remove scripts stubs (HSTATUS, HREMOVE)."""
+
+    def setUp(self):
+        super().setUp()
+        self.ws = os.path.join(self.tmp, "ws")
+        self.hstatus, self.hremove = os.path.join(self.tmp, "hstatus.sh"), os.path.join(self.tmp, "hremove.sh")
+        write(self.hstatus, HSTATUS)
+        write(self.hremove, HREMOVE)
+        for f in (self.hstatus, self.hremove):
+            os.chmod(f, 0o755)
+        self.hlog = os.path.join(self.tmp, "hremove.log")
+        self.env = mock.patch.dict(os.environ, {"HREMOVE_LOG": self.hlog})
+        self.env.start()
+        self.addCleanup(self.env.stop)
+        self.profile()
+
+    def profile(self, **worktree):
+        wt = dict({"marker": "marker.txt", "status": self.hstatus, "remove": self.hremove, "repos": "src/*",
+                   "holderRule": "r-holder", "own": ["build", "env"]}, **worktree)
+        dump({"name": "test2", "claude": ["true"], "codex": ["true"], "worktree": {k: v for k, v in wt.items() if v is not None}},
+             os.path.join(pa.ROOT, "profiles", "test2", "profile.json"))
+        agent = load(os.path.join(self.dir, "agent.json"))
+        agent["profile"] = "test2"
+        dump(agent, os.path.join(self.dir, "agent.json"))
+
+    def holder(self, name, pkgs=("Pkg",), merged=True):
+        """<ws>/worktrees/<name> with its marker and one linked worktree per package (branch <name>-<pkg>), each with a
+        commit merged into main and pushed when merged. Returns (holder, [package paths])."""
+        h = os.path.join(self.ws, "worktrees", name)
+        write(os.path.join(h, "marker.txt"), "")
+        paths = []
+        for pkg in pkgs:
+            path = os.path.join(h, "src", pkg)
+            branch = "{}-{}".format(name, pkg.lower())
+            sh(self.proj, "git", "worktree", "add", "-q", "-b", branch, path, "main")
+            if merged:
+                self.commit(path, branch + ".txt", branch + "\n", "work of " + branch)
+                sh(self.proj, "git", "merge", "-q", "--no-edit", branch)
+                sh(self.proj, "git", "push", "-q", "origin", "main")
+            paths.append(path)
+        return h, paths
+
+    def removals(self):
+        return pa.read_text(self.hlog).split("--\n")[:-1] if os.path.exists(self.hlog) else []
+
+
+class T192HolderPath(HolderBase):
+    """R3: a package path recorded in a holder is under a worktrees folder (the one recorded form)."""
+
+    def test_vp5_standing_removes_a_package_path_recorded_as_the_main_worktree(self):
+        _h, (pkg,) = self.holder("t-007-x")
+        self.add_task("t-007", "done", pkg, [])
+        code, out, err = self.standing()
+        self.assertEqual(code, 0, out + err)
+        self.assertNotIn("not under a worktrees folder", out)
+        self.assertIn("Removed 1 worktrees on rule r-wt: t-007 (main)", out)
+        self.assertFalse(os.path.exists(pkg))
+
+    def test_vp5_check_offers_a_package_path_recorded_for_a_job(self):
+        _h, (pkg,) = self.holder("t-008-x")
+        main = self.worktree(self.proj, "t-008-main")
+        self.add_task("t-008", "done", main, [], worktrees=[{"path": main, "job": "main"}, {"path": pkg, "job": "pkg"}])
+        code, out, err = self.check()
+        self.assertEqual(code, 0, out + err)
+        self.assertNotIn("is not under a worktrees folder", out)
+        items = self.dec("d-wt-batch-1")["items"] if os.path.exists(self.path("d-wt-batch-1")) else None
+        paths = [i["path"] for i in items] if items else [self.dec(c[:-5])["worktree"] for c in self.files() if c.startswith("d-wt-t-008")]
+        self.assertIn(os.path.realpath(pkg), [os.path.realpath(p) for p in paths], out)
+
+    def test_h3_holder_lookup(self):
+        h, (pkg,) = self.holder("t-009-x")
+        profile = pa.load_profile("test2")
+        hof = lambda p, prof=profile: pa_hooks.holder_of(p, prof)
+        self.assertEqual(hof(pkg), (os.path.realpath(h), os.path.realpath(pkg)))
+        self.assertTrue(pa_hooks.in_worktrees_folder(pkg, profile))
+        # H3.1 a package of a workspace not in a folder named worktrees
+        mainws = os.path.join(self.tmp, "mainws")
+        write(os.path.join(mainws, "marker.txt"), "")
+        os.makedirs(os.path.join(mainws, "src", "Pkg"))
+        self.assertIsNone(hof(os.path.join(mainws, "src", "Pkg")))
+        self.assertFalse(pa_hooks.in_worktrees_folder(os.path.join(mainws, "src", "Pkg"), profile))
+        # H3.3 deeper, or src itself
+        os.makedirs(os.path.join(pkg, "sub"))
+        self.assertIsNone(hof(os.path.join(pkg, "sub")))
+        self.assertIsNone(hof(os.path.join(h, "src")))
+        self.assertIsNone(hof(h))
+        # H3.4 '..' and a symlink to the package: realpath first
+        self.assertEqual(hof(os.path.join(pkg, "..", "Pkg") + "/"), (os.path.realpath(h), os.path.realpath(pkg)))
+        link = os.path.join(self.tmp, "link-to-pkg")
+        os.symlink(pkg, link)
+        self.assertEqual(hof(link), (os.path.realpath(h), os.path.realpath(pkg)))
+        # H3.5 a package that is a symlink out of the holder
+        out_pkg = os.path.join(self.tmp, "outside-pkg")
+        os.makedirs(out_pkg)
+        os.symlink(out_pkg, os.path.join(h, "src", "Out"))
+        self.assertIsNone(hof(os.path.join(h, "src", "Out")))
+        # no marker
+        os.remove(os.path.join(h, "marker.txt"))
+        self.assertIsNone(hof(pkg))
+        write(os.path.join(h, "marker.txt"), "")
+        # H3.6 no repos key; H3.7 a glob with '..' or an absolute part: no holder, a warning
+        for repos in (None, "", "../*", "src/../*", "/abs/*", "src//*"):
+            with self.subTest(repos=repos):
+                prof = dict(profile, worktree={k: v for k, v in dict(profile["worktree"], repos=repos).items() if v is not None})
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    self.assertIsNone(hof(pkg, prof))
+                if repos:
+                    self.assertIn("worktree.repos", err.getvalue())
+

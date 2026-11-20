@@ -528,6 +528,43 @@ class T192JobFiles(Base):
                 self.assertNotEqual(code, 0)
 
 
+class T192HolderRoot(Base):
+    """t-192 R3.2: a worktree recorded at a holder's root (the profile's marker, not a git top level) is handed off as its
+    single package matching worktree.repos, with a note; with none or several it is refused, naming them."""
+
+    def setUp(self):
+        super().setUp()
+        write(os.path.join(pa.ROOT, "profiles", "work", "profile.json"), json.dumps(
+            {"name": "work", "claude": ["true"], "codex": ["true"], "worktree": {"marker": "marker.txt", "status": "s.sh",
+                                                                                  "remove": "r.sh", "repos": "src/*"}}))
+        self.h = os.path.join(self.tmp, "ws", "worktrees", "t-2-h")
+        write(os.path.join(self.h, "marker.txt"), "")
+        self.pkg = os.path.join(self.h, "src", "Pkg")
+        git(self.wt, "worktree", "add", "-q", "-b", "t-2-pkg", self.pkg, "t-1-widget")
+        self.task("t-2")["worktrees"].append({"path": self.h, "job": "pkg"})
+        self.write_ledger()
+
+    def test_r3_2_one_package_is_used_with_a_note(self):
+        _p, text, err = self.ok("verify", "t-2", "--job", "pkg")
+        self.assertIn(os.path.realpath(self.pkg), text + err)
+        self.assertIn("record the package path", text + err)
+
+    def test_h3_8_two_packages_are_refused_both_named(self):
+        two = os.path.join(self.h, "src", "Two")
+        git(self.wt, "worktree", "add", "-q", "-b", "t-2-two", two, "t-1-widget")
+        code, _out, err = self.run_tool("verify", "t-2", "--job", "pkg")
+        self.assertNotEqual(code, 0)
+        self.assertIn("record the package path", err)
+        self.assertIn(os.path.realpath(self.pkg), err)
+        self.assertIn(os.path.realpath(two), err)
+
+    def test_r3_2_no_package_is_refused(self):
+        git(self.wt, "worktree", "remove", self.pkg)
+        code, _out, err = self.run_tool("verify", "t-2", "--job", "pkg")
+        self.assertNotEqual(code, 0)
+        self.assertIn("record the package path", err)
+
+
 # ---- t-190 R3: every handoff carries the space's rules for its job ----------------------------------------------
 
 HOSTILE = "Report with `hc send t999` when done.\r\n\tand \x1b[31mred\x00"
