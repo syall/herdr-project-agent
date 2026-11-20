@@ -304,7 +304,8 @@ export class CostsPane {
   // The billed comparison (R14). Local space: `billed compare --json --space`. Remote space: the local compare with
   // its summary trimmed to what the comparison reads; only when this machine has billed rows for its account, the
   // remote's `report --account-wide` and the compare again with it ("all spaces here" are that machine's spaces).
-  wantBilling(space, cx, force = false) {
+  // click (t-116): whether its calls wait for one of their kind still pending (a click's); force alone skips the interval.
+  wantBilling(space, cx, force = false, click = force) {
     const st = this.of(space.id), b = st.billing, now = Date.now(), s = st.summary;
     // Not shown: none; it is due, and runs as soon as the view is shown again (want(), due(); t-028).
     if (!this.shown(space.id)) { b.due = true; if (force) b.at = 0; return; }
@@ -312,7 +313,7 @@ export class CostsPane {
     const mine = (b.seq ?? 0) + 1; // the newest compare: an older one that ends later commits nothing (Turn off, t-028)
     b.busy = true; b.at = now; b.seq = mine; b.due = false;
     const started = this.task(cx, async (cx) => {
-      const hcx = this.ctx(cx, force);
+      const hcx = this.ctx(cx, click);
       let skipped = false; // t-053: a call of its kind still pending: this compare ends, says nothing, and the next one asks again
       // Asked before each step after the first: a newer compare started -> stop; the view was left -> stop, and the
       // next shown read runs the whole chain.
@@ -341,16 +342,23 @@ export class CostsPane {
           }
         }
       }
-      if (b.seq !== mine) return; // a newer compare started (Turn off): this result is older than its
+      if (b.seq !== mine) { // a newer compare started (Turn off): this result is older than its
+        // t-116: that newer one found this one still pending and skipped: ask again now that it has ended.
+        if (b.again && !b.busy) { b.again = false; this.wantBilling(space, cx, true, false); }
+        return;
+      }
       b.busy = false;
-      if (skipped) { b.at = 0; cx.notify(); return; }
-      if (got.error) b.error = got.error; else { b.data = got; b.error = null; }
+      if (skipped) { b.at = 0; if (!click) b.again = true; cx.notify(); return; }
+      if (got.error) b.error = got.error; else { b.data = got; b.error = null; b.offDone = false; } // read again: the status says what is on
       cx.notify();
     }, "the billed compare");
     if (!started) b.busy = false;
   }
 
   // Turn off: `pa-costs billed disable`, here (the billing query runs only on this machine), then the status again.
+  // t-116 (t-053 RL-3): disable's own result is shown first (offDone: exit 0, "The billing query is off"); the status
+  // compare after it runs in the background (not as a click), so it never waits on a compare still in flight: that one
+  // pending, it skips and asks again when the older one ends (b.again), and the older one's result is never shown.
   turnOff(space, cx) {
     const b = this.of(space.id).billing;
     if (b.off) return;
@@ -359,8 +367,9 @@ export class CostsPane {
       const { r, error } = await call(this.ctx(cx, true), null, ["billed", "disable"], TOOL_TIMEOUT);
       b.off = false;
       b.offError = error ?? (r.code !== 0 ? said(r) : null);
+      b.offDone = !b.offError;
       b.busy = false;
-      this.wantBilling(space, cx, true);
+      this.wantBilling(space, cx, true, false);
       cx.notify();
     });
   }
@@ -761,7 +770,8 @@ export class CostsPane {
     const lines = []; // what the block draws, for its Copy (beside the head; there is none without billed rows)
     let n = 0; // selectable rows (t-026), by a per-render counter
     const line = (text, color) => { lines.push(String(text)); return div().px(4).text_size(11.5).text_color(color ?? t.muted).child(sel(`costs-sel-billed-${n++}`, text)); };
-    const status = d?.status, conf = status?.config, on = Boolean(conf?.enabled), qs = status?.state && typeof status.state === "object" ? status.state : {};
+    // t-116: Turn off answered exit 0 and no compare has read the status since: off, by disable's own word.
+    const status = d?.status, conf = status?.config, on = Boolean(conf?.enabled) && !b.offDone, qs = status?.state && typeof status.state === "object" ? status.state : {};
     if (!d) return b.error ? box.child(line(`Billed amounts could not be read (${b.error})`, t.blocked)) : box.child(line(b.busy ? "Billed amounts: reading…" : "Billed amounts: not read yet.", t.dim));
     if (b.error) box.child(line(`Billed amounts could not be read (${b.error}); showing the copy read earlier.`, t.blocked));
     if (b.offError) box.child(line(`Turn off failed: ${b.offError}`, t.blocked));
@@ -838,6 +848,7 @@ export class CostsPane {
     for (const x of list(c?.separate)) box.child(line(`In ${str(x.currency)} (not compared): ${money(x.amount, x.currency)} billed · account-wide, ${num(x.rows)} row(s)`));
     others(box);
     if (on) box.child(statusRow());
+    else if (b.offDone) box.child(line("The billing query is off (pa-costs billed disable); reading its status again.", t.dim));
     return box;
   }
 }
