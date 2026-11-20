@@ -349,13 +349,12 @@ if wait_for 15 has_lines $((before + 1)); then
   scratch hc run --bg --parent n11 --no-notify --name w11 -- sleep 600 >/dev/null
   pid11=$(scratch hc get n11 --json | json "d.get('pid')")
   inst11=$(jf "$L11" "d['instance']")
-  python3 - "$S/pa/tools/pa.py" <<'PY3'
-import sys
-f = sys.argv[1]
-t = open(f).read()
-t = t.replace('def cmd_session(args):\n', 'def cmd_session(args):\n    if getattr(args, "restarted", None):\n        raise RuntimeError("S11 a bug only on the restarted path")\n', 1)
-open(f, "w").write(t)
-PY3
+  # t-195 round 2 (VERIFY M1): the bug is planted by the function's name, whatever its def line says; a patch that
+  # cannot land fails S11 as "patch did not apply" and runs none of the checks that rely on it.
+  if ! python3 "$here/source_patch.py" "$S/pa/tools/pa.py" cmd_session 'if getattr({arg}, "restarted", None):
+    raise RuntimeError("S11 a bug only on the restarted path")' 2> "$S/patch11.err"; then
+    fail S11 "patch did not apply: $(tail -n 3 "$S/patch11.err")"
+  else
   scratch python3 "$S/pa/tools/pa.py" stamp >/dev/null
   scratch pa-restart --space "$SP11" --now --wait 15 > "$S/restart11.out" 2>&1
   errored() { label n11 herdr.pa.error | grep -q "RuntimeError"; }
@@ -378,6 +377,7 @@ PY3
   wait_for 20 recovered && pass "S11 Enter after a fixed install loads it: restartedFrom the old instance, outcome ok" || fail S11 "launcher.json: $(head -c 300 "$L11")"
   wait_for 15 has_lines $((before + 1)) && pass "S11 Claude starts again" || fail S11 "no Claude start; n11: $(scratch hc read n11 2>&1 | tail -n 4)"
   [ -z "$(label n11 herdr.pa.error)" ] && [ "$(scratch hc get n11 --json | json "d.get('pid')")" = "$pid11" ] && [ "$(state w11)" = live ] && pass "S11 error label gone, same pid, w11 live" || fail S11 "error $(label n11 herdr.pa.error) pid $(scratch hc get n11 --json | json "d.get('pid')") w11 $(state w11)"
+  fi
 else fail S11 "stub never started; n11: $(scratch hc read n11 2>&1 | tail -n 5)"; fi
 cp "$S/pa.py.good" "$S/pa/tools/pa.py"
 scratch python3 "$S/pa/tools/pa.py" stamp >/dev/null
