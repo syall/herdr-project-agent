@@ -896,6 +896,74 @@ class A11StackedOrder(Standing):
         self.assertEqual(len(s), 1, out + err)
         self.assertIn("the gate fails now", s[0]["why"])
 
+    def card_entry_stops(self, spoil, words):
+        """Fix round 4, REVIEW-r3-2 MF-1 (probe P2): a card-approved front entry that fails for an R13 cause in a
+        --standing run writes the stop; the next run refuses on it, though the branch is back at its checked tip."""
+        a = self.joined("t-A", "fa.txt")
+        self.passed("t-A")
+        self.approve()
+        self.refresh("--no-merge")
+        self.assertEqual(self.approval("t-A").get("card"), "d-queue-1")
+        undo = spoil(a)
+        remote = self.remote()
+        code, out, err = self.smerge()
+        self.assertEqual(code, 1, out + err)
+        self.assertEqual(self.merged(), [], out + err)
+        s = self.stops()
+        self.assertEqual(len(s), 1, out + err)
+        self.assertIn(words, s[0]["why"])
+        self.assertEqual(s[0].get("task"), "t-A", s)
+        undo()
+        code, out, err = self.smerge()
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("stopped", err)
+        self.assertEqual(self.merged(), [], out + err)
+        self.assertEqual(self.remote(), remote)
+
+    def test_a11_5d_a_commit_after_the_check_on_a_card_entry_stops(self):  # REVIEW-r3-2 MF-1 (probe P2)
+        def spoil(a):
+            self.change("t-A", "fa.txt", "later\n")
+            return lambda: sh(self.trees["t-A"], "git", "reset", "-q", "--hard", a)
+        self.card_entry_stops(spoil, "a commit after the check")
+
+    def test_a11_5e_a_failing_gate_on_a_card_entry_stops(self):  # REVIEW-r3-2 MF-1
+        def spoil(a):
+            path = os.path.join(self.evidence("t-A"), "REVIEW.md")
+            text = read(path)
+            os.remove(path)
+            return lambda: write(path, text)
+        self.card_entry_stops(spoil, "the gate fails now")
+
+    def not_independent(self, verdict, ind):
+        """Fix round 4, VERIFY MF-r3-1: a stacked review that does not find t-B independent stops the rule."""
+        a, b = self.two()
+        code, out, err = self.smerge()
+        self.assertEqual(self.standing_merged(), ["t-A"], out + err)
+        self.add_worker("t-B", "t-Bi", "reviewer")
+        need = self.stacked_need("t-B")
+        write(os.path.join(self.evidence("t-B"), need["file"]), review_file(self.tip("t-B"), "t-Bi", verdict, ind))
+        code, out, err = self.refresh("--no-merge")
+        self.assertEqual(code, 0, out + err)
+        remote = self.remote()
+        code, out, err = self.smerge()
+        self.assertEqual(code, 1, out + err)
+        self.assertEqual(self.standing_merged(), ["t-A"], out + err)
+        self.assertEqual(self.ref("main"), a)
+        self.assertEqual(self.remote(), remote)
+        s = self.stops()
+        self.assertEqual(len(s), 1, out + err)
+        self.assertIn("did not find it independent", s[0]["why"])
+        self.assertIn("stopped at t-B: its independence review did not find it independent; its approval is void", out)
+        self.assertTrue(self.approval("t-B") and self.approval("t-B").get("void"), self.approval("t-B"))
+        ev = [l for l in self.all_journal() if l.get("event") == "merge-stopped" and l.get("task") == "t-B"]
+        self.assertEqual(len(ev), 1, ev)
+
+    def test_a11_1d_a_stacked_review_saying_not_independent_stops(self):  # VERIFY MF-r3-1
+        self.not_independent("pass", "no")
+
+    def test_a11_1e_a_stacked_review_with_must_fix_stops(self):  # VERIFY MF-r3-1
+        self.not_independent("must fix (1)", "yes")
+
     def test_a11_9_a_card_merge_after_a_rule_merge_opens_the_push_card(self):  # REVIEW-r2-2 MF-2 (probe P6)
         a, b = self.two()
         self.approve()
