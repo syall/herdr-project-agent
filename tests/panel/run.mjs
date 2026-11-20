@@ -5911,6 +5911,55 @@ cases["A7-script-fake-caffeinate"] = async () => { // VP1, VP2: the real script,
   }
 };
 
+// ---- t-065 (t-060 RL-2): the hold ends when the copy holding it closes (View.close, Herdr's one unload hook: its
+// pane, tab, layout slot or overlay goes, or Herdr quits). Only the lease holder stops it; fakes only (__execFn). ----
+const t065Close = async (v) => { check(typeof v.close === "function", "the view has close(cx)"); await v.close(cx); await settle(); };
+
+cases["A9-close-stops-the-hold"] = awWrap(async () => {
+  awSetup();
+  const v = await mount(); awHold(v);
+  await fire(1000);
+  check(awCalls().length === 1 && awCalls()[0][0] === "start", `held first (got ${JSON.stringify(awCalls())})`);
+  await t065Close(v);
+  const c = awCalls();
+  check(c.length === 2 && c[1][0] === "stop" && c[1][1] === "Herdr", `close runs one stop for Herdr (got ${JSON.stringify(c)})`);
+  check(g.__shared[AW.AWAKE_STATE]?.state === "off", `the shared state says off (got ${JSON.stringify(g.__shared[AW.AWAKE_STATE])})`);
+  check(g.localStorage.getItem("project-agent.awake") !== "off", "the toggle stays on (a later copy holds it again)");
+});
+
+cases["A9-close-a-start-in-flight"] = awWrap(async () => { // the holder closes before its first start answered: still stopped
+  awSetup({ reply: (act) => (act === "start" ? new Promise(() => {}) : { code: 0, stdout: "off\n", stderr: "" }) });
+  const v = await mount(); awHold(v);
+  await fire(1000);
+  await t065Close(v);
+  const c = awCalls();
+  check(c.length === 2 && c[0][0] === "start" && c[1][0] === "stop", `a stop while the start has not answered (got ${JSON.stringify(c)})`);
+});
+
+cases["A9-close-not-the-holder"] = awWrap(async () => { // another copy closing leaves the holder's hold alone
+  awSetup();
+  const v = await mount(), w = await mount(); awHold(v);
+  await fire(1000);
+  await t065Close(w);
+  check(awCalls().length === 1, `no stop from a copy without the lease (got ${JSON.stringify(awCalls())})`);
+});
+
+cases["A9-close-while-off"] = awWrap(async () => { // turned off: already stopped, close runs nothing more
+  awSetup({ storage: awFakeStorage({ "project-agent.awake": "off" }) });
+  const v = await mount(); awHold(v);
+  await fire(1000);
+  const n = awCalls().length;
+  await t065Close(v);
+  check(awCalls().length === n, `nothing more on close while off (got ${JSON.stringify(awCalls())})`);
+});
+
+cases["A9-close-not-macos"] = awWrap(async () => {
+  awSetup({ platform: "linux" });
+  const v = await mount(); awHold(v);
+  await t065Close(v);
+  check(awCalls().length === 0, `no call off macOS (got ${JSON.stringify(awCalls())})`);
+});
+
 // ---- t-037 J4: the Restart button (R13), older code in the panel (R14), the header during a restart (R15) ----
 // The button runs only the restart tool in place, on the space's machine: a dry run for the confirm, then one
 // `--json --wait 180 --expect-instance <instance> --by panel` run. It never ends a terminal itself.
