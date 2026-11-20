@@ -588,6 +588,40 @@ class RemoveCard(Batch):
         self.assertIn("answered 'Keep all 3': nothing is removed", out)
         self.assertTrue(all(os.path.isdir(p) for p in self.trees.values()))
 
+    def test_v7_2b_keep_all_with_a_note_is_withdrawn_too(self):  # R7: a Delete or Keep answer with a note
+        self.opened(2, label="keep", note="keep these but delete t-004 please")
+        code, out, err = self.check()
+        self.assertEqual(code, 0, err)
+        for tid in ("t-003", "t-004"):
+            self.assertIn("{}: card d-wt-batch-1 answered 'Keep all 2' with a note: run `pa-worktree remove --card d-wt-batch-1`".format(tid), out)
+            self.assertNotIn("{}: card d-wt-batch-1 answered 'Keep all 2': kept".format(tid), out)
+        code, out, err = self.remove_card()
+        self.assertEqual(code, 2)
+        self.assertIn('say "keep tNN"', err)
+        card = self.dec("d-wt-batch-1")
+        self.assertEqual((card["status"], card["previousAnswer"], card["previousNote"]),
+                         ("withdrawn", "Keep all 2", "keep these but delete t-004 please"))
+        self.assertTrue(all(os.path.isdir(p) for p in self.trees.values()))
+        self.check()
+        self.assertEqual(self.dec("d-wt-batch-2")["status"], "open")
+
+    def test_v5_1l_a_job_worktree_not_under_a_worktrees_folder(self):  # RL2: the check on the --card path
+        self.job("t-003")
+        self.job("t-004")
+        self.job("t-005")
+        self.check()
+        self.answer("d-wt-batch-1", self.label("d-wt-batch-1", "all"))
+        saved = pa_hooks.in_worktrees_folder
+        moved = os.path.realpath(self.trees["t-004"])
+        self.addCleanup(setattr, pa_hooks, "in_worktrees_folder", saved)
+        pa_hooks.in_worktrees_folder = lambda path: os.path.realpath(path) != moved and saved(path)
+        code, out, err = self.remove_card()
+        self.assertEqual(code, 1, err + out)
+        self.assertIn("is not under a worktrees folder; nothing was removed", out)
+        self.assertRegex(out, r"Removed 2 of 3 on card d-wt-batch-1: t-003 billing, t-005 billing; skipped 1: t-004 billing \(")
+        for t, p in self.trees.items():
+            self.assertEqual(os.path.isdir(p), t == "t-004", t)
+
     def test_v8_3_remove_task_on_a_batch_item_points_at_the_card(self):
         self.opened(2)
         code, out, err = self.run_cmd("pa-worktree", "remove", "t-003", "--space", "sp1")
@@ -932,7 +966,9 @@ class Clean(Standing):
         write(os.path.join(self.trees["t-003"], "new.txt"), "x\n")
         self.kept("t-003", "uncommitted or untracked")
 
-    def test_v15_4_a_profile_worktree(self):
+    def profile_tree(self, **status):
+        """t-003's worktree of the profile's kind: repositories A and B, each on branch feat, merged into main and pushed;
+        the profile's status script prints `status` over clean counts, and its remove script logs its arguments."""
         kind = os.path.join(self.tmp, "Ws", "worktrees", "t-003-pkg")
         repos = []
         for name in ("A", "B"):
@@ -951,24 +987,91 @@ class Clean(Standing):
             sh(folder, "git", "checkout", "-q", "feat")
             repos.append(folder)
         write(os.path.join(kind, "marker.txt"), "")
-        status, remove, log = (os.path.join(self.tmp, n) for n in ("status.sh", "remove.sh", "remove.log"))
-        write(status, "#!/bin/sh\ncat <<'JSON'\n{}\nJSON\n".format(json.dumps(
+        status_sh, remove, self.log = (os.path.join(self.tmp, n) for n in ("status.sh", "remove.sh", "remove.log"))
+        write(status_sh, "#!/bin/sh\ncat <<'JSON'\n{}\nJSON\n".format(json.dumps(dict(
             {"uncommitted": 0, "unpushed": 0, "branch": "A:feat, B:feat", "removesBranches": True, "kind": "custom worktree",
-             "repos": repos})))
-        write(remove, '#!/bin/sh\necho "$@" >> "{}"\nmv "$1" "$1.gone"\n'.format(log))
-        os.chmod(status, 0o755)
+             "repos": repos}, **status))))
+        write(remove, '#!/bin/sh\necho "$@" >> "{}"\nmv "$1" "$1.gone"\n'.format(self.log))
+        os.chmod(status_sh, 0o755)
         os.chmod(remove, 0o755)
         dump({"name": "test2", "claude": ["true"], "codex": ["true"],
-              "worktree": {"marker": "marker.txt", "status": status, "remove": remove}}, os.path.join(pa.ROOT, "profiles", "test2", "profile.json"))
+              "worktree": {"marker": "marker.txt", "status": status_sh, "remove": remove}}, os.path.join(pa.ROOT, "profiles", "test2", "profile.json"))
         agent = load(os.path.join(self.dir, "agent.json"))
         agent["profile"] = "test2"
         dump(agent, os.path.join(self.dir, "agent.json"))
         self.add_task("t-003", "done", kind, [])
+        self.repos = repos
+        return kind
+
+    def removals(self):
+        if not os.path.exists(self.log):
+            return []
+        with open(self.log) as f:
+            return f.read().splitlines()
+
+    def test_v15_4_a_profile_worktree(self):
+        kind = self.profile_tree()
         code, out, err = self.standing()
         self.assertEqual(code, 0, err + out)
         self.assertFalse(os.path.isdir(kind))
-        with open(log) as f:
-            self.assertEqual(f.read().split(), [os.path.realpath(kind)], "the profile's remove script, with no --force")
+        self.assertEqual(self.removals(), [os.path.realpath(kind)], "the profile's remove script, with no --force")
+
+    def test_v15_4b_untracked_in_a_repository_the_status_script_does_not_count(self):  # RL1
+        kind = self.profile_tree()
+        write(os.path.join(self.repos[1], "new.txt"), "x\n")
+        code, out, err = self.standing()
+        self.assertEqual(code, 0, err + out)
+        self.assertTrue(os.path.isdir(kind))
+        self.assertEqual(self.removals(), [])
+        self.assertIn("1 uncommitted or untracked file(s) in B", out)
+
+    # MF1: the re-read right before the removal checks every loss fact the first read checked
+    def changed_at_the_re_read(self, change, kind=None, before=False):
+        """Runs the standing removal with `change(row)` applied right after refresh_busy's re-read (before it, when the
+        change is on disk and the re-read is to see it); t-003 must stay."""
+        saved = pa_hooks.refresh_busy
+        def refresh(row, agent, profile):
+            if before:
+                change(row)
+            saved(row, agent, profile)
+            if not before:
+                change(row)
+        with mock.patch.object(pa_hooks, "refresh_busy", refresh):
+            code, out, err = self.standing()
+        self.assertEqual(code, 0, err + out)
+        self.assertTrue(os.path.isdir(kind or self.trees["t-003"]), "nothing is removed")
+        self.assertIn("t-003 (main) (changed while it ran", out)
+        self.assertIn("Removed 0 worktrees on rule r-wt: nothing is clean; 1 not clean, left for cards", out)
+        return out
+
+    def test_v15_5a_a_profile_worktree_unpushed_at_the_re_read(self):
+        kind = self.profile_tree()
+        self.changed_at_the_re_read(lambda row: row["facts"].update(unpushed=1), kind)
+        self.assertEqual(self.removals(), [], "the remove script is not run, so never with --force")
+
+    def test_v15_5b_a_profile_worktree_uncommitted_at_the_re_read(self):
+        kind = self.profile_tree()
+        self.changed_at_the_re_read(lambda row: row["facts"].update(uncommitted=2), kind)
+        self.assertEqual(self.removals(), [])
+
+    def test_v15_5c_unmerged_at_the_re_read(self):
+        self.clean("t-003")
+        self.changed_at_the_re_read(lambda row: self.commit(self.trees["t-003"], "late.txt", "x\n", "late, not merged"), before=True)
+
+    def test_v15_5d_untracked_at_the_re_read(self):
+        self.clean("t-003")
+        self.changed_at_the_re_read(lambda row: write(os.path.join(self.trees["t-003"], "late.txt"), "x\n"), before=True)
+
+    def test_v15_5e_unreadable_at_the_re_read(self):
+        kind = self.profile_tree()
+        out = self.changed_at_the_re_read(lambda row: row.update(facts={"unreadable": "the profile's worktree status script failed"}), kind)
+        self.assertIn("status script failed", out)
+        self.assertEqual(self.removals(), [])
+        self.assertEqual(self.stops(), [], "a worktree left for its card is not a failed removal")
+
+    def test_v15_5f_gone_at_the_re_read(self):
+        self.clean("t-003")
+        self.changed_at_the_re_read(lambda row: row.update(facts=None))
 
 
 class OneRun(Standing):
