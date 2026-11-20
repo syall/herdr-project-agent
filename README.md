@@ -370,8 +370,30 @@ another provider's or another endpoint's rows: with no matching row it shows `no
   config's `costs.region`, else unknown;
 - the account from `PA_COST_ACCOUNT`, else the machine config's `costs.accountRules`
   (`[{"env": "<NAME>", "match": "<regex>", "account": "<label>"}]`: the variable is tested and only the
-  label is stored), else the space's `agent.json` `costs.account`, the machine's `costs.account`, the
-  profile's `billing.account`, `default`.
+  label is stored), else the profile's `launchAccounts` (below), else, when the profile declares
+  `launchAccounts`, *not recorded*; else the space's `agent.json` `costs.account`, the machine's
+  `costs.account`, the profile's `billing.account`, `default`.
+
+**Which account a session bills** (t-177): a profile may map how a session is started to an account label:
+```json
+"launchAccounts": [{"path": "~/opt/bin/tool-a", "tool": "claude", "account": "acct-a"},
+                   {"program": "tool-b", "account": "acct-b"},
+                   {"settings": "~/s/own.json", "account": "acct-c"}]
+```
+Each entry has `account` (a label, no 12 digits) and at least one of `program` (the base name of the
+command's program), `path` (the whole program as written, after `~`) and `settings` (a `--settings X` or
+`--settings=X` among the profile's command and the caller's own arguments, after `~`; not after `--`, not an
+option's value, not inline JSON); `tool` (`claude` or `codex`) limits it to one kind. An entry matches when
+every field it gives matches, exactly (no path is resolved, no symlink followed, no file opened); the first
+match wins. A malformed entry (an unknown key, an empty field, no matcher, a bad label) is dropped and named in
+`pa-costs prices` and the summary's problems. Each start and each resume of pa-claude, pa-codex and the Project
+Agent records its label (`accountBy` `command` or `settings`), never the path or the settings value; a resumed
+session that changed command carries both, each from its own start. Under a profile that declares
+`launchAccounts`, a cost whose start recorded no account (every session from before, or one that matched no
+entry) reads **account not recorded** (`(not recorded)` in the summary and `report --by account`): it is
+never guessed from a model, a time or the profile's current setting, never added to a label's estimate and
+never compared with a bill (`billed compare` gives it apart as `notRecorded`). A profile without the key
+works as before. Prices do not change: the account only selects scoped prices that name one.
 A variable's value is never stored unless it is the accepted region label; names that look like
 credentials (`KEY`, `SECRET`, `TOKEN`, `PASSWORD`, `CREDENTIAL`, `SESSION`) are refused and not read,
 and so is any label with 12 digits. `pa-doctor` notes refused rules and values (names only). Sessions
@@ -425,6 +447,12 @@ declares none, so the command says "declares no price source"):
   package checkout>/profiles/<name>/prices.json`. Exit 0 written or no change, 1 failed, 2 bad
   arguments, 3 refused (an agent, a worker's terminal, no terminal, over 120 s), 4 the source's format
   or the reader's output not accepted, 5 declined. `pa-costs prices` lists the declared sources.
+
+**In the Costs view**, two or more accounts (the not-recorded part counted) give an Accounts card under the
+tiles, an account chip on each By scope row, session line and row that mixes accounts (`N accounts` opens its
+drill), and an account filter in the head (`All`, each label, `not recorded`): By task, By day and By session
+type then show that account's part and its share of that account; Total, the tiles, By activity, Accounts, By
+scope and Billed stay whole. Each sort chip shows its direction (`cost ↓`); clicking the active one flips it.
 
 The account label of estimates and of billed rows is the same chain: on a machine without
 `costs.account`, a profile's `billing.account` now labels the estimates too (they said `default`

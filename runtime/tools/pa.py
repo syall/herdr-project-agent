@@ -3133,7 +3133,7 @@ def run_agent(args, address, project, p, directory, agent, ctx, started):
             costs = costs_module()
             if costs:
                 try:
-                    costs.record_agent_start(directory, agent, address, project, model, resume, profile=p)
+                    costs.record_agent_start(directory, agent, address, project, model, resume, profile=p, command=argv)
                 except Exception:  # noqa: BLE001 - never stops the Project Agent
                     pass
             return began
@@ -3290,7 +3290,8 @@ def cmd_launch(kind, argv):
         costs = costs_module()
         if costs:
             try:
-                command = costs.record_launch(space_dir(pa_space), pa_space, kind, argv, command, walked, profile=p)
+                command = costs.record_launch(space_dir(pa_space), pa_space, kind, argv, command, walked, profile=p,
+                                              own=len(p[kind]) + len(argv))  # t-177 R5: the person's part of the command
             except Exception:  # noqa: BLE001 - never stops a launch
                 pass
         if kind == "claude":  # Claude Code's own cost figure, through its status line: the last --settings (t-029 R4)

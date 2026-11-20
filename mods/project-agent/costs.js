@@ -26,6 +26,10 @@
 //           session's end) and filters (a field made on its click: id, title or state); By day sorts by day or cost. Row ids
 //           stay the summary's index in any order. A task id is a link: shared "project-agent.show" (main.js shows the
 //           Tasks tab with it open), the only shared key this view sets; it reads and runs nothing.
+//   accounts: (t-177) where the summary has two or more byAccount entries (the "(not recorded)" one counted): an Accounts
+//           card under the tiles, account chips (By scope rows, session lines, rows that mix accounts) and an account
+//           filter in the view head (By task, By day, By session type show that account's part). Sorts flip direction on a
+//           second click of the active chip (↓ / ↑). All of it from the same summary.json; nothing more is read or run.
 
 import { div } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input } from "gpui-base";
@@ -46,6 +50,8 @@ const DAYS_SHOWN = 14, DAYS_MORE = 92, PROBLEMS_SHOWN = 20;
 // t-143: a list over LIST_ROWS rows scrolls at that many rows' height; an open drill over DRILL_ROWS lines likewise.
 const LIST_ROWS = 12, ROW_H = 22, DRILL_ROWS = 10, SUB_H = 18;
 const SORTS = { task: ["cost", "task", "recent"], day: ["day", "cost"] };
+// t-177 R17: each sort's default direction (today's orders); a second click of the active chip flips it.
+const DEFAULT_DIR = { task: { cost: "desc", task: "asc", recent: "desc" }, day: { day: "desc", cost: "desc" } };
 // A task row or line names a task the Tasks tab can open: not a "(no task)" / "(other tasks)" bucket, not deleted.
 const linkable = (key, state) => typeof key === "string" && key !== "" && !key.startsWith("(") && state !== "deleted";
 const DIMS = ["kind", "role", "program", "model", "machine"];
@@ -109,7 +115,7 @@ const list = (v) => (Array.isArray(v) ? v.filter((e) => e && typeof e === "objec
 const BY = ["providerBy", "endpointBy", "regionBy", "accountBy"];
 const FACT = ["provider", "endpoint", "region", "account"];
 const label = (v) => (typeof v === "string" && v ? v : null);
-const factsOf = (e) => (Array.isArray(e?.scope) && e.scope.length === 4 ? e.scope : [e?.provider, e?.endpoint, e?.region, e?.account]);
+const factsOf = (e) => (Array.isArray(e?.scope) && e.scope.length === 4 ? e.scope : [e?.provider, e?.endpoint, e?.region, e?.account === NOT_RECORDED ? null : e?.account]);
 const factsText = (facts) => facts.map((v) => label(v) ?? "?").join(" · ");
 const either = (names, last = "or") => (names.length < 2 ? names.join("") : `${names.slice(0, -1).join(", ")} ${last} ${names[names.length - 1]}`);
 // A scope in words (t-050): known facts named ("provider p", "region g"); unknown ones grouped by how they were found,
@@ -147,8 +153,48 @@ function priceWords(facts, pricedAs, from = false) {
 const pricedNote = (facts, pricedAs, from = false) => { const w = priceWords(facts, pricedAs, from); return w ? `priced from ${w}` : ""; };
 // The summary has two or more scopes (then lines say theirs); its one account label (null: none, or two or more).
 const tagged = (s) => num(s?.scopes) > 1 || list(s?.byScope).length > 1;
-const accountsOf = (s) => list(s?.byAccount).filter((e) => label(e.key));
+// t-177: byAccount's entries (the not-recorded part has the key "(not recorded)", never a label); "?" is not one.
+const accountsOf = (s) => list(s?.byAccount).filter((e) => label(e.key) && e.key !== "?");
 const oneAccount = (s) => { const a = accountsOf(s); return a.length === 1 ? a[0].key : null; };
+export const NOT_RECORDED = "(not recorded)";
+export const acctWords = (key) => (key === NOT_RECORDED ? "account not recorded" : `account ${str(key)}`);
+const acctChipText = (key) => (key === NOT_RECORDED ? "not recorded" : str(key));
+// An entry's per-account parts [{key, tokens, money, unpricedTokens}] from its `accounts` (two or more) or its one
+// `account` (the whole entry); [] for an older summary or a malformed one (H12: no chip, no part). Kept per entry object
+// (C7: the summary is the same object between renders), so a render looks each entry up once.
+const PARTS = new WeakMap();
+const okMoney = (m) => m === null || m === undefined || (typeof m === "number" && Number.isFinite(m));
+export function entryAccounts(e) {
+  if (!e || typeof e !== "object") return [];
+  const kept = PARTS.get(e);
+  if (kept) return kept;
+  let out = [];
+  if (e.accounts !== undefined) {
+    const a = e.accounts;
+    if (Array.isArray(a) && a.length && a.every((p) => p && typeof p === "object" && label(p.key) && okMoney(p.money) && (p.tokens === undefined || typeof p.tokens === "number")))
+      out = a.map((p) => ({ key: p.key, tokens: num(p.tokens), money: p.money ?? null, unpricedTokens: num(p.unpricedTokens) }));
+  } else if (label(e.account) && okMoney(e.money)) out = [{ key: e.account, tokens: num(e.tokens), money: e.money ?? null, unpricedTokens: num(e.unpricedTokens) }];
+  PARTS.set(e, out);
+  return out;
+}
+// The entry's part of one account (null: none).
+export const partOf = (e, acct) => entryAccounts(e).find((p) => p.key === acct) ?? null;
+// The summary has per-entry accounts (pa-costs of t-177 on); an older one has none (R15).
+const hasParts = (s) => [...list(s?.byTask), ...list(s?.byDay)].some((e) => e.account !== undefined || e.accounts !== undefined);
+
+// The machine row's accounts (t-177): its hosts' parts summed per account; none when a host has none.
+function machineAccounts(rows) {
+  if (!rows.length || rows.some((e) => !entryAccounts(e).length)) return {};
+  const by = new Map();
+  for (const e of rows) for (const p of entryAccounts(e)) {
+    const a = by.get(p.key) ?? { key: p.key, tokens: 0, money: null, unpricedTokens: 0 };
+    a.tokens += p.tokens;
+    if (p.money === null) a.unpricedTokens += p.tokens; else { a.money = (a.money ?? 0) + p.money; a.unpricedTokens += p.unpricedTokens; }
+    by.set(p.key, a);
+  }
+  const parts = [...by.values()].map((a) => ({ ...a, unpricedTokens: a.money === null ? 0 : a.unpricedTokens })).sort((a, b) => num(b.money) - num(a.money) || b.tokens - a.tokens);
+  return parts.length === 1 ? { account: parts[0].key } : { accounts: parts };
+}
 
 // The figure on the tab, from the last summary read (none: no figure).
 function tabFigure(s) {
@@ -187,7 +233,8 @@ export class CostsPane {
     if (st) { this.spaces.delete(id); this.spaces.set(id, st); return st; }
     st = { summary: null, readAt: 0, error: null, timedOut: false, missing: null, readFailed: null, busy: false, at: 0, seq: 0, stale: false,
       run: null, billing: { data: null, at: 0, busy: false, error: null }, open: {}, dim: "kind", moreDays: false, problemsOpen: false,
-      sort: { task: "cost", day: "day" }, filter: null }; // t-143: filter: the By task field (InputState), made on its click
+      sort: { task: "cost", day: "day" }, filter: null, // t-143: filter: the By task field (InputState), made on its click
+      dir: { task: null, day: null }, account: null }; // t-177: sort directions (null: the default) and the account filter
     this.spaces.set(id, st);
     while (this.spaces.size > CACHE_MAX) this.spaces.delete(this.spaces.keys().next().value);
     return st;
@@ -275,7 +322,8 @@ export class CostsPane {
       let got;
       if (!space.machine) got = await compare(["--space", localId(space.id)]);
       else {
-        const trimmed = JSON.stringify({ v: s.v, space: s.space, updated: s.updated, account: s.account, prices: s.prices, byDayModel: s.byDayModel });
+        const trimmed = JSON.stringify({ v: s.v, space: s.space, updated: s.updated, account: s.account, prices: s.prices, byDayModel: s.byDayModel,
+          ...(s.accountsDeclared === true ? { accountsDeclared: true } : {}) });
         if (trimmed.length > ARG_MAX) got = { error: "the space's summary is over 100 KB, too large to compare here" };
         else {
           got = await compare(["--summary-json", trimmed]);
@@ -346,6 +394,18 @@ export class CostsPane {
       .child(refresh())
       .when(Boolean(tot), (e) => e.child(this.copier.button(t, "costs-copy-totals", () => totals.join("\n"))));
     box.child(header);
+    // t-177 R14: the account filter, shown with the Accounts card; an account the summary no longer has goes back to All (H13).
+    const accts = accountsOf(s);
+    if (accts.length < 2 || !accts.some((a) => a.key === st.account)) st.account = null;
+    if (accts.length > 1 && tot) {
+      const fchip = (id, text, on, key) => div().id(id).flex_none().px(6).h(20).flex().items_center().rounded(5).text_size(11)
+        .bg(on ? t.selected : t.chrome).text_color(on ? t.foreground : t.muted).cursor_pointer().hover((x) => x.bg(t.hover))
+        .on_click((_e, cx) => { st.account = key; cx.notify(); }).child(text);
+      box.child(h_flex().gap(4).items_center().flex_wrap().child(div().flex_none().text_size(10.5).text_color(t.dim).child("Account:"))
+        .child(fchip("costs-acctf-all", "All", !st.account, null))
+        .children(accts.map((a, n) => (a.key === NOT_RECORDED ? fchip("costs-acctf-none", "not recorded", st.account === a.key, a.key) : fchip(`costs-acctf-${n}`, str(a.key), st.account === a.key, a.key)))));
+      if (st.account && !hasParts(s)) box.child(line("This summary has no per-account rows; Refresh to make one.", t.blocked));
+    }
     if (st.timedOut) box.child(line(`summary.json did not answer; showing the copy read at ${clock(new Date(st.readAt).toISOString())}.`, t.blocked));
     if (st.error) box.child(line(`costs/summary.json: ${st.error}; showing the copy read at ${clock(new Date(st.readAt).toISOString())}.`, t.blocked));
     extras(box);
@@ -401,11 +461,11 @@ export class CostsPane {
     // Claude Code's figure in the Total tile (AC7.1): under est.; where there is no est., the tile's money, never "est.".
     const cc = ccOf(s), ccM = ccNum(cc?.money), count = cc ? `${num(cc.sessions)} of ${num(cc.claudeSessions)} Claude sessions` : "";
     const noEst = tot.money === null || tot.money === undefined;
-    const acct = oneAccount(s); // R-A3 (t-032 J1d): one account: its label beside Total; two or more: the Accounts section
+    const acct = oneAccount(s); // R-A3 (t-032 J1d), t-177 R12: one entry: "account <label>" or "account not recorded" beside Total
     const ccAlt = cc && ccM !== null && noEst ? `Claude Code: ${ccMoney(ccM)} (list price)` : null;
     const ccLine = !cc ? null : ccM === null ? `Claude Code: no figure · ${count}` : noEst ? `Claude Code's figure: ${count}` : `Claude Code: ${ccMoney(ccM)} (list price) · ${count}`;
     return h_flex().gap(6)
-      .child(tile("Total", { money: tot.money, unpricedTokens: tot.unpricedTokens, tokens: all }, `${tokens(all)} tokens${all ? ` · ${Math.round((cr / all) * 100)}% cache read` : ""}${acct ? ` · account ${acct}` : ""}`, ccAlt, ccLine, true))
+      .child(tile("Total", { money: tot.money, unpricedTokens: tot.unpricedTokens, tokens: all }, `${tokens(all)} tokens${all ? ` · ${Math.round((cr / all) * 100)}% cache read` : ""}${acct ? ` · ${acctWords(acct)}` : ""}`, ccAlt, ccLine, true))
       .child(tile("Today", sum(mine), `${tokens(sum(mine).tokens)} tokens`))
       .child(tile(z.local ? "Last 7 days" : `Last 7 days (${z.label})`, week, `${tokens(week.tokens)} tokens`));
   }
@@ -453,8 +513,34 @@ export class CostsPane {
     const card = (key, top, rows) => v_flex().id(`costs-sec-${key}`).gap(2).p(6).rounded(7).border(1).border_color(t.border)
       .children(Array.isArray(top) ? top : [top])
       .child(v_flex().id(`costs-list-${key}`).gap(1).when(rows.length > LIST_ROWS, (x) => x.h(LIST_ROWS * ROW_H).overflow_y_scrollbar()).children(rows));
+    // t-177 R17: the active chip says its direction; clicking it again flips it; another chip starts at its default.
+    st.dir = st.dir && typeof st.dir === "object" ? st.dir : { task: null, day: null };
+    const dirOf = (section) => st.dir[section] ?? DEFAULT_DIR[section]?.[st.sort[section]] ?? "desc";
     const sortChips = (section) => [div().flex_none().text_size(10.5).text_color(t.dim).child("Sort:"),
-      ...SORTS[section].map((k) => chip(`costs-sort-${section}-${k}`, k, st.sort[section] === k, (_e, cx) => { st.sort[section] = k; cx.notify(); }))];
+      ...SORTS[section].map((k) => chip(`costs-sort-${section}-${k}`, st.sort[section] === k ? `${k} ${dirOf(section) === "desc" ? "↓" : "↑"}` : k, st.sort[section] === k, (_e, cx) => {
+        if (st.sort[section] === k) st.dir[section] = dirOf(section) === "desc" ? "asc" : "desc";
+        else { st.sort[section] = k; st.dir[section] = null; }
+        cx.notify();
+      }))];
+    // t-177 R12-R14: accounts. multi: the Accounts card is shown (two or more byAccount entries); fa: the filter in effect
+    // (none for an older summary, R15); base: the filtered account's est., the share of a filtered row.
+    const accts = accountsOf(s), multi = accts.length > 1;
+    const fa = multi && st.account && hasParts(s) ? st.account : null;
+    const base = fa ? accts.find((a) => a.key === fa)?.money ?? null : null;
+    const acctHead = fa ? ` · ${acctWords(fa)}` : "";
+    // A row's part under the filter (its own entry without one; null: nothing of that account, the row is hidden).
+    const shownOf = (x) => { if (!fa) return x; const p = partOf(x, fa); return p ? { ...x, tokens: p.tokens, money: p.money, unpricedTokens: p.unpricedTokens, reconstructed: 0, cc: undefined } : null; };
+    // An account chip: its own click target (never toggles the row it sits in).
+    const achip = (id, text, click) => div().id(id).flex_none().px(5).h(16).flex().items_center().rounded(4).border(1).border_color(t.border).text_size(10)
+      .text_color(t.muted).cursor_pointer().hover((x) => x.bg(t.hover)).on_click((_e, cx) => { cx.stop_propagation(); click(cx); cx.notify(); }).child(text);
+    const pick = (key) => () => { st.account = key; };
+    // A row's chip: its one account (rowAccount: By scope) or, when it mixes accounts, "N accounts" (opens its drill).
+    const rowChip = (section, i, x, one = null) => {
+      if (!multi) return null;
+      if (one) return achip(`costs-acct-${section}-${i}`, acctChipText(one), pick(one));
+      const parts = entryAccounts(x);
+      return parts.length > 1 ? achip(`costs-acct-${section}-${i}`, `${parts.length} accounts`, () => { st.open[section] = str(x.key); }) : null;
+    };
     // A number column: right-aligned in at least `w` px, so the figures line up down a section.
     const col = (w, el) => h_flex().flex_none().min_w(w).child(div().flex_1()).child(el);
     // A task link (t-143): its own target; a click does not toggle the row it sits in.
@@ -468,12 +554,12 @@ export class CostsPane {
     // An open drill: in its own box, which scrolls at a fixed height when it is long (a task's many sessions).
     const drillBox = (section, kids) => v_flex().id(`costs-drill-${section}`).when(kids.length > DRILL_ROWS, (x) => x.h(DRILL_ROWS * SUB_H).overflow_y_scrollbar()).children(kids);
     // linkTo: { key, rest }: the label's leading task id drawn as a link, the rest after it.
-    const row = (section, i, entry, label, extra, drill, linkTo = null) => {
-      const key = str(entry.key), open = st.open[section] === key;
-      const share = totalMoney && entry.money !== null && entry.money !== undefined && !num(entry.unpricedTokens) ? ` · ${Math.round((num(entry.money) / totalMoney) * 100)}%` : "";
+    const row = (section, i, entry, label, extra, drill, linkTo = null, opts = {}) => {
+      const key = str(entry.key), open = st.open[section] === key, of = opts.base ?? totalMoney, chipEl = opts.chip ?? null;
+      const share = of && entry.money !== null && entry.money !== undefined && !num(entry.unpricedTokens) ? ` · ${Math.round((num(entry.money) / of) * 100)}%` : "";
       const tag = priceTag(entry), mark = num(entry.reconstructed) > 0 ? " ◌" : "";
       const ccCell = ccOn && section === "task" && ccNum(entry.cc) !== null ? `CC ${money(entry.cc, null)} (${num(entry.ccSessions)} of ${num(entry.ccOf)} ${num(entry.ccOf) === 1 ? "session" : "sessions"})` : "";
-      lines.push([`${label}${mark}`, extra, tag, `${tokens(entry.tokens)} tokens`, `${est(entry, cur)}${share}`, ccCell].filter(Boolean).join(" · "));
+      lines.push([`${label}${mark}`, extra, tag, opts.chipText, `${tokens(entry.tokens)} tokens`, `${est(entry, cur)}${share}`, ccCell].filter(Boolean).join(" · "));
       const name = linkTo
         ? h_flex().flex_1().min_w(0).gap(5).items_center().child(link(`costs-link-${section}-${i}`, linkTo.key))
           .when(Boolean(`${linkTo.rest}${mark}`), (x) => x.child(div().min_w(0).truncate().text_size(12).text_color(t.foreground).child(`${linkTo.rest}${mark}`)))
@@ -484,6 +570,7 @@ export class CostsPane {
         .child(name)
         .when(Boolean(extra), (x) => x.child(div().flex_none().text_size(10.5).text_color(t.dim).child(extra)))
         .when(Boolean(tag), (x) => x.child(div().flex_none().text_size(10.5).text_color(t.blocked).child(tag)))
+        .when(Boolean(chipEl), (x) => x.child(chipEl))
         .child(col(64, div().text_size(11).text_color(t.dim).child(`${tokens(entry.tokens)} tokens`)))
         .child(col(120, div().text_size(12).text_color(t.foreground).child(`${est(entry, cur)}${share}`)))
         .when(Boolean(ccCell), (x) => x.child(div().flex_none().text_size(11).text_color(t.muted).child(ccCell))));
@@ -499,10 +586,33 @@ export class CostsPane {
       return n ? ` · ${n}` : "";
     };
     const sessionText = (x) => `${x.source === "reconstructed" ? "◌ " : ""}${str(x.key)} · ${[x.kind, x.role, x.program, x.model].filter(Boolean).map(str).join(" · ")}${scopeOf(x)} · ${clock(x.from)} – ${clock(x.to)} · ${est(x, cur)}${ccOn && ccNum(x.cc) !== null ? ` · CC ${money(x.cc, null)}` : ""}${noteOf(x)} · ${str(x.state)}${x.source ? ` · ${str(x.source)}` : ""}`;
-    const sessionsOf = (pred) => list(s.sessions).filter(pred).map((x) => sub(sessionText(x)));
+    // t-177 R13: with the Accounts card, a line in a drill carries an account chip (ids costs-acct-<section>-<i>-<j>, j counted
+    // per drill in `ctr`): a session's account, or "N accounts".
+    const lineChip = (el, x, at) => {
+      if (!multi || !at) return el;
+      const parts = entryAccounts(x), id = `costs-acct-${at.section}-${at.i}-${at.ctr.j++}`;
+      if (!parts.length) return el;
+      const text = parts.length > 1 ? `${parts.length} accounts` : acctChipText(parts[0].key);
+      lines[lines.length - 1] += ` · ${text}`;
+      return h_flex().gap(4).items_center().child(el).child(parts.length > 1 ? achip(id, text, () => {}) : achip(id, text, pick(parts[0].key)));
+    };
+    // fa (R14): in a filtered card's drill, a session line is kept when it has the account, alone or among its accounts.
+    const keepSess = (x, filtered) => !filtered || !fa || Boolean(partOf(x, fa));
+    const sessionsOf = (pred, at = null, filtered = false) => list(s.sessions).filter((x) => pred(x) && keepSess(x, filtered)).map((x) => lineChip(sub(sessionText(x)), x, at));
     // t-151: session lines led by their task's id as a link (ids costs-link-<linkBase>-<j>); a session with no task, plain.
-    const sessionLinks = (items, linkBase) => items.map((x, j) => (linkable(str(x.task), taskState.get(str(x.task))) && x.task
-      ? subLink(`costs-link-${linkBase}-${j}`, str(x.task), sessionText(x)) : sub(sessionText(x))));
+    const sessionLinks = (items, linkBase, at = null) => items.map((x, j) => lineChip(linkable(str(x.task), taskState.get(str(x.task))) && x.task
+      ? subLink(`costs-link-${linkBase}-${j}`, str(x.task), sessionText(x)) : sub(sessionText(x)), x, at));
+    // The first lines of a mixed row's drill (R13): each of its accounts with tokens and est., each a single chip.
+    const accountLines = (x, at) => {
+      const parts = entryAccounts(x);
+      if (!multi || parts.length < 2) return [];
+      return [sub("Accounts:", t.dim), ...parts.map((p) => {
+        const id = `costs-acct-${at.section}-${at.i}-${at.ctr.j++}`, text = `· ${tokens(p.tokens)} tokens · ${est(p, cur)}`;
+        lines.push(`  ${acctChipText(p.key)} ${text}`);
+        return h_flex().pl(20).gap(4).items_center().child(achip(id, acctChipText(p.key), pick(p.key))).child(div().min_w(0).text_size(11).text_color(t.muted).child(sel(`costs-sel-sub-${n++}`, text)));
+      })];
+    };
+    const at = (section, i) => ({ section, i, ctr: { j: 0 } });
     // The model lines of a scope or of a model (t-032 J1d): byDayModel (UTC days, from its oldest) summed per model and scope.
     const dayModel = list(s.byDayModel);
     const dmDays = dayModel.map((e) => str(e.day)).filter((d) => /^\d{4}-\d{2}-\d{2}$/.test(d)).sort();
@@ -528,6 +638,13 @@ export class CostsPane {
       const key = str(e.key), rest = `· ${tokens(e.tokens)} tokens · ${est(e, cur)}${priceTag(e) ? ` · ${priceTag(e)}` : ""}`;
       return linkBase && linkable(key, taskState.get(key)) ? subLink(`costs-link-${linkBase}-${j}`, key, rest) : sub(`${key} ${rest}`);
     });
+    // Accounts (R-A3, t-032 J1d; t-177 R12): two or more byAccount entries, the not-recorded part in words, right under the
+    // tiles; each opens to its sessions (an older summary's: by the session's account).
+    if (multi) {
+      const accHead = titled("account", "Accounts");
+      out.child(card("account", accHead, accts.map((x, i) => row("account", i, x, x.key === NOT_RECORDED ? "account not recorded" : str(x.key), null,
+        () => [sub("Sessions:", t.dim), ...sessionsOf((ss) => Boolean(partOf(ss, x.key)), at("account", i))]))));
+    }
     // By activity: tasks of an activity; unattributed: its reasons; cache rebuild: the passes with a rebuild and its tasks.
     const acts = list(s.byActivity);
     const actHead = titled("activity", "By activity", `${acts.length} ${acts.length === 1 ? "activity" : "activities"}`);
@@ -542,71 +659,83 @@ export class CostsPane {
     const ends = new Map(list(s.sessions).map((x) => [str(x.key), Date.parse(str(x.to))]));
     const lastEnd = (x) => (Array.isArray(x.sessions) ? x.sessions : []).reduce((a, k) => { const v = ends.get(str(k)); return v !== undefined && !Number.isNaN(v) && v > a ? v : a; }, -Infinity);
     const bucket = (x) => str(x.key).startsWith("(");
+    // R17: up = ascending; the direction flips the primary key only; ties keep the summary index ascending. Unfiltered
+    // cost ↓ is the summary's own order (money high first, "(other tasks)" last), as before.
+    const up = (section) => dirOf(section) === "asc";
+    const moneyOf = (e) => num(e.money);
     const bySort = {
-      cost: (a, b) => a.i - b.i,
-      task: (a, b) => (bucket(a.x) - bucket(b.x)) || str(a.x.key).localeCompare(str(b.x.key), undefined, { numeric: true }) || a.i - b.i,
-      recent: (a, b) => { const ea = lastEnd(a.x), eb = lastEnd(b.x); return ea === eb ? a.i - b.i : eb > ea ? 1 : -1; },
+      cost: (a, b) => (!fa && !up("task") ? a.i - b.i : ((moneyOf(a.v) - moneyOf(b.v)) * (up("task") ? 1 : -1)) || a.i - b.i),
+      task: (a, b) => (bucket(a.x) - bucket(b.x)) || (str(a.x.key).localeCompare(str(b.x.key), undefined, { numeric: true }) * (up("task") ? 1 : -1)) || a.i - b.i,
+      recent: (a, b) => { const ea = lastEnd(a.x), eb = lastEnd(b.x); return ea === eb ? a.i - b.i : (eb > ea ? 1 : -1) * (up("task") ? -1 : 1); },
     };
     const q = str(st.filter?.value?.()).trim().toLowerCase();
-    const tasksShown = tasksAll.filter(({ x }) => !q || [x.key, x.title, x.state].map(str).join(" ").toLowerCase().includes(q)).sort(bySort[st.sort.task] ?? bySort.cost);
-    const count = q ? `${tasksShown.length} of ${tasksAll.length} tasks` : `${tasksAll.length} ${tasksAll.length === 1 ? "task" : "tasks"}`;
+    const tasksShown = tasksAll.map((t0) => ({ ...t0, v: shownOf(t0.x) })).filter(({ x, v }) => v && (!q || [x.key, x.title, x.state].map(str).join(" ").toLowerCase().includes(q))).sort(bySort[st.sort.task] ?? bySort.cost);
+    const count = q || fa ? `${tasksShown.length} of ${tasksAll.length} tasks` : `${tasksAll.length} ${tasksAll.length === 1 ? "task" : "tasks"}`;
     const filterChip = st.filter ? [] : [chip("costs-filter-task", "Filter", false, (_e, cx) => {
       st.filter = InputState.new({ placeholder: "Filter tasks by id, title or state" }); // made on the click: never in render
       st.filter.on?.("change", (_e2, cx2) => cx2.notify());
       st.filter.focus?.();
       cx.notify();
     })];
-    const taskTop = [titled("task", "By task", count, [...sortChips("task"), ...filterChip])];
+    const taskTop = [titled("task", `By task${acctHead}`, count, [...sortChips("task"), ...filterChip])];
     if (st.filter) taskTop.push(h_flex().gap(6).items_center()
       .child(Input.new(st.filter).flex_1().h(24).px(6).rounded(6).border_1().border_color(t.input).bg(t.background).text_size(11.5).text_color(t.foreground))
       .child(chip("costs-filter-task-clear", "Clear", false, (_e, cx) => { st.filter = null; cx.notify(); })));
-    const taskRows = tasksShown.map(({ x, i }) => {
+    const taskRows = tasksShown.map(({ x, i, v }) => {
       const rest = `${x.key === "(other tasks)" && x.tasks ? ` (${x.tasks} tasks)` : ""}${x.state === "deleted" ? " (deleted)" : ""}${x.title ? ` ${str(x.title)}` : ""}${x.split ? " ≈" : ""}`;
-      return row("task", i, x, `${str(x.key)}${rest}`, x.state && x.state !== "deleted" ? str(x.state) : null, () => [
+      const chipEl = rowChip("task", i, x), where = at("task", i);
+      return row("task", i, v, `${str(x.key)}${rest}`, x.state && x.state !== "deleted" ? str(x.state) : null, () => [
+        ...accountLines(x, where),
         ...(x.split ? [sub("≈ shared passes split by journal entries", t.dim)] : []),
-        sub("Phases:", t.dim), ...entries(list(x.phases)),
-        sub("Sessions:", t.dim), ...sessionsOf((ss) => (Array.isArray(x.sessions) ? x.sessions : []).includes(ss.key)),
-      ], linkable(str(x.key), x.state) ? { key: str(x.key), rest: rest.trim() } : null);
+        sub(fa ? "Phases (all accounts):" : "Phases:", t.dim), ...entries(list(x.phases)),
+        sub("Sessions:", t.dim), ...sessionsOf((ss) => (Array.isArray(x.sessions) ? x.sessions : []).includes(ss.key), where, true),
+      ], linkable(str(x.key), x.state) ? { key: str(x.key), rest: rest.trim() } : null, { chip: chipEl, chipText: chipEl ? `${entryAccounts(x).length} accounts` : "", base: fa ? base : null });
     });
     if (q && !tasksShown.length) taskRows.push(sub(`No task matches “${q}”.`, t.dim));
     out.child(card("task", taskTop, taskRows));
     // By session type: a selector; the machine is shown as Herdr's machine name, never a host name.
-    begin("kind", `By session type: ${st.dim}`);
-    const kindHead = h_flex().gap(4).items_center().flex_wrap().child(head("By session type")).child(div().flex_1()).children(DIMS.map((d) => chip(`costs-dim-${d}`, d, st.dim === d, (_e, cx) => { st.dim = d; st.open.kind = null; cx.notify(); }))).child(copy("kind"));
-    const dimRows = st.dim === "machine" ? [this.machineRow(s, space)] : list(s.byKind?.[st.dim]);
+    begin("kind", `By session type: ${st.dim}${acctHead}`);
+    const dimAll = st.dim === "machine" ? [this.machineRow(s, space)] : list(s.byKind?.[st.dim]);
+    const dimRows = dimAll.map((x, i) => ({ x, i, v: shownOf(x) })).filter(({ v }) => v);
+    const kindHead = h_flex().gap(4).items_center().flex_wrap().child(head(`By session type${acctHead}`))
+      .when(Boolean(fa), (h) => h.child(div().flex_none().text_size(10.5).text_color(t.dim).child(`${dimRows.length} of ${dimAll.length}`)))
+      .child(div().flex_1()).children(DIMS.map((d) => chip(`costs-dim-${d}`, d, st.dim === d, (_e, cx) => { st.dim = d; st.open.kind = null; cx.notify(); }))).child(copy("kind"));
     // t-151: a row opens to its sessions (the summary's order, task ids linked); a row with nothing to show has no fold.
-    out.child(card("kind", kindHead, dimRows.map((x, i) => {
-      const mine = list(s.sessions).filter((ss) => st.dim === "machine" || str(ss[st.dim] ?? "(none)") === str(x.key));
+    out.child(card("kind", kindHead, dimRows.map(({ x, i, v }) => {
+      const mine = list(s.sessions).filter((ss) => (st.dim === "machine" || str(ss[st.dim] ?? "(none)") === str(x.key)) && keepSess(ss, true));
       const scoped = tags && st.dim === "model" && dayModel.some((e) => str(e.model) === str(x.key));
-      return row("kind", i, x, str(x.key), null, mine.length || scoped ? () => [
+      const chipEl = rowChip("kind", i, x), where = at("kind", i), mixed = Boolean(chipEl);
+      return row("kind", i, v, str(x.key), null, mine.length || scoped || mixed ? () => [
+        ...accountLines(x, where),
         ...(scoped ? [sub(`Scopes${dmFrom}:`, t.dim), ...modelLines((e) => str(e.model) === str(x.key), true)] : []),
-        ...sessionLinks(mine, `kind-${i}`)] : null);
+        ...sessionLinks(mine, `kind-${i}`, where)] : null, null, { chip: chipEl, chipText: chipEl ? `${entryAccounts(x).length} accounts` : "", base: fa ? base : null });
     })));
-    // Accounts (R-A3, t-032 J1d): two or more account labels; each with its sessions.
-    const accts = accountsOf(s);
-    if (accts.length > 1) {
-      const accHead = titled("account", "Accounts");
-      out.child(card("account", accHead, accts.map((x, i) => row("account", i, x, str(x.key), null, () => [sub("Sessions:", t.dim), ...sessionsOf((ss) => str(ss.account) === str(x.key))]))));
-    }
     // By scope (A-V3): two or more scopes; each says how it was priced where that is another scope; its models and sessions.
     if (tags) {
       const scopeHead = titled("scope", "By scope (provider · endpoint · region · account)");
       out.child(card("scope", scopeHead, list(s.byScope).map((x, i) => {
         const f = factsOf(x), same = (e) => factsText(factsOf(e)) === factsText(f);
+        const one = label(f[3]) && f[3] !== "?" ? f[3] : NOT_RECORDED, chipEl = rowChip("scope", i, x, one);
         return row("scope", i, x, scopeText(f, x.by), pricedNote(f, x.pricedAs, true) || null, () => [
-          sub(`Models${dmFrom}:`, t.dim), ...modelLines(same, false), sub("Sessions:", t.dim), ...sessionsOf(same)]);
+          sub(`Models${dmFrom}:`, t.dim), ...modelLines(same, false), sub("Sessions:", t.dim), ...sessionsOf(same, at("scope", i))], null,
+        { chip: chipEl, chipText: chipEl ? acctChipText(one) : "" });
       })));
     }
     // By day: newest first (or by cost); Show more reveals up to 92. A day pa-costs cut in UTC (older than the zone table) says (UTC).
-    const days = list(s.byDay).map((d, i) => ({ d, i }));
-    if (st.sort.day === "cost") days.sort((a, b) => (b.d.money ?? -1) - (a.d.money ?? -1) || a.i - b.i);
+    // t-177: by day (↓ newest first, "older" the oldest of all) or by cost, either direction; under a filter, the account's part.
+    const daysAll = list(s.byDay).map((d, i) => ({ d, i, v: shownOf(d) }));
+    const days = daysAll.filter(({ v }) => v);
+    const dayKey = (d) => (d.key === "older" ? "" : str(d.key)), dayUp = up("day") ? 1 : -1;
+    if (st.sort.day === "cost") days.sort((a, b) => (((a.v.money ?? -1) - (b.v.money ?? -1)) * dayUp) || a.i - b.i);
+    else days.sort((a, b) => (dayKey(a.d).localeCompare(dayKey(b.d)) * dayUp) || a.i - b.i);
     const z = summaryZone(s, Date.now());
-    const dayHead = titled("day", z.local ? "By day" : `By day (${z.label})`, null, sortChips("day"));
-    const dayRows = days.slice(0, st.moreDays ? DAYS_MORE : DAYS_SHOWN).map(({ d, i }) => row("day", i, d, d.key === "older" ? `older (${num(d.days)} days)` : `${str(d.key)}${d.utc ? " (UTC)" : ""}`, null,
+    const dayHead = titled("day", `${z.local ? "By day" : `By day (${z.label})`}${acctHead}`, fa ? `${days.length} of ${daysAll.length} days` : null, sortChips("day"));
+    const dayRows = days.slice(0, st.moreDays ? DAYS_MORE : DAYS_SHOWN).map(({ d, i, v }) => { const chipEl = rowChip("day", i, d), where = at("day", i); return row("day", i, v, d.key === "older" ? `older (${num(d.days)} days)` : `${str(d.key)}${d.utc ? " (UTC)" : ""}`, null,
       // Each activity with its tokens and est., marked as the rows are (t-028; activities from pa-costs of t-028 on);
-      // an older summary's byActivity (priced money only) as before.
-      () => (Array.isArray(d.activities) ? list(d.activities).map((a) => sub(`${ACTIVITY[a.key] ?? str(a.key)} · ${tokens(a.tokens)} tokens · ${est(a, cur)}${priceTag(a) ? ` · ${priceTag(a)}` : ""}`))
-        : Object.entries(d.byActivity && typeof d.byActivity === "object" ? d.byActivity : {}).map(([k, v]) => sub(`${ACTIVITY[k] ?? k} · ${money(v, cur)} est.`)))));
+      // an older summary's byActivity (priced money only) as before. Under a filter they are all accounts' (L2).
+      () => [...accountLines(d, where), ...(fa ? [sub("Activities (all accounts):", t.dim)] : []), ...(Array.isArray(d.activities) ? list(d.activities).map((a) => sub(`${ACTIVITY[a.key] ?? str(a.key)} · ${tokens(a.tokens)} tokens · ${est(a, cur)}${priceTag(a) ? ` · ${priceTag(a)}` : ""}`))
+        : Object.entries(d.byActivity && typeof d.byActivity === "object" ? d.byActivity : {}).map(([k, val]) => sub(`${ACTIVITY[k] ?? k} · ${money(val, cur)} est.`)))], null,
+      { chip: chipEl, chipText: chipEl ? `${entryAccounts(d).length} accounts` : "", base: fa ? base : null }); });
     const dayCard = card("day", dayHead, dayRows);
     if (days.length > DAYS_SHOWN && !st.moreDays) dayCard.child(div().id("costs-days-more").px(4).text_size(11.5).text_color(t.accent).cursor_pointer().on_click((_e, cx) => { st.moreDays = true; cx.notify(); }).child("Show more"));
     out.child(dayCard);
@@ -619,7 +748,7 @@ export class CostsPane {
     const pr = rows.filter((e) => e.money !== null && e.money !== undefined);
     return { key: space.machine ?? "this computer", tokens: rows.reduce((a, e) => a + num(e.tokens), 0), money: pr.length ? pr.reduce((a, e) => a + num(e.money), 0) : null,
       unpricedTokens: pr.length ? rows.reduce((a, e) => a + (e.money === null || e.money === undefined ? num(e.tokens) : num(e.unpricedTokens)), 0) : 0,
-      reconstructed: rows.reduce((a, e) => a + num(e.reconstructed), 0) };
+      reconstructed: rows.reduce((a, e) => a + num(e.reconstructed), 0), ...machineAccounts(rows) };
   }
 
   // Billed amounts beside the estimates (R14). Every billed figure says account-wide; the query's status and Turn off.
@@ -657,6 +786,9 @@ export class CostsPane {
           : list(o.separate).length ? `Account ${o.account}: this space ${estCell(se.money, se.partial, ocur)}; billed only in another currency (not compared)`
             : `Account ${o.account}: this space ${estCell(se.money, se.partial, ocur)}; no billed rows for it`, t.dim));
       }
+      // t-177 R16: the not-recorded part, said apart; never compared with a bill.
+      const nr = d.notRecorded && typeof d.notRecorded === "object" ? d.notRecorded : null;
+      if (nr) bx.child(line(`Account not recorded: this space ≈ ${estCell(ccNum(nr.money), nr.partial === true, cur)}; not compared with any bill`, t.dim));
       return bx;
     };
     if (!num(d.rows)) {

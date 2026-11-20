@@ -1840,6 +1840,64 @@ def drill(buckets, keep=8):
     return [{k: v for k, v in e.items() if k in ("key", "tokens", "money", "unpricedTokens")} for e in by_money(buckets)[:keep]]
 
 
+def merge_bucket(dst, src):
+    """Adds Bucket src into Bucket dst (older's per-account parts, t-177)."""
+    dst.tokens += src.tokens
+    dst.calls += src.calls
+    dst.unpriced += src.unpriced
+    if src.priced:
+        dst.money += src.money
+        dst.priced = True
+        dst.recon += src.recon
+
+
+ACCOUNT_PART = ("key", "tokens", "money", "unpricedTokens", "calls")
+
+
+def account_fields(buckets):
+    """An entry's accounts (t-177 R10): {"account": key} with one, {"accounts": [{key, tokens, money,
+    unpricedTokens?, calls}] by money} with two or more, {} with none."""
+    if not buckets:
+        return {}
+    items = [{k: v for k, v in e.items() if k in ACCOUNT_PART} for e in by_money(buckets)]
+    return {"account": items[0]["key"]} if len(items) == 1 else {"accounts": items}
+
+
+def entry_parts(e):
+    """An entry's per-account parts, from its `accounts` or its one `account` (the whole entry); [] without them."""
+    if isinstance(e.get("accounts"), list):
+        return [p for p in e["accounts"] if isinstance(p, dict) and isinstance(p.get("key"), str)]
+    if isinstance(e.get("account"), str):
+        return [{"key": e["account"], "tokens": e.get("tokens") or 0, "money": e.get("money"),
+                 "unpricedTokens": e.get("unpricedTokens") or 0, "calls": e.get("calls") or 0}]
+    return []
+
+
+def merge_accounts(entries):
+    """account_fields of several entries' parts summed per account (fold_tasks, t-177 R10)."""
+    acc = {}
+    for e in entries:
+        for p in entry_parts(e):
+            a = acc.setdefault(p["key"], {"key": p["key"], "tokens": 0, "money": None, "unpricedTokens": 0, "calls": 0})
+            a["tokens"] += p.get("tokens") or 0
+            a["calls"] += p.get("calls") or 0
+            if p.get("money") is None:
+                a["unpricedTokens"] += p.get("tokens") or 0
+            else:
+                a["money"] = (a["money"] or 0.0) + p["money"]
+                a["unpricedTokens"] += p.get("unpricedTokens") or 0
+    items = []
+    for a in acc.values():
+        part = {"key": a["key"], "tokens": a["tokens"], "money": None if a["money"] is None else round(a["money"], 6), "calls": a["calls"]}
+        if a["money"] is not None and a["unpricedTokens"]:
+            part["unpricedTokens"] = a["unpricedTokens"]
+        items.append(part)
+    items.sort(key=lambda e: (-(e["money"] or 0), -e["tokens"], str(e["key"])))
+    if not items:
+        return {}
+    return {"account": items[0]["key"]} if len(items) == 1 else {"accounts": items}
+
+
 def read_cc(directory):
     """(records, problems): costs/cc/*.json, newest first by mtime, at most CC_MAX_FILES, each checked again (t-029 R5)."""
     folder = os.path.join(costs_dir(directory), "cc")
@@ -1929,12 +1987,15 @@ def summarize(directory, rows, records, table, price_problem, profile_name, now,
     zone = zone or UTC_ZONE
     problems = list(problems)
     chain = account_chain(directory)
+    try:
+        prof = pa.load_profile(profile_name) if profile_name else {}
+    except pa.Problem:
+        prof = None
     if rules is None:
-        try:
-            rules, rule_problems = pricing_rules(pa.load_profile(profile_name) if profile_name else {})
-        except pa.Problem:
-            rules, rule_problems = None, []
+        rules, rule_problems = pricing_rules(prof) if prof is not None else (None, [])
         problems.extend(p for p in rule_problems if p not in problems)
+    _la, la_problems, declared = launch_account_rules(prof)  # t-177: costs not recorded under a declaring profile
+    problems.extend(p for p in la_problems if p not in problems)
     if cc is None:
         cc, cc_problems = read_cc(directory)
         problems.extend(cc_problems)
@@ -1957,12 +2018,14 @@ def summarize(directory, rows, records, table, price_problem, profile_name, now,
     fact_b = {f: {} for f in SCOPE_FIELDS}  # t-032: by provider, endpoint, region, account
     scope_b, scope_info, day_model_as = {}, {}, {}
     row_m = {}  # t-041: each row's money as priced here, for paContext (never priced a second way)
+    task_acc, day_acc, sess_acc = {}, {}, {}  # t-177 R10: key -> account key -> Bucket
+    dim_acc = {d: {} for d in dims}
     hour_floor = iso(now - HOURS * 3600)[:13]
     for r in rows:
         tokens = {k: num(r["tokens"].get(k)) for k in KINDS}
         t = total_tokens(tokens)
         sess = sessions.get(r["session"]) or {}
-        rf = row_facts(r, sess, rules, chain)
+        rf = row_facts(r, sess, rules, chain, declared)
         facts = tuple(rf[f] for f in SCOPE_FIELDS)
         entry, priced_as = (None, None)
         if table:
@@ -1976,6 +2039,7 @@ def summarize(directory, rows, records, table, price_problem, profile_name, now,
         row_m[id(r)] = m
         rec = r.get("source") == "reconstructed"
         calls = num(r.get("calls"))
+        akey = NOT_RECORDED if facts[3] is None else facts[3]  # t-177 R9: the not-recorded part has its own key
         if m is None and t:
             unpriced += t
             missing.add(r.get("model") or "(unknown model)")
@@ -2011,6 +2075,7 @@ def summarize(directory, rows, records, table, price_problem, profile_name, now,
             w = float(s.get("w") or 0) / wsum
             key = s.get("task") or "(no task)"
             group(task_b, key).add(t * w, None if m is None else m * w, calls * w, rec)
+            group(task_acc.setdefault(key, {}), akey).add(t * w, None if m is None else m * w, calls * w, rec)
             if len(split) > 1:
                 task_split.add(key)
             group(task_phase.setdefault(key, {}), r.get("phase") or "(none)").add(t * w, None if m is None else m * w, calls * w, rec)
@@ -2019,8 +2084,8 @@ def summarize(directory, rows, records, table, price_problem, profile_name, now,
                 task_sessions[key].append(short(r["session"]))
         group(phases, r.get("phase") or "(none)").add(t, m, calls, rec)
         for f, v in zip(SCOPE_FIELDS, facts):
-            group(fact_b[f], "?" if v is None else v).add(t, m, calls, rec)
-        skey = facts_text(facts)
+            group(fact_b[f], akey if f == "account" else "?" if v is None else v).add(t, m, calls, rec)
+        skey = facts_text(facts[:3] + (akey,))
         group(scope_b, skey).add(t, m, calls, rec)
         si = scope_info.setdefault(skey, {"scope": list(facts), "pricedAs": [], "by": {k: rf[k] for k in ("providerBy", "endpointBy", "regionBy", "accountBy")}})
         if priced_as is not None and priced_as not in si["pricedAs"] and len(si["pricedAs"]) < 4:
@@ -2030,7 +2095,9 @@ def summarize(directory, rows, records, table, price_problem, profile_name, now,
                 si["by"][k] = "mixed"
         for dim, value in (("kind", r.get("kind")), ("role", r.get("role")), ("program", r.get("program")),
                            ("model", r.get("model")), ("machine", sess.get("host"))):
-            group(dims[dim], value or ("unknown" if dim == "machine" else "(none)")).add(t, m, calls, rec)
+            dkey = value or ("unknown" if dim == "machine" else "(none)")
+            group(dims[dim], dkey).add(t, m, calls, rec)
+            group(dim_acc[dim].setdefault(dkey, {}), akey).add(t, m, calls, rec)
         utc_day = r.get("day") or (r.get("from") or "")[:10]
         utc_days.add(utc_day)
         day = day_in(zone, r.get("from")) or utc_day
@@ -2038,6 +2105,7 @@ def summarize(directory, rows, records, table, price_problem, profile_name, now,
         if start is not None and before_table(zone, start) and zone["offsets"] != [[0, 0]]:
             cut_utc.add(day)
         group(days, day).add(t, m, calls, rec)
+        group(day_acc.setdefault(day, {}), akey).add(t, m, calls, rec)
         da = day_acts.setdefault(day, {})
         if m is not None:
             da[act] = da.get(act, 0.0) + m - (rb_m or 0)
@@ -2065,6 +2133,7 @@ def summarize(directory, rows, records, table, price_problem, profile_name, now,
             p["rebuild"] = p["rebuild"] or bool(rb_t)
             p["from"] = min(p["from"] or r.get("from"), r.get("from"))
         group(sess_b, r["session"]).add(t, m, calls, rec)
+        group(sess_acc.setdefault(r["session"], {}), akey).add(t, m, calls, rec)
         info = sess_info.setdefault(r["session"], {"from": r.get("from"), "to": r.get("to"), "models": {}, "tasks": {}, "role": None})
         info["from"] = min(info["from"], r.get("from"))
         info["to"] = max(info["to"], r.get("to"))
@@ -2100,11 +2169,14 @@ def summarize(directory, rows, records, table, price_problem, profile_name, now,
             extra["split"] = True
         if key in task_cc:
             extra.update(cc=round(task_cc[key][0], 6), ccSessions=task_cc[key][1], ccOf=len(task_sessions.get(key, [])))
+        extra.update(account_fields(task_acc.get(key)))
         task_extra[key] = extra
     day_list = sorted(days, reverse=True)
-    older = Bucket()
+    older, older_acc = Bucket(), {}
     for d in day_list[DAYS:]:
         b = days[d]
+        for k, ab in (day_acc.get(d) or {}).items():
+            merge_bucket(group(older_acc, k), ab)
         older.tokens += b.tokens
         older.calls += b.calls
         older.unpriced += b.unpriced
@@ -2115,10 +2187,11 @@ def summarize(directory, rows, records, table, price_problem, profile_name, now,
     # byActivity: the priced money of each activity (as before); activities: every activity with its tokens, money
     # (None: no price) and unpricedTokens, for the day drill's marks (t-028).
     by_day = [days[d].out(d, byActivity={k: round(v, 6) for k, v in sorted(day_acts.get(d, {}).items())},
-                          activities=drill(day_act_b.get(d, {}), keep=20), **({"utc": True} if d in cut_utc else {}))
+                          activities=drill(day_act_b.get(d, {}), keep=20), **({"utc": True} if d in cut_utc else {}),
+                          **account_fields(day_acc.get(d)))
               for d in day_list[:DAYS]]
     if day_list[DAYS:]:
-        by_day.append(older.out("older", days=len(day_list) - DAYS))
+        by_day.append(older.out("older", days=len(day_list) - DAYS, **account_fields(older_acc)))
     kept_days = set(sorted(utc_days, reverse=True)[:DAYS])
     by_day_model = [dict(day=k[0], model=k[1], tokens=b.kinds or zero(), money=round(b.money, 6) if b.priced else None,
                          **({"unpricedTokens": b.partial()} if b.partial() else {}),
@@ -2136,6 +2209,11 @@ def summarize(directory, rows, records, table, price_problem, profile_name, now,
                       to=info["to"], state=state, source=r.get("source"), match=r.get("match"),
                       **dict(zip(SCOPE_FIELDS, top[1])), pricedAs=top[2],
                       **({"scopes": len(info["scopes"])} if len(info["scopes"]) > 1 else {}))
+        # t-177 R10: the session's account; with two or more, `accounts` beside the largest scope's `account` (which
+        # t-032 limit 9 names, as it names that scope's other facts: DECISIONS D2)
+        af = account_fields(sess_acc.get(sid))
+        entry["account"] = af.get("account") or (NOT_RECORDED if top[1][3] is None else top[1][3])
+        entry.update(af)
         if sid in cc_money:
             parts = [(rec, cleared) for rec, cleared in cc_parts[sid] if cc_figure(rec) is not None]
             entry["cc"], entry["ccAt"] = round(cc_money[sid], 6), max(rec["at"] for rec, _c in parts)
@@ -2165,6 +2243,7 @@ def summarize(directory, rows, records, table, price_problem, profile_name, now,
                         "unmatched": {"sessions": um_n, "money": round(um_money, 6) if um_n else None}, "ccCurrency": "USD"}
     return {
         "v": 1, "space": os.path.basename(directory), "updated": iso(now), "account": chain[0], "accountBy": chain[1],
+        **({"accountsDeclared": True} if declared else {}),
         "prices": {"profile": profile_name, "source": (table or {}).get("source"), "asOf": (table or {}).get("asOf"),
                    "currency": (table or {}).get("currency"), "missing": sorted(missing)},
         "totals": totals,
@@ -2174,12 +2253,12 @@ def summarize(directory, rows, records, table, price_problem, profile_name, now,
                                          for k in acts}),
         "byTask": by_money(task_b, **task_extra),
         "byPhase": by_money(phases),
-        "byKind": {d: by_money(v) for d, v in dims.items()},
+        "byKind": {d: by_money(v, **{k: account_fields(dim_acc[d].get(k)) for k in v}) for d, v in dims.items()},
         "byDay": by_day,
         "days": dict({"zone": zone["zone"], "offsets": zone["offsets"]}, **({"from": zone["from"]} if zone.get("from") else {})),
         "byDayModel": by_day_model,
         "byProvider": by_money(fact_b["provider"]), "byEndpoint": by_money(fact_b["endpoint"]),
-        "byRegion": by_money(fact_b["region"]), "byAccount": by_money(fact_b["account"]),
+        "byRegion": by_money(fact_b["region"]), "byAccount": by_money(fact_b["account"], **{NOT_RECORDED: {"notRecorded": True}}),
         "byScope": by_money(scope_b, **scope_info), "scopes": len(scope_b),
         "passes": sorted(({**{k: v for k, v in p.items() if k != "unpricedTokens"},
                            "money": None if p["money"] is None else round(p["money"], 6),
@@ -2350,6 +2429,7 @@ def fold_tasks(entries, keep):
     if with_cc:
         other.update(cc=round(sum(e["cc"] for e in with_cc), 6), ccSessions=sum(e.get("ccSessions", 0) for e in with_cc),
                      ccOf=sum(e.get("ccOf", 0) for e in with_cc))
+    other.update(merge_accounts(rest))  # t-177 R10
     return entries[:keep] + [other]
 
 
@@ -2381,9 +2461,12 @@ def fit_summary(s):
 
 
 def shrink(s):
-    """One step towards SUMMARY_MAX: fewer sessions, then shorter session lists per task, then fewer tasks (paContext
-    is never shrunk: fit_summary sets it aside first)."""
-    if s["sessions"]:
+    """One step towards SUMMARY_MAX: the sessions' accounts lists (t-177 R10), fewer sessions, then shorter session
+    lists per task, then fewer tasks (paContext is never shrunk: fit_summary sets it aside first)."""
+    if any("accounts" in x for x in s["sessions"]):
+        for x in s["sessions"]:
+            x.pop("accounts", None)
+    elif s["sessions"]:
         s["sessions"] = s["sessions"][:len(s["sessions"]) * 3 // 4]
     elif any(t["sessions"] for t in s["byTask"]):
         for t in s["byTask"]:
@@ -2558,11 +2641,16 @@ def report_lines(s, by=None):
     return out
 
 
-def entry_account(entry, otherwise):
-    """The account of a byDayModel entry: its own when its launch recorded one (accountBy env or rule), else
-    `otherwise` (the summary's label: an entry labelled by the space's chain follows the space)."""
-    if entry.get("accountBy") in ("env", "rule") and fact_label("account", entry.get("account")):
+def entry_account(entry, otherwise, declared=False):
+    """The account of a byDayModel entry: its own when its launch recorded one (accountBy env, rule, command or
+    settings), else `otherwise` (the summary's label: an entry labelled by the space's chain follows the space).
+    None (not recorded, t-177 R6/R11) when the entry says so, or when its summary's profile declared launchAccounts
+    (`declared`: the summary's accountsDeclared; an older summary has none and reads as before). None never equals a
+    label, so it is never added to or compared with one."""
+    if entry.get("accountBy") in RECORDED_BY and fact_label("account", entry.get("account")):
         return entry["account"]
+    if entry.get("accountBy") == "not-recorded" or declared:
+        return None
     return otherwise
 
 
@@ -2575,7 +2663,8 @@ def account_wide_summary(account, now):
         if not isinstance(s, dict):
             continue
         # per entry (t-032 R-A3): the account a launch recorded for it, else the summary's
-        mine = [e for e in s.get("byDayModel") or [] if isinstance(e, dict) and entry_account(e, s.get("account") or "default") == account]
+        mine = [e for e in s.get("byDayModel") or [] if isinstance(e, dict)
+                and entry_account(e, s.get("account") or "default", s.get("accountsDeclared") is True) == account]
         if not mine and (s.get("account") or "default") != account:
             continue
         spaces.append(name)
@@ -2605,16 +2694,19 @@ def account_wide_summary(account, now):
 def space_accounts(space):
     """The account labels of a space's byDayModel entries (entry_account): the space's own first, then the others sorted."""
     own = space.get("account") or "default"
-    seen = {entry_account(e, own) for e in space.get("byDayModel") or [] if isinstance(e, dict)}
-    return [own] + sorted(a for a in seen if a != own)
+    declared = space.get("accountsDeclared") is True
+    seen = {entry_account(e, own, declared) for e in space.get("byDayModel") or [] if isinstance(e, dict)}
+    return [own] + sorted(a for a in seen if a is not None and a != own)
 
 
 def space_estimate(space, account):
-    """This space's estimate of one account label over every day of its summary: {money (None: no price), partial}."""
+    """This space's estimate of one account label over every day of its summary: {money (None: no price), partial}.
+    account None: the part whose account was not recorded (t-177 R11)."""
     own = space.get("account") or "default"
+    declared = space.get("accountsDeclared") is True
     money, unpriced = None, False
     for e in space.get("byDayModel") or []:
-        if not isinstance(e, dict) or entry_account(e, own) != account:
+        if not isinstance(e, dict) or entry_account(e, own, declared) != account:
             continue
         if e.get("money") is not None:
             money = (money or 0.0) + e["money"]
@@ -3177,7 +3269,7 @@ def billing_comparison(billed, space, here, table, account=None, region_free=())
         whose fact is unknown (never set against another region's bill); a region-free endpoint's region is '*'."""
         return (endpoint or missing, "*" if endpoint in free else (region or missing))
 
-    def est(summary, otherwise):
+    def est(summary, otherwise, declared=False):
         """({key: money of the priced entries}, {keys with tokens and no price}, the same per byScope pair) over the
         covered days. otherwise: the label of an entry that recorded none (the space's own; for the account-wide
         summary, the account it was summed for)."""
@@ -3185,7 +3277,7 @@ def billing_comparison(billed, space, here, table, account=None, region_free=())
         for e in (summary or {}).get("byDayModel") or []:
             if not isinstance(e, dict) or e.get("day") not in covered:
                 continue
-            if entry_account(e, otherwise) != account:  # R-A5: never another account's estimate
+            if entry_account(e, otherwise, declared) != account:  # R-A5: never another account's estimate (nor a not-recorded one)
                 continue
             key = model_key(table, e.get("model")) or e.get("model")
             sk = pair(fact_label("endpoint", e.get("endpoint")), fact_label("region", e.get("region")), "?")
@@ -3206,7 +3298,7 @@ def billing_comparison(billed, space, here, table, account=None, region_free=())
 
     def est_total(priced, unpriced):
         return round(sum(priced.values()), 6) if priced else (None if unpriced else 0.0)
-    (this, this_np, this_by, this_by_np), (alls, alls_np, alls_by, alls_by_np) = est(space, space_account), est(here, account)
+    (this, this_np, this_by, this_by_np), (alls, alls_np, alls_by, alls_by_np) = est(space, space_account, space.get("accountsDeclared") is True), est(here, account)
     known = here is not None
     models, other = {}, 0.0
     for r in rows:
@@ -3366,8 +3458,19 @@ def billed_lines(s, now):
         else:
             out.append("Billed, account {} ({})".format(a, BILLED_HEAD))
             out.extend(comparison_lines(o))
+    nr = not_recorded_estimate(s)
+    if nr:  # t-177 R11: said apart, never compared
+        out.append("  account not recorded: est. {}{} in this space; not compared with any bill".format(fmt_money(nr["money"]), " + unpriced" if nr["partial"] else ""))
     out.append(status_line(now))
     return out
+
+
+def not_recorded_estimate(space):
+    """space_estimate of the part whose account was not recorded, or None when the space has none (t-177 R11)."""
+    own, declared = space.get("account") or "default", space.get("accountsDeclared") is True
+    if not any(isinstance(e, dict) and entry_account(e, own, declared) is None for e in space.get("byDayModel") or []):
+        return None
+    return space_estimate(space, None)
 
 
 COMPARE_ARG_MAX = 100 * 1024  # a summary passed as an argument (the panel, for a remote space): Linux caps one at 128 KB
@@ -3430,6 +3533,9 @@ def billed_compare(space=None, summary_json=None, here_json=None, now=None):
         others.append(o)
     if others:
         out["others"] = others
+    nr = not_recorded_estimate(s)
+    if nr:
+        out["notRecorded"] = nr  # t-177 R11: never added to a label, never compared
     print(json.dumps(out, indent=2))
     return 0
 
@@ -4448,6 +4554,109 @@ def pricing_rules(profile):
     return rules, problems
 
 
+# ---- t-177: the account a session is billed to, from how it was started (the profile's launchAccounts) -------------------
+# Labels only: a command's program or path and a --settings value are compared with the profile's entries and never
+# stored, printed or opened; only the entry's account label is recorded.
+
+NOT_RECORDED = "(not recorded)"  # the summary's key for costs whose account was not recorded (never a label: parentheses)
+RECORDED_BY = ("env", "rule", "command", "settings")  # accountBy words of an account the launch recorded
+LAUNCH_KEYS = ("account", "program", "path", "settings", "tool")
+LAUNCH_MATCHERS = ("program", "path", "settings")
+VALUE_OPTIONS = ("--append-system-prompt", "--system-prompt", "--model", "--name", "--mcp-config", "--agent", "--resume",
+                 "-r", "--session-id")
+
+
+def launch_account_rules(profile):
+    """(rules, problems, declared) of the profile's launchAccounts (t-177 R1, R2). declared: the profile has the key
+    (then a cost whose launch matched no entry is "not recorded"). A malformed entry is dropped and named by its
+    index, never by its values; never raises."""
+    profile = profile if isinstance(profile, dict) else {}
+    if "launchAccounts" not in profile:
+        return [], [], False
+    block = profile["launchAccounts"]
+    if not isinstance(block, list):
+        return [], ["launchAccounts must be a list"], True
+    rules, problems = [], []
+    for i, e in enumerate(block):
+        where = "launchAccounts[{}]".format(i)
+        if not isinstance(e, dict):
+            problems.append("{}: must be an object".format(where))
+            continue
+        unknown = [k for k in e if k not in LAUNCH_KEYS]
+        if unknown:
+            names = [k for k in unknown if isinstance(k, str) and ENV_NAME.match(k)]
+            problems.append("{}: unknown key{} {}".format(where, "s" if len(unknown) > 1 else "", ", ".join(names) or "(not a name)"))
+            continue
+        if any(not isinstance(e[k], str) or not e[k] for k in e):
+            problems.append("{}: every field must be a non-empty string".format(where))
+            continue
+        if fact_label("account", e.get("account")) is None:
+            problems.append("{}: needs account (a label)".format(where))
+            continue
+        if not any(k in e for k in LAUNCH_MATCHERS):
+            problems.append("{}: needs program, path or settings".format(where))
+            continue
+        if e.get("tool") not in (None, "claude", "codex"):
+            problems.append("{}: tool must be claude or codex".format(where))
+            continue
+        rules.append({"account": e["account"], "tool": e.get("tool"), "program": e.get("program"),
+                      "path": os.path.expanduser(e["path"]) if "path" in e else None,
+                      "settings": os.path.expanduser(e["settings"]) if "settings" in e else None,
+                      "by": "settings" if "settings" in e else "command"})
+    return rules, problems, True
+
+
+def settings_values(command, own):
+    """The --settings values among the person's own arguments command[1:own] (R3): `--settings X` and `--settings=X`;
+    never after `--`, never an option's value; a value empty, starting with '-' or '{' is not a path. ~ expanded."""
+    out, i = [], 1
+    while i < own:
+        a = command[i]
+        if not isinstance(a, str) or a == "--":
+            break
+        value = None
+        if a == "--settings":
+            nxt = command[i + 1] if i + 1 < own else None
+            if isinstance(nxt, str) and nxt and not nxt.startswith("-"):
+                value, i = nxt, i + 2
+            else:
+                i += 1
+        elif a.startswith("--settings="):
+            value, i = a[len("--settings="):], i + 1
+        elif a in VALUE_OPTIONS:
+            i += 2
+            continue
+        else:
+            i += 1
+        if value and not value.startswith("-") and not value.startswith("{"):
+            out.append(os.path.expanduser(value))
+    return out
+
+
+def launch_command_facts(rules, kind, command, own=None):
+    """(label, accountBy) of the first launchAccounts entry the command matches, else None (R1, R3). own: how many
+    leading elements of command are the profile's and the caller's (the rest pa added). Nothing is opened."""
+    if not rules or not isinstance(command, (list, tuple)) or not command or not isinstance(command[0], str):
+        return None
+    own = len(command) if own is None else max(0, min(int(own), len(command)))
+    path = os.path.expanduser(command[0])
+    program = os.path.basename(path)
+    values = None
+    for r in rules:
+        if r["tool"] is not None and r["tool"] != kind:
+            continue
+        if r["program"] is not None and r["program"] != program:
+            continue
+        if r["path"] is not None and r["path"] != path:
+            continue
+        if r["settings"] is not None:
+            values = settings_values(command, own) if values is None else values
+            if r["settings"] not in values:
+                continue
+        return r["account"], r["by"]
+    return None
+
+
 def machine_rules():
     """(accountRules [(name, regex, label)], region label or None, problems) of the machine's config costs block."""
     problems, out = [], []
@@ -4496,15 +4705,20 @@ def endpoint_rule(rules, model, env=None):
     return None
 
 
-def unknown_facts():
+def unknown_facts(declared=False):
+    """Facts of a launch whose own could not be worked out; the account is not recorded when the profile declares
+    launchAccounts (t-177 R4), else "default" as before."""
     return {"provider": None, "providerBy": "unknown", "endpoint": None, "endpointBy": "default", "region": None,
-            "regionBy": "unknown", "account": "default", "accountBy": "default"}
+            "regionBy": "unknown", "account": None if declared else "default", "accountBy": "not-recorded" if declared else "default"}
 
 
-def launch_facts(profile, program, model, directory=None, env=None):
+def launch_facts(profile, program, model, directory=None, env=None, command=None, own=None):
     """The facts a start record gets (t-032 R-P3, R-A2, A-R1, A-R2), plus `refused` (names, never values) when a value
-    or a rule was refused. Never raises: on any error, unknown facts."""
+    or a rule was refused. The account (t-177 R4): PA_COST_ACCOUNT, the machine's accountRules, the profile's
+    launchAccounts over `command` (its first `own` elements are the profile's and the caller's), then, when the
+    profile declares launchAccounts, not recorded; else the chain. Never raises: on any error, unknown facts."""
     env = os.environ if env is None else env
+    declared = isinstance(profile, dict) and "launchAccounts" in profile
     try:
         rules, _problems = pricing_rules(profile)
         account_rules, machine_region, _mp = machine_rules()
@@ -4548,23 +4762,29 @@ def launch_facts(profile, program, model, directory=None, env=None):
                 if value and rx.search(value):
                     account, account_by = label, "rule"
                     break
-        if account is None:
+        if account is None and declared:
+            rules_l, _lp, _d = launch_account_rules(profile)
+            hit = launch_command_facts(rules_l, program, command, own) if command is not None else None
+            account, account_by = hit if hit else (None, "not-recorded")
+        if account is None and account_by is None:
             account, account_by = account_chain(directory)
         out["account"], out["accountBy"] = account, account_by
         if refused:
             out["refused"] = refused
         return out
     except Exception:  # noqa: BLE001 - a launch never fails because of its facts
-        return unknown_facts()
+        return unknown_facts(declared)
 
 
-def row_facts(row, sess, rules, chain):
+def row_facts(row, sess, rules, chain, declared=False):
     """The facts a ledger row is priced and shown under (t-032): its own where it has them (from its launch record);
     else, at summarize time, provider and endpoint from the profile's model rules over its record's program and model
     (providerBy/endpointBy "rule"), else the default ("default"); region unknown; account from the chain (C7, C15).
     The rules read the program and model of the start record in effect at the row's time (t-032 J1d, d-117 limit 7).
-    A stored account counts only when the launch recorded it (accountBy env or rule); one the launch took from the
-    chain follows today's chain, as entry_account does (J1d, d-117 limit 2: one label per row)."""
+    A stored account counts only when the launch recorded it (accountBy env, rule, command or settings: t-177 R6), the
+    row's own or else its start record's; one the launch took from the chain follows today's chain, as entry_account
+    does (J1d, d-117 limit 2: one label per row), except that a profile declaring launchAccounts (`declared`) says
+    it was not recorded (account None, accountBy "not-recorded"): a chain label is today's setting, not a record."""
     sess = sess or {}
     rec = start_in_effect(sess, row.get("from")) if sess else {}
     out = {}
@@ -4582,17 +4802,26 @@ def row_facts(row, sess, rules, chain):
         out["region"], out["regionBy"] = row["region"], row.get("regionBy") or "unknown"
     else:
         out["region"], out["regionBy"] = None, row.get("regionBy") if row.get("regionBy") in ("refused",) else "unknown"
-    if row.get("account") and row.get("accountBy") in ("env", "rule"):
+    if fact_label("account", row.get("account")) and row.get("accountBy") in RECORDED_BY:
         out["account"], out["accountBy"] = row["account"], row["accountBy"]
+    elif "accountBy" not in row and fact_label("account", rec.get("account")) and rec.get("accountBy") in RECORDED_BY:
+        out["account"], out["accountBy"] = rec["account"], rec["accountBy"]
+    elif declared:
+        out["account"], out["accountBy"] = None, "not-recorded"
     else:
         out["account"], out["accountBy"] = chain
     return out
 
 
-def record_launch(directory, space, kind, argv, command, walked, profile=None):
+def record_launch(directory, space, kind, argv, command, walked, profile=None, own=None):
     """pa-claude / pa-codex under a Project Agent: the command with --session-id added when it is ours to choose,
-    after appending one start record (counters' context only: never an argument other than --model's value)."""
+    after appending one start record (counters' context only: never an argument other than --model's value). own: how
+    many leading elements of command are the profile's and the caller's (t-177 R5; default len(profile[kind]) +
+    len(argv)): only those are read for the account."""
     import uuid
+    if own is None:
+        own = len((profile or {}).get(kind) or []) + len(argv) if isinstance((profile or {}).get(kind), list) else len(command)
+    original = list(command)
     plan = launch_plan(kind, argv)
     session = plan["session"]
     if plan["add"]:
@@ -4606,7 +4835,7 @@ def record_launch(directory, space, kind, argv, command, walked, profile=None):
         "task": task_for(directory, name), "name": name, "role": None, "terminal": os.environ.get("HC_TERMINAL_ID"),
         "parent": me.get("parent"), "model": model, "host": host(), "cwd": os.getcwd(), "pid": os.getpid(),
         "resumed": plan["resumed"], "bind": plan["bind"], "fork": plan["fork"], "source": "recorded",
-        **(launch_facts(profile, kind, model, directory) if profile is not None else unknown_facts())})
+        **(launch_facts(profile, kind, model, directory, command=original, own=own) if profile is not None else unknown_facts())})
     return command
 
 
@@ -4615,9 +4844,11 @@ def record_closed(directory, terminal, by):
     return append_session(directory, {"v": 1, "ev": "closed", "at": pa.now(), "terminal": terminal, "by": by})
 
 
-def record_agent_start(directory, agent, address, project, model, resume, profile=None):
-    """pa-session: one start record per start and resume of the Project Agent's own session."""
-    facts = launch_facts(profile, "claude", model, directory) if profile is not None else unknown_facts()
+def record_agent_start(directory, agent, address, project, model, resume, profile=None, command=None):
+    """pa-session: one start record per start and resume of the Project Agent's own session. command: the argv
+    launch_command built for this start; its first len(profile["claude"]) elements are the profile's (t-177 R5)."""
+    own = len(profile.get("claude") or []) if isinstance(profile, dict) and isinstance(profile.get("claude"), list) else None
+    facts = launch_facts(profile, "claude", model, directory, command=command, own=own) if profile is not None else unknown_facts()
     return append_session(directory, {
         "v": 1, "ev": "start", "at": pa.now(), "session": agent.get("sessionId"), "program": "claude", "kind": "pa",
         "space": agent.get("space") or os.path.basename(directory), "task": None, "name": None, "role": None,
@@ -4941,9 +5172,13 @@ def space_directory(explicit):
 def cmd_prices(directory):
     table, problem, name = space_prices(directory)
     rules, rule_problems = space_rules(directory)
+    try:
+        _la, la_problems, declared = launch_account_rules(pa.load_profile((pa.read_json(os.path.join(directory, "agent.json"), {}) or {}).get("profile")))
+    except pa.Problem:
+        la_problems, declared = [], False
     if problem:
         print(problem)
-    for warning in ((table or {}).get("warnings") or []) + rule_problems:
+    for warning in ((table or {}).get("warnings") or []) + rule_problems + la_problems:
         print(warning)
 
     def rows_of(models):
@@ -4995,7 +5230,7 @@ def cmd_prices(directory):
     for r in ledger_rows(directory):
         if not r.get("model"):
             continue
-        rf = row_facts(r, sessions.get(r.get("session")) or {}, rules, chain)
+        rf = row_facts(r, sessions.get(r.get("session")) or {}, rules, chain, declared)
         facts = tuple(rf[f] for f in SCOPE_FIELDS)
         entry = None
         if table:
