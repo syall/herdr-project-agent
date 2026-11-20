@@ -841,7 +841,10 @@ class A11StackedOrder(Standing):
         self.assertEqual((carry["oldBase"], carry["newBase"]), (a_old, self.tip("t-A")), carry)
         code, out, err = self.refresh("--no-merge")
         self.assertEqual([e["state"] for e in self.entries()], ["passed", "passed"], out + err)
-        self.approve("Merge up to t-A")
+        # t-163 R1 (d-291 Q4): a Merge up to t-A card would hold t-B back from the rule; this card lists t-A only
+        code, out, err = self.queue("card", "--repo", self.proj, "--limits", LIMITS, "--max", "1")
+        self.assertEqual(code, 0, out + err)
+        self.answer("d-queue-1", "Merge all in order")
         code, out, err = self.merge()
         self.assertEqual(self.merged(), ["t-A"], out + err)
         a_from = self.qrepo()["merged"][-1]["from"]
@@ -967,10 +970,10 @@ class A11StackedOrder(Standing):
     def test_a11_9_a_card_merge_after_a_rule_merge_opens_the_push_card(self):  # REVIEW-r2-2 MF-2 (probe P6)
         a, b = self.two()
         self.approve()
-        self.change("t-A", "fa.txt", "later\n")
-        code, out, err = self.merge()
-        self.assertTrue(self.approval("t-A")["void"], out + err)
-        sh(self.trees["t-A"], "git", "reset", "-q", "--hard", a)
+        self.refresh("--no-merge")
+        # t-163 R3: a void card approval now waits for a new card (and voiding it stops the rule); t-A's approval is
+        # taken away instead, so the rule merges t-A and the card merges t-B
+        self.set_entries(lambda r: r["entries"][0].update(approval=None))
         code, out, err = self.smerge()
         self.assertEqual(code, 0, out + err)
         self.assertEqual([(m["task"], m.get("standing")) for m in self.qrepo()["merged"]], [("t-A", RULE), ("t-B", None)])
