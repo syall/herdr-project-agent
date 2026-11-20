@@ -186,7 +186,9 @@ CALL_TIMEOUT = None  # seconds a `call` may take; None: no limit. Only a detache
 
 def call(argv, check=True):
     try:
-        r = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=CALL_TIMEOUT)
+        # stdin /dev/null: while Claude has the terminal, this launcher is a background group (t-184)
+        r = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           universal_newlines=True, timeout=CALL_TIMEOUT)
     except FileNotFoundError:
         raise Problem("{} is not installed or not on PATH".format(argv[0]))
     except subprocess.TimeoutExpired:
