@@ -634,6 +634,17 @@ class R11Guards(Limits):
         need = self.stacked_need("t-B")
         self.assertEqual((need["oldBase"], need["newBase"]), (self.m0, a), need)
 
+    def test_r11d_a_need_for_another_pair_is_renewed_at_the_front(self):  # V RL-V4 (M12)
+        a, b = self.two()
+        self.smerge()
+        self.set_entries(lambda r: r["entries"][0]["needs"]["stacked"].update(oldBase=b))  # no refresh after it
+        code, out, err = self.smerge()
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("waits at t-B: stacked: waiting for its independence review", out)
+        need = self.stacked_need("t-B")
+        self.assertEqual((need["oldBase"], need["newBase"]), (self.m0, a), need)
+        self.assertIn("what it is stacked on: git diff {} {}".format(self.m0, a), out)
+
     def test_r11e_a_stacked_line_is_not_the_carry_review(self):  # V RL-r3-2 (M22)
         self.joined("t-X", "fx.txt")
         self.joined("t-A", "fa.txt")
@@ -646,6 +657,7 @@ class R11Guards(Limits):
         needs = self.entry("t-B")["needs"]
         self.assertIn("independence", needs, needs)
         self.assertIn("stacked", needs, needs)
+        self.assertEqual(self.gate("t-B")[0], 0)
         self.add_worker("t-B", "t-Bs", "reviewer")
         name = needs["stacked"]["file"]
         write(os.path.join(self.evidence("t-B"), name),
