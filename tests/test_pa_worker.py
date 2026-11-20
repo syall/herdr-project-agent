@@ -2349,6 +2349,7 @@ class JobCards(Base):
                 self.assertIsNone(self.card())
 
     def test_b4_pushed_only_is_not_enough_while_in_progress(self):
+        self.term("t98", "main-tree", cwd=self.wt)  # t-168: t-003's main worktree stays in use: the billing job is the one candidate
         bare = os.path.join(self.tmp, "remote.git")
         sh(self.tmp, "git", "init", "-q", "--bare", bare)
         sh(self.proj, "git", "remote", "add", "origin", bare)
@@ -2701,6 +2702,7 @@ class JobCards(Base):
         self.assertEqual(pa.task_worktrees(t9), [])
 
     def test_b17_a_task_that_records_the_container_counts_on_the_worktree(self):
+        self.term("t98", "main-tree", cwd=self.wt)  # t-168: t-003's main worktree stays in use: the billing job is the one candidate
         # the reviewer's P3: t-009 records the container <tmp>/worktrees/t-003-billing that holds t-003's billing worktree
         container = os.path.dirname(self.bill)
         for mine, other in (("in-progress", "in-progress"), ("done", "in-progress"), ("in-progress", "parked"), ("done", None)):
@@ -2729,6 +2731,7 @@ class JobCards(Base):
         self.assertTrue(t9["worktrees"][0].get("removed"), "the container is gone: t-009's entry is marked removed")
 
     def test_b17b_a_container_that_stays_is_not_marked(self):
+        self.term("t98", "main-tree", cwd=self.wt)  # t-168: t-003's main worktree stays in use: the billing job is the one candidate
         container = os.path.dirname(self.bill)
         write(os.path.join(container, "notes.txt"), "kept\n")
         self.billing_task("done")
@@ -2745,6 +2748,7 @@ class JobCards(Base):
         self.assertTrue(t3["worktrees"][0].get("removed"))
 
     def test_b18_an_answered_card_is_for_the_tasks_it_asked_about(self):
+        self.term("t98", "main-tree", cwd=self.wt)  # t-168: t-003's main worktree stays in use: the billing job is the one candidate
         # the verifier's probe2: a real rule-(b) card for t-003 alone, answered Delete; then t-004 records the path; both finish
         self.billing_task()
         self.merged_commit(self.bill)
@@ -2774,6 +2778,7 @@ class JobCards(Base):
         self.assertFalse(os.path.exists(self.bill))
         # the rule-(a) form (RL-V3): t-003 done with main W, answered; then t-009 (done) records W
         self.reset()
+        del self.terms["t98"]  # t-168: W is the candidate now
         self.add_task("t-003", "done", self.wt, [])
         self.check("--open-cards")
         self.assertEqual(self.card("d-wt-t-003")["tasks"], ["t-003"])
@@ -2785,6 +2790,7 @@ class JobCards(Base):
         self.assertTrue(os.path.isdir(self.wt))
 
     def test_b19_an_open_card_whose_tasks_or_rule_no_longer_match_is_withdrawn(self):
+        self.term("t98", "main-tree", cwd=self.wt)  # t-168: t-003's main worktree stays in use: the billing job is the one candidate
         self.billing_task()
         self.merged_commit(self.bill)
         self.check("--open-cards")
@@ -2958,19 +2964,25 @@ class CardPerWorktree(Base):
         self.assertEqual(code, 0, err)
         for task, _old, _new in self.LIVE:
             self.assertNotIn("{}: card d-wt-{} answered".format(task, task), out)
-            self.assertIn("{}: candidate, job main is over (every commit merged); --open-cards asks the person".format(task), out)
+            # t-168: the four candidates go on one card
+            self.assertIn("{}: candidate, job main is over (every commit merged); --open-cards puts it on one card with the other 3"
+                          .format(task), out)
         code, out, err = self.check("--open-cards")
         self.assertEqual(code, 0, err)
+        self.assertIn("opened card d-wt-batch-1 (4 worktrees)", out)
+        card = self.card("d-wt-batch-1")
+        self.assertEqual(card["status"], "open")
+        items = {i["task"]: i for i in card["items"]}
         for task, _old, _new in self.LIVE:
             with self.subTest(task=task):
                 path, before = made[task]
-                self.assertIn("{}: opened card d-wt-{}-main (recommends Delete)".format(task, task), out)
-                card = self.card("d-wt-{}-main".format(task))
-                self.assertEqual((card["id"], card["task"], card["worktree"], card["job"], card["main"], card["rule"], card["status"]),
-                                 ("d-wt-{}-main".format(task), task, os.path.realpath(path), "main", True, "b", "open"))
-                self.assertEqual(card["evidence"], ["WORKTREE-main.md"])
+                item = items[task]
+                self.assertEqual((item["path"], item["job"], item["main"], item["rule"], item["md"]),
+                                 (os.path.realpath(path), "main", True, "b", "WORKTREE-main.md"))
+                self.assertIn("  {} main · ".format(task), card["context"])
+                self.assertIsNone(self.card("d-wt-{}-main".format(task)))
                 self.assertEqual(raw(self.dec("d-wt-" + task)), before, "the old card is never touched")
-        self.assertIn("card d-wt-t-020-main is open", self.check("--open-cards")[1])
+        self.assertIn("card d-wt-batch-1 is open (4 worktrees)", self.check("--open-cards")[1])
 
     def test_k2_remove_refuses_an_old_delete_for_another_path(self):
         for task, old, new in self.LIVE:
@@ -3030,10 +3042,11 @@ class CardPerWorktree(Base):
         self.merged_commit(core)
         self.add_task("t-046", "in-progress", panel, [], worktrees=[{"path": core, "job": "J2"}])
         out = self.check("--open-cards")[1]
-        for cid, path in (("d-wt-t-063", t063), ("d-wt-t-032-main", fetch), ("d-wt-t-046-j2", core)):
-            with self.subTest(card=cid):
-                self.assertIn("opened card {} (recommends Delete)".format(cid), out)
-                self.assertEqual(self.card(cid)["worktree"], os.path.realpath(path))
+        self.assertIn("opened card d-wt-batch-1 (3 worktrees)", out)  # t-168: the three finished jobs on one card
+        items = {i["task"]: i for i in self.card("d-wt-batch-1")["items"]}
+        for task, md, path in (("t-063", "WORKTREE.md", t063), ("t-032", "WORKTREE-main.md", fetch), ("t-046", "WORKTREE-j2.md", core)):
+            with self.subTest(task=task):
+                self.assertEqual((items[task]["path"], items[task]["md"]), (os.path.realpath(path), md))
 
     def test_k6_same_folder_made_again_old_card_is_spent(self):
         path = self.job_tree("t-003-again")
