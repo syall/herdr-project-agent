@@ -43,8 +43,10 @@
 # A killed slot step (t-079 I3): under the slot step, a watchdog checks every 2 s that this script's parent is still
 # the step; when it is not (the step was killed, even with SIGKILL, and the slot is free again), every part is
 # stopped as for TERM and the run says so (exit 143).
-# Exit: 0 all passed, 1 a part failed, 2 a usage error or no temp folder, 124 no slot came free (or the deadline),
-# 125 not run on a machine (refused, not reachable with suiteFallback "none"),
+# Exit: 0 all passed, 1 a part failed, 2 a usage error or no temp folder, 124: no slot came free, the deadline
+# (PA_SUITE_DEADLINE, before or during a run), the machine lost, the machine's REMOTE_TIMEOUT, or the run limit
+# (PA_SUITE_RUN_LIMIT) after it took the slot; 125 not run on a machine (refused, not reachable with suiteFallback
+# "none", no usable machine in suiteMachines with "none", the slot step failed),
 # 130/143/129 interrupt, terminate, hangup.
 # Node: $NODE, else `node` on PATH, else the newest mise install.
 set -u
@@ -194,6 +196,9 @@ if [ -n "${PA_SUITE_WATCH:-}" ]; then
   printf '%s\n' "$out" > "$PA_SUITE_WATCH.new" && mv "$PA_SUITE_WATCH.new" "$PA_SUITE_WATCH"
 fi
 unset PA_SUITE_WATCH PA_SUITE_PROGRESS
+# t-117 R16: the slot step's own (its deadline, pa-run's local mark, its run limit) are never the parts': the first
+# pass above passed them to the step; here, before any part starts, they go
+unset PA_SUITE_DEADLINE PA_SUITE_LOCAL_RUN PA_SUITE_RUN_LIMIT
 # Print a file whole, ending in a newline.
 show() { cat "$1"; [ -s "$1" ] && [ -n "$(tail -c 1 "$1")" ] && echo; return 0; }
 # Run part $1 (function $2) with its own TMPDIR in the run folder: a test that looks for its own leftovers in

@@ -156,6 +156,14 @@ HOME_LINE = "printf 'home %s\\n' \"$HOME\"\n"  # a step run's probe only: the ma
 SIGNAL_EXIT = {signal.SIGTERM: 143, signal.SIGINT: 130, signal.SIGHUP: 129}
 
 
+# t-117 R7: the slot step's own could-not-run lines (pa_hooks.COULD_NOT_RUN is built from these): the slot step and
+# pa-run's code end a run that did not run with `run-all.sh: not run on <M>: ...` (or `run-all.sh: not run: ...`),
+# a wait for a slot with `<who>: no slot came free in ...` or `<who>: stopped waiting for the suite slot after ...`
+NOT_RUN_PREFIX = "run-all.sh: not run"
+NO_SLOT_TEXT = ": no slot came free in "
+STOPPED_TEXT = ": stopped waiting for the suite slot after "
+
+
 class Waited(Exception):
     pass
 
@@ -228,12 +236,12 @@ def acquire(limit_slots, info, poll=POLL, limit=WAIT_LIMIT, say=print, who="pa-f
             say("{}: waiting for the suite slot (cap {}): running: {}".format(who, limit_slots, text))
             shown = text
         if time.time() - began >= limit:
-            raise Waited("{}: no slot came free in {:.0f} s (running: {})".format(who, time.time() - began, text))
+            raise Waited("{}{}{:.0f} s (running: {})".format(who, NO_SLOT_TEXT, time.time() - began, text))
         if beat:
             beat(text)
         reason = gone() if gone else None
         if reason:
-            raise Waited("{}: stopped waiting for the suite slot after {:.0f} s: {}".format(who, time.time() - began, reason))
+            raise Waited("{}{}{:.0f} s: {}".format(who, STOPPED_TEXT, time.time() - began, reason))
         time.sleep(poll)
 
 
@@ -741,10 +749,11 @@ def script_read_text(path):
         return ""
 
 
-def slot_remote(command, flags, kind, args, progress, cfg, at):
+def slot_remote(command, flags, kind, args, progress, cfg, at, run_limit=None, fell=None):
     """R12: the slot step's run on a machine through pa_run.py (beside this file): its exit code, or None to run on
-    this Mac (no machine took it and suiteFallback allows). Never imports pa.py: pa_run gets a script-mode pa (UTC
-    clock, this config, read_text) and h (git, the guard's DENY_PATHS)."""
+    this Mac (no machine took it and suiteFallback allows; fell["why"] says why, t-117 R15). Never imports pa.py:
+    pa_run gets a script-mode pa (UTC clock, this config, read_text) and h (git, the guard's DENY_PATHS). run_limit
+    (t-117 R8c): this step's PA_SUITE_RUN_LIMIT, for the run there."""
     import importlib.util
     import types
     machine = (machines(cfg)[0] or [{}])[0].get("machine") or "a machine"
@@ -755,13 +764,13 @@ def slot_remote(command, flags, kind, args, progress, cfg, at):
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
     except Exception as e:  # noqa: BLE001 - A2: a broken slot step says why, never silently on this Mac
-        print("run-all.sh: not run on {}: the slot step cannot load its parts ({}: {})".format(
-            machine, type(e).__name__, e), flush=True)
+        print("{} on {}: the slot step cannot load its parts ({}: {})".format(
+            NOT_RUN_PREFIX, machine, type(e).__name__, e), flush=True)
         update_progress(progress, state="done", exit=125, end=stamp())
         return 125
     module.S = sys.modules[__name__]
     module.pa = types.SimpleNamespace(now=utc_now, config=lambda: cfg, read_text=script_read_text, ROOT=home())
-    return module.slot_run(h, command, flags, kind, args, progress, at)
+    return module.slot_run(h, command, flags, kind, args, progress, at, run_limit=run_limit, fell=fell)
 
 
 def run_under_slot(argv):
@@ -789,10 +798,15 @@ def run_under_slot(argv):
     kind, flags = slot_kind(command, args.dir)
     placing = not caller and not os.environ.get("PA_SUITE_REMOTE") and not os.environ.get("PA_SUITE_LOCAL_RUN")
     cfg = read_config() if placing else {}
-    good = machines(cfg)[0] if placing else []
+    good, bad = machines(cfg) if placing else ([], [])
     at = deadline()
+    if placing and kind is not None and not good and bad and fallback(cfg)[0] == "none":  # t-117 R13
+        for b in bad:
+            print("run-all.sh: suiteMachines in {}: {}".format(os.path.join(home(), "config.json"), b), flush=True)
+        print("{}: no usable machine in suiteMachines (suiteFallback \"none\")".format(NOT_RUN_PREFIX), flush=True)
+        return 125
     if good and kind in ("full", "other") and fallback(cfg)[0] == "none":  # R12: by hand, with "none"
-        print("run-all.sh: not run on {}: use pa-full-suite: the integration part runs on this Mac (suiteFallback "
+        print(NOT_RUN_PREFIX + " on {}: use pa-full-suite: the integration part runs on this Mac (suiteFallback "
               "\"none\": never this Mac on its own; pa-run --local -- sh tests/run-all.sh --except-integration runs "
               "the rest here)".format(good[0]["machine"]), flush=True)
         return 125
@@ -810,10 +824,12 @@ def run_under_slot(argv):
                                  "worker": args.worker or None, "dir": os.path.realpath(args.dir),
                                  "commit": head_commit(args.dir), "pid": os.getpid(), "state": "waiting",
                                  "queued": stamp(), "median_total": total, "median_runs": runs})
+    fell, fallback_seconds = {}, None
     if good and kind in ("affected", "module"):  # R12: to a machine, through pa-run's code
-        code = slot_remote(command, flags, kind, args, progress, cfg, at)
+        code = slot_remote(command, flags, kind, args, progress, cfg, at, run_limit=run_limit, fell=fell)
         if code is not None:
             return code
+        fallback_seconds = round(time.time() - began, 1)  # t-117 R15: the time spent before falling back
         began = time.time()  # on this Mac after all (it said why): the local run's own times from here
     if at is not None and not caller:  # R14: the wait ends before the deadline
         limit = max(0, min(limit, wait_end(at, kind, "local") - time.time()))
@@ -891,8 +907,11 @@ def run_under_slot(argv):
         test_run_record({"at": stamp(), "run": run, "task": task_of(args.dir), "worker": args.worker or None,
                          "kind": kind, "argv": " ".join(["sh", "tests/run-all.sh"] + flags), "place": "local",
                          "machine": None, "os": mac_os(), "waited": round(started - queued, 1),
-                         "seconds": round(now - began, 1), "ran": round(now - started, 1), "overhead": {"setup": 0},
-                         "exit": code, "note": None, "output": None})
+                         "seconds": round(now - began, 1), "ran": round(now - started, 1),
+                         "overhead": dict({"setup": 0}, **({"fallback": fallback_seconds} if fallback_seconds is not None
+                                                          else {})),
+                         "exit": code, "note": "on this Mac: " + fell["why"] if fell.get("why") else None,
+                         "output": None})
     return code
 
 
@@ -1846,6 +1865,7 @@ class RemoteWatcher(threading.Thread):
         self.sink, self.fast = sink, fast  # t-107: each copied text to sink too; fast: 1 s polls for the first 60 s
         self.lines, self.code, self.remote_lines, self.lost, self.timed_out = 0, None, None, None, False
         self.began = self.last_ok = time.time()
+        self.ended_at = None  # when it ended (t-117 R14: the copy back counts from the run's end there to this)
         self.stopping, self.ended = threading.Event(), threading.Event()
         open(output, "w").close()
 
@@ -1867,6 +1887,7 @@ class RemoteWatcher(threading.Thread):
                     break
                 self.stopping.wait(min(self.poll, FAST_POLL) if self.fast and now - self.began < FAST_SPAN else self.poll)
         finally:
+            self.ended_at = time.time()
             self.ended.set()
 
     def tick(self):
@@ -2333,7 +2354,7 @@ def run_remote(h, args, record, directory, command, evidence, build_log, where, 
                     median_total=total, median_runs=runs)
     start, load, began = pa.now(), load_now(), time.time()
     terminal, child, watcher, side, notes = None, None, None, None, []
-    saved, prep, step_tools, ran_from = {}, None, {}, None
+    saved, prep, step_tools, ran_from, ran_there = {}, None, {}, None, None
 
     def on_signal(sig, frame):
         raise Interrupted(SIGNAL_EXIT.get(sig, 1))
@@ -2407,9 +2428,22 @@ def run_remote(h, args, record, directory, command, evidence, build_log, where, 
             notes.append("the remote part timed out after {} s".format(REMOTE_TIMEOUT))
         else:
             remote_code = watcher.code
+            t = time.time()
             n = watcher.final()
+            final_seconds = time.time() - t
             if n:
                 notes.append(n)
+            # t-117 R14: the test's own time there (t1 - t0, the run script's stamps) and the copy back (from t1 to
+            # the end of the last read), as pa-run's; null with a note when the stamps cannot be read
+            c, stamps_out, stamps_err = hc(["exec", "--on", machine, "--timeout", "30", "--", "cat", folder + "/t0",
+                                            folder + "/t1"])
+            stamps = [int(x) for x in stamps_out.split() if x.isdigit()] if not c else []
+            if len(stamps) == 2:
+                ran_there = stamps[1] - stamps[0]
+                times["copyback"] = round(max(0.0, (watcher.ended_at or time.time()) - stamps[1]) + final_seconds, 1)
+            else:
+                notes.append("the run's times there could not be read ({})".format(
+                    first_line(stamps_err, "exit {}".format(c)) if c else "t0, t1: {!r}".format(stamps_out[:80])))
         if local_stopped:
             notes.append("the local part was stopped")
         code = remote_code if remote_code or step else local_code
@@ -2468,7 +2502,7 @@ def run_remote(h, args, record, directory, command, evidence, build_log, where, 
         if not [n for n in left if n.startswith("rm -rf")]:
             update_progress(progress, cleaned=True)
         terminal = None  # cleaned
-        suite_timing(record, command, None, run, code, machine, machine, os_name, waited, seconds, remote_seconds,
+        suite_timing(record, command, None, run, code, machine, machine, os_name, waited, seconds, ran_there,
                      times, output)
         print(h.tail(out, 40))
         if change:

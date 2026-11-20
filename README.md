@@ -699,10 +699,19 @@ Any other test command goes the same way with `pa-run -- <command>` (for example
 unittest tests.test_x`): the tree to run is HEAD plus every change in the worktree (what `git add -A` would stage),
 sent as a bundle and a patch whose tree id is checked there; `pa-run --commit <base> --overlay <test file> --
 <command>` runs an older commit with only the listed files from the worktree (a failing-first check). Nothing is
-written in the repository's `.git`; a changed secret file (`.env`, keys, a profile's `secretPaths`) or a file under
-`.claude/` is never sent. It takes the same machine slots as `pa-full-suite`, streams the output back and exits with
-the command's code (125: not run, with the reason; 124: no slot came free). Each run is one line in
-`~/.config/herdr-pa/test-runs.jsonl`. When no machine can take a run, it runs on this Mac unless config.json says
+written in the repository's `.git`: no filter a repository configures runs, so a changed file whose clean filter
+git would run (an LFS file, say) is not sent (`pa-run --local` runs it in the worktree); a changed secret file
+(`.env`, keys, a profile's `secretPaths`) or a file under `.claude/` is never sent. A script or program path is
+judged by where it really leads: one that leaves the tree, or reaches `tests/run-all.sh` (other than `--affected`,
+`--except-integration`, `--module`) or `tests/pa_session_check.sh` through a symlink or hard link, is refused.
+pa-run trusts the worktree's code as the suite does: `python3 -c`, `node -e`, and a wrapper or copy of run-all.sh in
+the tree run as written. On a machine such a run has its own HOME, TMPDIR and XDG folders, the refusing hc shim
+first on PATH and its run folder removed after; nothing stops a command that reads absolute paths of the
+machine's account. It takes the same machine slots as `pa-full-suite`, streams the output back (a reader that
+closes early, `| head -1`, does not end the run) and exits with the command's code (125: not run, with the reason;
+124: no slot came free, the deadline `PA_SUITE_DEADLINE` before or during a run, the machine lost, the machine's
+`REMOTE_TIMEOUT`, or the run limit `PA_SUITE_RUN_LIMIT` after it took the slot). Each run is one line in
+`~/.config/herdr-pa/test-runs.jsonl` (a run refused after its command was checked too). When no machine can take a run, it runs on this Mac unless config.json says
 
 ```json
 "suiteFallback": "none"

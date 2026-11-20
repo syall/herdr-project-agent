@@ -15,10 +15,19 @@ to stderr); pa-run exits with argv's code.
 - argv (R2): an argv list, each word quoted into the fixed remote script. argv[0] is python3, node, sh or a relative
   path to an executable file in the tree. Refused (125): hc or any other name, `sh -c`, a command that starts an hc
   core (tests/pa_session_check.sh; tests/run-all.sh unless its first word is --affected, --except-integration
-  or --module: use pa-full-suite). sh's script and an argv[0] path must be relative and stay inside the tree; they
-  are compared by realpath (a symlink in the tree to either script is that script).
+  or --module: use pa-full-suite). sh's script and an argv[0] path are judged by their realpath from the tree's top
+  and the cwd, read as the file system reads it (a symlink first, then any ..; t-117 R1): it must be relative, its
+  realpath the top or under it, and not one of those two scripts (realpath or the same file: a symlink, a hard link
+  or another case spelling of it). Any other word naming the session check the same way is refused. With --commit
+  C, a script or argv[0] word (not an --overlay path) with a symlink anywhere in its path in C is refused: give the
+  real path. pa-run trusts the worktree's code as the suite does (t-117 R2): `python3 -c`, `node -e`, a wrapper or a
+  copy of run-all.sh in the tree run as written. What contains such a run on a machine is its own run folder: its
+  own HOME, TMPDIR and XDG folders, the refusing hc shim first on PATH, the folder removed after; it does not stop a
+  command that reads absolute paths of the machine's account.
 - Never sent (R8): a changed path matching the guard's secret patterns or the profile's secretPaths, or under
-  .claude/; ignored files; bundle and patch over 6 MB base64 (125).
+  .claude/; ignored files; a changed path whose clean filter git would run (t-117 R6: a filter driver configured
+  for it; nothing a repo's filter does is written under .git); bundle and patch over 6 MB base64 (they go the way
+  a failed setup does: this Mac with suiteFallback "mac", else 125).
 - Where (R9 as J1-D1, R10, R11): every run on a machine takes one of its `cap` slots (the same slots as full
   suites). The first configured machine with a free slot that is reachable; all busy: it waits, saying for whom, up
   to PA_SUITE_WAIT_LIMIT (600) s, then 124. None reachable or its setup failed: this Mac when config.json's
@@ -35,7 +44,9 @@ to stderr); pa-run exits with argv's code.
   slot_run (this code, no pa.py), honouring PA_SUITE_DEADLINE; a local pa-run sets PA_SUITE_LOCAL_RUN so a
   run-all.sh under it stays here and is not recorded twice.
   pa-run --report [--days N]   per kind: runs and medians here and on each machine, and which is faster (T2)
-Exit: argv's code; 125 not run; 124 no slot came free or the machine was lost.
+Exit: argv's code; 125 not run (with the reason; recorded once it passed the argv check); 124: no slot came free,
+the deadline (PA_SUITE_DEADLINE, before or during a run), the machine lost, the machine's REMOTE_TIMEOUT, or the
+slot step's run limit (PA_SUITE_RUN_LIMIT) after it took the slot.
 """
 import base64
 import fcntl
@@ -91,8 +102,34 @@ PREFIX = "pa-run"  # the slot step (slot_run) says its lines as run-all.sh, on s
 TO_STDOUT = False
 
 
+STDOUT_GONE = False  # R5: stdout was closed (`pa-run ... | head -1`): the run goes on, its output in the file
+
+
+def to_stdout(text):
+    """R5: text to stdout; a closed stdout (EPIPE) is noted once and fd 1 pointed at /dev/null, so nothing after it
+    (nor the interpreter's exit flush) fails; the run goes on and the output file keeps everything."""
+    global STDOUT_GONE
+    if STDOUT_GONE:
+        return
+    try:
+        sys.stdout.write(text)
+        sys.stdout.flush()
+    except (OSError, ValueError):
+        STDOUT_GONE = True
+        try:
+            fd = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(fd, sys.stdout.fileno())
+            os.close(fd)
+        except (OSError, ValueError):
+            pass
+
+
 def say(line):
-    print("{}: {}".format(PREFIX, line), file=sys.stdout if TO_STDOUT else sys.stderr, flush=True)
+    text = "{}: {}\n".format(PREFIX, line)
+    if TO_STDOUT:
+        to_stdout(text)
+    else:
+        print(text, end="", file=sys.stderr, flush=True)
 
 
 def infer_kind(argv, commit, overlay):
@@ -133,12 +170,12 @@ def check_cwd(value):
     return (n, None) if n is not None else (None, "--cwd {!r} is not a folder inside the tree (relative, no ..)".format(value))
 
 
-def executable_in(top, rel, commit, overlay, h):
-    """Is rel (from the top) an executable file in the tree to run?"""
+def executable_in(top, rel, commit, overlay, h, resolved=None):
+    """Is rel (from the top) an executable file in the tree to run? resolved: its realpath in the worktree (R1)."""
     if commit and rel not in overlay:
         code, out, _ = h.git(top, "ls-tree", commit, "--", rel)
         return not code and out.split(" ")[0] == "100755"
-    path = os.path.join(top, rel)
+    path = resolved or os.path.join(top, rel)
     return os.path.isfile(path) and os.access(path, os.X_OK)
 
 
@@ -180,41 +217,70 @@ def sh_script(argv):
     return i, None
 
 
-def tree_path(subdir, word):
-    """word as a path from the tree's top, normalised the way the file system reads it ('..' and '//' resolved)."""
+def resolve(top, subdir, word):
+    """R1 (t-117): sh's script, or an argv[0] path, as the file system reads it from the tree's top and the cwd: its
+    realpath (each symlink followed, then any .. taken from where it led; no lexical normalising first). None when
+    the word is absolute or empty, or its realpath is not the top or under it (it leaves the tree). top is a
+    realpath."""
+    if not word or word.startswith("/"):
+        return None
+    rel = lexical_rel(subdir, word)
+    if rel == ".." or rel.startswith("../"):  # J1-D13 kept: a path that leaves and comes back is refused too
+        return None
+    path = os.path.realpath(os.path.join(top, subdir or "", word))
+    return path if path == top or path.startswith(top.rstrip("/") + "/") else None
+
+
+def same_file(path, top, target):
+    """Is path (a realpath) the tree's file target: the same realpath, or the same file (a hard link or another case
+    spelling of it)?"""
+    b = os.path.realpath(os.path.join(top, target))
+    if path == b:
+        return True
+    try:
+        return os.path.samefile(path, b)
+    except (OSError, ValueError):
+        return False
+
+
+def lexical_rel(subdir, word):
+    """word from the tree's top, normalised lexically (the path git names it by in a commit's tree)."""
     return posixpath.normpath(posixpath.join(subdir or "", word)) if word else ""
 
 
-def script_rel(subdir, word):
-    """sh's script, or an argv[0] path: from the tree's top, normalised; None when it is absolute, empty or leaves
-    the tree (a path that leaves and comes back, ../w/tests/run-all.sh, is refused too: J1-D13)."""
-    if not word or word.startswith("/"):
+def symlink_in(top, commit, subdir, word, h):
+    """R1: the first part of word's path (from the top) that is a symlink (mode 120000) in commit's tree, else None.
+    Every prefix up to each .. is asked (lnk/../x: lnk), in one git ls-tree."""
+    parts, prefixes = [], []
+    for c in posixpath.join(subdir or "", word).split("/"):
+        if c in ("", "."):
+            continue
+        if c == "..":
+            if parts:
+                parts.pop()
+            continue
+        parts.append(c)
+        prefixes.append("/".join(parts))
+    if not prefixes:
         return None
-    rel = tree_path(subdir, word)
-    if rel == ".." or rel.startswith("../") or rel.startswith("/"):
-        return None
-    return rel
-
-
-def is_file(top, rel, target):
-    """Is rel (from the top) the tree's file target: the same realpath under the top, or the same file (a symlink,
-    a hard link or another case spelling of it)?"""
-    a = os.path.realpath(os.path.join(top, rel))
-    b = os.path.realpath(os.path.join(top, target))
-    if a == b:
-        return True
-    try:
-        return os.path.samefile(a, b)
-    except OSError:
-        return False
+    code, out, err = h.git(top, "ls-tree", "-z", commit, "--", *prefixes)
+    if code:
+        return "{} (git ls-tree: {})".format(word, err or code)
+    for entry in out.split("\0"):
+        meta, _, name = entry.partition("\t")
+        if meta.split(" ")[0] == "120000":
+            return name
+    return None
 
 
 def check_argv(argv, top, subdir, commit=None, overlay=(), h=None):
     """R2: None when argv may run, else why not."""
     if not argv:
         return "no command after --"
+    h = h or _h
     first = argv[0]
     script = None
+    resolved = None
     if first == "sh":
         script, why = sh_script(argv)
         if why:
@@ -223,20 +289,31 @@ def check_argv(argv, top, subdir, commit=None, overlay=(), h=None):
         script = 0
     if script is not None:  # what runs as a script: relative, inside the tree, and not one that starts an hc core
         word = argv[script]
-        rel = script_rel(subdir, word)
-        if rel is None:
-            return "{} {!r} is an absolute path or leaves the tree (..): give a relative path inside the tree".format(
-                "sh's script" if script else "argv[0]", word)
-        if is_file(top, rel, SESSION_CHECK):
+        what = "sh's script" if script else "argv[0]"
+        resolved = resolve(top, subdir, word)
+        if resolved is None:
+            return "{} {!r} is an absolute path or leaves the tree (its realpath is not under the tree's top): give a " \
+                   "relative path inside the tree".format(what, word)
+        if same_file(resolved, top, SESSION_CHECK):
             return "{} starts an hc core: use pa-full-suite: the integration part runs on this Mac".format(SESSION_CHECK)
-        if is_file(top, rel, RUN_ALL):
+        if same_file(resolved, top, RUN_ALL):
             flags = argv[script + 1:]
             if not flags or flags[0] not in RUN_ALL_FLAGS:  # allowlist: everything else is a whole run (fail closed)
                 return "{} {} is a whole run or starts an hc core (allowed: {}): use pa-full-suite".format(
                     RUN_ALL, " ".join(repr(f) if not f else f for f in flags) or "(no flag)", ", ".join(RUN_ALL_FLAGS))
-    for word in argv[1:]:  # the session check named anywhere as a path in the tree
-        if not word.startswith("-") and tree_path(subdir, word) == SESSION_CHECK:
-            return "{} starts an hc core: use pa-full-suite: the integration part runs on this Mac".format(SESSION_CHECK)
+        if commit and lexical_rel(subdir, word) not in set(overlay or ()):
+            link = symlink_in(top, commit, subdir, word, h)
+            if link:
+                return "{} {!r}: {} is a symlink in {}'s tree: give the real path".format(what, word, link, commit)
+    for word in argv[1:]:  # the session check named anywhere as a path, by realpath or the same file
+        if word and not word.startswith("-"):
+            try:
+                path = os.path.realpath(os.path.join(top, subdir or "", word))
+            except (OSError, ValueError):
+                continue
+            if same_file(path, top, SESSION_CHECK):
+                return "{} starts an hc core: use pa-full-suite: the integration part runs on this Mac".format(
+                    SESSION_CHECK)
     if first == "hc":
         return "argv[0] is hc: hc never runs from pa-run (a test reaches no hc core)"
     if first not in PROGRAMS:
@@ -245,7 +322,7 @@ def check_argv(argv, top, subdir, commit=None, overlay=(), h=None):
         if "/.." in "/" + first + "/" or first.startswith(".."):
             return "argv[0] {!r} has ..: give a path inside the tree".format(first)
         rel = clean_rel(os.path.join(subdir or "", first))
-        if rel is None or not executable_in(top, rel, commit, set(overlay or ()), h or _h):
+        if rel is None or not executable_in(top, rel, commit, set(overlay or ()), h, resolved):
             return "argv[0] {!r} is not python3, node, sh or an executable file in the tree".format(first)
     return None
 
@@ -255,9 +332,9 @@ _h = None
 
 # ---- the tree to run (R4-R8) ----
 
-def git_bytes(top, env, *args, stdin=None):
+def git_bytes(top, env, *args, stdin=None, pre=()):
     try:
-        r = subprocess.run(["git"] + GIT_SAFE + ["-C", top] + list(args), env=env, input=stdin,
+        r = subprocess.run(["git"] + GIT_SAFE + list(pre) + ["-C", top] + list(args), env=env, input=stdin,
                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300)
     except subprocess.TimeoutExpired:
         return 124, b"", b"git timed out"
@@ -275,15 +352,45 @@ def secret_patterns(h, profile):
                                  for p in (profile or {}).get("secretPaths", []) if isinstance(p, str)]
 
 
+FILTER_KEY = re.compile(r"^filter\.(.+)\.(clean|process)$")
+FILTER_FAILED = re.compile(r"^fatal: (.+): clean filter '(.+)' failed$", re.M)
+
+
+def no_filters(top, env):
+    """R6 (t-117): git -c words that keep every filter driver configured for the repo (any config level) from
+    running: its clean and process commands empty and required true, so git refuses a path that needs the filter
+    (`fatal: <path>: clean filter '<d>' failed`) and runs nothing of the repo's (a filter may write under .git, e.g.
+    an LFS store). A filter attribute whose driver is not configured is no filter (git ignores it)."""
+    code, out, _ = git_bytes(top, env, "config", "--name-only", "-z", "--get-regexp", r"^filter\..*\.(clean|process)$")
+    drivers = []
+    for key in (out.decode("utf-8", "surrogateescape").split("\0") if not code else []):
+        m = FILTER_KEY.match(key.strip())
+        if m and m.group(1) not in drivers:
+            drivers.append(m.group(1))
+    words_ = []
+    for d in drivers:
+        words_ += ["-c", "filter.{}.clean=".format(d), "-c", "filter.{}.process=".format(d),
+                   "-c", "filter.{}.required=true".format(d)]
+    return words_
+
+
+def filtered(err):
+    """(path, driver) when git refused a path because of no_filters' words, else None."""
+    m = FILTER_FAILED.search(err.decode("utf-8", "replace") if isinstance(err, bytes) else err or "")
+    return (m.group(1), m.group(2)) if m else None
+
+
 def tree_to_run(h, top, commit=None, overlay=None, secrets=None):
     """R4-R6, R8: {commit, head, tree, patch (bytes), paths}. secrets: [(pattern, what)] checked against the changed
     paths (with .claude/), or None to skip (a local run: nothing is sent). Raises NotRun. Writes nothing in .git:
     git add and write-tree see only the temp object folder (with the repo's objects as alternates, git would
     "freshen" an existing object by setting its mtime), so every object they write lands there; read-tree and diff,
-    which only read, see the repo's objects too (J1-D3)."""
+    which only read, see the repo's objects too (J1-D3). Every configured filter driver is kept from running
+    (no_filters: a path that needs one is refused, R6)."""
     load(None)
-    base_env = dict(os.environ, GIT_OPTIONAL_LOCKS="0")
-    for k in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES"):
+    base_env = dict(os.environ, GIT_OPTIONAL_LOCKS="0", LC_ALL="C")  # C: git's messages read below (R6)
+    for k in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+              "GIT_LITERAL_PATHSPECS", "GIT_GLOB_PATHSPECS", "GIT_NOGLOB_PATHSPECS", "GIT_ICASE_PATHSPECS", "LANGUAGE"):
         base_env.pop(k, None)
     code, out, err = git_bytes(top, base_env, "rev-parse", "--verify", "-q", "HEAD^{commit}")
     head = text(out)
@@ -305,6 +412,7 @@ def tree_to_run(h, top, commit=None, overlay=None, secrets=None):
         code, _, _ = git_bytes(top, base_env, "merge-base", "--is-ancestor", base, head)
         if code:
             raise NotRun("--commit {} is not an ancestor of HEAD {} (v1 runs only HEAD's history)".format(commit, head[:12]))
+    filters = no_filters(top, base_env)
     scratch = tempfile.mkdtemp(prefix="pa-run-tree-")
     try:
         os.makedirs(os.path.join(scratch, "objects", "pack"))
@@ -331,12 +439,18 @@ def tree_to_run(h, top, commit=None, overlay=None, secrets=None):
                 except OSError:
                     pass
             steps = ([] if copied else [("read-tree", head)]) + [("add", "-A")]
+        # R12: --overlay words are literal paths (a glob or :(exclude) names only that path)
+        add_env = dict(write_env, GIT_LITERAL_PATHSPECS="1") if commit else write_env
         for step in steps:
-            code, _, err = git_bytes(top, write_env if step[0] == "add" else env, *step)
-            if code and step[0] == "add" and not commit:  # a copied index git cannot use: from HEAD instead
-                git_bytes(top, env, "read-tree", head)
-                code, _, err = git_bytes(top, write_env, *step)
+            code, _, err = git_bytes(top, add_env if step[0] == "add" else env, *step, pre=filters)
+            if code and step[0] == "add" and not commit and not filtered(err):  # a copied index git cannot use
+                git_bytes(top, env, "read-tree", head, pre=filters)
+                code, _, err = git_bytes(top, add_env, *step, pre=filters)
             if code:
+                hit = filtered(err)
+                if hit:
+                    raise NotRun("{} uses the clean filter {} (it writes under .git): not sent; pa-run --local runs it "
+                                 "in the worktree".format(*hit))
                 raise NotRun("git {}: {}".format(step[0], S.first_line(text(err), "exit {}".format(code))))
         code, out, err = git_bytes(top, write_env, "write-tree", "--missing-ok")
         tree = text(out)
@@ -407,6 +521,7 @@ class Run(object):
         self.printed = 0
         self.slot, self.worker, self.deadline, self.on_mac = False, os.environ.get("HC_TERMINAL_ID") or None, None, None
         self.temp_output = False  # the slot step's output outside a task's evidence folder: removed, not recorded
+        self.slot_at, self.run_limit = None, None  # when it took a machine's slot; the slot step's run limit (R8c)
 
     def finish(self, code, place, machine=None, os_name=None, ran=None):
         seconds = round(time.time() - self.began, 1)
@@ -426,8 +541,7 @@ class Run(object):
         return code
 
     def sink(self, chunk):
-        sys.stdout.write(chunk)
-        sys.stdout.flush()
+        to_stdout(chunk)  # R5: a closed stdout does not end the run
         self.printed += chunk.count("\n")
 
 
@@ -489,6 +603,28 @@ def main(h, args):
             signal.signal(sig, old)
 
 
+def refuse(r, line, code=NOT_RUN):
+    """R3 (t-117): a run that passed the argv check and then did not run: the line said, and recorded as the note
+    (one build.log line, one test-runs.jsonl line)."""
+    say(line)
+    r.notes.append(line)
+    return r.finish(code, None)
+
+
+def cwd_missing(r, tree=None):
+    """R10 (t-117): why --cwd (r.subdir) is not a folder in the tree to run (tree: its id, read with git ls-tree -d;
+    else the worktree), or None."""
+    if not r.subdir:
+        return None
+    if tree:
+        code, out, _ = r.h.git(r.top, "ls-tree", "-d", "-z", tree, "--", r.subdir)
+        if not code and any(e.partition("\t")[2] == r.subdir and e.split(" ")[0] == "040000" for e in out.split("\0")):
+            return None
+    elif os.path.isdir(os.path.join(r.top, r.subdir)):
+        return None
+    return "--cwd {} is not a folder in the tree to run".format(r.subdir)
+
+
 def place_and_run(r):
     args = r.args
     cfg = pa.config()
@@ -497,36 +633,40 @@ def place_and_run(r):
     for b in bad:
         say("suiteMachines in {}: {}".format(where, b))
     if args.on and not [m for m in good if m["machine"] == args.on]:
-        say("not run on {}: not a machine of suiteMachines in {}".format(args.on, where))
-        return NOT_RUN
-    fb, fb_note = S.fallback(cfg) if good else ("mac", None)
+        return refuse(r, "not run on {}: not a machine of suiteMachines in {}".format(args.on, where))
+    fb, fb_note = S.fallback(cfg) if good or bad else ("mac", None)
     if fb_note:
         say("{} in {}".format(fb_note, where))
+    if not good and bad and fb == "none":  # R13 (t-117): never this Mac on its own
+        return refuse(r, "not run: no usable machine in suiteMachines (suiteFallback \"none\")")
     if not good:
-        return run_local(r, "--local" if args.local else "no suiteMachines in " + where)
+        return run_local(r, "--local" if args.local else
+                         ("no usable machine in suiteMachines in " if bad else "no suiteMachines in ") + where)
     candidates = [m for m in good if not args.on or m["machine"] == args.on]
     name = args.on or candidates[0]["machine"]
-    try:
-        tree = tree_to_run(r.h, r.top, args.commit, r.overlay, secret_patterns(r.h, r.profile))
-        size = len(base64.b64encode(tree["patch"])) if tree["patch"] else 0
-        if size > S.BUNDLE_MAX:
-            raise NotRun("too large: the patch is {} bytes base64, at most {} with the bundle".format(size, S.BUNDLE_MAX))
-    except NotRun as e:
-        say("not run on {}: {}".format(name, e))
-        return NOT_RUN
-    r.tree = tree
     info = {"task": r.task.get("task"), "worker": r.worker,
             "what": "{} {}: {}".format("run-all.sh" if r.slot else "pa-run", r.kind, words(r.argv)[:120]), "dir": r.top}
-    if r.progress is None:  # the slot step's run has its own (kind run-all.sh)
+    if r.progress is None:  # the slot step's run has its own (kind run-all.sh); made before the tree (R4)
         r.progress = S.new_progress({"run": r.run, "kind": "pa-run", "what": words(r.argv)[:ARGV_KEEP], "for": r.kind,
                                      "task": r.task.get("task"), "worker": info["worker"], "dir": r.top,
-                                     "commit": tree["commit"], "tree": tree["tree"], "pid": os.getpid(),
+                                     "commit": None, "tree": None, "pid": os.getpid(),
                                      "state": "waiting", "queued": pa.now(), "output": r.output, "place": "local"})
-    else:
-        S.update_progress(r.progress, commit=tree["commit"], tree=tree["tree"])
     probes, chosen, slot = {}, None, None
-    queued = time.time()
     try:
+        try:  # R4: inside the try that catches a signal
+            tree = tree_to_run(r.h, r.top, args.commit, r.overlay, secret_patterns(r.h, r.profile))
+        except NotRun as e:
+            return refuse(r, "not run on {}: {}".format(name, e))
+        r.tree = tree
+        S.update_progress(r.progress, commit=tree["commit"], tree=tree["tree"])
+        why = cwd_missing(r, tree["tree"])
+        if why:
+            return refuse(r, "not run on {}: {}".format(name, why))
+        size = len(base64.b64encode(tree["patch"])) if tree["patch"] else 0
+        if size > S.BUNDLE_MAX:  # R11: as a bundle too large: the setup-failed path
+            return not_there(r, name, "setup failed: too large: the patch is {} bytes base64, at most {} with the "
+                                      "bundle".format(size, S.BUNDLE_MAX), fb)
+        queued = time.time()
         for m in candidates:  # a free slot first (a local flock), then the probe
             f, _ = S.try_slot(S.machine_dir(m["machine"]), m["cap"], info)
             if not f:
@@ -551,7 +691,16 @@ def place_and_run(r):
             else:
                 why = "; ".join("{}: {}".format(k, v.get("reason")) for k, v in probes.items())
                 return not_there(r, name, "not reachable ({})".format(why), fb)
-        r.waited = time.time() - queued
+        r.slot_at = time.time()
+        r.waited = r.slot_at - queued
+        if r.deadline:  # R8a (t-117): no run is started that the deadline leaves no time for (either pass)
+            left = r.deadline - time.time()
+            if time.time() >= S.wait_end(r.deadline, r.kind, chosen["machine"]):
+                median = S.kind_median(r.kind, chosen["machine"])
+                return refuse(r, "not run on {}: the deadline (PA_SUITE_DEADLINE) leaves no time to run ({:.0f} s "
+                                 "left, the run takes about {:.0f} s there)".format(
+                                     chosen["machine"], max(0.0, left),
+                                     median if median is not None else S.DEADLINE_MARGIN), NO_SLOT)
         p = probes[chosen["machine"]]
         r.overhead["probe"] = p.get("seconds")
         try:
@@ -559,7 +708,7 @@ def place_and_run(r):
         except S.SetupFailed as e:
             return not_there(r, chosen["machine"], "setup failed: {}".format(e), fb)
     except S.Interrupted as e:
-        say("interrupted while choosing a place")
+        say("interrupted before the run started")
         r.notes.append("interrupted")
         return r.finish(e.code, None)
     finally:
@@ -655,6 +804,7 @@ def run_remote(r, machine, found, slot):
             t = time.time()
             terminal = S.start_remote(machine, r.run, folder, tools, argv_script(folder, tools, r.argv, r.subdir))
             r.overhead["start"] = round(time.time() - t, 1)
+            started = time.time()  # R8b: how long it ran there
         except S.SetupFailed:
             S.cleanup(machine, r.run, terminal)
             S.update_progress(r.progress, cleaned=True, place="local", machine=None, remote=None)
@@ -662,18 +812,28 @@ def run_remote(r, machine, found, slot):
         S.update_progress(r.progress, state="running", start=pa.now(), remote={"folder": folder, "terminal": terminal})
         watcher = S.RemoteWatcher(machine, folder, r.output, r.progress, None, sink=r.sink, fast=True)
         watcher.start()
-        late = False
+        late = over = False
+        limit_at = (r.slot_at or started) + r.run_limit if r.run_limit else None
         while not watcher.ended.wait(0.2):
             if r.deadline and time.time() >= r.deadline:  # R14: the hook's deadline came
                 late = True
+                break
+            if limit_at and time.time() >= limit_at:  # R8c (t-117): the slot step's run limit after the slot
+                over = True
                 break
         seen = time.time()
         ran = None
         if late:
             watcher.stop()
             code = NO_SLOT
-            r.notes.append("did not finish on {}: the deadline (PA_SUITE_DEADLINE) came after {:.0f} s; the run "
-                           "there was ended".format(machine, time.time() - r.began))
+            r.notes.append("did not finish on {}: the deadline (PA_SUITE_DEADLINE) came after it ran {:.0f} s there "
+                           "(waited {:.0f} s for the slot); the run there was ended".format(
+                               machine, time.time() - started, r.waited))
+        elif over:
+            watcher.stop()
+            code = NO_SLOT
+            r.notes.append("did not finish on {}: it ran past its {} s limit after taking the slot "
+                           "(PA_SUITE_RUN_LIMIT); the run there was ended".format(machine, r.run_limit))
         elif watcher.lost is not None:
             code = NO_SLOT
             r.notes.append("machine {} lost after {:.0f} s".format(machine, watcher.lost))
@@ -721,6 +881,19 @@ def run_remote(r, machine, found, slot):
         S.update_progress(r.progress, cleaned=not [n for n in left if n.startswith("rm -rf")])
         r.notes.append("interrupted")
         return r.finish(e.code, machine, machine, os_name)
+    except S.SetupFailed:  # nothing ran there; cleaned above; the caller goes the fallback way
+        raise
+    except BaseException as e:  # R5 (t-117): anything else: end and clean the run there, record it, then raise
+        try:
+            if watcher is not None:
+                watcher.stop()
+            for n in S.cleanup(machine, r.run, terminal):
+                say("cleanup on {}: {}".format(machine, n))
+            r.notes.append("pa-run failed: {}: {}".format(type(e).__name__, e))
+            r.finish(NOT_RUN if r.slot else 1, machine, machine, os_name)
+        except Exception:  # noqa: BLE001 - the first error is the one raised
+            pass
+        raise
     finally:
         if watcher is not None:
             watcher.stop()
@@ -728,6 +901,10 @@ def run_remote(r, machine, found, slot):
 
 def run_local(r, why):
     """This Mac: the worktree itself, or (--commit) a scratch clone with the tree to run checked out."""
+    if not r.args.commit:
+        why_not = cwd_missing(r)  # R10
+        if why_not:
+            return refuse(r, "not run on this Mac: " + why_not)
     say("run {} on this Mac ({}): output in {}".format(r.run, why, r.output))
     if why != "--local":
         r.notes.append("on this Mac: " + why)
@@ -746,6 +923,9 @@ def run_local(r, why):
             t = time.time()
             try:
                 tree = getattr(r, "tree", None) or tree_to_run(r.h, r.top, r.args.commit, r.overlay, None)
+                missing = cwd_missing(r, tree["tree"])  # R10
+                if missing:
+                    raise NotRun(missing)
                 scratch = tempfile.mkdtemp(prefix="pa-run-")
                 root = os.path.join(scratch, "w")
                 local_checkout(r.top, root, tree)
@@ -854,74 +1034,81 @@ def check_changed(value, secrets):
     return None
 
 
-def slot_run(h, command, flags, kind, step_args, progress, at):
+def slot_run(h, command, flags, kind, step_args, progress, at, run_limit=None, fell=None):
     """R12: the slot step's `sh tests/run-all.sh <flags>` on a machine, through pa-run's code (tree to run, place,
     ship, terminal, watcher, cleanup, records). Lines say `run-all.sh: ...` on stdout, the first `on <M> (<os>)`,
     then the run's output as it comes; 124/125 end with `run-all.sh: not run on <M>: <reason>` (124 for a run that
     started and did not end: `run-all.sh: did not finish on <M>: <reason>`, MF-J2-1). Its exit code, or
-    LOCAL (not reachable or setup failed with suiteFallback "mac": the step runs it here and has said why)."""
+    LOCAL (not reachable or setup failed with suiteFallback "mac": the step runs it here and has said why, also in
+    fell["why"] when fell is a dict, R15). run_limit (t-117 R8c): the step's PA_SUITE_RUN_LIMIT; a run there still
+    running that long after it took the slot is ended (124). A signal anywhere in it ends it with the signal's
+    code; any other error with 125 and `run-all.sh: not run on <M>: the slot step failed (<type>: <message>)`
+    (never 1, which the hook reads as a test failure; R4)."""
     import types
     global PREFIX, TO_STDOUT, _h
     PREFIX, TO_STDOUT, _h = "run-all.sh", True, h
-    cfg = pa.config()
-    record_ = S.task_record(step_args.dir) or {}
-    top = os.path.realpath(step_args.dir)
-    argv = ["sh", RUN_ALL] + list(flags)
-    args = types.SimpleNamespace(on=None, local=False, commit=None, overlay=None, cwd=None, kind=kind)
-    name = (S.machines(cfg)[0] or [{}])[0].get("machine") or "a machine"
+    name = "a machine"
     output_dir = None
-    space = (record_.get("space") or "").split("/")[-1]
-    evidence = os.path.join(S.home(), "spaces", space, "evidence", record_.get("task") or "") if space and \
-        S.SEGMENT.fullmatch(space) and S.SEGMENT.fullmatch(record_.get("task") or "") else None
-    if not (evidence and os.path.isdir(os.path.dirname(evidence))):
-        output_dir = tempfile.mkdtemp(prefix="pa-run-slot-")
-        evidence = output_dir
-    else:
-        os.makedirs(evidence, exist_ok=True)
+    saved = {}
 
-    def done(code, line=None):
-        if line:
-            say("not run on {}: {}".format(name, line))
+    def on_signal(sig, frame):
+        raise S.Interrupted(S.SIGNAL_EXIT.get(sig, 1))
+
+    def done(code):
         S.update_progress(progress, state="done", exit=code, end=pa.now())
         return code
     try:
-        try:
-            profile = script_profile(record_, cfg)
-        except NotRun as e:
-            return done(NOT_RUN, str(e))
-        why = check_changed(os.environ.get("PA_CHANGED_FILES", ""), secret_patterns(h, profile))
-        if why:
-            return done(NOT_RUN, why)
-        r = Run(h, args, dict(record_, task=record_.get("task")), None, profile, output=os.devnull)
+        for sig in S.SIGNAL_EXIT:
+            saved[sig] = signal.signal(sig, on_signal)
+        cfg = pa.config()
+        name = (S.machines(cfg)[0] or [{}])[0].get("machine") or "a machine"
+        record_ = S.task_record(step_args.dir) or {}
+        top = os.path.realpath(step_args.dir)
+        argv = ["sh", RUN_ALL] + list(flags)
+        args = types.SimpleNamespace(on=None, local=False, commit=None, overlay=None, cwd=None, kind=kind)
+        space = (record_.get("space") or "").split("/")[-1]
+        evidence = os.path.join(S.home(), "spaces", space, "evidence", record_.get("task") or "") if space and \
+            S.SEGMENT.fullmatch(space) and S.SEGMENT.fullmatch(record_.get("task") or "") else None
+        if not (evidence and os.path.isdir(os.path.dirname(evidence))):
+            output_dir = tempfile.mkdtemp(prefix="pa-run-slot-")
+            evidence = output_dir
+        else:
+            os.makedirs(evidence, exist_ok=True)
+        # R3 (t-117): the Run first, so a refusal below is recorded (one test-runs.jsonl line)
+        r = Run(h, args, dict(record_, task=record_.get("task")), None, {}, output=os.devnull)
         r.output = os.path.join(evidence, "run-{}.out".format(r.run))
         r.temp_output = output_dir is not None
         r.slot, r.worker, r.deadline, r.progress = True, step_args.worker or None, at, progress
+        r.run_limit = run_limit
         r.argv, r.top, r.subdir, r.overlay = argv, top, "", []
-        here = {}
+        try:
+            r.profile = script_profile(record_, cfg)
+        except NotRun as e:
+            return refuse(r, "not run on {}: {}".format(name, e))
+        why = check_changed(os.environ.get("PA_CHANGED_FILES", ""), secret_patterns(h, r.profile))
+        if why:
+            return refuse(r, "not run on {}: {}".format(name, why))
+        here = fell if isinstance(fell, dict) else {}
 
         def on_mac(r_, why_):
             say("on this Mac: " + why_)
             here["why"] = why_
             return LOCAL
         r.on_mac = on_mac
-        saved = {}
-
-        def on_signal(sig, frame):
-            raise S.Interrupted(S.SIGNAL_EXIT.get(sig, 1))
-        for sig in S.SIGNAL_EXIT:
-            saved[sig] = signal.signal(sig, on_signal)
-        try:
-            code = place_and_run(r)
-        finally:
-            for sig, old in saved.items():
-                signal.signal(sig, old)
+        code = place_and_run(r)
         if code is LOCAL:
             S.update_progress(progress, state="waiting", place="local", machine=None, remote=None,
                               note="on this Mac: " + here.get("why", ""))
             return LOCAL
-        S.update_progress(progress, state="done", exit=code, end=pa.now())
-        return code
+        return done(code)
+    except S.Interrupted as e:  # R4: a signal before or after place_and_run's own handler
+        return done(e.code)
+    except Exception as e:  # noqa: BLE001 - R4: a broken slot step says why; never 1 (a test failure)
+        say("not run on {}: the slot step failed ({}: {})".format(name, type(e).__name__, e))
+        return done(NOT_RUN)
     finally:
+        for sig, old in saved.items():
+            signal.signal(sig, old)
         if output_dir:
             shutil.rmtree(output_dir, ignore_errors=True)
 

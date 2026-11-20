@@ -303,12 +303,25 @@ AFFECTED_LIMIT = AFFECTED_WAIT + AFFECTED_RUN
 DEADLINE_SPARE = 30  # R14: PA_SUITE_DEADLINE is this long before that limit
 
 
+# t-117 R7: the slot step's own could-not-run last lines, as pa_suite prints them (NOT_RUN_PREFIX, NO_SLOT_TEXT,
+# STOPPED_TEXT there): `run-all.sh: not run on <M>: ...` / `run-all.sh: not run: ...`, `<who>: no slot came free in
+# ...`, `<who>: stopped waiting for the suite slot after ...`. Any other 124 or 125 is the command's own.
+COULD_NOT_RUN = re.compile(r"^(?:run-all\.sh: not run(?: on |: )|\S+: no slot came free in |"
+                           r"\S+: stopped waiting for the suite slot after )")
+
+
+def could_not_run(out):
+    """R7: the last non-empty line, when it is one of the slot step's could-not-run lines, else None."""
+    lines = [l.strip() for l in (out or "").splitlines() if l.strip()]
+    return lines[-1].rstrip(".") if lines and COULD_NOT_RUN.match(lines[-1]) else None
+
+
 def not_run_line(out):
     """R15: the line that says why the tests did not run: the last `... not run ...` / `no slot came free` line,
     else the last line."""
     lines = [l.strip() for l in (out or "").splitlines() if l.strip()]
     for line in reversed(lines):
-        if re.search(r"\bnot run\b|no slot came free|timed out after", line):
+        if re.search(r"\bnot run\b|no slot came free", line):
             return line.rstrip(".")
     return lines[-1].rstrip(".") if lines else "(no output)"
 
@@ -342,10 +355,10 @@ def hook_affected(data, args):
     if not code:
         return 0
     unfinished = did_not_finish(out) if code == 124 else None
-    if code in (124, 125) and not unfinished:  # R15: could not run (no slot, not reachable, refused, the wait's
-        # deadline), not a test failure
-        message = "The affected tests could not run (task {}): {}. Do not change code for this; report it " \
-                  "(r-cloud-runs).\n{}".format(record["task"], not_run_line(out), tail(out, 20))
+    if code in (124, 125) and not unfinished and could_not_run(out):  # R15, t-117 R7: could not run (no slot, not
+        # reachable, refused, the wait's deadline: the slot step's own last line), not a test failure
+        message = "The affected tests could not run (task {}): {}. Do not change code for this; report " \
+                  "it.\n{}".format(record["task"], not_run_line(out), tail(out, 20))
         if "--stop" in args:  # let the session stop, saying so
             print(message, file=sys.stderr)
             return 1
@@ -4719,9 +4732,8 @@ def types_namespace(names):
 
 def cmd_run(args):
     """pa-run (t-107): any test command in the tree to run, on a configured machine or this Mac: pa_run.py."""
-    import types
     module = load_tool("pa_run")
-    return sys.exit(module.main(types.SimpleNamespace(**globals()), args))
+    return sys.exit(module.main(types_namespace(globals()), args))
 
 
 def suite_record(directory, record, command, code, seconds, pins=None, extra=None):
