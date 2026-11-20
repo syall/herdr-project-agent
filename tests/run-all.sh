@@ -125,13 +125,45 @@ store() { [ -n "$NODE" ] || { echo "no node found (set NODE)"; return 1; }; "$NO
 # The integration check is three parts at once (t-112): $1 is the part, 1..integration_parts, each with its own
 # scratch folder and so its own private hc core.
 integration_parts=3
-integration() {
-  S=$(mktemp -d /tmp/t001.XXXXXX) || return 1
-  sh tests/setup-scratch.sh "$S" && sh tests/pa_session_check.sh "$S" --part "$1"
-  code=$?
-  rm -rf "$S"
-  return $code
+# t-192 R4: a part's scratch is t001.XXXXXX in $PA_INTEGRATION_SCRATCH (tests only; else /tmp: the private hc core's
+# socket path must stay short). The part is a subshell whose EXIT trap removes it on any exit (TERM, INT and HUP exit
+# through it); its .owner says "<the subshell's pid> <its ps start time>". SIGKILL runs no trap, so part 1 first
+# removes the stale scratch of killed runs: a real folder of this user, named t001. and six characters, whose .owner
+# names a pid not running or running with another start time; one with no readable .owner (a symlink, empty, not
+# two fields, a pid that is not a positive number) only when it was last changed more than 24 h ago. Never fails.
+scratch_root=${PA_INTEGRATION_SCRATCH:-/tmp}
+started() ( set -- $(ps -o lstart= -p "$1" 2>/dev/null); [ $# -gt 0 ] || exit 1; IFS=_; echo "$*" )
+sweep_scratch() {
+  n=0 uid=$(id -u)
+  if ! started $$ >/dev/null; then echo "integration scratch: not swept (ps does not say when a process started)"; return 0; fi
+  for d in "$scratch_root"/t001.??????; do
+    [ -n "$(find "$d" -maxdepth 0 -type d -user "$uid" 2>/dev/null)" ] || continue
+    pid= when= extra=
+    if [ -f "$d/.owner" ] && [ ! -L "$d/.owner" ]; then { read -r pid when extra < "$d/.owner"; } 2>/dev/null; fi
+    case $pid in ''|0*|*[!0-9]*) pid= ;; esac
+    if [ -z "$when" ] || [ -n "$extra" ]; then pid=; fi
+    if [ -n "$pid" ]; then
+      [ "$(started "$pid")" = "$when" ] && continue  # its run is alive
+    elif [ -z "$(find "$d" -maxdepth 0 -mmin +1440 2>/dev/null)" ]; then
+      continue  # no owner, and changed in the last 24 h (a run just made it, or one from before t-192)
+    fi
+    rm -rf "$d" 2>/dev/null && n=$((n + 1))
+  done
+  echo "integration scratch: removed $n stale folder(s) in $scratch_root"
+  return 0
 }
+integration() (
+  S=
+  trap 'if [ -n "$S" ]; then rm -rf "$S"; fi' EXIT
+  trap 'exit 143' TERM
+  trap 'exit 130' INT
+  trap 'exit 129' HUP
+  if [ "$1" = 1 ]; then sweep_scratch; fi
+  S=$(mktemp -d "$scratch_root/t001.XXXXXX") || exit 1
+  me=$(exec sh -c 'echo $PPID')
+  echo "$me $(started "$me")" > "$S/.owner"
+  sh tests/setup-scratch.sh "$S" && sh tests/pa_session_check.sh "$S" --part "$1"
+)
 
 # The parts to run, in the order they are printed: part_<i> is the function, name_<i> its name, arg_<i> its
 # argument. Each unit test module is its own part (they share no state: each makes its own temp folder and
