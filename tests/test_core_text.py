@@ -962,8 +962,8 @@ class T041DiskState(unittest.TestCase):  # t-041 J2: R7, R8, R9 (text), R10 (AC1
         p = self.part("## The pass", "## After a restart or a compaction")
         self.assertIn("4. Write the ledger again, with its `context` checkpoint, before you end your turn, and "
                       "before any long wait.", p)
-        self.assertIn("write nothing but the `passCount` and the checkpoint's `pass` and `at`, and end the turn in "
-                      "one line.", p)
+        self.assertIn("write nothing but the `passCount` and the checkpoint's `pass`, `at` and `session`, and end the "
+                      "turn in one line.", p)  # t-041 J7-R2: `session` too
 
 
 class T037Restart(unittest.TestCase):  # t-037 R16: pa-restart is the person's
@@ -987,6 +987,30 @@ class T041FreshReset(unittest.TestCase):  # t-041 J4 (plan Q1): the launcher's l
         text = text[:text.index("## After a restart or a compaction")]
         self.assertIn("A message starting `[launcher] context` comes from your launcher: journal it with "
                       "`\"trigger\": \"context\"`, write the checkpoint (clean only if it is) and end the turn.", text)
+
+
+class T041Tune(unittest.TestCase):  # t-041 J7 (card d-274): R2, R4 (a, b), R5 (a)
+    def setUp(self):
+        self.raw = read("runtime", "core", "orchestrator.md")
+
+    def test_t7_1_empty_pass_writes_session(self):
+        text = flat(section(self.raw, "## The pass"))
+        self.assertIn("the checkpoint's `pass`, `at` and `session`", text)
+
+    def test_t7_2_corrections_go_to_working_notes(self):
+        text = flat(section(self.raw, "## What must be on disk"))
+        self.assertIn("When you journal a `repeat` or `redo` about a rule or a standing word, add a `# Working notes` "
+                      "line to `standing.md` in the same pass with the right value and the rule id.", text)
+
+    def test_t7_3_numbers_from_the_active_rules(self):
+        text = flat(section(self.raw, "## Workers"))
+        self.assertIn("Take every number a rule sets (mutations, tiers, places) from the active rules, never from an "
+                      "older handoff.", text)
+
+    def test_t7_4_each_pass_adds_one(self):
+        text = flat(section(self.raw, "## The pass"))
+        self.assertIn("Each pass adds 1 to `passCount` in its first ledger write; every journal line and the checkpoint "
+                      "of that pass carry that number. A pass ends with your turn.", text)
 
 
 def part(raw, start, end):

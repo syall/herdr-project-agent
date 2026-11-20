@@ -1183,11 +1183,15 @@ class J4Clean(J4Base):  # R2, AC2.1, AC2.2, AC8.2
         self.assertEqual([r[0] for r in reasons], ["b"])
         self.assertIn("not clean (waiting for the yes)", self.words(reasons))
 
-    def test_c4_another_session(self):
+    def test_c4_another_session_accepted_by_its_time(self):  # t-041 J7-R2 (d-274 Q2): written in this turn
         self.checkpoint(session="ffffffff-eeee-dddd-cccc-bbbbbbbbbbbb")
+        self.assertEqual(self.clean(), (True, []))
+
+    def test_c4c_another_session_before_the_turn(self):  # J7-R2: still refused, both ids named
+        self.checkpoint(session="ffffffff-eeee-dddd-cccc-bbbbbbbbbbbb", at=pa.iso_time(self.base - 30))
         ok, reasons = self.clean()
         self.assertEqual(([r[0] for r in reasons], ok), (["b"], False))
-        self.assertIn("another session", self.words(reasons))
+        self.assertIn("checkpoint of another session (ffffffff not aaaaaaaa)", self.words(reasons))
 
     def test_c4b_null_session_accepted_by_the_times(self):  # Q3
         self.checkpoint(session=None)
@@ -1830,7 +1834,174 @@ class J4Followup(J4Base):  # R17, AC17.1
         code, out, err = self.cli("followup", "--space", "sp1")
         self.assertIn("verdict", out)
         self.assertEqual(sorted(r), sorted(["since", "until", "days", "before", "after", "fell", "resets", "compact", "markers",
-                                            "standing", "judgement", "verdict"]))
+                                            "standing", "judgement", "verdict", "refusals", "acceptedByTime", "passes"]))
+
+
+class J7Unacted(J4Base):  # t-041 J7-R1: R2 (c) looks only at this conversation's window
+    def card(self, cid, answered):
+        dump({"id": cid, "status": "answered", "question": "q", "options": ["a"], "answer": "a", "answered": answered},
+             os.path.join(self.dir, "decisions", cid + ".json"))
+
+    def filler(self, size, start, step=1, name="x"):
+        """Journal lines of about 300 bytes, stamped from `start` on, naming no card, `size` bytes in all."""
+        lines, n, t = [], 0, start
+        while n < size:
+            line = json.dumps({"at": pa.iso_time(t), "pass": 1, "trigger": "report", "why": name * 280}) + "\n"
+            lines.append(line)
+            n += len(line)
+            t += step
+        return "".join(lines)
+
+    def test_c6c_old_answered_cards_do_not_count(self):  # the J6 case: 90 of 90 refusals
+        old = self.base - 2 * 86400
+        for i in range(200):
+            self.card("d-{}".format(100 + i), pa.iso_time(old + i))
+        write(os.path.join(self.dir, "journal.jsonl"), self.filler(1500000, old - 86400, step=1))
+        self.assertEqual(self.clean(), (True, []))
+
+    def test_c6d_answered_in_this_conversation(self):
+        self.card("d-007", pa.iso_time(self.base - 40))  # running.since is base - 50
+        ok, reasons = self.clean()
+        self.assertEqual(([r[0] for r in reasons], ok), (["c"], False))
+
+    def test_c6e_answered_in_the_slack_before_it(self):
+        self.card("d-007", pa.iso_time(self.base - 50 - 1200))  # 20 min before this conversation began
+        self.assertIn("card d-007 answered, not acted on", self.words(self.clean()[1]))
+
+    def test_c6f_naming_line_beyond_256_kb(self):
+        self.card("d-007", pa.iso_time(self.base - 20))
+        write(os.path.join(self.dir, "journal.jsonl"),
+              json.dumps({"at": pa.iso_time(self.base - 10), "why": "acting on d-007"}) + "\n"
+              + self.filler(600000, self.base - 9, step=0))
+        self.assertEqual(self.clean(), (True, []))
+
+    def test_c6g_no_running_record_a_day_back(self):
+        ctx = self.ctx()
+        del ctx["running"]
+        self.checkpoint(session=SID)
+        self.card("d-007", pa.iso_time(self.now - 25 * 3600))
+        self.assertEqual(self.clean(ctx), (True, []))
+        self.card("d-008", pa.iso_time(self.now - 2 * 3600))
+        ok, reasons = self.clean(ctx)
+        self.assertEqual(([r[0] for r in reasons], ok), (["c"], False))
+        self.assertIn("card d-008 answered, not acted on", self.words(reasons))
+
+    def test_c6h_journal_not_read_back_that_far(self):
+        self.card("d-007", pa.iso_time(self.base - 1800))  # inside W (running.since - 30 min)
+        write(os.path.join(self.dir, "journal.jsonl"), self.filler(6 << 20, self.base - 1700, step=0))
+        reads = []
+        real_open = open
+
+        class Counting:
+            def __init__(self, f):
+                self.f = f
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                self.f.close()
+
+            def read(self, n=-1):
+                data = self.f.read(n)
+                reads.append(len(data))
+                return data
+
+            def __getattr__(self, name):
+                return getattr(self.f, name)
+
+        def counting_open(path, mode="r", *a, **kw):
+            f = real_open(path, mode, *a, **kw)
+            return Counting(f) if str(path).endswith("journal.jsonl") else f
+        pa.open = counting_open
+        try:
+            ok, reasons = self.clean()
+        finally:
+            del pa.open
+        self.assertFalse(ok)
+        self.assertIn("card d-007 answered, journal not read back that far", self.words(reasons))
+        self.assertLessEqual(sum(reads), (4 << 20) + (256 << 10))
+
+
+class J7Checkpoint(J4Base):  # t-041 J7-R2: the accepted-by-time note
+    def test_c4d_note_once_per_idle_period(self):
+        self.big()
+        self.checkpoint(session="ffffffff-eeee-dddd-cccc-bbbbbbbbbbbb")
+        os.remove(os.path.join(self.dir, "standing.md"))  # another reason, so no reset is taken
+        ctx = self.ctx()
+        self.once(ctx)
+        self.once(ctx, self.now + 10)
+        note = "checkpoint names session ffffffff, this session aaaaaaaa: accepted by its time"
+        self.assertEqual(self.log().count(note), 1, self.log())
+
+
+class J7Texts(J4Base):  # t-041 J7-R3, R4 (c, d), R5 (b)
+    def test_k13_the_net_fires_below_its_window(self):
+        settings, _p = pa.read_context(self.dir)
+        self.assertIn("net 400,000 (compacts at about 366k)", pa.context_summary(settings, False))
+        self.assertIn("(compacts at about 416k)", pa.context_summary(dict(settings, net=450000), True))
+
+    def rules(self, value):
+        path = os.path.join(self.dir, "rules.json")
+        write(path, value if isinstance(value, str) else json.dumps(value))
+
+    def test_p5_active_rule_ids(self):
+        self.rules({"version": 1, "rules": [{"id": "r-a", "status": "active"}, {"id": "r-p", "status": "proposed"},
+                                            {"id": "r-b", "status": "active"}]})
+        text = pa.fresh_prompt(self.dir, 1, "pass-cap", SID)
+        self.assertIn("Active rules (rules.json): r-a, r-b; read it before you write a handoff.", text)
+        for bad in ("{not json", json.dumps({"version": 1}), json.dumps([1]), json.dumps({"rules": "x"})):
+            self.rules(bad)
+            self.assertNotIn("Active rules", pa.fresh_prompt(self.dir, 1, "pass-cap", SID))
+        os.remove(os.path.join(self.dir, "rules.json"))
+        self.assertNotIn("Active rules", pa.fresh_prompt(self.dir, 1, "pass-cap", SID))
+        self.rules({"rules": [{"id": "r-rule-number-{:02d}".format(i), "status": "active"} for i in range(60)]})
+        line = [x for x in pa.fresh_prompt(self.dir, 1, "pass-cap", SID).split("\n") if x.startswith("Active rules")][0]
+        self.assertLessEqual(len(line), 400)
+        write(os.path.join(self.dir, "standing.md"), (SEED + "- 2026-11-18 " + "y" * 6000)[:6000])
+        self.assertLessEqual(len(pa.fresh_prompt(self.dir, 3, "pass-cap", SID)), 9000)
+
+    def test_p6_next_pass(self):
+        self.assertIn("Your next pass is 13.", pa.fresh_prompt(self.dir, 1, "pass-cap", SID))
+        os.remove(os.path.join(self.dir, "ledger.json"))
+        self.assertNotIn("next pass", pa.fresh_prompt(self.dir, 1, "pass-cap", SID))
+
+    def test_compact_instructions_name_rules_json(self):
+        self.assertIn("rules.json", pa.compact_instructions())
+
+
+class J7Followup(J4Base):  # t-041 J7-R5 (c), R7; J4Followup's fixture, not its tests again
+    fixture = J4Followup.fixture
+    journal = J4Followup.journal
+
+    def test_v6_refusals_by_reason(self):
+        self.fixture()
+        write(os.path.join(self.dir, "session.log"),
+              "2026-11-17T10:00:00Z context not reset (ctx=260000 reason=pass-cap): card d-9 answered, not acted on\n"
+              "2026-11-18T10:00:00Z context not reset (ctx=260000 reason=pass-cap): card d-1 answered, not acted on\n"
+              "2026-11-18T10:01:00Z context not reset (ctx=261000 reason=pass-cap): card d-2 answered, not acted on\n"
+              "2026-11-18T10:02:00Z context not reset (ctx=262000 reason=task-cap): checkpoint of another session "
+              "(ffffffff not aaaaaaaa)\n"
+              "2026-11-17T11:00:00Z checkpoint names session ffffffff, this session aaaaaaaa: accepted by its time\n"
+              "2026-11-18T11:00:00Z checkpoint names session ffffffff, this session aaaaaaaa: accepted by its time\n")
+        r = pa.followup_report(self.dir, "2026-11-18T00:00:00Z")
+        self.assertEqual(r["refusals"], {"total": 3, "byReason": {"card answered, not acted on": 2,
+                                                                  "checkpoint of another session": 1}})
+        self.assertEqual(r["acceptedByTime"], 1)
+        code, out, err = self.cli("followup", "--space", "sp1")
+        self.assertIn("refusals 3", out)
+
+    def test_v7_long_passes(self):
+        self.fixture()
+        self.journal(*[{"at": pa.iso_time(pa.parse_time("2026-11-18T06:00:00Z") + i * 100), "pass": 7, "trigger": "message"}
+                       for i in range(25)])
+        self.journal({"at": "2026-11-18T08:00:00Z", "pass": 8, "trigger": "report"})
+        r = pa.followup_report(self.dir, "2026-11-18T00:00:00Z")
+        self.assertEqual(r["passes"]["maxLines"], 25)
+        self.assertEqual(r["passes"]["ids"], 3)  # 7, 8 and the fixture's 19
+        self.assertEqual([(p["pass"], p["lines"], p["from"], p["to"]) for p in r["passes"]["long"]],
+                         [(7, 25, "2026-11-18T06:00:00Z", "2026-11-18T06:40:00Z")])
+        self.assertEqual(json.loads(json.dumps(r)), r)
 
 
 if __name__ == "__main__":
