@@ -2574,6 +2574,121 @@ cases["P-costs-drill"] = async () => { // AC9.2: task -> phases and sessions; ac
   check(moneyLabelled(v).length === 0, `labelled (${JSON.stringify(moneyLabelled(v))})`);
 };
 
+// ---- t-143 the Costs tab: long lists scroll, sort, filter, task links (evidence/t-143/plan.md) ----
+// The element with this id in the Costs view (null: none).
+function costsEl(v, key) {
+  let found = null;
+  const walk = (x) => { if (found || !x || typeof x !== "object") return; if (x.key === key) { found = x; return; } for (const k of x.kids ?? []) walk(k); };
+  walk(v.render(cx));
+  return found;
+}
+// The By task section's text segments (between its head and the next section's).
+const taskSegs = (v) => { const segs = costsView(v).text.split(" | "); const a = segs.indexOf("By task"), b = segs.indexOf("By session type"); return segs.slice(a, b); };
+// Three tasks whose cost, id and recent orders differ: cost t-2, t-10, t-3; id t-2, t-3, t-10; recent t-10, t-2, t-3.
+function sortSummary() {
+  const s = costsSummary();
+  s.byTask = [
+    { key: "t-2", title: "Two", state: "in-progress", tokens: 500, money: 5, calls: 2, phases: [], sessions: ["s2"] },
+    { key: "t-10", title: "Ten", state: "done", tokens: 300, money: 3, calls: 1, phases: [], sessions: ["s10"] },
+    { key: "t-3", title: "Three", state: "queued", tokens: 100, money: 1, calls: 1, phases: [], sessions: [] }];
+  s.sessions = [
+    { key: "s2", tokens: 500, money: 5, calls: 2, kind: "worker", role: "build", program: "claude", task: "t-2", model: "model-a", from: isoAt(T0 - 7200000), to: isoAt(T0 - 3600000), state: "closed", source: "recorded" },
+    { key: "s10", tokens: 300, money: 3, calls: 1, kind: "worker", role: "review", program: "claude", task: "t-10", model: "model-a", from: isoAt(T0 - 1800000), to: isoAt(T0 - 600000), state: "closed", source: "recorded" }];
+  s.byDay = [
+    { key: isoAt(T0).slice(0, 10), tokens: 100, money: 1, calls: 1, byActivity: {} },
+    { key: isoAt(T0 - 86400000).slice(0, 10), tokens: 800, money: 8, calls: 3, byActivity: {} }];
+  return s;
+}
+const orderOf = (segs, keys) => keys.map((k) => segs.indexOf(k));
+const ascending = (xs) => xs.every((x, i) => x >= 0 && (i === 0 || x > xs[i - 1]));
+
+cases["P143-scroll"] = async () => { // I2: a long By task list sits in a fixed-height box that scrolls; a short one draws at its own height
+  const s = costsSummary();
+  s.byTask = Array.from({ length: 30 }, (_, i) => ({ key: `t-${i + 1}`, title: `Task ${i + 1}`, state: "queued", tokens: 10, money: 0.1, calls: 1, phases: [], sessions: [] }));
+  const { v } = await costsWorld({ summary: s });
+  const box = costsEl(v, "costs-list-task");
+  check(Boolean(box), "a costs-list-task box");
+  check(Boolean(box?.style?.overflow_y_scrollbar) && Array.isArray(box?.style?.h), `it scrolls at a fixed height (style ${JSON.stringify(box?.style)})`);
+  const text = costsView(v).text;
+  check(text.includes("Task 1") && text.includes("Task 30"), "every row is still drawn inside it");
+  check(moneyLabelled(v).length === 0, `labelled (${JSON.stringify(moneyLabelled(v))})`);
+  const short = (await costsWorld()).v, sbox = costsEl(short, "costs-list-task");
+  check(Boolean(sbox) && !sbox.style?.h, `three tasks: no fixed height (style ${JSON.stringify(sbox?.style)})`);
+};
+
+cases["P143-drill-scroll"] = async () => { // I2: a task with many workers: its open drill scrolls in its own box, every session listed
+  const s = costsSummary();
+  const keys = Array.from({ length: 25 }, (_, i) => `w${String(i).padStart(3, "0")}aaaa`);
+  s.sessions = keys.map((key) => ({ key, tokens: 10, money: 0.1, calls: 1, kind: "worker", role: "build", program: "claude", task: "t-1", model: "model-a", from: isoAt(T0 - 7200000), to: isoAt(T0 - 3600000), state: "closed", source: "recorded" }));
+  s.byTask[0].sessions = keys;
+  const { v } = await costsWorld({ summary: s });
+  await click(v, "costs-task-0"); await settle();
+  const box = costsEl(v, "costs-drill-task");
+  check(Boolean(box?.style?.overflow_y_scrollbar) && Array.isArray(box?.style?.h), `the drill scrolls at a fixed height (style ${JSON.stringify(box?.style)})`);
+  const text = inspect(box ?? {}).text;
+  check(keys.every((k) => text.includes(k)), "every session is in the drill box");
+};
+
+cases["P143-sort"] = async () => { // I3: By task sorts by cost (default: the summary's order), task id, recent; By day by day (default) or cost
+  const { v } = await costsWorld({ summary: sortSummary() });
+  const keys = ["t-2", "t-10", "t-3"];
+  check(ascending(orderOf(taskSegs(v), keys)), `cost order by default (got ${taskSegs(v).join(" | ")})`);
+  await click(v, "costs-sort-task-task"); await settle();
+  check(ascending(orderOf(taskSegs(v), ["t-2", "t-3", "t-10"])), `task order (got ${taskSegs(v).join(" | ")})`);
+  await click(v, "costs-sort-task-recent"); await settle();
+  check(ascending(orderOf(taskSegs(v), ["t-10", "t-2", "t-3"])), `recent order (got ${taskSegs(v).join(" | ")})`);
+  await click(v, "costs-task-0"); await settle(); // ids stay the summary's index: costs-task-0 is t-2 in any order
+  check(costsView(v).text.includes("s2 · worker"), "costs-task-0 is still t-2");
+  await click(v, "costs-sort-task-cost"); await settle();
+  check(ascending(orderOf(taskSegs(v), keys)), `back to cost (got ${taskSegs(v).join(" | ")})`);
+  const days = sortSummary().byDay.map((d) => d.key), segs = () => costsView(v).text.split(" | ");
+  check(ascending(orderOf(segs(), days)), "By day newest first by default");
+  await click(v, "costs-sort-day-cost"); await settle();
+  check(ascending(orderOf(segs(), [days[1], days[0]])), `By day by cost (got ${segs().slice(-20).join(" | ")})`);
+  check(moneyLabelled(v).length === 0, `labelled (${JSON.stringify(moneyLabelled(v))})`);
+};
+
+cases["P143-filter"] = async () => { // I3: a filter field (made on its click) narrows By task by id, title or state; none matching says so; clear ends it
+  const { v } = await costsWorld({ summary: sortSummary() });
+  check(!costsView(v).text.includes("of 3 tasks"), "no filter before the click");
+  await click(v, "costs-filter-task"); await settle();
+  const st = v.costs.peek(S), field = st?.filter;
+  check(Boolean(field) && typeof field.set === "function", "a filter field");
+  field.set("ten"); field.fire("change"); await settle();
+  let segs = taskSegs(v);
+  check(segs.includes("t-10") && !segs.includes("t-2") && !segs.includes("t-3") && segs.join(" | ").includes("1 of 3 tasks"), `title match (got ${segs.join(" | ")})`);
+  field.set("QUEUED"); field.fire("change"); await settle();
+  segs = taskSegs(v);
+  check(segs.includes("t-3") && !segs.includes("t-10"), `state match, any case (got ${segs.join(" | ")})`);
+  field.set("zzz"); field.fire("change"); await settle();
+  check(taskSegs(v).join(" | ").includes("No task matches"), `none matching (got ${taskSegs(v).join(" | ")})`);
+  await click(v, "costs-filter-task-clear"); await settle();
+  segs = taskSegs(v);
+  check(["t-2", "t-10", "t-3"].every((k) => segs.includes(k)) && !segs.join(" | ").includes("of 3 tasks"), `cleared (got ${segs.join(" | ")})`);
+};
+
+cases["P143-link"] = async () => { // I4: a task id is a link: the Tasks tab opens with that task; the row does not toggle; no link for (no task) or a deleted task
+  const { v } = await costsWorld();
+  const { clicks } = costsView(v);
+  check(Boolean(clicks["costs-link-task-0"]) && !clicks["costs-link-task-1"] && !clicks["costs-link-task-2"], `a link for t-1 only (have ${Object.keys(clicks).filter((k) => k.startsWith("costs-link"))})`);
+  await click(v, "costs-link-task-0"); await settle();
+  check(g.__shared["project-agent.show"]?.task === "t-1" && g.__shared["project-agent.show"]?.space === S, `the show request (got ${JSON.stringify(g.__shared["project-agent.show"])})`);
+  look(v);
+  check(v.view === "tasks" && v.open.has("t-1"), `the Tasks tab with t-1 open (view ${v.view}, open ${[...v.open]})`);
+  check(!v.costs.peek(S).open.task, "the row did not toggle");
+  // The By activity drill's Tasks lines link too.
+  v.open.delete("t-1");
+  await click(v, "view-costs"); await settle();
+  await click(v, "costs-activity-0"); await settle();
+  check(Boolean(costsView(v).clicks["costs-link-activity-0-0"]), `a link in the activity drill (have ${Object.keys(costsView(v).clicks).filter((k) => k.startsWith("costs-link"))})`);
+  await click(v, "costs-link-activity-0-0"); await settle();
+  look(v);
+  check(v.view === "tasks" && v.open.has("t-1"), `opened again from the drill (view ${v.view}, open ${[...v.open]})`);
+  // (no task) in the unattributed drill is not a link.
+  await click(v, "view-costs"); await settle(); await click(v, "costs-activity-2"); await settle();
+  check(!costsView(v).clicks["costs-link-activity-2-0"], "no link for (no task)");
+};
+
 cases["P-costs-machine"] = async () => { // §5.1: the machine row is Herdr's machine name or "this computer", never a host key
   for (const [machine, want] of [[null, "this computer"], [M, M]]) {
     const { v } = await costsWorld({ machine });
