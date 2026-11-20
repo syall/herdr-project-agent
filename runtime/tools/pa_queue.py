@@ -82,7 +82,9 @@ QUESTION = ("for each place where the base's change lies within about 30 lines o
 
 
 class Refused(Exception):
-    pass
+    def __init__(self, message, lines=()):
+        super().__init__(message)
+        self.lines = list(lines)  # t-146 RL-146-1: what was done and saved before the refusal, printed with it
 
 
 short = pa_push.short
@@ -1414,7 +1416,7 @@ def cmd_refresh(args):
             try:
                 lines += merge_run(ctx, data, rec)
             except Refused as r:  # t-109 RL-1: a busy push lock; refresh's own work is saved and still printed
-                lines.append("merge skipped: {}".format(r))
+                lines += r.lines + ["merge skipped: {}".format(r)]  # t-146 RL-146-1: a card answered since refresh began
         lines += ["{}. {}: {}".format(i, e["task"], e.get("state")) for i, e in enumerate(rec["entries"], 1)] + ctx.notes
         lines.append("pa-queue show --repo {} reads every state now".format(ctx.repo))
     print("\n".join(lines))
@@ -1745,7 +1747,7 @@ def merge_run(ctx, data, rec):
         try:  # V-M5: held from the first merge to the push card's write; a push run holds it while it pushes
             stack.enter_context(pa_push.push_lock(ctx.directory))
         except pa_push.Refused as r:
-            raise Refused("{}: nothing was merged (the approvals are recorded); merge again after it".format(r.message))
+            raise Refused("{}: nothing was merged (the approvals are recorded); merge again after it".format(r.message), lines)
         more, merged = merge_front(ctx, data, rec)
         lines += more
         if merged:
@@ -2146,6 +2148,8 @@ def main():
     try:
         return COMMANDS[args.command](args)
     except Refused as r:
+        if r.lines:
+            print("\n".join(r.lines))
         print("pa-queue: refused: {}".format(r), file=sys.stderr)
         return 1
     except pa_hooks.ContentError as e:
