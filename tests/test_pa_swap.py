@@ -1331,5 +1331,198 @@ class S7_S11_Records(Base):
         self.assertTrue(pa.pa_session_argv(argv, SP))
 
 
+# ---- round 2, REVIEW L1: the terminal back to the launcher when a child that held it is gone without settle_child --
+
+# The old image's stand-in on the pty (the stand-in shell's foreground job): a child of its own in a group of its own
+# takes the terminal's foreground (as spawn's child_setup gives it to Claude), turns mouse reports on (as a Claude
+# leaves them), runs 2 s; meanwhile this process execs pa.py with the swap argv `value` (KID_OWN: the child with the
+# launcher's own group as its pgid, so the new image adopts it without a group). The job-control signals are ignored
+# as run_session leaves them across an exec (t-193 R2.1).
+FG_OLD = r"""
+import os, signal, sys, time
+d, pa_py, project, value, profile = sys.argv[1:6]
+for s in (signal.SIGTTOU, signal.SIGTTIN, signal.SIGTSTP):
+    signal.signal(s, signal.SIG_IGN)
+r, w = os.pipe()
+kid = os.fork()
+if kid == 0:
+    os.close(w)
+    os.setpgid(0, 0)
+    os.read(r, 1)
+    open(os.path.join(d, "kid-held"), "w").write("1" if os.tcgetpgrp(0) == os.getpgrp() else "0")
+    os.write(1, b"\x1b[?1000h")
+    time.sleep(2)
+    open(os.path.join(d, "kid-end"), "w").write(repr(time.time()))
+    os._exit(0)
+os.close(r)
+try:
+    os.setpgid(kid, kid)
+except OSError:
+    pass
+os.tcsetpgrp(0, kid)
+os.write(w, b"x")
+os.close(w)
+value = value.replace("KID_OWN", "{}:{}".format(kid, os.getpgrp()))
+open(os.path.join(d, "child.pid"), "w").write(str(kid))
+os.execv(sys.executable, [sys.executable, pa_py, "session", "--space=sp1", "--project=" + project, "--profile=" + profile,
+                          "--name=proj", "--swap-child=" + value, "--swap-id=0123456789abcdef"])
+"""
+
+# A stub Claude that records whether it got the terminal's foreground, then waits (it reads nothing).
+FG_STUB = r"""
+import json, os, sys, time
+if sys.argv[1:2] in (["--help"], ["--version"]):
+    print("2.1.300 (Claude Code)")
+    sys.exit(0)
+try:
+    fg = os.tcgetpgrp(0)
+except OSError:
+    fg = None
+with open(os.path.join(os.environ["T195_DIR"], "stub-starts.jsonl"), "a") as f:
+    f.write(json.dumps({"pid": os.getpid(), "pgrp": os.getpgrp(), "fg": fg, "at": time.time()}) + "\n")
+time.sleep(3600)
+"""
+
+MOUSE_ON = b"\x1b[?1000h"
+
+
+class L1_TerminalBack(unittest.TestCase):
+    """REVIEW L1 and its class (round 2): a child that held the terminal's foreground and ended without settle_child
+    (reaped by an exec that could not adopt it, an adopted child with no group, waited out before an error) leaves the
+    terminal to the launcher's group again, reset, before the next Claude starts or the error is shown; so the next
+    Claude starts with the foreground (else its first read stops it, SIGTTIN)."""
+
+    def run_case(self, value, profile="test"):
+        base = self.base = os.path.realpath(tempfile.mkdtemp(dir=TMP))
+        home, project = os.path.join(base, "pa"), os.path.join(base, "proj")
+        os.makedirs(project)
+        install(home)
+        for name, text in (("shell.py", SHELL), ("old.py", FG_OLD), ("stub.py", FG_STUB), ("bin/hc", HC)):
+            write(os.path.join(base, name), text)
+        os.chmod(os.path.join(base, "bin", "hc"), 0o755)
+        write(os.path.join(home, "profiles", "test", "profile.json"), json.dumps(
+            {"name": "test", "claude": [sys.executable, os.path.join(base, "stub.py")], "codex": ["true"]}))
+        self.space = os.path.join(home, "spaces", SP)
+        dump({"version": 1, "space": SP, "project": project, "profile": "test", "name": "proj", "terminal": "t1",
+              "terminals": ["t1"], "sessionId": SID, "sessionStarted": False}, os.path.join(self.space, "agent.json"))
+        env = {k: v for k, v in os.environ.items() if k not in ("HC_TERMINAL_ID", "CLAUDECODE")}
+        env.update(HERDR_PA_HOME=home, HERDR_APP_HOME=os.path.join(base, "app"), HC_TERMINAL_ID="t1", T195_DIR=base,
+                   CLAUDE_CONFIG_DIR=os.path.join(base, "claude"),
+                   PATH=os.path.join(base, "bin") + os.pathsep + os.environ.get("PATH", ""))
+        master, slave = pty.openpty()
+        self.shown, lock = [b""], threading.Lock()
+        err = open(os.path.join(base, "shell.err"), "w")
+        self.addCleanup(err.close)
+        proc = subprocess.Popen([sys.executable, os.path.join(base, "shell.py"), os.path.join(base, "shell.json"),
+                                 sys.executable, os.path.join(base, "old.py"), base, os.path.join(home, "tools", "pa.py"),
+                                 project, value, profile], stdin=slave, stdout=slave, stderr=err,
+                                start_new_session=True, cwd=project, env=env)
+        os.close(slave)
+        state = {"open": True}
+
+        def reader():
+            while state["open"]:
+                try:
+                    if not select.select([master], [], [], 0.1)[0]:
+                        continue
+                    chunk = os.read(master, 65536)
+                except (OSError, ValueError):
+                    return
+                if not chunk:
+                    return
+                with lock:
+                    self.shown[0] += chunk
+        t = threading.Thread(target=reader, daemon=True)
+        t.start()
+
+        def stop():
+            for s in lines(os.path.join(base, "stub-starts.jsonl")):
+                kill_group(s.get("pgrp"))
+            try:
+                kill_pid(int(read(os.path.join(base, "child.pid")) or 0))
+            except ValueError:
+                pass
+            try:
+                launcher = int(read(os.path.join(base, "shell.json.pid")) or 0)
+            except ValueError:
+                launcher = 0
+            kill_group(launcher)
+            kill_pid(launcher)
+            kill_group(proc.pid)
+            proc.kill()
+            proc.wait()
+            state["open"] = False
+            t.join(2)
+            os.close(master)
+        self.addCleanup(stop)
+        self.text = lambda: (lock.acquire(), self.shown[0], lock.release())[1]
+        self.master = master
+        self.assertTrue(wait_until(lambda: read(os.path.join(base, "kid-held")), 10), self.explain())
+        self.assertEqual(read(os.path.join(base, "kid-held")), "1", "the fixture's child did not hold the terminal")
+
+    def explain(self):
+        return "\nsession.log:\n{}\nshell.err:\n{}\npty:\n{!r}".format(
+            read(os.path.join(self.space, "session.log"))[-3000:], read(os.path.join(self.base, "shell.err"))[-3000:],
+            self.text()[-1500:])
+
+    def assert_next_start_has_the_terminal(self):
+        started = wait_until(lambda: lines(os.path.join(self.base, "stub-starts.jsonl")), 25)
+        self.assertTrue(started, "no Claude start" + self.explain())
+        ended = float(read(os.path.join(self.base, "kid-end")) or "inf")
+        self.assertGreaterEqual(started[0]["at"], ended, "a Claude started while the first child lived")
+        self.assertEqual(started[0]["fg"], started[0]["pgrp"],
+                         "the next Claude started without the terminal's foreground" + self.explain())
+        shown = self.text()
+        self.assertGreater(shown.rfind(TTY_RESET.encode()), shown.find(MOUSE_ON),
+                           "the terminal was not reset after the child that held it" + self.explain())
+
+    def test_not_adopted_reaped_then_next_start(self):  # run_agent's reapFirst branch (R2.6)
+        self.run_case("abc")
+        self.assertTrue(wait_until(lambda: "swap: reaped pid=" in read(os.path.join(self.space, "session.log")), 10))
+        self.assert_next_start_has_the_terminal()
+
+    def test_adopted_without_a_group_then_next_start(self):  # settle_child had no group to settle
+        self.run_case("KID_OWN")
+        self.assertTrue(wait_until(lambda: "swap adopted pid=" in read(os.path.join(self.space, "session.log")), 10),
+                        self.explain())
+        self.assertIn("pgid=none", read(os.path.join(self.space, "session.log")))
+        self.assert_next_start_has_the_terminal()
+
+    def assert_error_after_reset(self):
+        self.assertTrue(wait_until(lambda: b"It cannot start" in self.text(), 20), self.explain())
+        shown = self.text()
+        self.assertGreater(shown.find(MOUSE_ON), -1)
+        reset = shown.find(TTY_RESET.encode(), shown.find(MOUSE_ON))
+        self.assertGreater(reset, -1, "no reset after the child that held the terminal" + self.explain())
+        self.assertLess(reset, shown.find(b"It cannot start"), "the error was shown before the terminal was reset")
+
+    def test_not_adopted_then_an_error(self):  # swap_wait_out's reap, before error_wait
+        self.run_case("abc", profile="missing")
+        self.assert_error_after_reset()
+
+    def test_adopted_then_an_error(self):  # swap_wait_out's adopted child, before error_wait
+        self.run_case("KID_OWN", profile="missing")
+        self.assert_error_after_reset()
+
+
+class L1_FailedExec(unittest.TestCase):
+    """REVIEW L1's class: a re-read profile whose program the exec cannot start (t-033 round 4). The child's setup
+    gave it the terminal before its exec failed; the launch with the profile in hand must start with the foreground."""
+
+    def test_launch_after_a_failed_exec_has_the_terminal(self):
+        r = Pty(self, stub_run=2, stub_exit=7).start()
+        self.assertTrue(wait_until(lambda: len(r.starts()) == 1, 20), r.explain())
+        first = r.starts()[0]
+        self.assertEqual(first["fg"], first["pgrp"], "the first Claude had the terminal")
+        os.makedirs(os.path.join(r.base, "not-a-program"))
+        write(os.path.join(r.home, "profiles", "test", "profile.json"), json.dumps(
+            {"name": "test", "claude": [os.path.join(r.base, "not-a-program")], "codex": ["true"]}))
+        self.assertTrue(wait_until(lambda: len(r.starts()) == 2, 25), r.explain())
+        self.assertIn("the re-read profile did not start", r.log())
+        second = r.starts()[1]
+        self.assertEqual(second["fg"], second["pgrp"],
+                         "the launch after the failed exec started without the terminal's foreground" + r.explain())
+
+
 if __name__ == "__main__":
     unittest.main()
