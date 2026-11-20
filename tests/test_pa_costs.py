@@ -8253,6 +8253,20 @@ class T177_Summary(Collecting):
         self.assertTrue(pa_costs.shrink(s))
         self.assertEqual(len(s["sessions"]), 1)
 
+    def test_t4b_shrink_never_leaves_a_mixed_session_as_one_account(self):
+        # Review Must fix 1: DECISIONS D2 keeps `account` (the largest scope's) beside `accounts` on a mixed session; when
+        # shrink drops the list, the one label must go with it, or the session reads as wholly that account.
+        mixed = {"key": "s1", "tokens": 100, "money": 10.0, "account": "acct-a", "accounts": [
+            {"key": "acct-a", "tokens": 60, "money": 6.0, "calls": 1}, {"key": "acct-b", "tokens": 40, "money": 4.0, "calls": 1}]}
+        one = {"key": "s2", "tokens": 5, "money": 0.5, "account": "acct-b"}
+        s = {"sessions": [mixed, one], "byTask": [], "passes": [], "byDayModel": []}
+        self.assertTrue(pa_costs.shrink(s))
+        self.assertEqual(len(s["sessions"]), 2)
+        self.assertNotIn("accounts", s["sessions"][0])
+        self.assertNotIn("account", s["sessions"][0])
+        self.assertEqual(pa_costs.entry_parts(s["sessions"][0]), [])
+        self.assertEqual(s["sessions"][1]["account"], "acct-b")
+
     def test_c4_a_summary_at_the_real_size_still_fits(self):
         self.prices()
         self.declare()
