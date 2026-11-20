@@ -1606,11 +1606,11 @@ class T192HolderRemove(HolderBase):
         self.assertFalse(os.path.exists(pkg), out)
         self.assertEqual(self.removals(), [os.path.realpath(h) + "\n"], "the remove script ran once, with H only (no --force)")
 
-    def stays(self, h, pkg, out, *why):
+    def stays(self, h, pkg, out, *why, kind="test workspace worktree"):
         self.assertTrue(os.path.isdir(h), out)
         self.assertFalse(os.path.exists(pkg), "the package goes by git: " + out)
         self.assertEqual(self.removals(), [], "the remove script never ran")
-        self.assertIn("the test workspace worktree {} stays: ".format(os.path.realpath(h)), out)
+        self.assertIn("the {} {} stays: ".format(kind, os.path.realpath(h)), out)
         for w in why:
             self.assertIn(w, out)
 
@@ -1718,7 +1718,8 @@ class T192HolderRemove(HolderBase):
                 with mock.patch.dict(os.environ, env):
                     code, out, err = self.standing()
                 self.assertEqual(code, 0, out + err)
-                self.stays(h, pkg, out)
+                # a failed status script cannot say its kind: the generic name
+                self.stays(h, pkg, out, kind="worktree that holds it" if "HSTATUS_FAIL" in env else "test workspace worktree")
 
     def test_a_failed_remove_script_is_said_and_the_package_goes_by_git(self):
         h, (pkg,) = self.one("t-110")
