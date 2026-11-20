@@ -108,7 +108,7 @@ if [ "$affected" = 1 ] && [ -n "${PA_CHANGED_FILES:-}" ]; then
 fi
 
 parse37() { "$PY" -c "import ast,sys
-for f in sys.argv[1:]: ast.parse(open(f).read(), feature_version=(3,7)); print(f, 'parses as Python 3.7')" runtime/tools/pa.py runtime/tools/pa_hooks.py runtime/tools/pa_guard.py runtime/tools/pa_costs.py runtime/tools/pa_push.py runtime/tools/pa_queue.py runtime/tools/pa_places.py runtime/tools/pa_statusline.py runtime/tools/pa_handoff.py; }
+for f in sys.argv[1:]: ast.parse(open(f).read(), feature_version=(3,7)); print(f, 'parses as Python 3.7')" runtime/tools/pa.py runtime/tools/pa_hooks.py runtime/tools/pa_guard.py runtime/tools/pa_costs.py runtime/tools/pa_push.py runtime/tools/pa_queue.py runtime/tools/pa_places.py runtime/tools/pa_statusline.py runtime/tools/pa_handoff.py runtime/tools/pa_net.py runtime/tools/pa_run.py runtime/tools/pa_suite.py; }
 units() { "$PY" -m unittest discover -s tests -p "$1.py" -v; }  # one module: the same loader and top folder
 # The long unit modules run as several parts (t-078): <module>:<n> runs the module n times at once, the k-th with
 # PA_UNIT_SHARD=k/n, which its load_tests (tests/unit_shards.py) turns into every n-th test from the k-th, so each
