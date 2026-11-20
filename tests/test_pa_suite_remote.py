@@ -2209,7 +2209,7 @@ class X44Unexpected(Remote):
         rows = self.lines()
         self.assertEqual([(r.get("run"), r["exit"], r.get("machine")) for r in rows], [(run, 1, "box-1")], rows)
         self.assertIn("pa-full-suite failed: RuntimeError: " + error, rows[0].get("note") or "", rows)
-        log = [l for l in (self.build_log() or "").splitlines() if " full suite: " in l]
+        log = [l for l in (self.build_log() or "").splitlines() if l.startswith("=== ") and " full suite: `" in l]
         self.assertEqual(len(log), 1, self.build_log())
         self.assertIn("-> exit 1 ", log[0])
         self.assertEqual((self.progress(run).get("state"), self.progress(run).get("exit")), ("done", 1))
@@ -2244,7 +2244,7 @@ class X44Unexpected(Remote):
         self.check_cleaned(run, out)
         rows = self.lines()
         self.assertEqual([(r.get("run"), r["exit"]) for r in rows], [(run, 0)], rows)
-        log = [l for l in (self.build_log() or "").splitlines() if " full suite: " in l]
+        log = [l for l in (self.build_log() or "").splitlines() if l.startswith("=== ") and " full suite: `" in l]
         self.assertEqual(len(log), 1, self.build_log())
         self.assertIn("-> exit 0 ", log[0])
         self.assertEqual((self.progress(run).get("state"), self.progress(run).get("exit")), ("done", 0))
