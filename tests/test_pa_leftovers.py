@@ -540,6 +540,11 @@ class H1_H4_H8_Choice(unittest.TestCase):
         rows = self.chain() + [row(720, tty="pts/1", uid=os.getuid() + 1)]
         self.assertEqual(self.pids(rows), ([], [720]))
 
+    def test_other_uids_off_tty_child_is_not_a_target(self):
+        """Round 2 (REVIEW M1's class): a process the sweep never signals does not bring what it started."""
+        rows = self.chain() + [row(720, tty="pts/1", uid=os.getuid() + 1), row(721, ppid=720, tty="?")]
+        self.assertEqual(self.pids(rows), ([], [720]))
+
 
 class H5_H6_Steps(Guarded):
     """end_leftovers' steps (R1.2, R1.3): every pid re-read before every signal; EPERM logged as left; the start goes

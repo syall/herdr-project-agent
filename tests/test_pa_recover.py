@@ -165,6 +165,59 @@ class Targets(unittest.TestCase):
         self.assertNotIn(601, pids)
 
 
+class M1_SparedHaveNoStartedByOne(unittest.TestCase):
+    """Round 2 (REVIEW M1 and its class): only what --recover ends brings its descendants. A process it spares or
+    never signals (a session leader, a launcher's ancestor, its own ancestors, its group, another uid) does not."""
+    ME = 4000
+
+    def base(self, launcher_ppid=90, me_ppid=3999):
+        return [row(1, ["/sbin/init"], ppid=0),
+                row(3999, ["sshd"], ppid=1),
+                row(self.ME, ["python3", "pa.py", "restart"], ppid=me_ppid),
+                row(90, ["zsh"], ppid=3999, stat="Ss", tty="pts/1"),  # the tab's shell: session leader
+                row(100, ["python3", "/h/tools/pa.py", "session", "--space=" + SP], ppid=launcher_ppid, stat="T",
+                    tty="pts/1"),
+                row(101, ["claude", "--resume", CUR], ppid=100, stat="T", tty="pts/1", pgid=101),
+                row(104, ["mcp"], ppid=101, tty="?", pgid=104)]  # started by an ended one: still ended
+
+    def ended(self, rows, me=None):
+        got = pa.recover_targets(rows, SP, {CUR}, self.ME if me is None else me)
+        return {r["pid"]: r["what"] for r in got["ended"]}
+
+    def test_leaders_off_tty_child_not_ended(self):
+        got = self.ended(self.base() + [row(91, ["mydaemon"], ppid=90, tty="?")])
+        self.assertNotIn(91, got)
+        self.assertEqual(sorted(got), [100, 101, 104])
+        self.assertEqual(got[104], "started by one")
+
+    def test_launchers_ancestor_on_the_tty_off_tty_child_not_ended(self):
+        rows = self.base(launcher_ppid=95) + [row(95, ["zsh"], ppid=90, tty="pts/1"),
+                                              row(96, ["helper"], ppid=95, tty="?")]
+        got = self.ended(rows)
+        self.assertNotIn(95, got)
+        self.assertNotIn(96, got)
+
+    def test_own_ancestor_on_the_tty_off_tty_child_not_ended(self):
+        rows = self.base(me_ppid=97) + [row(97, ["zsh"], ppid=90, tty="pts/1"), row(98, ["job"], ppid=97, tty="?")]
+        got = self.ended(rows)
+        self.assertNotIn(97, got)
+        self.assertNotIn(98, got)
+
+    def test_other_uids_child_not_ended(self):
+        rows = self.base() + [row(92, ["sudo"], ppid=90, tty="pts/1", uid=os.getuid() + 1),
+                              row(93, ["job"], ppid=92, tty="?")]
+        got = self.ended(rows)
+        self.assertNotIn(92, got)
+        self.assertNotIn(93, got)
+
+    def test_own_groups_child_not_ended(self):
+        rows = self.base() + [row(94, ["x"], ppid=1, tty="pts/1", pgid=os.getpgrp()),
+                              row(941, ["job"], ppid=94, tty="?", pgid=941)]
+        got = self.ended(rows, me=os.getpid())
+        self.assertNotIn(94, got)
+        self.assertNotIn(941, got)
+
+
 class Recover(unittest.TestCase):
     """pa-restart --recover end to end, in process (pa.main), with real stand-in processes."""
 
