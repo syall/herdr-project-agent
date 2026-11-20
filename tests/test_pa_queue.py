@@ -1490,7 +1490,8 @@ class T86HeldApproval(UBase):
 # ---- t-116: the union checks' limits from t-086 (REVIEW findings 1-2) ------------------------------------------
 
 class T116Union(UBase):
-    """t-086 finding 1: each commit's union regions go to the short reviewer."""
+    """t-086 finding 1: each commit's union regions go to the short reviewer; finding 2: a commit whose clean replay
+    gives other -U0 hunks (a diff realignment) is accepted when the three-way merge equals its blob, never otherwise."""
 
     records = T86Limits.records
 
@@ -1560,6 +1561,82 @@ class T116Union(UBase):
             "  the file has the lines Start: <UTC time>, End: <UTC time>, Reviewer: <its address>, Checked: {}, and its "
             "Verdict: line".format(tip)])
         self.assertNotIn("in commit", out)
+
+    def same_change(self):
+        """main (t-A) changes line 2 and line 50; t-B's c1 changes line 2 (a conflict), its c2 makes main's line-50
+        change too and changes line 100. A rebase replays c2 cleanly, without line 50: other -U0 hunks."""
+        self.task("t-A", [("a.txt", line_edit(line_edit(LINES, 2, "two A"), 50, "fifty M"))])
+        self.add("t-A")
+        self.task("t-B", [("a.txt", (2, "two B")), ("a.txt", line_edit(line_edit(line_edit(LINES, 2, "two B"), 50, "fifty M"),
+                                                                       100, "hundred B"))])
+        checked_tip = self.tip("t-B")
+        self.assertIn("needs a rebase worker onto t-A-x", self.add("t-B", ok=False)[2])
+        return checked_tip
+
+    def test_t2_a_realigned_clean_replay_is_a_union(self):
+        checked_tip = self.same_change()
+        tip = self.resolve("t-B", "t-A-x", "a.txt", line_edit(union_text("two B", "two A"), 51, "fifty M"))
+        self.assertEqual(read(os.path.join(self.trees["t-B"], "a.txt")),
+                         line_edit(line_edit(union_text("two B", "two A"), 51, "fifty M"), 101, "hundred B"))
+        run, checked, now = self.records("t-B", checked_tip, "t-A-x")
+        c2, c2n = checked["commits"][1], now["commits"][1]
+        x = pa_hooks.raw_files(run, self.proj, c2["sha"] + "^", c2["sha"])[0]
+        y = pa_hooks.raw_files(run, self.proj, c2n["sha"] + "^", c2n["sha"])[0]
+        self.assertFalse(pa_hooks.same_lines(run, self.proj, x, y), "the replay's hunks differ")
+        ok, why, unions, shared = pa_hooks.union_only(run, pa_hooks.git, self.proj, checked, now)
+        self.assertTrue(ok, why)
+        code, out, err = self.verify("t-B")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn(": union", out)
+        self.assertIn("docstrings or comments", out)
+        self.assertEqual(self.journal("verify")[-1]["result"], "union")
+        self.assertEqual(tip, self.tip("t-B"))
+
+    def test_t2b_a_clean_replay_that_is_not_the_new_blob_is_refused(self):
+        """c2' adds line 120 'X' that c2 never had, c3' takes it out again (c3 changes line 150): the tip is the
+        union, but c2' and c3' are not their merges."""
+        self.task("t-A", [("a.txt", (2, "two A"))])
+        self.add("t-A")
+        self.task("t-B", [("a.txt", (2, "two B")), ("a.txt", (100, "hundred B")), ("a.txt", (150, "one-fifty B"))])
+        checked_tip = self.tip("t-B")
+        self.assertIn("needs a rebase worker onto t-A-x", self.add("t-B", ok=False)[2])
+        u = union_text("two B", "two A")
+        self.manual(self.ref("t-A-x"), [u, line_edit(line_edit(u, 101, "hundred B"), 121, "X"),
+                                        line_edit(line_edit(u, 101, "hundred B"), 151, "one-fifty B")])
+        run, checked, now = self.records("t-B", checked_tip, "t-A-x")
+        ok, why, unions, shared = pa_hooks.union_only(run, pa_hooks.git, self.proj, checked, now)
+        self.assertFalse(ok, "a replay with a line of its own must not pass")
+        self.assertIn("the commits changed (a.txt)", why)
+        code, out, err = self.verify("t-B")
+        self.assertEqual(code, 1, out + err)
+        self.assertIn(": changed", out)
+
+    def test_t2c_a_replay_with_a_conflict_is_refused(self):
+        """c2 changes line 50 to 'fifty B' where main has 'fifty M': its replay conflicts. A c2' that is that merge's
+        output with its markers, as a worker might commit it, is no replay; nor one on the same parent or another mode.
+        (replay_of's exit-0 test is defence only: its markers name a mktemp file, so no blob can equal them.)"""
+        self.task("t-A", [("a.txt", line_edit(line_edit(LINES, 2, "two A"), 50, "fifty M"))])
+        self.add("t-A")
+        self.task("t-B", [("a.txt", (2, "two B")), ("a.txt", (50, "fifty B"))])
+        checked_tip = self.tip("t-B")
+        self.assertIn("needs a rebase worker onto t-A-x", self.add("t-B", ok=False)[2])
+        c1, = self.manual(self.ref("t-A-x"), [line_edit(union_text("two B", "two A"), 51, "fifty M")])
+        run, checked, _now = self.records("t-B", checked_tip, "t-A-x")
+        c2 = checked["commits"][1]["sha"]
+        x = pa_hooks.raw_files(run, self.proj, c2 + "^", c2)[0]
+        folder = os.path.join(self.tmp, "replay")
+        os.makedirs(folder)
+        for name, rev in (("ours", c2 + ":a.txt"), ("base", c2 + "^:a.txt"), ("theirs", c1 + ":a.txt")):
+            write(os.path.join(folder, name), sh(self.proj, "git", "show", rev) + "\n")
+        r = subprocess.run(["git", "merge-file", "-q", "ours", "base", "theirs"], cwd=folder)
+        self.assertEqual(r.returncode, 1, "the replay conflicts")
+        blob = sh(self.proj, "git", "hash-object", "-w", os.path.join(folder, "ours"))
+        y = {"path": "a.txt", "status": "M", "baseMode": "100644", "tipMode": "100644",
+             "baseBlob": sh(self.proj, "git", "rev-parse", c1 + ":a.txt"), "tipBlob": blob}
+        common = pa_hooks.common_dir(run, self.proj)[1]
+        self.assertFalse(pa_hooks.replay_of(pa_hooks.git, common, x, y), "a merge with a conflict is no replay")
+        self.assertFalse(pa_hooks.replay_of(pa_hooks.git, common, x, dict(y, baseBlob=x["baseBlob"])), "the same parent")
+        self.assertFalse(pa_hooks.replay_of(pa_hooks.git, common, x, dict(y, tipMode="120000")), "another mode")
 
 
 # ---- t-176: a short review of a branch rebased outside the queue counts ------------------------------------
