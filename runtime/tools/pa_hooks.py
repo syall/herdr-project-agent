@@ -2813,6 +2813,7 @@ BATCH = "d-wt-batch-"
 BATCH_MAX = 60  # worktrees on one card, at most; the rest wait for the next card
 BATCH_CONTEXT_MAX = 6000  # characters of a batch card's context (t-168 Q1: 48 lines fit; a single card keeps CONTEXT_MAX)
 BATCH_LINE = 200  # characters of one worktree's line on it
+HELD_LINE = 400  # characters of one of the person's earlier answers shown under it (the item's `held` keeps them all)
 WORKTREE_LOCK = ".worktree.lock"
 WORKTREE_LOCK_WAIT = 30  # seconds a second pa-worktree remove --card or --standing waits for the first
 
@@ -2976,7 +2977,13 @@ def worktree_line(item):
              "{} uncommitted".format(c["uncommitted"]) if c.get("uncommitted") else "clean"]
     if item.get("cost"):
         parts.append(clean(item["cost"]))
-    return "  " + cut(" · ".join(parts), BATCH_LINE)
+    lines = ["  " + cut(" · ".join(parts), BATCH_LINE)]
+    for h in item.get("held") or []:  # the person's earlier words on this worktree, each hold on its own line
+        said = ["{!r}".format(clean(h["answer"]))] if h.get("answer") is not None else []
+        if h.get("note"):
+            said.append('note "{}"'.format(clean(h["note"])))
+        lines.append("    " + cut("you said before, on card {}: {}".format(clean(h.get("card")), ", ".join(said)), HELD_LINE))
+    return "\n".join(lines)
 
 
 def worktrees_card_text(items, total):
@@ -3028,6 +3035,9 @@ def open_worktrees_card(directory, candidates, profile, old=None, listing=None):
     if listing is not None:
         listing.add(cid)
     built = [worktree_item(directory, c, profile, cid) for c in ordered[:BATCH_MAX]]
+    holds = worktree_holds(directory, listing)
+    for (item, _text), c in zip(built, ordered):
+        item["held"] = item_held(holds, c["row"])  # every hold's words, under the worktree they hold (round 6)
     shown, context = worktrees_card_text([b[0] for b in built], len(ordered))
     for (item, text_), c in zip(built[:len(shown)], ordered):
         try:
@@ -3038,7 +3048,7 @@ def open_worktrees_card(directory, candidates, profile, old=None, listing=None):
     n = len(shown)
     path = pa.card_file(directory, cid)
     # The person's standing words on any worktree on it, from the store, whichever card they were given on (round 5).
-    carry = held_carry(worktree_holds(directory, listing), [c["row"] for c in ordered[:n]]) or carried(old)
+    carry = held_carry(holds, [c["row"] for c in ordered[:n]]) or carried(old)
     pa.write_card(directory, path, dict(carry, **{
         "id": cid, "kind": "worktrees", "task": None, "question": "Delete {} worktrees whose jobs are over?".format(n),
         "context": context, "options": options, "recommendation": recommendation, "status": "open", "answer": None,
@@ -4108,12 +4118,17 @@ def replaces(answer, hold):
     return bool((answer["time"] and answer["time"] > hold["time"]) or (answer["created"] and answer["created"] >= hold["time"]))
 
 
+def standing_holds(holds, row):
+    """Every event that holds the row's worktree now: the holds on its branch no later answer replaced."""
+    events = [e for e in holds.get(row["path"], []) if not branch_differs(e, row.get("facts"))]
+    clears = [e for e in events if e["source"] == "answer" and not e["words"]]
+    return [e for e in events if e["words"] and not any(replaces(a, e) for a in clears)]
+
+
 def worktree_hold(holds, row):
     """The event that holds the row's worktree now, or None: the newest hold no later answer replaced (an open card
     first among equals, as card_for ranks)."""
-    events = [e for e in holds.get(row["path"], []) if not branch_differs(e, row.get("facts"))]
-    clears = [e for e in events if e["source"] == "answer" and not e["words"]]
-    standing = [e for e in events if e["words"] and not any(replaces(a, e) for a in clears)]
+    standing = standing_holds(holds, row)
     if not standing:
         return None
     rank = {"open": 2, "answered": 1}
@@ -4125,6 +4140,22 @@ def hold_line(hold):
     if hold["source"] == "answer" and hold["words"].startswith("answer"):
         return "answered {!r} on card {}".format(hold["label"], hold["cid"])
     return "its card {} carries the person's {}; left for its card".format(hold["cid"], hold["words"])
+
+
+def item_held(holds, row):
+    """[{card, answer, note, answered}] of every hold on the row's worktree, oldest first, once per answer and note:
+    what a batch card shows under that worktree's line (review r5 RL1), so the person answers with all their words on it."""
+    floor = datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
+    out, seen = [], set()
+    for e in sorted(standing_holds(holds, row), key=lambda e: e["time"] or floor):
+        c = e["carry"]
+        held = {"card": e["cid"], "answer": c.get("previousAnswer"),
+                "note": c.get("previousNote") if str(c.get("previousNote") or "").strip() else None,
+                "answered": c.get("previousAnswered")}
+        if (held["answer"], held["note"]) not in seen:
+            seen.add((held["answer"], held["note"]))
+            out.append(held)
+    return out
 
 
 def held_carry(holds, rows):
