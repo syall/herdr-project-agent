@@ -909,6 +909,44 @@ class T133Places(GuardTest):  # t-133 (t-083 RL3): workers never run the pa-plac
             with self.subTest(line=line):
                 self.assertIsNone(self.check(line))
 
+    def test_d8_module_forms(self):  # t-136 (t-133 RL1): D7's module forms, for pa_places
+        for form in D8_MODULE_FORMS:
+            line, inner = form[0], form[-1]
+            with self.subTest(line=line):
+                self.assertEqual(self.check(line), msg(D8, inner))
+
+    def test_d8_module_allowed(self):
+        for line in D8_MODULE_ALLOWED:
+            with self.subTest(line=line):
+                self.assertIsNone(self.check(line))
+
+    def test_d8_scans_python_only_for_a_line_naming_pa_places(self):  # the D7 prefilter count holds for D8's forms
+        counted, real = [], guard.PYTHON
+        with mock.patch.object(guard, "PYTHON", mock.Mock(match=lambda w: counted.append(w) or real.match(w))):
+            for line, calls in (("python3 -m x add; " * 50, 50), ("python3 -m pa_places next; " * 50, 100)):
+                with self.subTest(line=line[:40]):
+                    del counted[:]
+                    self.check(line)
+                    self.assertEqual(len(counted), calls)
+
+
+# t-136 (t-133 RL1): a module run, runpy, pdb -m and python -c naming pa_places, as D7 has for pa_costs
+D8_MODULE_FORMS = [
+    ("python3 -m pa_places add t-1 --job b --kind working --role r",), ("python3 -mpa_places start t-1/b --worker t5",),
+    ("python3 -um pa_places block t-1/b --why x",), ("python3 -Bm pa_places unblock t-1/b",),
+    ("PYTHONPATH=runtime/tools python3 -m runtime.tools.pa_places drop t-1/b --why x",),
+    ("cd ~/.config/herdr-pa/tools && python3 -m pa_places add t-1", "python3 -m pa_places add t-1"),
+    ("python3 -m runpy pa_places start t-1/b --worker t5",), ("python3 -m pdb -m tools.pa_places add t-1",),
+    ("python3 -m PA_PLACES add t-1",),
+    ("python3 -c '__import__(\"pa_places\").main()' add t-1", 'python3 -c __import__("pa_places").main() add t-1'),
+    ("python3 -c 'import sys,pa_places;sys.argv[1:]=[\"drop\",\"t-1/b\"];pa_places.main()'",
+     'python3 -c import sys,pa_places;sys.argv[1:]=["drop","t-1/b"];pa_places.main()'),
+]
+D8_MODULE_ALLOWED = ["python3 -m pa_places next", "python3 -m pa_places show --json", "python3 -m pa_places_x add t-1",
+                     "python3 -m mypa_places add t-1", "python3 -c 'import pa_places; print(pa_places.__file__)'",
+                     "python3 -c 'print(1)' add t-1", "python3 -m unittest tests.test_pa_places",
+                     "grep -c pa_places add", "python3 -m tools.pa_places limits"]
+
 
 
 class T041Context(GuardTest):  # t-041 J3: workers never run pa-context

@@ -19,6 +19,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TOOLS = os.path.join(HERE, "..", "runtime", "tools")
@@ -4496,6 +4497,234 @@ class Unrecorded(Base):
             self.assertEqual(len(calls), 1, "the same set: the open card stays, nothing described")
         finally:
             pa_hooks.describe_worktree = real
+
+
+class T136WaiterLimits(Base):
+    """t-136 (t-133 RL3, RL4, N3): a cancel right after --when-idle reaches the waiter that is still starting; an hc
+    kill or rm that does not answer is journaled as maybe closed, not as not closed."""
+
+    setUp, tearDown = T133CloseWhenIdleLimits.setUp, T133CloseWhenIdleLimits.tearDown
+    when_idle, waiter, flip_after = CloseWhenIdle.when_idle, CloseWhenIdle.waiter, CloseWhenIdle.flip_after
+    cancel, hold_waiter_lock, assertNotClosed = (T133CloseWhenIdleLimits.cancel, T133CloseWhenIdleLimits.hold_waiter_lock,
+                                                 CloseWhenIdle.assertNotClosed)
+
+    def marker(self):
+        return os.path.join(self.dir, ".close-when-idle-t31.starting")
+
+    def test_rl3_when_idle_leaves_a_starting_marker(self):
+        self.terms["t31"]["status"] = "working"
+        self.assertEqual(self.when_idle()[0], 0)
+        self.assertEqual(len(self.spawned), 1)
+        self.assertTrue(os.path.exists(self.marker()), "written before the waiter is started")
+
+    def test_rl3_a_cancel_before_the_waiter_holds_its_lock_lands(self):
+        write(self.marker(), "x\n")  # spawned; the child has not taken its lock yet
+        code, out, err = self.cancel()
+        self.assertEqual(code, 0, err)
+        self.assertIn("cancelled; the worker stays open", out)
+        self.assertTrue(os.path.exists(os.path.join(self.dir, ".close-when-idle-t31.cancel")))
+        self.assertIn("cancel", self.journal()[-1]["why"])
+        self.assertNotClosed()
+
+    def test_rl3_then_the_waiter_closes_nothing(self):
+        write(self.marker(), "x\n")
+        self.assertEqual(self.cancel()[0], 0)
+        self.terms["t31"]["status"] = "idle"
+        self.assertEqual(self.waiter()[0], 0)
+        self.assertNotClosed()
+        self.assertIn("cancelled", self.journal()[-1]["why"])
+
+    def test_rl3_an_old_marker_is_no_waiter(self):
+        write(self.marker(), "x\n")
+        old = time.time() - 600
+        os.utime(self.marker(), (old, old))  # a waiter that died before it took its lock
+        code, out, err = self.cancel()
+        self.assertEqual(code, 0, err)
+        self.assertIn("no pa-worker close --when-idle is waiting for t31", out)
+        self.assertFalse(os.path.exists(os.path.join(self.dir, ".close-when-idle-t31.cancel")))
+
+    def test_rl3_the_waiter_removes_the_marker(self):
+        write(self.marker(), "x\n")
+        self.terms["t31"]["status"] = "idle"
+        self.assertEqual(self.waiter()[0], 0)
+        self.assertFalse(os.path.exists(self.marker()))
+
+    def test_rl3_a_spawn_that_fails_leaves_no_marker(self):
+        def fail(*a, **k):
+            raise OSError("no python")
+        pa_hooks.spawn_idle_closer = fail
+        self.terms["t31"]["status"] = "working"
+        with self.assertRaises(OSError):
+            self.when_idle()
+        self.assertFalse(os.path.exists(self.marker()))
+
+    def test_rl4_a_kill_that_does_not_answer_may_have_closed(self):
+        real = self.fake_call
+
+        def call(argv, check=True):
+            if argv[:2] == ["hc", "kill"]:
+                real(argv, check)  # it lands, but hc does not answer in time
+                raise pa.Problem("hc kill t31 did not answer in 30 s")
+            return real(argv, check)
+        pa.call = call
+        self.terms["t31"]["status"] = "idle"
+        self.assertEqual(self.waiter()[0], 0)
+        why = self.journal()[-1]["why"]
+        self.assertIn("may have been closed", why)
+        self.assertIn("pa-worker close t31 again", why)
+        self.assertNotIn("not closed", why)
+
+    def test_rl4_an_rm_that_does_not_answer_may_have_closed(self):
+        real = self.fake_call
+
+        def call(argv, check=True):
+            if argv[:2] == ["hc", "rm"]:
+                raise pa.Problem("hc rm t31 did not answer in 30 s")
+            return real(argv, check)
+        pa.call = call
+        self.terms["t31"]["status"] = "idle"
+        self.assertEqual(self.waiter()[0], 0)
+        self.assertIn("may have been closed", self.journal()[-1]["why"])
+
+    def test_n3_already_closed_line(self):
+        self.hold_waiter_lock()
+        led = self.ledger()
+        led["tasks"][0]["workers"][0]["finished"] = "2026-01-01T00:00:00Z"
+        self.ledger(led)
+        code, out, err = self.cancel()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out.strip(), "t31: already closed by close --when-idle; nothing to cancel.")
+
+
+class T136SnapshotLimits(Base):
+    """t-136 (t-133 RL2, RL5, RL6, N2): the start record in the space's own folder, private to the user; a snapshot that
+    cannot be taken in time runs the tests; quoted paths, symlinks and nested repositories are read as they are."""
+
+    def setUp(self):
+        Base.setUp(self)
+        self.proj = self.repo()
+        self.wt = self.worktree(self.proj, "t-003-x")
+        self.marker = os.path.join(self.tmp, "ran")
+        agent = load(os.path.join(self.dir, "agent.json"))
+        agent["commands"] = {"affected": "echo ran >> {}".format(self.marker)}
+        dump(agent, os.path.join(self.dir, "agent.json"))
+        dump({"task": "t-003", "space": "sp1", "fix": False}, os.path.join(self.wt, ".claude", "pa-task.json"))
+        self.saved_start = pa_hooks.START_DIR
+        pa_hooks.START_DIR = os.path.join(self.tmp, "starts")
+        os.environ["HC_TERMINAL_ID"] = "t41"
+
+    def tearDown(self):
+        pa_hooks.START_DIR = self.saved_start
+        os.environ.pop("HC_TERMINAL_ID", None)
+        Base.tearDown(self)
+    data, start, stop, ran = T133ReportOnlyStop.data, T133ReportOnlyStop.start, T133ReportOnlyStop.stop, T133ReportOnlyStop.ran
+
+    def records(self):
+        folder = os.path.join(self.dir, ".hook-starts")
+        return [os.path.join(folder, n) for n in os.listdir(folder)] if os.path.isdir(folder) else []
+
+    def test_rl2_the_record_is_in_the_space_folder_and_private(self):
+        pa_hooks.START_DIR = None
+        tmp = os.path.join(self.tmp, "system-temp")
+        os.makedirs(tmp)
+        saved, tempfile.tempdir = tempfile.tempdir, tmp
+        try:
+            write(os.path.join(self.wt, "README"), "the builder's edit\n")
+            self.start()
+            self.assertEqual(os.listdir(tmp), [], "nothing in the temp folder")
+            self.assertEqual(len(self.records()), 1)
+            self.assertEqual(os.stat(self.records()[0]).st_mode & 0o777, 0o600)
+            self.assertEqual(self.stop(), 0)
+            self.assertFalse(self.ran(), "the record is read back from the space folder")
+        finally:
+            tempfile.tempdir = saved
+
+    def test_rl2_a_record_others_can_write_is_not_trusted(self):
+        pa_hooks.START_DIR = None
+        write(os.path.join(self.wt, "README"), "the builder's edit\n")
+        self.start()
+        os.chmod(self.records()[0], 0o666)
+        self.assertEqual(self.stop(), 0)
+        self.assertTrue(self.ran())
+
+    def test_rl2_a_record_in_place_is_kept(self):  # first write wins, in the new place too
+        pa_hooks.START_DIR = None
+        self.start("s-1")
+        before = raw(self.records()[0])
+        write(os.path.join(self.wt, "new.txt"), "x\n")
+        self.start("s-2")
+        self.assertEqual(raw(self.records()[0]), before)
+        self.assertEqual(len(self.records()), 1)
+
+    def timeout_on(self, flag):
+        real = pa_hooks.subprocess.run
+
+        def run(argv, *a, **k):
+            if argv[:2] == ["git", "status"] and flag in argv:
+                raise subprocess.TimeoutExpired(argv, 30)
+            return real(argv, *a, **k)
+        return mock.patch.object(pa_hooks.subprocess, "run", run)
+
+    def test_rl5_a_snapshot_whose_git_status_times_out_runs_the_tests(self):
+        write(os.path.join(self.wt, "README"), "the builder's edit\n")
+        with self.timeout_on("--untracked-files=all"):
+            self.start()
+            write(os.path.join(self.wt, "new.txt"), "the worker's file\n")
+            self.assertEqual(self.stop(), 0)
+        self.assertTrue(self.ran(), "a timeout at the start and the end is not 'unchanged'")
+
+    def test_rl5_a_snapshot_over_its_budget_runs_the_tests(self):
+        write(os.path.join(self.wt, "README"), "the builder's edit\n")
+        self.start()
+        saved = getattr(pa_hooks, "SNAPSHOT_LIMIT", None)
+        pa_hooks.SNAPSHOT_LIMIT = -1
+        try:
+            self.assertEqual(self.stop(), 0)
+        finally:
+            pa_hooks.SNAPSHOT_LIMIT = saved
+        self.assertTrue(self.ran())
+
+    def test_rl6_an_edit_to_a_quoted_path_counts(self):
+        write(os.path.join(self.wt, "été.txt"), "1\n")
+        self.start()
+        write(os.path.join(self.wt, "été.txt"), "2\n")
+        self.assertEqual(self.stop(), 0)
+        self.assertTrue(self.ran())
+
+    def test_rl6_changed_files_reads_paths_as_they_are(self):
+        write(os.path.join(self.wt, "été.txt"), "1\n")
+        write(os.path.join(self.wt, "a b.txt"), "1\n")
+        sh(self.wt, "git", "mv", "README", "READ ME.md")
+        self.assertEqual(sorted(pa_hooks.changed_files(self.wt)), ["READ ME.md", "a b.txt", "été.txt"])
+
+    def test_n2_a_symlink_pointed_elsewhere_counts(self):
+        a, b = os.path.join(self.tmp, "A"), os.path.join(self.tmp, "B")
+        write(os.path.join(a, "x.txt"), "a\n")
+        write(os.path.join(b, "x.txt"), "b\n")
+        os.symlink(a, os.path.join(self.wt, "lnk"))
+        self.start()
+        os.unlink(os.path.join(self.wt, "lnk"))
+        os.symlink(b, os.path.join(self.wt, "lnk"))
+        self.assertEqual(self.stop(), 0)
+        self.assertTrue(self.ran())
+
+    def test_n2_an_edit_inside_a_nested_repository_counts(self):
+        sub = os.path.join(self.wt, "sub")
+        write(os.path.join(sub, "a.txt"), "1\n")
+        sh(sub, "git", "init", "-q")
+        self.start()
+        write(os.path.join(sub, "a.txt"), "2\n")
+        self.assertEqual(self.stop(), 0)
+        self.assertTrue(self.ran())
+
+    def test_n2_an_untouched_nested_repository_skips(self):
+        sub = os.path.join(self.wt, "sub")
+        write(os.path.join(sub, "a.txt"), "1\n")
+        sh(sub, "git", "init", "-q")
+        self.start()
+        self.assertEqual(self.stop(), 0)
+        self.assertFalse(self.ran())
+
 
 if __name__ == "__main__":
     unittest.main()
