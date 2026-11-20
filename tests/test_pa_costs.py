@@ -2996,12 +2996,27 @@ class CC_StatusLine(CCBase):
         self.assertEqual(self.run_sl(cc_bytes(), then=("fail",)), b"partial line")
         self.assertEqual(len(self.run_sl(cc_bytes(), then=("big",))), 2097152)
         self.assertEqual(self.run_sl(cc_bytes(pad="y" * 900000), then=("noread",)), b"no-read")
+        self.assert_slow_inner_killed()
+        self.assertEqual((pa_costs.INNER_TIMEOUT, pa_costs.RECORD_BUDGET), (2.0, 0.3))
+
+    def test_cc9b_a_slow_start_of_the_inner_command_is_not_its_timeout(self):
+        # t-173: at load a start can be slow (the statusline process took up to 0.62 s to start its inner command, 64
+        # busy loops on 32 cores); INNER_TIMEOUT counts from the inner command's start, so a Popen 0.6 s late changes nothing
+        real = subprocess.Popen
+
+        def late(*args, **kwargs):
+            time.sleep(0.6)
+            return real(*args, **kwargs)
+        with mock.patch("subprocess.Popen", late):
+            self.assert_slow_inner_killed()
+
+    def assert_slow_inner_killed(self):
+        """The slow inner command is cut at INNER_TIMEOUT: nothing returned, recorded while it ran."""
         sid = "cc000000-0000-4000-8000-abcd000000aa"
         began = time.time()
         self.assertEqual(self.run_sl(cc_bytes(sid=sid), then=("slow",)), b"")
         self.assertLess(time.time() - began, 2.5)
         self.assertIsNotNone(self.cc_record(sid))  # recorded while the inner command ran
-        self.assertEqual((pa_costs.INNER_TIMEOUT, pa_costs.RECORD_BUDGET), (2.0, 0.3))
 
 
 # t-110 D1: cs4's bound, in the units of the machine that runs it. CS4_UNIT_SRC is an expression the timed child builds
@@ -3062,8 +3077,19 @@ class CC_Script(CCBase):
         self.assertEqual(self.cc_record()["terminal"], "t5")
 
     def test_cs2_slow_inner_is_killed_at_2_s_and_nothing_printed(self):
+        self.assert_killed_at_2_s()
+
+    def test_cs2b_a_slow_start_is_not_the_inner_timeout(self):
+        # t-173: at load the statusline took up to 0.62 s to start its inner command (64 busy loops on 32 cores), all
+        # before INNER_TIMEOUT starts counting; the same statusline started 0.6 s late is still killed at about 2 s
+        late = [sys.executable, "-c", "import runpy, sys, time; time.sleep(0.6); sys.argv = sys.argv[1:]; "
+                "runpy.run_path(sys.argv[0], run_name='__main__')"] + STATUSLINE[1:]
+        self.assert_killed_at_2_s(entry=late)
+
+    def assert_killed_at_2_s(self, entry=None):
+        """The slow inner command is killed at about 2 s (INNER_TIMEOUT), nothing printed, recorded while it ran."""
         sid = "cc000000-0000-4000-8000-abcd000000cc"
-        out, took = self.script(["--space", "sp1", "--then", cc_stub("slow")], cc_bytes(sid=sid))
+        out, took = self.script(["--space", "sp1", "--then", cc_stub("slow")], cc_bytes(sid=sid), entry=entry)
         self.assertEqual(out, b"")
         self.assertLess(took, 2.5)
         self.assertGreaterEqual(took, 1.9)
