@@ -10,14 +10,16 @@ only its judgement lines (--items). What it reads:
   - the ledger task: title, tier, evidence folder, the job's worktree (its `worktrees` entry, `main` the task's
     `worktree`); the round is the highest build round of its workers (a fix: one more), unless --round;
   - git in that worktree: the branch, HEAD, the base (--base; else the merge-base with main; a recheck, a --diff
-    verify or review and a fix: the last `Checked:` commit in REVIEW.md, else VERIFY.md) and the failing-test commits
-    in base..HEAD (a subject with "failing");
+    verify or review and a fix: the last `Checked:` commit in REVIEW.md, else VERIFY.md) and the test commits in
+    base..HEAD (a commit whose files are all under tests/; its subject is not read);
   - rules.json: r-few-mutations (its `mutations` field {low, normal, high, recheck}, else the numbers in its text) and
     r-test-runs (pa-run, --local only where a test needs this Mac) when active; no number is ever copied from an
     inactive rule or from an earlier handoff;
   - <space>/flakes.txt: the known flakes, one per line (blank lines and lines starting with # skipped);
   - agent.json: the Project Agent's address (`terminal`) and profile (the --public line).
-queue wraps `pa-queue brief <task> --repo <main checkout>` (repo: --repo, else the worktree's main checkout).
+queue wraps `pa-queue brief <task> --repo <main checkout>` from the task's queue.json entry (its repository and job;
+--job and --repo choose among several); it reads no git and needs no ledger worktree. A task not in queue.json
+falls back to --repo, else the ledger worktree's main checkout (pa-queue brief then says why it refuses).
 It never starts a worker and never writes the ledger or any file but the handoff; an existing handoff is kept
 unless --force. check and recheck are the low tier's (a normal or high tier task gets verify and review).
 """
@@ -35,6 +37,7 @@ import pa_hooks  # noqa: E402
 KINDS = ("check", "recheck", "fix", "verify", "review", "queue")
 TIERS = ("low", "normal", "high")
 FLAKES_FILE = "flakes.txt"
+QUEUE_FILE = "queue.json"  # pa-queue's file (read only here)
 MAIN = "main"
 RUNS = "pa-run, --local only where a test needs this Mac; say where each ran"
 RUNS_LOCAL = "pa-run --local; say so"
@@ -122,6 +125,11 @@ def checked_commit(evidence):
     return None, None, ""
 
 
+def passed(verdict):
+    """The last verdict was a pass (its Recorded limits are what a fix round closes)."""
+    return (verdict or "").strip().lower().startswith("pass")
+
+
 def must_count(verdict):
     m = re.match(r"must fix \((\d+)\)", verdict or "")
     return "{} Must fix".format(m.group(1)) if m else "Must fix findings"
@@ -138,6 +146,39 @@ def queue_brief(directory, repo, task, job):
     except pa_queue.Refused as r:
         raise Refused("pa-queue brief: {}".format(r))
     return out.getvalue().rstrip("\n")
+
+
+def queue_entry(directory, task, job, repo):
+    """(repository key, entry) of the task's queue.json entry, or (None, None) when it has none. job None: the main
+    entry, else the task's only entry; repo narrows to one repository."""
+    path = os.path.join(directory, QUEUE_FILE)
+    data = pa.read_json_safe(path) if os.path.exists(path) else {"repos": {}}
+    if not isinstance(data, dict) or not isinstance(data.get("repos"), dict):
+        raise Refused("{} is not a valid queue file".format(path))
+    want = os.path.realpath(repo) if repo else None
+    found = [(key, e) for key, rec in sorted(data["repos"].items()) if isinstance(rec, dict)
+             and (want is None or os.path.realpath(key) == want)
+             for e in rec.get("entries") or [] if isinstance(e, dict) and e.get("task") == task]
+    if job:
+        match = [x for x in found if (x[1].get("job") or MAIN) == job]
+    else:
+        match = [x for x in found if not x[1].get("job")] or found
+    if len(match) > 1:
+        raise Refused("{} has {} queue entries ({}); pass --job or --repo".format(
+            task, len(match), ", ".join("{} {}".format(k, e.get("job") or MAIN) for k, e in match)))
+    return match[0] if match else (None, None)
+
+
+def test_commits(path, base):
+    """The commits in base..HEAD whose files are all under tests/ (oldest first); the subject is not read."""
+    out = git(path, "-c", "core.quotePath=false", "log", "--reverse", "--abbrev=7", "--no-renames", "--name-only",
+              "--format=%x00%h", "{}..HEAD".format(base))
+    tests = []
+    for chunk in out.split("\0")[1:]:
+        lines = [l for l in chunk.splitlines() if l.strip()]
+        if len(lines) > 1 and all(l.startswith("tests/") for l in lines[1:]):
+            tests.append(lines[0].strip())
+    return tests
 
 
 def main_checkout(worktree):
@@ -165,10 +206,16 @@ def gather(args, directory, agent):
         raise Refused("{} has no tier in the ledger (low, normal or high)".format(args.task))
     if f.kind in ("check", "recheck") and f.tier != "low":
         raise Refused("{} is {} tier: check and recheck are the low tier's; use verify and review".format(args.task, f.tier))
+    f.queue_repo = f.queue_job = None
+    if f.kind == "queue":
+        key, qe = queue_entry(directory, args.task, args.job, args.repo)
+        if qe is not None:
+            f.queue_repo, f.queue_job = key, qe.get("job") or None
+            f.job = f.queue_job or MAIN
     f.label = args.task if f.job == MAIN else "{} {}".format(args.task, f.job)
     entry = next((w for w in task.get("worktrees") or [] if isinstance(w, dict) and w.get("job") == f.job), None)
     f.wt = (entry or {}).get("path") or (task.get("worktree") if f.job == MAIN else None)
-    if not f.wt:
+    if not f.wt and not f.queue_repo:
         raise Refused("{} has no worktree for job {} in the ledger".format(args.task, f.job))
     f.ev = os.path.join(directory, task.get("evidence") or os.path.join("evidence", args.task))
     f.pa = agent.get("terminal")
@@ -181,13 +228,15 @@ def gather(args, directory, agent):
     f.round = args.round or (built + 1 if f.kind == "fix" else built)
     f.diff = f.kind == "recheck" or bool(args.diff)
     f.items = items_text(args)
+    f.flakes = parse_flakes(read_text(os.path.join(directory, FLAKES_FILE)))
+    f.notes = []
+    if f.kind == "queue":
+        return f  # pa-queue brief reads the repository itself: no git here
     # git
     f.branch = git(f.wt, "rev-parse", "--abbrev-ref", "HEAD")
     f.head = short(f.wt, "HEAD")
     f.checked, f.checked_in, f.verdict = checked_commit(f.ev)
-    if f.kind == "queue":
-        f.base = f.base_label = None
-    elif args.base:
+    if args.base:
         f.base, f.base_label = short(f.wt, args.base), "base {}".format(short(f.wt, args.base))
     elif f.diff or f.kind == "fix":
         if not f.checked:
@@ -202,14 +251,11 @@ def gather(args, directory, agent):
         f.checked = f.base
     f.tests = []
     if f.base and f.kind != "fix":
-        log = git(f.wt, "log", "--reverse", "--abbrev=7", "--format=%h %s", "{}..HEAD".format(f.base))
-        f.tests = [l.split(" ", 1)[0] for l in log.splitlines() if re.search(r"\bfailing\b", l, re.I)]
+        f.tests = test_commits(f.wt, f.base)
     # rules and flakes
     rules = pa.read_json_safe(os.path.join(directory, "rules.json")) or {}
     f.mutations = mutation_numbers(rules)
     f.runs = RUNS if active_rule(rules, "r-test-runs") else RUNS_LOCAL
-    f.flakes = parse_flakes(read_text(os.path.join(directory, FLAKES_FILE)))
-    f.notes = []
     return f
 
 
@@ -322,18 +368,24 @@ def text_check(f):
 
 def text_recheck(f):
     rr, prev = r(f), max(f.round - 1, 1)
+    if passed(f.verdict):
+        found, what, closed = "passed with Recorded limits to fix", "Recorded limits", "fixed them"
+        each, bar = "each Recorded limit to fix", "a fix"
+    else:
+        found, what, closed = "found " + must_count(f.verdict), "Must fix", "fixed it"
+        each, bar = "each Must fix", "a Must fix's fix"
     return [
         "# {} recheck (check role, {} tier, round {}, check: diff)".format(f.label, f.tier, f.round), "",
-        "Fresh context; you are not an author of {0}. Task {0}: {1}. The round {2} check at {3} found {4} (read "
-        "{5}/REVIEW.md '## Must fix'); round {6} fixed it: read FINDINGS.md, DECISIONS.md, build.log 'Round {6}'.".format(
-            f.label, f.title, prev, f.base, must_count(f.verdict), f.ev, f.round),
+        "Fresh context; you are not an author of {0}. Task {0}: {1}. The round {2} check at {3} {4} (read "
+        "{5}/{6} '## {7}'); round {8} {9}: read FINDINGS.md, DECISIONS.md, build.log 'Round {8}'.".format(
+            f.label, f.title, prev, f.base, found, f.ev, f.checked_in or "REVIEW.md", what, f.round, closed),
         "{} Diff check: {}..{}.".format(where_line(f), f.base, f.head),
         "You report; you never fix.",
         "1. pa-full-suite once at HEAD (never under a timeout), output to full-suite-check{}.out.{}".format(rr, flakes_sentence(f)),
         "2. {} -> check-failing-first{}.out.".format(failing_first(f), rr),
         "3. " + mutations_line(f, "check-mut{}.log".format(rr)),
-        with_items("4. Review: each Must fix is closed and nothing else changed.", f.items),
-        "Must-fix bar: breaks a Must fix's fix, a verification point, safety or security. Else Recorded limit or Nit; "
+        with_items("4. Review: {} is closed and nothing else changed.".format(each), f.items),
+        "Must-fix bar: breaks " + bar + ", a verification point, safety or security. Else Recorded limit or Nit; "
         "say whether each is small and inside this task's files (fixed before merge) or accepted (no follow-up task).",
         "Append '## Round {} recheck (diff {}..{})' to VERIFY.md and REVIEW.md, each ending {}; REVIEW.md's section has "
         "{}.".format(f.round, f.base, f.head, ENDING, REVIEWER),
@@ -345,14 +397,19 @@ def text_fix(f):
     installed = " Hooks installed." if hooks.get("task") == f.task else ""
     suite = ("pa-full-suite once at the end of the Test phase, before the commit." if f.tier == "high"
              else "No pa-full-suite.")
-    found = must_count(f.verdict) if f.checked_in else "Must fix findings"
-    where = "{}/{} '## Must fix' (and VERIFY.md)".format(f.ev, f.checked_in or "REVIEW.md")
+    if f.checked_in and passed(f.verdict):
+        found = "passed with Recorded limits to fix: read {}/{} '## Recorded limits' (and Nits)".format(f.ev, f.checked_in)
+        only = "Fix only the Recorded limits and Nits named here; nothing else."
+    else:
+        found = "found {}: read {}/{} '## Must fix' (and VERIFY.md)".format(
+            must_count(f.verdict) if f.checked_in else "Must fix findings", f.ev, f.checked_in or "REVIEW.md")
+        only = "Fix only the Must fix findings. Recorded limits and Nits stay as they are."
     return [
         "# {} fix (build role, {} tier, round {})".format(f.label, f.tier, f.round), "",
-        "Task {}: {}. The check at {} found {}: read {}. Also read plan.md, FINDINGS.md, DECISIONS.md.".format(
-            f.label, f.title, f.checked, found, where),
+        "Task {}: {}. The check at {} {}. Also read plan.md, FINDINGS.md, DECISIONS.md.".format(
+            f.label, f.title, f.checked, found),
         "Worktree {}, branch {}, HEAD {}.{}".format(f.wt, f.branch, f.head, installed),
-        with_items("Fix only the Must fix findings. Recorded limits and Nits stay as they are.", f.items),
+        with_items(only, f.items),
         "1. A test first that fails at {}: commit it while failing. 2. The fix. 3. Affected tests ({}). {} 4. Append a "
         "'Round {}' section to FINDINGS.md, DECISIONS.md and build.log with real output. Commit; report commit ids and "
         "files touched.".format(f.head, f.runs, suite, f.round),
@@ -395,7 +452,11 @@ def text_review(f):
 
 
 def text_queue(f, repo):
-    lines = [queue_brief(f.directory, repo or main_checkout(f.wt), f.task, None if f.job == MAIN else f.job), ""]
+    if f.queue_repo:
+        brief = queue_brief(f.directory, f.queue_repo, f.task, f.queue_job)
+    else:
+        brief = queue_brief(f.directory, repo or main_checkout(f.wt), f.task, None if f.job == MAIN else f.job)
+    lines = [brief, ""]
     if f.items:
         lines += [f.items, ""]
     lines.append((flakes_sentence(f).strip() + " " if f.flakes else "") +
