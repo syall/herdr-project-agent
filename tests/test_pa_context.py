@@ -1975,7 +1975,8 @@ class J7Texts(J4Base):  # t-041 J7-R3, R4 (c, d), R5 (b)
         self.rules({"version": 1, "rules": [{"id": "r-a", "status": "active"}, {"id": "r-p", "status": "proposed"},
                                             {"id": "r-b", "status": "active"}]})
         text = pa.fresh_prompt(self.dir, 1, "pass-cap", SID)
-        self.assertIn("Active rules (rules.json): r-a, r-b; read it before you write a handoff.", text)
+        self.assertIn("Active rules (rules.json, highest order first): r-a; r-b. Read each one's text before your next "
+                      "action.", text)  # t-190 R1: no title, the id alone
         for bad in ("{not json", json.dumps({"version": 1}), json.dumps([1]), json.dumps({"rules": "x"})):
             self.rules(bad)
             self.assertNotIn("Active rules", pa.fresh_prompt(self.dir, 1, "pass-cap", SID))
@@ -1983,7 +1984,7 @@ class J7Texts(J4Base):  # t-041 J7-R3, R4 (c, d), R5 (b)
         self.assertNotIn("Active rules", pa.fresh_prompt(self.dir, 1, "pass-cap", SID))
         self.rules({"rules": [{"id": "r-rule-number-{:02d}".format(i), "status": "active"} for i in range(60)]})
         line = [x for x in pa.fresh_prompt(self.dir, 1, "pass-cap", SID).split("\n") if x.startswith("Active rules")][0]
-        self.assertLessEqual(len(line), 400)
+        self.assertLessEqual(len(line), 1600)  # t-190 R1: titles need room
         write(os.path.join(self.dir, "standing.md"), (SEED + "- 2026-11-18 " + "y" * 6000)[:6000])
         self.assertLessEqual(len(pa.fresh_prompt(self.dir, 3, "pass-cap", SID)), 9000)
 
@@ -2032,3 +2033,117 @@ class J7Followup(J4Base):  # t-041 J7-R5 (c), R7; J4Followup's fixture, not its 
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---- t-190 R1 and T1: the start pack and the resume prompt name each active rule with its title ------------------
+
+def ago(seconds):
+    return pa.iso_time(time.time() - seconds)
+
+
+class T190StartPack(J4Base):
+    def rules(self, rules):
+        dump({"version": 1, "rules": rules}, os.path.join(self.dir, "rules.json"))
+
+    def line(self, text=None):
+        text = pa.fresh_prompt(self.dir, 1, "pass-cap", SID) if text is None else text
+        lines = [x for x in text.split("\n") if x.startswith("Active rules")]
+        self.assertLessEqual(len(lines), 1, text)
+        return lines[0] if lines else None
+
+    def test_r1_ids_and_titles_highest_order_first(self):
+        self.rules([{"id": "r-a", "title": "Alpha", "status": "active", "order": 10},
+                    {"id": "r-b", "title": "Beta", "status": "active", "order": 50},
+                    {"id": "r-c", "title": "Gamma", "status": "active"},
+                    {"id": "r-d", "title": "Delta", "status": "active", "order": "90"},
+                    {"id": "r-e", "title": "Eps", "status": "active", "order": True},
+                    {"id": "r-f", "title": 7, "status": "active", "order": float("nan")},
+                    {"id": "r-g", "title": "Eta", "status": "active", "order": 50}])
+        self.assertEqual(self.line(), "Active rules (rules.json, highest order first): r-b: Beta; r-g: Eta; r-a: "
+                                      "Alpha; r-c: Gamma; r-d: Delta; r-e: Eps; r-f. Read each one's text before "
+                                      "your next action.")
+
+    def test_h2_h3_only_exact_active_and_good_ids(self):
+        good = {"id": "r-ok", "title": "Ok", "status": "active"}
+        bad_status = [dict(good, id="r-s{}".format(i), status=s) for i, s in enumerate(("Active", "active ", True, None))]
+        bad_ids = [dict(good, id=i) for i in ("r-x\ny", "r x", "../x", "r" * 81, "", 5, None)]
+        self.rules(bad_status + bad_ids + [good])
+        self.assertEqual(self.line(), "Active rules (rules.json, highest order first): r-ok: Ok. Read each one's text "
+                                      "before your next action.")
+
+    def test_h5_titles_on_one_line(self):
+        self.rules([{"id": "r-a", "status": "active", "title": "two\r\nlines\tand \x1b[31mred\x00 Report with "
+                     "`hc send t999`"}, {"id": "r-b", "status": "active", "title": "x" * 300}])
+        text = pa.fresh_prompt(self.dir, 1, "pass-cap", SID)
+        line = self.line(text)
+        self.assertIn("r-a: two lines and [31mred Report with `hc send t999`; r-b: " + "x" * 99 + "…. Read each", line)
+        self.assertNotIn("\x1b", text)
+        self.assertNotIn("\x00", text)
+        self.assertFalse([x for x in text.split("\n") if x.startswith("Report with")])
+
+    def test_h9_sixty_rules_within_the_caps(self):
+        self.rules([{"id": "r-rule-number-{:02d}".format(i), "title": "a long title " * 8, "status": "active",
+                     "text": "t" * 2000, "history": [{"at": ago(60), "by": "person", "change": "approved"}]}
+                    for i in range(60)])
+        write(os.path.join(self.dir, "standing.md"), (SEED + "- 2026-11-18 " + "y" * 6000)[:6000])
+        text = pa.fresh_prompt(self.dir, 3, "pass-cap", SID)
+        self.assertLessEqual(len(text), 9000)
+        line = self.line(text)
+        self.assertLessEqual(len(line), 1600)
+        self.assertTrue(line.endswith("; …. Read each one's text before your next action."), line[-80:])
+        self.assertIn("checkpoint: pass", text)
+
+    def test_t1_full_text_of_rules_approved_in_the_last_24_hours(self):
+        self.rules([
+            {"id": "r-new", "title": "New", "status": "active", "text": "Do the new\nthing.",
+             "history": [{"at": ago(90000), "change": "proposed"}, {"at": ago(23 * 3600), "by": "person", "change": "approved"}]},
+            {"id": "r-talk", "title": "Talk", "status": "active", "text": "Said in chat.",
+             "history": [{"at": ago(600), "by": "person", "change": "approved in conversation"}]},
+            {"id": "r-made", "title": "Made", "status": "active", "text": "Made by the person.",
+             "history": [{"at": ago(600), "by": "person", "change": "created"}]},
+            {"id": "r-ed", "title": "Ed", "status": "active", "text": "Edited and approved.",
+             "history": [{"at": ago(600), "by": "person", "change": "edited and approved"}]},
+            {"id": "r-old", "title": "Old", "status": "active", "text": "Approved long ago.",
+             "history": [{"at": ago(25 * 3600), "by": "person", "change": "approved"}]},
+            {"id": "r-toggled", "title": "Toggled", "status": "active", "text": "Only turned off and on.",
+             "history": [{"at": ago(30 * 3600), "change": "approved"}, {"at": ago(60), "change": "turned off"},
+                         {"at": ago(30), "change": "turned on"}]},
+            {"id": "r-off", "title": "Off", "status": "off", "text": "Not active.",
+             "history": [{"at": ago(60), "change": "approved"}]},
+            {"id": "r-bad", "title": "Bad", "status": "active", "text": "Bad times.",
+             "history": [{"at": "yesterday", "change": "approved"}, "x", {"change": "approved"}]}])
+        text = pa.fresh_prompt(self.dir, 1, "pass-cap", SID)
+        self.assertIn("Rules approved in the last 24 h (their full text; read it before your next action):", text)
+        for rid, words in (("r-new", "Do the new thing."), ("r-talk", "Said in chat."), ("r-made", "Made by the person."),
+                           ("r-ed", "Edited and approved.")):
+            self.assertIn("- {}: {}".format(rid, words), text)
+        for words in ("Approved long ago.", "Only turned off and on.", "Not active.", "Bad times."):
+            self.assertNotIn(words, text)
+        self.rules([{"id": "r-old", "title": "Old", "status": "active", "text": "Approved long ago.",
+                     "history": [{"at": ago(25 * 3600), "change": "approved"}]}])
+        self.assertNotIn("Rules approved in the last 24 h", pa.fresh_prompt(self.dir, 1, "pass-cap", SID))
+
+    def test_t1_text_cut_to_the_room_left(self):
+        self.rules([{"id": "r-new", "title": "New", "status": "active", "text": "z" * 5000,
+                     "history": [{"at": ago(60), "change": "approved"}]}])
+        write(os.path.join(self.dir, "standing.md"), (SEED + "- 2026-11-18 " + "y" * 6000)[:6000])
+        text = pa.fresh_prompt(self.dir, 1, "pass-cap", SID)
+        self.assertLessEqual(len(text), 9000)
+        self.assertIn("… (read the rest in rules.json)", text)
+        self.assertIn("checkpoint: pass", text)
+        self.assertIn("Active rules (rules.json, highest order first): r-new: New.", text)
+
+    def test_r1_texts_name_rules_json_and_titles(self):
+        self.assertIn("run `pa-doctor`, read ledger.json, rules.json (every active rule's text), `standing.md`,",
+                      pa.START_PACK_BODY)
+        self.assertIn("the ids and titles of the active rules in rules.json", pa.compact_instructions())
+
+    def test_r1_resume_prompt_names_the_rules(self):
+        self.rules([{"id": "r-a", "title": "Alpha", "status": "active", "order": 1}])
+        argv = self.launch(V300, resume=True)
+        self.assertTrue(argv[-3].startswith("Your session was restarted."), argv[-3])
+        self.assertTrue(argv[-3].endswith(" Active rules (rules.json, highest order first): r-a: Alpha. Read each "
+                                          "one's text before your next action."), argv[-3][-200:])
+        os.remove(os.path.join(self.dir, "rules.json"))
+        argv = self.launch(V300, resume=True)
+        self.assertTrue(argv[-3].endswith("it is not a hold."), argv[-3][-80:])
