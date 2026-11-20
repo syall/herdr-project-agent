@@ -2,23 +2,25 @@
 
 A per-space orchestrator agent for Herdr, and the panel you run it from. The agent plans work,
 hands it to worker agents and asks you only for decisions; the panel shows its decision cards,
-tasks, rules and pass schedule, read from plain files the agent keeps on disk.
+tasks, merge queue, rules, pass schedule and costs, read from plain files the agent keeps on disk.
 
 ## What you see
 
 A right-panel view on the theme's `chrome` background, text 11 to 13 px, top to bottom:
 
-1. A 34 px header: `PA: <name>`, the agent's status dot and word on the right.
-2. Two dim lines: the project folder, then `profile <name> · <n> active of <m> tasks · pass <k>`.
-3. The schedule bar: a one-line summary (`Passes every 5 min · next 14:32`, or paused, off,
+1. A 34 px header: `PA: <name>`, the agent's status dot and word on the right, then ☕ (keep this Mac
+   awake while Herdr runs; macOS only) and ↻ (fresh contexts on or off), each explained in its tooltip.
+2. Two dim lines: the project folder, then `profile <name> · in progress 2 · queued 3 · pass <k>` (a count per
+   active state, or `no active tasks`; the pass number only while passes are on; the name opens `profile.json`).
+3. Six view pills: `Decisions · n`, `Tasks · n`, `Queue · n`, `Rules · n`, `Passes · <cadence>`
+   (or off, paused, queued, `!`), `Costs` (with the space's estimated total once read, `Costs · 12.34 est.`).
+4. The chosen view, scrolling: cards with a 1 px border and 7 px corners on `surface`. The Passes view
+   holds the schedule: a one-line summary (`Passes every 5 min · next 14:32`, or paused, off,
    `no active tasks`, `quiet hours until 08:00`), then `Pause passes`, `Run pass now` and
    `Run retrospective now`. Clicking the summary opens cadence presets (5, 10, 15, 30, 60), a
    custom number, Off, quiet hours and "Only while tasks are active". Quiet hours' Set takes an
    empty field as the time it shows (19:00 to 08:00); a typed time is 24-hour H:MM or HH:MM, and
    one that is not gets a message naming the field and what was typed.
-4. Four view pills: `Decisions · n`, `Tasks · n`, `Rules · n`, `Costs` (with the space's estimated
-   total once read, `Costs · 12.34 est.`).
-5. The chosen view, scrolling: cards with a 1 px border and 7 px corners on `surface`.
 
 A new space opens with a 600 x 440 dialog: a Project Agent card (`Set up for <folder>`,
 `Another folder…`) and three tiles (Claude, Codex, Terminal).
@@ -141,15 +143,20 @@ push card can be made and nothing about pushing changes. Agents never push a mai
 
 - `mods/project-agent/`: `main.js` (panel), `store.js` (file reads, guarded writes, links),
   `rules.js`, `timer.js` (schedule), `keeper.js` (the agent tab: tracking, ordering, restoring in place
-  with `keeper.lock` between Herdr clients, the new-space dialog), `setup.js` (the new-space dialog), `worker.js` (the delete-worker dialog), `pathfield.js`, `project.svg`,
+  with `keeper.lock` between Herdr clients, the new-space dialog), `setup.js` (the new-space dialog), `worker.js` (the delete-worker dialog),
+  `tasks.js` (the task order), `places.js` (worker places and the start order), `queue.js` (the Queue
+  view), `costs.js` (the Costs view), `push.js` (push cards), `copy.js` (Copy controls), `awake.js`
+  (keep awake), `zone.js` (the timezone for Costs), `host.js` (the one place host calls start),
+  `pathfield.js`, `project.svg`,
   `mod.json` (`{ "place": "none" }`).
 - Layout: a block `{ "mod": "project-agent" }` in the right panel's stack, optionally with
   `props.profile`, and a floating block `{ "mod": "project-agent", "props": { "timer": true } }`
   that draws nothing and keeps the timer and keeper running. Optional ids it uses when present:
   a stack `panel-body` with children `files`, `agents-view` (holding a block `agents-live`).
 - `runtime/` (installed to `~/.config/herdr-pa/` by `install.sh`): `core/` (the orchestrator
-  and worker prompts, the phases and gates, default rules, hook wrappers), `tools/pa.py` and
-  `tools/pa_hooks.py` (the `pa-*` commands), `profiles/personal/`.
+  and worker prompts, the phases and gates, default rules, hook wrappers), `tools/` (the `pa-*`
+  commands: `pa.py`, `pa_hooks.py`, `pa_costs.py`, `pa_places.py`, `pa_handoff.py`, `pa_queue.py`,
+  `pa_push.py` and the modules they load), `profiles/personal/`.
 - State it reads, on the space's machine: `~/.config/herdr-pa/spaces/<space-id>/` (`agent.json`,
   `ledger.json`, `decisions/*.json`, `rules.json`, `schedule.json`, `pass-request.json`,
   `evidence/<task>/`, `heartbeat`) and `~/.config/herdr-pa/profiles/<name>/profile.json`.

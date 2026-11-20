@@ -6,9 +6,9 @@ company's tools; a profile maps its terms to real ones.
 
 | Folder | Installed to | What it is |
 |---|---|---|
-| `mods/project-agent/` | `~/.config/herdr-app/mods/project-agent/` | The panel (decisions, tasks, rules, costs, schedule), the new-space setup dialog, the pass timer, and the keeper that tracks each Project Agent tab |
+| `mods/project-agent/` | `~/.config/herdr-app/mods/project-agent/` | The panel (Decisions, Tasks, Queue, Rules, Passes and Costs tabs), the new-space setup dialog, the pass timer, and the keeper that tracks each Project Agent tab |
 | `runtime/core/` | `~/.config/herdr-pa/core/` | The orchestrator and worker prompts, the SDLC, default rules, hook wrappers |
-| `runtime/tools/` | `~/.config/herdr-pa/tools/` | The `pa-*` commands (`pa.py`, `pa_hooks.py`, `pa_costs.py`, `pa_push.py`), linked into `~/.local/bin` |
+| `runtime/tools/` | `~/.config/herdr-pa/tools/` | The `pa-*` commands (`pa.py`, `pa_hooks.py`, `pa_costs.py`, `pa_places.py`, `pa_handoff.py`, `pa_queue.py`, `pa_push.py` and the modules they load), linked into `~/.local/bin` (most through `pa_launch.py`) |
 | `runtime/profiles/personal/` | `~/.config/herdr-pa/profiles/personal/` | A profile for personal development |
 
 ## Install
@@ -218,6 +218,25 @@ script a worker writes can still do what your user can. When it cannot load, it 
 it had before (an allowlist, plain lines, a Bash write rule) are described in `docs/worker-guard-history.md`,
 with the commits that hold them.
 
+## The merge queue (`pa-queue`)
+
+Changes that passed their checks reach a repository's main branch through one queue per space,
+`queue.json` in the state folder, which only `pa-queue` writes (workers are refused it). Each entry
+is **stacked**: `pa-queue add` joins it at the end, on the branch of the entry before it (the tool
+rebases it there when needed), so the entries merge in order as one chain. `pa-queue verify` decides
+from git whether a rebased branch still holds the content that was checked (clean, moved, a union of
+both sides, changed, or stale); moved and union ones need a short review rather than a new check,
+and a stacked entry under your standing rule also needs a short review that finds it independent of
+the entry below it. A branch rebased outside the queue can be verified the same way, and its short
+review counts. An entry taken out (`pa-queue out`, with its dependents) leaves the entries behind it
+invalidated, and `pa-queue restack` rebases them again as a chain (`refresh` does so itself after a
+failure). `pa-queue refresh` also records short reviews and answered cards; `pa-queue card` puts the
+ready front (at most 4 entries) on one queue card; `pa-queue merge` fast-forwards local main entry
+by entry (no merge commits) and, where pushing is set up for the repository, opens the push card.
+The tool rebases only queue branches, in their own clean worktrees, aborts on a conflict, and never
+pushes, fetches or touches a remote. `pa-queue show` reads every state now; the panel's Queue tab
+shows the last one written.
+
 ## Pushing main from the panel
 
 Off by default. No agent pushes a main branch: not a worker, and not the Project Agent, except
@@ -270,9 +289,12 @@ push it yourself with one click in the panel.
   counts only while it is active, yours (no later change by anyone else), and bound by you on the
   allowlist entry with its text unchanged: `pa-push-allow set --path P --space S --standing <rule
   id>` in your own terminal (`--unbind` removes it; any edit of the rule's text ends it until you
-  bind again). Then the Project Agent merges passed entries with `pa-queue merge --standing` and
-  pushes them with `pa-push-main run --standing`, with every check above except that no card is
-  shown; high tier entries still get a card. A stacked entry must first be found independent of
+  bind again). Then the Project Agent merges passed entries with `pa-queue merge --repo <main checkout>
+  --standing <rule id>` and pushes them with `pa-push-main run --standing <rule id> --repo <main
+  checkout> --space <id>` (refused without `--space`), with every check above except that no card
+  is shown; high tier entries still get a card. An entry that you held back on a queue card (**Not
+  now**, or past the "Merge up to" you chose) is held from the rule too, until a later card
+  approves it. A stacked entry must first be found independent of
   the one it is stacked on: `pa-queue brief` asks that with the entry's other checks, in the same
   review file as its shared-file review when it has one, and that one file must answer both. A hold, an Other answer or a note on any card, a
   failed check or gate, a commit after the checked commit, or a refused push stops it and the
@@ -537,7 +559,7 @@ nothing is deleted. Every tool still reads an archived card (an answered Keep is
 tool that changes one puts it back in `decisions/`. The panel shows the archive under the answered cards,
 read only when you open it. `pa-task unarchive <card-id>` moves one card back by hand.
 
-**The Costs view** (Project panel, fifth tab) reads only `costs/summary.json` on the space's machine,
+**The Costs view** (Project panel, sixth tab) reads only `costs/summary.json` on the space's machine,
 only while it is shown, at most every 10 s. It shows Total, Today and Last 7 days, then the spend by
 activity, task, session type and day, each with its drill-down, and `Refresh` (runs `pa-costs
 collect`). Nothing in it writes anything except those two buttons and `Turn off` below.
@@ -834,6 +856,7 @@ pa-handoff fix t-12 --items "M1 only"                 # the next round, from REV
 pa-handoff recheck t-12 --logic                       # low tier: the diff from the checked commit to HEAD
 pa-handoff verify t-30 --job j2                       # normal or high tier (review is the same; --diff for a recheck)
 pa-handoff queue t-12                                 # wraps `pa-queue brief` with the reviewer's lines
+pa-handoff rules t-12 --role build                    # only the rules block below, printed; writes nothing
 ```
 
 It reads the ledger task (title, tier, the job's worktree, its evidence folder, the round from its build workers),
@@ -843,6 +866,17 @@ space's `flakes.txt` (one per line, `#` for comments) and the address in `agent.
 `evidence/<task>/handoff-<kind>[-<job>][-r<round>].md`, prints its path, keeps an existing one unless `--force`,
 and writes nothing else: no ledger change, no worker started. `--items` (or `--items-file`) adds the judgement
 lines; `--public` adds the public-repository rule; `--no-mutations` is for docs-only or test-only changes.
+
+**The space's rules in every handoff.** Each handoff ends, before its last line, with the rules for that job:
+every active rule in `rules.json` whose `appliesTo` is all, one of the job role's names (a build job also takes
+`plan` and `test`), the task's type or its tier, highest `order` first, as `- <id>: <title>`, with the full text
+of the rules aimed at the role (at most 6,000 characters, then `- and N more in rules.json`), and the time of the
+newest change. `pa-handoff rules <task> --role design|build|verifier|reviewer|check` prints that block alone, for
+a handoff the Project Agent writes itself. The Project Agent gets every active rule: its start pack (after a
+compaction or a fresh context) and its prompt after a restart carry one `Active rules (rules.json, highest order
+first): <id>: <title>; …` line, and the start pack also carries the full text of rules created or approved in the
+last 24 hours. `pa-doctor` lists the active rules, any duplicate id, and the rules changed since the ledger's
+checkpoint.
 
 ## Licence
 
