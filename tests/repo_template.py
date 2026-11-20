@@ -4,8 +4,8 @@ A fixture that made the same repository with git in every setUp (init, config, a
 process as a template, under its own temp folder, and copies it into each test's folder with shutil.copytree: no
 process start. Each test still owns its copy alone (objects, refs, index, config); the template is never handed to a
 test and never written after it is built. A layout whose files name absolute paths (a remote url, linked worktrees)
-is pointed at the copy by relink(); references() lists what still names the template, and the fixtures assert it is
-empty.
+is pointed at the copy by relink(); references() lists the git files that still name a path outside the copy (the
+template or any other folder), and push_fixtures asserts it is empty.
 """
 import os
 import shutil
@@ -59,11 +59,39 @@ def relink(dest, old):
                 f.write(text.replace(old + os.sep, dest + os.sep))
 
 
-def references(dest, old):
-    """The git files under dest whose text still names the folder old (a copy must name only itself)."""
+def _paths_named(text):
+    """The absolute paths a git path file names: a config value (`key = value`, a `file://` url read as its path),
+    a `.git` file's `gitdir: <path>`, or a gitdir file's bare line."""
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith(("#", ";", "[")):
+            continue
+        if line.startswith("gitdir:"):
+            value = line[len("gitdir:"):]
+        elif "=" in line:
+            value = line.split("=", 1)[1]
+        else:
+            value = line
+        value = value.strip().strip('"')
+        if value.startswith("file://"):
+            value = value[len("file://"):]
+        if os.path.isabs(value):
+            yield value
+
+
+def _inside(path, folder):
+    path, folder = os.path.realpath(path), os.path.realpath(folder)
+    return path == folder or path.startswith(folder.rstrip(os.sep) + os.sep)
+
+
+def references(dest, old=None):
+    """The git files under dest that name an absolute path outside dest (a copy must name only itself, t-114 REVIEW
+    R1): the template (old), another test's copy, or any other folder. old is kept for the callers; it is outside
+    dest, so it is flagged like any other outside path."""
     found = []
     for p in _path_files(dest):
         with open(p, errors="replace") as f:
-            if old in f.read():
-                found.append(p)
+            text = f.read()
+        if any(not _inside(v, dest) for v in _paths_named(text)) or (old and old in text):
+            found.append(p)
     return found
