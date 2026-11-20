@@ -1448,6 +1448,28 @@ class X25Sent(StepBase):
         self.assertIn(name, out)
         self.assertFalse([c for c in self.calls() if c[0] == "file"], self.calls())
 
+    def test_x25g_log_showroot_false_hides_no_root_path(self):
+        """t-123 round 3 (REVIEW Herdr H2-1): with log.showRoot=false a plain git log lists no path of the root
+        commit, so a secret the root commit added and nothing changed since is in no log line; a replace ref on
+        HEAD whose tree lacks it hides it from a plain ls-tree too. Both reads must still see it (log --root)."""
+        name = "." + "env"
+        write(os.path.join(self.wt, name), "x\n")
+        sh(self.wt, "git", "add", "-f", name)
+        root = sh(self.wt, "git", "commit-tree", sh(self.wt, "git", "write-tree").strip(), "-m", "root").strip()
+        sh(self.wt, "git", "update-ref", "HEAD", root)
+        sh(self.wt, "git", "rm", "-q", "--cached", name)
+        os.remove(os.path.join(self.wt, name))
+        copy = sh(self.wt, "git", "commit-tree", sh(self.wt, "git", "write-tree").strip(), "-m", "a copy").strip()
+        sh(self.wt, "git", "replace", "HEAD", copy)
+        sh(self.wt, "git", "config", "log.showRoot", "false")
+        self.assertNotIn(name, sh(self.wt, "git", "--no-replace-objects", "log", "--format=", "--name-only", "HEAD"))
+        self.assertNotIn(name, sh(self.wt, "git", "ls-tree", "-r", "--name-only", "HEAD"))
+        self.assertEqual("", sh(self.wt, "git", "status", "--porcelain"))
+        self.fresh_log()
+        out = self.check_refused_on("never sent")
+        self.assertIn(name, out)
+        self.assertFalse([c for c in self.calls() if c[0] == "file"], self.calls())
+
 
 class X26Prepare(StepBase):
     """R6: the step's probe and prepare; each bad prepare output is a setup failure."""
