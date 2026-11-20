@@ -1719,7 +1719,7 @@ def raw_blobs(raw, common, folder, shas):
 
 def union_pair(x, y):
     """True when file entries x (before the rebase) and y (after) may be compared by content: status M on both, the
-    same regular modes, another base blob (t-052 J3c, t-086, t-116: one guard for union_only and commit_union)."""
+    same regular modes, another base blob (t-052 J3c, t-086, t-116: one guard for union_of, commit_union, replay_of)."""
     return x.get("status") == "M" and y.get("status") == "M" and x.get("baseBlob") != y.get("baseBlob") and \
         (x.get("baseMode"), x.get("tipMode")) == (y.get("baseMode"), y.get("tipMode")) and \
         x.get("tipMode") in REGULAR_MODES and x.get("baseMode") in REGULAR_MODES
@@ -1769,6 +1769,30 @@ def commit_union(raw, common, x, y):
     return (order, regions) if order else None
 
 
+def replay_of(raw, common, x, y):
+    """True when file entry y (a commit's) is a clean replay of x (the same commit before the rebase) whose -U0 hunks
+    differ (a diff realignment, t-086 finding 2): union_pair, and a plain `git merge-file` of x's blob onto y's parent
+    over x's parent exits 0 with an output equal to y's blob byte for byte, with git's own diff or the rebase's
+    (UNION_ALGORITHMS). The blobs are written raw into a mktemp -d folder, as union_of does (t-116)."""
+    if not union_pair(x, y):
+        return False
+    folder = tempfile.mkdtemp(prefix="pa-replay-")
+    try:
+        names, blobs = raw_blobs(raw, common, folder, (("mine", x["tipBlob"]), ("old", x["baseBlob"]),
+                                                       ("new", y["baseBlob"]), ("tip", y["tipBlob"])))
+        for algorithm in UNION_ALGORITHMS:
+            with open(os.path.join(folder, "replay"), "wb") as f:
+                f.write(blobs["mine"])
+            code, _o, _e = raw(folder, *(("merge-file", "-q") + algorithm + ("replay", names["old"], names["new"])))
+            with open(os.path.join(folder, "replay"), "rb") as f:
+                merged = f.read()
+            if code == 0 and merged == blobs["tip"]:
+                return True
+        return False
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+
+
 def union_only(run, raw, path, checked, now):
     """union_check's first four values: (ok, why, unions, shared)."""
     return union_check(run, raw, path, checked, now)[:4]
@@ -1780,7 +1804,8 @@ def union_check(run, raw, path, checked, now):
     or a union: status M on both sides, the same regular modes, another base, and its tip blob exactly the
     merge-file --union of the checked tip and the new base (union_of); at least one union; the same commits (count,
     messages, paths), each the same, moved, or touching union files differently only as a union of its own
-    (commit_union, t-086: every commit is checked, not just the tip). unions: [{path, oldBase, newBase, checkedTip, tip, order, regions}]. commit_unions
+    (commit_union, t-086: every commit is checked, not just the tip) or as a clean replay of its own change (replay_of,
+    t-116: a diff realignment). unions: [{path, oldBase, newBase, checkedTip, tip, order, regions}]. commit_unions
     (t-116, t-086 finding 1): [{commit, path, blob, regions, order}] of each commit's union, except one that is the tip's
     own (the same blob and regions as a tip union): a one-commit union gives []. Else (False, why, [], [], []). Never
     raises; never clean alone: a short reviewer judges that every region is only docstrings or comments."""
@@ -1829,7 +1854,8 @@ def union_check(run, raw, path, checked, now):
                 if fx[p] == fy[p] or same_lines(run, path, fx[p], fy[p]):
                     continue
                 # t-086 (RL-J3c-1): a union file is checked in every commit that changes it otherwise, the same way
-                # as at the tip: that commit's blob must be the union of its old change on its new parent
+                # as at the tip: that commit's blob must be the union of its old change on its new parent, or (t-116,
+                # t-086 finding 2) exactly the clean three-way replay of its old change there
                 if p not in union_paths:
                     return False, "the commits changed ({})".format(clean(p)), [], [], []
                 found = commit_union(raw, common, fx[p], fy[p])
@@ -1838,7 +1864,7 @@ def union_check(run, raw, path, checked, now):
                     if (p, fy[p]["tipBlob"], json.dumps(regions)) not in tip_own:
                         commit_unions.append({"commit": y["sha"], "path": p, "blob": fy[p]["tipBlob"],
                                               "regions": regions, "order": order})
-                else:
+                elif not replay_of(raw, common, fx[p], fy[p]):
                     return False, "the commits changed ({})".format(clean(p)), [], [], []
         return True, "", unions, shared, commit_unions
     except ContentError as e:
