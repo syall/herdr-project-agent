@@ -388,7 +388,8 @@ class Doctor(Base):
         self.assertIn("t-044 due 'soon' is not a UTC time", out)
 
     def test_d6_handoff_notes(self):
-        write(os.path.join(self.dir, "evidence", "t-041", "handoff-plan-j2.md"), "job\n")
+        write(os.path.join(self.dir, "evidence", "t-041", "handoff-plan-j2.md"),
+              "job\nSpace rules for this job: none active (rules.json).\n")  # t-190 R7: a block, so no note
         self.ledger({"version": 1, "tasks": [{"id": "t-041", "state": "in-progress", "workers": [
             {"address": "t10", "name": "t-041-plan-j2"},
             {"address": "t11", "name": "t-041-fix"},
@@ -2147,3 +2148,137 @@ class T190StartPack(J4Base):
         os.remove(os.path.join(self.dir, "rules.json"))
         argv = self.launch(V300, resume=True)
         self.assertTrue(argv[-3].endswith("it is not a hold."), argv[-3][-80:])
+
+
+# ---- t-190 R6, R7: pa-doctor lists the active rules, the ones changed since the checkpoint, handoffs without the block
+
+class T190Doctor(Doctor):
+    def rules(self, rules):
+        dump({"version": 1, "rules": rules}, os.path.join(self.dir, "rules.json"))
+
+    def notes(self):
+        code, out = self.doctor()
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("PROBLEM", out)
+        return out
+
+    def test_r6_active_list(self):
+        self.rules([{"id": "r-a", "title": "Alpha\nx", "status": "active", "appliesTo": "build", "order": 5},
+                    {"id": "r-b", "title": "Beta", "status": "active", "appliesTo": "all", "order": 9},
+                    {"id": "r-p", "title": "Pro", "status": "proposed"}, {"id": "r-n", "status": "active"}])
+        self.assertIn("rules: 3 active: r-b (all): Beta; r-a (build): Alpha x; r-n (all)", self.notes())
+        self.rules([])
+        self.assertIn("rules: 0 active", self.notes())
+
+    def test_h4_duplicate_ids(self):
+        self.rules([{"id": "r-a", "title": "One", "status": "active"}, {"id": "r-a", "title": "Two", "status": "off"}])
+        out = self.notes()
+        self.assertIn("rules: duplicate id r-a", out)
+        self.assertIn("rules: 1 active: r-a (all): One", out)
+
+    def test_r6_i1_changed_since_the_checkpoint(self):
+        self.ledger(dict(self.ledger(), context=CHECKPOINT))  # at 2026-11-18T10:00:00Z
+        self.rules([
+            {"id": "r-later", "status": "off", "history": [{"at": "2026-11-18T10:00:01Z", "change": "turned off"}]},
+            {"id": "r-equal", "status": "active", "history": [{"at": "2026-11-18T10:00:00Z", "change": "approved"}]},
+            {"id": "r-earlier", "status": "active", "history": [{"at": "2026-11-18T09:59:59Z", "change": "edited"}]},
+            {"id": "r-what", "status": "active", "history": [{"at": "2026-11-19T00:00:00Z", "what": "proposed\nnow"}]},
+            {"id": "r-zone", "status": "active", "history": [{"at": "2026-11-20 09:12:11", "change": "edited"},
+                                                             {"at": "2026-11-20T09:12:11+01:00", "change": "edited"},
+                                                             {"change": "edited"}, "x", 5]},
+            {"id": "r-far", "status": "active", "history": [{"at": "2999-01-01T00:00:00Z", "change": "created"}]},
+            {"id": "r-nolist", "status": "active", "history": {"at": "2026-11-19T00:00:00Z"}}])
+        out = self.notes()
+        line = [x.strip() for x in out.splitlines() if x.strip().startswith("rules changed since your checkpoint")]
+        self.assertEqual(len(line), 1, out)
+        self.assertEqual(line[0], "rules changed since your checkpoint (2026-11-18T10:00:00Z): r-later turned off "
+                                  "2026-11-18T10:00:01Z; r-what proposed now 2026-11-19T00:00:00Z; r-zone time "
+                                  "unreadable; r-zone time unreadable; r-zone time unreadable; r-far created "
+                                  "2999-01-01T00:00:00Z")
+
+    def test_r6_no_checkpoint(self):
+        self.rules([{"id": "r-a", "status": "active", "history": [{"at": "2026-11-19T00:00:00Z", "change": "edited"}]}])
+        self.assertIn("rules: no checkpoint; read every active rule", self.notes())
+        self.ledger(dict(self.ledger(), context=dict(CHECKPOINT, boundary="phase")))
+        self.assertIn("rules: no checkpoint; read every active rule", self.notes())
+        self.ledger(dict(self.ledger(), context=CHECKPOINT))
+        self.rules([{"id": "r-a", "status": "active", "history": [{"at": "2026-11-17T00:00:00Z", "change": "edited"}]}])
+        out = self.notes()
+        self.assertNotIn("rules changed since", out)
+        self.assertNotIn("no checkpoint", out)
+
+    def test_h1_bad_rules_file_keeps_its_problem(self):
+        for bad in ("{not json", "[]", json.dumps({"rules": "x"}), json.dumps({"version": 1})):
+            write(os.path.join(self.dir, "rules.json"), bad)
+            code, out = self.doctor()
+            self.assertNotIn("rules: 0 active", out)
+            self.assertNotIn("Traceback", out)
+
+    def test_h9_long_lists_are_capped(self):
+        self.ledger(dict(self.ledger(), context=CHECKPOINT))
+        self.rules([{"id": "r-rule-{:02d}".format(i), "title": "t" * 200, "status": "active",
+                     "history": [{"at": "2026-11-19T00:00:00Z", "change": "edited " * 20}]} for i in range(60)])
+        for x in self.notes().splitlines():
+            if x.strip().startswith("rules"):
+                self.assertLessEqual(len(x.strip()), 1600, x[:80])
+
+    def workers(self, *workers):
+        self.ledger(dict(self.ledger(), tasks=[{"id": "t-9", "state": "in-progress", "workers": list(workers)}]))
+
+    def handoff(self, job, text, mode="w"):
+        path = os.path.join(self.dir, "evidence", "t-9", "handoff-{}.md".format(job))
+        write(path, text, mode)
+        return path
+
+    def test_r7_h14_handoff_without_the_block(self):
+        self.handoff("fix", "do it\nRules: x\n")
+        self.handoff("verify", "do it\nSpace rules for this job (x/rules.json, active):\n- r-a: A\nRules: x\n")
+        self.handoff("review", "do it\n> Space rules for this job\nsee: Space rules for this job\n")
+        self.handoff("old", "nothing\n")
+        self.workers({"address": "t1", "name": "t-9-fix"}, {"address": "t2", "name": "t-9-verify"},
+                     {"address": "t3", "name": "t-9-review"}, {"address": "t4", "name": "t-9-old", "finished": True})
+        out = self.notes()
+        self.assertIn("worker t1 (t-9 fix) handoff has no rules block", out)
+        self.assertNotIn("worker t2", out)
+        self.assertIn("worker t3 (t-9 review) handoff has no rules block", out)
+        self.assertNotIn("worker t4", out)
+
+    def test_h13_handoff_not_read(self):
+        outside = os.path.join(TMP, "outside.md")
+        write(outside, "Space rules for this job\n")
+        folder = os.path.join(self.dir, "evidence", "t-9")
+        os.makedirs(folder, exist_ok=True)
+        os.symlink(outside, os.path.join(folder, "handoff-fix.md"))
+        self.handoff("big", "x" * (64 * 1024 + 1) + "\nSpace rules for this job\n")
+        self.handoff("bytes", b"\xff\xfe not text\n", mode="wb")
+        self.workers({"address": "t1", "name": "t-9-fix"}, {"address": "t2", "name": "t-9-big"},
+                     {"address": "t3", "name": "t-9-bytes"})
+        out = self.notes()
+        self.assertIn("worker t1 (t-9 fix) handoff not read (a symlink)", out)
+        self.assertIn("worker t2 (t-9 big) handoff not read (over 64 KB)", out)
+        self.assertIn("worker t3 (t-9 bytes) handoff not read (not UTF-8)", out)
+
+    def test_r7_at_most_five(self):
+        for i in range(7):
+            self.handoff("j{}".format(i), "no block\n")
+        self.workers(*[{"address": "t{}".format(i), "name": "t-9-j{}".format(i)} for i in range(7)])
+        out = self.notes()
+        self.assertEqual(out.count("handoff has no rules block"), 5, out)
+        self.assertIn("and 2 more", out)
+
+    def test_h1_class_doctor_reads_any_json_value(self):  # r-fix-the-class: a JSON value that is not an object
+        for name in ("rules.json", "schedule.json", "ledger.json", os.path.join("decisions", "d-001.json")):
+            with self.subTest(name=name):
+                saved = {n: read_text_or_empty(os.path.join(self.dir, n)) for n in ("rules.json", "schedule.json", "ledger.json")}
+                write(os.path.join(self.dir, name), "[]")
+                code, out = self.doctor()
+                self.assertEqual(code, 1, out)
+                self.assertIn("PROBLEM {}: not an object".format(name), out)
+                self.assertNotIn("Traceback", out)
+                for n, text in saved.items():
+                    write(os.path.join(self.dir, n), text)
+                if name.startswith("decisions"):
+                    os.remove(os.path.join(self.dir, name))
+        self.ledger({"version": 1, "tasks": [1, {"id": "t-1", "state": "queued"}]})
+        code, out = self.doctor()
+        self.assertIn("PROBLEM ledger.json: task 1 is not an object", out)
