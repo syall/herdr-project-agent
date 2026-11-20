@@ -10,7 +10,7 @@
 import { div } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
 import { gaveUp } from "./host.js";
-import { at } from "./queue.js";
+import { at, slotBox, taskLink } from "./queue.js"; // t-156: the Waiting list's jobs in the Queue's slots
 import { workerItem } from "./tasks.js"; // t-142: a worker line is the task card's worker item
 
 export const KINDS = ["working", "no-test", "suite"];
@@ -256,8 +256,11 @@ export function placesRows({ waiting, startOrder, rules, ledger, isLive, statusO
   if (x || extra.length) kinds.push({ kind: "no-test", head: `No-test extra · ${extra.length} of ${x}`, over: extra.length > x, holders: extra.map((h) => line(h)) });
   if (cap !== null) kinds.push({ kind: "suite", head: `Suite step · ${s} of ${cap}  (held within Working)`, over: s > cap, holders: holders.filter((h) => h.place === "suite").map((h) => line(h, true)) });
   const named = [...new Set(KINDS.map((k) => sources[k]).filter((v) => v !== "default"))];
+  // t-156 (d-272): the rule ids link to their rules when the Rules view lists them (rules.json read without an error)
+  const ruleLinks = Boolean(rules && !gaveUp(rules) && !rules.error) && named.length > 0;
+  const tasksKnown = new Set((Array.isArray(ledger?.tasks) ? ledger.tasks : []).filter((x) => obj(x) && typeof x.id === "string").map((x) => x.id));
   const slots = machinesRows(machines, { isLive, statusOf, here, ledger }); // t-119: the suite machines' slots
-  const out = { shown: false, state: "loading", kinds, slots, notes, limitsLine: `limits: ${named.length ? named.join(", ") : "default"}`, jobs: [], badges: {}, effective: [], orderKnown: false,
+  const out = { shown: false, state: "loading", kinds, slots, notes, limitsLine: `limits: ${named.length ? named.join(", ") : "default"}`, limitRules: ruleLinks ? named : [], jobs: [], badges: {}, effective: [], orderKnown: false,
     orderLine: null, reset: false, orderTextRead: null, waitingLine: null, head: `Places · ${used} of ${w} working` };
   const badge = (task, b) => { (out.badges[task] ??= []).push(b); };
   for (const h of holders) badge(h.task, { key: holderKey(h), text: `running · ${h.recorded ? KIND[h.place] : "working"}` });
@@ -281,7 +284,8 @@ export function placesRows({ waiting, startOrder, rules, ledger, isLive, statusO
       : r.action === "skip" ? `waits for a ${FULL[r.full.kind]} place (${r.full.used} of ${r.full.limit})`
       : r.place === "no-test" ? "next to start: the no-test extra place is free" : "next to start";
     badge(j.task, { key: jobKey(j), text: `next #${i + 1} · ${KIND[j.kind] ?? j.kind}` });
-    return { key: jobKey(j), id: j.id, label: `${i + 1}. ${j.task ?? "?"} ${j.job ?? ""} · ${j.role ?? "?"} · ${KIND[j.kind] ?? j.kind}`, reason, fixed,
+    // t-156: no number; the slot's head is the task id (a link when the ledger has it), the job, role · kind
+    return { key: jobKey(j), id: j.id, task: String(j.task ?? "?"), job: j.job ? String(j.job) : null, linked: tasksKnown.has(j.task), meta: `${j.role ?? "?"} · ${KIND[j.kind] ?? j.kind}`, reason, fixed,
       note: fixed ? "merge queue order (Queue tab)" : null, up: movesOn && !fixed && k > 0, top: movesOn && !fixed && k > 0, down: movesOn && !fixed && k >= 0 && k < movable.length - 1 };
   });
   return { ...out, state: "ok", jobs, effective, jobsIn, start: read.start, rank, orderKnown, movesOn, rankLine: rankKnown ? null : RANK_WAIT, head: `${out.head} · ${jobs.length} waiting`,
@@ -312,7 +316,7 @@ function slotsBlock(t, s, o, line, marked, items) {
 }
 
 // Draws the section (R1, R9). o: { folded, mark (a line key or null), busy, error, asOf, onFold, onMove(id, move, cx), onReset(cx),
-// onWorker(address) } (each handler gets its click's cx: a cx is valid only for the call that gave it). t-084 R5: a
+// onWorker(address), onTask(task, cx) (t-156: a job's task id), onRule(id, cx) (t-156: a limits rule id) } (each handler gets its click's cx: a cx is valid only for the call that gave it). t-084 R5: a
 // holder line opens its worker in the Agents view (a holder's terminal is live: holdersFrom).
 
 export function renderPlaces(t, rows, o) {
@@ -326,7 +330,7 @@ export function renderPlaces(t, rows, o) {
     .child(h_flex().id("places-head").gap(8).items_center().cursor_pointer().on_click(o.onFold)
       .child(div().flex_none().text_size(11).text_color(t.dim).child(o.folded ? "▸" : "▾"))
       .child(div().flex_1().min_w(0).truncate().text_size(12.5).font_semibold().child(rows.head))
-      .child(div().flex_none().text_size(11).text_color(t.dim).child(rows.limitsLine)));
+      .child(limitsEl(t, rows, o)));
   if (o.folded) return box;
   return box
     .children(rows.notes.map((x) => line(x, t.blocked)))
@@ -348,12 +352,25 @@ export function renderPlaces(t, rows, o) {
         .child(btn("places-reset", "Reset order", (_e, cx) => o.onReset(cx)))))
       .when(Boolean(rows.rankLine) && rows.jobs.length > 1, (x) => x.child(line(rows.rankLine ?? "", t.dim))) // t-120
       .when(!rows.jobs.length, (x) => x.child(line("Nothing waiting.", t.dim)))
-      .children(rows.jobs.map((j) => marked(v_flex().gap(1).py(1), j.key)
-        .child(h_flex().gap(6).items_center()
-          .child(div().flex_1().min_w(0).truncate().text_size(12).text_color(t.foreground).child(j.label))
+      .children(rows.jobs.map((j) => marked(slotBox(t, `place-slot-${j.id}`), j.key) // t-156: the Queue's slot, no number
+        .child(h_flex().gap(8).items_center()
+          .child(taskLink(t, { id: `places-task-${j.id}`, task: j.task, linked: j.linked, onTask: o.onTask }))
+          .when(Boolean(j.job), (x) => x.child(div().flex_none().text_size(12).text_color(t.muted).child(j.job ?? "")))
+          .child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(t.muted).child(j.meta))
           .when(Boolean(j.note), (x) => x.child(div().flex_none().text_size(11).text_color(t.dim).child(j.note ?? "")))
           .when(j.top, (x) => x.child(btn(`place-top-${j.id}`, "⤒", (_e, cx) => o.onMove(j.id, "top", cx))))
           .when(j.up, (x) => x.child(btn(`place-up-${j.id}`, "↑", (_e, cx) => o.onMove(j.id, "up", cx))))
           .when(j.down, (x) => x.child(btn(`place-down-${j.id}`, "↓", (_e, cx) => o.onMove(j.id, "down", cx)))))
-        .child(div().pl(12).child(line(j.reason, t.dim))))));
+        .child(line(j.reason, t.dim)))));
+}
+
+// t-156 (d-272): "limits: r-a, r-b" with each rule id a link to its rule (the click stopped there: the head folds);
+// "limits: default", or rules the Rules view does not list, as plain text.
+function limitsEl(t, rows, o) {
+  const plain = div().flex_none().text_size(11).text_color(t.dim);
+  if (!rows.limitRules?.length) return plain.child(rows.limitsLine);
+  const link = (id) => div().id(`places-rule-${id}`).flex_none().text_color(t.accent).cursor_pointer().hover((s) => s.text_color(t.foreground))
+    .on_click((_e, cx) => { cx?.stop_propagation?.(); o.onRule?.(id, cx); }).child(id);
+  return h_flex().flex_none().text_size(11).text_color(t.dim).child(div().flex_none().pr(4).child("limits:"))
+    .children(rows.limitRules.flatMap((id, k) => [...(k ? [div().flex_none().pr(4).child(",")] : []), link(id)]));
 }

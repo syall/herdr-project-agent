@@ -1686,7 +1686,8 @@ export default class ProjectAgent extends View {
         .when(places.shown, (e) => e.child(renderPlaces(t, places, { folded: this.placesFolded, busy: Boolean(this.placesBusy[space.id]), error: this.placesError[space.id] ?? null,
           mark: this.placeMark?.space === space.id && Date.now() < this.placeMark.until ? this.placeMark.key : null, asOf: atZone(new Date(this.dataAt ?? Date.now()).toISOString()).slice(6),
           onFold: (_e, cx) => { this.placesFolded = !this.placesFolded; this.machinesWant(space, cx); cx.notify(); }, onMove: (id, move, cx) => this.moveJob(space, id, move, cx), onReset: (cx) => this.moveJob(space, null, "reset", cx),
-          onWorker: (address) => this.showAgent(onMachine(address)) })))
+          onWorker: (address) => this.showAgent(onMachine(address)), onTask: (task, cx) => this.costs.openTask(space, task, cx), // t-156: a job's task id, as the Queue's
+          onRule: (id, cx) => { this.view = "rules"; this.disarm(); this.push.leave(space.id); this.rules.open.add(id); this.rules.wantAllow(space, cx); cx.notify(); } }))) // t-156: a limits rule id opens that rule
         .when(!tasks.length, (e) => e.child(note("No tasks yet. Give the Project Agent a goal in its tab.")))
         // t-097 J2 (R2, R15): the order line once, above the sections; Reset order over an unreadable file; a refused write.
         .when(tasks.length > 0, (e) => e.child(h_flex().id("task-order-line").px(4).gap(8).items_center()

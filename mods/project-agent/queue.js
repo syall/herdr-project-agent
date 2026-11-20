@@ -153,6 +153,15 @@ export function queueLabel(rows) {
 
 const TONE = { checking: "working", passed: "done", failed: "blocked", invalidated: "dim" };
 
+// t-154's slot, shared (t-156: the Places Waiting list draws its jobs in it too): one entry's bordered box, no number.
+export const slotBox = (t, id) => v_flex().id(id).flex_none().px(8).py(6).gap(1).rounded(6).border(1).border_color(t.border);
+// t-154's task id: a link to the task (onTask(task, cx), the click stopped there) when `linked`, else plain text.
+export function taskLink(t, { id, task, linked, onTask, size = 12 }) {
+  if (!linked) return div().flex_none().text_size(size).text_color(t.foreground).child(task);
+  return div().id(id).flex_none().text_size(size).text_color(t.accent).cursor_pointer().hover((s) => s.text_color(t.foreground))
+    .on_click((_e, cx) => { cx?.stop_propagation?.(); onTask?.(task, cx); }).child(task);
+}
+
 // Draws the view; starts nothing (t-053). o (t-084): { isLive(address), onWorker(address), evidence (the load's Map of
 // task -> files, or undefined: not known), onFile(task, file) }; a click only opens a view. t-145: mergedOpen(path) (the
 // repository's merged entries past MERGED_SHOWN are shown), onMerged(path, cx) (its Archived (n) row clicked). t-154:
@@ -168,9 +177,6 @@ export function renderQueue(t, rows, o = {}) {
       text: on ? `${w.label} ↗` : `${w.label} ${w.finished ? "(closed)" : "(ended)"}` });
   };
   const toTask = (task) => (_e, cx) => { cx?.stop_propagation?.(); o.onTask?.(task, cx); };
-  const taskId = (id, task, linked, size = 12) => linked
-    ? div().id(id).flex_none().text_size(size).text_color(t.accent).cursor_pointer().hover((s) => s.text_color(t.foreground)).on_click(toTask(task)).child(task)
-    : div().flex_none().text_size(size).text_color(t.foreground).child(task);
   // t-154 (d-270): a Left or Merged entry as a task item: the head (id, title, state chip; a link to the task when the
   // ledger has it), the facts below it.
   const taskItem = (id, linkId, x, extra = []) => {
@@ -202,9 +208,9 @@ export function renderQueue(t, rows, o = {}) {
       .when(!r.entries.length, (el) => el.child(line("Queue empty.", t.dim)))
       .children(r.entries.map((e) => {
         const crew = e.workers.filter((w) => w.recorded || live(w.address));
-        return v_flex().id(`queue-slot-${e.key}`).flex_none().px(8).py(6).gap(1).rounded(6).border(1).border_color(t.border) // t-154: a slot, no number
+        return slotBox(t, `queue-slot-${e.key}`) // t-154: a slot, no number
         .child(h_flex().gap(8).items_center()
-          .child(taskId(`queue-task-${e.key}`, e.task, e.linked))
+          .child(taskLink(t, { id: `queue-task-${e.key}`, task: e.task, linked: e.linked, onTask: o.onTask }))
           .when(Boolean(e.job), (b) => b.child(div().flex_none().text_size(12).text_color(t.muted).child(e.job ?? "")))
           .child(div().flex_1())
           .child(div().text_size(11).text_color(t[TONE[e.state]] ?? t.muted).child(e.state)))
