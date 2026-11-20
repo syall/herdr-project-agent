@@ -11,8 +11,10 @@ const src = path.join(here, "..", "..", "mods", "project-agent");
 const dst = fs.mkdtempSync(path.join(os.tmpdir(), "t003-panel-"));
 fs.copyFileSync(path.join(here, "..", "keeper", "stubs.mjs"), path.join(dst, "keeper-stubs.mjs"));
 fs.copyFileSync(path.join(here, "stubs.mjs"), path.join(dst, "stubs.mjs"));
+// gpui-kit and gpui-base each from its own file (t-049): a name taken from the wrong module fails to load, as in Herdr.
+for (const m of ["gpui-kit", "gpui-base"]) fs.copyFileSync(path.join(here, `${m}.mjs`), path.join(dst, `${m}.mjs`));
 for (const f of fs.readdirSync(src).filter((n) => n.endsWith(".js"))) {
-  fs.writeFileSync(path.join(dst, f), fs.readFileSync(path.join(src, f), "utf8").replace(/from "(herdr|gpui-kit|gpui-base)"/g, 'from "./stubs.mjs"'));
+  fs.writeFileSync(path.join(dst, f), fs.readFileSync(path.join(src, f), "utf8").replace(/from "herdr"/g, 'from "./stubs.mjs"').replace(/from "(gpui-kit|gpui-base)"/g, 'from "./$1.mjs"'));
 }
 const stubs = await import(path.join(dst, "stubs.mjs"));
 const { default: ProjectAgent } = await import(path.join(dst, "main.js"));
