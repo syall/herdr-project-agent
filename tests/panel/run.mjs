@@ -7552,6 +7552,24 @@ cases["P41-20-utc-asof"] = async () => { // RL-J5-3: the "as of" in UTC like the
   check(text.includes(`PA context ${DAY41} (UTC): mean 158k · peak 254k · resets 6 (fresh 6, compact 0) (as of ${DAY41.slice(5)} 23:50 UTC)`), `an earlier UTC day: its date in UTC (got ${text.slice(0, 900)})`);
 };
 
+cases["P41-21-clock-ahead"] = async () => { // RL-J5r3-1: a summary written by a clock ahead of this Mac: its own day and figures, and how far ahead
+  const NEXT = new Date(T0 + 86400000).toISOString().slice(0, 10);
+  const entry = { ...SUMMARY41.paContext[0], day: NEXT };
+  ctxWorld({ summary: { updated: `${NEXT}T00:10:00Z`, paContext: [entry] } });
+  const v = await liveMount();
+  g.__now = T0 + (15 * 60 + 55) * 60000; // 23:55 UTC on DAY41 here; the summary says 00:10 the next day
+  await click(v, "view-costs"); await settle();
+  let text = look(v).text;
+  check(text.includes(`PA context ${NEXT} (UTC): mean 158k · peak 254k · resets 6 (fresh 6, compact 0) (as of ${NEXT.slice(5)} 00:10 UTC) · its clock is 15 min ahead of this Mac`), `its day, its figures, 15 min ahead (got ${text.slice(0, 900)})`);
+  check(!text.includes("no Project Agent calls yet"), "never no calls for today");
+  ctxWorld({ summary: { ...SUMMARY41, updated: `${DAY41}T23:55:30Z` } });
+  const w = await liveMount();
+  g.__now = T0 + (15 * 60 + 55) * 60000; // 30 s behind the summary: within a minute, no note
+  await click(w, "view-costs"); await settle();
+  text = look(w).text;
+  check(text.includes("(as of 23:55 UTC)") && !text.includes("ahead of this Mac"), `under a minute: no note (got ${text.slice(0, 900)})`);
+};
+
 // ---- t-119: the suite machines' slots in the Places section (pa-full-suite --places --json) ----
 const FSUITE = ["pa", "full", "suite"].join("-"); // spelled so a guard reading this file's commands is not confused
 const P119 = {
