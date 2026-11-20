@@ -7151,6 +7151,7 @@ cases["P085-1-named-id"] = async () => { // I1: an id typed in the Id field is t
 };
 
 cases["P085-2-empty-id"] = async () => { // I1: left empty (or spaces), the id comes from the title as before
+  // A regression guard (t-134): at base this case fails only in newRule's "has an Id field"; its own check passes there.
   const v = await ruleWorld();
   await newRule(v, "   ", "One");
   check(ruleIds() === "r-one-2,r-one,r-two", `from the title (got ${ruleIds()})`);
@@ -7246,6 +7247,75 @@ cases["P085-8-gone-meanwhile"] = async () => { // nit (t-101 REVIEW): a rule gon
   g.__files[RULES] = JSON.stringify({ rules: [rule("r-one", "One")] }); // r-two deleted meanwhile
   await press(w, "rule-toggle-r-two"); await settle();
   check(rulesNotices(w).length === 0, `on/off: no notice (got ${JSON.stringify(w.unsent)})`);
+};
+
+// ---- t-134: limits from t-085 (a refused write keeps the form; notice ids; mergeNotices) ----------------------------
+const formValues = (v) => Object.fromEntries(Object.entries(v.rules.form?.inputs ?? {}).map(([k, s]) => [k, s.value()]));
+cases["P134-1-late-clash-keeps-form"] = async () => { // t-085 RL1: an id taken by write time: the form is back, as typed
+  const v = await ruleWorld();
+  await press(v, "rule-add");
+  const typed = { title: "Late", text: "Late text", why: "Because", appliesTo: "build", id: "r-late" };
+  for (const [k, s] of Object.entries(typed)) v.rules.form.inputs[k].set(s);
+  const d2 = ruleDoc(); d2.rules.push(rule("r-late", "Someone else's")); g.__files[RULES] = JSON.stringify(d2); // written meanwhile, not read yet
+  const before = g.__files[RULES];
+  await press(v, "rule-save"); await settle();
+  check(g.__files[RULES] === before, "nothing written");
+  check(Boolean(v.rules.form) && v.rules.form.id === null && v.rules.form.approve === false, `the new-rule form is open again (got ${JSON.stringify(v.rules.form && { id: v.rules.form.id, approve: v.rules.form.approve })})`);
+  check(JSON.stringify(formValues(v)) === JSON.stringify(typed), `with what was typed (got ${JSON.stringify(formValues(v))})`);
+  const text = look(v).text;
+  check(/r-late is already a rule's id/.test(text) && text.includes("New rule"), `said, beside the form (got ${text.slice(0, 400)})`);
+  check(rulesNotices(v).length === 0, `no notice (got ${JSON.stringify(v.unsent)})`);
+  v.rules.form.inputs.id.set("r-later");
+  await press(v, "rule-save"); await settle();
+  check(ruleIds() === "r-later,r-one,r-two,r-late" && !v.rules.form, `a new id, then written (got ${ruleIds()})`);
+  const r = ruleDoc().rules.find((x) => x.id === "r-later");
+  check(r.title === "Late" && r.why === "Because" && r.appliesTo === "build", `as typed (got ${JSON.stringify(r)})`);
+};
+
+cases["P134-2-refused-edit-keeps-form"] = async () => { // t-085 RL1: any refused write of a form: it comes back; not over another form
+  let v = await ruleWorld();
+  await press(v, "rule-edit-r-one"); v.rules.form.inputs.text.set("One, changed");
+  g.__files[RULES] = "{ not json"; // the file turned invalid meanwhile
+  await press(v, "rule-save"); await settle();
+  check(g.__files[RULES] === "{ not json", "nothing written");
+  check(v.rules.form?.id === "r-one" && v.rules.form.approve === false && v.rules.form.inputs.id === undefined, `the Edit form is back (got ${JSON.stringify(v.rules.form && { id: v.rules.form.id })})`);
+  check(formValues(v).text === "One, changed" && formValues(v).title === "One", `with what was typed (got ${JSON.stringify(formValues(v))})`);
+  v = await ruleWorld();
+  const doc = ruleDoc(); doc.rules.push({ ...rule("r-p", "Proposed"), status: "proposed", source: "orchestrator" }); g.__files[RULES] = JSON.stringify(doc);
+  v.reload(cx); await settle();
+  await press(v, "rule-head-r-p"); await press(v, "rule-editapprove-r-p"); v.rules.form.inputs.why.set("Kept why");
+  g.__files[RULES] = "{ not json";
+  await press(v, "rule-save"); await settle();
+  check(v.rules.form?.id === "r-p" && v.rules.form.approve === true && formValues(v).why === "Kept why", `the Edit, then approve form is back (got ${JSON.stringify(v.rules.form && { id: v.rules.form.id, approve: v.rules.form.approve, ...formValues(v) })})`);
+  check(!v.unsent.some((u) => /r-p approved/.test(u.message)), "not approved");
+  v = await ruleWorld();
+  await press(v, "rule-edit-r-one"); v.rules.form.inputs.text.set("One, changed");
+  g.__files[RULES] = "{ not json"; g.__hang = [RULES];
+  await press(v, "rule-save"); await settle();
+  await press(v, "rule-add"); // another form, opened while the write waits
+  g.__hang = []; await settle(); await settle();
+  check(v.rules.form?.id === null && formValues(v).title === "" && formValues(v).text === "", `the form opened meanwhile stays as it is (got ${JSON.stringify(v.rules.form && { id: v.rules.form.id, ...formValues(v) })})`);
+};
+
+cases["P134-3-long-id-notice"] = async () => { // t-085 nit: an id over 80 characters is cut with "…", not the card's tail
+  const v = await ruleWorld();
+  const long = `r-${"a".repeat(98)}`;
+  g.__files[":/home/u/long.json"] = JSON.stringify({ version: 1, rules: [rule(long, "Long"), rule("r-ok", "Ok")] });
+  await press(v, "rule-import"); v.rules.importPath.set("/home/u/long.json"); await press(v, "rule-import"); await settle();
+  const want = `rules changed: ${long.slice(0, 79)}…, r-ok`;
+  check(JSON.stringify(rulesNotices(v)) === JSON.stringify([want]), `cut to 80 with … (got ${JSON.stringify(v.unsent)})`);
+  check(!rulesNotices(v).some((m) => m.includes("on the card")), "no card tail");
+};
+
+cases["P134-4-merge-copies"] = async () => { // t-085 nit: mergeNotices leaves the items it was given as they were
+  const RM = await import(path.join(dst, "rules.js"));
+  const a = { spaceId: S, rules: ["r-a"], message: RM.noticeText(["r-a"]), why: "kept" }, b = { spaceId: S, rules: ["r-b", "r-a"], message: RM.noticeText(["r-b", "r-a"]) };
+  const c = { spaceId: S, message: "rule r-p approved" }, d = { spaceId: "other", rules: ["r-z"], message: RM.noticeText(["r-z"]) };
+  const out = RM.mergeNotices([a, c, b, d]);
+  check(JSON.stringify(out.map((u) => u.message)) === JSON.stringify(["rules changed: r-a, r-b", "rule r-p approved", "rules changed: r-z"]), `merged (got ${JSON.stringify(out)})`);
+  check(out[0].why === "kept" && JSON.stringify(out[0].rules) === JSON.stringify(["r-a", "r-b"]), `the first keeps its place and why (got ${JSON.stringify(out[0])})`);
+  check(JSON.stringify(a.rules) === JSON.stringify(["r-a"]) && a.message === "rules changed: r-a", `the first item given is unchanged (got ${JSON.stringify(a)})`);
+  check(JSON.stringify(b.rules) === JSON.stringify(["r-b", "r-a"]), `the later one too (got ${JSON.stringify(b)})`);
 };
 
 // ---- t-131: limits from t-100, t-061/t-054 (t-064), t-046 J3 (t-075) and t-020 J6 ----------------------------------
