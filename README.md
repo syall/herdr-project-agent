@@ -644,7 +644,9 @@ output is kept in a run folder that the last line names, after a summary of ever
 `PA_SERIAL=1` runs the parts one after another, each streamed as it runs. Every run that has parts to
 run, full or `--affected`, first takes the same machine slot as `pa-full-suite` (at most `PA_SUITE_CAP`, default
 1, at once per user), waiting its turn and saying for whom; its summary says how long it waited. It waits at most 840 s (`PA_SUITE_WAIT_LIMIT`), and stops waiting if its caller
-is gone. Each part has a time limit, 3 times its median in the suite record or 900 s
+is gone, so a run started with `nohup ... &` from a shell that then exits stops waiting: start it from a shell that
+stays. If the step holding the slot for a run is killed (even with `kill -9`, which frees the slot), the run stops
+its parts within a few seconds and says so, rather than going on beside the next run. Each part has a time limit, 3 times its median in the suite record or 900 s
 (`PA_PART_LIMIT`), whichever is longer: a part past it is stopped and named HUNG, the other parts
 finish, and the run exits 1. Every run keeps a progress file under `~/.config/herdr-pa/suite-runs`
 (waiting for whom, or the parts done of the total, the parts running now and their last output).
@@ -711,7 +713,11 @@ this Mac.
 
 `tests/run-all.sh --affected` and `--module test_x`, run by hand or by the affected-tests hook, go to the machine
 the same way (their first line says `run-all.sh: on box-1 (...)`); a run under `pa-full-suite` or `pa-run --local`
-stays where it was placed. The hook gives the run a deadline 30 s before its own 900 s limit, and when the tests
+stays where it was placed. The hook's limit is a whole slot wait (840 s) plus the run's own 900 s, so a run that
+waited long for the slot still has its time: on this Mac the run is ended 870 s after it took the slot
+(`PA_SUITE_RUN_LIMIT`, `run-all.sh: did not finish on this Mac`, read as a test that may hang), and the hook gives
+it a deadline 30 s before its own limit (run `pa-hooks install` again in a worktree to get the longer hook
+timeout). When the tests
 could not run there (no slot came free in time, not reachable with `"suiteFallback": "none"`) it says so rather than
 asking for a code fix. Every pa-run, run-all.sh and pa-full-suite run records its kind (affected, single, module,
 failing-first, mutation, full), place, wall time, slot wait, the test's own time and the setup and transfer time

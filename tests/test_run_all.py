@@ -307,7 +307,9 @@ class RunAll(unittest.TestCase):
                 for name in NAMES:
                     self.assertIn("  {}: {}".format(name, "FAILED" if name == "store harness" else "ok"), tail)
                 self.assertEqual(r.returncode, 1, out)
-                self.assertIn("=== keeper harness\nkeeper says hello\nkeeper done\n--- keeper harness: ok\n", out)
+                # the stand-in's own "not a child" lines (stderr, between a part's lines in serial mode) left out
+                body = "".join(l for l in out.splitlines(True) if not l.startswith("wait: pid "))
+                self.assertIn("=== keeper harness\nkeeper says hello\nkeeper done\n--- keeper harness: ok\n", body)
 
     def test_r2b_quiet_failure(self):
         code, out = self.run_all(store="quiet")

@@ -38,6 +38,11 @@
 # <i>.pid, <i>.start, <i>.end, <i>.code): it keeps the run's progress file under HERDR_PA_HOME/suite-runs
 # (pa-full-suite --status reads it) and stops a part past max(PA_PART_LIMIT or 900 s, 3x its recorded median),
 # writing <i>.hung; the summary names it HUNG, the other parts finish, and the run exits 1.
+# The run's own limit (t-079 I2): with PA_SUITE_RUN_LIMIT (the affected-tests hook's), the slot step ends a run
+# here still running that long after it took the slot: `run-all.sh: did not finish on this Mac: ...`, 124.
+# A killed slot step (t-079 I3): under the slot step, a watchdog checks every 2 s that this script's parent is still
+# the step; when it is not (the step was killed, even with SIGKILL, and the slot is free again), every part is
+# stopped as for TERM and the run says so (exit 143).
 # Exit: 0 all passed, 1 a part failed, 2 a usage error or no temp folder, 124 no slot came free (or the deadline),
 # 125 not run on a machine (refused, not reachable with suiteFallback "none"),
 # 130/143/129 interrupt, terminate, hangup.
@@ -198,6 +203,14 @@ show() { cat "$1"; [ -s "$1" ] && [ -n "$(tail -c 1 "$1")" ] && echo; return 0; 
 # Its exit code goes there too, as <i>.code, before <i>.end (pa_suite.py's watcher reads .code once .end is there),
 # and the run reads it from that file, not from `wait` (t-113): on a Linux machine whose sh is bash, `wait <pid>`
 # answered "pid N is not a child of this shell" (127) for parts that had passed, and they were marked FAILED.
+# A wait that answers while the part still runs (t-079 I4) is followed by waiting for its .end (or .hung, or its
+# pid gone). The run writes <i>.code itself only when the part wrote none, whole (setcode), and never after .end
+# with another text (t-079 I6).
+setcode() { echo "$2" > "$out/$1.code.new" && mv "$out/$1.code.new" "$out/$1.code"; }
+# Until part $1 (pid $2) wrote its .end, was stopped as hung, or is gone.
+untilend() {
+  while [ ! -f "$out/$1.end" ] && [ ! -f "$out/$1.hung" ] && kill -0 "$2" 2>/dev/null; do sleep 1; done
+}
 inpart() {
   date +%s > "$out/$1.start"
   TMPDIR="$out/$1.tmp"; export TMPDIR; mkdir "$TMPDIR" || { echo 1 > "$out/$1.code"; date +%s > "$out/$1.end"; return 1; }
@@ -211,8 +224,11 @@ took() { s=$(cat "$out/$1.start" 2>/dev/null) e=$(cat "$out/$1.end" 2>/dev/null)
 
 # Ctrl-C, TERM or a hangup (the pane is closed): stop every part still running (each is its own process group,
 # in PA_SERIAL=1 mode too), then exit 130, 143 or 129.
-pids=
+pids= watchdog= step=
 stop() {
+  [ -f "$out/orphan" ] && echo "run-all.sh: the slot step (pid $step) is gone: stopping the parts (the slot is free"\
+    "again, so this run must not go on beside another)"
+  [ -n "$watchdog" ] && kill "$watchdog" 2>/dev/null
   for p in $pids; do kill -TERM -- "-$p" 2>/dev/null || kill -TERM "$p" 2>/dev/null; done
   echo "=== interrupted (outputs so far: $out)"
   exit "$1"
@@ -220,6 +236,24 @@ stop() {
 trap 'stop 130' INT
 trap 'stop 143' TERM
 trap 'stop 129' HUP
+# The watchdog (t-079 I3, t-072 RL-1): only under the slot step (this script's parent). It reads this script's
+# parent pid (ps), so a reused pid cannot fool it: not the step any more -> <out>/orphan, then TERM to this script.
+# Its output goes nowhere (it never holds the caller's pipe open); it is ended before the summary.
+if [ "${PA_SUITE_SLOT_PID:-}" = "$PPID" ]; then
+  step=$PPID main=$$
+  (
+    trap - INT TERM HUP
+    while sleep 2; do
+      now=$(ps -o ppid= -p "$main" 2>/dev/null | tr -d ' ')
+      [ -n "$now" ] || exit 0
+      [ "$now" = "$step" ] && continue
+      : > "$out/orphan"
+      kill -TERM "$main" 2>/dev/null
+      exit 0
+    done
+  ) </dev/null >/dev/null 2>&1 &
+  watchdog=$!
+fi
 
 i=1
 if [ "${PA_SERIAL:-}" = 1 ]; then
@@ -229,16 +263,17 @@ if [ "${PA_SERIAL:-}" = 1 ]; then
     # In the background in its own process group, and waited for: a signal then runs the trap at once (it
     # would wait for a foreground pipeline to end), and stop() can end the part, tee and its children.
     set -m 2>/dev/null
-    ( { (inpart "$i" "$p" "$a") 2>&1; echo $? > "$out/$i.code"; } </dev/null | tee "$(log "$i")" ) &
+    ( { (inpart "$i" "$p" "$a") 2>&1; c=$?; [ -s "$out/$i.code" ] || echo "$c" > "$out/$i.code"; } </dev/null |
+      tee "$(log "$i")" ) &
     pids=$!
     echo "$pids" > "$out/$i.pid"
     set +m 2>/dev/null
     wait "$pids"
+    [ -s "$out/$i.code" ] || { untilend "$i" "$pids"; wait "$pids" 2>/dev/null; }
     pids=
-    code=$(cat "$out/$i.code" 2>/dev/null) || code=1
-    code=${code:-1}
+    code=$(cat "$out/$i.code" 2>/dev/null)
+    [ -n "$code" ] || { code=1; setcode "$i" "$code"; }
     [ -f "$out/$i.end" ] || date +%s > "$out/$i.end"  # a part stopped as hung wrote none
-    echo "$code" > "$out/$i.code"
     eval "code_$i=\$code"
     [ "$code" = 0 ] && echo "--- $name: ok" || echo "--- $name: FAILED"
     i=$((i + 1))
@@ -261,9 +296,9 @@ else
     # (hung, or a signal) before it wrote one, so wait's status when that is not 0, else 1.
     wait "$pid"
     code=$?
-    w=$(cat "$out/$i.code" 2>/dev/null) && [ -n "$w" ] && code=$w || { [ "$code" = 0 ] && code=1; }
+    [ -s "$out/$i.code" ] || untilend "$i" "$pid"
+    w=$(cat "$out/$i.code" 2>/dev/null) && [ -n "$w" ] && code=$w || { [ "$code" = 0 ] && code=1; setcode "$i" "$code"; }
     [ -f "$out/$i.end" ] || date +%s > "$out/$i.end"
-    echo "$code" > "$out/$i.code"
     eval "code_$i=\$code"
     echo "=== $name"
     show "$(log "$i")"
@@ -272,6 +307,8 @@ else
   done
 fi
 pids=
+[ -n "$watchdog" ] && kill "$watchdog" 2>/dev/null
+watchdog=
 
 # The summary: always the last lines (pa-full-suite keeps the tail of this output).
 echo "=== summary (each part's whole output: $out)"

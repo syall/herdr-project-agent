@@ -295,7 +295,11 @@ def unchanged_since_start(root, data):
     return now is not None and now["head"] == start.get("head") and now["files"] == start.get("files")
 
 
-AFFECTED_LIMIT = 900  # the affected-tests hook's run_shell limit
+# t-079 I2 (t-072 RL-5): the affected-tests hook's run_shell limit is a whole slot wait plus a whole run, so a run
+# that waited long for the suite slot still has its own time once it has it
+AFFECTED_WAIT = 840  # the slot step's wait at most (pa_suite.SLOT_WAIT_LIMIT)
+AFFECTED_RUN = 900  # the run's own time once it has the slot (PA_SUITE_RUN_LIMIT is this less DEADLINE_SPARE)
+AFFECTED_LIMIT = AFFECTED_WAIT + AFFECTED_RUN
 DEADLINE_SPARE = 30  # R14: PA_SUITE_DEADLINE is this long before that limit
 
 
@@ -330,9 +334,11 @@ def hook_affected(data, args):
         return 0
     if unchanged_since_start(record["root"], data):
         return 0
-    # t-107 R14: the slot step's wait and a run on a machine end before this hook's own limit (900 s, less 30)
+    # t-107 R14: the slot step's wait and a run on a machine end before this hook's own limit (less 30 s); t-079 I2:
+    # a run on this Mac is ended by the slot step once it has run PA_SUITE_RUN_LIMIT s after taking the slot
     code, out = run_shell(command, record["root"], files, AFFECTED_LIMIT,
-                          {"PA_SUITE_DEADLINE": str(int(time.time()) + AFFECTED_LIMIT - DEADLINE_SPARE)})
+                          {"PA_SUITE_DEADLINE": str(int(time.time()) + AFFECTED_LIMIT - DEADLINE_SPARE),
+                           "PA_SUITE_RUN_LIMIT": str(AFFECTED_RUN - DEADLINE_SPARE)})
     if not code:
         return 0
     unfinished = did_not_finish(out) if code == 124 else None
@@ -443,8 +449,8 @@ def hook_settings():
         "PreToolUse": [{"matcher": "Edit|Write|MultiEdit", "hooks": [dict(run("test-file-lock"), timeout=10)]},
                        {"matcher": "Bash|Read|Edit|Write|MultiEdit|NotebookEdit", "hooks": [dict(run("guard"), timeout=10)]}],
         "PostToolUse": [{"matcher": "Edit|Write|MultiEdit", "hooks": [dict(run("lint-after-edit"), timeout=150)]}],
-        "TaskCompleted": [{"hooks": [dict(run("affected-tests"), timeout=930)]}],
-        "Stop": [{"hooks": [dict(run("affected-tests --stop"), timeout=930)]}],
+        "TaskCompleted": [{"hooks": [dict(run("affected-tests"), timeout=AFFECTED_LIMIT + 30)]}],
+        "Stop": [{"hooks": [dict(run("affected-tests --stop"), timeout=AFFECTED_LIMIT + 30)]}],
         "SessionStart": [{"hooks": [dict(run("session-start"), timeout=60)]}],
     }
 

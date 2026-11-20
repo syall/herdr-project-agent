@@ -38,7 +38,10 @@ is locked and its recorded holder is an ancestor of this process, so the run und
 no trusted marker, any locked slot of this home whose holder is an ancestor counts too (an older pa-full-suite sets
 none). A wait ends after SLOT_WAIT_LIMIT s (PA_SUITE_WAIT_LIMIT) or once this process's caller is gone, never later.
 The command gets PA_SUITE_SLOT, PA_SUITE_SLOT_PID (this process) and PA_SUITE_HOLD (the seconds waited, or held
-by the caller). Script mode never loads pa.py (run-all.sh's test fixture stubs it): HERDR_PA_HOME and a UTC clock.
+by the caller). t-079 I2: with PA_SUITE_RUN_LIMIT (seconds; the affected-tests hook gives it) a command run on this
+Mac that is still running that long after it got the slot is ended (TERM, KILL after STOP_GRACE): last line
+`run-all.sh: did not finish on this Mac: ...`, exit 124; the variable is not passed on. A run started from a shell
+that then exits (nohup ... &) stops waiting for the slot (its caller is gone): start it from a shell that stays. Script mode never loads pa.py (run-all.sh's test fixture stubs it): HERDR_PA_HOME and a UTC clock.
 t-107 J2: with suiteMachines configured, a `--affected` or `--module test_x` run of this tree's run-all.sh that no
 caller placed (no trusted caller slot, PA_SUITE_REMOTE and PA_SUITE_LOCAL_RUN unset) goes to a machine through
 pa_run.slot_run (R12), with PA_SUITE_HC_* (run-all.sh's kept hc variables) set back only in its own hc calls (R13)
@@ -111,7 +114,7 @@ else:
 CAP = 1  # one at a time: two overlapping took 8-10 min each, two in a row ~4 min together (plan.md, rule r-worker-mix)
 POLL = 2
 WAIT_LIMIT = 7200  # longer than a run's own 3600 s timeout
-SLOT_WAIT_LIMIT = 840  # script mode (run-all.sh): under its shortest caller's timeout, the affected-tests hook's 900 s
+SLOT_WAIT_LIMIT = 840  # script mode (run-all.sh): the affected-tests hook's limit is this wait plus its run's own 900 s
 PART = re.compile(r"^  (.+): (ok|FAILED|HUNG) \((\d+)s\)$")
 PART_FLOOR = 900  # a part's limit is at least this (PA_PART_LIMIT), else 3x its recorded median
 STOP_GRACE = 10  # seconds from TERM to KILL for a hung part
@@ -775,6 +778,8 @@ def run_under_slot(argv):
     take_hc_env()  # R13: PA_SUITE_HC_* only for this step's own hc calls, never in the command's env
     value = os.environ.get("PA_SUITE_WAIT_LIMIT", "")
     limit = int(value) if value.isdigit() else SLOT_WAIT_LIMIT
+    value = os.environ.pop("PA_SUITE_RUN_LIMIT", "")  # t-079 I2: this step's own, never the command's
+    run_limit = int(value) if value.isdigit() and int(value) > 0 else None
     who = args.what.split()[0] if args.what.split() else "pa_suite.py"
     path, caller = caller_slot(os.environ.get("PA_SUITE_SLOT", ""))
     slot, parent = None, os.getppid()
@@ -845,7 +850,7 @@ def run_under_slot(argv):
     watcher = Watcher(progress, watch, medians, floor_limit()) if progress else None
     if watcher:
         watcher.start()
-    child, code = None, 1
+    child, code, over = None, 1, False
 
     def forward(sig, frame):  # TERM, INT or HUP to this process goes to the run, which stops its parts
         if child is not None and child.poll() is None:
@@ -855,7 +860,16 @@ def run_under_slot(argv):
         for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
             signal.signal(sig, forward)
         child = subprocess.Popen(command, env=env)
-        code = child.wait()
+        try:
+            code = child.wait(timeout=run_limit)
+        except subprocess.TimeoutExpired:  # t-079 I2: past its own limit after the slot: TERM stops its parts
+            over = True
+            child.send_signal(signal.SIGTERM)
+            try:
+                child.wait(timeout=STOP_GRACE)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait()
     finally:
         if watcher:
             watcher.stop()
@@ -866,6 +880,10 @@ def run_under_slot(argv):
         except OSError:
             pass
     code = 128 - code if code < 0 else code
+    if over:  # the hook reads this last line as a run that started and did not end (a failure to fix)
+        code = 124
+        print("run-all.sh: did not finish on this Mac: it ran past its {} s limit after taking the slot "
+              "(PA_SUITE_RUN_LIMIT); the run was ended".format(run_limit), flush=True)
     if own:
         update_progress(progress, state="done", exit=code, end=stamp())
     if placing and kind is not None:  # R19, T1: this Mac's run, recorded (a caller's or pa-run's records its own)

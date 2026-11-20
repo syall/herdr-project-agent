@@ -6,6 +6,7 @@ modules' temp homes, no global or system config), only on repositories the tests
 import os
 import struct
 import subprocess
+import sys
 import unittest
 
 
@@ -23,7 +24,8 @@ def forge_parent(repo, child, parent):
 
     A git that does not read the forged graph (git 2.47.3 on Linux, t-089 TRIAL.md) cannot give the callers their
     precondition, so the test skips with the reason (R21): a capability probe on what plain git says, no version
-    compare. The gate check the callers guard is unchanged."""
+    compare. The gate check the callers guard is unchanged. On the Mac, whose git reads the graph, the same reason is
+    a failure (t-079 I9, t-099), so the forged-graph tests never stop running there unnoticed."""
     git(repo, "-c", "commitGraph.generationVersion=1", "commit-graph", "write", "--reachable", "--no-progress")
     graph = os.path.join(git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir"), "objects", "info", "commit-graph")
     with open(graph, "rb") as f:
@@ -46,6 +48,8 @@ def forge_parent(repo, child, parent):
                        stderr=subprocess.PIPE, universal_newlines=True)
     if r.stdout.strip() != parent:
         version = subprocess.run(["git", "--version"], stdout=subprocess.PIPE, universal_newlines=True).stdout.strip()
-        raise unittest.SkipTest("plain git here ({}) does not read a forged commit-graph ({}^ gives {}): the forged-graph "
-                                "precondition cannot be set up".format(version or "git", child[:12],
-                                                                       r.stdout.strip()[:12] or "nothing"))
+        why = "plain git here ({}) does not read a forged commit-graph ({}^ gives {}): the forged-graph precondition " \
+              "cannot be set up".format(version or "git", child[:12], r.stdout.strip()[:12] or "nothing")
+        if sys.platform == "darwin":
+            raise AssertionError(why + " (on the Mac this fails rather than skips: find why this git ignores the graph)")
+        raise unittest.SkipTest(why)
