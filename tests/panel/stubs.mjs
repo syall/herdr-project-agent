@@ -159,7 +159,9 @@ export const theme = () => new Proxy({}, { get: (_t, k) => (!g.__themeNames ? "#
 export const window = () => ({ platform: g.__platform ?? "macos" }); // __platform (t-060): "linux" | "windows" for a case
 export const layout = () => g.__layout ?? {};
 // Never changes, unless a case keeps __watchers (t-053): then each call waits for a batch the case gives it.
+// __watchRefuse n (t-116): the next n watchFolder calls throw the runtime's RangeError (a refused watch), counted in __watchRefused.
 export const watchFolder = (path) => {
+  if (g.__watchRefuse > 0) { g.__watchRefuse -= 1; g.__watchRefused = (g.__watchRefused ?? 0) + 1; throw new RangeError(LIMIT_TEXT("watch")); }
   const end = hold("watch");
   let resolve;
   const p = new Promise((r) => { resolve = r; });

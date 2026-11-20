@@ -61,6 +61,7 @@ function world({ agent = true, agentTerminal = "t30", records = {}, extraPanes =
   g.__remoteDelay = 0; g.__execHang = []; g.__batchFail = {}; g.__issued = []; g.__timers = []; g.__layout = {}; g.__execs = []; g.__execOut = {}; g.__sleepHang = false; g.__execFail = []; g.__execFn = null;
   g.__themeNames = false; g.__focus = null; // t-142
   g.__pool = null; g.__watchers = null; g.__hangOn = []; g.__delayOn = {}; g.__als = null; g.__cardReads = { live: 0, peak: 0 }; // t-053: off unless a case sets them
+  g.__watchRefuse = 0; g.__watchRefused = 0; // t-116: no watch refused unless a case says so
   if (agent) {
     const dir = machine ? `${machine}:.config/herdr-pa/spaces/${S}` : `:${DIR}`, home = machine ? `${machine}:.config/herdr-pa` : ":/home/u/.config/herdr-pa";
     g.__files[`${dir}/agent.json`] = JSON.stringify({ space: S, project: "/proj", profile: "test", name: "proj", terminal: agentTerminal });
@@ -8531,6 +8532,24 @@ cases["P160-4-show-before-mount"] = async () => { // R2: a request with no copy 
   g.__shared["project-agent.show"] = { space: S, task: "t-2", at: Date.now() + 5 };
   look(v);
   check(v.view === "tasks" && v.open.has("t-2"), `a later request from another mod opens (view ${v.view}, open ${[...v.open]})`);
+};
+
+// ---- t-116 (t-053 RL-6, RL-2, RL-3): a refused watch retried, a refused push run, Turn off beside a hung compare ----
+cases["P116-watch-retry"] = async () => { // RL-6: a refused folder watch is started again after a back-off (1 s, doubling), and its batches reload
+  world(); localCards(3, { open: 1 }); g.__watchers = []; g.__watchRefuse = 2;
+  await mount(); await settle();
+  const fireOnly1s = () => { for (const tm of g.__timers.filter((x) => x.ms === 1000)) tm.fn(cx); };
+  check(g.__watchRefused === 1 && g.__watchers.length === 0, `the first watch refused, none running (refused ${g.__watchRefused}, watching ${g.__watchers.length})`);
+  advance(1100); await turn(4); await settle();
+  check(g.__watchRefused === 2 && g.__watchers.length === 0, `retried after 1 s, refused again (refused ${g.__watchRefused})`);
+  advance(1500); await turn(4); await settle();
+  check(g.__watchers.length === 0, "the next try waits 2 s, not 1 s");
+  advance(700); await turn(4); await settle();
+  check(g.__watchers.length === 1, `a watch runs again after the back-off (watching ${g.__watchers.length})`);
+  const before = loadsLocal();
+  g.__watchers.shift().resolve([`/home/u/.config/herdr-pa/spaces`]); await turn(2); advance(3000); fireOnly1s(); await settle();
+  check(loadsLocal() > before, `a change under spaces/ reloads (loads ${before} -> ${loadsLocal()})`);
+  check(g.__watchers.length === 1, "and the watch goes on");
 };
 
 // --list prints the names that would run and runs none. An unknown name or option exits 2.
