@@ -176,11 +176,16 @@ if [ "${PA_SUITE_SLOT_PID:-}" != "$PPID" ]; then
     for v in TERMINAL_ID SOCKET TERMINAL_SOCKET SCOPE; do
       eval "if [ -n \"\${keep_hc_$v+x}\" ]; then PA_SUITE_HC_$v=\$keep_hc_$v; export PA_SUITE_HC_$v; fi"
     done
+    # t-147: the affected-tests hook's mark: this run entered the slot step (and may wait for it), so the hook
+    # gives it the slot wait too; the variable goes no further
+    if [ -n "${PA_HOOK_SLOT_MARK:-}" ]; then touch "$PA_HOOK_SLOT_MARK" 2>/dev/null || true; fi
+    unset PA_HOOK_SLOT_MARK
     exec "$PY" "$helper" slot --for "tests/run-all.sh${*:+ $*}" --worker "$worker" --dir "$repo" -- \
       sh "$here/$(basename "$0")" "$@"
   fi
   PA_SUITE_HOLD="none (no $helper: this run took no slot)"
 fi
+unset PA_HOOK_SLOT_MARK
 hold=${PA_SUITE_HOLD:-unknown}
 
 tmp=${TMPDIR:-/tmp}

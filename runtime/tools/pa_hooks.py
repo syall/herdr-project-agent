@@ -56,6 +56,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -189,22 +190,64 @@ def changed_files(root, every=False):
 
 
 TIMED_OUT = "(timed out after {} s)"  # run_shell's last line when the command outlived its limit
+KILL_GRACE = 5  # t-147: seconds a command's process group has to end on SIGTERM before SIGKILL
 
 
-def run_shell(command, cwd, files, timeout, extra_env=None):
-    """Runs a configured command. {file}/{files} are filled in; PA_CHANGED_FILES lists them, one per line."""
+def end_group(proc, grace):
+    """t-147: ends what is left of proc's process group (its own, start_new_session): SIGTERM, up to grace s for it
+    to go (proc itself reaped meanwhile, so it is not counted as a zombie), then SIGKILL. Never raises."""
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(proc.pid, sig)
+        except OSError:  # ESRCH: nothing left (EPERM on macOS: only zombies left)
+            return
+        end = time.monotonic() + (grace if sig == signal.SIGTERM else 0)
+        while time.monotonic() < end:
+            proc.poll()
+            try:
+                os.killpg(proc.pid, 0)
+            except OSError:
+                return
+            time.sleep(0.05)
+
+
+def run_shell(command, cwd, files, timeout, extra_env=None, mark=None, first=None):
+    """Runs a configured command. {file}/{files} are filled in; PA_CHANGED_FILES lists them, one per line.
+
+    t-147: it runs in a process group of its own, stdin /dev/null, its output in a temp file (no pipe that a
+    grandchild could hold open). Its limit is timeout s; with mark and first, first s unless the file mark exists by
+    then (the command entered the slot step), and then timeout s from the start. At the limit the whole group is
+    ended (end_group) and the last line is TIMED_OUT; what a clean exit leaves in the group is ended too."""
     quoted = " ".join(shlex.quote(f) for f in files)
     line = command.replace("{files}", quoted).replace("{file}", quoted)
     env = dict(os.environ, PA_CHANGED_FILES="\n".join(files), **(extra_env or {}))
-    try:
-        r = subprocess.run(["sh", "-c", line], cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                           universal_newlines=True, timeout=timeout)
-        return r.returncode, r.stdout
-    except subprocess.TimeoutExpired as e:
-        out = e.stdout or ""  # bytes here even with universal_newlines (subprocess.run's TimeoutExpired)
-        if isinstance(out, bytes):
-            out = out.decode("utf-8", "replace")
-        return 124, out + "\n" + TIMED_OUT.format(timeout)
+    limit = first if mark and first is not None and first < timeout else timeout
+    code = None
+    with tempfile.TemporaryFile() as out:
+        proc = subprocess.Popen(["sh", "-c", line], cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=out,
+                                stderr=subprocess.STDOUT, start_new_session=True)
+        began = time.monotonic()
+        try:
+            while code is None:
+                try:
+                    code = proc.wait(timeout=max(0, began + limit - time.monotonic()))
+                except subprocess.TimeoutExpired:
+                    if limit == timeout or not os.path.exists(mark):
+                        break
+                    limit = timeout  # in the slot step: the whole limit, counted from the start
+        finally:
+            end_group(proc, KILL_GRACE)
+            if code is None:
+                try:
+                    proc.wait(timeout=KILL_GRACE)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+        out.seek(0)
+        text = out.read().decode("utf-8", "replace").replace("\r\n", "\n").replace("\r", "\n")
+    if code is None:
+        return 124, text + "\n" + TIMED_OUT.format(limit)
+    return code, text
 
 
 def tail(text, lines=40):
@@ -386,7 +429,8 @@ def unchanged_since_start(record, data):
 # t-079 I2 (t-072 RL-5): the affected-tests hook's run_shell limit is a whole slot wait plus a whole run, so a run
 # that waited long for the suite slot still has its own time once it has it
 AFFECTED_WAIT = 840  # the slot step's wait at most (pa_suite.SLOT_WAIT_LIMIT)
-AFFECTED_RUN = 900  # the run's own time once it has the slot (PA_SUITE_RUN_LIMIT is this less DEADLINE_SPARE)
+AFFECTED_RUN = 900  # the run's own time once it has the slot (PA_SUITE_RUN_LIMIT is this less DEADLINE_SPARE);
+# t-147: also the whole limit of a command that never entered the slot step (no PA_HOOK_SLOT_MARK made)
 AFFECTED_LIMIT = AFFECTED_WAIT + AFFECTED_RUN
 DEADLINE_SPARE = 30  # R14: PA_SUITE_DEADLINE is this long before that limit
 
@@ -437,9 +481,14 @@ def hook_affected(data, args):
         return 0
     # t-107 R14: the slot step's wait and a run on a machine end before this hook's own limit (less 30 s); t-079 I2:
     # a run on this Mac is ended by the slot step once it has run PA_SUITE_RUN_LIMIT s after taking the slot
-    code, out = run_shell(command, record["root"], files, AFFECTED_LIMIT,
-                          {"PA_SUITE_DEADLINE": str(int(time.time()) + AFFECTED_LIMIT - DEADLINE_SPARE),
-                           "PA_SUITE_RUN_LIMIT": str(AFFECTED_RUN - DEADLINE_SPARE)})
+    # t-147 (RL-b): a command that has not entered the slot step (run-all.sh makes the mark just before it) by
+    # AFFECTED_RUN s is ended then: it had no slot wait, so it gets the run's own time only
+    with tempfile.TemporaryDirectory(prefix="pa-hook-") as marks:
+        mark = os.path.join(marks, "slot")
+        code, out = run_shell(command, record["root"], files, AFFECTED_LIMIT,
+                              {"PA_SUITE_DEADLINE": str(int(time.time()) + AFFECTED_LIMIT - DEADLINE_SPARE),
+                               "PA_SUITE_RUN_LIMIT": str(AFFECTED_RUN - DEADLINE_SPARE), "PA_HOOK_SLOT_MARK": mark},
+                              mark=mark, first=AFFECTED_RUN)
     if not code:
         return 0
     unfinished = did_not_finish(out) if code == 124 else None
