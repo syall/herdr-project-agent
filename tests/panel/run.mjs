@@ -4514,9 +4514,9 @@ cases["P177-filter"] = async () => { // P3 R14 (H13): the filter shows each row'
   await click(v, "costs-acctf-0"); await settle();
   let text = costsView(v).text, t = section(text, "| By task", ["| By session type"]);
   check(t.startsWith(" · account acct-a |") && /2 of 3 tasks/.test(t), `head and count (got ${t})`);
-  check(/t-1 \| One ≈ \| in-progress \| 600 tokens \| [^|]*7\.50[^|]* est\. · 88% \|/.test(t) && !/t-0/.test(t) && /\(no task\) \| 100 tokens \| [^|]*1\.00[^|]* est\. · 12%/.test(t), `parts and shares of acct-a (got ${t})`);
+  check(/t-1 \| One ≈ \| in-progress \| 2 accounts \| 600 tokens \| [^|]*7\.50[^|]* est\. · 88% \|/.test(t) && !/t-0/.test(t) && /\(no task\) \| 100 tokens \| [^|]*1\.00[^|]* est\. · 12%/.test(t), `parts and shares of acct-a (got ${t})`);
   const k = section(text, "| By session type", ["| By day"]);
-  check(/worker \| 600 tokens/.test(k) && /pa \| 100 tokens/.test(k), `By session type filtered (got ${k})`);
+  check(/worker \| 2 accounts \| 600 tokens/.test(k) && /pa \| 100 tokens/.test(k) && k.includes("2 of 2"), `By session type filtered (got ${k})`);
   check(/700 tokens \| [^|]*8\.50/.test(section(text, "| By day", ["| Billed", "Billed amounts"])), "By day filtered");
   check(act(text) === act(before) && tot(text) === tot(before), "Total and By activity unchanged");
   await click(v, "costs-task-0"); await settle(); text = costsView(v).text;
@@ -4603,7 +4603,9 @@ cases["P177-hostile"] = async () => { // P6 H11, H12: a label that looks like ma
   check(!clicks["costs-acct-task-0"] && !clicks["costs-acct-task-1"] && !clicks["costs-acct-task-2"] && !clicks["costs-acct-kind-0"], `no chips for malformed entries (have ${Object.keys(clicks).filter((k) => k.startsWith("costs-acct"))})`);
   await click(v, "costs-acctf-0"); await settle();
   check(costsView(v).text.includes(`By task · account ${odd}`), "filtering by it works");
-  await click(v, "costs-task-0"); await settle();
+  await click(v, "costs-acctf-all"); await settle();
+  await click(v, "costs-task-0"); await settle(); // a malformed entry still opens, with no account lines
+  check(!/Accounts:/.test(section(costsView(v).text, "| By task", ["| By session type"])), "no account lines for it");
   check(!g.__rejected.length, `nothing thrown (${g.__rejected})`);
 };
 

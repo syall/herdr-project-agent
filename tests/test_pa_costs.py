@@ -8203,7 +8203,7 @@ class T177_Summary(Collecting):
         self.assertEqual([r["account"] for r in rows], ["acct-a", "acct-b"])
         s = load(self.costs("summary.json"))
         e = s["sessions"][0]
-        self.assertNotIn("account", e)
+        self.assertEqual(e["account"], "acct-b")  # its largest scope's (DECISIONS D2), beside the list
         self.assertEqual([a["key"] for a in e["accounts"]], ["acct-b", "acct-a"])  # by money
         self.assertEqual({a["key"] for a in s["byAccount"]}, {"acct-a", "acct-b"})
         sess = {"starts": [{"at": "not a time", "account": "acct-a", "accountBy": "command"},
