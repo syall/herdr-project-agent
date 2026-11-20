@@ -241,10 +241,8 @@ class Recover(unittest.TestCase):
         return pid
 
     def orphan(self, session):
-        out = subprocess.run(["/bin/sh", "-c", '"$0" -c "import time; time.sleep(300)" --session-id "$1" >/dev/null 2>&1 & echo $!',
-                              sys.executable, session], stdout=subprocess.PIPE, universal_newlines=True, timeout=10).stdout
-        pid = int(out.strip())
-        self.procs.append(pid)
+        # in a session of its own, as a Claude left by a tab is (never in --recover's own group)
+        pid = self.detached([sys.executable, "-c", "import time; time.sleep(300)", "--session-id", session])
         end = time.time() + 5
         rows = None
         while time.time() < end:
