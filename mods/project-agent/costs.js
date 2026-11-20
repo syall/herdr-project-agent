@@ -497,7 +497,11 @@ export class CostsPane {
       const n = [pricedNote(factsOf(x), x.pricedAs) || priceTag(x), num(x.scopes) > 1 ? `rows in ${num(x.scopes)} scopes (the largest shown)` : ""].filter(Boolean).join(" · ");
       return n ? ` · ${n}` : "";
     };
-    const sessionsOf = (pred) => list(s.sessions).filter(pred).map((x) => sub(`${x.source === "reconstructed" ? "◌ " : ""}${str(x.key)} · ${[x.kind, x.role, x.program, x.model].filter(Boolean).map(str).join(" · ")}${scopeOf(x)} · ${clock(x.from)} – ${clock(x.to)} · ${est(x, cur)}${ccOn && ccNum(x.cc) !== null ? ` · CC ${money(x.cc, null)}` : ""}${noteOf(x)} · ${str(x.state)}${x.source ? ` · ${str(x.source)}` : ""}`));
+    const sessionText = (x) => `${x.source === "reconstructed" ? "◌ " : ""}${str(x.key)} · ${[x.kind, x.role, x.program, x.model].filter(Boolean).map(str).join(" · ")}${scopeOf(x)} · ${clock(x.from)} – ${clock(x.to)} · ${est(x, cur)}${ccOn && ccNum(x.cc) !== null ? ` · CC ${money(x.cc, null)}` : ""}${noteOf(x)} · ${str(x.state)}${x.source ? ` · ${str(x.source)}` : ""}`;
+    const sessionsOf = (pred) => list(s.sessions).filter(pred).map((x) => sub(sessionText(x)));
+    // t-151: session lines led by their task's id as a link (ids costs-link-<linkBase>-<j>); a session with no task, plain.
+    const sessionLinks = (items, linkBase) => items.map((x, j) => (linkable(str(x.task), taskState.get(str(x.task))) && x.task
+      ? subLink(`costs-link-${linkBase}-${j}`, str(x.task), sessionText(x)) : sub(sessionText(x))));
     // The model lines of a scope or of a model (t-032 J1d): byDayModel (UTC days, from its oldest) summed per model and scope.
     const dayModel = list(s.byDayModel);
     const dmDays = dayModel.map((e) => str(e.day)).filter((d) => /^\d{4}-\d{2}-\d{2}$/.test(d)).sort();
@@ -569,9 +573,14 @@ export class CostsPane {
     begin("kind", `By session type: ${st.dim}`);
     const kindHead = h_flex().gap(4).items_center().flex_wrap().child(head("By session type")).child(div().flex_1()).children(DIMS.map((d) => chip(`costs-dim-${d}`, d, st.dim === d, (_e, cx) => { st.dim = d; st.open.kind = null; cx.notify(); }))).child(copy("kind"));
     const dimRows = st.dim === "machine" ? [this.machineRow(s, space)] : list(s.byKind?.[st.dim]);
-    out.child(card("kind", kindHead, dimRows.map((x, i) => row("kind", i, x, str(x.key), null, () => [
-      ...(tags && st.dim === "model" ? [sub(`Scopes${dmFrom}:`, t.dim), ...modelLines((e) => str(e.model) === str(x.key), true)] : []),
-      ...sessionsOf((ss) => st.dim === "machine" || str(ss[st.dim] ?? "(none)") === str(x.key))]))));
+    // t-151: a row opens to its sessions (the summary's order, task ids linked); a row with nothing to show has no fold.
+    out.child(card("kind", kindHead, dimRows.map((x, i) => {
+      const mine = list(s.sessions).filter((ss) => st.dim === "machine" || str(ss[st.dim] ?? "(none)") === str(x.key));
+      const scoped = tags && st.dim === "model" && dayModel.some((e) => str(e.model) === str(x.key));
+      return row("kind", i, x, str(x.key), null, mine.length || scoped ? () => [
+        ...(scoped ? [sub(`Scopes${dmFrom}:`, t.dim), ...modelLines((e) => str(e.model) === str(x.key), true)] : []),
+        ...sessionLinks(mine, `kind-${i}`)] : null);
+    })));
     // Accounts (R-A3, t-032 J1d): two or more account labels; each with its sessions.
     const accts = accountsOf(s);
     if (accts.length > 1) {
