@@ -6,7 +6,7 @@
 // reloads while it is shown, at most once per ALLOW_EVERY; never written here.
 
 import { div } from "gpui-kit";
-import { v_flex, h_flex, InputState, Input } from "gpui-base";
+import { v_flex, h_flex, InputState, Input, ScrollHandle } from "gpui-base";
 import { home } from "herdr";
 import { loadRules, changeRules, touched, reorder, newRuleId, exportRules, importRules, oneLine } from "./store.js";
 import { readAllow } from "./push.js";
@@ -75,6 +75,26 @@ export class RulesPane {
     this.allow = {}; // space id -> { data, asked, busy }: the last pa-push-allow show --json (data: its report, or { error })
     this.changed = null; // (space, ids, cx): the person changed these rules (main.js: the "rules changed" notice)
     this.at = null; // () => { space, view }: the space id and view the panel shows (main.js); unset: the caller's space
+    this.scroll = ScrollHandle.new(); // t-160: the list (#pa-rules), to bring one rule into view
+    this.revealing = null; // t-160: { space, id }: the rule to bring into view at the next render that lists it
+  }
+
+  // t-160 (t-156 RL2): bring rule id of space into view once it is drawn (the Places rule link).
+  reveal(spaceId, id) { this.revealing = { space: spaceId, id }; }
+
+  // t-160: the index of rule id among #pa-rules's children, as render draws them (keep in step with render), or -1.
+  // A declined rule is drawn only while the declined list is open: opening it is the caller's.
+  rowIndex(space, d, proposed, live, declined, id) {
+    let at = (d.error ? 1 : 0) + (this.error ? 1 : 0) + (this.message ? 1 : 0);
+    if (d.error) return -1;
+    at += 1 + (this.importPath ? 1 : 0) + (this.form?.space === space.id ? 1 : 0); // the buttons row, the import field, the form
+    const p = proposed.findIndex((r) => r.id === id);
+    if (proposed.length) { if (p >= 0) return at + 1 + p; at += 1 + proposed.length; }
+    const l = live.findIndex((r) => r.id === id);
+    if (l >= 0) return at + 1 + l;
+    at += 1 + live.length;
+    const k = declined.findIndex((r) => r.id === id);
+    return k >= 0 && this.declined ? at + 1 + k : -1; // after the declined toggle
   }
 
   // t-134 round 2: one pane serves every space, so a form keeps the space it was opened for (form.space). shows(id):
@@ -289,7 +309,13 @@ export class RulesPane {
     const note = (text, color) => div().px(4).py(4).text_size(12).text_color(color ?? t.dim).child(text);
     if (!d) return v_flex().p(8).child(note("Loading…")).child(this.allowView(t, space));
     const proposed = d.rules.filter((r) => r.status === "proposed"), live = d.rules.filter((r) => r.status === "active" || r.status === "off"), declined = d.rules.filter((r) => r.status === "declined");
-    return v_flex().id("pa-rules").flex_1().min_h(0).p(8).gap(6).overflow_y_scrollbar()
+    if (this.revealing?.space === space.id) { // t-160: once, with this render's rows
+      const id = this.revealing.id; this.revealing = null;
+      if (declined.some((r) => r.id === id)) this.declined = true;
+      const at = this.rowIndex(space, d, proposed, live, declined, id);
+      if (at >= 0) this.scroll.scroll_to_item(at);
+    }
+    return v_flex().id("pa-rules").flex_1().min_h(0).p(8).gap(6).overflow_y_scrollbar().track_scroll(this.scroll)
       .on_mouse_up("left", (_e, cx) => { if (this.pressed) { this.pressed = null; cx.notify(); } })
       .when(Boolean(d.error), (el) => el.child(v_flex().p(10).gap(4).rounded(7).border(1).border_color(t.blocked).bg(t.surface)
         .child(div().text_size(12).text_color(t.blocked).child(d.error))
