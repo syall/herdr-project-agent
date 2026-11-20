@@ -9,6 +9,7 @@ the temp home's own. No real space, queue.json, push card or push.
 import fcntl
 import json
 import os
+import re
 import sys
 import unittest
 from unittest import mock
@@ -137,15 +138,19 @@ class M1Card(MBase):
         self.assertIn("t-C", err)
         self.assertEqual(self.queue_cards(), [])
 
-    def test_m1d_limits_that_do_not_fit_are_refused_not_cut(self):
-        """t-109 MF-1 (AC10.3): the facts plus --limits over the card's context cap refuse; no limit is ever cut."""
+    def test_m1e_limits_that_do_not_fit_are_refused_not_cut(self):
+        """t-109 MF-1 (AC10.3): the facts plus --limits over the card's context cap refuse; no limit is ever cut.
+        t-146 N-6: the refusal names --max and says to name each limit by its id (a file path alone lists none)."""
         self.three()
         limits = LIMITS + "; t-C: RL-1 " + "x" * pa_hooks.CONTEXT_MAX + " END-OF-LIMITS"
         code, out, err = self.make_card(limits)
         self.assertEqual(code, 1, out + err)
         self.assertIn("refused", err)
         self.assertIn("fewer entries", err)
+        self.assertIn("--max", err)
         self.assertIn("shorten", err)
+        self.assertIn("by its id", err)
+        self.assertNotIn("name a file with them", err)
         self.assertEqual(self.queue_cards(), [])
         self.assertEqual(self.journal("card"), [])
         code, out, err = self.make_card()
@@ -153,6 +158,56 @@ class M1Card(MBase):
         context = self.card("d-queue-1")["context"]
         self.assertTrue(context.endswith(LIMITS), context[-80:])
         self.assertLessEqual(len(context), pa_hooks.CONTEXT_MAX)
+
+    def test_m1f_facts_and_limits_each_under_the_cap_over_together(self):
+        """t-109 RL-R1-1 and N-7: --limits under CONTEXT_MAX that goes over it with the facts is refused; a context
+        of exactly CONTEXT_MAX opens, one character more refuses (D-109-4: the boundary is '>')."""
+        self.three()
+        limits = LIMITS + "; " + "y" * (pa_hooks.CONTEXT_MAX - len(LIMITS) - 100)
+        self.assertLess(len(limits), pa_hooks.CONTEXT_MAX)
+        code, out, err = self.make_card(limits)
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("fewer entries", err)
+        self.assertEqual(self.queue_cards(), [])
+        total = int(re.search(r"come to (\d+) characters", err).group(1))
+        facts = total - len(limits)
+        self.assertGreater(facts, 100)
+        exact = LIMITS + "; " + "z" * (pa_hooks.CONTEXT_MAX - facts - len(LIMITS) - 2)
+        code, out, err = self.make_card(exact + "z")
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("{} characters".format(pa_hooks.CONTEXT_MAX + 1), err)
+        self.assertEqual(self.queue_cards(), [])
+        code, out, err = self.make_card(exact)
+        self.assertEqual(code, 0, out + err)
+        context = self.card("d-queue-1")["context"]
+        self.assertEqual(len(context), pa_hooks.CONTEXT_MAX)
+        self.assertTrue(context.endswith(exact))
+
+    def test_m1g_max_lists_fewer_entries(self):
+        """t-109 RL-2: pa-queue card --max N lists at most N entries of the ready front; --limits names only those."""
+        self.three()
+        for bad in ("0", "5"):
+            code, out, err = self.queue("card", "--repo", self.proj, "--limits", LIMITS, "--max", bad)
+            self.assertEqual(code, 1, out + err)
+            self.assertIn("--max", err)
+            self.assertEqual(self.queue_cards(), [])
+        code, out, err = self.queue("card", "--repo", self.proj, "--limits", "Recorded limits: t-A none", "--max", "1")
+        self.assertEqual(code, 0, out + err)
+        c = self.card("d-queue-1")
+        self.assertEqual([x["task"] for x in c["queue"]["entries"]], ["t-A"])
+        self.assertEqual([o["label"] for o in c["options"]], [ALL, "Not now"])
+        code, out, err = self.queue("card", "--repo", self.proj, "--limits", "Recorded limits: t-B none; t-C none", "--max", "2")
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual([x["task"] for x in self.card("d-queue-2")["queue"]["entries"]], ["t-B", "t-C"])
+
+    def test_m1h_a_digestless_approval_does_not_hold_the_card(self):
+        """t-109 N-2: an approval naming no content (no digests) can never merge, so it does not count as held: the
+        entry is listed on the card (else it would block the card for good)."""
+        self.three()
+        self.set_entries(lambda r: r["entries"][0].update(approval={"card": None, "answeredAt": pa.now(), "void": None}))
+        code, out, err = self.make_card()
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual([x["task"] for x in self.card("d-queue-1")["queue"]["entries"]], ["t-A", "t-B", "t-C"])
 
     def test_m1c_an_entry_on_an_open_card_is_not_listed_again(self):
         self.three()
@@ -182,6 +237,19 @@ class M2SecondCard(MBase):
         self.assertEqual(self.queue_cards(), ["d-queue-1", "d-queue-2"])
         self.assertEqual([x["task"] for x in self.card("d-queue-2")["queue"]["entries"]], ["t-C"])
         self.assertEqual(self.card("d-queue-2")["task"], "t-C")
+
+    def test_m2c_a_rejoined_entry_gets_a_new_card(self):
+        """t-109 N-3: an open card lists an entry instance; a task that left and joined again is a new instance (the
+        old card can no longer approve it, D-J3b-10), so the old card does not hold it off a new card."""
+        self.joined("t-A", "fa.txt")
+        self.assertEqual(self.make_card()[0], 0)
+        code, out, err = self.queue("out", "t-A", "--repo", self.proj, "--why", "held")
+        self.assertEqual(code, 0, out + err)
+        self.add("t-A")
+        code, out, err = self.make_card()
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(self.queue_cards(), ["d-queue-1", "d-queue-2"])
+        self.assertEqual(self.card("d-queue-2")["queue"]["entries"][0]["instance"], self.entry("t-A")["instance"])
 
     def test_m2b_the_card_id_skips_an_archived_one(self):
         dump({"id": "d-queue-1", "kind": "queue", "status": "answered"}, os.path.join(self.dir, "decisions-archive", "d-queue-1.json"))
@@ -294,6 +362,30 @@ class M3Merge(MBase):
             self.stops_at_b("main checkout", void=False)
         finally:
             pa_queue.ff_merge = real
+
+
+    def test_m3_6e_local_main_moved_by_hand_between_merges(self):
+        """t-109 N-1, R9 (6): local main must be where the run left it (the tip it merged last); a hand commit on main
+        between two merges stops the run there as 'moved during the run', and voids nothing."""
+        real = pa_queue.ff_merge
+
+        def moved_after(ctx, rec, e, tip):
+            out = real(ctx, rec, e, tip)
+            self.on_main("README", "moved by hand\n")
+            return out
+        pa_queue.ff_merge = moved_after
+        try:
+            a_tip = self.tip("t-A")
+            code, out, err = self.merge()
+        finally:
+            pa_queue.ff_merge = real
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(self.merged(), ["t-A"])
+        self.assertIn("stopped at t-B", out)
+        self.assertIn("moved during the run", out)
+        self.assertIn(a_tip[:7], out)
+        self.assertFalse(self.approval("t-B").get("void"))
+        self.assertEqual(self.journal("void"), [])
 
 
 class M3MainCheckout(MBase):
@@ -435,6 +527,24 @@ class M6M8Refresh(MBase):
         self.assertEqual(self.ref("main"), self.tip("t-C"))
         self.assertEqual(self.queue_cards(), ["d-queue-1"])
         self.assertFalse(os.path.exists(os.path.join(self.proj, "fb.txt")))
+
+    def test_m6b_a_busy_push_lock_keeps_refresh_lines(self):
+        """t-109 RL-1: refresh's merge finding the push lock busy (a push run) adds one line; refresh's own lines (a
+        failure that left, the states, the show hint) are printed and its exit code is kept."""
+        self.three()
+        self.approve()
+        self.suite("t-A", 0)
+        self.suite("t-B", 3)
+        with mock.patch.object(pa_push, "push_lock", side_effect=pa_push.Refused("C2", "another push for this space is running")):
+            code, out, err = self.refresh()
+        self.assertEqual(code, 0, out + err)
+        self.assertNotIn("refused", err)
+        self.assertIn("t-B failed", out)
+        self.assertIn("merge skipped: another push for this space is running", out)
+        self.assertIn("pa-queue show", out)
+        self.assertEqual(self.merged(), [])
+        self.assertEqual(self.ref("main"), self.m0)
+        self.assertEqual(self.approval("t-A")["card"], "d-queue-1")
 
     def test_m8_approved_while_checking_merged_by_refresh(self):
         self.joined("t-A", "fa.txt")
@@ -837,8 +947,8 @@ class CarryYes(Carry):
 
     def test_carry_not_when_a_file_of_the_change_moved_under_it(self):
         # clean already implies it (the record holds each file's base blob); the rule's own test is checked alone
-        real = pa_queue.touched
-        pa_queue.touched = lambda ctx, a, b: real(ctx, a, b) | {"fb.txt"}
+        real = pa_queue.changed_files
+        pa_queue.changed_files = lambda ctx, a, b: (real(ctx, a, b) or set()) | {"fb.txt"}
         try:
             self.independence()
             code, out, err = self.refresh("--no-merge")
@@ -846,7 +956,22 @@ class CarryYes(Carry):
             code, out, err = self.brief("t-B")
             self.assertIn("run pa-full-suite", out)
         finally:
-            pa_queue.touched = real
+            pa_queue.changed_files = real
+
+    def test_carry_not_when_what_moved_under_it_cannot_be_read(self):
+        """t-109 N-4: a git diff of what moved under the change that fails makes the entry not eligible (fail
+        closed), not 'nothing moved'."""
+        self.independence()
+        checked_base, new_base = self.entry("t-B")["checked"]["base"], self.entry("t-B")["base"]
+        real = pa_hooks.raw_files
+
+        def failing(run, path, a, b, label=None):
+            if b == new_base and a == checked_base:
+                raise pa_hooks.ContentError("git diff failed (test)")
+            return real(run, path, a, b, label)
+        with mock.patch.object(pa_hooks, "raw_files", failing):
+            code, out, err = self.refresh("--no-merge")
+        self.assertEqual(self.entry("t-B")["state"], "checking", out + err)
 
 
 class CarryHighTier(Carry):
