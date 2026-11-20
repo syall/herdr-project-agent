@@ -2,9 +2,8 @@
 
 check_command(line) refuses a Bash line only when a simple command in it (also inside $(...), `...`, <(...), >(...),
 sh -c or eval, to depth 4) pushes (D1), publishes or merges a change request (D2), deletes a branch or a worktree
-(D3), runs the person's push tools (D4), pa-restart, pa-context, the person's price fetch (D7, t-070 J2) or a pa-places
-write (D8, t-133); spec
-t-025. When unsure, it lets the line run. check_edit(path, spaces_dir, cwd, home) refuses editor writes into .git, the Project Agent's files (evidence excepted) and the
+(D3, pa-worktree remove too), runs the person's push tools or pa-worktree-allow (D4), pa-restart, pa-context, the
+person's price fetch (D7, t-070 J2) or a pa-places write (D8, t-133); spec t-025. When unsure, it lets the line run. check_edit(path, spaces_dir, cwd, home) refuses editor writes into .git, the Project Agent's files (evidence excepted) and the
 person's git and gh settings. A fence for workers that follow their rules, not a sandbox: scripts, aliases and names
 built at run time are not caught. The rules this replaced are described in docs/worker-guard-history.md.
 """
@@ -26,6 +25,7 @@ DENY_DELETE = refusal(" deletes a branch or a worktree. Deleting is the person's
                       "and name it in your report if it should go.")
 DENY_TOOLS = refusal(". pa-push-main and pa-push-allow are the person's commands: a main branch is pushed only when the "
                      "person answers a push card in the panel. Say in your report that the work is ready to release.", False)
+DENY_ALLOW = refusal(". pa-worktree-allow is the person's command: they bind their rule to delete clean worktrees.", False)
 DENY_RESTART = refusal(". pa-restart is the person's command, or the Project Agent's at their word: a worker never "
                        "restarts a Project Agent. Say in your report what should be restarted and why.", False)
 DENY_CONTEXT = refusal(". pa-context is the person's command (its other subcommands are the Project Agent's own hooks): "
@@ -161,11 +161,11 @@ def row_of(words, d7=True):
     elif any(action in ("create", "new", "ready", "merge") for action in actions):
         row = DENY_PR
     elif any(word(j) == "branch" and deleting > j or word(j) == "worktree" and after(j) == "remove"
-             or word(j) == "update-ref" and removing > j for j in subs):
+             or word(j) == "update-ref" and removing > j for j in subs) or names[first:first + 1] == ["pa-worktree"] and "remove" in words[first + 1:]:
         row = DENY_DELETE
-    elif first < n and (names[first] in ("pa-push-main", "pa-push-allow", "pa_push.py")
-                        or PYTHON.match(names[first]) and "pa_push.py" in names[first + 1:]):
-        row = DENY_TOOLS
+    elif first < n and (names[first] in ("pa-push-main", "pa-push-allow", "pa_push.py", "pa-worktree-allow")
+                        or PYTHON.match(names[first]) and "pa_push.py" in names[first + 1:]):  # t-168: pa-worktree-allow too
+        row = DENY_ALLOW if names[first] == "pa-worktree-allow" else DENY_TOOLS
     elif tool in ("restart", "context"):  # pa-restart (t-037 J2), pa-context (t-041 J3), or pa.py restart|context
         row = DENY_RESTART if tool == "restart" else DENY_CONTEXT
     elif places_write(words, names, first, n, after):

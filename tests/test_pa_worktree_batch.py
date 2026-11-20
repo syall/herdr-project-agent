@@ -916,7 +916,7 @@ class Clean(Standing):
         self.assertTrue(all(i["removed"] for i in self.dec("d-wt-batch-1")["items"]))
 
     def test_v15_1h_not_a_candidate_is_not_touched(self):
-        self.clean("t-003", state="in-progress")
+        self.clean("t-003", commit=False, state="in-progress")  # rule (b): no commits since its fork, so its job is not over
         code, out, err = self.standing()
         self.assertEqual(code, 0, err)
         self.assertTrue(os.path.isdir(self.trees["t-003"]))

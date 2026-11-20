@@ -27,7 +27,7 @@ chmod +x "$PA"/tools/*.py "$PA"/core/hooks/*.sh
 mkdir -p "$PA/spaces" "$HOME/.local/bin"
 [ -f "$PA/config.json" ] || printf '{\n  "version": 1,\n  "defaultProfile": "personal"\n}\n' > "$PA/config.json"
 for n in pa-start pa-session pa-claude pa-codex pa-profile pa-peers pa-pass pa-cleanup pa-doctor pa-task pa-decide pa-sync pa-core-check pa-stamp pa-restart pa-context; do ln -sfn "$PA/tools/pa.py" "$HOME/.local/bin/$n"; done
-for n in pa-gate pa-hooks pa-hook pa-full-suite pa-run pa-worktree pa-worker pa-trust; do ln -sfn "$PA/tools/pa_hooks.py" "$HOME/.local/bin/$n"; done
+for n in pa-gate pa-hooks pa-hook pa-full-suite pa-run pa-worktree pa-worktree-allow pa-worker pa-trust; do ln -sfn "$PA/tools/pa_hooks.py" "$HOME/.local/bin/$n"; done
 for n in pa-costs; do ln -sfn "$PA/tools/pa_costs.py" "$HOME/.local/bin/$n"; done
 for n in pa-queue; do ln -sfn "$PA/tools/pa_queue.py" "$HOME/.local/bin/$n"; done
 for n in pa-places; do ln -sfn "$PA/tools/pa_places.py" "$HOME/.local/bin/$n"; done

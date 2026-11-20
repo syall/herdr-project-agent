@@ -19,6 +19,12 @@ Selected by the name it is invoked as (symlinks in ~/.local/bin):
   pa-run --report [--days N]                    which kinds of test run are faster here or on a machine (t-107)
   pa-worktree check [--open-cards]              worktrees whose tasks are all done or parked: list them, open decision cards
   pa-worktree remove <task-id>                  delete a task's worktree, only with an answered "Delete" card
+  pa-worktree remove --card <d-wt-batch-n>      delete each worktree an answered batch card covers, each re-checked;
+                                                one that changed is skipped and listed (t-168)
+  pa-worktree remove --standing <rule>          the Project Agent's: delete the clean worktrees (merged into main and
+                                                pushed, nothing uncommitted or untracked, no terminal, no keep) on the
+                                                person's rule bound in worktree-allow.json (t-168)
+  pa-worktree-allow show|set|unbind|on|off      the person's binding of that rule (show: anyone)
   pa-worker info <address>                      what deleting a worker would remove, as JSON
   pa-worker delete <address> [--keep-worktree] [--discard] [--with-task]
                                                 the person's command: end a worker and remove what belongs to it
@@ -3506,6 +3512,8 @@ def cmd_worktree(args):
     # remove: only what an answered card allows, re-checked now.
     if getattr(args, "card", None):
         return remove_card(directory, agent, profile, args.card)
+    if getattr(args, "standing", None):
+        return remove_standing(directory, space, agent, profile, args.standing)
     row = pick_row(rows, args.task, args.job)
     owner = card_owner(row)
     task, job, main = owner
@@ -3748,6 +3756,342 @@ def remove_card(directory, agent, profile, cid):
                 len(skipped), ", ".join(skipped))
         print(line)
         return 1 if skipped else 0
+
+
+# ---- deleting clean worktrees on the person's standing rule (t-168 Part B) ---------------------------------------
+# The person's rule, bound by them in worktree-allow.json (their command pa-worktree-allow only), is their standing
+# approval to delete, with no card, the worktrees whose every commit is merged into main and pushed, with nothing
+# uncommitted or untracked, no terminal in them and no keep. Only this space's Project Agent runs it. pa_push's
+# standing-rule checks (t-140) are reused; anything unknown refuses.
+
+WORKTREE_ALLOW = "worktree-allow.json"
+ALLOW_TOP = ("version", "enabled", "spaces")
+ALLOW_ENTRY = ("space", "enabled", "standing", "note")
+_PUSH = [None]
+
+
+class _Self:
+    """pa_hooks as pa_push sees it: every name read from this module's globals when used (so a test's patch counts),
+    also when this module was loaded under another name or as __main__."""
+
+    def __getattr__(self, name):
+        return globals()[name]
+
+
+def push_tool():
+    """pa_push.py from this file's folder, loaded once with this pa and this module as its pa_hooks (it imports
+    pa_hooks at its top; loading it here lazily keeps pa_hooks free of an import cycle)."""
+    if _PUSH[0] is None:
+        import importlib.util
+        saved = {k: sys.modules.get(k) for k in ("pa", "pa_hooks")}
+        sys.modules["pa"], sys.modules["pa_hooks"] = pa, _Self()
+        try:
+            spec = importlib.util.spec_from_file_location("pa_push", os.path.join(os.path.dirname(os.path.realpath(__file__)), "pa_push.py"))
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    sys.modules.pop(k, None)
+                else:
+                    sys.modules[k] = v
+        _PUSH[0] = module
+    return _PUSH[0]
+
+
+def worktree_allow_path():
+    return os.path.join(pa.ROOT, WORKTREE_ALLOW)
+
+
+def worktree_allow_validate(data):
+    """None when data is a valid worktree-allow.json; else why not. All or nothing."""
+    if not isinstance(data, dict):
+        return "the file must hold a JSON object"
+    extra = sorted(set(data) - set(ALLOW_TOP))
+    if extra:
+        return "unknown key {}".format(", ".join(extra))
+    if type(data.get("version")) is not int or data.get("version") != 1:
+        return "version must be 1"
+    if not isinstance(data.get("enabled"), bool):
+        return "enabled must be true or false"
+    if not isinstance(data.get("spaces"), list):
+        return "spaces must be a list"
+    seen = set()
+    for i, e in enumerate(data["spaces"]):
+        where = "spaces[{}]: ".format(i)
+        if not isinstance(e, dict):
+            return where + "must be an object"
+        extra = sorted(set(e) - set(ALLOW_ENTRY))
+        if extra:
+            return where + "unknown key {}".format(", ".join(extra))
+        if not isinstance(e.get("space"), str) or not pa.ID.match(e["space"]):
+            return where + "space must be a space id (letters, digits, _ and -)"
+        if not isinstance(e.get("enabled"), bool):
+            return where + "enabled must be true or false"
+        b = e.get("standing")
+        if "standing" in e and (not isinstance(b, dict) or sorted(b) != ["rule", "textSha"] or not isinstance(b.get("rule"), str)
+                                or not pa.ID.match(b["rule"]) or not isinstance(b.get("textSha"), str)
+                                or not re.match(r"^[0-9a-f]{64}$", b["textSha"])):
+            return where + "standing must be {\"rule\": <rule id>, \"textSha\": <SHA-256 of its text>} (pa-worktree-allow set)"
+        if "note" in e and (not isinstance(e["note"], str) or len(e["note"]) > 200):
+            return where + "note must be a string of at most 200 characters"
+        if e["space"] in seen:
+            return where + "space {} is listed twice".format(e["space"])
+        seen.add(e["space"])
+    return None
+
+
+def worktree_allow_load():
+    """(data, problem): (None, None) when there is no file; a problem when it cannot be read or is not valid."""
+    try:
+        with open(worktree_allow_path(), "rb") as f:
+            raw = f.read()
+    except FileNotFoundError:
+        return None, None
+    except OSError as e:
+        return None, "cannot read it ({})".format(e.strerror or e)
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as e:
+        return None, "not JSON ({})".format(e)
+    return data, worktree_allow_validate(data)
+
+
+def cmd_worktree_allow(args, env=None, ancestors=None):
+    """pa-worktree-allow: show (anyone); set, unbind, on, off: the person's own changes, refused in an agent's shell
+    (pa_push.caller_refusal, not strict, as pa-push-allow). The old file is kept as .bak-pa-worktree-allow[-n]."""
+    push = push_tool()
+    path = worktree_allow_path()
+    data, problem = worktree_allow_load()
+    space = pa.local_id(args.space or "") or None
+    if args.action == "show":
+        exists = data is not None or problem is not None
+        state = ("off (the default): no worktree-allow.json" if not exists else "not valid, so off: " + problem if problem
+                 else "on" if data["enabled"] else "off (enabled: false)")
+        spaces = [dict(e, thisSpace=e["space"] == space) for e in (data or {}).get("spaces") or []] if exists and not problem else []
+        if args.json:
+            print(json.dumps({"file": path, "exists": exists, "valid": problem is None, "problem": problem, "state": state,
+                              "enabled": bool(exists and not problem and data["enabled"]), "spaces": spaces}, indent=2))
+            return 0
+        print("Worktree deletion rule bindings {}: {}".format(path, state))
+        for e in spaces:
+            b = e.get("standing") or {}
+            print("  {} {} space {}: {}{}".format("*" if e["thisSpace"] else "-", "on " if e["enabled"] else "off", e["space"],
+                                                  "rule {} (text sha256 {})".format(b["rule"], b["textSha"]) if b else "no rule bound",
+                                                  "  note: " + e["note"] if e.get("note") else ""))
+        return 0
+    env = os.environ if env is None else env
+    why = push.caller_refusal(env, push.ancestors() if ancestors is None else ancestors, strict=False)
+    if why:
+        print("pa-worktree-allow: refused: pa-worktree-allow {} is the person's command; run it in your own terminal. ({})".format(
+            args.action, why), file=sys.stderr)
+        return 1
+    if problem:
+        print("pa-worktree-allow: {} is not valid: {}; fix it by hand".format(path, problem), file=sys.stderr)
+        return 1
+    data = data or {"version": 1, "enabled": True, "spaces": []}
+    found = [e for e in data["spaces"] if e["space"] == space]
+    if args.action in ("on", "off") and not space:
+        data["enabled"] = args.action == "on"
+        what = "worktree-allow.json is {}".format(args.action)
+    elif not space:
+        print("pa-worktree-allow: {} needs --space <id>".format(args.action), file=sys.stderr)
+        return 1
+    elif args.action == "set":
+        binding, why = push.binding_for(space, args.standing)
+        if why:
+            print("pa-worktree-allow: not changed: " + why, file=sys.stderr)
+            return 1
+        if found:
+            found[0]["standing"] = binding
+        else:
+            data["spaces"].append({"space": space, "enabled": True, "standing": binding})
+        if args.note is not None:
+            (found or data["spaces"][-1:])[0]["note"] = args.note
+        what = "space {} is bound to rule {} (text sha256 {})".format(space, binding["rule"], binding["textSha"])
+    elif not found:
+        print("pa-worktree-allow: space {} is not in {}".format(space, path), file=sys.stderr)
+        return 1
+    elif args.action == "unbind":
+        found[0].pop("standing", None)
+        what = "space {} has no rule bound".format(space)
+    else:
+        found[0]["enabled"] = args.action == "on"
+        what = "space {} is {}".format(space, args.action)
+    problem = worktree_allow_validate(data)
+    if problem:
+        print("pa-worktree-allow: not changed: the result would not be valid: {}".format(problem), file=sys.stderr)
+        return 1
+    pa.backup(path, "pa-worktree-allow")
+    pa.write_json(path, data)
+    print("{} ({}).".format(what, path))
+    return 0
+
+
+def standing_delete_rule(directory, space, rule_id):
+    """(rule, binding) when the person's rule rule_id is in force for deleting worktrees in this space (R13), read now;
+    else pa.Problem with why not. The binding is in worktree-allow.json only (a push binding does not count)."""
+    push = push_tool()
+
+    def no(why):
+        raise pa.Problem("the rule is not in force: {}; nothing was removed".format(why))
+    if not isinstance(rule_id, str) or not pa.ID.match(rule_id):
+        no("--standing needs the rule's id")
+    data, problem = worktree_allow_load()
+    if data is None and problem is None:
+        no("no worktree-allow.json ({}): the rule is not bound; the person binds it with pa-worktree-allow set --space {} "
+           "--standing {}".format(worktree_allow_path(), space, rule_id))
+    if problem:
+        no("worktree-allow.json is not valid: {}".format(problem))
+    if not data["enabled"]:
+        no("worktree-allow.json is turned off (enabled: false)")
+    entry = next((e for e in data["spaces"] if e["space"] == space), None)
+    if entry is None:
+        no("space {} is not in worktree-allow.json".format(space))
+    if not entry["enabled"]:
+        no("worktree-allow.json is turned off for space {}".format(space))
+    bound = (entry.get("standing") or {}).get("rule")
+    if bound != rule_id:
+        no("space {} is bound to rule {}, not {}".format(space, bound, rule_id) if bound else "space {} has no rule bound".format(space))
+    rules = push.space_rules(directory)
+    if rules is None:
+        no("this space has no valid rules.json")
+    found = [r for r in rules if r.get("id") == rule_id]
+    if not found:
+        no("no rule {} in this space's rules.json".format(rule_id))
+    if len(found) > 1:
+        no("{} rules have the id {}".format(len(found), rule_id))
+    rule = found[0]
+    if rule.get("status") != "active":
+        no("rule {} is {}, not active".format(rule_id, rule.get("status")))
+    if rule.get("appliesTo") != "all":
+        no("rule {} applies to {}, not all".format(rule_id, rule.get("appliesTo")))
+    why = push.not_persons(rule)
+    if why:
+        no("rule {} is not the person's: {}".format(rule_id, why))
+    if not isinstance(rule.get("text"), str) or push.text_sha(rule["text"]) != entry["standing"]["textSha"]:
+        no("the text of rule {} changed since the person bound it; they bind it again".format(rule_id))
+    return rule, entry["standing"]
+
+
+def merged_and_pushed(path, profile):
+    """True when HEAD is reachable from a remote-tracking ref of a main branch (local refs, no fetch, Q8): every commit
+    is merged into main and on the remote. A squash merge or a picked commit is not."""
+    names = {"main", "master", "trunk"}
+    for b in (profile or {}).get("mainBranches") or []:
+        names.add(str(b).split("/", 1)[-1] if str(b).startswith("origin/") else str(b))
+    code, target, _ = git(path, "symbolic-ref", "--short", "refs/remotes/origin/HEAD")
+    if not code and "/" in target:
+        names.add(target.split("/", 1)[1])
+    code, out, _ = git(path, "for-each-ref", "--format=%(refname)", "refs/remotes")
+    if code:
+        return False
+    for ref in out.splitlines():
+        parts = ref[len("refs/remotes/"):].split("/", 1)
+        if len(parts) == 2 and parts[1] in names and git(path, "merge-base", "--is-ancestor", "HEAD", ref)[0] == 0:
+            return True
+    return False
+
+
+def standing_clean(directory, row, owner, profile, entries, listing=None):
+    """Why a candidate worktree is not clean enough to delete on the rule (R15), or None. Fails closed."""
+    facts = row["facts"]
+    task = owner[0]
+    cid, _path, card = card_for(directory, row, task, entries.get(task), listing)
+    if card and card.get("status") == "answered" and (pa.is_other(card) or not str(card.get("answer") or "").lower().startswith("delete")):
+        return "answered {!r} on card {}".format("Other" if pa.is_other(card) else card.get("answer"), cid)
+    if not in_worktrees_folder(row["path"]):
+        return "not under a worktrees folder"
+    if facts.get("uncommitted"):
+        return "{} uncommitted or untracked file(s)".format(facts["uncommitted"])
+    if facts.get("unpushed"):
+        return "not every commit is merged into main and pushed ({} on no remote)".format(facts["unpushed"])
+    repos = facts.get("repos") if facts.get("remove") else [row["path"]]
+    if not repos:
+        return "its repositories are not listed, so they cannot be checked"
+    for repo in repos:
+        files = status_files(repo)
+        name = os.path.basename(repo.rstrip(os.sep))
+        if files is None:
+            return "cannot read {} (git status failed)".format(clean(name))
+        if files:
+            return "{} uncommitted or untracked file(s) in {}".format(len(files), clean(name))
+        if not merged_and_pushed(repo, profile):
+            return "not every commit is merged into main and pushed in {}".format(clean(name))
+    return None
+
+
+def standing_who(owner):
+    task, job, main = owner
+    return "{} (main)".format(clean(task)) if main and job == "main" else "{} {}".format(clean(task), clean(job))
+
+
+def remove_standing(directory, space, agent, profile, rule_id, env=None, ancs=None, cwd=None):
+    """pa-worktree remove --standing <rule> (R13-R16): the Project Agent deletes the clean candidate worktrees on the
+    person's rule, all in one run, and reports one line. A failed removal writes the rule's stop line and ends the run."""
+    push = push_tool()
+    env = os.environ if env is None else env
+    why = push.standing_caller_refusal(env, push.ancestors() if ancs is None else ancs, cwd or os.getcwd(), directory)
+    if why:
+        raise pa.Problem("pa-worktree remove --standing is the Project Agent's, under the person's standing rule in its own "
+                         "space; without it, the person answers a card in the panel ({}). Nothing was removed".format(why))
+    with worktree_lock(directory):
+        rule, binding = standing_delete_rule(directory, space, rule_id)
+        stop = push.standing_stops(directory, rule)
+        if stop:
+            if stop[1]:
+                push.write_stop(directory, rule_id, stop[0])
+            raise pa.Problem("the rule stops here: {}; nothing was removed".format(stop[0]))
+        rows = worktree_state(directory, agent, profile)
+        entries = ledger_tasks(directory)
+        listing = card_listing(directory)
+        removed, paths, left, failed = [], [], [], None
+        for row in rows.values():
+            owner = card_owner(row)
+            why, _rule, _desc = candidate_why(row, profile, owner)
+            if why:
+                continue  # not a candidate: not touched, not listed
+            why = standing_clean(directory, row, owner, profile, entries, listing)
+            if not why:
+                refresh_busy(row, agent, profile)
+                busy = [w["address"] for w in row["workers"] if w["fate"] == "live"] + row["others"]
+                why = ("in use by " + ", ".join(busy)) if busy else None if row["facts"] and not row["facts"].get("uncommitted") \
+                    else "changed while it ran"
+            if why:
+                left.append("{} ({})".format(standing_who(owner), cut(clean(why), 120)))
+                continue
+            cid, cpath, card = card_for(directory, row, owner[0], entries.get(owner[0]), listing)
+            try:
+                done = remove_worktree(row["path"], row["facts"])
+                if os.path.lexists(row["path"]):
+                    raise pa.Problem("the folder is still there after its removal")
+            except pa.Problem as e:
+                failed = "removing {} failed: {}".format(row["path"], clean(e))
+                if not os.path.lexists(row["path"]):
+                    mark_removed_everywhere(directory, row, "the worktree {} is gone after a failed removal on rule {}".format(row["path"], rule_id))
+                push.write_stop(directory, rule_id, failed)
+                break
+            if card and card.get("status") == "open" and not card.get("batch"):
+                with contextlib.redirect_stdout(io.StringIO()):  # journaled; the report line is the run's only output
+                    withdraw_card(directory, cpath, card, owner[0], "its worktree was removed on the person's rule " + rule_id)
+            if card and card.get("status") in ("open", "answered", "withdrawn"):
+                spend_card(directory, cpath, card)
+            remove_container(row["given"])  # one report line for the person (R16): the container's outcome is not printed
+            mark_removed_everywhere(directory, row, "removed the worktree {} on rule {} (standing): {}".format(row["path"], rule_id, done))
+            removed.append(standing_who(owner))
+            paths.append(row["path"])
+        line = "Removed {} worktrees on rule {}: {}".format(len(removed), rule_id, ", ".join(removed) or "nothing is clean")
+        if left:
+            line += "; {} not clean, left for cards: {}".format(len(left), ", ".join(left))
+        if failed:
+            line += "; then {}: the rule is stopped, and resuming it is the person's".format(failed)
+        if removed:
+            append_journal(directory, {"by": "agent", "trigger": "standing", "rule": rule_id, "textSha": binding["textSha"],
+                                       "why": cut(line, 1000), "removed": paths})
+        print(line)
+        if failed:
+            raise pa.Problem(failed + "; the rule is stopped")
+        return 0
 
 
 def spend_card(directory, path, card):
@@ -5457,16 +5801,38 @@ def main():
         parser.add_argument("--open-cards", action="store_true", help="open a decision card for each candidate")
         parser.add_argument("--job", help="remove: the job whose worktree to remove (default: the task's main worktree)")
         parser.add_argument("--card", help="remove: every worktree on this answered batch card d-wt-batch-<n> (t-168)")
+        parser.add_argument("--standing", metavar="RULE", help="remove: the clean worktrees, on the person's bound rule (the "
+                                                               "Project Agent's; t-168)")
         parser.add_argument("--space")
         args = parser.parse_args()
-        if args.action == "remove" and sum(map(bool, (args.task, args.card))) != 1:
-            raise pa.Problem("pa-worktree remove needs a task id, or --card <id>")
-        if args.card and (args.action != "remove" or args.job):
-            raise pa.Problem("--card is for pa-worktree remove, with nothing else")
+        if args.action == "remove" and sum(map(bool, (args.task, args.card, args.standing))) != 1:
+            raise pa.Problem("pa-worktree remove needs a task id, --card <id> or --standing <rule>")
+        if (args.card or args.standing) and (args.action != "remove" or args.job):
+            raise pa.Problem("--card and --standing are for pa-worktree remove, with nothing else")
         code = cmd_worktree(args)
         if code:
             sys.exit(code)
         return code
+    if kind == "pa-worktree-allow":
+        parser.description = "The person's binding of their rule to delete clean worktrees ({}).".format(worktree_allow_path())
+        sub = parser.add_subparsers(dest="action")
+        sub.required = True
+        show = sub.add_parser("show", help="print the bindings (anyone)")
+        show.add_argument("--json", action="store_true")
+        show.add_argument("--space")
+        bind = sub.add_parser("set", help="bind the rule, as its text stands now (the person's command)")
+        bind.add_argument("--space", required=True)
+        bind.add_argument("--standing", required=True, help="the rule's id in the space's rules.json")
+        bind.add_argument("--note")
+        unbind = sub.add_parser("unbind", help="take the space's binding away (the person's command)")
+        unbind.add_argument("--space", required=True)
+        for name in ("on", "off"):
+            p = sub.add_parser(name, help="turn the file, or one space, {} (the person's command)".format(name))
+            p.add_argument("--space")
+        code = cmd_worktree_allow(parser.parse_args())
+        if code:
+            sys.exit(code)
+        return 0
     if kind == "pa-worker":
         parser.add_argument("action", choices=("info", "delete", "close", "keep"))
         parser.add_argument("address", nargs="?")
@@ -5542,7 +5908,7 @@ def main():
         if not [w for w in args.argv if w != "--"][:1]:
             parser.error("give the command after --")
         return cmd_run(args)
-    raise pa.Problem("invoke as pa-gate, pa-hooks, pa-hook, pa-worktree, pa-worker, pa-trust, pa-full-suite or pa-run")
+    raise pa.Problem("invoke as pa-gate, pa-hooks, pa-hook, pa-worktree, pa-worktree-allow, pa-worker, pa-trust, pa-full-suite or pa-run")
 
 
 if __name__ == "__main__":
