@@ -25,7 +25,8 @@ space rule named);
   q4  R4: TERM during tree_to_run is 143 and recorded; any other exception in slot_run is 125 with its line
   q5  R5: an error in run_remote (neither Interrupted nor SetupFailed): cleaned there, one record 125, the line
   q7  R7: could not run only for 124/125 with the slot step's own last line; no space rule in runtime/
-  q8  R8: no remote run when the deadline leaves no time for it; PA_SUITE_RUN_LIMIT ends a remote run
+  q8  R8: no remote run when the deadline leaves no time for it; PA_SUITE_RUN_LIMIT ends a remote run; t-147
+      (t-079 R-2): a run on this Mac (after a fallback or with no machines) ends at the deadline (q8d, q8e)
   q13 R13: the slot step with no usable machine and "none": 125
   q14 R14: pa-full-suite's remote ran and copyback from the run folder's stamps
   q18 R18 (X15): this Mac's slot wait ends before the deadline
@@ -765,6 +766,37 @@ class Q8DeadlineAndRunLimit(HookCase):
         rows = [r for r in self.rows(kind="affected", machine="box-1") if r["run"] not in ("m0", "m1", "m2")]
         self.assertEqual([r["exit"] for r in rows], [124], self.run_rows())
         self.assertTrue(pa_hooks.did_not_finish(out), out)
+
+    def local_run_at_the_deadline(self):
+        # t-147 (t-079 R-2): a run on this Mac under a deadline 8 s away and a 40 s run limit, never ending: the
+        # deadline ends it (not the run limit, not the hook's run_shell after the deadline)
+        go = os.path.join(self.tmp, "never")
+        code, out, err, took = self.slot("--affected", FAKE_GO=go, PA_SUITE_RUN_LIMIT="40",
+                                         PA_SUITE_DEADLINE=str(int(time.time()) + 8))
+        self.assertEqual(code, 124, out + err)
+        self.assertLess(took, 25, out + err)
+        self.assertIn("remote=unset", out)
+        self.assertRegex(out.splitlines()[-1], r"^run-all\.sh: did not finish on this Mac: the deadline "
+                                               r"\(PA_SUITE_DEADLINE\) came after it ran \d+ s \(waited \d+ s for the "
+                                               r"slot\); the run was ended$")
+        self.assertTrue(pa_hooks.did_not_finish(out), out)
+        rows = [r for r in self.rows(kind="affected") if r["place"] == "local"]
+        self.assertEqual([r["exit"] for r in rows], [124], self.run_rows())
+        self.assertTrue(self.slot_free_here(), "this Mac's slot is released")
+
+    def slot_free_here(self):
+        return all(slot_is_free(os.path.join(pa_suite.slot_dir(), n)) for n in os.listdir(pa_suite.slot_dir())
+                   if n.startswith("slot-")) if os.path.isdir(pa_suite.slot_dir()) else True
+
+    def test_q8d_a_run_here_after_a_fallback_ends_at_the_deadline(self):
+        # R-2: box-1 not reachable, suiteFallback "mac": the run falls back to this Mac and still ends at the deadline
+        self.setenv(STUB_HC_FAIL="down:box-1")
+        self.local_run_at_the_deadline()
+
+    def test_q8e_a_run_here_with_no_machines_ends_at_the_deadline(self):
+        # the class: any run on this Mac under a deadline nearer than its run limit
+        self.configure([])
+        self.local_run_at_the_deadline()
 
 
 class Q13SlotNoUsableMachine(Slot):
