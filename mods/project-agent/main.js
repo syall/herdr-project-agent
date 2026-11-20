@@ -250,16 +250,17 @@ export default class ProjectAgent extends View {
     cx.timer.every(1000, (cx) => { this.wake(cx); this.costsDue(cx); this.deferredDue(cx); if ((this.armed && !this.armedTask(this.space, this.armed.what ?? "delete")) || (this.rules.armed && !this.rules.armedRule(this.space))) cx.notify(); if (this.placeMark && Date.now() >= this.placeMark.until) { this.placeMark = null; cx.notify(); } }); // shown again (render may not run for a hidden copy); an armed Delete timed out; a badge's mark ended
     // Changes under spaces/ (one watch, D3): a batch reloads only for what the panel shows (watched()), coalesced.
     // t-116 (t-053 RL-6): a watch the runtime refused (or that threw) is started again after a back-off: QUIET_MS, doubling
-    // up to WATCH_BACKOFF_MAX, back to QUIET_MS after a batch. One sleep at a time, counted by the Host; a sleep the runtime
-    // refuses ends the loop (the 10 s timer still reloads).
+    // up to WATCH_BACKOFF_MAX, back to QUIET_MS after a batch. The wait is a deadline on the Host's one clock (host.js
+    // within: no sleep of its own, no cx.sleep outside host.js); a context with no clock ends the loop, as before (the
+    // 10 s timer still reloads).
     this.host.spawn(cx, async (cx) => {
       let backoff = QUIET_MS;
       for (;;) {
         let paths;
         try { paths = await watch(`${paHome(null)}/spaces`, this.host); }
         catch {
-          const end = this.host.hold();
-          try { await cx.sleep(backoff); } catch { return; } finally { end(); }
+          if (typeof cx?.spawn !== "function" || typeof cx?.sleep !== "function" || this.host.noClock) return;
+          await this.host.within(cx, new Promise(() => {}), backoff);
           backoff = Math.min(backoff * 2, WATCH_BACKOFF_MAX);
           continue;
         }
