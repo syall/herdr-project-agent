@@ -147,6 +147,10 @@ export class Keeper {
     if (gaveUp(text)) throw new Error("did not answer");
     return text;
   }
+  // t-116 (t-053 RL-1): a keeper.lock write, keyed `write:<machine>:<path>` and given up after WRITE_LIMIT through the
+  // copy's Host (replaceFile's cx), so a hung write is never joined by another of that lock; a give-up throws, which
+  // the callers read as busy (a take) or as expiring (a refresh, a release). No Host: as before (tests).
+  writeLock(cx, path, text, old, on) { return replaceFile(path, text, old, on, this.host ? this.host.ctx(cx, { origin: "keeper" }) : null); }
 
   read(cx, beats) {
     const records = tabs(), sp = spaces(), ps = panes();
@@ -211,7 +215,7 @@ export class Keeper {
         l.refreshing = true; l.tried = now;
         const text = JSON.stringify({ client: this.me, at: new Date(now).toISOString(), tab });
         this.task(cx, async () => {
-          try { await replaceFile(path, text, l.text, on); l.text = text; l.at = now; }
+          try { await this.writeLock(cx, path, text, l.text, on); l.text = text; l.at = now; }
           catch { if (this.locks[space.id] === l) this.locks[space.id] = { state: "busy", at: Date.now() }; } // taken over: not ours any more
           l.refreshing = false;
         }, "the lock refresh") || (l.refreshing = false);
@@ -230,10 +234,10 @@ export class Keeper {
         if (info && !info.released && info.client !== this.me && t - Date.parse(info.at) <= LOCK_TTL) { if (this.locks[space.id] === take) this.locks[space.id] = { state: "busy", at: t }; return; }
         if (this.locks[space.id] !== take) return; // released (or retaken) while reading: do not take it
         const text = JSON.stringify({ client: this.me, at: new Date(t).toISOString(), tab });
-        await replaceFile(path, text, old, on);
+        await this.writeLock(cx, path, text, old, on);
         if (this.locks[space.id] === take) { this.locks[space.id] = { state: "held", text, at: t }; return; }
         // Released while writing: give it back at once.
-        try { await replaceFile(path, JSON.stringify({ released: true, at: new Date(Date.now()).toISOString() }), text, on); } catch { /* expires */ }
+        try { await this.writeLock(cx, path, JSON.stringify({ released: true, at: new Date(Date.now()).toISOString() }), text, on); } catch { /* expires */ }
       } catch { if (this.locks[space.id] === take) this.locks[space.id] = { state: "busy", at: Date.now() }; }
     }, "the lock");
     if (!started && this.locks[space.id] === take) this.locks[space.id] = { state: "busy", at: now };
@@ -245,7 +249,7 @@ export class Keeper {
     delete this.locks[space.id];
     if (l?.state !== "held" || !cx) return;
     const text = JSON.stringify({ released: true, at: new Date(Date.now()).toISOString() });
-    this.task(cx, async () => { try { await replaceFile(`${dirOf(space)}/keeper.lock`, text, l.text, space.machine ?? null); } catch { /* expires */ } }, "the lock release");
+    this.task(cx, async () => { try { await this.writeLock(cx, `${dirOf(space)}/keeper.lock`, text, l.text, space.machine ?? null); } catch { /* expires */ } }, "the lock release");
   }
 
   // A restore that was given up. The next one comes a minute after the last start (RETRY),
