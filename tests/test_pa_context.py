@@ -1923,6 +1923,32 @@ class J7Unacted(J4Base):  # t-041 J7-R1: R2 (c) looks only at this conversation'
         self.assertLessEqual(sum(reads), (4 << 20) + (256 << 10))
 
 
+    def test_c6i_answered_hours_before_this_conversation(self):  # inside the day, outside since - 30 min
+        self.card("d-007", pa.iso_time(self.base - 50 - 3 * 3600))  # running.since is base - 50
+        self.assertEqual(self.clean(), (True, []))
+
+    def edge(self, since, answered):
+        """clean_point at a whole-second `at` with running.since `since`, one card d-007 answered at `answered`."""
+        at = int(self.now)
+        self.card("d-007", pa.iso_time(answered))
+        ctx = self.ctx(running={"since": since, "session": SID, "marked": True})
+        return pa.clean_point(ctx, self.dir, load(os.path.join(self.dir, "agent.json")), self.size(), at, "t0")
+
+    def test_c6j_window_edge_at_since_less_the_slack(self):
+        since = int(self.now) - 150
+        self.assertEqual(self.edge(since, since - 1801), (True, []))
+        ok, reasons = self.edge(since, since - 1800)
+        self.assertEqual(([r[0] for r in reasons], ok), (["c"], False))
+
+    def test_c6k_day_cap_in_a_conversation_older_than_a_day(self):
+        at = int(self.now)
+        since = at - 3 * 86400
+        self.assertEqual(self.edge(since, at - 86401), (True, []))
+        ok, reasons = self.edge(since, at - 86400)
+        self.assertEqual(([r[0] for r in reasons], ok), (["c"], False))
+        self.assertIn("card d-007 answered, not acted on", self.words(reasons))
+
+
 class J7Checkpoint(J4Base):  # t-041 J7-R2: the accepted-by-time note
     def test_c4d_note_once_per_idle_period(self):
         self.big()
