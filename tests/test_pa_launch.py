@@ -162,13 +162,13 @@ class Launch(unittest.TestCase):
         tools = tools_copy("warm")
         before = files_under(tools)
         link = self.link("pa-hook", os.path.join(tools, "pa_launch.py"))
-        call = json.dumps({"tool_name": "Bash", "tool_input": {"command": "git push origin main"},
-                           "cwd": self.root}).encode()
+        # a call the guard lets through, so that it reaches pa_guard.py (loaded by pa_hooks' own loader)
+        call = json.dumps({"tool_name": "Bash", "tool_input": {"command": "ls"}, "cwd": self.root}).encode()
         cold = self.probe(link, tools, "guard", data=call)
-        self.assertEqual(cold["code"], 2)  # the guard refuses a push
+        self.assertEqual(cold["code"], 0)
         for name in ("pa.py", "pa_hooks.py", "pa_guard.py"):
             self.assertIn(name, cold["compiled"])
-        self.assertEqual(self.probe(link, tools, "guard", data=call), {"compiled": [], "code": 2})
+        self.assertEqual(self.probe(link, tools, "guard", data=call), {"compiled": [], "code": 0})
         self.assertEqual(files_under(tools), before)
         self.assertTrue(os.listdir(self.cache()))
 
