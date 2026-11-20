@@ -3832,17 +3832,18 @@ def cancel_when_idle(directory, address):
     the ledger lock, which the waiter's last check before the kill holds too: the cancel lands first, or it was closed."""
     import fcntl
     with ledger_lock(directory):
+        # t-136 (t-133 RL3): spawned, and not yet holding its lock. Read before the lock probe: the waiter locks first and
+        # then unlinks the marker, so a marker gone here means the lock is already held when the probe below runs.
+        try:
+            running = time.time() - os.stat(idle_file(directory, address, "starting")).st_mtime < WHEN_IDLE_START_GRACE
+        except OSError:
+            running = False
         with open(idle_file(directory, address, "lock"), "a") as lock:
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 fcntl.flock(lock, fcntl.LOCK_UN)
-                running = False
             except OSError:
                 running = True
-        try:  # t-136 (t-133 RL3): spawned, and not yet holding its lock
-            running = running or time.time() - os.stat(idle_file(directory, address, "starting")).st_mtime < WHEN_IDLE_START_GRACE
-        except OSError:
-            pass
         task, entry = recorded(read_ledger(directory), address)
         done = entry and entry.get("finished")
         if running and done:  # the waiter closed it and has not yet left its lock: nothing is left to cancel
