@@ -2772,7 +2772,8 @@ def open_worktree_card(directory, row, facts, profile, owner, rule, gone, desc=N
     squash = (" " + SQUASH if any(c["merged"] is False for r in desc["repos"] for c in r["commits"]) else "")
     titles = ", ".join('{} "{}"'.format(clean(t), cut(clean(row["titles"].get(t, "")), 60)) for t in row.get("counted") or row["tasks"])
     path = pa.card_file(directory, cid)
-    pa.write_card(directory, path, dict(carried(pa.read_json(path)), **{
+    carry = held_carry(worktree_holds(directory), [row]) or carried(pa.read_json(path))
+    pa.write_card(directory, path, dict(carry, **{
         "id": cid, "task": task, "worktree": row["path"], "branch": facts.get("branch") or None, "job": job, "main": main,
         "rule": rule, "tasks": row_tasks(row),
         "question": "Delete the worktree for {}{}?".format(titles, ", job {}".format(clean(job)) if named else ""),
@@ -2850,18 +2851,15 @@ def answer_scope(card):
 
 def item_view(cid, card, i):
     """Item i of batch card cid in the shape of a single card (id, task, worktree, branch, rule, tasks, snapshot, status,
-    answer, note, answered, answeredBy, worktreeRemoved, and the card's carried previous* while it is not answered), plus
-    `batch` and `item`. Its status: withdrawn when the item or
-    the card is; open while the card is; answered when the card's answer covers the item (Other, Keep all, Delete all,
-    or Delete the lossless ones for a lossless item); else withdrawn: the next check asks about it again (Q3)."""
+    answer, note, answered, answeredBy, worktreeRemoved), plus `batch` and `item`. Its status: withdrawn when the item
+    or the card is; open while the card is; answered when the card's answer covers the item (item_covered); else
+    withdrawn: the next check asks about it again (Q3). The person's holds are read from the card itself (worktree_holds)."""
     item = card["items"][i] if isinstance(card["items"][i], dict) else {}
     status, answer = card.get("status"), card.get("answer")
     if item.get("withdrawn") or status not in ("open", "answered"):
         status = "withdrawn"
-    elif status == "answered" and not pa.is_other(card):
-        scope = answer_scope(card)
-        if scope == "lossless" and not item.get("lossless"):
-            status, answer = "withdrawn", None
+    elif status == "answered" and not item_covered(card, item):
+        status, answer = "withdrawn", None
     view = {"id": cid, "batch": cid, "item": i, "task": item.get("task"), "worktree": item.get("path"),
             "branch": item.get("branch"), "job": item.get("job"), "main": item.get("main"), "rule": item.get("rule"),
             "tasks": item.get("tasks"), "snapshot": item.get("snapshot") or {}, "status": status,
@@ -2869,9 +2867,13 @@ def item_view(cid, card, i):
             "answeredBy": card.get("answeredBy"), "created": card.get("created"), "worktreeRemoved": item.get("removed")}
     if card.get("other") is True and status == "answered":
         view["other"] = True
-    if card.get("status") != "answered":  # the person's words carried from an earlier answer, until a later one (round 4)
-        view.update({k: card[k] for k in CARRIED if card.get(k) is not None})
     return view
+
+
+def item_covered(card, item):
+    """Whether answered batch card `card`'s answer covers `item`: Other, Keep all, Delete all, an answer that is none of
+    its options (fail closed: it then holds), or Delete the lossless ones for a lossless item."""
+    return pa.is_other(card) or answer_scope(card) != "lossless" or bool(item.get("lossless"))
 
 
 def batch_views(directory, task, listing=None):
@@ -3035,7 +3037,9 @@ def open_worktrees_card(directory, candidates, profile, old=None, listing=None):
     options, recommendation = batch_options(shown)
     n = len(shown)
     path = pa.card_file(directory, cid)
-    pa.write_card(directory, path, dict(carried(old), **{
+    # The person's standing words on any worktree on it, from the store, whichever card they were given on (round 5).
+    carry = held_carry(worktree_holds(directory, listing), [c["row"] for c in ordered[:n]]) or carried(old)
+    pa.write_card(directory, path, dict(carry, **{
         "id": cid, "kind": "worktrees", "task": None, "question": "Delete {} worktrees whose jobs are over?".format(n),
         "context": context, "options": options, "recommendation": recommendation, "status": "open", "answer": None,
         "note": None, "items": shown, "more": len(ordered) - n, "created": pa.now(), "answered": None}))
@@ -3108,11 +3112,6 @@ def finish_candidates(directory, candidates, leaving, profile, open_cards, listi
             print("{}; --open-cards puts it on one card with the other {}".format(
                 c["line"] if not c.get("single") else "{}: card {} is open".format(c["owner"][0], c["single"][0]), len(candidates) - 1))
         return
-    if old is None:  # the person's earlier words on these worktrees stay in sight (carried): the newest withdrawn card's
-        paths = {c["row"]["path"] for c in candidates}
-        held = [(str(c.get("answered") or ""), c) for c in worktrees_cards(directory, listing).values() if c.get("status") == "withdrawn"
-                and c.get("previousAnswer") is not None and any(os.path.realpath(str(i.get("path"))) in paths for i in c["items"])]
-        old = max(held, key=lambda x: x[0])[1] if held else None
     open_worktrees_card(directory, candidates, profile, old, listing)
 
 
@@ -3996,16 +3995,13 @@ def merged_and_pushed(path, profile):
     return False
 
 
-def standing_clean(directory, row, owner, profile, entries, listing=None):
-    """Why a candidate worktree is not clean enough to delete on the rule (R15), or None. Fails closed."""
+def standing_clean(directory, row, owner, profile, entries, listing=None, holds=None):
+    """Why a candidate worktree is not clean enough to delete on the rule (R15), or None. Fails closed. holds: the run's
+    worktree_holds (None: read now, as standing_recheck does)."""
     facts = row["facts"]
-    task = owner[0]
-    cid, _path, card = card_for(directory, row, task, entries.get(task), listing)
-    if card and card.get("status") == "answered" and (pa.is_other(card) or not str(card.get("answer") or "").lower().startswith("delete")):
-        return "answered {!r} on card {}".format("Other" if pa.is_other(card) else card.get("answer"), cid)
-    held = card and held_words(card)
-    if held:
-        return "its card {} carries the person's {}; left for its card".format(cid, held)
+    hold = worktree_hold(worktree_holds(directory, listing, entries) if holds is None else holds, row)
+    if hold:
+        return hold_line(hold)
     if not in_worktrees_folder(row["path"]):
         return "not under a worktrees folder"
     if facts.get("uncommitted"):
@@ -4027,19 +4023,118 @@ def standing_clean(directory, row, owner, profile, entries, listing=None):
     return None
 
 
-def held_words(card):
-    """What of the person's on a worktree card (single, or a batch item as item_view gives it) holds its worktree under the
-    rule, or None (t-168 round 4): the note of its answer (never read: it may say to keep it), or, while the card is
-    withdrawn or asked again, the note or a not-Delete answer carried from the answer before (keep_previous, carried).
-    Only the person's later answer replaces them; resuming the rule does not (R15, R13)."""
-    if card.get("status") == "answered":
-        return "note" if str(card.get("note") or "").strip() else None
+# ---- the person's holds, one store per worktree (t-168 round 5) ---------------------------------------------------
+# Every worktree card (single, and each item of a batch card), answered, withdrawn or asked again, gives events: its
+# answer, when it covers the worktree, and the answer it carries from before (previous*). An event holds the worktree
+# when it is Keep, Keep all, Other, an answer that is none of the options, or any answer with a note (never read). A hold
+# stands until a later answer of the person that covers the worktree and holds nothing (a Delete with no note) replaces
+# it: answered after it, or on a card asked after it, or the answer on the card that carries it. Keyed by the worktree's
+# path; an event for another branch than the worktree is on now does not count, nor a spent card. Read by the card
+# builds (open_worktree_card, open_worktrees_card carry the words) and by remove --standing (standing_clean).
+
+def hold_time(value):
+    when = stamp_time(value)
+    return when[0] if when else None
+
+
+def answer_hold(answer, note, other=False):
+    """What of an answer given now holds its worktree: its answer when not a Delete, else its note, else None."""
+    if other or answer is None or not str(answer).strip().lower().startswith("delete"):
+        return "answer {!r}".format("Other" if other else str(answer))
+    return "note" if str(note or "").strip() else None
+
+
+def carried_hold(card):
+    """What of the answer a card carries from before (previous*) holds its worktree: its note, else a not-Delete answer."""
     if str(card.get("previousNote") or "").strip():
         return "note"
     answer = card.get("previousAnswer")
     if answer is not None and not str(answer).strip().lower().startswith("delete"):
         return "answer {!r}".format(str(answer))
     return None
+
+
+def card_events(cid, card, covered, unknown=False):
+    """The events of one card for one worktree: (answer when `covered`, previous*). unknown: a batch card answered
+    with none of its options, which holds (fail closed)."""
+    base = {"cid": cid, "status": card.get("status"), "branch": card.get("branch"), "created": hold_time(card.get("created"))}
+    out = []
+    if card.get("status") == "answered" and covered:
+        out.append(dict(base, source="answer", time=hold_time(card.get("answered")),
+                        words=("answer {!r}".format(str(card.get("answer"))) if unknown and not pa.is_other(card) else
+                               answer_hold(card.get("answer"), card.get("note"), pa.is_other(card))),
+                        label="Other" if pa.is_other(card) else card.get("answer"),
+                        carry={"previousAnswer": card.get("answer"), "previousNote": card.get("note") if str(card.get("note") or "").strip() else None,
+                               "previousAnswered": card.get("answered")}))
+    if card.get("previousAnswer") is not None or str(card.get("previousNote") or "").strip():
+        out.append(dict(base, source="previous", time=hold_time(card.get("previousAnswered") or card.get("answered")),
+                        words=carried_hold(card), label=card.get("previousAnswer"),
+                        carry={k: card.get(k) for k in CARRIED}))
+    return out
+
+
+def worktree_holds(directory, listing=None, entries=None):
+    """{worktree realpath: [event]} of every worktree card in decisions/ and the archive (see above)."""
+    listing = card_listing(directory) if listing is None else listing
+    entries = ledger_tasks(directory) if entries is None else entries
+    holds = {}
+    for cid in sorted(listing):
+        if not cid.startswith("d-wt-") or is_batch_id(cid) or cid.startswith(UNRECORDED):
+            continue
+        card = pa.read_json_safe(pa.card_file(directory, cid))
+        if not isinstance(card, dict) or not isinstance(card.get("worktree"), str) or not card["worktree"].strip():
+            continue
+        if card_spent(card, entries.get(card.get("task"))):
+            continue
+        holds.setdefault(card_tree(card), []).extend(card_events(cid, card, True))
+    for cid, card in worktrees_cards(directory, listing).items():
+        for i, item in enumerate(card["items"]):
+            if not isinstance(item, dict) or not isinstance(item.get("path"), str) or not item["path"].strip():
+                continue
+            view = item_view(cid, card, i)
+            if card_spent(view, entries.get(item.get("task"))):
+                continue
+            events = card_events(cid, dict(card, branch=item.get("branch")), item_covered(card, item), answer_scope(card) is None)
+            holds.setdefault(card_tree(view), []).extend(events)
+    return holds
+
+
+def replaces(answer, hold):
+    """Whether a Delete with no note (`answer`) is later than `hold`, so it replaces it."""
+    if answer["cid"] == hold["cid"] and hold["source"] == "previous":
+        return True  # the card asked again with these words carried, answered since
+    if hold["time"] is None:
+        return False
+    return bool((answer["time"] and answer["time"] > hold["time"]) or (answer["created"] and answer["created"] >= hold["time"]))
+
+
+def worktree_hold(holds, row):
+    """The event that holds the row's worktree now, or None: the newest hold no later answer replaced (an open card
+    first among equals, as card_for ranks)."""
+    events = [e for e in holds.get(row["path"], []) if not branch_differs(e, row.get("facts"))]
+    clears = [e for e in events if e["source"] == "answer" and not e["words"]]
+    standing = [e for e in events if e["words"] and not any(replaces(a, e) for a in clears)]
+    if not standing:
+        return None
+    rank = {"open": 2, "answered": 1}
+    floor = datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
+    return max(standing, key=lambda e: (e["time"] or floor, rank.get(e["status"], 0)))
+
+
+def hold_line(hold):
+    if hold["source"] == "answer" and hold["words"].startswith("answer"):
+        return "answered {!r} on card {}".format(hold["label"], hold["cid"])
+    return "its card {} carries the person's {}; left for its card".format(hold["cid"], hold["words"])
+
+
+def held_carry(holds, rows):
+    """previous* of the newest hold on any of `rows`, for a card asked now: the person sees their words again. {} if none."""
+    found = [h for h in (worktree_hold(holds, r) for r in rows) if h]
+    if not found:
+        return {}
+    floor = datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
+    best = max(found, key=lambda e: e["time"] or floor)
+    return {k: v for k, v in best["carry"].items() if v is not None}
 
 
 def standing_recheck(directory, row, owner, agent, profile, entries, listing):
@@ -4084,13 +4179,14 @@ def remove_standing(directory, space, agent, profile, rule_id, env=None, ancs=No
         rows = worktree_state(directory, agent, profile)
         entries = ledger_tasks(directory)
         listing = card_listing(directory)
+        holds = worktree_holds(directory, listing, entries)
         removed, paths, left, failed = [], [], [], None
         for row in rows.values():
             owner = card_owner(row)
             why, _rule, _desc = candidate_why(row, profile, owner)
             if why:
                 continue  # not a candidate: not touched, not listed
-            why = standing_clean(directory, row, owner, profile, entries, listing)
+            why = standing_clean(directory, row, owner, profile, entries, listing, holds)
             if not why:
                 why = standing_recheck(directory, row, owner, agent, profile, entries, listing)
             if why:
