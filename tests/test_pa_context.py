@@ -2302,3 +2302,26 @@ class T190Version(J3Base):
         self.assertEqual(self.net(self.launch(pa.probe_version(p))), 400000)
         notes = pa.context_launch(self.dir, pa.probe_version(p))["notes"]
         self.assertFalse([n for n in notes if "not known" in n], notes)
+
+
+# ---- t-190 T5: the follow-up counts each refusal line once per reason, not once per card ------------------------
+
+class T190Followup(J4Base):
+    fixture = J4Followup.fixture
+    journal = J4Followup.journal
+
+    def test_t5_by_reason_counts_lines(self):
+        self.fixture()
+        write(os.path.join(self.dir, "session.log"),
+              "2026-11-18T10:00:00Z context not reset (ctx=260000 reason=task-cap): checkpoint older than the turn; "
+              "card d-1 answered, not acted on; card d-2 answered, not acted on; card d-3 answered, not acted on\n"
+              "2026-11-18T10:01:00Z context not reset (ctx=261000 reason=task-cap): card d-1 answered, not acted on; "
+              "card d-2 answered, not acted on\n"
+              "2026-11-18T10:02:00Z context not reset (ctx=262000 reason=task-cap): worker t1zc (t-147 check) has no "
+              "handoff file\n"
+              "2026-11-18T10:03:00Z context not reset (ctx=262000 reason=task-cap): checkpoint not clean (waiting; the "
+              "push (d-9; later)); standing.md over the cap: 6,063 of 6,000 characters\n")
+        r = pa.followup_report(self.dir, "2026-11-18T00:00:00Z")
+        self.assertEqual(r["refusals"], {"total": 4, "byReason": {
+            "card answered, not acted on": 2, "checkpoint older than the turn": 1, "worker has no handoff file": 1,
+            "checkpoint not clean": 1, "standing.md over the cap: of characters": 1}})
