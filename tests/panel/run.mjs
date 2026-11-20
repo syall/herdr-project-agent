@@ -7929,6 +7929,18 @@ cases["P160-3-rule-scroll"] = async () => { // R3: the rule link brings its rule
   check(handle.calls.length === 1, `later renders do not scroll again (calls ${JSON.stringify(handle.calls)})`);
 };
 
+cases["P160-4-show-before-mount"] = async () => { // R2: a request with no copy (another mod) made before a copy mounts is not taken by it
+  world(); P145.ledger([tq("t-1", "done", 1), tq("t-2", "done", 2)]);
+  g.__shared["project-agent.show"] = { space: S, task: "t-1", at: Date.now() };
+  const v = await mount(); await settle();
+  look(v);
+  check(v.view !== "tasks" && !v.open.has("t-1"), `a copy made after the request does not take it (view ${v.view}, open ${[...v.open]})`);
+  // A copy-less request made after it mounts is still taken.
+  g.__shared["project-agent.show"] = { space: S, task: "t-2", at: Date.now() + 5 };
+  look(v);
+  check(v.view === "tasks" && v.open.has("t-2"), `a later request from another mod opens (view ${v.view}, open ${[...v.open]})`);
+};
+
 // --list prints the names that would run and runs none. An unknown name or option exits 2.
 const refuse = (why) => { fs.rmSync(dst, { recursive: true, force: true }); console.error(`run.mjs: ${why}`); process.exit(2); };
 const pick = [];
