@@ -1064,14 +1064,14 @@ def compact_instructions():
     return ("This is the Project Agent's conversation. In the summary, keep: the open asks (what was asked of or "
             "promised to the person and is not answered yet, with what waits on it); the person's own words since the "
             "last ledger checkpoint, quoted exactly; each running worker's address, task and job; the next step per "
-            "task; any hold or resume the person said; and the ids of the active rules in rules.json and the numbers "
+            "task; any hold or resume the person said; and the ids and titles of the active rules in rules.json and the numbers "
             "in them that handoffs follow. The ledger, the journal and standing.md are read again after the "
             "compaction, so do not copy them.\n")
 
 
 START_PACK_BODY = ("Your state is on disk. This is not a new space. Do as orchestrator.md says under 'After a restart "
-                   "or a compaction': run `pa-doctor`, read ledger.json, `standing.md`, the last 30 journal lines, the "
-                   "open decisions and `hc ls`; read the reports that came in; take the next step the ledger's `next` "
+                   "or a compaction': run `pa-doctor`, read ledger.json, rules.json (every active rule's text), "
+                   "`standing.md`, the last 30 journal lines, the open decisions and `hc ls`; read the reports that came in; take the next step the ledger's `next` "
                    "sets; start nothing else until asked. If the last hold or resume line in the journal is a hold, "
                    "start nothing. Your standing notes follow, the person's words in quotes; they stand as said.")
 
@@ -1102,30 +1102,121 @@ def start_pack(directory, head):
     rules = active_rules_line(directory)
     if rules:
         parts.append(rules)
+        room = START_PACK_MAX - len("\n\n".join(parts)) - 2
+        fresh = new_rules_text(directory, room)
+        if fresh:
+            parts.append(fresh)
     return "\n\n".join(parts)[:START_PACK_MAX]
 
 
-RULES_LINE_MAX = 400  # characters of the start pack's active-rules line (t-041 J7-R4)
+# ---- t-190: the space's rules as the Project Agent's start pack, pa-doctor and pa-handoff read them --------------
+RULES_LINE_MAX = 1600  # characters of the start pack's active-rules line (t-041 J7-R4; t-190 R1: with titles)
+RULE_TITLE_MAX = 100  # characters of one rule's title in a list
+RULE_TEXT_MAX = 1200  # characters of one rule's text where a list gives it in full
+RULE_ID = re.compile(r"^[\w.-]{1,80}$")
+RULE_NEW = ("created", "approved", "edited and approved", "approved in conversation")  # T1: the rule's text is new
+RULE_NEW_SECONDS = 86400
+REST = "… (read the rest in rules.json)"
+
+
+def one_line(text, cap):
+    """text on one line: control characters to spaces, runs of white space as one, cut at cap characters with '…';
+    '' when it is not text."""
+    if not isinstance(text, str):
+        return ""
+    text = re.sub(r"\s+", " ", re.sub(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]", " ", text)).strip()
+    return text if len(text) <= cap else text[:cap - 1].rstrip() + "…"
+
+
+def rule_text(rule, cap=RULE_TEXT_MAX):
+    """A rule's text on one line, cut at cap characters with REST."""
+    text = one_line(rule.get("text"), 1 << 20)
+    return text if len(text) <= cap else text[:max(cap - len(REST), 0)].rstrip() + REST
+
+
+def read_rules(directory):
+    """(rules, why): the rules of rules.json whose status is exactly 'active' and whose id is an id (H2, H3), highest
+    `order` first (a missing or non-number order last, file order among equals: H7); why is None, or why the file
+    gives none (missing, not JSON, no rules list: H1). Never raises."""
+    try:
+        path = os.path.join(directory, "rules.json")
+        if not os.path.isfile(path):
+            return [], "missing"
+        try:
+            doc = json.loads(read_text(path))
+        except ValueError:
+            return [], "not JSON"
+        rules = doc.get("rules") if isinstance(doc, dict) else None
+        if not isinstance(rules, list):
+            return [], "no rules list"
+        active = [r for r in rules if isinstance(r, dict) and r.get("status") == "active"
+                  and isinstance(r.get("id"), str) and RULE_ID.match(r["id"])]
+
+        def key(item):
+            n, r = item
+            o = r.get("order")
+            if isinstance(o, (int, float)) and not isinstance(o, bool) and o == o and abs(o) != float("inf"):
+                return (0, -o, n)
+            return (1, 0, n)
+        return [r for _n, r in sorted(enumerate(active), key=key)], None
+    except Exception as e:  # noqa: BLE001
+        return [], "unreadable ({})".format(type(e).__name__)
+
+
+def rule_named(rule):
+    """'<id>: <title>' (the id alone when it has no title)."""
+    title = one_line(rule.get("title"), RULE_TITLE_MAX)
+    return "{}: {}".format(rule["id"], title) if title else rule["id"]
+
+
+def capped_list(head, items, tail, cap, sep="; "):
+    """head + items joined + tail in at most cap characters; '…' stands for the items left out."""
+    shown = []
+    for item in items:
+        if len(head) + len(sep.join(shown + [item])) + len(sep + "…") + len(tail) > cap:
+            return head + sep.join(shown + ["…"]) + tail
+        shown.append(item)
+    return head + sep.join(shown) + tail
 
 
 def active_rules_line(directory):
-    """'Active rules (rules.json): <id>, ...; read it before you write a handoff.' for the rules whose status is
-    active, at most RULES_LINE_MAX characters; None when rules.json is missing, invalid or has none. Never raises."""
-    try:
-        rules = as_dict(read_json_safe(os.path.join(directory, "rules.json"))).get("rules")
-        ids = [r["id"] for r in rules if isinstance(r, dict) and r.get("status") == "active"
-               and isinstance(r.get("id"), str) and re.match(r"^[\w.-]{1,80}$", r["id"])] if isinstance(rules, list) else []
-    except Exception:  # noqa: BLE001
+    """'Active rules (rules.json, highest order first): <id>: <title>; ... Read each one's text before your next
+    action.' at most RULES_LINE_MAX characters (t-190 R1); None when rules.json is missing, invalid or has none."""
+    rules, _why = read_rules(directory)
+    if not rules:
         return None
-    if not ids:
+    return capped_list("Active rules (rules.json, highest order first): ", [rule_named(r) for r in rules],
+                       ". Read each one's text before your next action.", RULES_LINE_MAX)
+
+
+def rule_new_at(rule, at=None):
+    """The time (epoch s) of the rule's newest history entry that made its text new (RULE_NEW: created, approved),
+    when it is within RULE_NEW_SECONDS before `at` (now); else None. A time that is not UTC Z is not read."""
+    at = time.time() if at is None else at
+    times = [parse_time(h["at"]) for h in rule.get("history") if isinstance(h, dict) and isinstance(h.get("at"), str)
+             and (h.get("change") or h.get("what")) in RULE_NEW] if isinstance(rule.get("history"), list) else []
+    times = [t for t in times if t is not None and at - RULE_NEW_SECONDS <= t <= at + 60]
+    return max(times) if times else None
+
+
+def new_rules_text(directory, room):
+    """t-190 T1: the full text of the active rules approved in the last 24 h, one bullet each, in at most `room`
+    characters (each text cut with REST to share it); None when there is none or no room."""
+    rules, _why = read_rules(directory)
+    fresh = [r for r in rules if rule_new_at(r) is not None]
+    head = "Rules approved in the last 24 h (their full text; read it before your next action):"
+    if not fresh or room < len(head) + 40:
         return None
-    head, tail = "Active rules (rules.json): ", "; read it before you write a handoff."
-    shown = []
-    for rid in ids:
-        if len(head) + len(", ".join(shown + [rid])) + len(", …") + len(tail) > RULES_LINE_MAX:
-            return head + ", ".join(shown + ["…"]) + tail
-        shown.append(rid)
-    return head + ", ".join(shown) + tail
+    lines = [head]
+    for n, r in enumerate(fresh):
+        start = "- {}: ".format(r["id"])
+        share = (room - len("\n".join(lines)) - 1) // (len(fresh) - n) - len(start)
+        if share < len(REST) + 20:
+            lines.append("- and {} more in rules.json".format(len(fresh) - n))
+            break
+        lines.append(start + rule_text(r, min(share, RULE_TEXT_MAX)))
+    text = "\n".join(lines)
+    return text if len(text) <= room else None
 
 
 def parse_amount(text):
@@ -2544,6 +2635,8 @@ def launch_command(p, agent, resume, directory, snapshot=False, version=None, pr
     if net:  # t-041 R5: the 400k net, a flag (not inherited by anything the Project Agent starts), before the prompt
         argv += ["--autocompact", str(net)]
     if resume:
+        line = active_rules_line(directory) if directory else None  # t-190 R1
+        rules = " " + line if line else ""
         argv += ["Your session was restarted. Read your state folder (ledger.json, journal.jsonl, decisions/, "
                  "rules.json), then say in one line where things stand. Continue where you left off without "
                  "asking, as orchestrator.md defines it under \"After a restart or a compaction\": read the "
@@ -2551,7 +2644,7 @@ def launch_command(p, agent, resume, directory, snapshot=False, version=None, pr
                  "worker stopped. Start nothing else until asked: no new task, no move to a phase that needs "
                  "the person, no worker for a task with an open card. If the last hold or resume line in the "
                  "journal is a hold, start nothing at all until the person says go. `paused` in "
-                 "`schedule.json` stops timed passes only; it is not a hold."]
+                 "`schedule.json` stops timed passes only; it is not a hold." + rules]
     elif prompt:  # t-041 J4: the fresh context's start prompt, where the resume prompt sits
         if not isinstance(prompt, str) or prompt.startswith("-"):
             raise Problem("a start prompt must be text that does not start with '-'")
