@@ -237,6 +237,12 @@ The tool rebases only queue branches, in their own clean worktrees, aborts on a 
 pushes, fetches or touches a remote. `pa-queue show` reads every state now; the panel's Queue tab
 shows the last one written.
 
+A task with jobs in more than one worktree (two repositories, say) gates each job on its own:
+`pa-gate <task> --job <job>` pins that job's worktree, reads `VERIFY-<job>.md` and `REVIEW-<job>.md`
+(the task's other evidence is shared) and writes `GATE-<job>.json`; `pa-queue add <task> --job <job>`
+and the push of that job's repository read those. Without `--job`, or with `--job main`, the gate
+reads `VERIFY.md` and `REVIEW.md` and writes `GATE.json` as before.
+
 ## Pushing main from the panel
 
 Off by default. No agent pushes a main branch: not a worker, and not the Project Agent, except

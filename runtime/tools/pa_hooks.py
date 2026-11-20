@@ -768,12 +768,63 @@ def gate_commits(worktree, runner=None):
     return found
 
 
-def evaluate_gate(directory, task, phase, rules=None, runner=None, records=None, cache=None):
+# ---- t-192 R2: a task with several jobs gates each job on its own check files -------------------------------------
+JOB_WORD = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")  # what pa.job_slug makes
+
+
+def check_files(job=None):
+    """(verify, review, gate) file names of a job: VERIFY.md, REVIEW.md, GATE.json for the main job (None or 'main');
+    else VERIFY-<job>.md, REVIEW-<job>.md, GATE-<job>.json. No fallback from one to the other (Q2)."""
+    if job is None or job == "main":
+        return "VERIFY.md", "REVIEW.md", "GATE.json"
+    return "VERIFY-{}.md".format(job), "REVIEW-{}.md".format(job), "GATE-{}.json".format(job)
+
+
+def gate_job(task, job):
+    """The recorded worktree path of job `job` of the ledger task (pa-gate --job, pa-queue add --job), None for the
+    main job (None or exactly 'main': today's gate). Raises pa.Problem, before any file is read, for a word that is not
+    exactly the `job` of one non-removed `worktrees` entry of the task (H2.1-H2.4). A job recorded on the task's own
+    worktree (its `worktree` field) is the main job: None."""
+    if job is None or job == "main":
+        return None
+    tid = clean(task.get("id"))
+    if not isinstance(job, str) or not JOB_WORD.fullmatch(job):
+        raise pa.Problem("{!r} is not a recorded job of {}".format(clean(job), tid))
+    entries = [w for w in task.get("worktrees") or [] if isinstance(w, dict) and w.get("job") == job] \
+        if isinstance(task.get("worktrees"), list) else []
+    usable = [w for w in entries if isinstance(w.get("path"), str) and w["path"].strip()]
+    live = [w for w in usable if not w.get("removed")]
+    if not usable:
+        raise pa.Problem("{!r} is not a recorded job of {}".format(job, tid))
+    if len(live) > 1:
+        raise pa.Problem("job {} of {} is recorded {} times ({}); name one worktree per job in the ledger".format(
+            job, tid, len(live), ", ".join(clean(w["path"]) for w in live)))
+    if not live:
+        raise pa.Problem("job {} of {} was removed at {}".format(job, tid, clean(usable[-1].get("removed"))))
+    main = task.get("worktree")
+    if isinstance(main, str) and main.strip() and \
+            os.path.realpath(os.path.expanduser(live[0]["path"])) == os.path.realpath(os.path.expanduser(main)):
+        return None  # the job of the task's own worktree is its main job: today's files (DECISIONS D-R2-main)
+    return live[0]["path"]
+
+
+def files_job(task, job):
+    """The job whose check files a gate, a queue entry or a handoff of `job` reads: None for the main job (check_files
+    gives VERIFY.md, REVIEW.md, GATE.json), else job. Raises pa.Problem as gate_job does."""
+    return job if gate_job(task, job) else None
+
+
+def evaluate_gate(directory, task, phase, rules=None, runner=None, records=None, cache=None, job=None):
     """The gate's verdict for one ledger task, as GATE.json holds it. Reads only: writes and prints nothing.
     rules: the space's rules list (default: read from rules.json in directory). runner: how gate_commits and the
     content check run git (default: git()). records: a list the content check appends the content records it
     computed to (cmd_gate stores them; t-052). cache: the run's ContentCache (t-094 R3: pa-queue's command,
-    pa-push-main's Session); given none, this call is its own run and makes its own, shared with no other call."""
+    pa-push-main's Session); given none, this call is its own run and makes its own, shared with no other call.
+    job (t-192 R2): a recorded job other than main: its worktree is pinned and its VERIFY-<job>.md and REVIEW-<job>.md
+    are read in place of VERIFY.md and REVIEW.md (raises pa.Problem for a job that is not recorded, gate_job)."""
+    tree = gate_job(task, job)
+    job = job if tree else None
+    verify_name, review_name, _gate_name = check_files(job)
     tier = str(task.get("tier") or "normal").lower()
     code = bool(task.get("worktree")) or str(task.get("type", "")).lower() in ("feature", "bug", "chore", "code")
     # Leaving `review` (the default) needs every earlier phase's artifact too.
@@ -782,7 +833,7 @@ def evaluate_gate(directory, task, phase, rules=None, runner=None, records=None,
         for name in ARTIFACTS.get(p, []):
             if name == "spec.md" and tier == "low":
                 continue  # low-tier tasks skip design
-            needed.append(name)
+            needed.append({"VERIFY.md": verify_name, "REVIEW.md": review_name}.get(name, name))
     if code and phase in ("test", "review"):
         needed.append("build.log")
     if rules is None:
@@ -795,6 +846,9 @@ def evaluate_gate(directory, task, phase, rules=None, runner=None, records=None,
     for name in dict.fromkeys(needed):
         path = os.path.normpath(os.path.join(evidence, name))
         if not path.startswith(evidence + os.sep):
+            checks.append({"check": name, "ok": False, "why": "outside the evidence folder"})
+        elif job and name in (verify_name, review_name) and os.path.lexists(path) and \
+                not os.path.realpath(path).startswith(os.path.realpath(evidence) + os.sep):  # H2.6: a link out
             checks.append({"check": name, "ok": False, "why": "outside the evidence folder"})
         elif not os.path.isfile(path):
             checks.append({"check": name, "ok": False, "why": "missing"})
@@ -820,14 +874,17 @@ def evaluate_gate(directory, task, phase, rules=None, runner=None, records=None,
         else:
             why = "the ledger lists no reviewer worker separate from the build workers (a check worker counts for low tier only)"
         checks.append({"check": "reviewer is not the author", "ok": separate, **({} if separate else {"why": why})})
-    pins = gate_commits(task.get("worktree"), runner)
+    pins = gate_commits(tree if job else task.get("worktree"), runner)
     content = []
     if phase == "review" and pins:
-        check, content = content_check(directory, task, pins, runner, records, ContentCache() if cache is None else cache)
+        check, content = content_check(directory, task, pins, runner, records, ContentCache() if cache is None else cache, job=job)
         checks.append(check)
     ok = all(c["ok"] for c in checks)
-    return {"task": task.get("id"), "phase": phase, "tier": tier, "passed": ok, "at": pa.now(), "checks": checks,
-            "commits": pins, "content": content}
+    result = {"task": task.get("id"), "phase": phase, "tier": tier, "passed": ok, "at": pa.now(), "checks": checks,
+              "commits": pins, "content": content}
+    if job:
+        result["job"] = job
+    return result
 
 
 # ---- t-052: what a check saw, as content ------------------------------------------------------------
@@ -1331,14 +1388,16 @@ def compare_records(checked, now):
     return "; ".join(parts)
 
 
-def content_check(directory, task, pins, runner=None, records=None, cache=None):
+def content_check(directory, task, pins, runner=None, records=None, cache=None, job=None):
     """(check, GATE.json content) for the review gate: the commit on VERIFY.md's last Checked: line makes the same
-    change as HEAD, per pin (t-052 R5). records: computed records are appended here (with source verify or head)."""
+    change as HEAD, per pin (t-052 R5). records: computed records are appended here (with source verify or head).
+    job (t-192 R2): a recorded job's VERIFY-<job>.md and REVIEW-<job>.md instead (check_files)."""
     raw = globals()["git"] if runner is None else runner
     run = content_git(raw, cache)
     evidence = os.path.join(directory, "evidence", str(task.get("id")))
-    verify = checked_commits(pa.read_text(os.path.join(evidence, "VERIFY.md")))
-    review = checked_commits(pa.read_text(os.path.join(evidence, "REVIEW.md")))
+    vname, rname, _g = check_files(job)
+    verify = checked_commits(pa.read_text(os.path.join(evidence, vname)))
+    review = checked_commits(pa.read_text(os.path.join(evidence, rname)))
     required = content_required(directory, task)
     stored = stored_records(directory, task.get("id"))
     try:
@@ -1377,7 +1436,7 @@ def content_check(directory, task, pins, runner=None, records=None, cache=None):
                 return found[-1] if found else None
 
             x, rv = last(verify), last(review)
-            onto = content_onto(directory, task.get("id"), common, pin.get("branch"), run, path, x) or content_main(run, path, profile)
+            onto = content_onto(directory, task.get("id"), common, pin.get("branch"), run, path, x, job) or content_main(run, path, profile)
             entry.update(onto=onto, checked=x, review=rv)
             now = content_record(run, path, head, onto) if head else {"error": "no commit in the worktree"}
             if not now.get("error") and now["base"] == head and x != head:
@@ -1395,11 +1454,11 @@ def content_check(directory, task, pins, runner=None, records=None, cache=None):
                     keep.append(dict(now, source="head"))
             if x is None:
                 if verify and len(pins) == 1:
-                    fails.append("{}VERIFY.md's Checked commit {} is not a commit in this repository".format(label, verify[-1][:7]))
+                    fails.append("{}{}'s Checked commit {} is not a commit in this repository".format(label, vname, verify[-1][:7]))
                 elif required:
-                    fails.append("{}VERIFY.md has no Checked: line for this repository".format(label))
+                    fails.append("{}{} has no Checked: line for this repository".format(label, vname))
                 else:
-                    notes.append("{}content not recorded: VERIFY.md has no Checked: line, and its verifier started before the content check".format(label))
+                    notes.append("{}content not recorded: {} has no Checked: line, and its verifier started before the content check".format(label, vname))
                 continue
             if now.get("error"):
                 fails.append(label + now["error"])
@@ -1484,7 +1543,7 @@ def content_check(directory, task, pins, runner=None, records=None, cache=None):
         except ContentError as e:  # content_git refused a call (a grafts or shallow file): never a crash, never ok
             entry["error"] = str(e)
             if not verify and not required:
-                notes.append("{}content not recorded: VERIFY.md has no Checked: line, and its verifier started before the content check".format(label))
+                notes.append("{}content not recorded: {} has no Checked: line, and its verifier started before the content check".format(label, vname))
             else:
                 fails.append(label + str(e))
     check = {"check": CONTENT_CHECK, "ok": not fails}
@@ -2016,17 +2075,20 @@ def cmd_gate(args):
     phase = (args.phase or "review").lower()
     if phase not in PHASES:
         raise pa.Problem("unknown phase {!r}; one of {}".format(phase, ", ".join(PHASES)))
+    job = getattr(args, "job", None)
+    job = job if gate_job(task, job) else None  # t-192 R2: refused here, before any file is read, unless recorded
     stamp_content(directory)
     records = []
-    result = evaluate_gate(directory, task, phase, records=records)
+    result = evaluate_gate(directory, task, phase, records=records, job=job)
     evidence, checks, ok = os.path.join(directory, "evidence", args.task), result["checks"], result["passed"]
     store_records(directory, args.task, records)
     if os.path.isdir(evidence):
-        pa.write_json(os.path.join(evidence, "GATE.json"), result)
+        pa.write_json(os.path.join(evidence, check_files(job)[2]), result)
     for c in checks:
         print("{}  {}{}".format("ok  " if c["ok"] else "FAIL", c["check"],
                                 "  ({})".format(c["why"]) if not c["ok"] else "  ({})".format(c["note"]) if c.get("note") else ""))
-    print("pa-gate {} ({} phase, {} tier): {}".format(args.task, phase, result["tier"], "PASSED" if ok else "FAILED. The task does not move."))
+    print("pa-gate {}{} ({} phase, {} tier): {}".format(args.task, " job " + job if job else "", phase, result["tier"],
+                                                       "PASSED" if ok else "FAILED. The task does not move."))
     sys.exit(0 if ok else 1)
 
 
@@ -4557,8 +4619,9 @@ TOOL_FILES = ("GATE.json", "WORKTREE.md")  # written by pa-gate and pa-worktree,
 
 
 def tool_file(name):
-    """True for a file the tools write into a task's evidence folder: TOOL_FILES, and a job's WORKTREE-<job>.md."""
-    return name in TOOL_FILES or re.fullmatch(r"WORKTREE-[a-z0-9-]+\.md", name) is not None
+    """True for a file the tools write into a task's evidence folder: TOOL_FILES, and a job's WORKTREE-<job>.md and
+    GATE-<job>.json (t-192 R2)."""
+    return name in TOOL_FILES or re.fullmatch(r"WORKTREE-[a-z0-9-]+\.md|GATE-[a-z0-9-]+\.json", name) is not None
 
 
 @contextlib.contextmanager
@@ -6059,6 +6122,8 @@ def main():
     if kind == "pa-gate":
         parser.add_argument("task")
         parser.add_argument("--phase", help="the phase the task wants to leave (default: review)")
+        parser.add_argument("--job", help="a recorded job of the task (t-192): its worktree, VERIFY-<job>.md, REVIEW-<job>.md, "
+                                          "GATE-<job>.json; default or main: the task's (VERIFY.md, REVIEW.md, GATE.json)")
         parser.add_argument("--space")
         return cmd_gate(parser.parse_args())
     if kind == "pa-hooks":

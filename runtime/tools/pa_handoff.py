@@ -125,9 +125,10 @@ def short(path, rev):
     return git(path, "rev-parse", "--short=7", rev + "^{commit}")
 
 
-def checked_commit(evidence):
-    """The last 'Checked: <id>' in REVIEW.md, else VERIFY.md, and the last Verdict line of that file."""
-    for name in ("REVIEW.md", "VERIFY.md"):
+def checked_commit(evidence, files=None):
+    """The last 'Checked: <id>' in REVIEW.md, else VERIFY.md, and the last Verdict line of that file. files (t-192 R2):
+    a job's (verify, review) names, VERIFY-<job>.md and REVIEW-<job>.md, read in their place."""
+    for name in ((files[1], files[0]) if files else ("REVIEW.md", "VERIFY.md")):
         text = read_text(os.path.join(evidence, name)) or ""
         ids = re.findall(r"^Checked:\s*([0-9a-f]{7,40})\s*$", text, re.M)
         if ids:
@@ -268,6 +269,12 @@ def gather(args, directory, agent):
             f.queue_repo, f.queue_job = key, qe.get("job") or None
             f.job = f.queue_job or MAIN
     f.label = args.task if f.job == MAIN else "{} {}".format(args.task, f.job)
+    # t-192 R2: a recorded job other than the main one has its own check files (VERIFY-<job>.md, REVIEW-<job>.md)
+    try:
+        f.fjob = pa_hooks.files_job(task, f.job) if f.job != MAIN and f.kind != "queue" else None
+    except pa.Problem as e:
+        raise Refused(str(e))
+    f.vname, f.rname, _g = pa_hooks.check_files(f.fjob)
     entry = next((w for w in task.get("worktrees") or [] if isinstance(w, dict) and w.get("job") == f.job), None)
     f.wt = (entry or {}).get("path") or (task.get("worktree") if f.job == MAIN else None)
     if not f.wt and not f.queue_repo:
@@ -290,12 +297,12 @@ def gather(args, directory, agent):
     # git
     f.branch = git(f.wt, "rev-parse", "--abbrev-ref", "HEAD")
     f.head = short(f.wt, "HEAD")
-    f.checked, f.checked_in, f.verdict = checked_commit(f.ev)
+    f.checked, f.checked_in, f.verdict = checked_commit(f.ev, (f.vname, f.rname) if f.fjob else None)
     if args.base:
         f.base, f.base_label = short(f.wt, args.base), "base {}".format(short(f.wt, args.base))
     elif f.diff or f.kind == "fix":
         if not f.checked:
-            raise Refused("no 'Checked:' commit in {}/REVIEW.md or VERIFY.md; pass --base".format(f.ev))
+            raise Refused("no 'Checked:' commit in {}/{} or {}; pass --base".format(f.ev, f.rname, f.vname))
         f.base, f.base_label = short(f.wt, f.checked), None
     else:
         f.base = short(f.wt, git(f.wt, "merge-base", "HEAD", MAIN))
@@ -397,9 +404,10 @@ def r(f):
 
 def section(f, what):
     """The section title a check appends ('' when it writes a new file: job main, round 1, full)."""
-    parts = ([f.job] if f.job != MAIN else []) + (["Round {}".format(f.round)] if f.round > 1 else []) + \
+    own = f.job == MAIN or bool(getattr(f, "fjob", None))  # t-192 R2: a job with its own files writes them like main
+    parts = ([f.job] if not own else []) + (["Round {}".format(f.round)] if f.round > 1 else []) + \
         ([what] if what else [])
-    if not parts or (f.job == MAIN and f.round == 1 and what == "review"):
+    if not parts or (own and f.round == 1 and what == "review"):
         return ""
     return "## {} ({} {}..{})".format(" ".join(parts), "diff" if f.diff else "full,", f.base, f.head)
 
@@ -417,7 +425,7 @@ def text_check(f):
         with_items("4. Review against each intent item.", f.items),
         "Must-fix bar: breaks an intent item, a verification point, safety or security. Else Recorded limit (name a "
         "follow-up) or Nit.",
-        "Write VERIFY.md and REVIEW.md, each ending {}; REVIEW.md has {}.".format(ENDING, REVIEWER),
+        "Write {} and {}, each ending {}; {} has {}.".format(f.vname, f.rname, ENDING, f.rname, REVIEWER),
         "Evidence folder: {}.".format(f.ev), rules_line(f)]
 
 
@@ -433,7 +441,7 @@ def text_recheck(f):
         "# {} recheck (check role, {} tier, round {}, check: diff)".format(f.label, f.tier, f.round), "",
         "Fresh context; you are not an author of {0}. Task {0}: {1}. The round {2} check at {3} {4} (read "
         "{5}/{6} '## {7}'); round {8} {9}: read FINDINGS.md, DECISIONS.md, build.log 'Round {8}'.".format(
-            f.label, f.title, prev, f.base, found, f.ev, f.checked_in or "REVIEW.md", what, f.round, closed),
+            f.label, f.title, prev, f.base, found, f.ev, f.checked_in or f.rname, what, f.round, closed),
         "{} Diff check: {}..{}.".format(where_line(f), f.base, f.head),
         "You report; you never fix.",
         "1. pa-full-suite once at HEAD (never under a timeout), output to full-suite-check{}.out.{}".format(rr, flakes_sentence(f)),
@@ -442,8 +450,8 @@ def text_recheck(f):
         with_items("4. Review: {} is closed and nothing else changed.".format(each), f.items),
         "Must-fix bar: breaks " + bar + ", a verification point, safety or security. Else Recorded limit or Nit; "
         "say whether each is small and inside this task's files (fixed before merge) or accepted (no follow-up task).",
-        "Append '## Round {} recheck (diff {}..{})' to VERIFY.md and REVIEW.md, each ending {}; REVIEW.md's section has "
-        "{}.".format(f.round, f.base, f.head, ENDING, REVIEWER),
+        "Append '## Round {} recheck (diff {}..{})' to {} and {}, each ending {}; {}'s section has "
+        "{}.".format(f.round, f.base, f.head, f.vname, f.rname, ENDING, f.rname, REVIEWER),
         "Evidence folder: {}.".format(f.ev), rules_line(f)]
 
 
@@ -456,8 +464,8 @@ def text_fix(f):
         found = "passed with Recorded limits to fix: read {}/{} '## Recorded limits' (and Nits)".format(f.ev, f.checked_in)
         only = "Fix only the Recorded limits and Nits named here; nothing else."
     else:
-        found = "found {}: read {}/{} '## Must fix' (and VERIFY.md)".format(
-            must_count(f.verdict) if f.checked_in else "Must fix findings", f.ev, f.checked_in or "REVIEW.md")
+        found = "found {}: read {}/{} '## Must fix' (and {})".format(
+            must_count(f.verdict) if f.checked_in else "Must fix findings", f.ev, f.checked_in or f.rname, f.vname)
         only = "Fix only the Must fix findings. Recorded limits and Nits stay as they are."
     return [
         "# {} fix (build role, {} tier, round {})".format(f.label, f.tier, f.round), "",
@@ -474,8 +482,8 @@ def text_fix(f):
 def text_verify(f):
     sfx = ("-" + f.job if f.job != MAIN else "") + r(f)
     title = section(f, "")
-    write = ("Append '{}' to VERIFY.md, ending {}.".format(title, ENDING) if title
-             else "Write VERIFY.md, ending {}.".format(ENDING))
+    write = ("Append '{}' to {}, ending {}.".format(title, f.vname, ENDING) if title
+             else "Write {}, ending {}.".format(f.vname, ENDING))
     scope = "Diff: {}..{}.".format(f.base, f.head) if f.diff else "Full: the whole diff {}..{}.".format(f.base, f.head)
     return [
         "# {} verifier (verifier role, {} tier, round {}, check: {})".format(f.label, f.tier, f.round, "diff" if f.diff else "full"), "",
@@ -492,8 +500,8 @@ def text_verify(f):
 
 def text_review(f):
     title = section(f, "review")
-    write = ("Append '{}' to REVIEW.md with {}, ending {}.".format(title, REVIEWER, ENDING) if title
-             else "Write REVIEW.md with {}, ending {}.".format(REVIEWER, ENDING))
+    write = ("Append '{}' to {} with {}, ending {}.".format(title, f.rname, REVIEWER, ENDING) if title
+             else "Write {} with {}, ending {}.".format(f.rname, REVIEWER, ENDING))
     scope = ("Review the diff {}..{} against the plan.".format(f.base, f.head) if f.diff
              else "Review the whole diff {}..{} against the plan.".format(f.base, f.head))
     f.tests = []  # a reviewer runs no failing-first: the header names the base only

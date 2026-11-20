@@ -1077,5 +1077,130 @@ class S1FullSuiteRecord(Base):
         self.assertIn("full suite: `exit 3`", pa.read_text(os.path.join(self.dir, "evidence", "t-1", "build.log")))
 
 
+# ---- t-192 R2: a task with jobs in two repositories gates each job on its own check files --------------------------
+
+class T192JobGate(Base):
+    """t-1: its main worktree in repo proj, job j2's in repo other (a second repository); the task's evidence has
+    VERIFY.md and REVIEW.md for the main job and VERIFY-j2.md, REVIEW-j2.md for j2."""
+
+    def setUp(self):
+        super().setUp()
+        self.wt = self.linked(self.repo("proj"), "t-1-x", os.path.join(self.tmp, "wt"))
+        self.f1 = self.commit(self.wt, "a.txt", "a\n")
+        self.wt2 = self.linked(self.repo("other"), "t-1-j2", os.path.join(self.tmp, "wt2"))
+        self.j2 = self.commit(self.wt2, "j.txt", "j\n")
+        self.add_task("t-1", worktree=self.wt, type="feature",
+                      worktrees=[{"path": self.wt, "job": "main"}, {"path": self.wt2, "job": "j2"}])
+        self.evidence("t-1")
+        self.evidence("t-1", ["VERIFY-j2.md", "REVIEW-j2.md"])
+
+    def ev(self, name):
+        return os.path.join(self.dir, "evidence", "t-1", name)
+
+    def test_vp3_the_job_gate_reads_its_files_and_pins_its_worktree(self):
+        code, out, err = self.run_gate("t-1", "--job", "j2")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("ok    VERIFY-j2.md", out)
+        self.assertIn("ok    REVIEW-j2.md", out)
+        self.assertNotIn("VERIFY.md", out)
+        self.assertNotIn("REVIEW.md", out)
+        self.assertEqual(out.splitlines()[-1], "pa-gate t-1 job j2 (review phase, normal tier): PASSED")
+        self.assertFalse(os.path.exists(self.gate_file("t-1")), "GATE.json is the main job's")
+        with open(self.ev("GATE-j2.json")) as f:
+            result = json.load(f)
+        self.assertEqual(result["job"], "j2")
+        self.assertEqual([(c["repo"], c["commit"]) for c in result["commits"]], [(self.wt2, self.j2)])
+        self.assertTrue(pa_hooks.tool_file("GATE-j2.json"))
+
+    def test_vp3_with_no_job_the_gate_is_todays(self):
+        expected = None
+        for extra in ((), ("--job", "main")):
+            with self.subTest(extra=extra):
+                code, out, err = self.run_gate("t-1", *extra)
+                self.assertEqual(code, 0, out + err)
+                self.assertIn("ok    VERIFY.md", out)
+                self.assertNotIn("j2", out)
+                self.assertEqual(out.splitlines()[-1], "pa-gate t-1 (review phase, normal tier): PASSED")
+                result = self.gate_json("t-1")
+                self.assertNotIn("job", result)
+                self.assertEqual(list(result), ["task", "phase", "tier", "passed", "at", "checks", "commits", "content"])
+                self.assertEqual([c["repo"] for c in result["commits"]], [self.wt])
+                self.assertFalse(os.path.exists(self.ev("GATE-main.json")))
+                expected = expected or out
+                self.assertEqual(out, expected, "--job main is byte for byte no --job")
+
+    def test_h2_5_a_missing_job_file_never_falls_back_to_the_task_file(self):
+        os.remove(self.ev("VERIFY-j2.md"))
+        code, out, _ = self.run_gate("t-1", "--job", "j2")
+        self.assertEqual(code, 1, out)
+        self.assertIn("FAIL  VERIFY-j2.md  (missing)", out)
+        self.assertTrue(os.path.isfile(self.ev("VERIFY.md")))
+
+    def test_h2_6_a_job_file_linked_out_of_the_evidence_folder(self):
+        outside = os.path.join(self.tmp, "elsewhere.md")
+        write(outside, "text\n")
+        os.remove(self.ev("REVIEW-j2.md"))
+        os.symlink(outside, self.ev("REVIEW-j2.md"))
+        code, out, _ = self.run_gate("t-1", "--job", "j2")
+        self.assertEqual(code, 1, out)
+        self.assertIn("FAIL  REVIEW-j2.md  (outside the evidence folder)", out)
+
+    def refused(self, *argv):
+        before = sorted(os.listdir(os.path.join(self.dir, "evidence", "t-1")))
+        with self.assertRaises(pa.Problem) as cm:
+            self.run_gate("t-1", *argv)
+        self.assertEqual(sorted(os.listdir(os.path.join(self.dir, "evidence", "t-1"))), before, "nothing is written")
+        return str(cm.exception)
+
+    def test_h2_1_h2_2_words_that_are_not_a_recorded_job(self):
+        for word in ("", "-x", "../x", "a/b", "/abs", "x.md", "MAIN", "Main", "J2", "j2 ", "j2\n", "j3", "j2/../j2"):
+            with self.subTest(word=word):
+                self.assertIn("is not a recorded job of t-1", self.refused("--job=" + word))
+
+    def test_h2_3_a_job_recorded_twice_is_ambiguous(self):
+        led = pa.read_json(os.path.join(self.dir, "ledger.json"))
+        wt3 = self.linked(os.path.join(self.tmp, "other"), "t-1-j2b", os.path.join(self.tmp, "wt3"))
+        led["tasks"][0]["worktrees"].append({"path": wt3, "job": "j2"})
+        dump(led, os.path.join(self.dir, "ledger.json"))
+        why = self.refused("--job", "j2")
+        self.assertIn("recorded 2 times", why)
+        self.assertIn(self.wt2, why)
+        self.assertIn(wt3, why)
+
+    def test_h2_4_a_removed_job(self):
+        led = pa.read_json(os.path.join(self.dir, "ledger.json"))
+        led["tasks"][0]["worktrees"][1]["removed"] = "2026-11-20T10:00:00Z"
+        dump(led, os.path.join(self.dir, "ledger.json"))
+        self.assertIn("job j2 of t-1 was removed at 2026-11-20T10:00:00Z", self.refused("--job", "j2"))
+
+    def test_vp3_the_content_check_reads_the_jobs_checked_line(self):
+        dump({"version": 1, "at": SINCE}, os.path.join(self.dir, "content", "since.json"))
+        led = pa.read_json(os.path.join(self.dir, "ledger.json"))
+        led["tasks"][0]["workers"] = WORKERS + [{"address": "t33", "role": "verifier", "started": AFTER}]
+        dump(led, os.path.join(self.dir, "ledger.json"))
+        write(self.ev("VERIFY.md"), "text\nChecked: {}\nVerdict: pass\n".format(self.f1))
+        write(self.ev("VERIFY-j2.md"), "text\nChecked: {}\nVerdict: pass\n".format(self.j2))
+        code, out, err = self.run_gate("t-1", "--job", "j2")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("ok    the checks saw this content  (the checked commit is HEAD)", out)
+        write(self.ev("VERIFY-j2.md"), "text\nChecked: {}\nVerdict: pass\n".format(self.f1))  # the main job's commit
+        code, out, _ = self.run_gate("t-1", "--job", "j2")
+        self.assertEqual(code, 1, out)
+        self.assertIn("VERIFY-j2.md's Checked commit {} is not a commit in this repository".format(self.f1[:7]), out)
+        code, out, err = self.run_gate("t-1")  # the main job reads VERIFY.md's line, untouched
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("(the checked commit is HEAD)", out)
+
+    def test_a_job_on_the_task_worktree_is_the_main_job(self):  # DECISIONS D-R2-main
+        led = pa.read_json(os.path.join(self.dir, "ledger.json"))
+        led["tasks"][0]["worktrees"][0]["job"] = "build"
+        dump(led, os.path.join(self.dir, "ledger.json"))
+        code, out, err = self.run_gate("t-1", "--job", "build")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("ok    VERIFY.md", out)
+        self.assertTrue(os.path.isfile(self.gate_file("t-1")))
+        self.assertEqual(pa_hooks.check_files(pa_hooks.files_job(led["tasks"][0], "build")), ("VERIFY.md", "REVIEW.md", "GATE.json"))
+
+
 if __name__ == "__main__":
     unittest.main()

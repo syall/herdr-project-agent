@@ -995,8 +995,9 @@ class A4OutDependents(QBase):
 
 
 class A5JobWorktree(QBase):
-    """Job entries: a job whose worktree is not the ledger's task.worktree is refused at add, with the reason; an
-    entry_below of a sibling job is not skipped (Nit-J2-R2-1)."""
+    """Job entries: a job whose worktree is not the ledger's task.worktree joins on its own gate (t-192 R2: VERIFY-<job>.md,
+    REVIEW-<job>.md, GATE-<job>.json; before, it was refused at add); an entry_below of a sibling job is not skipped
+    (Nit-J2-R2-1)."""
 
     def job_tree(self):
         self.task("t-J", [("fa.txt", "a\n")])
@@ -1011,14 +1012,47 @@ class A5JobWorktree(QBase):
         self.set_ledger(led)
         return wt2
 
-    def test_a5_job_outside_the_task_worktree_is_refused(self):
-        self.job_tree()
+    def test_t192_vp4_a_job_outside_the_task_worktree_needs_its_own_gate(self):
+        # t-192 R2.3 (was t-052 A5's refusal): a job elsewhere joins on its own check files and GATE-<job>.json
+        wt2 = self.job_tree()
         before = snapshot(self.qfile())
         code, out, err = self.queue("add", "t-J", "--job", "j2", "--repo", self.proj)
         self.assertEqual(code, 1, out + err)
-        self.assertIn("the gate reads", err)
-        self.assertIn("worktree", err)
+        self.assertIn("VERIFY-j2.md (missing)", err)
+        self.assertNotIn("the gate reads", err)
         self.assertEqual(snapshot(self.qfile()), before)
+        ev = self.evidence("t-J")
+        write(os.path.join(ev, "VERIFY-j2.md"), "text\nChecked: {}\nVerdict: pass\n".format(sh(wt2, "git", "rev-parse", "HEAD")))
+        write(os.path.join(ev, "REVIEW-j2.md"), "text\n")
+        code, out, err = self.queue("add", "t-J", "--job", "j2", "--repo", self.proj)
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("GATE-j2.json's pin is not the branch tip", err)
+        self.assertIn("run pa-gate t-J --job j2 again", err)
+        code, out, err = self.run_main(pa_hooks, ["pa-gate", "t-J", "--job", "j2", "--space", SPACE])
+        self.assertEqual(code, 0, out + err)
+        gate_j2 = pa.read_json(os.path.join(ev, "GATE-j2.json"))
+        # H2.7: a GATE-j2.json pinning another repository's commit is refused
+        bad = dict(gate_j2, commits=[dict(c, common=os.path.join(self.tmp, "other.git")) for c in gate_j2["commits"]])
+        dump(bad, os.path.join(ev, "GATE-j2.json"))
+        code, out, err = self.queue("add", "t-J", "--job", "j2", "--repo", self.proj)
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("GATE-j2.json's pin is not the branch tip", err)
+        dump(gate_j2, os.path.join(ev, "GATE-j2.json"))
+        code, out, err = self.queue("add", "t-J", "--job", "j2", "--repo", self.proj)
+        self.assertEqual(code, 0, out + err)
+        e = self.entries()[0]
+        self.assertEqual((e["task"], e["job"], e["worktree"]), ("t-J", "j2", wt2))
+        self.assertEqual(e["checked"]["commit"], sh(wt2, "git", "rev-parse", "HEAD"))
+
+    def test_t192_vp4_a_job_word_that_is_not_recorded_is_refused(self):
+        self.job_tree()
+        before = snapshot(self.qfile())
+        for word in ("../x", "J2", "j9", "a/b"):
+            with self.subTest(word=word):
+                code, out, err = self.queue("add", "t-J", "--job=" + word, "--repo", self.proj)
+                self.assertEqual(code, 1, out + err)
+                self.assertIn("is not a recorded job of t-J", err)
+                self.assertEqual(snapshot(self.qfile()), before)
 
     def test_a5_job_that_is_the_task_worktree_joins(self):
         wt2 = self.job_tree()

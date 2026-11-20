@@ -706,6 +706,29 @@ def main_settings_refusal(s, path):
     return None
 
 
+def push_job(directory, task, common):
+    """t-192 R2: the recorded job (other than main) whose gate a push of the repository `common` reads, or None (the
+    task's own GATE.json, as before): when GATE.json pins no commit of this repository and exactly one recorded job's
+    GATE-<job>.json does. Reads the gate files only (no git: C8a's settings check comes first)."""
+    def pins_here(name):
+        g = pa.read_json_safe(os.path.join(directory, "evidence", task["id"], name))
+        return isinstance(g, dict) and any(isinstance(c, dict) and isinstance(c.get("common"), str)
+                                           and os.path.realpath(c["common"]) == common for c in g.get("commits") or [])
+    if pins_here("GATE.json"):
+        return None
+    found = []
+    for w in task.get("worktrees") or [] if isinstance(task.get("worktrees"), list) else []:
+        job = w.get("job") if isinstance(w, dict) else None
+        try:
+            if not isinstance(job, str) or job in found or not pa_hooks.files_job(task, job):
+                continue
+        except pa.Problem:
+            continue
+        if pins_here(pa_hooks.check_files(job)[2]):
+            found.append(job)
+    return found[0] if len(found) == 1 else None
+
+
 def gather(s, directory, space, push, facts, plan=False, ontos=None):
     """Checks C6-C11 in order, filling facts as it goes. Raises Refused at the first that fails. plan: the card does
     not exist yet, so its fields are taken from what is read now (and push is filled in), instead of compared.
@@ -773,26 +796,31 @@ def gather(s, directory, space, push, facts, plan=False, ontos=None):
     task = next((t for t in ledger.get("tasks", []) if isinstance(t, dict) and t.get("id") == task_id), None)
     if not task:
         raise Refused("C8a", "no task {} in this space's ledger".format(task_id))
-    why = task_settings_refusal(s, task.get("worktree"))
+    # t-192 R2: a repository only a recorded job's worktree holds is gated as that job (pa-gate --job: its worktree,
+    # its GATE-<job>.json); read from the gate files alone, so the main job's path runs exactly as before
+    job = push_job(directory, task, common)
+    tree = pa_hooks.gate_job(task, job) if job else task.get("worktree")
+    gname, again = pa_hooks.check_files(job)[2], task_id + (" --job " + job if job else "")
+    why = task_settings_refusal(s, tree)
     if why:
         raise Refused("C8a", why)
-    now_gate = pa_hooks.evaluate_gate(directory, task, "review", runner=s.gate_git, cache=s.cache)
+    now_gate = pa_hooks.evaluate_gate(directory, task, "review", runner=s.gate_git, cache=s.cache, job=job)
     if not now_gate["passed"]:
         failed = ["{} ({})".format(c["check"], c.get("why")) for c in now_gate["checks"] if not c["ok"]]
         raise Refused("C8a", "the full gate for {} does not pass now: {}".format(task_id, "; ".join(failed)))
-    gate = pa.read_json(os.path.join(directory, "evidence", task_id, "GATE.json"))
+    gate = pa.read_json(os.path.join(directory, "evidence", task_id, gname))
     if not isinstance(gate, dict):
-        raise Refused("C8b", "there is no GATE.json for {}; run pa-gate {}".format(task_id, task_id))
+        raise Refused("C8b", "there is no {} for {}; run pa-gate {}".format(gname, task_id, again))
     facts["gate"] = {"at": gate.get("at"), "phase": gate.get("phase"), "passed": gate.get("passed"), "commit": None, "uncommitted": None}
     if gate.get("phase") != "review":
-        raise Refused("C8b", "GATE.json for {} is from phase {}; run pa-gate {} again".format(task_id, gate.get("phase"), task_id))
+        raise Refused("C8b", "{} for {} is from phase {}; run pa-gate {} again".format(gname, task_id, gate.get("phase"), again))
     if gate.get("passed") is not True:
-        raise Refused("C8b", "GATE.json for {} did not pass".format(task_id))
+        raise Refused("C8b", "{} for {} did not pass".format(gname, task_id))
     pins = [c for c in gate.get("commits") or [] if isinstance(c, dict) and isinstance(c.get("common"), str)
             and os.path.realpath(c["common"]) == common]
     if len(pins) != 1:
-        raise Refused("C8c", "GATE.json pins {} for this repository; run pa-gate {} again".format(
-            "no commit" if not pins else "{} commits".format(len(pins)), task_id))
+        raise Refused("C8c", "{} pins {} for this repository; run pa-gate {} again".format(
+            gname, "no commit" if not pins else "{} commits".format(len(pins)), again))
     pin = pins[0]
     facts["gate"].update(commit=pin.get("commit"), uncommitted=pin.get("uncommitted"))
     if pin.get("uncommitted") != 0:
@@ -811,7 +839,7 @@ def gather(s, directory, space, push, facts, plan=False, ontos=None):
     if tip != commit:
         raise Refused("C8f", "commits were added to {} after the gate (gate {}, branch now {}); run pa-gate again and ask for a new card".format(
             task_branch, short(commit), short(tip)))
-    live = live_pin(s, task.get("worktree"), common)
+    live = live_pin(s, tree, common)
     if not live or live["commit"] != commit:
         raise Refused("C8g", "the task's worktree is not at the gated commit now ({}); run pa-gate {} again and ask for a new card".format(
             "not found" if not live else "it is at " + short(live["commit"]), task_id))

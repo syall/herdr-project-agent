@@ -357,19 +357,36 @@ def stored_base(ctx, task_id, common, sha):
                                    and isinstance(r.get("base"), str) and r["base"] and r["base"] != sha])
 
 
-def checked_at_add(ctx, rec, task, branch):
+def entry_files(ctx, tid, job):
+    """(verify, review, gate) file names the gate reads for task tid's job (t-192 R2: a job's own VERIFY-<job>.md,
+    REVIEW-<job>.md, GATE-<job>.json; the main job's VERIFY.md, REVIEW.md, GATE.json), or None when job is not a
+    usable recorded job of the task (then nothing is read: fails closed)."""
+    task = ctx.task(tid)
+    if job is None or job == "main":
+        return pa_hooks.check_files(None)
+    try:
+        return pa_hooks.check_files(pa_hooks.files_job(task, job)) if task else None
+    except pa.Problem:
+        return None
+
+
+def checked_at_add(ctx, rec, task, branch, job=None):
     """The record of VERIFY.md's last Checked: commit, against its first stored base (or its merge base with onto); onto
-    as the gate takes it for that commit (pa_hooks.content_onto, else main): the gate and add agree (MF-J2-1)."""
+    as the gate takes it for that commit (pa_hooks.content_onto, else main): the gate and add agree (MF-J2-1).
+    job (t-192 R2): the job's own check files (entry_files)."""
     evidence = os.path.join(ctx.directory, "evidence", task["id"])
-    verify = pa_hooks.checked_commits(pa.read_text(os.path.join(evidence, "VERIFY.md")))
-    review = pa_hooks.checked_commits(pa.read_text(os.path.join(evidence, "REVIEW.md")))
+    cfiles = entry_files(ctx, task["id"], job)
+    if not cfiles:
+        raise Refused("{!r} is not a recorded job of {}".format(pa_hooks.clean(job), task["id"]))
+    verify = pa_hooks.checked_commits(pa.read_text(os.path.join(evidence, cfiles[0])))
+    review = pa_hooks.checked_commits(pa.read_text(os.path.join(evidence, cfiles[1])))
     is_c = lambda x: pa_hooks.is_commit(ctx.run, ctx.repo, x)
     x = next((c for c in reversed(verify) if is_c(c)), None)
     rv = next((c for c in reversed(review) if is_c(c)), None)
     if not x:
-        raise Refused("VERIFY.md has no Checked: line naming a commit here; the queue takes only checks recorded as "
-                      "content (R5 AC5.2): a fresh verifier writes it")
-    onto = pa_hooks.content_onto(ctx.directory, task["id"], rec["common"], branch, ctx.run, ctx.repo, x) or rec["main"]
+        raise Refused("{} has no Checked: line naming a commit here; the queue takes only checks recorded as "
+                      "content (R5 AC5.2): a fresh verifier writes it".format(cfiles[0]))
+    onto = pa_hooks.content_onto(ctx.directory, task["id"], rec["common"], branch, ctx.run, ctx.repo, x, job) or rec["main"]
     saved = stored_base(ctx, task["id"], rec["common"], x)
     if saved:
         r = pa_hooks.content_record(ctx.run, ctx.repo, x, onto, saved["base"])
@@ -569,8 +586,13 @@ def content_only(checks):
     return bool(fails) and all(c.get("check") == pa_hooks.CONTENT_CHECK for c in fails)
 
 
-def gate_now(ctx, task, detail=False):
-    result = pa_hooks.evaluate_gate(ctx.directory, task, "review", runner=ctx.s.gate_git, cache=ctx.s.cache)
+def gate_now(ctx, task, detail=False, job=None):
+    """The gate now (passed, pending, why[, content only]); job (t-192 R2): a recorded job's own gate. A job that is not
+    a usable recorded job fails it (never the task's files)."""
+    try:
+        result = pa_hooks.evaluate_gate(ctx.directory, task, "review", runner=ctx.s.gate_git, cache=ctx.s.cache, job=job)
+    except pa.Problem as e:
+        result = {"passed": False, "checks": [{"check": "job", "ok": False, "why": str(e)}]}
     fails = [c for c in result["checks"] if not c["ok"]]
     pending = bool(fails) and all(c["check"] == pa_hooks.CONTENT_CHECK and "a short review is needed" in str(c.get("why")) for c in fails)
     why = "; ".join("{} ({})".format(c["check"], c.get("why")) for c in fails)
@@ -579,9 +601,13 @@ def gate_now(ctx, task, detail=False):
     return result["passed"], pending, why
 
 
-def gate_pin(ctx, rec, tid, tip, content_failed=False):
-    """GATE.json passed at tip; content_failed: or failed only on the content check there (add, a union, d-166)."""
-    g = pa.read_json_safe(os.path.join(ctx.directory, "evidence", tid, "GATE.json"))
+def gate_pin(ctx, rec, tid, tip, content_failed=False, job=None):
+    """GATE.json passed at tip; content_failed: or failed only on the content check there (add, a union, d-166).
+    job (t-192 R2): the job's GATE-<job>.json (entry_files); False for a job that is not a usable recorded one."""
+    cfiles = entry_files(ctx, tid, job)
+    if not cfiles:
+        return False
+    g = pa.read_json_safe(os.path.join(ctx.directory, "evidence", tid, cfiles[2]))
     ok = isinstance(g, dict) and (g.get("passed") is True or (content_failed and content_only(g.get("checks") or [])))
     return ok and g.get("phase") == "review" and \
         any(isinstance(c, dict) and c.get("common") == rec["common"] and c.get("commit") == tip for c in g.get("commits") or [])
@@ -639,7 +665,7 @@ def derive(ctx, rec):
                 elif not (s and s.get("exit") == 0):
                     # The gate is read once its suite passed on this tree (it then decides passed or failed); before,
                     # the entry waits for its suite either way, or failed on it.
-                    n["gate"] = {"passed": None, "pending": None, "pin": gate_pin(ctx, rec, e["task"], n["tip"]), "why": ""}
+                    n["gate"] = {"passed": None, "pending": None, "pin": gate_pin(ctx, rec, e["task"], n["tip"], job=e.get("job")), "why": ""}
                     if s:
                         n.update(state="failed", why="the full suite exited {} on its tree ({}, {})".format(s.get("exit"), s.get("worker"), s.get("ended")))
                     elif r and r.get("verdict") != "pass":
@@ -649,8 +675,8 @@ def derive(ctx, rec):
                     else:
                         n["why"] = "waiting for its suite"
                 else:
-                    ok, pending, why = gate_now(ctx, task)
-                    n["gate"] = {"passed": ok, "pending": pending, "pin": gate_pin(ctx, rec, e["task"], n["tip"]), "why": why}
+                    ok, pending, why = gate_now(ctx, task, job=e.get("job"))
+                    n["gate"] = {"passed": ok, "pending": pending, "pin": gate_pin(ctx, rec, e["task"], n["tip"], job=e.get("job")), "why": why}
                     if s and s.get("exit") != 0:
                         n.update(state="failed", why="the full suite exited {} on its tree ({}, {})".format(s.get("exit"), s.get("worker"), s.get("ended")))
                     elif r and r.get("verdict") != "pass":
@@ -1114,11 +1140,15 @@ def add(ctx, data, rec, tid, job):
         raise Refused("no task {} in the ledger".format(tid))
     if any(same(e, tid, job) for e in rec["entries"]):
         raise Refused("{} is already in the queue".format(tid))
+    if job and job != "main":
+        # t-192 R2: the gate reads each job's own worktree and check files (pa-gate --job); a job that is not exactly
+        # one recorded, non-removed job of the task is refused before anything is read (the old refusal, t-052 J3a A5,
+        # of a job outside task.worktree is gone)
+        try:
+            pa_hooks.gate_job(task, job)
+        except pa.Problem as e:
+            raise Refused(str(e))
     tree = task_tree(task, job)
-    if job and tree and os.path.realpath(tree) != os.path.realpath(os.path.expanduser(str(task.get("worktree") or ""))):
-        # t-052 J3a A5 (Q-J3-7): pa-gate pins task.worktree only, so a job elsewhere could never pass in the queue
-        raise Refused("the gate reads {}'s worktree only ({}), not job {}'s ({}); set the task's worktree to the job's "
-                      "worktree, run pa-gate {} again, then add".format(tid, task.get("worktree"), job, tree, tid))
     pin = pin_in(ctx, rec, tree) if tree else None
     if not pin or not pin.get("commit") or not pin.get("branch"):
         raise Refused("{} has no worktree on a branch of {}".format(tid, ctx.repo))
@@ -1126,14 +1156,16 @@ def add(ctx, data, rec, tid, job):
     main_tip = ctx.tip(rec["main"])
     if ctx.is_ancestor(tip, main_tip):
         raise Refused("{} at {} is already in {}: nothing to queue".format(tid, short(tip), rec["main"]))
-    ok, _pending, why, only_content = gate_now(ctx, task, detail=True)
+    ok, _pending, why, only_content = gate_now(ctx, task, detail=True, job=job)
     # d-166 (t-052 J3c): a branch a rebase worker put on the last entry, keeping a conflict's both sides, fails the
     # gate's content check until it is queued (the gate compares it against main): add's own decision below must then
     # say union, with no tool rebase in between; any other failure refuses here.
     if not ok and not only_content:
         raise Refused("the gate does not pass now: {}".format(why))
-    if not gate_pin(ctx, rec, tid, tip, content_failed=not ok):
-        raise Refused("GATE.json's pin is not the branch tip {} (run pa-gate {} again)".format(short(tip), tid))
+    if not gate_pin(ctx, rec, tid, tip, content_failed=not ok, job=job):
+        cfiles = entry_files(ctx, tid, job) or pa_hooks.check_files(job)
+        raise Refused("{}'s pin is not the branch tip {} (run pa-gate {}{} again)".format(
+            cfiles[2], short(tip), tid, " --job " + job if cfiles[2] != "GATE.json" else ""))
     if pin.get("uncommitted"):
         raise Refused("its worktree has uncommitted tracked changes ({}); commit or drop them first".format(pin["uncommitted"]))
     planned = next((p for p in rec["planned"] if same(p, tid, job)), None)
@@ -1143,7 +1175,7 @@ def add(ctx, data, rec, tid, job):
         raise Refused("it depends on {} (they share planned files), which is not ahead of it in the queue".format(dep.get("task")))
     onto = rec["entries"][-1]["branch"] if rec["entries"] else rec["main"]
     onto_tip = ctx.tip(onto)
-    checked = checked_at_add(ctx, rec, task, branch)
+    checked = checked_at_add(ctx, rec, task, branch, job)
     entry = {"task": tid, "job": job, "instance": new_instance(), "branch": branch, "worktree": tree, "onto": onto, "dependsOn": dep, "state": "checking",
              "added": now(), "base": upstream(ctx, rec, tip, onto_tip), "tip": tip, "checked": checked,
              "files": sorted(set((planned or {}).get("files") or []) | touched(ctx, checked["base"], checked["commit"])),
@@ -1468,14 +1500,14 @@ def cmd_verify(args):
                 raise Refused("{} has no worktree on a branch of {}".format(args.task, ctx.repo))
             last = rec["entries"][-1]["branch"] if rec["entries"] else rec["main"]
             tip = pin["commit"]
-            checked = checked_at_add(ctx, rec, task, pin.get("branch"))
+            checked = checked_at_add(ctx, rec, task, pin.get("branch"), args.job)
             subject = {"task": args.task, "job": args.job, "branch": pin.get("branch"), "rebases": []}
             # t-176 R2: decided against the branch the gate compares on (checked_at_add's onto), so a short review
             # recorded here is the one the gate reads. A branch put on the queue's last entry by hand is decided
             # against that entry as before: the gate compares it against main, so nothing recorded here could count;
             # the queue records its review after add (DECISIONS D1).
             onto = pa_hooks.content_onto(ctx.directory, task["id"], rec["common"], pin.get("branch"), ctx.run, ctx.repo,
-                                         checked["commit"]) or rec["main"]
+                                         checked["commit"], args.job) or rec["main"]
             gate_onto = not (last != onto and ctx.tip(last) and ctx.merge_base(tip, ctx.tip(last)) == ctx.tip(last))
             onto = onto if gate_onto else last
             d = decide(ctx, checked, tip, onto, ctx.tip(onto))
@@ -1607,7 +1639,7 @@ def ready_for_card(ctx, rec, e, n):
     if n["state"] not in ("checking", "passed") or n["content"] not in ("clean", "moved", "union"):
         return False
     task = ctx.task(e["task"])
-    return bool(task) and gate_now(ctx, task)[0] and gate_pin(ctx, rec, e["task"], n["tip"])
+    return bool(task) and gate_now(ctx, task, job=e.get("job"))[0] and gate_pin(ctx, rec, e["task"], n["tip"], job=e.get("job"))
 
 
 def cmd_card(args):
@@ -1648,9 +1680,10 @@ def cmd_card(args):
                             "base": e["base"], "change": c["change"], "sequence": c["sequence"], "commit": c["commit"],
                             "verify": c.get("verify"), "review": c.get("review"), "state": n["state"], "added": e.get("added"),
                             "instance": instance_of(e)})
-            context.append("{}. {} {} on {}: tip {}, content {} (as checked at {}: VERIFY.md {}, REVIEW.md {}), state {}{}; "
+            cfiles = entry_files(ctx, e["task"], e.get("job")) or pa_hooks.check_files(None)
+            context.append("{}. {} {} on {}: tip {}, content {} (as checked at {}: {} {}, {} {}), state {}{}; "
                            "evidence/{}/".format(i, label(e), e["branch"], e["onto"], short(n["tip"]), n["content"], short(c["commit"]),
-                                                 short(c.get("verify")), short(c.get("review")), n["state"],
+                                                 cfiles[0], short(c.get("verify")), cfiles[1], short(c.get("review")), n["state"],
                                                  " ({})".format(n["why"]) if n["why"] else "", e["task"]))
         pushing = pa_push.queue_card_push(ctx.directory, ctx.repo)  # t-140 R1: None where pushing is not set up
         context.append("At merge time pa-queue merge reads again, for each: the content is the one checked, every rebase "
@@ -1807,7 +1840,10 @@ def merge_check(ctx, rec, e, main_tip, suites, reviews, onto=None, expected=None
     task = ctx.task(e["task"])
     if not task:
         return "the task is not in the ledger", False, None
-    gate = pa_hooks.evaluate_gate(ctx.directory, task, "review", runner=ctx.s.gate_git, cache=ctx.s.cache)
+    try:
+        gate = pa_hooks.evaluate_gate(ctx.directory, task, "review", runner=ctx.s.gate_git, cache=ctx.s.cache, job=e.get("job"))
+    except pa.Problem as err:  # t-192 R2: its job is no longer a usable recorded job
+        return "the gate fails now: " + str(err), False, None
     content = [x for x in gate.get("content") or [] if isinstance(x, dict) and x.get("common") == rec["common"]]
     seen = content[0] if len(content) == 1 else {}
     if seen.get("checked") != c.get("commit") or seen.get("error"):
@@ -1825,8 +1861,10 @@ def merge_check(ctx, rec, e, main_tip, suites, reviews, onto=None, expected=None
         return "its worktree has uncommitted tracked changes ({})".format(pin["uncommitted"]), False, None
     if not gate["passed"]:
         return "the gate fails now: " + "; ".join("{} ({})".format(x["check"], x.get("why")) for x in gate["checks"] if not x["ok"]), False, None
-    if not gate_pin(ctx, rec, e["task"], tip):
-        return "GATE.json does not pin its tip {}: pa-gate {} again".format(short(tip), e["task"]), False, None
+    if not gate_pin(ctx, rec, e["task"], tip, job=e.get("job")):
+        cfiles = entry_files(ctx, e["task"], e.get("job")) or pa_hooks.check_files(e.get("job"))
+        return "{} does not pin its tip {}: pa-gate {}{} again".format(cfiles[2], short(tip), e["task"], " --job " + e["job"]
+                                                                       if cfiles[2] != "GATE.json" else ""), False, None
     # (5) passed: its own suite on its tip tree, or the carried pass of r-disjoint-carry (d-202)
     tree = ctx.tree(tip)
     s = latest(suites, lambda r: tree and r.get("tree") == tree and r.get("uncommitted") == 0 and r.get("reusable"))
@@ -2170,10 +2208,11 @@ def open_card_of(directory, tid):
 LIMIT_LINE = re.compile(r"recorded limit", re.I)
 
 
-def recorded_limits(directory, tid):
-    """The Recorded limit lines of the task's REVIEW.md and VERIFY.md (Q3: the one-line report lists them)."""
+def recorded_limits(directory, tid, names=None):
+    """The Recorded limit lines of the task's REVIEW.md and VERIFY.md (Q3: the one-line report lists them); names (t-192
+    R2): a job's (verify, review, ...) file names (entry_files)."""
     out = []
-    for name in ("REVIEW.md", "VERIFY.md"):
+    for name in ((names[1], names[0]) if names else ("REVIEW.md", "VERIFY.md")):
         for line in (pa.read_text(os.path.join(directory, "evidence", tid, name)) or "").splitlines():
             line = pa_hooks.clean(line).strip(" -*#")
             if LIMIT_LINE.search(line) and line.lower() not in ("recorded limit", "recorded limits") and line not in out:
@@ -2313,7 +2352,8 @@ def merge_standing(ctx, data, rec, rule, binding, space_id):
             break
         merged_record(ctx, data, rec, e, main_tip, suite, lines, standing=rid, textSha=sha)
         merged.append((e, True))
-        limits = recorded_limits(ctx.directory, e["task"])
+        cfiles = entry_files(ctx, e["task"], e.get("job"))
+        limits = recorded_limits(ctx.directory, e["task"], cfiles) if cfiles else []
         lines.append("report: merged {} into {} on rule {}{}".format(label(e), rec["main"], rid, "; Recorded limits: " +
                                                                      " | ".join(limits) if limits else "; no Recorded limits"))
     if any(not on_rule for _e, on_rule in merged):

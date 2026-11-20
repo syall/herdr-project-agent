@@ -510,5 +510,31 @@ class Links(unittest.TestCase):
         line = next(l for l in self.read("tests/run-all.sh").splitlines() if "parses as Python 3.7" in l)
         self.assertIn("runtime/tools/pa_push.py", line)
 
+class T192PushJob(unittest.TestCase):
+    """t-192 R2: which gate a push of one repository reads, from the gate files alone (push_job)."""
+
+    def test_the_job_whose_gate_pins_the_repository(self):
+        import tempfile
+        d = tempfile.mkdtemp(dir=TMP)
+        ev = os.path.join(d, "evidence", "t-1")
+        a, b = os.path.join(d, "a.git"), os.path.join(d, "b.git")
+        pin = lambda common: {"phase": "review", "passed": True, "commits": [{"common": common, "commit": "1" * 40}]}
+        task = {"id": "t-1", "worktree": os.path.join(d, "wt"), "worktrees": [
+            {"path": os.path.join(d, "wt"), "job": "main"}, {"path": os.path.join(d, "wt2"), "job": "j2"},
+            {"path": os.path.join(d, "wt3"), "job": "j3"}, {"path": os.path.join(d, "wt4"), "job": "j4", "removed": "2026-01-01T00:00:00Z"},
+            {"path": os.path.join(d, "x"), "job": "../x"}]}
+        dump(pin(a), os.path.join(ev, "GATE.json"))
+        dump(pin(b), os.path.join(ev, "GATE-j2.json"))
+        dump(pin(b), os.path.join(ev, "GATE-j4.json"))  # removed: never read
+        write(os.path.join(ev, "GATE-..", "x.json"), "{}")
+        self.assertIsNone(pa_push.push_job(d, task, a), "the main job's gate pins it: as before")
+        self.assertEqual(pa_push.push_job(d, task, b), "j2")
+        self.assertIsNone(pa_push.push_job(d, task, os.path.join(d, "c.git")), "no gate pins it: as before (C8c refuses)")
+        dump(pin(b), os.path.join(ev, "GATE-j3.json"))
+        self.assertIsNone(pa_push.push_job(d, task, b), "two jobs pin it: none chosen (C8c refuses)")
+        dump(pin(b), os.path.join(ev, "GATE.json"))
+        self.assertIsNone(pa_push.push_job(d, task, b), "GATE.json pins it: the main job")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -29,14 +29,14 @@ Low-tier tasks skip design and the person's plan approval. Any other skip needs 
 
 ## Evidence the gate checks (`pa-gate <task-id>`)
 
-Before `review`: the phase artifacts the tier requires (`intent.md`, `plan.md`,
-`VERIFY.md`; `spec.md` unless low tier), `FINDINGS.md`, `DECISIONS.md`, `REVIEW.md`
-by a worker other than the author (for low tier, a `check` worker counts), and
-`build.log` when the task changed code. Rules can add more. Files must exist and not be
-empty. At `review` the gate also compares content: the commit on the last `Checked:` line
-of `VERIFY.md` must make the same change as HEAD (the same content on the base and the tip
-for every file it touches, and the same commits), or the gate fails and names the files
-that differ.
+Before `review`: the phase artifacts the tier requires (`intent.md`, `plan.md`, `VERIFY.md`;
+`spec.md` unless low tier), `FINDINGS.md`, `DECISIONS.md`, `REVIEW.md` by a worker other than the
+author (for low tier, a `check` worker counts), and `build.log` when the task changed code. Rules
+can add more. Files must exist and not be empty. At `review` the gate also compares content: the
+commit on the last `Checked:` line of `VERIFY.md` must make the same change as HEAD (the same
+content on the base and the tip for every file it touches, and the same commits), or the gate fails
+and names the files that differ. With several jobs, `pa-gate <task-id> --job <job>` pins that job's
+worktree and reads `VERIFY-<job>.md` and `REVIEW-<job>.md`.
 
 ## Practices
 
