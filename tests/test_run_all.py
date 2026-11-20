@@ -167,14 +167,31 @@ def alive(pid):
     return True
 
 
+def parse37_files():
+    """The files run-all.sh's Python 3.7 parse check reads (its parse37 line), as repo-relative paths."""
+    with open(os.path.join(HERE, "run-all.sh")) as f:
+        line = [ln for ln in f.read().splitlines() if "feature_version=(3,7)" in ln][0]
+    return [w.rstrip(";") for w in line.split() if w.startswith("runtime/tools/")]
+
+
+class P37ParseList(unittest.TestCase):
+    def test_p37_every_tool_is_parsed_as_3_7(self):
+        # t-147 item 3 (t-135 "new"): the parse check reads every runtime/tools/*.py, so a tool added later is
+        # parsed as 3.7 too (pa_net.py, pa_run.py and pa_suite.py were not)
+        tools = sorted("runtime/tools/" + n for n in os.listdir(os.path.join(HERE, "..", "runtime", "tools"))
+                       if n.endswith(".py"))
+        self.assertEqual(sorted(parse37_files()), tools)
+
+
 class RunAll(unittest.TestCase):
     def setUp(self):
         self.tmp = os.path.realpath(tempfile.mkdtemp(prefix="t017-runall-"))
         self.repo = os.path.join(self.tmp, "repo")
         os.makedirs(os.path.join(self.repo, "tests"))
         shutil.copy(os.path.join(HERE, "run-all.sh"), os.path.join(self.repo, "tests", "run-all.sh"))
-        for name in ("pa", "pa_hooks", "pa_guard", "pa_costs", "pa_push", "pa_queue", "pa_places", "pa_statusline", "pa_handoff"):
-            write(os.path.join(self.repo, "runtime", "tools", name + ".py"), "x = 1\n")
+        for path in parse37_files():  # a stand-in for every file the 3.7 parse reads; pa_suite.py is the real one
+            if os.path.basename(path) != "pa_suite.py":
+                write(os.path.join(self.repo, path), "x = 1\n")
         shutil.copy(os.path.join(HERE, "..", "runtime", "tools", "pa_suite.py"), os.path.join(self.repo, "runtime", "tools"))
         self.home = os.path.join(self.tmp, "pa")  # HERDR_PA_HOME: the slots are under it, never the real one
         self.slot = os.path.join(self.home, "suite-slots", "slot-0")
