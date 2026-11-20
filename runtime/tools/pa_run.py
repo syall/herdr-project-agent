@@ -317,8 +317,10 @@ def tree_to_run(h, top, commit=None, overlay=None, secrets=None):
         else:
             copied = False
             if real_index and os.path.isfile(real_index):  # read only: its stat data spares rehashing every file
-                try:
-                    shutil.copyfile(real_index, env["GIT_INDEX_FILE"])
+                try:  # copy2 keeps the index's mtime: git re-hashes a racy entry (mtime not older than the index)
+                    # only while the copy is as old as the real index; a fresh mtime would stage HEAD's blob for a
+                    # same-size edit made in the second of the checkout (t-130)
+                    shutil.copy2(real_index, env["GIT_INDEX_FILE"])
                     copied = True
                 except OSError:
                     pass
