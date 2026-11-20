@@ -23,6 +23,7 @@ t-117 (spec R-numbers): s3a also R15 (the fallback's note and overhead), s5c als
 space rule named);
   q3  R3: the slot step's refusals before a Run (PA_CHANGED_FILES, the profile) write one test-runs.jsonl line
   q4  R4: TERM during tree_to_run is 143 and recorded; any other exception in slot_run is 125 with its line
+  q5  R5: an error in run_remote (neither Interrupted nor SetupFailed): cleaned there, one record 125, the line
   q7  R7: could not run only for 124/125 with the slot step's own last line; no space rule in runtime/
   q8  R8: no remote run when the deadline leaves no time for it; PA_SUITE_RUN_LIMIT ends a remote run
   q13 R13: the slot step with no usable machine and "none": 125
@@ -652,6 +653,31 @@ class Q4SlotStep(Slot):
         self.assertNotIn("Traceback", out + err)
         self.assertRegex(out.splitlines()[-1], r"^run-all\.sh: not run on box-1: the slot step failed \(\w+: .+\)$")
         self.assertEqual(self.remote_runs(), [])
+
+
+class Q5SlotRemoteError(Slot):
+    """R5's catch-all in run_remote for the slot step (VERIFY MF-1, spec V1/A5): the run's output file cannot be
+    opened (its evidence folder is read-only) after the run started there: the run there is ended and cleaned, one
+    test-runs.jsonl line exit 125 (never 0 or 1) with the error, and slot_run's `the slot step failed (...)` last."""
+
+    def test_q5d_an_error_in_run_remote_is_cleaned_recorded_and_125(self):
+        evidence = os.path.join(self.dir, "evidence", "t-1")
+        os.makedirs(evidence, exist_ok=True)
+        os.chmod(evidence, 0o555)
+        self.addCleanup(os.chmod, evidence, 0o755)
+        if os.access(evidence, os.W_OK):
+            self.skipTest("a read-only folder is writable here (root)")
+        code, out, err, _ = self.slot("--affected")
+        self.assertEqual(code, 125, out + err)
+        self.assertNotIn("Traceback", out + err)
+        self.assertRegex(out.splitlines()[-1],
+                         r"^run-all\.sh: not run on box-1: the slot step failed \(PermissionError: .+\)$")
+        self.assertTrue(self.remote_runs(), self.calls())  # it started there
+        self.assertEqual(self.terminals(), [])
+        self.assertEqual(self.remote_folders(), [])
+        rows = self.rows(kind="affected")
+        self.assertEqual([(r["exit"], r["place"]) for r in rows], [(125, "box-1")], self.run_rows())
+        self.assertIn("pa-run failed: PermissionError", rows[0].get("note") or "", rows)
 
 
 class Q7HookReading(HookCase):

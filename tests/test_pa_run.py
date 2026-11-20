@@ -22,10 +22,12 @@ t-117 (the limits from t-107 J1 and J2; spec R-numbers):
   q2  R2: README and the docstring say pa-run trusts the worktree's code (python3 -c, node -e)
   q3  R3: a refusal after the argv check (a secret, not an ancestor) writes build.log and test-runs.jsonl
   q4  R4: TERM while the tree to run is made: 143, a record `interrupted`, no traceback, its scratch removed
-  q5  R5: a closed stdout (| head -1) does not end the run: argv's code, records, cleaned, the whole output kept
+  q5  R5: a closed stdout (| head -1) does not end the run: argv's code, records, cleaned, the whole output kept;
+      q5c an error in run_remote that is neither Interrupted nor SetupFailed: cleaned there, recorded exit 1, raised
   q6  R6: a clean filter never runs (it writes under .git): 125 naming the path and the filter
   q9  R9: every 124 is listed in the Exit line, run-all.sh's exit comment and README
-  q10 R10: --cwd that is not a folder in the tree to run: 125 before anything runs
+  q10 R10: --cwd that is not a folder in the tree to run: 125 before anything runs; a folder of the tree to run
+      (a worktree change, a new folder, --commit with --overlay, remote and local) runs (round 2, REVIEW MF-1)
   q11 R11: a patch too large to send: this Mac with "mac" (saying why), 125 with "none"
   q12 R12: --overlay words are literal paths
   q13 R13: suiteMachines with no usable entry and "none": 125
@@ -42,6 +44,7 @@ import subprocess
 import sys
 import time
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -1023,6 +1026,52 @@ class Q5ClosedStdout(Run):
                          [])
 
 
+class Q5RemoteError(Run):
+    """R5's catch-all in run_remote (VERIFY MF-1, spec V1/A5): an error there that is neither Interrupted nor
+    SetupFailed (here the watcher's last read raises, after the run ended there) ends and cleans the run on the
+    machine, writes one record (build.log and test-runs.jsonl, exit 1, never 0) and is raised again."""
+
+    def test_q5c_an_error_in_run_remote_is_cleaned_recorded_and_raised(self):
+        real = pa_hooks.load_tool
+
+        def broken_final(watcher):
+            raise RuntimeError("the last read broke")
+
+        def load_tool(name):
+            module = real(name)
+            if name == "pa_run":
+                real_load = module.load
+
+                def load(h):
+                    s = real_load(h)
+                    s.RemoteWatcher = type("BrokenWatcher", (s.RemoteWatcher,), {"final": broken_final})
+                    return s
+                module.load = load
+            return module
+        out, saved, sys.argv = io.StringIO(), sys.argv, ["pa-run", "--", "sh", "probe.sh"]
+        try:
+            with mock.patch.object(pa_hooks, "load_tool", load_tool), contextlib.redirect_stdout(out), \
+                    contextlib.redirect_stderr(out):
+                with self.assertRaises(RuntimeError) as caught:
+                    pa_hooks.main()
+        finally:
+            sys.argv = saved
+        text = out.getvalue()
+        self.assertIn("the last read broke", str(caught.exception))
+        run = self.run_id(text)
+        self.assertTrue(self.remote_runs(), self.calls())  # it ran there
+        self.assertFalse(os.path.exists(self.remote_folder(run)), text)
+        self.assertEqual([n for n in os.listdir(os.path.join(self.stub, "box-1", "terminals")) if n.endswith(".json")],
+                         [])
+        rows = self.run_rows()
+        self.assertEqual([(r["run"], r["exit"], r["place"]) for r in rows], [(run, 1, "box-1")], rows)
+        self.assertIn("pa-run failed: RuntimeError: the last read broke", rows[0].get("note") or "", rows)
+        log = [l for l in (self.build_log() or "").splitlines() if " pa-run " in l]
+        self.assertEqual(len(log), 1, self.build_log())
+        self.assertIn("-> exit 1 ", log[0])
+        self.assertEqual(self.progress(run).get("state"), "done")
+
+
 class Q6CleanFilter(Run):
     """R6 (RL-5): tree_to_run never runs a repo's clean filter (it could write under .git): a path that needs one
     is 125, naming the path and the filter; a filter attribute with no driver configured is no filter."""
@@ -1112,6 +1161,45 @@ class Q10Cwd(Run):
         code, out = self.pa_run("--local", "--cwd", "nope", "--", "sh", "../probe.sh")
         self.assertEqual(code, 125, out)
         self.assertIn("--cwd nope is not a folder in the tree to run", out)
+
+    def test_q10c_a_remote_run_with_a_worktree_change(self):
+        # REVIEW MF-1 (1): the tree to run is not one of the repo's own trees
+        self.dirty()
+        write(os.path.join(self.wt, "sub", "s.txt"), "in sub, changed\n")
+        code, out = self.pa_run("--cwd", "sub", "--", "sh", "../probe.sh", "cat=s.txt", "cat=../a.txt")
+        self.assertEqual(code, 0, out)
+        self.assertIn("file s.txt: in sub, changed", out)
+        self.assertIn("file ../a.txt: a changed", out)
+        self.assertRegex(out, r"cwd /\S*/w/sub")
+        self.assertIn("remote 1", out)
+
+    def test_q10d_a_new_folder_of_the_worktree_on_a_machine(self):
+        write(os.path.join(self.wt, "fresh", "f.txt"), "fresh\n")
+        code, out = self.pa_run("--cwd", "fresh", "--", "sh", "../probe.sh", "cat=f.txt")
+        self.assertEqual(code, 0, out)
+        self.assertIn("file f.txt: fresh", out)
+        self.assertIn("remote 1", out)
+
+    def test_q10e_commit_and_overlay_on_a_machine(self):
+        # REVIEW MF-1 (2)
+        base = sh(self.wt, "git", "rev-parse", "HEAD")
+        write(os.path.join(self.wt, "sub", "new.txt"), "x\n")
+        code, out = self.pa_run("--commit", base, "--overlay", "sub/new.txt", "--cwd", "sub", "--", "sh", "../probe.sh",
+                                "cat=new.txt", "cat=s.txt")
+        self.assertEqual(code, 0, out)
+        self.assertIn("file new.txt: x", out)
+        self.assertIn("file s.txt: in sub", out)
+        self.assertIn("remote 1", out)
+
+    def test_q10f_commit_and_overlay_locally(self):
+        # REVIEW MF-1: the same check in run_local's --commit path
+        base = sh(self.wt, "git", "rev-parse", "HEAD")
+        write(os.path.join(self.wt, "nsub", "new.txt"), "y\n")
+        code, out = self.pa_run("--local", "--commit", base, "--overlay", "nsub/new.txt", "--cwd", "nsub", "--", "sh",
+                                "../probe.sh", "cat=new.txt")
+        self.assertEqual(code, 0, out)
+        self.assertIn("file new.txt: y", out)
+        self.assertIn("remote unset", out)
 
 
 class Q11TooLarge(Run):
