@@ -402,7 +402,8 @@ Run `hc --skill` once to learn `hc`. Start workers with the profile's commands (
   the task changed, or follows a rebase with conflicts. The handoff names the base and
   says full or diff. Decide the full cases from the build or fix worker's report
   (`worker.md`, build role); in round 2 the previous fix's diff is the diff of round 1's
-  build.
+  build. A branch rebased outside the queue gets the same short review: `pa-queue verify`
+  names the file and, once a fresh reviewer wrote it, records it; then pa-gate and add.
 - Checks by tier (`sdlc.md`): low tier gets one `check` worker; normal a verifier and a
   reviewer; high a verifier and two reviewers when its review is full, one on a diff
   review. Size the verifier's brief by tier: low, the full suite once, the diff, at most

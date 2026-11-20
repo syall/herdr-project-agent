@@ -7,7 +7,9 @@
   pa-queue out <task> [--job J] --repo R --why T  take an entry out (with its dependents); those behind it are invalidated
   pa-queue restack --repo R [--dry-run]         rebase the invalidated entries as a chain, in merge order
   pa-queue verify <task> [--job J] --repo R     decide whether the branch is clean against the content checked
-                                                (clean, moved or union: a short review; changed; stale)
+                                                (clean, moved or union: a short review; changed; stale); for a
+                                                branch not in the queue (rebased outside it, t-176), against the
+                                                branch the gate compares on, and record its short review once valid
   pa-queue refresh --repo R [--no-merge]        record short reviews and answered queue cards, set passed or failed,
                                                 restack after a failure, then merge what is approved and passed
   pa-queue card --repo R --limits T             one queue card for the ready entries at the front (at most 4)
@@ -490,7 +492,13 @@ def needs_for(ctx, entry, tip, decision, old_base, new_base, since=None):
     files += [shared_file(ctx, u, u["regions"]) for u in decision.get("unions") or []]
     files.sort(key=lambda f: f["path"])
     n = max(1, len(entry.get("rebases") or []))
-    name = "SHORT-REVIEW-{}{}-{}.md".format(entry["task"], "-" + entry["job"] if entry.get("job") else "", n)
+    named = lambda k: "SHORT-REVIEW-{}{}-{}.md".format(entry["task"], "-" + entry["job"] if entry.get("job") else "", k)
+    # t-176: a file pa-queue verify recorded for another tip (a branch rebased outside the queue) is not asked again
+    used = {r.get("file") for r in pa_hooks.review_runs(ctx.directory) if r.get("source") == "verify" and r.get("tip") != tip
+            and r.get("task") == entry["task"] and (r.get("job") or None) == (entry.get("job") or None)}
+    while named(n) in used:
+        n += 1
+    name = named(n)
     need = {"tip": tip, "tree": ctx.tree(tip), "file": name, "since": since or now(), "oldBase": old_base, "newBase": new_base,
             "files": files, "kind": "moved"}
     if decision.get("unions"):  # d-166 (t-052 J3c): the reviewer judges the conflict regions, lines of the tip's file
@@ -820,62 +828,105 @@ def record_reviews(ctx, rec):
                 continue  # its partner's need, on the same file, says it waits
             ctx.notes.append("{}: waiting for its short review ({})".format(e["task"], need["file"]))
             continue
-        text = pa.read_text(path)
-        problems = []
-        start, end = START_LINE.search(text), END_LINE.search(text)
-        t0 = pa.parse_time(start.group(1)) if start else None
-        t1 = pa.parse_time(end.group(1)) if end else None
-        if t0 is None or t1 is None or t1 < t0:
-            problems.append("it needs Start: and End: lines with UTC times (End not before Start)")
-        if tip not in pa_hooks.checked_commits(text):
-            problems.append("its Checked: line must name the tip {}".format(tip))
-        verdict = VERDICT_LINE.findall(text)
-        if not verdict:
-            problems.append("it has no Verdict: line")
-        independent = independent_answer(text, need) if ind else None
-        if ind and not independent:
-            if stale_joint(e, need, have, tip):
-                # t-170 R4: the one file answered its partner's question only; the stacked review is asked apart
-                need.update(file=apart_name(e), joint=None)
-                ctx.notes.append("{}: {} has no answer for the stacked review; it is asked apart in {} (pa-queue brief "
-                                 "{})".format(e["task"], path.rsplit(os.sep, 1)[-1], need["file"], e["task"]))
-                continue
-            problems.append("it has no {} line".format(
-                "Independent (stacked): or Independent (both):" if need.get("joint") == "independence"
-                else "Independent: yes or Independent: no"))
-        who = REVIEWER_LINE.search(text)
-        address = pa.local_id(who.group(1)) if who else None
-        task = ctx.task(e["task"]) or {}
-        workers = [w for w in task.get("workers") or [] if isinstance(w, dict)]
-        authors = {w.get("address") for w in workers if str(w.get("role") or "").lower() in ("build", "design")}
-        since = pa.parse_time(str(need.get("since")))
-        fresh = [w for w in workers if w.get("address") == address and str(w.get("role") or "").lower() == "reviewer"
-                 and pa.parse_time(str(w.get("started"))) is not None and since is not None and pa.parse_time(str(w["started"])) >= since]
-        if not address:
-            problems.append("it has no Reviewer: line")
-        elif address in authors:
-            problems.append("its reviewer {} is an author of the task".format(address))
-        elif not fresh:
-            problems.append("its reviewer {} is not a reviewer of the task started after the rebase".format(address))
+        if ind and not independent_answer(pa.read_text(path), need) and stale_joint(e, need, have, tip):
+            # t-170 R4: the one file answered its partner's question only; the stacked review is asked apart
+            need.update(file=apart_name(e), joint=None)
+            ctx.notes.append("{}: {} has no answer for the stacked review; it is asked apart in {} (pa-queue brief "
+                             "{})".format(e["task"], path.rsplit(os.sep, 1)[-1], need["file"], e["task"]))
+            continue
+        line, problems = review_line(ctx, rec, e, need, tip, path)
         if problems:
             ctx.notes.append("{}: {} not recorded: {}".format(e["task"], need["file"], "; ".join(problems)))
             continue
-        with open(path, "rb") as f:
-            sha = hashlib.sha256(f.read()).hexdigest()
-        line = {"kind": "short-review", "at": now(), "task": e["task"], "job": e.get("job"), "repo": ctx.repo, "common": rec["common"],
-                "branch": e["branch"], "tip": tip, "tree": ctx.tree(tip), "file": need["file"], "fileSha256": sha, "worker": address,
-                "started": start.group(1), "ended": end.group(1), "seconds": round(t1 - t0, 1),
-                "verdict": "pass" if verdict[-1] == "pass" else "must fix", "about": need.get("kind") or "moved"}
-        if ind:
-            line["independent"] = independent.lower() == "yes"
-        if mark[0]:
-            line.update(standing=True, oldBase=need.get("oldBase"), newBase=need.get("newBase"))
-        os.makedirs(pa_hooks.content_dir(ctx.directory), exist_ok=True)
-        with open(os.path.join(pa_hooks.content_dir(ctx.directory), REVIEWS_FILE), "a") as f:
-            f.write(json.dumps(line) + "\n")
+        write_review(ctx, e, need, line)
         have.append(line)
-        ctx.event("review", e, file=need["file"], verdict=line["verdict"], started=line["started"], ended=line["ended"],
-                  seconds=line["seconds"], worker=address)
+
+
+def review_line(ctx, rec, subject, need, tip, path, outside=False):
+    """(line, []) when the short review file at path is valid for need at tip, else (None, problems): the checks
+    record_reviews makes (Start/End, Checked, Verdict, Independent for an independence need, a fresh ledger reviewer
+    who is not an author). outside (t-176, a branch not in the queue, need.since = HEAD's commit time): its Start:
+    must not be before HEAD was committed either, as short_review_passed reads it. One function for both paths (R3)."""
+    text = pa.read_text(path)
+    ind = need.get("kind") == "independent"
+    mark = (bool(need.get("standing")), need.get("oldBase"), need.get("newBase")) if ind and need.get("standing") else (False,)
+    problems = []
+    start, end = START_LINE.search(text), END_LINE.search(text)
+    t0 = pa.parse_time(start.group(1)) if start else None
+    t1 = pa.parse_time(end.group(1)) if end else None
+    if t0 is None or t1 is None or t1 < t0:
+        problems.append("it needs Start: and End: lines with UTC times (End not before Start)")
+    elif outside:
+        committed = pa.parse_time(str(need.get("since")))
+        if committed is None or t0 < committed:
+            problems.append("its Start: is before HEAD {} was committed".format(short(tip)))
+    if tip not in pa_hooks.checked_commits(text):
+        problems.append("its Checked: line must name the tip {}".format(tip))
+    verdict = VERDICT_LINE.findall(text)
+    if not verdict:
+        problems.append("it has no Verdict: line")
+    independent = independent_answer(text, need) if ind else None
+    if ind and not independent:
+        problems.append("it has no {} line".format(
+            "Independent (stacked): or Independent (both):" if need.get("joint") == "independence"
+            else "Independent: yes or Independent: no"))
+    who = REVIEWER_LINE.search(text)
+    address = pa.local_id(who.group(1)) if who else None
+    task = ctx.task(subject["task"]) or {}
+    workers = [w for w in task.get("workers") or [] if isinstance(w, dict)]
+    authors = {w.get("address") for w in workers if str(w.get("role") or "").lower() in ("build", "design")}
+    since = pa.parse_time(str(need.get("since")))
+    fresh = [w for w in workers if w.get("address") == address and str(w.get("role") or "").lower() == "reviewer"
+             and pa.parse_time(str(w.get("started"))) is not None and since is not None and pa.parse_time(str(w["started"])) >= since]
+    if not address:
+        problems.append("it has no Reviewer: line")
+    elif address in authors:
+        problems.append("its reviewer {} is an author of the task".format(address))
+    elif not fresh:
+        problems.append("its reviewer {} is not a reviewer of the task started after the rebase".format(address))
+    if problems:
+        return None, problems
+    with open(path, "rb") as f:
+        sha = hashlib.sha256(f.read()).hexdigest()
+    line = {"kind": "short-review", "at": now(), "task": subject["task"], "job": subject.get("job"), "repo": ctx.repo,
+            "common": rec["common"], "branch": subject["branch"], "tip": tip, "tree": ctx.tree(tip), "file": need["file"],
+            "fileSha256": sha, "worker": address, "started": start.group(1), "ended": end.group(1), "seconds": round(t1 - t0, 1),
+            "verdict": "pass" if verdict[-1] == "pass" else "must fix", "about": need.get("kind") or "moved",
+            "source": "verify" if outside else "queue"}
+    if ind:
+        line["independent"] = independent.lower() == "yes"
+    if mark[0]:
+        line.update(standing=True, oldBase=need.get("oldBase"), newBase=need.get("newBase"))
+    return line, []
+
+
+def write_review(ctx, subject, need, line, **extra):
+    """Append one reviews.jsonl line and its journal event (under the queue lock: only pa-queue writes the file)."""
+    os.makedirs(pa_hooks.content_dir(ctx.directory), exist_ok=True)
+    with open(os.path.join(pa_hooks.content_dir(ctx.directory), REVIEWS_FILE), "a") as f:
+        f.write(json.dumps(line) + "\n")
+    ctx.event("review", subject, file=need["file"], verdict=line["verdict"], started=line["started"], ended=line["ended"],
+              seconds=line["seconds"], worker=line["worker"], **extra)
+
+
+def outside_review(ctx, rec, subject, need, tip):
+    """t-176: the short review of a branch not in the queue (rebased outside it), recorded by pa-queue verify once its
+    file is valid (R1, R3). (status, text, line): recorded, waiting, problems or the line already recorded for the
+    same task, job, common, tip and question (R6)."""
+    about = need.get("kind") or "moved"
+    have = latest(pa_hooks.review_runs(ctx.directory), lambda r: r.get("task") == subject["task"]
+                  and (r.get("job") or None) == (subject.get("job") or None) and r.get("common") == rec["common"]
+                  and r.get("tip") == tip and (r.get("about") or "moved") == about)
+    if have:
+        return "had", None, have
+    path = os.path.join(ctx.directory, "evidence", subject["task"], need["file"])
+    if not os.path.isfile(path):
+        return "waiting", "{}: waiting for its short review ({})".format(subject["task"], need["file"]), None
+    line, problems = review_line(ctx, rec, subject, need, tip, path, outside=True)
+    if problems:
+        return "problems", "{}: {} not recorded: {}".format(subject["task"], need["file"], "; ".join(problems)), None
+    write_review(ctx, subject, need, line, outside=True)
+    return "recorded", None, line
 
 
 def review_mark(r):
@@ -1129,7 +1180,8 @@ def add(ctx, data, rec, tid, job):
             raise Refused("the gate does not pass now: {}".format(why))
         if d["result"] in ("moved", "union"):
             # the rebase worker's resolution, not the tool's: a review started after its commit counts, as the gate's
-            since = committed_at(ctx, tip) if d["result"] == "union" else None
+            # (t-176 R9: a moved branch too; a review recorded outside the queue, by pa-queue verify, counts here)
+            since = committed_at(ctx, tip)
             entry["needs"] = {"shortReview": needs_for(ctx, entry, tip, d, checked["base"], onto_tip, since)}
             lines += handoff_lines(entry, entry["needs"]["shortReview"])
     lines += resume_approval(ctx, rec, entry, d)
@@ -1380,6 +1432,7 @@ def cmd_restack(args):
 
 
 def cmd_verify(args):
+    status, need = None, None
     with writing(args) as (ctx, data, rec):
         entry = next((e for e in rec["entries"] if same(e, args.task, args.job)), None)
         if entry:
@@ -1402,19 +1455,48 @@ def cmd_verify(args):
             pin = pin_in(ctx, rec, tree) if tree else None
             if not pin or not pin.get("commit"):
                 raise Refused("{} has no worktree on a branch of {}".format(args.task, ctx.repo))
-            onto = rec["entries"][-1]["branch"] if rec["entries"] else rec["main"]
+            last = rec["entries"][-1]["branch"] if rec["entries"] else rec["main"]
             tip = pin["commit"]
             checked = checked_at_add(ctx, rec, task, pin.get("branch"))
+            subject = {"task": args.task, "job": args.job, "branch": pin.get("branch"), "rebases": []}
+            # t-176 R2: decided against the branch the gate compares on (checked_at_add's onto), so a short review
+            # recorded here is the one the gate reads. A branch put on the queue's last entry by hand is decided
+            # against that entry as before: the gate compares it against main, so nothing recorded here could count;
+            # the queue records its review after add (DECISIONS D1).
+            onto = pa_hooks.content_onto(ctx.directory, task["id"], rec["common"], pin.get("branch"), ctx.run, ctx.repo,
+                                         checked["commit"]) or rec["main"]
+            gate_onto = not (last != onto and ctx.tip(last) and ctx.merge_base(tip, ctx.tip(last)) == ctx.tip(last))
+            onto = onto if gate_onto else last
             d = decide(ctx, checked, tip, onto, ctx.tip(onto))
-            subject = {"task": args.task, "job": args.job, "rebases": []}
-            need = needs_for(ctx, subject, tip, d, checked["base"], ctx.tip(onto)) if d["result"] in ("moved", "union") else None
+            if d["result"] in ("moved", "union"):
+                need = needs_for(ctx, subject, tip, d, checked["base"], ctx.tip(onto),
+                                 since=committed_at(ctx, tip) if gate_onto else None)
+                if gate_onto:
+                    status = outside_review(ctx, rec, subject, need, tip) + (last != onto,)
         ctx.event("verify", subject, tip=tip, onto=onto, result=d["result"], files=d["files"])
         save(ctx, data, rec)
     print("{} at {} on {}: {}{}".format(args.task, short(tip), onto, d["result"],
                                        " ({})".format(d["why"] or ", ".join(d["files"])) if d["result"] not in ("clean",) else ""))
     if d["result"] in ("moved", "union") and need:
         print("\n".join(handoff_lines(subject, need)))
+    if status:
+        return outside_lines(args.task, need, last, *status)
     return 0 if d["result"] in ("clean", "moved", "union") else 1
+
+
+def outside_lines(tid, need, last, state, text, line, rebase):
+    """What verify says of an outside short review (t-176 R4, R5): 0 when recorded with a pass or still waiting."""
+    if rebase:
+        print("{}: add will rebase it onto {} (a new short review is asked then)".format(tid, last))
+    if text:
+        print(text)
+        return 0 if state == "waiting" else 1
+    if line.get("verdict") != "pass":
+        print("{}: short review {} must fix: the branch needs the R8 check (a check worker and pa-full-suite)".format(
+            tid, line.get("file") or need["file"]))
+        return 1
+    print("{}: short review {} recorded (pass); run pa-gate {}, then pa-queue add".format(tid, line.get("file") or need["file"], tid))
+    return 0
 
 
 def cmd_refresh(args):

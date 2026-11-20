@@ -1393,7 +1393,8 @@ def content_check(directory, task, pins, runner=None, records=None, cache=None):
                         notes.append("{}change lines only moved in {}; short review {} passed".format(label, names, clean(passed.get("file"))))
                     else:
                         fails.append("{}change lines only moved in {}: a short review is needed (pa-queue verify names it); "
-                                     "HEAD {} against the checked {}".format(label, names, head[:7], x[:7]))
+                                     "HEAD {} against the checked {}{}".format(label, names, head[:7], x[:7],
+                                                                             review_hint(directory, task.get("id"))))
                     continue
                 union, _uwhy, unions, ushared = union_only(run, raw, path, checked, now)
                 if union:  # d-166 (t-052 J3c): a conflict kept on both sides counts only with a doc-only short review
@@ -1408,7 +1409,8 @@ def content_check(directory, task, pins, runner=None, records=None, cache=None):
                             label, names, clean(passed.get("file"))))
                     else:
                         fails.append("{}a conflict kept on both sides in {}: a short review is needed (doc-only; pa-queue "
-                                     "verify names it); HEAD {} against the checked {}".format(label, names, head[:7], x[:7]))
+                                     "verify names it); HEAD {} against the checked {}{}".format(
+                                         label, names, head[:7], x[:7], review_hint(directory, task.get("id"))))
                     continue
                 fails.append("{}{}; HEAD {} against the checked {}".format(label, why, head[:7], x[:7]))
             else:
@@ -1425,6 +1427,26 @@ def content_check(directory, task, pins, runner=None, records=None, cache=None):
     elif notes:
         check["note"] = "; ".join(notes)
     return check, summary
+
+
+def review_hint(directory, task_id):
+    """t-176 R10: '; <file> is written: pa-queue verify <task> records it' (refresh, for a queue entry) when a short
+    review file of the task is in its evidence (the newest), else ''. Text only: the gate never counts a file itself;
+    only a reviews.jsonl line pa-queue wrote passes the content check."""
+    folder = os.path.join(directory, "evidence", str(task_id))
+    pattern = re.compile(r"^SHORT-REVIEW-{}(?:-(?!stacked-)[^/]+)?-\d+\.md$".format(re.escape(str(task_id))))
+    try:
+        found = [n for n in os.listdir(folder) if pattern.match(n) and os.path.isfile(os.path.join(folder, n))]
+    except OSError:
+        return ""
+    if not found:
+        return ""
+    name = max(found, key=lambda n: (os.path.getmtime(os.path.join(folder, n)), n))
+    data = pa.read_json_safe(os.path.join(directory, "queue.json"))
+    repos = data.get("repos") if isinstance(data, dict) and isinstance(data.get("repos"), dict) else {}
+    queued = any(isinstance(e, dict) and e.get("task") == task_id for r in repos.values() if isinstance(r, dict)
+                 for e in r.get("entries") or [])
+    return "; {} is written: {} records it".format(clean(name), "pa-queue refresh" if queued else "pa-queue verify " + clean(task_id))
 
 
 def content_onto(directory, task_id, common, branch, run=None, path=None, commit=None, job=None):
@@ -1786,7 +1808,8 @@ def suite_runs(directory):
 
 
 def review_runs(directory):
-    """Every short review run of content/reviews.jsonl (written by pa-queue refresh only), in file order."""
+    """Every short review run of content/reviews.jsonl (written by pa-queue: refresh, add, and verify for a branch not
+    in the queue, t-176), in file order."""
     return [l for l in read_lines(os.path.join(content_dir(directory), "reviews.jsonl")) if l.get("kind") == "short-review"]
 
 
