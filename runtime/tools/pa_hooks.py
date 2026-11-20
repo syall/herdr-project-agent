@@ -2850,7 +2850,8 @@ def answer_scope(card):
 
 def item_view(cid, card, i):
     """Item i of batch card cid in the shape of a single card (id, task, worktree, branch, rule, tasks, snapshot, status,
-    answer, note, answered, answeredBy, worktreeRemoved), plus `batch` and `item`. Its status: withdrawn when the item or
+    answer, note, answered, answeredBy, worktreeRemoved, and the card's carried previous* while it is not answered), plus
+    `batch` and `item`. Its status: withdrawn when the item or
     the card is; open while the card is; answered when the card's answer covers the item (Other, Keep all, Delete all,
     or Delete the lossless ones for a lossless item); else withdrawn: the next check asks about it again (Q3)."""
     item = card["items"][i] if isinstance(card["items"][i], dict) else {}
@@ -2868,6 +2869,8 @@ def item_view(cid, card, i):
             "answeredBy": card.get("answeredBy"), "created": card.get("created"), "worktreeRemoved": item.get("removed")}
     if card.get("other") is True and status == "answered":
         view["other"] = True
+    if card.get("status") != "answered":  # the person's words carried from an earlier answer, until a later one (round 4)
+        view.update({k: card[k] for k in CARRIED if card.get(k) is not None})
     return view
 
 
@@ -4000,6 +4003,9 @@ def standing_clean(directory, row, owner, profile, entries, listing=None):
     cid, _path, card = card_for(directory, row, task, entries.get(task), listing)
     if card and card.get("status") == "answered" and (pa.is_other(card) or not str(card.get("answer") or "").lower().startswith("delete")):
         return "answered {!r} on card {}".format("Other" if pa.is_other(card) else card.get("answer"), cid)
+    held = card and held_words(card)
+    if held:
+        return "its card {} carries the person's {}; left for its card".format(cid, held)
     if not in_worktrees_folder(row["path"]):
         return "not under a worktrees folder"
     if facts.get("uncommitted"):
@@ -4018,6 +4024,21 @@ def standing_clean(directory, row, owner, profile, entries, listing=None):
             return "{} uncommitted or untracked file(s) in {}".format(len(files), clean(name))
         if not merged_and_pushed(repo, profile):
             return "not every commit is merged into main and pushed in {}".format(clean(name))
+    return None
+
+
+def held_words(card):
+    """What of the person's on a worktree card (single, or a batch item as item_view gives it) holds its worktree under the
+    rule, or None (t-168 round 4): the note of its answer (never read: it may say to keep it), or, while the card is
+    withdrawn or asked again, the note or a not-Delete answer carried from the answer before (keep_previous, carried).
+    Only the person's later answer replaces them; resuming the rule does not (R15, R13)."""
+    if card.get("status") == "answered":
+        return "note" if str(card.get("note") or "").strip() else None
+    if str(card.get("previousNote") or "").strip():
+        return "note"
+    answer = card.get("previousAnswer")
+    if answer is not None and not str(answer).strip().lower().startswith("delete"):
+        return "answer {!r}".format(str(answer))
     return None
 
 
