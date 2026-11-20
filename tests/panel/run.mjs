@@ -6374,7 +6374,7 @@ cases["P83-1-places"] = async () => { // AC1.1, AC1.2: the kinds, their limits a
   check(/Places · 3 of 4 working · 3 waiting/.test(text), `the section head (got ${text.slice(0, 600)})`);
   check(text.includes("Working · 3 of 4") && text.includes("No-test extra · 0 of 1") && text.includes("Suite step · 1 of 2  (held within Working)"), `AC1.1 the three kinds (got ${text.slice(0, 900)})`);
   check(text.includes("t53 · t-020 verify · verifier · suite step · since 11-19 10:02") && text.includes("t54 · t-041 review · reviewer · since 11-19 10:02"), `AC1.1 holder lines (got ${text.slice(0, 900)})`);
-  check(text.includes("limits: r-places"), "the limits' rule");
+  check(text.includes("limits: | r-places"), "the limits' rule"); // t-156: its id a link
   check(!/t59 ·/.test(text), "AC1.2: a finished worker is not drawn");
   check(text.indexOf("Places ·") < text.indexOf("| in progress |"), "the section comes before the task sections");
 };
@@ -7469,10 +7469,10 @@ cases["P156-3-task-link"] = async () => { // R2: the task id links to the task, 
   const waiting = { version: 1, jobs: [...plJobs(), P83.job("t-999/build", "working")] };
   const { v } = await placesWorld({ waiting });
   const { clicks, text } = look(v);
-  check(Boolean(clicks["place-task-t-020/verify-2"]) && Boolean(clicks["place-task-t-083/design"]) && !clicks["place-task-t-999/build"], `links (have ${Object.keys(clicks).filter((k) => k.startsWith("place-task-"))})`);
+  check(Boolean(clicks["places-task-t-020/verify-2"]) && Boolean(clicks["places-task-t-083/design"]) && !clicks["places-task-t-999/build"], `links (have ${Object.keys(clicks).filter((k) => k.startsWith("places-task-"))})`);
   check(/t-999 \| build/.test(text), "the unlinked id still drawn");
   let stopped = false;
-  clicks["place-task-t-083/design"]({}, { ...cx, stop_propagation() { stopped = true; } }); await flush(); await settle();
+  clicks["places-task-t-083/design"]({}, { ...cx, stop_propagation() { stopped = true; } }); await flush(); await settle();
   check(stopped, "the click stops there");
   check(g.__shared["project-agent.show"]?.task === "t-083" && g.__shared["project-agent.show"]?.space === S, `the show request (got ${JSON.stringify(g.__shared["project-agent.show"])})`);
   look(v);
