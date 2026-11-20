@@ -658,8 +658,10 @@ def gate_commits(worktree, runner=None):
             top, common, branch = found
         # 2: the commit and the tracked changes. --no-optional-locks stays the first argument. --no-ahead-behind
         # (t-108 review N-1): no walk to count against the upstream, which the pin never reads (branch.ab says +? -?).
-        code, status, _ = git(path, "--no-optional-locks", "status", "--porcelain=v2", "--branch", "--untracked-files=no",
-                              "--no-ahead-behind")
+        argv = ["--no-optional-locks", "status", "--porcelain=v2", "--branch", "--untracked-files=no", "--no-ahead-behind"]
+        code, status, err = git(path, *argv)
+        if code and "no-ahead-behind" in (err or ""):  # git 2.11-2.16 has no such option (t-139, t-108 RL-1)
+            code, status, _ = git(path, *argv[:-1])
         commit, changed, oid = None, 0, None
         for line in status.splitlines() if not code else []:
             if line.startswith("# branch.oid "):
@@ -857,7 +859,8 @@ def batch_objects(run, path, ids):
         data = "".join(i + "\n" for i in ids).encode("ascii")
     except UnicodeEncodeError:
         return None
-    code, out, _err = run(path, "cat-file", "--batch", input=data)
+    # One GIT_TIMEOUT per id (t-139, t-104 review RL-1): the per-call path gives each of its calls one.
+    code, out, _err = run(path, "cat-file", "--batch", input=data, timeout=GIT_TIMEOUT * max(1, len(ids)))
     if code or not isinstance(out, bytes):
         return None
     objects, at = [], 0
@@ -884,7 +887,7 @@ def batch_diffs(run, path, pairs):
         data = "".join(a + " " + b + "\n" for a, b in pairs).encode("ascii")
     except UnicodeEncodeError:
         return None
-    code, out, _err = run(path, *DIFF_TREE, input=data)
+    code, out, _err = run(path, *DIFF_TREE, input=data, timeout=GIT_TIMEOUT * max(1, len(pairs)))  # as batch_objects
     if code or not isinstance(out, bytes):
         return None
     tokens = out.split(b"\0")
@@ -982,7 +985,17 @@ class ContentCache:
 
 class StdinArgv(tuple):
     """A cache key's argv for a call given stdin (t-104 R4): the argv, then the input (ASCII text) as its last word,
-    so the key holds both and cacheable reads the input back from it. Only content_git makes one."""
+    so the key holds both and cacheable reads the input back from it. Only content_git makes one. It equals only a
+    StdinArgv with the same words (t-139, t-104 review N-1): a key with input never matches a plain argv key."""
+
+    def __eq__(self, other):
+        return type(other) is StdinArgv and tuple.__eq__(self, other)
+
+    def __ne__(self, other):
+        return not self == other
+
+    def __hash__(self):
+        return hash((StdinArgv, tuple(self)))
 
 
 def cacheable(args, hexlen, input=None):
