@@ -1446,7 +1446,7 @@ class OneRun(Standing):
 # ---- t-192 R3, R6, R7: a package worktree in a holder (a workspace-like worktree), its holder, its branch ----------
 HSTATUS = r"""#!/bin/sh
 [ -n "$HSTATUS_FAIL" ] && exit 1
-printf '{"uncommitted": 0, "unpushed": 0, "branch": "b", "kind": "test workspace worktree", "removesBranches": true, "repos": ['
+printf '{"uncommitted": %s, "unpushed": 0, "branch": "b", "kind": "test workspace worktree", "removesBranches": true, "repos": [' "${HSTATUS_UNCOMMITTED:-0}"
 sep=
 for d in "$1"/src/*; do
   [ -d "$d" ] || continue
@@ -1492,15 +1492,15 @@ class HolderBase(Standing):
 
     def holder(self, name, pkgs=("Pkg",), merged=True):
         """<ws>/worktrees/<name> with its marker and one linked worktree per package (branch <name>-<pkg>), each with a
-        commit merged into main and pushed when merged. Returns (holder, [package paths])."""
+        commit merged into main and pushed when merged (True, or the packages named). Returns (holder, [package paths])."""
         h = os.path.join(self.ws, "worktrees", name)
         write(os.path.join(h, "marker.txt"), "")
         paths = []
         for pkg in pkgs:
             path = os.path.join(h, "src", pkg)
-            branch = "{}-{}".format(name, pkg.lower())
+            branch = "{}-{}".format(name.lstrip("-") or "h", pkg.lower())
             sh(self.proj, "git", "worktree", "add", "-q", "-b", branch, path, "main")
-            if merged:
+            if merged is True or (isinstance(merged, (tuple, list)) and pkg in merged):
                 self.commit(path, branch + ".txt", branch + "\n", "work of " + branch)
                 sh(self.proj, "git", "merge", "-q", "--no-edit", branch)
                 sh(self.proj, "git", "push", "-q", "origin", "main")
@@ -1574,4 +1574,158 @@ class T192HolderPath(HolderBase):
                     self.assertIsNone(hof(pkg, prof))
                 if repos:
                     self.assertIn("worktree.repos", err.getvalue())
+
+
+class T192HolderRemove(HolderBase):
+    """R6 (VP8): with rule r-holder active, removing a package also removes its holder when everything in it is merged,
+    pushed and clean and nothing else is in it (the stub remove script once, with H, no --force); else the package goes
+    by git and the holder stays, said why (H6.1-H6.9)."""
+
+    def setUp(self):
+        super().setUp()
+        self.rules()
+
+    def rules(self, status="active", rid="r-holder", raw_text=None):
+        path = os.path.join(self.dir, "rules.json")
+        if raw_text is not None:
+            write(path, raw_text)
+            return
+        wt = {"id": "r-wt", "text": RULE_TEXT, "status": "active", "appliesTo": "all", "source": "person",
+              "history": [{"at": "2026-11-01T00:00:00Z", "by": "person", "change": "created"}]}
+        holder = {"id": rid, "text": "Remove the holder too when it is all merged.", "status": status, "appliesTo": "all",
+                  "source": "person", "history": [{"at": "2026-11-01T00:00:00Z", "by": "person", "change": "created"}]}
+        dump({"version": 1, "rules": [wt, holder]}, path)
+
+    def one(self, tid="t-010", pkgs=("Pkg",), name=None):
+        h, paths = self.holder(name or tid + "-x", pkgs)
+        self.add_task(tid, "done", paths[0], [])
+        return h, paths
+
+    def gone(self, h, pkg, out):
+        self.assertFalse(os.path.exists(h), out)
+        self.assertFalse(os.path.exists(pkg), out)
+        self.assertEqual(self.removals(), [os.path.realpath(h) + "\n"], "the remove script ran once, with H only (no --force)")
+
+    def stays(self, h, pkg, out, *why):
+        self.assertTrue(os.path.isdir(h), out)
+        self.assertFalse(os.path.exists(pkg), "the package goes by git: " + out)
+        self.assertEqual(self.removals(), [], "the remove script never ran")
+        self.assertIn("the test workspace worktree {} stays: ".format(os.path.realpath(h)), out)
+        for w in why:
+            self.assertIn(w, out)
+
+    def test_vp8_standing_removes_a_clean_holder_with_its_package(self):
+        h, (pkg,) = self.one()
+        os.makedirs(os.path.join(h, "build"))  # the profile's own folders may be there
+        code, out, err = self.standing()
+        self.assertEqual(code, 0, out + err)
+        self.gone(h, pkg, out)
+        self.assertIn("Removed the test workspace worktree {} with {} (rule r-holder)".format(os.path.realpath(h), os.path.realpath(pkg)), out)
+        self.assertIn(os.path.realpath(h), self.journal()[-1]["why"])
+        self.assertIsNone(next(t for t in self.ledger()["tasks"] if t["id"] == "t-010")["worktree"])
+
+    def test_vp8_a_card_answer_removes_the_holder_too(self):
+        h, (pkg,) = self.one("t-020")
+        code, out, err = self.check()
+        self.assertEqual(code, 0, out + err)
+        cid = next(f[:-5] for f in self.files() if f.startswith("d-wt-t-020"))
+        self.answer(cid, "Delete")
+        code, out, err = self.run_cmd("pa-worktree", "remove", "t-020", "--space", "sp1")
+        self.assertEqual(code, 0, out + err)
+        self.gone(h, pkg, out)
+        self.assertIn("Removed the test workspace worktree {} with {} (rule r-holder)".format(os.path.realpath(h), os.path.realpath(pkg)), out)
+
+    def test_h6_8_the_rule_not_active(self):
+        for i, (kw, raw_text) in enumerate(((dict(status="proposed"), None), (dict(status="retired"), None),
+                                             (dict(rid="R-holder"), None), ({}, "{not json"))):
+            with self.subTest(kw=kw, raw=raw_text):
+                h, (pkg,) = self.one("t-03{}".format(i))
+                self.rules(raw_text=raw_text, **kw)
+                if os.path.exists(self.hlog):
+                    os.remove(self.hlog)
+                code, out, err = self.standing()
+                self.assertEqual(code, 0, out + err)
+                self.stays(h, pkg, out, "rule r-holder is not active")
+
+    def test_h6_1_another_package_recorded_by_a_task_in_progress(self):
+        h, (p1, p2) = self.holder("t-040-x", ("Pkg", "Two"), merged=("Pkg",))  # Two: no commits (so "merged")
+        self.add_task("t-040", "done", p1, [])
+        self.add_task("t-041", "in-progress", p2, [])
+        code, out, err = self.standing()
+        self.assertEqual(code, 0, out + err)
+        self.stays(h, p1, out, "t-041")
+        self.assertTrue(os.path.isdir(p2))
+
+    def test_h6_2_another_package_with_untracked_or_unmerged_work(self):
+        for i, spoil in enumerate(("untracked", "local commit")):
+            with self.subTest(spoil=spoil):
+                h, (p1, p2) = self.holder("t-05{}-x".format(i), ("Pkg", "Two"))
+                self.add_task("t-05{}".format(i), "done", p1, [])
+                if spoil == "untracked":
+                    write(os.path.join(p2, "notes.txt"), "mine\n")
+                else:
+                    self.commit(p2, "more.txt", "more\n", "only here")
+                code, out, err = self.standing()
+                self.assertEqual(code, 0, out + err)
+                self.stays(h, p1, out, "Two")
+                self.assertTrue(os.path.isdir(p2))
+
+    def test_h6_3_a_terminal_in_the_holder(self):
+        for i, sub in enumerate(("", "build")):
+            with self.subTest(sub=sub):
+                h, (pkg,) = self.one("t-06{}".format(i))
+                os.makedirs(os.path.join(h, sub), exist_ok=True)
+                self.term("t7{}".format(i), "someone", cwd=os.path.join(h, sub) if sub else h)
+                code, out, err = self.standing()
+                self.assertEqual(code, 0, out + err)
+                self.stays(h, pkg, out, "t7{}".format(i))
+                del self.terms["t7{}".format(i)]
+
+    def test_h6_5_a_file_the_person_left_at_the_top(self):
+        h, (pkg,) = self.one("t-070")
+        write(os.path.join(h, "notes.txt"), "mine\n")
+        code, out, err = self.standing()
+        self.assertEqual(code, 0, out + err)
+        self.stays(h, pkg, out, "notes.txt")
+
+    def test_h6_6_an_unlisted_repo_or_a_link_out(self):
+        h, (pkg,) = self.one("t-080")
+        other = os.path.join(h, "src", "Other")
+        sh(self.proj, "git", "worktree", "add", "-q", "-b", "t-080-other", other, "main")
+        with mock.patch.dict(os.environ, {"HSTATUS_HIDE": "Other"}):
+            code, out, err = self.standing()
+        self.assertEqual(code, 0, out + err)
+        self.stays(h, pkg, out, "Other")
+        h2, (pkg2,) = self.one("t-081")
+        target = os.path.join(self.tmp, "linked-pkg")
+        os.makedirs(target)
+        os.symlink(target, os.path.join(h2, "src", "Link"))
+        code, out, err = self.standing()
+        self.assertEqual(code, 0, out + err)
+        self.stays(h2, pkg2, out, "Link")
+        self.assertTrue(os.path.isdir(target))
+
+    def test_h6_7_a_holder_named_like_an_option(self):
+        h, (pkg,) = self.one("t-090", name="-x")
+        code, out, err = self.standing()
+        self.assertEqual(code, 0, out + err)
+        self.stays(h, pkg, out, "starts with '-'")
+
+    def test_h6_9_the_status_script_fails_or_reports_changes(self):
+        for i, env in enumerate(({"HSTATUS_FAIL": "1"}, {"HSTATUS_UNCOMMITTED": "2"})):
+            with self.subTest(env=env):
+                h, (pkg,) = self.one("t-10{}".format(i))
+                with mock.patch.dict(os.environ, env):
+                    code, out, err = self.standing()
+                self.assertEqual(code, 0, out + err)
+                self.stays(h, pkg, out)
+
+    def test_a_failed_remove_script_is_said_and_the_package_goes_by_git(self):
+        h, (pkg,) = self.one("t-110")
+        with mock.patch.dict(os.environ, {"HREMOVE_FAIL": "1"}):
+            code, out, err = self.standing()
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("remove broke", out)
+        self.assertTrue(os.path.isdir(h))
+        self.assertFalse(os.path.exists(pkg))
 
