@@ -220,6 +220,33 @@ class OneReview(mp.Standing):
         self.assertEqual(self.entry("t-B")["needs"]["stacked"]["file"], "SHORT-REVIEW-t-B-stacked-{}.md".format(n), out)
         self.assertNotEqual(self.entry("t-B")["needs"]["stacked"]["file"], need["file"])
 
+    def test_rl1_suite_ran_at_the_tree_brief_still_asks_the_stacked_form(self):
+        """RL-1 (round 2): once a suite ran at the tree, the carry block is gone, but the stacked need still names the
+        joint file: brief asks the labelled stacked answer refresh accepts, so the one file is recorded and no second
+        review is asked."""
+        self.joined("t-X", "fx.txt")
+        self.joined("t-A", "fa.txt")
+        self.joined("t-B", "fb.txt")
+        self.suite("t-X", 1)
+        self.suite("t-A", 0)
+        self.suite("t-B", 0)
+        self.refresh("--no-merge")
+        tip = self.tip("t-B")
+        need = self.entry("t-B")["needs"]["stacked"]
+        self.assertEqual(need.get("joint"), "independence", need)
+        self.suite("t-B", 0)  # a suite at the rebased tree: carry-over becomes none
+        code, out, err = self.brief("t-B")
+        self.assertIn("its suite passed on this tree", out)
+        self.assertEqual(out.count(FRESH), 1, out)
+        self.assertIn(need["file"], out)
+        self.assertIn("Independent (stacked): yes|no", out)
+        self.assertNotIn(", Independent: yes|no,", out)
+        self.add_worker("t-B", "t-Bq", "reviewer")
+        self.write_review("t-B", need["file"], joint_file(tip, "t-Bq", "pass", ["Independent (stacked): yes"]))
+        code, out, err = self.refresh("--no-merge")
+        self.assertNotIn("asked apart", out + err)
+        self.assertEqual([(r["tip"], r["independent"]) for r in self.stacked_reviews("t-B")], [(tip, True)], out + err)
+
 
 class NoRule(MBase):
     def test_r5_no_rule_no_early_stacked_need(self):
