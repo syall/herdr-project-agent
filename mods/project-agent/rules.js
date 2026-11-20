@@ -65,7 +65,7 @@ export class RulesPane {
     this.field = field; // makes the view's text fields (main.js: focus in one drops an armed Delete)
     this.data = null; // loadRules() result
     this.open = new Set(); // expanded rule ids
-    this.form = null; // { id | null, approve, inputs: { title, text, why, appliesTo, and id for a new rule (t-085) } }
+    this.form = null; // { id | null, approve, space, inputs: { title, text, why, appliesTo, and id for a new rule (t-085) } }
     this.armed = null; // arm(): the rule whose Delete was clicked once (a second click deletes); see armedRule()
     this.pressed = null; // rule id being dragged
     this.declined = false; // declined rules shown
@@ -74,7 +74,13 @@ export class RulesPane {
     this.importPath = null; // InputState, made on first use (never in render)
     this.allow = {}; // space id -> { data, asked, busy }: the last pa-push-allow show --json (data: its report, or { error })
     this.changed = null; // (space, ids, cx): the person changed these rules (main.js: the "rules changed" notice)
+    this.at = null; // () => { space, view }: the space id and view the panel shows (main.js); unset: the caller's space
   }
+
+  // t-134 round 2: one pane serves every space, so a form keeps the space it was opened for (form.space). shows(id):
+  // the panel shows space id (any view); viewing(id): it shows that space's Rules view.
+  shows(spaceId) { const a = this.at?.(); return !a || a.space === spaceId; }
+  viewing(spaceId) { const a = this.at?.(); return !a || (a.space === spaceId && a.view === "rules"); }
 
   // Reads the push allowlist for the view (main.js: the view opening, a reload while it is shown;
   // force: its Refresh link). At most once per ALLOW_EVERY unless forced; one read at a time.
@@ -147,33 +153,36 @@ export class RulesPane {
         if (after) await after(cx);
       }
       catch (e) { this.error = String(e.message ?? e); if (!written) failed?.(); }
-      try { await this.load(space); } catch {}
+      if (this.shows(space.id)) try { await this.load(space); } catch {} // t-134: not into another space's view
       cx.notify();
     });
   }
 
   // `typed` (t-134): what the person typed in a form whose write was refused ({ title, text, why, appliesTo, id }),
-  // shown instead of the rule's own values.
-  edit(rule, approve, typed) {
+  // shown instead of the rule's own values. `spaceId`: the space the form is for; it is drawn and saved only there.
+  edit(rule, approve, typed, spaceId) {
     for (const s of Object.values(this.form?.inputs ?? {})) s.release?.();
     const inputs = {};
     for (const [key, placeholder] of FIELDS) inputs[key] = this.field({ placeholder, value: String(typed?.[key] ?? rule?.[key] ?? (key === "appliesTo" ? "all" : "")) });
     if (!rule) inputs.id = this.field({ placeholder: "Id (optional): r-lowercase-words; empty makes one from the title", ...(typed?.id ? { value: typed.id } : {}) }); // t-085: fixed once made
-    this.form = { id: rule?.id ?? null, approve: Boolean(approve), inputs };
+    this.form = { id: rule?.id ?? null, approve: Boolean(approve), space: spaceId ?? null, inputs };
   }
 
   closeForm() { for (const s of Object.values(this.form?.inputs ?? {})) s.release?.(); this.form = null; }
 
   submit(space, cx, onDecided) {
-    const f = this.form, v = Object.fromEntries(FIELDS.map(([k]) => [k, f.inputs[k].value().trim()]));
+    const f = this.form;
+    if (!f || f.space !== space.id) { this.closeForm(); cx.notify(); return; } // t-134: a form opened for another space never writes this one
+    const v = Object.fromEntries(FIELDS.map(([k]) => [k, f.inputs[k].value().trim()]));
     if (!v.title || !v.text) { this.error = "A rule needs a title and its text."; cx.notify(); return; }
     v.appliesTo ||= "all";
     const id = f.id, approve = f.approve, named = f.id ? "" : (f.inputs.id?.value() ?? "").trim();
     const problem = named && ruleIdProblem(named, this.data?.rules); // checked again against the file when written
     if (problem) { this.error = problem; cx.notify(); return; }
     let made = id; // the new rule's id, chosen against the file as it is when written
-    // t-085 RL1 (t-134): a refused write brings the form back as typed, unless another form was opened meanwhile.
-    const refill = () => { if (!this.form) this.edit(id ? { id } : null, approve, { ...v, id: named }); };
+    // t-085 RL1 (t-134): a refused write brings the form back as typed, unless another form was opened meanwhile,
+    // and only while the panel shows this space's Rules view (round 2: never into another space's view).
+    const refill = () => { if (!this.form && this.viewing(space.id)) this.edit(id ? { id } : null, approve, { ...v, id: named }, space.id); };
     this.closeForm();
     this.save(space, cx, (rules) => {
       if (!id) {
@@ -262,9 +271,9 @@ export class RulesPane {
           .child(this.copier.button(t, `rule-copy-${rule.id}`, () => this.ruleText(rule)))
           .when(proposed, (e) => e
             .child(this.button(t, `rule-approve-${rule.id}`, "Approve", (_e, cx) => this.setStatus(space, cx, rule.id, "active", "approved", onDecided)))
-            .child(this.button(t, `rule-editapprove-${rule.id}`, "Edit, then approve", (_e, cx) => { this.edit(rule, true); cx.notify(); }))
+            .child(this.button(t, `rule-editapprove-${rule.id}`, "Edit, then approve", (_e, cx) => { this.edit(rule, true, null, space.id); cx.notify(); }))
             .child(this.button(t, `rule-decline-${rule.id}`, "Decline", (_e, cx) => this.setStatus(space, cx, rule.id, "declined", "declined", onDecided), t.muted)))
-          .when(!proposed, (e) => e.child(this.button(t, `rule-edit-${rule.id}`, "Edit", (_e, cx) => { this.edit(rule, false); cx.notify(); })))
+          .when(!proposed, (e) => e.child(this.button(t, `rule-edit-${rule.id}`, "Edit", (_e, cx) => { this.edit(rule, false, null, space.id); cx.notify(); })))
           // Two clicks on the same button (ARM_WAIT; Cancel, a press elsewhere, another view or space disarm).
           .child(this.button(t, `rule-delete-${rule.id}`, armed ? "Delete for good?" : "Delete", (_e, cx) => {
             // The arm is asked again at the click (t-028): one that ran out since this was drawn only arms again.
@@ -289,7 +298,7 @@ export class RulesPane {
       .when(Boolean(this.message), (el) => el.child(note(this.message, t.muted)))
       .when(!d.error, (el) => el
         .child(h_flex().gap(6).flex_wrap()
-          .child(this.button(t, "rule-add", "+ Add rule", (_e, cx) => { this.edit(null, false); cx.notify(); }))
+          .child(this.button(t, "rule-add", "+ Add rule", (_e, cx) => { this.edit(null, false, null, space.id); cx.notify(); }))
           .child(this.button(t, "rule-export", "Export", (_e, cx) => cx.spawn(async (cx) => {
             try { this.message = `Exported to ${(await exportRules(space, d.rules)).replace(home(), "~")}`; } catch (e) { this.error = String(e.message ?? e); }
             cx.notify();
@@ -310,7 +319,7 @@ export class RulesPane {
             });
           }, t.muted)))
         .when(Boolean(this.importPath), (e) => e.child(Input.new(this.importPath).h(30).px(8).rounded(6).border_1().border_color(t.input).bg(t.background).text_size(12).text_color(t.foreground)))
-        .when(Boolean(this.form), (e) => e.child(this.formView(t, space, onDecided)))
+        .when(this.form?.space === space.id, (e) => e.child(this.formView(t, space, onDecided))) // t-134: only the space it is for
         .when(proposed.length > 0, (e) => e.child(note(`Proposed by the Project Agent · ${proposed.length}`)).children(proposed.map((r) => this.row(t, space, r, onDecided, false))))
         .child(note(live.length ? "Your rules, highest precedence first" : "No rules yet."))
         .children(live.map((r) => this.row(t, space, r, onDecided, true)))

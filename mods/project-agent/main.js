@@ -167,6 +167,7 @@ export default class ProjectAgent extends View {
     this.viewShown = null; // the view the last render drew (this.view, or the one picked for null)
     this.rules = new RulesPane((options) => this.field(options));
     this.rules.host = this.host;
+    this.rules.at = () => ({ space: this.space, view: this.view }); // t-134: a rules form keeps to its own space
     this.rules.changed = (space, ids, cx) => this.rulesChanged(space, ids, cx); // t-101: the person's rule changes
     this.copier = new Copier(); // the Copy controls of cards and tasks (copy.js, t-026)
     // push cards: the last pa-push-main check and run of each (push.js); its runs take the shared mark (t-045 round 2)
