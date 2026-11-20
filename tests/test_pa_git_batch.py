@@ -357,6 +357,63 @@ class Fallback(Repo):
         self.assertEqual(len(rec.batches()), 1, "nothing runs after the refusal")
 
 
+class Framing(Repo):
+    """t-139 (t-104 VERIFY RL-2): each framing check of batch_objects and batch_diffs on its own. One batch answer is
+    made wrong in one way, the other is git's; the record must equal the per-call record AND the per-call calls must
+    have run after the batch (a cat-file commit and a RAW_DIFF per commit), so an answer accepted by mistake fails."""
+
+    def setUp(self):
+        super().setUp()
+        self.path = self.repo()
+        self.base, self.tip = self.chain(self.path, 3)
+        self.listed = sh(self.path, "git", "rev-list", "--reverse", self.base + ".." + self.tip).split()
+
+    def check(self, which, change):
+        def answer(args, kw, real):
+            code, out, err = real()
+            if which in args:
+                out = change(out)
+            return code, out, err
+        a, batched, b, _p = self.both(pa_hooks.git, self.path, self.tip, base=self.base, answer=answer)
+        self.assertNotIn("error", b)
+        self.assertEqual(same(a), same(b))
+        calls = batched.content()
+        first = min(i for i, c in enumerate(calls) if which in c)
+        after, parent = calls[first + 1:], self.base
+        for sha in self.listed:
+            self.assertIn(("cat-file", "commit", sha), after, "the per-call path ran")
+            self.assertIn(pa_hooks.RAW_DIFF + (parent, sha), after, "the per-call path ran")
+            parent = sha
+
+    def test_a_cat_file_header_naming_another_id_falls_back(self):
+        self.check("--batch", lambda out: self.base.encode() + out[len(self.base):])
+
+    def test_a_cat_file_answer_with_a_trailing_byte_falls_back(self):
+        self.check("--batch", lambda out: out + b"x")
+
+    def test_a_cat_file_object_not_followed_by_a_newline_falls_back(self):
+        def change(out):
+            end = out.index(b"\n")
+            at = end + 1 + int(out[:end].split(b" ")[2])
+            self.assertEqual(out[at:at + 1], b"\n")
+            return out[:at] + b"x" + out[at + 1:]
+        self.check("--batch", change)
+
+    def test_a_diff_tree_header_naming_another_id_falls_back(self):
+        def change(out):
+            tokens = out.split(b"\0")
+            self.assertEqual(tokens[0], self.tip.encode())
+            return b"\0".join([self.base.encode()] + tokens[1:])
+        self.check("--stdin", change)
+
+    def test_a_diff_tree_answer_with_an_extra_token_falls_back(self):
+        self.check("--stdin", lambda out: out + b"x\0")
+
+    def test_a_diff_tree_lone_meta_with_no_path_falls_back(self):
+        zero = b"0" * len(self.base)
+        self.check("--stdin", lambda out: out + b":100644 100644 " + zero + b" " + zero + b" M\0")
+
+
 # ---- R4: the cache's batch shapes -------------------------------------------------------------------------------
 
 class Shapes(unittest.TestCase):
@@ -493,6 +550,16 @@ class Parents(Repo):
         run = self.transient(self.path, "shallow", self.c2 + "\n", "rev-list")
         record = pa_hooks.content_record(pa_hooks.content_git(run), self.path, self.tip, "main", self.base)
         self.assertEqual(record, self.refusal)
+
+    def test_an_empty_list_when_base_is_not_tip_is_refused(self):
+        # t-139 (t-104 VERIFY RL-1, verify/m9.py): a graft "<base> <tip>" during rev-list makes it list nothing; the
+        # objects were never read, so only `listed[-1] (or base) == tip` refuses the 0-commit record, on both paths.
+        run = self.transient(self.path, "info/grafts", "{} {}\n".format(self.base, self.tip), "rev-list")
+        for stdin in (True, False):
+            with self.subTest(stdin=stdin):
+                rec = Rec(run, stdin=stdin)
+                record = pa_hooks.content_record(pa_hooks.content_git(rec), self.path, self.tip, "main", self.base)
+                self.assertEqual(record, self.refusal)
 
     def test_ac6_3_the_per_call_path_checks_the_objects_too(self):
         for name, text in (("info/grafts", "{} {}\n".format(self.tip, self.base)), ("shallow", self.c2 + "\n")):
