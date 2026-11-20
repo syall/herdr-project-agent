@@ -8576,6 +8576,14 @@ cases["P116-push-refused"] = async () => { // RL-2: a run the runtime refused (n
   check(sends().length === 1 && sends()[0][2].startsWith(`decision ${PID} answered Push; result:`), `told once, for the run that ran (got ${JSON.stringify(sends())})`);
 };
 
+cases["P116-costs-refused"] = async () => { // RL-2 (the class): a pa-costs call the runtime refused says it was not started, never "skipped"
+  const LIMIT116 = "a HostModule's async function exceeded the per-runtime outstanding host task limit of 1024";
+  const { v } = await costsWorld({ tool: { collect: () => { throw new RangeError(LIMIT116); } } });
+  await click(v, "costs-refresh"); await settle();
+  const text = costsView(v).text;
+  check(text.includes("Refresh failed: not started: too many calls waiting") && !text.includes("skipped"), `the plain line (got ${text.slice(0, 600)})`);
+};
+
 // --list prints the names that would run and runs none. An unknown name or option exits 2.
 const refuse = (why) => { fs.rmSync(dst, { recursive: true, force: true }); console.error(`run.mjs: ${why}`); process.exit(2); };
 const pick = [];
