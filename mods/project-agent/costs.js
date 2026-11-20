@@ -20,9 +20,16 @@
 //           from <date>"), never as "?" or "*". An older summary has none of these keys and draws as before; nothing more is read.
 //   runs:   on a click only: Refresh (`pa-costs collect`, with this panel's zone), Reconstruct (`pa-costs reconstruct`) on the
 //           space's machine, Turn off (`pa-costs billed disable`, here). Nothing else writes (R12).
+//   layout: (t-143) each section a bordered card: its head (title, count, controls, Copy), its rows with tokens and est. in
+//           right-aligned columns. A list over LIST_ROWS rows, and an open drill over DRILL_ROWS lines (a task's many
+//           sessions), scrolls in a fixed-height box. By task sorts (cost: the summary's order; task id; recent: its last
+//           session's end) and filters (a field made on its click: id, title or state); By day sorts by day or cost. Row ids
+//           stay the summary's index in any order. A task id is a link: shared "project-agent.show" (main.js shows the
+//           Tasks tab with it open), the only shared key this view sets; it reads and runs nothing.
 
 import { div } from "gpui-kit";
-import { v_flex, h_flex } from "gpui-base";
+import { v_flex, h_flex, InputState, Input } from "gpui-base";
+import { setShared } from "herdr";
 import { loadCosts, localId, capped, gaveUp, TIMED_OUT, READ_LIMIT, missingTool } from "./store.js";
 import { run } from "./host.js";
 import { Copier, sel } from "./copy.js";
@@ -36,6 +43,11 @@ const GRACE = 5000; // an exec still unsettled this long after its own timeout i
 const COLLECT_TIMEOUT = 60000, RECONSTRUCT_TIMEOUT = 600000, TOOL_TIMEOUT = 30000;
 const ARG_MAX = 100 * 1024; // the summary passed to the local compare for a remote space (pa-costs refuses more)
 const DAYS_SHOWN = 14, DAYS_MORE = 92, PROBLEMS_SHOWN = 20;
+// t-143: a list over LIST_ROWS rows scrolls at that many rows' height; an open drill over DRILL_ROWS lines likewise.
+const LIST_ROWS = 12, ROW_H = 22, DRILL_ROWS = 10, SUB_H = 18;
+const SORTS = { task: ["cost", "task", "recent"], day: ["day", "cost"] };
+// A task row or line names a task the Tasks tab can open: not a "(no task)" / "(other tasks)" bucket, not deleted.
+const linkable = (key, state) => typeof key === "string" && key !== "" && !key.startsWith("(") && state !== "deleted";
 const DIMS = ["kind", "role", "program", "model", "machine"];
 const ACTIVITY = { "cache-rebuild": "cache rebuild after idle", unattributed: "unattributed" };
 
@@ -154,6 +166,14 @@ export class CostsPane {
     this.shown = shown; // (space id) -> this view is on screen for that space now (main.js)
     this.spaces = new Map(); // space id -> its state (most recently shown last; at most CACHE_MAX)
     this.seq = 0;
+    this.showAt = 0; // t-143: the last task link's request stamp (each one new, so main.js takes it)
+  }
+
+  // t-143: a task link: ask the panel to show the task in the Tasks tab (main.js reads "project-agent.show" in render).
+  openTask(space, task, cx) {
+    this.showAt = Math.max(Date.now(), this.showAt + 1);
+    setShared("project-agent.show", { space: space.id, task, at: this.showAt });
+    cx.notify();
   }
 
   // A task's context for its calls: background (a read or compare the view asked for itself) or a click's (waits for a
@@ -165,7 +185,8 @@ export class CostsPane {
     let st = this.spaces.get(id);
     if (st) { this.spaces.delete(id); this.spaces.set(id, st); return st; }
     st = { summary: null, readAt: 0, error: null, timedOut: false, missing: null, readFailed: null, busy: false, at: 0, seq: 0, stale: false,
-      run: null, billing: { data: null, at: 0, busy: false, error: null }, open: {}, dim: "kind", moreDays: false, problemsOpen: false };
+      run: null, billing: { data: null, at: 0, busy: false, error: null }, open: {}, dim: "kind", moreDays: false, problemsOpen: false,
+      sort: { task: "cost", day: "day" }, filter: null }; // t-143: filter: the By task field (InputState), made on its click
     this.spaces.set(id, st);
     while (this.spaces.size > CACHE_MAX) this.spaces.delete(this.spaces.keys().next().value);
     return st;
@@ -364,14 +385,14 @@ export class CostsPane {
     const day0 = z.local ? daysBefore(localToday, 6) : new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate() - 6)).toISOString().slice(0, 10);
     const week = sum(dayList.filter((d) => d.key >= day0));
     // alt: the figure instead of est. (Claude Code's, where there is no est.); cc: Claude Code's line under it.
-    const tile = (title, e, small, alt = null, cc = null) => {
+    const tile = (title, e, small, alt = null, cc = null, big = false) => {
       const figure = alt ?? (priced ? est(e, cur) : `${tokens(e.tokens)} tokens`);
       lines.push(`${title}: ${figure} · ${small}`);
       const i = lines.length; // its row in the copy text: a stable id
       if (cc) lines.push(cc);
-      return v_flex().flex_1().min_w(0).p(8).gap(2).rounded(7).border(1).border_color(t.border).bg(t.surface)
+      return v_flex().flex_1().min_w(0).p(8).gap(2).rounded(7).border(1).border_color(big ? t.accent : t.border).bg(t.surface)
         .child(div().text_size(11).text_color(t.dim).child(sel(`costs-sel-tile-${i}-title`, title)))
-        .child(div().text_size(15).font_semibold().text_color(t.foreground).child(sel(`costs-sel-tile-${i}-figure`, figure)))
+        .child(div().text_size(big ? 18 : 15).font_semibold().text_color(t.foreground).child(sel(`costs-sel-tile-${i}-figure`, figure)))
         .child(div().text_size(10.5).text_color(t.dim).child(sel(`costs-sel-tile-${i}-small`, small)))
         .when(Boolean(cc), (x) => x.child(div().text_size(10.5).text_color(t.muted).child(sel(`costs-sel-tile-${i}-cc`, cc))));
     };
@@ -383,7 +404,7 @@ export class CostsPane {
     const ccAlt = cc && ccM !== null && noEst ? `Claude Code: ${ccMoney(ccM)} (list price)` : null;
     const ccLine = !cc ? null : ccM === null ? `Claude Code: no figure · ${count}` : noEst ? `Claude Code's figure: ${count}` : `Claude Code: ${ccMoney(ccM)} (list price) · ${count}`;
     return h_flex().gap(6)
-      .child(tile("Total", { money: tot.money, unpricedTokens: tot.unpricedTokens, tokens: all }, `${tokens(all)} tokens${all ? ` · ${Math.round((cr / all) * 100)}% cache read` : ""}${acct ? ` · account ${acct}` : ""}`, ccAlt, ccLine))
+      .child(tile("Total", { money: tot.money, unpricedTokens: tot.unpricedTokens, tokens: all }, `${tokens(all)} tokens${all ? ` · ${Math.round((cr / all) * 100)}% cache read` : ""}${acct ? ` · account ${acct}` : ""}`, ccAlt, ccLine, true))
       .child(tile("Today", sum(mine), `${tokens(sum(mine).tokens)} tokens`))
       .child(tile(z.local ? "Last 7 days" : `Last 7 days (${z.label})`, week, `${tokens(week.tokens)} tokens`));
   }
@@ -415,33 +436,57 @@ export class CostsPane {
   }
 
   sections(t, space, st, s, cur) {
-    const out = v_flex().gap(6);
+    const out = v_flex().gap(8);
     const totalMoney = s.totals?.money;
     const ccOn = Boolean(ccOf(s)); // Claude Code's figure on session lines and task rows (AC7.2), only with totals.cc
     // Each section's text as drawn, for its Copy: the head, its rows, and the open drill rows (indented).
     const blocks = {}; let lines = [];
     const begin = (key, text) => { lines = blocks[key] = [text]; };
     const copy = (key) => this.copier.button(t, `costs-copy-${key}`, () => blocks[key].join("\n"));
-    const head = (text) => div().pt(4).px(4).text_size(11.5).font_semibold().text_color(t.foreground).child(text);
-    const titled = (key, text) => { begin(key, text); return h_flex().gap(6).items_center().child(head(text)).child(copy(key)); };
+    const head = (text) => div().flex_none().px(2).text_size(12).font_semibold().text_color(t.foreground).child(text);
+    // t-143: a section is a card: its head row (title, a dim count, its controls, Copy), then its rows in a list box.
+    const chip = (id, label, on, click) => div().id(id).flex_none().px(6).h(20).flex().items_center().rounded(5).text_size(11)
+      .bg(on ? t.selected : t.chrome).text_color(on ? t.foreground : t.muted).cursor_pointer().hover((x) => x.bg(t.hover)).on_click(click).child(label);
+    const titled = (key, text, meta = null, controls = []) => { begin(key, text); return h_flex().gap(6).items_center().flex_wrap().child(head(text))
+      .when(Boolean(meta), (x) => x.child(div().flex_none().text_size(10.5).text_color(t.dim).child(meta))).child(div().flex_1()).children(controls).child(copy(key)); };
+    const card = (key, top, rows) => v_flex().id(`costs-sec-${key}`).gap(2).p(6).rounded(7).border(1).border_color(t.border)
+      .children(Array.isArray(top) ? top : [top])
+      .child(v_flex().id(`costs-list-${key}`).gap(1).when(rows.length > LIST_ROWS, (x) => x.h(LIST_ROWS * ROW_H).overflow_y_scrollbar()).children(rows));
+    const sortChips = (section) => [div().flex_none().text_size(10.5).text_color(t.dim).child("Sort:"),
+      ...SORTS[section].map((k) => chip(`costs-sort-${section}-${k}`, k, st.sort[section] === k, (_e, cx) => { st.sort[section] = k; cx.notify(); }))];
+    // A number column: right-aligned in at least `w` px, so the figures line up down a section.
+    const col = (w, el) => h_flex().flex_none().min_w(w).child(div().flex_1()).child(el);
+    // A task link (t-143): its own target; a click does not toggle the row it sits in.
+    const link = (id, key, size = 12) => div().id(id).flex_none().text_size(size).text_color(t.accent).cursor_pointer().hover((x) => x.bg(t.hover))
+      .on_click((_e, cx) => { cx.stop_propagation(); this.openTask(space, key, cx); }).child(key);
+    const taskState = new Map(list(s.byTask).map((x) => [str(x.key), x.state]));
     let n = 0; // the drill rows (children of a row's v_flex, not of its clickable h_flex) are selectable
     const sub = (text, color) => { lines.push(`  ${text}`); return div().pl(20).text_size(11).text_color(color ?? t.muted).child(sel(`costs-sel-sub-${n++}`, text)); };
-    const row = (section, i, entry, label, extra, drill) => {
+    // A drill line that starts with a task id: the id a link, the rest selectable; its Copy line is the whole text.
+    const subLink = (id, key, rest) => { lines.push(`  ${key} ${rest}`); return h_flex().pl(20).gap(4).items_center().child(link(id, key, 11)).child(div().min_w(0).text_size(11).text_color(t.muted).child(sel(`costs-sel-sub-${n++}`, rest))); };
+    // An open drill: in its own box, which scrolls at a fixed height when it is long (a task's many sessions).
+    const drillBox = (section, kids) => v_flex().id(`costs-drill-${section}`).when(kids.length > DRILL_ROWS, (x) => x.h(DRILL_ROWS * SUB_H).overflow_y_scrollbar()).children(kids);
+    // linkTo: { key, rest }: the label's leading task id drawn as a link, the rest after it.
+    const row = (section, i, entry, label, extra, drill, linkTo = null) => {
       const key = str(entry.key), open = st.open[section] === key;
       const share = totalMoney && entry.money !== null && entry.money !== undefined && !num(entry.unpricedTokens) ? ` · ${Math.round((num(entry.money) / totalMoney) * 100)}%` : "";
       const tag = priceTag(entry), mark = num(entry.reconstructed) > 0 ? " ◌" : "";
       const ccCell = ccOn && section === "task" && ccNum(entry.cc) !== null ? `CC ${money(entry.cc, null)} (${num(entry.ccSessions)} of ${num(entry.ccOf)} ${num(entry.ccOf) === 1 ? "session" : "sessions"})` : "";
       lines.push([`${label}${mark}`, extra, tag, `${tokens(entry.tokens)} tokens`, `${est(entry, cur)}${share}`, ccCell].filter(Boolean).join(" · "));
-      const el = v_flex().child(h_flex().id(`costs-${section}-${i}`).gap(8).px(4).items_center().cursor_pointer().hover((x) => x.bg(t.hover))
+      const name = linkTo
+        ? h_flex().flex_1().min_w(0).gap(5).items_center().child(link(`costs-link-${section}-${i}`, linkTo.key))
+          .when(Boolean(`${linkTo.rest}${mark}`), (x) => x.child(div().min_w(0).truncate().text_size(12).text_color(t.foreground).child(`${linkTo.rest}${mark}`)))
+        : div().flex_1().min_w(0).truncate().text_size(12).text_color(t.foreground).child(`${label}${mark}`);
+      const el = v_flex().child(h_flex().id(`costs-${section}-${i}`).gap(8).px(4).py(1).rounded(4).items_center().cursor_pointer().hover((x) => x.bg(t.hover))
         .on_click((_e, cx) => { st.open[section] = open ? null : key; cx.notify(); })
         .child(div().flex_none().text_size(11).text_color(t.dim).child(drill ? (open ? "▾" : "▸") : " "))
-        .child(div().flex_1().min_w(0).truncate().text_size(12).text_color(t.foreground).child(`${label}${mark}`))
+        .child(name)
         .when(Boolean(extra), (x) => x.child(div().flex_none().text_size(10.5).text_color(t.dim).child(extra)))
         .when(Boolean(tag), (x) => x.child(div().flex_none().text_size(10.5).text_color(t.blocked).child(tag)))
-        .child(div().flex_none().text_size(11).text_color(t.dim).child(`${tokens(entry.tokens)} tokens`))
-        .child(div().flex_none().text_size(12).text_color(t.foreground).child(`${est(entry, cur)}${share}`))
+        .child(col(64, div().text_size(11).text_color(t.dim).child(`${tokens(entry.tokens)} tokens`)))
+        .child(col(120, div().text_size(12).text_color(t.foreground).child(`${est(entry, cur)}${share}`)))
         .when(Boolean(ccCell), (x) => x.child(div().flex_none().text_size(11).text_color(t.muted).child(ccCell))));
-      return open && drill ? el.children(drill()) : el;
+      return open && drill ? el.child(drillBox(section, drill())) : el;
     };
     // With two or more scopes (t-032 J1d) a session line says its scope after the model, and how it was priced where that
     // is another scope (or not at all); a session whose rows span scopes shows its largest and says so.
@@ -473,56 +518,88 @@ export class CostsPane {
         return sub([`${g.model}${withScope ? ` (${scopeText(g.facts)})` : ""}`, `${tokens(g.tokens)} tokens`, est(e, cur), pricedNote(g.facts, g.pricedAs), priceTag(e)].filter(Boolean).join(" · "));
       });
     };
-    const entries = (items) => items.map((e) => sub(`${str(e.key)} · ${tokens(e.tokens)} tokens · ${est(e, cur)}${priceTag(e) ? ` · ${priceTag(e)}` : ""}`));
+    // linkBase: the drill's task lines link (ids costs-link-<linkBase>-<j>) where the key names a task.
+    const entries = (items, linkBase = null) => items.map((e, j) => {
+      const key = str(e.key), rest = `· ${tokens(e.tokens)} tokens · ${est(e, cur)}${priceTag(e) ? ` · ${priceTag(e)}` : ""}`;
+      return linkBase && linkable(key, taskState.get(key)) ? subLink(`costs-link-${linkBase}-${j}`, key, rest) : sub(`${key} ${rest}`);
+    });
     // By activity: tasks of an activity; unattributed: its reasons; cache rebuild: the passes with a rebuild and its tasks.
     const acts = list(s.byActivity);
-    out.child(titled("activity", "By activity"));
-    acts.forEach((a, i) => out.child(row("activity", i, a, ACTIVITY[a.key] ?? str(a.key).replace(/^pass:/, "pass: "), null, () => [
+    const actHead = titled("activity", "By activity", `${acts.length} ${acts.length === 1 ? "activity" : "activities"}`);
+    out.child(card("activity", actHead, acts.map((a, i) => row("activity", i, a, ACTIVITY[a.key] ?? str(a.key).replace(/^pass:/, "pass: "), null, () => [
       ...(a.key === "unattributed" ? [sub("Reasons:", t.dim), ...entries(list(a.reasons))] : []),
       ...(a.key === "cache-rebuild" ? [sub("Passes with a cache rebuild:", t.dim), ...list(s.passes).filter((p) => p.rebuild).map((p) => sub(`pass ${str(p.pass)} · ${str(p.trigger)} · ${clock(p.from)} · ${est(p, cur)} · cache rebuild`))] : []),
-      sub("Tasks:", t.dim), ...entries(list(a.tasks)),
-    ])));
-    // By task: its phases and its sessions.
-    out.child(titled("task", "By task"));
-    list(s.byTask).forEach((x, i) => out.child(row("task", i, x, `${str(x.key)}${x.key === "(other tasks)" && x.tasks ? ` (${x.tasks} tasks)` : ""}${x.state === "deleted" ? " (deleted)" : ""}${x.title ? ` ${str(x.title)}` : ""}${x.split ? " ≈" : ""}`,
-      x.state && x.state !== "deleted" ? str(x.state) : null, () => [
+      sub("Tasks:", t.dim), ...entries(list(a.tasks), `activity-${i}`),
+    ]))));
+    // By task: its phases and its sessions. Sorted (cost: the summary's order; task: by id; recent: its last session's
+    // end) and filtered (id, title or state); each row keeps its summary index as its id.
+    const tasksAll = list(s.byTask).map((x, i) => ({ x, i }));
+    const ends = new Map(list(s.sessions).map((x) => [str(x.key), Date.parse(str(x.to))]));
+    const lastEnd = (x) => (Array.isArray(x.sessions) ? x.sessions : []).reduce((a, k) => { const v = ends.get(str(k)); return v !== undefined && !Number.isNaN(v) && v > a ? v : a; }, -Infinity);
+    const bucket = (x) => str(x.key).startsWith("(");
+    const bySort = {
+      cost: (a, b) => a.i - b.i,
+      task: (a, b) => (bucket(a.x) - bucket(b.x)) || str(a.x.key).localeCompare(str(b.x.key), undefined, { numeric: true }) || a.i - b.i,
+      recent: (a, b) => { const ea = lastEnd(a.x), eb = lastEnd(b.x); return ea === eb ? a.i - b.i : eb > ea ? 1 : -1; },
+    };
+    const q = str(st.filter?.value?.()).trim().toLowerCase();
+    const tasksShown = tasksAll.filter(({ x }) => !q || [x.key, x.title, x.state].map(str).join(" ").toLowerCase().includes(q)).sort(bySort[st.sort.task] ?? bySort.cost);
+    const count = q ? `${tasksShown.length} of ${tasksAll.length} tasks` : `${tasksAll.length} ${tasksAll.length === 1 ? "task" : "tasks"}`;
+    const filterChip = st.filter ? [] : [chip("costs-filter-task", "Filter", false, (_e, cx) => {
+      st.filter = InputState.new({ placeholder: "Filter tasks by id, title or state" }); // made on the click: never in render
+      st.filter.on?.("change", (_e2, cx2) => cx2.notify());
+      st.filter.focus?.();
+      cx.notify();
+    })];
+    const taskTop = [titled("task", "By task", count, [...sortChips("task"), ...filterChip])];
+    if (st.filter) taskTop.push(h_flex().gap(6).items_center()
+      .child(Input.new(st.filter).flex_1().h(24).px(6).rounded(6).border_1().border_color(t.input).bg(t.background).text_size(11.5).text_color(t.foreground))
+      .child(chip("costs-filter-task-clear", "Clear", false, (_e, cx) => { st.filter = null; cx.notify(); })));
+    const taskRows = tasksShown.map(({ x, i }) => {
+      const rest = `${x.key === "(other tasks)" && x.tasks ? ` (${x.tasks} tasks)` : ""}${x.state === "deleted" ? " (deleted)" : ""}${x.title ? ` ${str(x.title)}` : ""}${x.split ? " ≈" : ""}`;
+      return row("task", i, x, `${str(x.key)}${rest}`, x.state && x.state !== "deleted" ? str(x.state) : null, () => [
         ...(x.split ? [sub("≈ shared passes split by journal entries", t.dim)] : []),
         sub("Phases:", t.dim), ...entries(list(x.phases)),
         sub("Sessions:", t.dim), ...sessionsOf((ss) => (Array.isArray(x.sessions) ? x.sessions : []).includes(ss.key)),
-      ])));
+      ], linkable(str(x.key), x.state) ? { key: str(x.key), rest: rest.trim() } : null);
+    });
+    if (q && !tasksShown.length) taskRows.push(sub(`No task matches “${q}”.`, t.dim));
+    out.child(card("task", taskTop, taskRows));
     // By session type: a selector; the machine is shown as Herdr's machine name, never a host name.
     begin("kind", `By session type: ${st.dim}`);
-    out.child(h_flex().gap(4).items_center().child(head("By session type")).child(copy("kind")).children(DIMS.map((d) => div().id(`costs-dim-${d}`).px(6).h(20).flex().items_center().rounded(5).text_size(11)
-      .bg(st.dim === d ? t.selected : t.chrome).text_color(st.dim === d ? t.foreground : t.muted).cursor_pointer().on_click((_e, cx) => { st.dim = d; st.open.kind = null; cx.notify(); }).child(d))));
+    const kindHead = h_flex().gap(4).items_center().flex_wrap().child(head("By session type")).child(div().flex_1()).children(DIMS.map((d) => chip(`costs-dim-${d}`, d, st.dim === d, (_e, cx) => { st.dim = d; st.open.kind = null; cx.notify(); }))).child(copy("kind"));
     const dimRows = st.dim === "machine" ? [this.machineRow(s, space)] : list(s.byKind?.[st.dim]);
-    dimRows.forEach((x, i) => out.child(row("kind", i, x, str(x.key), null, () => [
+    out.child(card("kind", kindHead, dimRows.map((x, i) => row("kind", i, x, str(x.key), null, () => [
       ...(tags && st.dim === "model" ? [sub(`Scopes${dmFrom}:`, t.dim), ...modelLines((e) => str(e.model) === str(x.key), true)] : []),
-      ...sessionsOf((ss) => st.dim === "machine" || str(ss[st.dim] ?? "(none)") === str(x.key))])));
+      ...sessionsOf((ss) => st.dim === "machine" || str(ss[st.dim] ?? "(none)") === str(x.key))]))));
     // Accounts (R-A3, t-032 J1d): two or more account labels; each with its sessions.
     const accts = accountsOf(s);
     if (accts.length > 1) {
-      out.child(titled("account", "Accounts"));
-      accts.forEach((x, i) => out.child(row("account", i, x, str(x.key), null, () => [sub("Sessions:", t.dim), ...sessionsOf((ss) => str(ss.account) === str(x.key))])));
+      const accHead = titled("account", "Accounts");
+      out.child(card("account", accHead, accts.map((x, i) => row("account", i, x, str(x.key), null, () => [sub("Sessions:", t.dim), ...sessionsOf((ss) => str(ss.account) === str(x.key))]))));
     }
     // By scope (A-V3): two or more scopes; each says how it was priced where that is another scope; its models and sessions.
     if (tags) {
-      out.child(titled("scope", "By scope (provider · endpoint · region · account)"));
-      list(s.byScope).forEach((x, i) => {
+      const scopeHead = titled("scope", "By scope (provider · endpoint · region · account)");
+      out.child(card("scope", scopeHead, list(s.byScope).map((x, i) => {
         const f = factsOf(x), same = (e) => factsText(factsOf(e)) === factsText(f);
-        out.child(row("scope", i, x, scopeText(f, x.by), pricedNote(f, x.pricedAs, true) || null, () => [
-          sub(`Models${dmFrom}:`, t.dim), ...modelLines(same, false), sub("Sessions:", t.dim), ...sessionsOf(same)]));
-      });
+        return row("scope", i, x, scopeText(f, x.by), pricedNote(f, x.pricedAs, true) || null, () => [
+          sub(`Models${dmFrom}:`, t.dim), ...modelLines(same, false), sub("Sessions:", t.dim), ...sessionsOf(same)]);
+      })));
     }
-    // By day: newest first; Show more reveals up to 92. A day pa-costs cut in UTC (older than the zone table) says (UTC).
-    const days = list(s.byDay);
+    // By day: newest first (or by cost); Show more reveals up to 92. A day pa-costs cut in UTC (older than the zone table) says (UTC).
+    const days = list(s.byDay).map((d, i) => ({ d, i }));
+    if (st.sort.day === "cost") days.sort((a, b) => (b.d.money ?? -1) - (a.d.money ?? -1) || a.i - b.i);
     const z = summaryZone(s, Date.now());
-    out.child(titled("day", z.local ? "By day" : `By day (${z.label})`));
-    days.slice(0, st.moreDays ? DAYS_MORE : DAYS_SHOWN).forEach((d, i) => out.child(row("day", i, d, d.key === "older" ? `older (${num(d.days)} days)` : `${str(d.key)}${d.utc ? " (UTC)" : ""}`, null,
+    const dayHead = titled("day", z.local ? "By day" : `By day (${z.label})`, null, sortChips("day"));
+    const dayRows = days.slice(0, st.moreDays ? DAYS_MORE : DAYS_SHOWN).map(({ d, i }) => row("day", i, d, d.key === "older" ? `older (${num(d.days)} days)` : `${str(d.key)}${d.utc ? " (UTC)" : ""}`, null,
       // Each activity with its tokens and est., marked as the rows are (t-028; activities from pa-costs of t-028 on);
       // an older summary's byActivity (priced money only) as before.
       () => (Array.isArray(d.activities) ? list(d.activities).map((a) => sub(`${ACTIVITY[a.key] ?? str(a.key)} · ${tokens(a.tokens)} tokens · ${est(a, cur)}${priceTag(a) ? ` · ${priceTag(a)}` : ""}`))
-        : Object.entries(d.byActivity && typeof d.byActivity === "object" ? d.byActivity : {}).map(([k, v]) => sub(`${ACTIVITY[k] ?? k} · ${money(v, cur)} est.`))))));
-    if (days.length > DAYS_SHOWN && !st.moreDays) out.child(div().id("costs-days-more").px(4).text_size(11.5).text_color(t.accent).cursor_pointer().on_click((_e, cx) => { st.moreDays = true; cx.notify(); }).child("Show more"));
+        : Object.entries(d.byActivity && typeof d.byActivity === "object" ? d.byActivity : {}).map(([k, v]) => sub(`${ACTIVITY[k] ?? k} · ${money(v, cur)} est.`)))));
+    const dayCard = card("day", dayHead, dayRows);
+    if (days.length > DAYS_SHOWN && !st.moreDays) dayCard.child(div().id("costs-days-more").px(4).text_size(11.5).text_color(t.accent).cursor_pointer().on_click((_e, cx) => { st.moreDays = true; cx.notify(); }).child("Show more"));
+    out.child(dayCard);
     return out;
   }
 
