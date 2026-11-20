@@ -62,11 +62,15 @@ function printed(r) {
 const said = (r) => String(r?.stderr || r?.stdout || "").trim().slice(0, 600);
 
 // One exec of the tool on the space's machine, given up GRACE after its own timeout (an exec that never
-// settles). { r } or { error }, or { busy: true } (t-053: one of its kind still pending; nothing started, nothing to say).
+// settles). { r } or { error }, or { busy: true } (t-053: one of its kind still pending; nothing started, nothing to say),
+// or { refused: true, error } (t-116, t-053 RL-2: the runtime refused the exec, so it never started: REFUSED comes only
+// from a start the runtime turned down, never from a call that ran).
 // hcx: the task's context (a Host's ctx: keyed `key`; a plain cx: capped only).
+export const NOT_STARTED = "not started: too many calls waiting";
 async function call(hcx, space, command, args, timeout, key = null) {
   try {
     const r = await capped(hcx, () => hostRun(command, args, { on: space.machine ?? null, timeout }), { key, limit: timeout + GRACE, what: `${command} ${args[0]}` });
+    if (r?.refused === true) return { refused: true, error: NOT_STARTED };
     if (gaveUp(r) && r !== TIMED_OUT) return { busy: true };
     return r === TIMED_OUT ? { error: `${command} ${args[0]} did not answer in ${Math.round((timeout + GRACE) / 1000)} s` } : { r };
   } catch (e) { return { error: String(e.message ?? e) }; }
@@ -75,8 +79,8 @@ const ctxOf = (host, cx, click) => (host ? host.ctx(cx, { origin: "push", backgr
 
 // `pa-push-allow show --json` (read-only), for the Rules view: its report, or { error }.
 export async function readAllow(space, cx, host = null, click = false) {
-  const { r, error, busy } = await call(ctxOf(host, cx, click), space, "pa-push-allow", ["show", "--json", "--space", localId(space.id)], ALLOW_TIMEOUT, `allow:${space.id}`);
-  if (busy) return { busy: true }; // t-053: the last one is still pending: the caller keeps what it has
+  const { r, error, busy, refused } = await call(ctxOf(host, cx, click), space, "pa-push-allow", ["show", "--json", "--space", localId(space.id)], ALLOW_TIMEOUT, `allow:${space.id}`);
+  if (busy || refused) return { busy: true }; // t-116: refused, as before: nothing ran, the caller keeps what it has // t-053: the last one is still pending: the caller keeps what it has
   if (error) return { error };
   return printed(r) ?? { error: said(r) || `pa-push-allow exited with ${r?.code}` };
 }
@@ -133,8 +137,8 @@ export class PushCards {
     const asked = Date.now();
     st.busy = true; st.asked = asked; st.stale = false;
     cx.spawn(async (cx) => {
-      const { r, error, busy } = await call(ctxOf(this.host, cx, !auto), space, "pa-push-main", ["check", entry.id, "--space", localId(space.id), "--json"], CHECK_TIMEOUT, `check:${space.id}:${entry.id}`);
-      if (busy) { st.busy = false; cx.notify(); return; } // the last check still pending: nothing read, nothing said (never "open")
+      const { r, error, busy, refused } = await call(ctxOf(this.host, cx, !auto), space, "pa-push-main", ["check", entry.id, "--space", localId(space.id), "--json"], CHECK_TIMEOUT, `check:${space.id}:${entry.id}`);
+      if (busy || refused) { st.busy = false; cx.notify(); return; } // t-116: refused, as before: nothing ran // the last check still pending: nothing read, nothing said (never "open")
       st.check = error ? failed(`pa-push-main check could not run: ${error}`) : printed(r) ?? failed(`pa-push-main check printed no result${said(r) ? `: ${said(r)}` : ` (exit ${r?.code})`}`);
       st.at = asked; st.busy = false;
       if (st.unknown && !st.running && !st.result && readOpen(st.check)) this.share(space.id, entry.id, null); // known open again
@@ -173,8 +177,17 @@ export class PushCards {
     st.note = label === OTHER ? note : null;
     this.share(space.id, entry.id, label, true, false, st.note);
     cx.spawn(async (cx) => {
-      const { r, error } = await call(ctxOf(this.host, cx, true), space, "pa-push-main", args, RUN_TIMEOUT, `run:${space.id}:${entry.id}`);
+      const { r, error, refused } = await call(ctxOf(this.host, cx, true), space, "pa-push-main", args, RUN_TIMEOUT, `run:${space.id}:${entry.id}`);
       st.running = null;
+      // t-116 (t-053 RL-2): the runtime refused the exec: pa-push-main never started, so nothing can have been answered or
+      // pushed. The card is as before the click (its check kept, so Submit works again) with the plain line; no lock, not
+      // kept, nobody told; only this run's own running mark goes (sharePush removes a mark only when this copy wrote it).
+      if (refused) {
+        st.error = error;
+        this.share(space.id, entry.id, null);
+        cx.notify();
+        return;
+      }
       let notice;
       const out = error ? null : printed(r);
       // The answer the card has, as the tool says (t-045): a card answered before this run (Push, say, when Not now
