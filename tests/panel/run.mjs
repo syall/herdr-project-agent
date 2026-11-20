@@ -6382,7 +6382,7 @@ cases["P83-1-places"] = async () => { // AC1.1, AC1.2: the kinds, their limits a
 cases["P83-2-waiting"] = async () => { // R9: effective order, kind labels, reasons, the queue job without buttons; AC9.1
   const { v } = await placesWorld();
   const { text, clicks } = look(v);
-  const at = ["1. t-020 verify-2 · verifier · suite step", "2. t-060 merge-check · verifier · suite step", "3. t-083 design · design · no-test"].map((s) => text.indexOf(s));
+  const at = ["t-020 | verify-2 | verifier · suite step", "t-060 | merge-check | verifier · suite step", "t-083 | design | design · no-test"].map((s) => text.indexOf(s)); // t-156: slots, no numbers
   check(at.every((i) => i >= 0) && at[0] < at[1] && at[1] < at[2], `the jobs in order (got ${text})`);
   check(text.includes("Waiting · 3") && text.includes("merge queue order (Queue tab)") && text.includes("waits for a suite place (2 of 2)") && text.includes("next to start: the no-test extra place is free"), `reasons (got ${text})`);
   check(/order: the Project Agent's/.test(text), "no order file: the Project Agent's order");
@@ -6399,7 +6399,7 @@ cases["P83-3-move"] = async () => { // AC6.1, AC6.3: a move writes the whole ord
   check(typeof g.__files[path] === "string" && JSON.stringify(pinsOf(g.__files[path])) === JSON.stringify([{ id: "t-083/design", slot: 0 }]), `the new pin (got ${g.__files[path]})`);
   const doc = JSON.parse(g.__files[path]);
   check(doc.version === 2 && doc.by === "person" && doc.moves.length === 1 && doc.moves[0].id === "t-083/design" && doc.moves[0].move === "top", `the file (got ${g.__files[path]})`);
-  check(/order: yours/.test(look(v).text) && look(v).text.indexOf("1. t-083 design") >= 0, `drawn in the new order (got ${look(v).text})`);
+  check(/order: yours/.test(look(v).text) && P156.first(look(v).text) === "t-083 | design", `drawn in the new order (got ${look(v).text})`);
   await click(v, "place-down-t-083/design"); await settle();
   check(JSON.stringify(pinsOf(g.__files[path])) === JSON.stringify([{ id: "t-083/design", slot: 1 }]), `down: its pin replaced (got ${g.__files[path]})`);
   await click(v, "place-up-t-083/design"); await settle();
@@ -6477,7 +6477,7 @@ cases["P133-places-hung"] = async () => { // t-083 J2 RL2: both places reads han
   g.__hang = [`${dir}/waiting.json`, `${dir}/start-order.json`];
   advance(3000); v.reload(cx); await settle(); await step(11000);
   ({ text, clicks } = look(v));
-  check(text.includes("Waiting · 3") && text.includes("1. t-020 verify-2") && text.includes("3. t-083 design"), `the Waiting lines stay (got ${text.slice(0, 900)})`);
+  check(text.includes("Waiting · 3") && text.includes("t-020 | verify-2") && text.includes("t-083 | design"), `the Waiting lines stay (got ${text.slice(0, 900)})`);
   check(Boolean(clicks["place-down-t-020/verify-2"]) && Boolean(clicks["place-up-t-083/design"]), "the buttons stay");
   check(!text.includes("No waiting list yet") && !text.includes("Loading waiting list"), `never missing or loading again (got ${text.slice(0, 900)})`);
   g.__hang = [];
@@ -6670,29 +6670,28 @@ cases["P97-12-places-rank"] = async () => { // R9, R27: the waiting list follows
   const waiting = { version: 1, jobs: [P83.job("t-2/build", "working"), P83.job("t-1/build", "working")] };
   let { v } = await orderWorld({ tasks, waiting });
   let text = look(v).text;
-  check(text.indexOf("1. t-2 build") >= 0 && text.indexOf("2. t-1 build") >= 0, `no task order: the added order (got ${text})`);
+  check(P156.order(text, ["t-2 | build", "t-1 | build"]), `no task order: the added order (got ${text})`);
   ({ v } = await orderWorld({ tasks, waiting, order: tOrder([]) }));
   text = look(v).text;
-  check(text.indexOf("1. t-1 build") >= 0 && text.indexOf("2. t-2 build") >= 0, `a task order: by rank (got ${text})`);
+  check(P156.order(text, ["t-1 | build", "t-2 | build"]), `a task order: by rank (got ${text})`);
   ({ v } = await orderWorld({ tasks, waiting, taskOrder: { order: ["t-2"], chat: [] } }));
-  check(look(v).text.indexOf("1. t-2 build") >= 0, "the ledger's taskOrder counts");
+  check(P156.first(look(v).text) === "t-2 | build", "the ledger's taskOrder counts");
   ({ v } = await orderWorld({ tasks, waiting: { version: 1, jobs: [P83.job("t-1/build", "working"), P83.job("t-2/build", "working")] } }));
-  check(look(v).text.indexOf("1. t-1 build") >= 0, "before the move");
+  check(P156.first(look(v).text) === "t-1 | build", "before the move");
   await click(v, "tmove-up-t-2"); await settle();
   text = look(v).text;
-  check(text.indexOf("1. t-2 build") >= 0, `a task move moves its jobs (got ${text})`);
+  check(P156.first(text) === "t-2 | build", `a task move moves its jobs (got ${text})`);
 };
 
 cases["P97-13-shared-places"] = async () => { // R9, R10: the shared rank and pin cases drawn in the Places list
-  const label = (id) => { const [task, job] = id.split("/"); return `${task} ${job}`; };
+  const label = (id) => { const [task, job] = id.split("/"); return `${task} | ${job}`; }; // t-156: the slot head
   const PSH = sample("places-cases.json");
   for (const c of [...PSH.rankCases, ...PSH.pinCases]) {
     const jobs = c.jobs.map((j) => { const x = typeof j === "string" ? { id: j } : j; return P83.job(x.id, "working", { source: x.source ?? "pa" }); });
     const tasks = c.rank.map((id, i) => tq(id, "queued", i + 1));
     const { v } = await orderWorld({ tasks, waiting: { version: 1, jobs }, order: tOrder(c.rank), startOrder: c.orderText ?? undefined });
     const text = look(v).text;
-    const at = c.effective.map((id, i) => text.indexOf(`${i + 1}. ${label(id)} `));
-    check(at.every((x) => x >= 0), `${c.name}: ${JSON.stringify(c.effective)} (got ${text.slice(text.indexOf("Waiting ·"), text.indexOf("Waiting ·") + 400)})`);
+    check(P156.order(text, c.effective.map((id) => `${label(id)} | `)), `${c.name}: ${JSON.stringify(c.effective)} (got ${text.slice(text.indexOf("Waiting ·"), text.indexOf("Waiting ·") + 400)})`);
   }
 };
 
@@ -6729,7 +6728,7 @@ cases["P120-3-places-rank-unknown"] = async () => { // t-097 REVIEW J2 RL-2 (R9)
   g.__hang = [];
   advance(3000); v.reload(cx); await settle(); await step(1000);
   ({ text, clicks } = look(v));
-  check(Boolean(clicks["place-down-t-1/build"]) && text.indexOf("1. t-1 build") >= 0, `read: by rank, the moves back (got ${text.slice(0, 900)})`);
+  check(Boolean(clicks["place-down-t-1/build"]) && P156.first(text) === "t-1 | build", `read: by rank, the moves back (got ${text.slice(0, 900)})`);
 };
 
 cases["P120-4-cards-not-read"] = async () => { // t-097 REVIEW J2 RL-3 (R17): no Park or Mark done on a needs-decision task until its cards are read
@@ -7430,6 +7429,74 @@ cases["P155-2-remote"] = async () => { // on the space's machine: the same item,
   g.__runs = [];
   await click(v, "places-slot-box-1-0");
   check(g.__runs.some(([n, a]) => n === "terminal.peek" && a?.terminal === `${M}/t53`), `opens ${M}/t53 (got ${JSON.stringify(g.__runs)})`);
+};
+
+// ---- t-156: the Waiting list drawn as the Queue's slots; the limits' rule ids link to their rules ----
+const P156 = {
+  // The waiting part of the text (after the "Waiting ·" heading).
+  part: (text) => text.slice(Math.max(0, text.indexOf("Waiting ·"))),
+  // The given heads appear in the Waiting part, in this order, and nothing else does between the first and last.
+  order: (text, heads) => { const w = P156.part(text), at = heads.map((h) => w.indexOf(h)); return at.every((x) => x >= 0) && at.every((x, i) => !i || at[i - 1] < x); },
+  // The top slot's "task | job".
+  first: (text) => { const m = /\| (t-[\w-]+ \| [\w-]+) \| /.exec(P156.part(text).replace(/^Waiting · \d+/, "")); return m ? m[1] : null; },
+  box: (el) => el && Object.fromEntries(["flex_none", "px", "py", "gap", "rounded", "border", "border_color"].map((k) => [k, JSON.stringify(el.style?.[k] ?? null)])),
+};
+
+cases["P156-1-slots"] = async () => { // R1, R2: no numbers; each waiting job a slot, in effective order, top first; the reason inside it
+  const { v } = await placesWorld();
+  const root = v.render(cx), { text } = inspect(root);
+  check(!/(^|\| )\d+\. t-/.test(text), `no "1." numbers (got ${P156.part(text).slice(0, 600)})`);
+  const ids = ["t-020/verify-2", "t-060/merge-check", "t-083/design"], slots = ids.map((id) => P142.find(root, `place-slot-${id}`));
+  check(slots.every(Boolean), `one slot per job (got ${slots.map((s) => Boolean(s))})`);
+  const seq = slots.map((s) => inspect(s ?? {}).text);
+  check(/^t-020 \| verify-2 \| verifier · suite step/.test(seq[0]) && /waits for a suite place \(2 of 2\)/.test(seq[1]) && /^t-060 \| merge-check \| verifier · suite step \| merge queue order \(Queue tab\)/.test(seq[1]),
+    `head and reason in each slot (got ${seq.join(" ; ")})`);
+  check(/^t-083 \| design \| design · no-test \| ↑ \| ⤒|^t-083 \| design \| design · no-test \| ⤒ \| ↑/.test(seq[2]) && /next to start: the no-test extra place is free$/.test(seq[2]), `the moves in the head, the reason below (got ${seq[2]})`);
+  check(text.indexOf(seq[0]) < text.indexOf(seq[1]) && text.indexOf(seq[1]) < text.indexOf(seq[2]), "slots top to bottom in effective order");
+  check(text.includes("Waiting · 3"), "the heading keeps its count");
+};
+
+cases["P156-2-slot-shape"] = async () => { // R2, R3: the Queue's slot box (t-154's code, shared)
+  const { v } = await placesWorld();
+  const place = P142.find(v.render(cx), "place-slot-t-020/verify-2");
+  const q = await queueWorld(twoRepos());
+  const slot = P142.find(q.render(cx), `queue-slot-${Q154.key(0)}`);
+  check(Boolean(place) && Boolean(slot) && JSON.stringify(P156.box(place)) === JSON.stringify(P156.box(slot)) && place.kind === slot.kind,
+    `the same box (places ${JSON.stringify(P156.box(place))}, queue ${JSON.stringify(P156.box(slot))})`);
+};
+
+cases["P156-3-task-link"] = async () => { // R2: the task id links to the task, as the Queue's; one the ledger lacks is plain
+  const waiting = { version: 1, jobs: [...plJobs(), P83.job("t-999/build", "working")] };
+  const { v } = await placesWorld({ waiting });
+  const { clicks, text } = look(v);
+  check(Boolean(clicks["place-task-t-020/verify-2"]) && Boolean(clicks["place-task-t-083/design"]) && !clicks["place-task-t-999/build"], `links (have ${Object.keys(clicks).filter((k) => k.startsWith("place-task-"))})`);
+  check(/t-999 \| build/.test(text), "the unlinked id still drawn");
+  let stopped = false;
+  clicks["place-task-t-083/design"]({}, { ...cx, stop_propagation() { stopped = true; } }); await flush(); await settle();
+  check(stopped, "the click stops there");
+  check(g.__shared["project-agent.show"]?.task === "t-083" && g.__shared["project-agent.show"]?.space === S, `the show request (got ${JSON.stringify(g.__shared["project-agent.show"])})`);
+  look(v);
+  check(v.view === "tasks" && v.open.has("t-083"), `the Tasks tab with t-083 open (view ${v.view}, open ${[...v.open]})`);
+};
+
+cases["P156-4-rule-links"] = async () => { // Added (d-272): each rule id in "limits: ..." links to its rule
+  const rules = JSON.stringify({ version: 1, rules: [
+    { id: "r-places-6", title: "Six places", text: "x", status: "active", order: 50, places: { working: 6 } },
+    { id: "r-places-suite-4", title: "Suite four", text: "y", status: "active", order: 40, places: { suite: 4 } },
+    { id: "r-other", title: "Other", text: "z", status: "active", order: 30 }] });
+  const { v } = await placesWorld({ rules });
+  const { clicks, text } = look(v);
+  check(/limits: \| r-places-6 \| , \| r-places-suite-4/.test(text), `the line (got ${text.slice(0, 400)})`);
+  check(Boolean(clicks["places-rule-r-places-6"]) && Boolean(clicks["places-rule-r-places-suite-4"]) && !clicks["places-rule-r-other"], `a link per rule id (have ${Object.keys(clicks).filter((k) => k.startsWith("places-rule"))})`);
+  let stopped = false;
+  clicks["places-rule-r-places-suite-4"]({}, { ...cx, stop_propagation() { stopped = true; } }); await flush(); await settle();
+  check(stopped && !v.placesFolded, "the head does not fold");
+  check(v.view === "rules" && v.rules.open.has("r-places-suite-4") && !v.rules.open.has("r-places-6"), `the Rules view, that rule open (view ${v.view}, open ${[...v.rules.open]})`);
+  const after = look(v).text;
+  check(after.includes("Suite four") && after.includes("y"), `the rule's text shown (got ${after.slice(0, 600)})`);
+  const d = await placesWorld({ rules: JSON.stringify({ version: 1, rules: [] }) });
+  const dl = look(d.v);
+  check(dl.text.includes("limits: default") && !Object.keys(dl.clicks).some((k) => k.startsWith("places-rule")), "the defaults: no link");
 };
 
 const moveIds = (clicks, id) => Object.keys(clicks).filter((k) => k.endsWith(`-${id}`) && /^(tmove-|next-)/.test(k)).sort();
