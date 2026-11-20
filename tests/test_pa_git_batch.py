@@ -414,6 +414,54 @@ class Framing(Repo):
         self.check("--stdin", lambda out: out + b":100644 100644 " + zero + b" " + zero + b" M\0")
 
 
+class Limits(Repo):
+    """t-139 job 2 (t-104 REVIEW RL-1, N-1)."""
+
+    def test_rl1_a_batch_call_gets_one_git_timeout_per_item(self):
+        # The per-call path gives each of its calls GIT_TIMEOUT; a batch of n items gets n of them, never fewer.
+        path = self.repo()
+        base, tip = self.chain(path, 3)
+        given = {}
+
+        def answer(args, kw, real):
+            if "--batch" in args or "--stdin" in args:
+                given["--batch" if "--batch" in args else "--stdin"] = kw.get("timeout")
+            return real()
+        for name, inner in self.runners():
+            with self.subTest(runner=name):
+                given.clear()
+                a, _b, b, _p = self.both(inner, path, tip, base=base, answer=answer)
+                self.assertEqual(same(a), same(b))
+                self.assertEqual(given, {"--batch": 3 * pa_hooks.GIT_TIMEOUT, "--stdin": 4 * pa_hooks.GIT_TIMEOUT})
+
+    def test_rl1_a_batch_of_one_gets_one_git_timeout(self):
+        path = self.repo()
+        tip = self.head(path)
+        given = {}
+
+        def answer(args, kw, real):
+            if "--batch" in args or "--stdin" in args:
+                given["--batch" if "--batch" in args else "--stdin"] = kw.get("timeout")
+            return real()
+        self.both(pa_hooks.git, path, tip, base=tip, answer=answer)
+        self.assertEqual(given, {"--batch": pa_hooks.GIT_TIMEOUT, "--stdin": pa_hooks.GIT_TIMEOUT})
+
+    def test_n1_a_stdin_argv_equals_only_a_stdin_argv(self):
+        words = ("cat-file", "--batch", "x\n")
+        s = pa_hooks.StdinArgv(words)
+        self.assertNotEqual(s, words)
+        self.assertNotEqual(words, s)
+        self.assertFalse(s == words)
+        self.assertFalse(words == s)
+        self.assertEqual(s, pa_hooks.StdinArgv(words))
+        self.assertEqual(hash(s), hash(pa_hooks.StdinArgv(words)))
+        keys = {("c", s): 1, ("c", words): 2}
+        self.assertEqual(len(keys), 2)
+        self.assertEqual(keys[("c", pa_hooks.StdinArgv(words))], 1)
+        self.assertEqual(keys[("c", words)], 2)
+        self.assertEqual(tuple(s), words)
+
+
 # ---- R4: the cache's batch shapes -------------------------------------------------------------------------------
 
 class Shapes(unittest.TestCase):

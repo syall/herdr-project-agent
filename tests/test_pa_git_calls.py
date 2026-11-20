@@ -305,6 +305,45 @@ class R1PinAnswers(Base):
         self.assertSamePin(path, gate_git_like)
 
 
+OLD_GIT_REFUSAL = "error: unknown option `no-ahead-behind'\nusage: git status [<options>] [--] <pathspec>..."
+
+
+def older_git(text=OLD_GIT_REFUSAL):
+    """A runner with git()'s signature that answers a status call holding --no-ahead-behind as git 2.11-2.16 does
+    (exit 129, the option named on stderr), else runs pa_hooks.git."""
+    def run(path, *args, **kw):
+        if "status" in args and "--no-ahead-behind" in args:
+            return 129, "", text
+        return pa_hooks.git(path, *args, **kw)
+    return run
+
+
+class R1OldGit(Base):
+    """t-139 job 2 (t-104 REVIEW RL-2, t-108 RL-1): on a git without --no-ahead-behind the pin still counts."""
+
+    def test_rl2_a_git_without_the_option_counts_tracked_changes(self):
+        path = self.repo()
+        write(os.path.join(path, "README"), "changed\n")
+        runner = Counting(older_git())
+        pin = pa_hooks.gate_commits(path, runner)
+        self.assertEqual(pin, OLD_GATE_COMMITS(path))
+        self.assertEqual(pin[0]["uncommitted"], 1)
+        status = runner.having("status")
+        self.assertEqual(len(status), 2, runner.calls)
+        self.assertNotIn("--no-ahead-behind", status[1])
+        self.assertEqual(status[1][0], "--no-optional-locks")
+        self.assertEqual(len(runner.calls), 3, runner.calls)
+
+    def test_rl2_another_status_failure_is_not_retried(self):
+        path = self.repo()
+        write(os.path.join(path, "README"), "changed\n")
+        runner = Counting(older_git("fatal: index file corrupt"))
+        pin = pa_hooks.gate_commits(path, runner)
+        self.assertEqual(pin[0]["uncommitted"], 0)
+        self.assertEqual(pin[0]["commit"], sh(path, "git", "rev-parse", "HEAD"))
+        self.assertEqual(len(runner.having("status")), 1, runner.calls)
+
+
 class R1AmbiguousNames(Base):
     """J1-D1 (option A, t1dr): the branch is symbolic-ref --short's, also where status v2's name differs."""
 
