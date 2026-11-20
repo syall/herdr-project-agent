@@ -50,6 +50,7 @@ import argparse
 import contextlib
 import datetime
 import hashlib
+import importlib.util
 import io
 import json
 import os
@@ -67,14 +68,24 @@ sys.dont_write_bytecode = True  # keep tools/ free of caches
 import pa  # noqa: E402
 
 
+def tool_spec(name):
+    """The import spec of <name>.py in this file's own folder. t-147: when pa_launch.py started this process, its
+    Finder (on sys.meta_path) gives one whose code comes from the compiled-code cache; else the usual source loader."""
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), name + ".py")
+    for finder in sys.meta_path:
+        make = getattr(finder, "pa_tool_spec", None)
+        if make is not None:
+            return make(name, path)
+    return importlib.util.spec_from_file_location(name, path)
+
+
 def _load_guard():
     """pa_guard.py from this file's own folder, found the same way when run through a symlink or loaded by a test.
 
     Loaded by hook_guard each time it is needed, not at import, so that a missing or broken pa_guard.py stops only
     the guard (which then refuses the call) and the other hooks keep working.
     """
-    import importlib.util
-    spec = importlib.util.spec_from_file_location("pa_guard", os.path.join(os.path.dirname(os.path.realpath(__file__)), "pa_guard.py"))
+    spec = tool_spec("pa_guard")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -3843,11 +3854,10 @@ def push_tool():
     """pa_push.py from this file's folder, loaded once with this pa and this module as its pa_hooks (it imports
     pa_hooks at its top; loading it here lazily keeps pa_hooks free of an import cycle)."""
     if _PUSH[0] is None:
-        import importlib.util
         saved = {k: sys.modules.get(k) for k in ("pa", "pa_hooks")}
         sys.modules["pa"], sys.modules["pa_hooks"] = pa, _Self()
         try:
-            spec = importlib.util.spec_from_file_location("pa_push", os.path.join(os.path.dirname(os.path.realpath(__file__)), "pa_push.py"))
+            spec = tool_spec("pa_push")
             module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(module)
         finally:
@@ -5934,8 +5944,7 @@ def cmd_trust(args):
 
 def cmd_full_suite(args):
     """The run, its machine slot, reuse of a passing tree, --last and --report: pa_suite.py (t-056)."""
-    import importlib.util
-    spec = importlib.util.spec_from_file_location("pa_suite", os.path.join(os.path.dirname(os.path.realpath(__file__)), "pa_suite.py"))
+    spec = tool_spec("pa_suite")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     module.pa = pa
@@ -5945,8 +5954,7 @@ def cmd_full_suite(args):
 
 def load_tool(name):
     """A tool module of this folder (pa_suite, pa_run), sharing pa."""
-    import importlib.util
-    spec = importlib.util.spec_from_file_location(name, os.path.join(os.path.dirname(os.path.realpath(__file__)), name + ".py"))
+    spec = tool_spec(name)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     module.pa = pa

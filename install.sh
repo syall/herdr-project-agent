@@ -26,12 +26,10 @@ copy runtime "$PA"
 chmod +x "$PA"/tools/*.py "$PA"/core/hooks/*.sh
 mkdir -p "$PA/spaces" "$HOME/.local/bin"
 [ -f "$PA/config.json" ] || printf '{\n  "version": 1,\n  "defaultProfile": "personal"\n}\n' > "$PA/config.json"
-for n in pa-start pa-session pa-claude pa-codex pa-profile pa-peers pa-pass pa-cleanup pa-doctor pa-task pa-decide pa-sync pa-core-check pa-stamp pa-restart pa-context; do ln -sfn "$PA/tools/pa.py" "$HOME/.local/bin/$n"; done
-for n in pa-gate pa-hooks pa-hook pa-full-suite pa-run pa-worktree pa-worktree-allow pa-worker pa-trust; do ln -sfn "$PA/tools/pa_hooks.py" "$HOME/.local/bin/$n"; done
-for n in pa-costs; do ln -sfn "$PA/tools/pa_costs.py" "$HOME/.local/bin/$n"; done
+# t-147: the commands of pa.py, pa_hooks.py, pa_costs.py, pa_places.py and pa_handoff.py go through one launcher
+# that runs their code from the compiled-code cache (see pa_launch.py); it lists them itself.
+for n in $("$PA/tools/pa_launch.py" --names); do ln -sfn "$PA/tools/pa_launch.py" "$HOME/.local/bin/$n"; done
 for n in pa-queue; do ln -sfn "$PA/tools/pa_queue.py" "$HOME/.local/bin/$n"; done
-for n in pa-places; do ln -sfn "$PA/tools/pa_places.py" "$HOME/.local/bin/$n"; done
-for n in pa-handoff; do ln -sfn "$PA/tools/pa_handoff.py" "$HOME/.local/bin/$n"; done
 for n in pa-push-main pa-push-allow; do ln -sfn "$PA/tools/pa_push.py" "$HOME/.local/bin/$n"; done
 "$HOME/.local/bin/pa-core-check"
 # Last: installed.json, the hashes of what is installed now, and the commit it came from (t-037).
