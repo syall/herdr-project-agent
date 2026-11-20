@@ -20,6 +20,7 @@ import sys
 import tempfile
 import time
 import unittest
+import warnings
 from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -3022,6 +3023,23 @@ class CC_StatusLine(CCBase):
         with mock.patch("subprocess.Popen", late):
             self.assert_slow_inner_killed()
 
+    def test_cc9c_an_inner_command_left_running_fails_the_check(self):
+        # t-173 round 2 (REVIEW M1): the timed-out inner command not killed (statusline_kill a no-op) must fail
+        # assert_slow_inner_killed on its own check, not on a timing margin (it returns at ~2.5 s either way)
+        try:
+            with mock.patch.object(pa_costs, "statusline_kill", lambda proc: None), warnings.catch_warnings():
+                warnings.simplefilter("ignore", ResourceWarning)  # Popen's "still running": not the check under test
+                with self.assertRaisesRegex(AssertionError, "inner command not killed"):
+                    self.assert_slow_inner_killed()
+        finally:
+            proc = pa_costs.CC_STOP["proc"]
+            if proc is not None and proc.returncode is None:
+                try:
+                    os.killpg(proc.pid, 9)
+                except OSError:
+                    pass
+                proc.wait()
+
     def assert_slow_inner_killed(self):
         """The slow inner command is cut at INNER_TIMEOUT: nothing returned, recorded while it ran. Timed from the
         inner command's own start (t-173: a Popen slowed by load is not the timeout's), to the return."""
@@ -3098,6 +3116,15 @@ class CC_Script(CCBase):
         late = [sys.executable, "-c", "import runpy, sys, time; time.sleep(0.6); sys.argv = sys.argv[1:]; "
                 "runpy.run_path(sys.argv[0], run_name='__main__')"] + STATUSLINE[1:]
         self.assert_killed_at_2_s(entry=late)
+
+    def test_cs2c_an_inner_command_left_running_fails_the_check(self):
+        # t-173 round 2 (REVIEW M1): the timed-out inner command not killed (os.killpg and Popen.kill no-ops in the
+        # statusline process) must fail assert_killed_at_2_s on its own check, not on a timing margin
+        nokill = [sys.executable, "-c", "import os, runpy, subprocess, sys; os.killpg = lambda *a: None; "
+                  "subprocess.Popen.kill = lambda self: None; sys.argv = sys.argv[1:]; "
+                  "runpy.run_path(sys.argv[0], run_name='__main__')"] + STATUSLINE[1:]
+        with self.assertRaisesRegex(AssertionError, "inner command not killed"):
+            self.assert_killed_at_2_s(entry=nokill)
 
     def assert_killed_at_2_s(self, entry=None):
         """The slow inner command is killed at about 2 s (INNER_TIMEOUT), nothing printed, recorded while it ran.
