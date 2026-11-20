@@ -577,9 +577,9 @@ Run `hc --skill` once to learn `hc`. Start workers with the profile's commands (
   the panel only. Answered Delete: run `pa-worktree remove --card <card-id>`. It removes
   each worktree the answer covers through the same checks, read again now, skips and
   lists any that changed, and the next check asks about those again; tell the person its
-  line. Answered with a note: nothing is removed and the card is withdrawn; ask the
-  person to say "keep tNN" for each one to keep first, and set `"keep": true` on its
-  entry. Keep all: none of them is asked about again. While it is open, a worktree that
+  line. Answered with a note (Delete or Keep all): run `pa-worktree remove --card
+  <card-id>` too; it removes nothing and withdraws the card; ask the person to say
+  "keep tNN" for each one to keep first, and set `"keep": true` on its entry. Keep all: none of them is asked about again. While it is open, a worktree that
   joins or leaves the set withdraws it, and the check opens one card for all of them
   again. No card counts the files git ignores. If the person says to keep a worktree
   whatever happens, set `"keep": true` on its entry, or `"keepWorktree": true` on the

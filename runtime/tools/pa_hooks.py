@@ -3451,7 +3451,7 @@ def cmd_worktree(args):
                       task, card["id"], cut(clean(card.get("note")), 200)))
             elif card and card.get("status") == "answered":
                 delete = str(card.get("answer", "")).lower().startswith("delete")
-                if delete and card.get("batch") and str(card.get("note") or "").strip():
+                if card.get("batch") and str(card.get("note") or "").strip():  # Delete or Keep all with a note (R7)
                     print("{}: card {} answered {!r} with a note: run `{}`; it removes nothing, withdraws the card, and you ask "
                           "the person to say \"keep tNN\" for any to keep".format(task, card["id"], card.get("answer"), remove_for(card, owner)))
                 elif delete and under_rule_b(row, card) and not mismatch:
@@ -4021,6 +4021,24 @@ def standing_clean(directory, row, owner, profile, entries, listing=None):
     return None
 
 
+def standing_recheck(directory, row, owner, agent, profile, entries, listing):
+    """Right before a standing removal: the facts, workers and terminals read again, and every loss fact the first read
+    checked checked again on them (uncommitted, untracked, unpushed, unmerged). Why it must stay, or None. Fails closed."""
+    refresh_busy(row, agent, profile)
+    busy = [w["address"] for w in row["workers"] if w["fate"] == "live"] + row["others"]
+    if busy:
+        return "in use by " + ", ".join(busy)
+    facts = row["facts"]
+    if not facts:
+        return "changed while it ran: gone or not a worktree"
+    if facts.get("unreadable"):
+        return "changed while it ran: could not read it ({})".format(facts["unreadable"])
+    if facts.get("main"):
+        return "changed while it ran: it is the project's main checkout"
+    why = standing_clean(directory, row, owner, profile, entries, listing)
+    return "changed while it ran: " + why if why else None
+
+
 def standing_who(owner):
     task, job, main = owner
     return "{} (main)".format(clean(task)) if main and job == "main" else "{} {}".format(clean(task), clean(job))
@@ -4053,16 +4071,14 @@ def remove_standing(directory, space, agent, profile, rule_id, env=None, ancs=No
                 continue  # not a candidate: not touched, not listed
             why = standing_clean(directory, row, owner, profile, entries, listing)
             if not why:
-                refresh_busy(row, agent, profile)
-                busy = [w["address"] for w in row["workers"] if w["fate"] == "live"] + row["others"]
-                why = ("in use by " + ", ".join(busy)) if busy else None if row["facts"] and not row["facts"].get("uncommitted") \
-                    else "changed while it ran"
+                why = standing_recheck(directory, row, owner, agent, profile, entries, listing)
             if why:
                 left.append("{} ({})".format(standing_who(owner), cut(clean(why), 120)))
                 continue
             cid, cpath, card = card_for(directory, row, owner[0], entries.get(owner[0]), listing)
             try:
-                done = remove_worktree(row["path"], row["facts"])
+                # Clean, just checked again: its counts are 0, and they go as 0 so the removal is never forced (R15).
+                done = remove_worktree(row["path"], dict(row["facts"], uncommitted=0, unpushed=0))
                 if os.path.lexists(row["path"]):
                     raise pa.Problem("the folder is still there after its removal")
             except pa.Problem as e:
