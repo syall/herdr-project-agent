@@ -2018,6 +2018,8 @@ def stack_pair(rec, e):
         x = next((x for x in rec.get("entries") or [] if x is not e and (x.get("task"), x.get("job") or None) == key
                   and x.get("tip") == at), None)
         if x is not None:
+            if "stackedOn" not in x:
+                return None  # queued before stackedOn existed: whether it is stacked cannot be told (t-163 round 2)
             low, at, below = x.get("base"), x.get("base"), x.get("stackedOn")
             continue
         m = next((m for m in reversed(rec.get("merged") or []) if isinstance(m, dict) and (m.get("task"), m.get("job") or None) == key
