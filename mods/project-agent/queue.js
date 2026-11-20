@@ -5,13 +5,18 @@
 // read); this file starts no call. It reads J3b's and J3c's fields (approval, queue cards, doc-only reviews) when
 // they are there, and says "not asked yet" until then. t-084: each entry's workers (a link to the Agents view) and
 // the evidence files it names (a link to the Files view; "(not yet)" while not written); an answered merge card for
-// the entry's task stands for its approval until J3b writes one.
+// the entry's task stands for its approval until J3b writes one. t-154: each entry is a slot (no number; the stored
+// order is merge order, the top one stacked nearest main), its task id a link to the task (as Costs links one), its
+// workers the task card's worker item (tasks.js workerItem: the status dot; a closed one is not drawn); Left and Merged
+// entries are task items as in the Tasks tab (id, title, state chip) with the facts as the detail line, and an entry
+// that left and later merged is no longer under Left.
 
 import { div } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
 import { home } from "herdr";
 import { gaveUp } from "./host.js";
 import { zone } from "./zone.js";
+import { workerItem, stateChip } from "./tasks.js";
 
 export const LEFT_SHOWN = 10, MERGED_SHOWN = 10; // t-145: the 10 most recent merged; the rest behind Archived (n)
 export const STORED_LINE = "As pa-queue last wrote it; pa-queue show reads each state now.";
@@ -69,7 +74,10 @@ const trim = (p) => String(p ?? "").replace(/\/+$/, "");
 function workersOf(e, ledger) {
   const task = list(ledger?.tasks).find((x) => obj(x) && x.id === e.task);
   const crew = list(task?.workers).filter((w) => obj(w) && str(w.address));
-  const out = [], add = (w, address) => { if (!out.some((x) => x.address === address)) out.push({ address, label: `${w?.role ?? "worker"} ${address}`, finished: Boolean(w?.finished) }); };
+  const out = [], add = (w, address) => {
+    if (w?.finished && w?.closed) return; // t-154: closed with pa-worker close: not drawn, as in the task card
+    if (!out.some((x) => x.address === address)) out.push({ address, label: `${w?.role ?? "worker"} ${address}`, finished: Boolean(w?.finished), recorded: Boolean(w) });
+  };
   if (str(e.worktree)) for (const w of crew) if (!w.finished && trim(w.worktree) === trim(e.worktree)) add(w, String(w.address));
   for (const a of [e.suite?.worker, e.review?.worker].map(str).filter(Boolean)) add([...crew].reverse().find((w) => w.address === a), a);
   return out;
@@ -92,6 +100,10 @@ export function queueRows(q, ledger, cards = []) {
   if (!q || gaveUp(q)) return { state: "loading", repos: [], count: null };
   if (q.error) return { state: "error", error: q.error, repos: [], count: null };
   if (q.missing || !obj(q.doc)) return { state: "missing", repos: [], count: null };
+  const known = new Map(list(ledger?.tasks).filter((x) => obj(x) && str(x.id)).map((x) => [x.id, x]));
+  // t-154: a Left or Merged entry as a task item: its id (a link when the ledger has the task), title and state.
+  const item = (x) => { const k = known.get(x.task); return { task: x.task, linked: Boolean(k), title: k ? String(k.title ?? "(untitled)") : null, state: k ? str(k.state) : null }; };
+  const jobOf = (x) => (str(x.job) ? `${x.job} · ` : "");
   const cardList = list(cards).map((c) => (obj(c?.card) ? { ...c.card, id: c.card.id ?? c.id } : null)).filter(Boolean);
   const paths = Object.keys(q.doc.repos ?? {}).sort();
   const base = (p) => p.split("/").filter(Boolean).pop() ?? p;
@@ -113,18 +125,20 @@ export function queueRows(q, ledger, cards = []) {
       const suite = s ? `suite ${s.exit === 0 ? "passed" : `failed (exit ${s.exit})`}${s.ended ? ` ${at(s.ended)}` : ""}${s.worker ? ` by ${s.worker}` : ""}` : null;
       const r = obj(e.review) ? e.review : null;
       const review = r ? `short review ${r.verdict ?? "?"}${r.ended ? ` ${at(r.ended)}` : ""}${r.worker ? ` by ${r.worker}` : ""}` : null;
-      return { key: `${path}#${i}`, task: e.task, label: `${i + 1}. ${who(e)}`, state: str(e.state) ?? "?", stack, waits: waits(e), suite, review, approval: approval(e, cardList),
+      return { key: `${path}#${i}`, task: e.task, job: str(e.job), linked: known.has(e.task), label: who(e), state: str(e.state) ?? "?", stack, waits: waits(e), suite, review, approval: approval(e, cardList),
         workers: workersOf(e, ledger), files: filesOf(e) };
     });
-    const leftAll = list(rec.left).filter(readable);
-    const left = leftAll.slice(-LEFT_SHOWN).reverse().map((l) => ({
-      text: `${who(l)} left ${at(l.at)}: ${l.why ?? "?"}`,
+    // t-154: an entry that left and merged at or after it left is no longer under Left.
+    const mergedAfter = (l) => list(rec.merged).some((m) => readable(m) && same(m, l.task, l.job) && Date.parse(m.at) >= Date.parse(l.at));
+    const leftAll = list(rec.left).filter(readable).filter((l) => !mergedAfter(l));
+    const left = leftAll.slice(-LEFT_SHOWN).reverse().map((l) => ({ ...item(l),
+      detail: `${jobOf(l)}left ${at(l.at)}: ${l.why ?? "?"}`,
       round: fixRound(l, ledger),
       void: obj(l.approval) && str(l.approval.void) ? `approval voided: ${l.approval.void}` : null,
       resumable: l.resumable === true ? "approval kept for a doc-only rejoin" : null,
     }));
     const mergedAll = list(rec.merged).filter(readable).reverse() // newest first
-      .map((m) => `${who(m)} merged ${at(m.at)} at ${short(m.tip)} (${m.by ?? "queue"}${m.card ? `, ${m.card}` : ""})`);
+      .map((m) => ({ ...item(m), detail: `${jobOf(m)}merged ${at(m.at)} at ${short(m.tip)} (${m.by ?? "queue"}${m.card ? `, ${m.card}` : ""})` }));
     const merged = mergedAll.slice(0, MERGED_SHOWN), mergedRest = mergedAll.slice(MERGED_SHOWN);
     return { path, title: clash(path) ? path.replace(home(), "~") : base(path), main, intoLine: `into ${main}`, entries: shown, skipped: all.length - entries.length,
       left, leftCount: leftAll.length, leftMore: Math.max(0, leftAll.length - LEFT_SHOWN), merged, mergedRest };
@@ -141,16 +155,32 @@ const TONE = { checking: "working", passed: "done", failed: "blocked", invalidat
 
 // Draws the view; starts nothing (t-053). o (t-084): { isLive(address), onWorker(address), evidence (the load's Map of
 // task -> files, or undefined: not known), onFile(task, file) }; a click only opens a view. t-145: mergedOpen(path) (the
-// repository's merged entries past MERGED_SHOWN are shown), onMerged(path, cx) (its Archived (n) row clicked).
+// repository's merged entries past MERGED_SHOWN are shown), onMerged(path, cx) (its Archived (n) row clicked). t-154:
+// statusOf(address) (a live terminal's status, for the worker dot), onTask(task, cx) (a task link clicked: the Tasks tab).
 export function renderQueue(t, rows, o = {}) {
   const note = (text, color) => div().px(4).py(4).text_size(12).text_color(color ?? t.dim).child(text);
   const line = (text, color) => div().text_size(11.5).text_color(color ?? t.muted).child(text);
   const live = (a) => Boolean(o.isLive?.(a));
+  // t-154: the task card's worker item. One with no ledger record and no live terminal is closed for all the view can tell: not drawn.
   const worker = (e, w, k) => {
     const on = live(w.address);
-    return h_flex().id(`queue-worker-${e.key}-${k}`).flex_none().px(6).h(20).gap(5).items_center().rounded(5).border(1).border_color(t.border).text_size(11)
-      .text_color(on ? t.foreground : t.dim).when(on, (b) => b.cursor_pointer().hover((s) => s.bg(t.hover)).on_click(() => o.onWorker?.(w.address)))
-      .child(on ? `${w.label} ↗` : `${w.label} ${w.finished ? "(closed)" : "(ended)"}`);
+    return workerItem(t, { id: `queue-worker-${e.key}-${k}`, live: on, status: on ? o.statusOf?.(w.address) ?? null : null, onClick: on ? () => o.onWorker?.(w.address) : null,
+      text: on ? `${w.label} ↗` : `${w.label} ${w.finished ? "(closed)" : "(ended)"}` });
+  };
+  const toTask = (task) => (_e, cx) => { cx?.stop_propagation?.(); o.onTask?.(task, cx); };
+  const taskId = (id, task, linked, size = 12) => linked
+    ? div().id(id).flex_none().text_size(size).text_color(t.accent).cursor_pointer().hover((s) => s.text_color(t.foreground)).on_click(toTask(task)).child(task)
+    : div().flex_none().text_size(size).text_color(t.foreground).child(task);
+  // t-154 (d-270): a Left or Merged entry as a task item: the head (id, title, state chip; a link to the task when the
+  // ledger has it), the facts below it.
+  const taskItem = (id, linkId, x, extra = []) => {
+    const head = h_flex().h(28).px(9).gap(7).items_center()
+      .child(div().flex_none().text_size(11.5).text_color(x.linked ? t.accent : t.dim).child(x.task))
+      .when(Boolean(x.title), (b) => b.child(div().flex_1().min_w(0).truncate().text_size(12.5).text_color(t.foreground).child(x.title ?? "")))
+      .when(Boolean(x.state), (b) => b.child(stateChip(t, x.state)));
+    return v_flex().id(id).flex_none().rounded(7).border(1).border_color(t.border).bg(t.surface)
+      .child(x.linked ? head.id(linkId).cursor_pointer().hover((s) => s.bg(t.hover)).on_click(toTask(x.task)) : head)
+      .child(v_flex().px(9).pb(6).gap(1).child(line(x.detail, t.muted)).children(extra));
   };
   const known = o.evidence instanceof Map;
   const file = (e, f, k) => {
@@ -170,31 +200,33 @@ export function renderQueue(t, rows, o = {}) {
         .child(div().flex_1().min_w(0).truncate().text_size(12.5).font_semibold().child(r.title))
         .child(div().text_size(11).text_color(t.dim).child(r.intoLine)))
       .when(!r.entries.length, (el) => el.child(line("Queue empty.", t.dim)))
-      .children(r.entries.map((e) => v_flex().gap(1).py(2)
+      .children(r.entries.map((e) => {
+        const crew = e.workers.filter((w) => w.recorded || live(w.address));
+        return v_flex().id(`queue-slot-${e.key}`).flex_none().px(8).py(6).gap(1).rounded(6).border(1).border_color(t.border) // t-154: a slot, no number
         .child(h_flex().gap(8).items_center()
-          .child(div().flex_1().min_w(0).truncate().text_size(12).text_color(t.foreground).child(e.label))
+          .child(taskId(`queue-task-${e.key}`, e.task, e.linked))
+          .when(Boolean(e.job), (b) => b.child(div().flex_none().text_size(12).text_color(t.muted).child(e.job ?? "")))
+          .child(div().flex_1())
           .child(div().text_size(11).text_color(t[TONE[e.state]] ?? t.muted).child(e.state)))
         .child(line(e.stack))
-        .when(e.workers.length > 0, (el) => el.child(h_flex().gap(6).flex_wrap().items_center().children(e.workers.map((w, k) => worker(e, w, k)))))
+        .when(crew.length > 0, (el) => el.child(h_flex().gap(6).flex_wrap().items_center().children(crew.map((w, k) => worker(e, w, k)))))
         .when(Boolean(e.waits), (el) => el.child(line(e.waits ?? "")))
         .when(Boolean(e.suite), (el) => el.child(line(e.suite ?? "", t.dim)))
         .when(Boolean(e.review), (el) => el.child(line(e.review ?? "", t.dim)))
         .when(e.files.length > 0, (el) => el.child(h_flex().gap(6).flex_wrap().items_center().child(line("evidence:", t.dim)).children(e.files.map((f, k) => file(e, f, k)))))
-        .child(line(e.approval, t.dim))))
+        .child(line(e.approval, t.dim));
+      }))
       .when(r.skipped > 0, (el) => el.child(line(`${r.skipped} ${r.skipped === 1 ? "entry" : "entries"} could not be read`, t.blocked)))
       .when(r.leftCount > 0, (el) => el.child(div().pt(4).text_size(11.5).font_semibold().text_color(t.dim).child(`Left · ${r.leftCount}`))
-        .children(r.left.map((l) => v_flex().gap(1).py(1)
-          .child(line(l.text, t.foreground))
-          .child(line(l.round, t.dim))
-          .when(Boolean(l.void), (x) => x.child(line(l.void ?? "", t.dim)))
-          .when(Boolean(l.resumable), (x) => x.child(line(l.resumable ?? "", t.dim)))))
+        .children(r.left.map((l, i) => taskItem(`queue-left-${k}-${i}`, `queue-left-task-${k}-${i}`, l,
+          [line(l.round, t.dim), ...(l.void ? [line(l.void, t.dim)] : []), ...(l.resumable ? [line(l.resumable, t.dim)] : [])])))
         .when(r.leftMore > 0, (x) => x.child(line(`and ${r.leftMore} earlier`, t.dim))))
       .when(r.merged.length > 0, (el) => el.child(div().pt(4).text_size(11.5).font_semibold().text_color(t.dim).child("Merged"))
-        .children(r.merged.map((m) => line(m, t.dim)))
+        .children(r.merged.map((m, i) => taskItem(`queue-merged-${k}-${i}`, `queue-merged-task-${k}-${i}`, m)))
         .when(r.mergedRest.length > 0, (x) => {
           const open = Boolean(o.mergedOpen?.(r.path));
           return x.child(div().id(`queue-merged-archived-${k}`).py(1).text_size(11.5).text_color(t.dim).cursor_pointer().hover((s) => s.text_color(t.foreground))
             .on_click((_e, cx) => o.onMerged?.(r.path, cx)).child(`${open ? "▾" : "▸"} Archived (${r.mergedRest.length})`))
-            .when(open, (y) => y.children(r.mergedRest.map((m) => line(m, t.dim))));
+            .when(open, (y) => y.children(r.mergedRest.map((m, i) => taskItem(`queue-merged-${k}-${MERGED_SHOWN + i}`, `queue-merged-task-${k}-${MERGED_SHOWN + i}`, m))));
         }))));
 }

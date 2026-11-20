@@ -1717,6 +1717,7 @@ export default class ProjectAgent extends View {
           ];
         }))))
       .when(view === "queue", (el) => el.child(renderQueue(t, queue, { isLive: (a) => terminals().some((x) => x.address === onMachine(a) && x.state === "live"), onWorker: (a) => this.showAgent(onMachine(a)),
+        statusOf: (a) => terminals().find((x) => x.address === onMachine(a) && x.state === "live")?.status ?? null, onTask: (task, cx) => this.costs.openTask(space, task, cx), // t-154: the worker dot; a task link (Costs's "project-agent.show")
         evidence: data.evidence, onFile: (task, file) => this.showEvidence(space, task, file), // t-084: worker and evidence links
         mergedOpen: (path) => this.mergedOpen.has(`${space.id}\0${path}`), onMerged: (path, cx) => { const k = `${space.id}\0${path}`; this.mergedOpen.has(k) ? this.mergedOpen.delete(k) : this.mergedOpen.add(k); cx.notify(); } }))) // t-145
       .when(view === "costs", (el) => el.when(Boolean(costsContext), (e) => e.child(costsContext)).child(this.costs.render(t, space, (shared("project-agent.costs") ?? {})[space.id] ?? null))) // t-145: the context rows on top

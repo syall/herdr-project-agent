@@ -248,3 +248,9 @@ export function workerItem(t, { id = null, text, live, status = null, onClick = 
     .child(text)
     .when(Boolean(trailing), (b) => b.child(trailing));
 }
+
+// A task's state chip (t-154): the Tasks tab's state colors and chip, shared with the Queue tab's task items.
+export const stateTone = (t, state) => ({ "needs-decision": t.blocked, review: t.done, "in-progress": t.working, investigating: t.working, queued: t.muted, parked: t.dim, done: t.dim }[state] ?? t.muted);
+export function stateChip(t, state, color = stateTone(t, state)) {
+  return div().flex_none().px(6).h(18).flex().items_center().rounded(5).bg(color + "26").text_size(10.5).font_semibold().text_color(color).child(String(state));
+}
