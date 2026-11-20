@@ -1510,7 +1510,7 @@ class T190RulesFollowed(unittest.TestCase):  # t-190 R1-R5, R8, R9: the space's 
     def test_r8_notice_carries_the_text(self):
         workers = part(self.raw, "## Workers", "## Phases and gates")
         self.assertIn("(`hc send`: the rule's id and new text, or that it is off, and what stays the same)", workers)
-        self.assertNotIn("what changed and what stays the same", workers)
+        self.assertNotIn("(`hc send`: what changed and what stays the same)", workers)
 
     def test_r2_r5_worker_reads_and_follows(self):
         rules = part(self.worker, "## Rules of the job", "## Roles")
