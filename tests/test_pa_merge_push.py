@@ -833,10 +833,21 @@ class A13Stops(Standing):
             for line in lines:
                 f.write(line + "\n")
 
+    def stops_around_broken_lines(self):
+        out = []
+        for line in read(os.path.join(self.dir, "journal.jsonl")).splitlines():
+            try:
+                value = json.loads(line)
+            except ValueError:
+                continue
+            if value.get("standing") == "stopped":
+                out.append(value)
+        return out
+
     def test_a13_1b_a_torn_hold_line_stops_as_pa_places_reads_it(self):  # fix round 2, REVIEW-2 MF-2
         self.raw_journal('{"by": "person", "hold": "o')
         self.refused("hold is unknown")
-        self.assertEqual(len(self.stops()), 1)
+        self.assertEqual(len(self.stops_around_broken_lines()), 1)
 
     def test_a13_1c_a_broken_line_after_the_last_hold_line_stops(self):  # fix round 2, REVIEW-2 MF-2
         pa_hooks.append_journal(self.dir, {"by": "person", "hold": "off"})
@@ -844,7 +855,7 @@ class A13Stops(Standing):
         code, out = self.spush()
         self.assertEqual((code, out["refusal"]["check"]), (1, "C0"), out)
         self.assertIn("hold is unknown", out["refusal"]["message"])
-        self.assertEqual(len(self.stops()), 1)
+        self.assertEqual(len(self.stops_around_broken_lines()), 1)
         self.assertEqual(self.merged(), [])
 
     def test_a13_2_an_other_answer_on_any_card(self):
