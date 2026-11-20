@@ -7517,6 +7517,26 @@ cases["P41-18-no-updated"] = async () => { // MF-J5r2-1: no updated, or one that
   }
 };
 
+// ---- t-116 (t-041 J5 limits): the context line before the Costs view's read, in UTC, and a remote clock ahead ----
+const NOT_READ41 = "PA context: the Costs view has not read the summary yet.";
+cases["P41-19-not-read-yet"] = async () => { // RL-J5-1: the Costs tab shown, its read still running or failed: says so; then the figures
+  let { dir } = ctxWorld();
+  g.__hang = [`${dir}/costs/summary.json`];
+  let v = await liveMount();
+  await click(v, "view-costs"); await settle();
+  check(look(v).text.includes(NOT_READ41), `a read still running: the line (got ${look(v).text.slice(0, 900)})`);
+  g.__hang = []; await settle(); await settle();
+  check(look(v).text.includes("PA context today (UTC): mean 158k · peak 254k") && !look(v).text.includes(NOT_READ41), `the read answers: the figures (got ${look(v).text.slice(0, 900)})`);
+  ({ dir } = ctxWorld());
+  g.__fail = [`${dir}/costs/summary.json`];
+  v = await liveMount();
+  await click(v, "view-costs"); await settle();
+  check(v.costs.peek(S)?.readFailed && look(v).text.includes(NOT_READ41), `a read that failed: the line (got ${look(v).text.slice(0, 900)})`);
+  g.__fail = [];
+  advance(11000); v.reload(cx); await settle(); await settle();
+  check(look(v).text.includes("PA context today (UTC): mean 158k · peak 254k") && !look(v).text.includes(NOT_READ41), `read again: the figures (got ${look(v).text.slice(0, 900)})`);
+};
+
 // ---- t-119: the suite machines' slots in the Places section (pa-full-suite --places --json) ----
 const FSUITE = ["pa", "full", "suite"].join("-"); // spelled so a guard reading this file's commands is not confused
 const P119 = {
