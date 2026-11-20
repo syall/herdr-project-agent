@@ -1759,7 +1759,7 @@ class T192Branch(Standing):
         path = self.clean("t-003")
         sha = sh(path, "git", "rev-parse", "HEAD")
         sh(self.proj, "git", "tag", "t-003", sha)  # H7.6: a tag and a remote branch of the same name stay
-        sh(self.proj, "git", "push", "-q", "origin", "t-003")
+        sh(self.proj, "git", "push", "-q", "origin", "refs/heads/t-003:refs/heads/t-003")
         sh(self.proj, "git", "fetch", "-q", "origin")
         sh(self.proj, "git", "config", "branch.t-003.description", "mine")
         remote_before = self.refs(self.remote)
