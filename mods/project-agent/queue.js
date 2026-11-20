@@ -48,7 +48,9 @@ function waits(e) {
 }
 
 // The approval line: the entry's approval (J3b), else a queue card that lists it, else not asked.
-function approval(e, cards) {
+// merged: the repository's merged records (t-116, t-084 RL-1: a merge card answered before the task's last merge was
+// that merge's approval, not this entry's).
+function approval(e, cards, merged = []) {
   const a = e.approval;
   if (obj(a)) {
     if (str(a.void)) return `approval: voided (${a.void})`;
@@ -61,8 +63,12 @@ function approval(e, cards) {
   const answered = cards.find((c) => lists(c) && c.status === "answered" && !c.queue.applied && /^Merge/.test(String(c.answer ?? "")));
   if (answered) return `approval: answered on ${answered.id}, applied at the next pa-queue merge`;
   // t-084 R4: the newest answered merge card for the task (not a queue card); with a job, one that names it.
+  // t-116 (t-084 RL-1): after the task's (and job's) latest merge, only a card answered later than it (an older one, or
+  // one with no answered time, was used by that merge): a task re-entering the queue reads "not asked yet".
+  const last = list(merged).filter((m) => readable(m) && same(m, e.task, e.job)).reduce((n, m) => Math.max(n, Date.parse(m.at) || 0), -Infinity);
+  const after = (c) => last === -Infinity || (Date.parse(c.answered) || 0) > last;
   const names = (c) => !e.job || c.job === e.job || new RegExp(`(^|[^A-Za-z0-9_-])${String(e.job).replace(/[^A-Za-z0-9]/g, "\\$&")}([^A-Za-z0-9_-]|$)`).test(String(c.question ?? ""));
-  const merge = cards.filter((c) => obj(c) && c.kind !== "queue" && c.task === e.task && c.status === "answered" && /^Merge\b/.test(String(c.answer ?? "")) && names(c))
+  const merge = cards.filter((c) => obj(c) && c.kind !== "queue" && c.task === e.task && c.status === "answered" && /^Merge\b/.test(String(c.answer ?? "")) && names(c) && after(c))
     .sort((a, b) => (Date.parse(b.answered) || 0) - (Date.parse(a.answered) || 0))[0];
   if (merge) return `approval: approved on ${merge.id} (${merge.answer}${merge.answered ? `, ${at(merge.answered)}` : ""})`;
   return "approval: not asked yet";
@@ -125,7 +131,7 @@ export function queueRows(q, ledger, cards = []) {
       const suite = s ? `suite ${s.exit === 0 ? "passed" : `failed (exit ${s.exit})`}${s.ended ? ` ${at(s.ended)}` : ""}${s.worker ? ` by ${s.worker}` : ""}` : null;
       const r = obj(e.review) ? e.review : null;
       const review = r ? `short review ${r.verdict ?? "?"}${r.ended ? ` ${at(r.ended)}` : ""}${r.worker ? ` by ${r.worker}` : ""}` : null;
-      return { key: `${path}#${i}`, task: e.task, job: str(e.job), linked: known.has(e.task), label: who(e), state: str(e.state) ?? "?", stack, waits: waits(e), suite, review, approval: approval(e, cardList),
+      return { key: `${path}#${i}`, task: e.task, job: str(e.job), linked: known.has(e.task), label: who(e), state: str(e.state) ?? "?", stack, waits: waits(e), suite, review, approval: approval(e, cardList, rec.merged),
         workers: workersOf(e, ledger), files: filesOf(e) };
     });
     // t-154: an entry that left and merged at or after it left is no longer under Left.
