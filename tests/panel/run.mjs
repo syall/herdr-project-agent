@@ -4275,16 +4275,16 @@ async function j1dStates(v, s) {
   return out;
 }
 const J1D_OLD = { // t-143: the same text in the new layout (section counts, Sort/Filter, the task id a link); every figure as before J1d
-  "default": "Estimated from test table prices as of 2027-01-01 (XTS) · updated 2 min ago | Refresh | Copy | Total | {CUR}12.50 est. | 1k tokens · 94% cache read | Today | {CUR}1.25 est. | 100 tokens | Last 7 days (UTC) | {CUR}12.50 est. | 1k tokens | ◌ Includes {CUR}2.50 est. reconstructed (best effort) from session files still on disk. | By activity | 3 activities | Copy | ▸ | build ◌ | 600 tokens | {CUR}7.50 est. · 60% | ▸ | cache rebuild after idle | 300 tokens | {CUR}4.00 est. · 32% | ▸ | unattributed | 100 tokens | {CUR}1.00 est. · 8% | By task | 3 tasks | Sort: | cost | task | recent | Filter | Copy | ▸ | t-1 | One ≈ | in-progress | 900 tokens | {CUR}11.50 est. · 92% | ▸ | t-0 (deleted) Gone | 0 tokens | {CUR}0.00 est. · 0% | ▸ | (no task) | 100 tokens | {CUR}1.00 est. · 8% | By session type | kind | role | program | model | machine | Copy | ▸ | worker | 900 tokens | {CUR}11.50 est. · 92% | ▸ | pa | 100 tokens | {CUR}1.00 est. · 8% | By day (UTC) | Sort: | day | cost | Copy | ▸ | 2027-01-15 | 1k tokens | {CUR}12.50 est. · 100% | Billed amounts: none. The billing query is off; the person turns it on in their own terminal (pa-costs billed enable, see README).",
-  "dim-kind": "Estimated from test table prices as of 2027-01-01 (XTS) · updated 2 min ago | Refresh | Copy | Total | {CUR}12.50 est. | 1k tokens · 94% cache read | Today | {CUR}1.25 est. | 100 tokens | Last 7 days (UTC) | {CUR}12.50 est. | 1k tokens | ◌ Includes {CUR}2.50 est. reconstructed (best effort) from session files still on disk. | By activity | 3 activities | Copy | ▸ | build ◌ | 600 tokens | {CUR}7.50 est. · 60% | ▸ | cache rebuild after idle | 300 tokens | {CUR}4.00 est. · 32% | ▸ | unattributed | 100 tokens | {CUR}1.00 est. · 8% | By task | 3 tasks | Sort: | cost | task | recent | Filter | Copy | ▸ | t-1 | One ≈ | in-progress | 900 tokens | {CUR}11.50 est. · 92% | ▸ | t-0 (deleted) Gone | 0 tokens | {CUR}0.00 est. · 0% | ▸ | (no task) | 100 tokens | {CUR}1.00 est. · 8% | By session type | kind | role | program | model | machine | Copy | ▸ | worker | 900 tokens | {CUR}11.50 est. · 92% | ▸ | pa | 100 tokens | {CUR}1.00 est. · 8% | By day (UTC) | Sort: | day | cost | Copy | ▸ | 2027-01-15 | 1k tokens | {CUR}12.50 est. · 100% | Billed amounts: none. The billing query is off; the person turns it on in their own terminal (pa-costs billed enable, see README).",
-  "dim-role": "Estimated from test table prices as of 2027-01-01 (XTS) · updated 2 min ago | Refresh | Copy | Total | {CUR}12.50 est. | 1k tokens · 94% cache read | Today | {CUR}1.25 est. | 100 tokens | Last 7 days (UTC) | {CUR}12.50 est. | 1k tokens | ◌ Includes {CUR}2.50 est. reconstructed (best effort) from session files still on disk. | By activity | 3 activities | Copy | ▸ | build ◌ | 600 tokens | {CUR}7.50 est. · 60% | ▸ | cache rebuild after idle | 300 tokens | {CUR}4.00 est. · 32% | ▸ | unattributed | 100 tokens | {CUR}1.00 est. · 8% | By task | 3 tasks | Sort: | cost | task | recent | Filter | Copy | ▸ | t-1 | One ≈ | in-progress | 900 tokens | {CUR}11.50 est. · 92% | ▸ | t-0 (deleted) Gone | 0 tokens | {CUR}0.00 est. · 0% | ▸ | (no task) | 100 tokens | {CUR}1.00 est. · 8% | By session type | kind | role | program | model | machine | Copy | ▸ | build | 900 tokens | {CUR}11.50 est. · 92% | ▸ | (none) | 100 tokens | {CUR}1.00 est. · 8% | By day (UTC) | Sort: | day | cost | Copy | ▸ | 2027-01-15 | 1k tokens | {CUR}12.50 est. · 100% | Billed amounts: none. The billing query is off; the person turns it on in their own terminal (pa-costs billed enable, see README).",
-  "dim-program": "Estimated from test table prices as of 2027-01-01 (XTS) · updated 2 min ago | Refresh | Copy | Total | {CUR}12.50 est. | 1k tokens · 94% cache read | Today | {CUR}1.25 est. | 100 tokens | Last 7 days (UTC) | {CUR}12.50 est. | 1k tokens | ◌ Includes {CUR}2.50 est. reconstructed (best effort) from session files still on disk. | By activity | 3 activities | Copy | ▸ | build ◌ | 600 tokens | {CUR}7.50 est. · 60% | ▸ | cache rebuild after idle | 300 tokens | {CUR}4.00 est. · 32% | ▸ | unattributed | 100 tokens | {CUR}1.00 est. · 8% | By task | 3 tasks | Sort: | cost | task | recent | Filter | Copy | ▸ | t-1 | One ≈ | in-progress | 900 tokens | {CUR}11.50 est. · 92% | ▸ | t-0 (deleted) Gone | 0 tokens | {CUR}0.00 est. · 0% | ▸ | (no task) | 100 tokens | {CUR}1.00 est. · 8% | By session type | kind | role | program | model | machine | Copy | ▸ | claude | 1k tokens | {CUR}12.50 est. · 100% | By day (UTC) | Sort: | day | cost | Copy | ▸ | 2027-01-15 | 1k tokens | {CUR}12.50 est. · 100% | Billed amounts: none. The billing query is off; the person turns it on in their own terminal (pa-costs billed enable, see README).",
-  "dim-model": "Estimated from test table prices as of 2027-01-01 (XTS) · updated 2 min ago | Refresh | Copy | Total | {CUR}12.50 est. | 1k tokens · 94% cache read | Today | {CUR}1.25 est. | 100 tokens | Last 7 days (UTC) | {CUR}12.50 est. | 1k tokens | ◌ Includes {CUR}2.50 est. reconstructed (best effort) from session files still on disk. | By activity | 3 activities | Copy | ▸ | build ◌ | 600 tokens | {CUR}7.50 est. · 60% | ▸ | cache rebuild after idle | 300 tokens | {CUR}4.00 est. · 32% | ▸ | unattributed | 100 tokens | {CUR}1.00 est. · 8% | By task | 3 tasks | Sort: | cost | task | recent | Filter | Copy | ▸ | t-1 | One ≈ | in-progress | 900 tokens | {CUR}11.50 est. · 92% | ▸ | t-0 (deleted) Gone | 0 tokens | {CUR}0.00 est. · 0% | ▸ | (no task) | 100 tokens | {CUR}1.00 est. · 8% | By session type | kind | role | program | model | machine | Copy | ▸ | model-a | 1k tokens | {CUR}12.50 est. · 100% | By day (UTC) | Sort: | day | cost | Copy | ▸ | 2027-01-15 | 1k tokens | {CUR}12.50 est. · 100% | Billed amounts: none. The billing query is off; the person turns it on in their own terminal (pa-costs billed enable, see README).",
-  "dim-machine": "Estimated from test table prices as of 2027-01-01 (XTS) · updated 2 min ago | Refresh | Copy | Total | {CUR}12.50 est. | 1k tokens · 94% cache read | Today | {CUR}1.25 est. | 100 tokens | Last 7 days (UTC) | {CUR}12.50 est. | 1k tokens | ◌ Includes {CUR}2.50 est. reconstructed (best effort) from session files still on disk. | By activity | 3 activities | Copy | ▸ | build ◌ | 600 tokens | {CUR}7.50 est. · 60% | ▸ | cache rebuild after idle | 300 tokens | {CUR}4.00 est. · 32% | ▸ | unattributed | 100 tokens | {CUR}1.00 est. · 8% | By task | 3 tasks | Sort: | cost | task | recent | Filter | Copy | ▸ | t-1 | One ≈ | in-progress | 900 tokens | {CUR}11.50 est. · 92% | ▸ | t-0 (deleted) Gone | 0 tokens | {CUR}0.00 est. · 0% | ▸ | (no task) | 100 tokens | {CUR}1.00 est. · 8% | By session type | kind | role | program | model | machine | Copy | ▸ | this computer | 1k tokens | {CUR}12.50 est. · 100% | By day (UTC) | Sort: | day | cost | Copy | ▸ | 2027-01-15 | 1k tokens | {CUR}12.50 est. · 100% | Billed amounts: none. The billing query is off; the person turns it on in their own terminal (pa-costs billed enable, see README).",
-  "model-open": "Estimated from test table prices as of 2027-01-01 (XTS) · updated 2 min ago | Refresh | Copy | Total | {CUR}12.50 est. | 1k tokens · 94% cache read | Today | {CUR}1.25 est. | 100 tokens | Last 7 days (UTC) | {CUR}12.50 est. | 1k tokens | ◌ Includes {CUR}2.50 est. reconstructed (best effort) from session files still on disk. | By activity | 3 activities | Copy | ▸ | build ◌ | 600 tokens | {CUR}7.50 est. · 60% | ▸ | cache rebuild after idle | 300 tokens | {CUR}4.00 est. · 32% | ▸ | unattributed | 100 tokens | {CUR}1.00 est. · 8% | By task | 3 tasks | Sort: | cost | task | recent | Filter | Copy | ▸ | t-1 | One ≈ | in-progress | 900 tokens | {CUR}11.50 est. · 92% | ▸ | t-0 (deleted) Gone | 0 tokens | {CUR}0.00 est. · 0% | ▸ | (no task) | 100 tokens | {CUR}1.00 est. · 8% | By session type | kind | role | program | model | machine | Copy | ▾ | model-a | 1k tokens | {CUR}12.50 est. · 100% | t-1 | ◌ aaaa1111 · worker · build · claude · model-a · {clock} – {clock} · {CUR}7.50 est. · closed · reconstructed | t-1 | bbbb2222 · worker · build · claude · model-a · {clock} – {clock} · {CUR}4.00 est. · gone · recorded | cccc3333 · pa · claude · model-a · {clock} – {clock} · {CUR}1.00 est. · open · recorded | By day (UTC) | Sort: | day | cost | Copy | ▸ | 2027-01-15 | 1k tokens | {CUR}12.50 est. · 100% | Billed amounts: none. The billing query is off; the person turns it on in their own terminal (pa-costs billed enable, see README).",
-  "task-open": "Estimated from test table prices as of 2027-01-01 (XTS) · updated 2 min ago | Refresh | Copy | Total | {CUR}12.50 est. | 1k tokens · 94% cache read | Today | {CUR}1.25 est. | 100 tokens | Last 7 days (UTC) | {CUR}12.50 est. | 1k tokens | ◌ Includes {CUR}2.50 est. reconstructed (best effort) from session files still on disk. | By activity | 3 activities | Copy | ▸ | build ◌ | 600 tokens | {CUR}7.50 est. · 60% | ▸ | cache rebuild after idle | 300 tokens | {CUR}4.00 est. · 32% | ▸ | unattributed | 100 tokens | {CUR}1.00 est. · 8% | By task | 3 tasks | Sort: | cost | task | recent | Filter | Copy | ▾ | t-1 | One ≈ | in-progress | 900 tokens | {CUR}11.50 est. · 92% | ≈ shared passes split by journal entries | Phases: | build · 900 tokens · {CUR}11.50 est. | Sessions: | ◌ aaaa1111 · worker · build · claude · model-a · {clock} – {clock} · {CUR}7.50 est. · closed · reconstructed | bbbb2222 · worker · build · claude · model-a · {clock} – {clock} · {CUR}4.00 est. · gone · recorded | ▸ | t-0 (deleted) Gone | 0 tokens | {CUR}0.00 est. · 0% | ▸ | (no task) | 100 tokens | {CUR}1.00 est. · 8% | By session type | kind | role | program | model | machine | Copy | ▸ | worker | 900 tokens | {CUR}11.50 est. · 92% | ▸ | pa | 100 tokens | {CUR}1.00 est. · 8% | By day (UTC) | Sort: | day | cost | Copy | ▸ | 2027-01-15 | 1k tokens | {CUR}12.50 est. · 100% | Billed amounts: none. The billing query is off; the person turns it on in their own terminal (pa-costs billed enable, see README).",
-  "activity-open": "Estimated from test table prices as of 2027-01-01 (XTS) · updated 2 min ago | Refresh | Copy | Total | {CUR}12.50 est. | 1k tokens · 94% cache read | Today | {CUR}1.25 est. | 100 tokens | Last 7 days (UTC) | {CUR}12.50 est. | 1k tokens | ◌ Includes {CUR}2.50 est. reconstructed (best effort) from session files still on disk. | By activity | 3 activities | Copy | ▾ | build ◌ | 600 tokens | {CUR}7.50 est. · 60% | Tasks: | t-1 | · 600 tokens · {CUR}7.50 est. | ▸ | cache rebuild after idle | 300 tokens | {CUR}4.00 est. · 32% | ▸ | unattributed | 100 tokens | {CUR}1.00 est. · 8% | By task | 3 tasks | Sort: | cost | task | recent | Filter | Copy | ▸ | t-1 | One ≈ | in-progress | 900 tokens | {CUR}11.50 est. · 92% | ▸ | t-0 (deleted) Gone | 0 tokens | {CUR}0.00 est. · 0% | ▸ | (no task) | 100 tokens | {CUR}1.00 est. · 8% | By session type | kind | role | program | model | machine | Copy | ▸ | worker | 900 tokens | {CUR}11.50 est. · 92% | ▸ | pa | 100 tokens | {CUR}1.00 est. · 8% | By day (UTC) | Sort: | day | cost | Copy | ▸ | 2027-01-15 | 1k tokens | {CUR}12.50 est. · 100% | Billed amounts: none. The billing query is off; the person turns it on in their own terminal (pa-costs billed enable, see README).",
-  "day-open": "Estimated from test table prices as of 2027-01-01 (XTS) · updated 2 min ago | Refresh | Copy | Total | {CUR}12.50 est. | 1k tokens · 94% cache read | Today | {CUR}1.25 est. | 100 tokens | Last 7 days (UTC) | {CUR}12.50 est. | 1k tokens | ◌ Includes {CUR}2.50 est. reconstructed (best effort) from session files still on disk. | By activity | 3 activities | Copy | ▸ | build ◌ | 600 tokens | {CUR}7.50 est. · 60% | ▸ | cache rebuild after idle | 300 tokens | {CUR}4.00 est. · 32% | ▸ | unattributed | 100 tokens | {CUR}1.00 est. · 8% | By task | 3 tasks | Sort: | cost | task | recent | Filter | Copy | ▸ | t-1 | One ≈ | in-progress | 900 tokens | {CUR}11.50 est. · 92% | ▸ | t-0 (deleted) Gone | 0 tokens | {CUR}0.00 est. · 0% | ▸ | (no task) | 100 tokens | {CUR}1.00 est. · 8% | By session type | kind | role | program | model | machine | Copy | ▸ | worker | 900 tokens | {CUR}11.50 est. · 92% | ▸ | pa | 100 tokens | {CUR}1.00 est. · 8% | By day (UTC) | Sort: | day | cost | Copy | ▾ | 2027-01-15 | 1k tokens | {CUR}12.50 est. · 100% | build · {CUR}7.50 est. | cache rebuild after idle · {CUR}4.00 est. | unattributed · {CUR}1.00 est. | Billed amounts: none. The billing query is off; the person turns it on in their own terminal (pa-costs billed enable, see README).",
+  "default": "Estimated from test table prices as of 2027-01-01 (XTS) · updated 2 min ago | Refresh | Copy | Total | {CUR}12.50 est. | 1k tokens · 94% cache read | Today | {CUR}1.25 est. | 100 tokens | Last 7 days (UTC) | {CUR}12.50 est. | 1k tokens | ◌ Includes {CUR}2.50 est. reconstructed (best effort) from session files still on disk. | By activity | 3 activities | Copy | ▸ | build ◌ | 600 tokens | {CUR}7.50 est. · 60% | ▸ | cache rebuild after idle | 300 tokens | {CUR}4.00 est. · 32% | ▸ | unattributed | 100 tokens | {CUR}1.00 est. · 8% | By task | 3 tasks | Sort: | cost ↓ | task | recent | Filter | Copy | ▸ | t-1 | One ≈ | in-progress | 900 tokens | {CUR}11.50 est. · 92% | ▸ | t-0 (deleted) Gone | 0 tokens | {CUR}0.00 est. · 0% | ▸ | (no task) | 100 tokens | {CUR}1.00 est. · 8% | By session type | kind | role | program | model | machine | Copy | ▸ | worker | 900 tokens | {CUR}11.50 est. · 92% | ▸ | pa | 100 tokens | {CUR}1.00 est. · 8% | By day (UTC) | Sort: | day ↓ | cost | Copy | ▸ | 2027-01-15 | 1k tokens | {CUR}12.50 est. · 100% | Billed amounts: none. The billing query is off; the person turns it on in their own terminal (pa-costs billed enable, see README).",
+  "dim-kind": "Estimated from test table prices as of 2027-01-01 (XTS) · updated 2 min ago | Refresh | Copy | Total | {CUR}12.50 est. | 1k tokens · 94% cache read | Today | {CUR}1.25 est. | 100 tokens | Last 7 days (UTC) | {CUR}12.50 est. | 1k tokens | ◌ Includes {CUR}2.50 est. reconstructed (best effort) from session files still on disk. | By activity | 3 activities | Copy | ▸ | build ◌ | 600 tokens | {CUR}7.50 est. · 60% | ▸ | cache rebuild after idle | 300 tokens | {CUR}4.00 est. · 32% | ▸ | unattributed | 100 tokens | {CUR}1.00 est. · 8% | By task | 3 tasks | Sort: | cost ↓ | task | recent | Filter | Copy | ▸ | t-1 | One ≈ | in-progress | 900 tokens | {CUR}11.50 est. · 92% | ▸ | t-0 (deleted) Gone | 0 tokens | {CUR}0.00 est. · 0% | ▸ | (no task) | 100 tokens | {CUR}1.00 est. · 8% | By session type | kind | role | program | model | machine | Copy | ▸ | worker | 900 tokens | {CUR}11.50 est. · 92% | ▸ | pa | 100 tokens | {CUR}1.00 est. · 8% | By day (UTC) | Sort: | day ↓ | cost | Copy | ▸ | 2027-01-15 | 1k tokens | {CUR}12.50 est. · 100% | Billed amounts: none. The billing query is off; the person turns it on in their own terminal (pa-costs billed enable, see README).",
+  "dim-role": "Estimated from test table prices as of 2027-01-01 (XTS) · updated 2 min ago | Refresh | Copy | Total | {CUR}12.50 est. | 1k tokens · 94% cache read | Today | {CUR}1.25 est. | 100 tokens | Last 7 days (UTC) | {CUR}12.50 est. | 1k tokens | ◌ Includes {CUR}2.50 est. reconstructed (best effort) from session files still on disk. | By activity | 3 activities | Copy | ▸ | build ◌ | 600 tokens | {CUR}7.50 est. · 60% | ▸ | cache rebuild after idle | 300 tokens | {CUR}4.00 est. · 32% | ▸ | unattributed | 100 tokens | {CUR}1.00 est. · 8% | By task | 3 tasks | Sort: | cost ↓ | task | recent | Filter | Copy | ▸ | t-1 | One ≈ | in-progress | 900 tokens | {CUR}11.50 est. · 92% | ▸ | t-0 (deleted) Gone | 0 tokens | {CUR}0.00 est. · 0% | ▸ | (no task) | 100 tokens | {CUR}1.00 est. · 8% | By session type | kind | role | program | model | machine | Copy | ▸ | build | 900 tokens | {CUR}11.50 est. · 92% | ▸ | (none) | 100 tokens | {CUR}1.00 est. · 8% | By day (UTC) | Sort: | day ↓ | cost | Copy | ▸ | 2027-01-15 | 1k tokens | {CUR}12.50 est. · 100% | Billed amounts: none. The billing query is off; the person turns it on in their own terminal (pa-costs billed enable, see README).",
+  "dim-program": "Estimated from test table prices as of 2027-01-01 (XTS) · updated 2 min ago | Refresh | Copy | Total | {CUR}12.50 est. | 1k tokens · 94% cache read | Today | {CUR}1.25 est. | 100 tokens | Last 7 days (UTC) | {CUR}12.50 est. | 1k tokens | ◌ Includes {CUR}2.50 est. reconstructed (best effort) from session files still on disk. | By activity | 3 activities | Copy | ▸ | build ◌ | 600 tokens | {CUR}7.50 est. · 60% | ▸ | cache rebuild after idle | 300 tokens | {CUR}4.00 est. · 32% | ▸ | unattributed | 100 tokens | {CUR}1.00 est. · 8% | By task | 3 tasks | Sort: | cost ↓ | task | recent | Filter | Copy | ▸ | t-1 | One ≈ | in-progress | 900 tokens | {CUR}11.50 est. · 92% | ▸ | t-0 (deleted) Gone | 0 tokens | {CUR}0.00 est. · 0% | ▸ | (no task) | 100 tokens | {CUR}1.00 est. · 8% | By session type | kind | role | program | model | machine | Copy | ▸ | claude | 1k tokens | {CUR}12.50 est. · 100% | By day (UTC) | Sort: | day ↓ | cost | Copy | ▸ | 2027-01-15 | 1k tokens | {CUR}12.50 est. · 100% | Billed amounts: none. The billing query is off; the person turns it on in their own terminal (pa-costs billed enable, see README).",
+  "dim-model": "Estimated from test table prices as of 2027-01-01 (XTS) · updated 2 min ago | Refresh | Copy | Total | {CUR}12.50 est. | 1k tokens · 94% cache read | Today | {CUR}1.25 est. | 100 tokens | Last 7 days (UTC) | {CUR}12.50 est. | 1k tokens | ◌ Includes {CUR}2.50 est. reconstructed (best effort) from session files still on disk. | By activity | 3 activities | Copy | ▸ | build ◌ | 600 tokens | {CUR}7.50 est. · 60% | ▸ | cache rebuild after idle | 300 tokens | {CUR}4.00 est. · 32% | ▸ | unattributed | 100 tokens | {CUR}1.00 est. · 8% | By task | 3 tasks | Sort: | cost ↓ | task | recent | Filter | Copy | ▸ | t-1 | One ≈ | in-progress | 900 tokens | {CUR}11.50 est. · 92% | ▸ | t-0 (deleted) Gone | 0 tokens | {CUR}0.00 est. · 0% | ▸ | (no task) | 100 tokens | {CUR}1.00 est. · 8% | By session type | kind | role | program | model | machine | Copy | ▸ | model-a | 1k tokens | {CUR}12.50 est. · 100% | By day (UTC) | Sort: | day ↓ | cost | Copy | ▸ | 2027-01-15 | 1k tokens | {CUR}12.50 est. · 100% | Billed amounts: none. The billing query is off; the person turns it on in their own terminal (pa-costs billed enable, see README).",
+  "dim-machine": "Estimated from test table prices as of 2027-01-01 (XTS) · updated 2 min ago | Refresh | Copy | Total | {CUR}12.50 est. | 1k tokens · 94% cache read | Today | {CUR}1.25 est. | 100 tokens | Last 7 days (UTC) | {CUR}12.50 est. | 1k tokens | ◌ Includes {CUR}2.50 est. reconstructed (best effort) from session files still on disk. | By activity | 3 activities | Copy | ▸ | build ◌ | 600 tokens | {CUR}7.50 est. · 60% | ▸ | cache rebuild after idle | 300 tokens | {CUR}4.00 est. · 32% | ▸ | unattributed | 100 tokens | {CUR}1.00 est. · 8% | By task | 3 tasks | Sort: | cost ↓ | task | recent | Filter | Copy | ▸ | t-1 | One ≈ | in-progress | 900 tokens | {CUR}11.50 est. · 92% | ▸ | t-0 (deleted) Gone | 0 tokens | {CUR}0.00 est. · 0% | ▸ | (no task) | 100 tokens | {CUR}1.00 est. · 8% | By session type | kind | role | program | model | machine | Copy | ▸ | this computer | 1k tokens | {CUR}12.50 est. · 100% | By day (UTC) | Sort: | day ↓ | cost | Copy | ▸ | 2027-01-15 | 1k tokens | {CUR}12.50 est. · 100% | Billed amounts: none. The billing query is off; the person turns it on in their own terminal (pa-costs billed enable, see README).",
+  "model-open": "Estimated from test table prices as of 2027-01-01 (XTS) · updated 2 min ago | Refresh | Copy | Total | {CUR}12.50 est. | 1k tokens · 94% cache read | Today | {CUR}1.25 est. | 100 tokens | Last 7 days (UTC) | {CUR}12.50 est. | 1k tokens | ◌ Includes {CUR}2.50 est. reconstructed (best effort) from session files still on disk. | By activity | 3 activities | Copy | ▸ | build ◌ | 600 tokens | {CUR}7.50 est. · 60% | ▸ | cache rebuild after idle | 300 tokens | {CUR}4.00 est. · 32% | ▸ | unattributed | 100 tokens | {CUR}1.00 est. · 8% | By task | 3 tasks | Sort: | cost ↓ | task | recent | Filter | Copy | ▸ | t-1 | One ≈ | in-progress | 900 tokens | {CUR}11.50 est. · 92% | ▸ | t-0 (deleted) Gone | 0 tokens | {CUR}0.00 est. · 0% | ▸ | (no task) | 100 tokens | {CUR}1.00 est. · 8% | By session type | kind | role | program | model | machine | Copy | ▾ | model-a | 1k tokens | {CUR}12.50 est. · 100% | t-1 | ◌ aaaa1111 · worker · build · claude · model-a · {clock} – {clock} · {CUR}7.50 est. · closed · reconstructed | t-1 | bbbb2222 · worker · build · claude · model-a · {clock} – {clock} · {CUR}4.00 est. · gone · recorded | cccc3333 · pa · claude · model-a · {clock} – {clock} · {CUR}1.00 est. · open · recorded | By day (UTC) | Sort: | day ↓ | cost | Copy | ▸ | 2027-01-15 | 1k tokens | {CUR}12.50 est. · 100% | Billed amounts: none. The billing query is off; the person turns it on in their own terminal (pa-costs billed enable, see README).",
+  "task-open": "Estimated from test table prices as of 2027-01-01 (XTS) · updated 2 min ago | Refresh | Copy | Total | {CUR}12.50 est. | 1k tokens · 94% cache read | Today | {CUR}1.25 est. | 100 tokens | Last 7 days (UTC) | {CUR}12.50 est. | 1k tokens | ◌ Includes {CUR}2.50 est. reconstructed (best effort) from session files still on disk. | By activity | 3 activities | Copy | ▸ | build ◌ | 600 tokens | {CUR}7.50 est. · 60% | ▸ | cache rebuild after idle | 300 tokens | {CUR}4.00 est. · 32% | ▸ | unattributed | 100 tokens | {CUR}1.00 est. · 8% | By task | 3 tasks | Sort: | cost ↓ | task | recent | Filter | Copy | ▾ | t-1 | One ≈ | in-progress | 900 tokens | {CUR}11.50 est. · 92% | ≈ shared passes split by journal entries | Phases: | build · 900 tokens · {CUR}11.50 est. | Sessions: | ◌ aaaa1111 · worker · build · claude · model-a · {clock} – {clock} · {CUR}7.50 est. · closed · reconstructed | bbbb2222 · worker · build · claude · model-a · {clock} – {clock} · {CUR}4.00 est. · gone · recorded | ▸ | t-0 (deleted) Gone | 0 tokens | {CUR}0.00 est. · 0% | ▸ | (no task) | 100 tokens | {CUR}1.00 est. · 8% | By session type | kind | role | program | model | machine | Copy | ▸ | worker | 900 tokens | {CUR}11.50 est. · 92% | ▸ | pa | 100 tokens | {CUR}1.00 est. · 8% | By day (UTC) | Sort: | day ↓ | cost | Copy | ▸ | 2027-01-15 | 1k tokens | {CUR}12.50 est. · 100% | Billed amounts: none. The billing query is off; the person turns it on in their own terminal (pa-costs billed enable, see README).",
+  "activity-open": "Estimated from test table prices as of 2027-01-01 (XTS) · updated 2 min ago | Refresh | Copy | Total | {CUR}12.50 est. | 1k tokens · 94% cache read | Today | {CUR}1.25 est. | 100 tokens | Last 7 days (UTC) | {CUR}12.50 est. | 1k tokens | ◌ Includes {CUR}2.50 est. reconstructed (best effort) from session files still on disk. | By activity | 3 activities | Copy | ▾ | build ◌ | 600 tokens | {CUR}7.50 est. · 60% | Tasks: | t-1 | · 600 tokens · {CUR}7.50 est. | ▸ | cache rebuild after idle | 300 tokens | {CUR}4.00 est. · 32% | ▸ | unattributed | 100 tokens | {CUR}1.00 est. · 8% | By task | 3 tasks | Sort: | cost ↓ | task | recent | Filter | Copy | ▸ | t-1 | One ≈ | in-progress | 900 tokens | {CUR}11.50 est. · 92% | ▸ | t-0 (deleted) Gone | 0 tokens | {CUR}0.00 est. · 0% | ▸ | (no task) | 100 tokens | {CUR}1.00 est. · 8% | By session type | kind | role | program | model | machine | Copy | ▸ | worker | 900 tokens | {CUR}11.50 est. · 92% | ▸ | pa | 100 tokens | {CUR}1.00 est. · 8% | By day (UTC) | Sort: | day ↓ | cost | Copy | ▸ | 2027-01-15 | 1k tokens | {CUR}12.50 est. · 100% | Billed amounts: none. The billing query is off; the person turns it on in their own terminal (pa-costs billed enable, see README).",
+  "day-open": "Estimated from test table prices as of 2027-01-01 (XTS) · updated 2 min ago | Refresh | Copy | Total | {CUR}12.50 est. | 1k tokens · 94% cache read | Today | {CUR}1.25 est. | 100 tokens | Last 7 days (UTC) | {CUR}12.50 est. | 1k tokens | ◌ Includes {CUR}2.50 est. reconstructed (best effort) from session files still on disk. | By activity | 3 activities | Copy | ▸ | build ◌ | 600 tokens | {CUR}7.50 est. · 60% | ▸ | cache rebuild after idle | 300 tokens | {CUR}4.00 est. · 32% | ▸ | unattributed | 100 tokens | {CUR}1.00 est. · 8% | By task | 3 tasks | Sort: | cost ↓ | task | recent | Filter | Copy | ▸ | t-1 | One ≈ | in-progress | 900 tokens | {CUR}11.50 est. · 92% | ▸ | t-0 (deleted) Gone | 0 tokens | {CUR}0.00 est. · 0% | ▸ | (no task) | 100 tokens | {CUR}1.00 est. · 8% | By session type | kind | role | program | model | machine | Copy | ▸ | worker | 900 tokens | {CUR}11.50 est. · 92% | ▸ | pa | 100 tokens | {CUR}1.00 est. · 8% | By day (UTC) | Sort: | day ↓ | cost | Copy | ▾ | 2027-01-15 | 1k tokens | {CUR}12.50 est. · 100% | build · {CUR}7.50 est. | cache rebuild after idle · {CUR}4.00 est. | unattributed · {CUR}1.00 est. | Billed amounts: none. The billing query is off; the person turns it on in their own terminal (pa-costs billed enable, see README).",
 };
 cases["P-costs-j1d-old"] = async () => { // V-J1d-1: a summary without the J1 keys draws exactly as before J1d, in every state
   const s = costsSummary();
@@ -4394,7 +4394,7 @@ cases["P-costs-j1d-accounts"] = async () => { // R-A3 AC: two accounts: an Accou
   check(!/· account /.test(text), `no single account beside Total (got ${text.slice(0, 900)})`);
   const a = section(text, "| Accounts | Copy", ["| By scope", "| By day"]);
   check(/acct-a \| 900 tokens \| [^|]*9\.50[^|]* est\. · 76% \|/.test(a) && /acct-b \| 100 tokens \| [^|]*3\.00[^|]* est\. · 24% \|/.test(`${a}|`), `one row per account (got ${a})`); // section() ends before the next head's |
-  check(text.indexOf("| Accounts |") > text.indexOf("| By session type") && text.indexOf("| Accounts |") < text.indexOf("| By scope"), "after session type, before By scope");
+  check(text.indexOf("| Accounts |") > text.indexOf("| Last 7 days") && text.indexOf("| Accounts |") < text.indexOf("| By activity"), "under the tiles, before By activity (t-177 R12)");
   await click(v, "costs-account-1"); await settle(); text = costsView(v).text;
   const d = section(text, "| Accounts | Copy", ["| By scope", "| By day"]);
   check(/Sessions: \| cccc3333 /.test(d) && !d.includes("aaaa1111"), `the account's sessions (got ${d})`);
@@ -4440,6 +4440,181 @@ cases["P-costs-t050-words"] = async () => { // t-050: the one-scope note in plai
   const w2 = await costsWorld({ summary: s2 });
   const t2 = costsView(w2.v).text;
   check(t2.includes("| All costs priced from the price file's prices for provider provider-a valid from 2026-01-01 · provider provider-a, endpoint regional, region region-a, account acct1 |"), `every fact known: named, no parentheses (got ${t2.slice(0, 1200)})`);
+};
+
+// ---- t-177: costs per billing account (R12-R16) and sort direction (R17); evidence/t-177/plan.md. Own block. ----
+const NRK = "(not recorded)";
+const A177_SCOPE_A = ["provider-a", "global", null, "acct-a"], A177_SCOPE_N = ["provider-a", "global", null, null];
+// One label and the not-recorded part: per-entry accounts on byTask, byDay, byKind and sessions.
+function acctSummary(over = {}) {
+  const base = costsSummary(), part = (key, tokens, money, calls = 1) => ({ key, tokens, money, calls });
+  const s = costsSummary({
+    accountsDeclared: true,
+    byAccount: [{ ...part("acct-a", 700, 8.5, 4) }, { ...part(NRK, 300, 4, 3), notRecorded: true }],
+    byScope: [{ key: "provider-a · global · ? · acct-a", scope: A177_SCOPE_A, tokens: 700, money: 8.5, calls: 4, pricedAs: [], by: {} },
+      { key: `provider-a · global · ? · ${NRK}`, scope: A177_SCOPE_N, tokens: 300, money: 4, calls: 3, pricedAs: [], by: { accountBy: "not-recorded" } }],
+    scopes: 2,
+    byTask: [{ ...base.byTask[0], accounts: [part("acct-a", 600, 7.5, 3), part(NRK, 300, 4, 2)] },
+      { ...base.byTask[1], account: NRK }, { ...base.byTask[2], account: "acct-a" }],
+    byKind: { ...base.byKind, kind: [{ ...base.byKind.kind[0], accounts: [part("acct-a", 600, 7.5, 3), part(NRK, 300, 4, 2)] }, { ...base.byKind.kind[1], account: "acct-a" }] },
+    byDay: [{ ...base.byDay[0], accounts: [part("acct-a", 700, 8.5, 4), part(NRK, 300, 4, 3)] }],
+    sessions: [{ ...base.sessions[0], account: "acct-a" }, { ...base.sessions[1], account: NRK }, { ...base.sessions[2], account: "acct-a" }],
+  });
+  return { ...s, ...over };
+}
+const st177 = (v) => v.costs.peek(S);
+
+cases["P177-card"] = async () => { // P1 R12: the Accounts card right under the tiles (one label + not recorded, or two labels); one entry: Total says it
+  let { v } = await costsWorld({ summary: acctSummary() });
+  let text = costsView(v).text;
+  const at = text.indexOf("| Accounts |");
+  check(at > text.indexOf("| Last 7 days") && at < text.indexOf("| By activity"), `under the tiles, before By activity (got ${text.slice(0, 1400)})`);
+  const a = section(text, "| Accounts | Copy", ["| By activity"]);
+  check(/acct-a \| 700 tokens \| [^|]*8\.50[^|]* est\. · 68% \|/.test(a) && /account not recorded \| 300 tokens \| [^|]*4\.00[^|]* est\. · 32%/.test(a), `one row per entry, in words (got ${a})`);
+  check(!/· account /.test(section(text, "| Total |", ["| Today"])), `no single account beside Total (got ${text.slice(0, 600)})`);
+  await click(v, "costs-account-1"); await settle(); text = costsView(v).text;
+  check(/Sessions: \| [^|]*bbbb2222 /.test(section(text, "| Accounts | Copy", ["| By activity"])), `the not-recorded row opens to its sessions (got ${text.slice(0, 2000)})`);
+  ({ v } = await costsWorld({ summary: acctSummary({ byAccount: [{ key: "acct-a", tokens: 700, money: 8.5, calls: 4 }, { key: "acct-b", tokens: 300, money: 4, calls: 3 }] }) }));
+  check(costsView(v).text.includes("| Accounts |"), "two labels: the card");
+  ({ v } = await costsWorld({ summary: acctSummary({ byAccount: [{ key: NRK, tokens: 1000, money: 12.5, calls: 7, notRecorded: true }] }) }));
+  text = costsView(v).text;
+  check(!text.includes("| Accounts |") && /94% cache read · account not recorded \|/.test(text), `one entry, not recorded: in words beside Total (got ${text.slice(0, 700)})`);
+  check(!Object.keys(costsView(v).clicks).some((k) => k.startsWith("costs-acct")), "no chips and no filter without the card");
+  ({ v } = await costsWorld({ summary: acctSummary({ byAccount: [{ key: "acct-a", tokens: 1000, money: 12.5, calls: 7 }] }) }));
+  check(/94% cache read · account acct-a \|/.test(costsView(v).text), "one label beside Total");
+};
+
+cases["P177-chips"] = async () => { // P2 R13: chips on By scope rows, session lines and mixed rows only; a chip sets the filter, never toggles its row
+  const { v } = await costsWorld({ summary: acctSummary() });
+  let { clicks, text } = costsView(v);
+  check(Boolean(clicks["costs-acct-scope-0"]) && Boolean(clicks["costs-acct-scope-1"]), `By scope rows have chips (have ${Object.keys(clicks).filter((k) => k.startsWith("costs-acct"))})`);
+  check(/account not recorded[^|]* \| not recorded \|/.test(section(text, "| By scope", ["| By day"])) || /\| not recorded \|/.test(section(text, "| By scope", ["| By day"])), `the not-recorded scope's chip in words (got ${section(text, "| By scope", ["| By day"])})`);
+  check(Boolean(clicks["costs-acct-task-0"]) && !clicks["costs-acct-task-1"] && !clicks["costs-acct-task-2"], "only the mixed task row has a chip");
+  check(/\| 2 accounts \|/.test(section(text, "| By task", ["| By session type"])), "it says 2 accounts");
+  check(Boolean(clicks["costs-acct-day-0"]) && Boolean(clicks["costs-acct-kind-0"]) && !clicks["costs-acct-kind-1"], "mixed day and kind rows only");
+  await click(v, "costs-acct-scope-1"); await settle();
+  check(st177(v).account === NRK && !st177(v).open.scope, `a scope chip sets the filter, the row stays shut (account ${st177(v).account}, open ${st177(v).open.scope})`);
+  await click(v, "costs-acctf-all"); await settle();
+  await click(v, "costs-acct-task-0"); await settle();
+  check(st177(v).open.task === "t-1" && !st177(v).account, "an N accounts chip opens the row's drill");
+  ({ clicks, text } = costsView(v));
+  const d = section(text, "| By task", ["| By session type"]);
+  check(/≈ \| [^|]*acct-a[^|]*600 tokens|acct-a \| [^|]*600 tokens/.test(d) || /600 tokens/.test(d), `the drill lists each account (got ${d})`);
+  check(Boolean(clicks["costs-acct-task-0-0"]) && Boolean(clicks["costs-acct-task-0-1"]), `each a single chip (have ${Object.keys(clicks).filter((k) => k.startsWith("costs-acct-task"))})`);
+  check(Boolean(clicks["costs-acct-task-0-2"]) && Boolean(clicks["costs-acct-task-0-3"]), "and each session line has its chip");
+  await click(v, "costs-acct-task-0-0"); await settle();
+  check(st177(v).account === "acct-a" && st177(v).open.task === "t-1", `the drill's chip sets the filter, the drill stays open (${st177(v).account}, ${st177(v).open.task})`);
+};
+
+cases["P177-filter"] = async () => { // P3 R14 (H13): the filter shows each row's part with its share of that account; n of m; head and Copy say it; back to All
+  const { v } = await costsWorld({ summary: acctSummary() });
+  const before = costsView(v).text, act = (t) => section(t, "| By activity", ["| By task"]), tot = (t) => section(t, "| Total", ["| By activity"]);
+  const { clicks } = costsView(v);
+  check(Boolean(clicks["costs-acctf-all"]) && Boolean(clicks["costs-acctf-0"]) && Boolean(clicks["costs-acctf-none"]) && !clicks["costs-acctf-1"], `All, acct-a, not recorded (have ${Object.keys(clicks).filter((k) => k.startsWith("costs-acctf"))})`);
+  await click(v, "costs-acctf-0"); await settle();
+  let text = costsView(v).text, t = section(text, "| By task", ["| By session type"]);
+  check(t.startsWith(" · account acct-a |") && /2 of 3 tasks/.test(t), `head and count (got ${t})`);
+  check(/t-1 \| One ≈ \| in-progress \| 600 tokens \| [^|]*7\.50[^|]* est\. · 88% \|/.test(t) && !/t-0/.test(t) && /\(no task\) \| 100 tokens \| [^|]*1\.00[^|]* est\. · 12%/.test(t), `parts and shares of acct-a (got ${t})`);
+  const k = section(text, "| By session type", ["| By day"]);
+  check(/worker \| 600 tokens/.test(k) && /pa \| 100 tokens/.test(k), `By session type filtered (got ${k})`);
+  check(/700 tokens \| [^|]*8\.50/.test(section(text, "| By day", ["| Billed", "Billed amounts"])), "By day filtered");
+  check(act(text) === act(before) && tot(text) === tot(before), "Total and By activity unchanged");
+  await click(v, "costs-task-0"); await settle(); text = costsView(v).text;
+  const d = section(text, "| By task", ["| By session type"]);
+  check(d.includes("aaaa1111") && !d.includes("bbbb2222"), `a session line is kept only with the account (got ${d})`);
+  const copied = await j1dCopy(v, "costs-copy-task");
+  check(copied.startsWith("By task · account acct-a"), `the Copy says it (got ${copied.slice(0, 200)})`);
+  await click(v, "costs-task-0"); await settle();
+  await click(v, "costs-acctf-none"); await settle(); text = costsView(v).text; t = section(text, "| By task", ["| By session type"]);
+  check(t.startsWith(" · account not recorded |") && /2 of 3 tasks/.test(t) && /t-1 [^]*300 tokens/.test(t) && /t-0/.test(t) && !/\(no task\)/.test(t), `not recorded (got ${t})`);
+  check(!/\| pa \|/.test(section(text, "| By session type", ["| By day"])), "a row with nothing in that account is hidden");
+  await click(v, "costs-sort-task-cost"); await settle(); t = section(costsView(v).text, "| By task", ["| By session type"]);
+  check(t.indexOf("t-0") < t.indexOf("t-1"), `cost ↑ orders by the filtered part (got ${t})`);
+  st177(v).account = "acct-gone"; text = costsView(v).text;
+  check(!st177(v).account && !/By task · account/.test(text), `an account the summary no longer has goes back to All (got ${st177(v).account})`);
+};
+
+cases["P177-older"] = async () => { // P4 R15: an older summary (no per-entry accounts) with a filter says so and draws unfiltered
+  const s = costsSummary({ byAccount: [{ key: "acct-a", tokens: 900, money: 9.5, calls: 5 }, { key: "acct-b", tokens: 100, money: 3, calls: 2 }] });
+  const { v } = await costsWorld({ summary: s });
+  check(!costsView(v).text.includes("no per-account rows"), "no note without a filter");
+  await click(v, "costs-acctf-0"); await settle();
+  const text = costsView(v).text;
+  check(text.includes("This summary has no per-account rows; Refresh to make one"), `the note (got ${text.slice(0, 1500)})`);
+  check(/\| 3 tasks \|/.test(text) && !/of 3 tasks/.test(text), "drawn unfiltered");
+};
+
+cases["P177-sort"] = async () => { // P5 R17: each sort flips on a second click with its arrow; defaults as today; buckets last; older placed; ties stable; Show more after
+  const s = sortSummary();
+  s.byTask.push({ key: "(no task)", state: null, tokens: 50, money: 0.5, calls: 1, phases: [], sessions: [] });
+  const { v } = await costsWorld({ summary: s });
+  const segs = () => taskSegs(v), chipsOf = () => segs().slice(segs().indexOf("Sort:") + 1, segs().indexOf("Sort:") + 4);
+  check(JSON.stringify(chipsOf()) === JSON.stringify(["cost ↓", "task", "recent"]), `the default arrow (got ${chipsOf()})`);
+  check(ascending(orderOf(segs(), ["t-2", "t-10", "t-3", "(no task)"])), `cost ↓ is today's order (got ${segs().join(" | ")})`);
+  await click(v, "costs-sort-task-cost"); await settle();
+  check(chipsOf()[0] === "cost ↑" && ascending(orderOf(segs(), ["(no task)", "t-3", "t-10", "t-2"])), `cost ↑ (got ${segs().join(" | ")})`);
+  await click(v, "costs-sort-task-task"); await settle();
+  check(chipsOf()[1] === "task ↑" && ascending(orderOf(segs(), ["t-2", "t-3", "t-10", "(no task)"])), `task ↑, buckets last (got ${segs().join(" | ")})`);
+  await click(v, "costs-sort-task-task"); await settle();
+  check(chipsOf()[1] === "task ↓" && ascending(orderOf(segs(), ["t-10", "t-3", "t-2", "(no task)"])), `task ↓, buckets still last (got ${segs().join(" | ")})`);
+  await click(v, "costs-sort-task-recent"); await settle();
+  check(chipsOf()[2] === "recent ↓" && ascending(orderOf(segs(), ["t-10", "t-2"])), `another chip: its default (got ${segs().join(" | ")})`);
+  await click(v, "costs-sort-task-recent"); await settle();
+  check(chipsOf()[2] === "recent ↑" && ascending(orderOf(segs(), ["t-2", "t-10"])), `recent ↑ (got ${segs().join(" | ")})`);
+  await click(v, "costs-sort-task-cost"); await settle();
+  check(chipsOf()[0] === "cost ↓", "back to cost: its default direction");
+  // ties keep the summary index in both directions
+  const tie = sortSummary(); tie.byTask[2].money = 3; tie.byTask[2].tokens = 300;
+  const w = (await costsWorld({ summary: tie })).v, tsegs = () => taskSegs(w);
+  check(ascending(orderOf(tsegs(), ["t-2", "t-10", "t-3"])), "tie, cost ↓");
+  await click(w, "costs-sort-task-cost"); await settle();
+  check(ascending(orderOf(tsegs(), ["t-10", "t-3", "t-2"])), `tie, cost ↑: index order between the tied (got ${tsegs().join(" | ")})`);
+  // By day: day ↓ (older last), day ↑ (older first), cost; Show more after an ascending sort
+  const ds = sortSummary(), day = (i) => isoAt(T0 - i * 86400000).slice(0, 10);
+  ds.byDay = Array.from({ length: 20 }, (_, i) => ({ key: day(i), tokens: 10 + i, money: 1 + i, calls: 1, byActivity: {} }));
+  ds.byDay.push({ key: "older", days: 9, tokens: 5, money: 0.5, calls: 1 });
+  const dv = (await costsWorld({ summary: ds })).v, dsegs = () => costsView(dv).text.split(" | ");
+  const dayHead = () => { const x = dsegs(); const i = x.findIndex((y, j) => y === "Sort:" && x[j + 1]?.startsWith("day")); return x.slice(i + 1, i + 3); };
+  check(JSON.stringify(dayHead()) === JSON.stringify(["day ↓", "cost"]), `day default arrow (got ${dayHead()})`);
+  check(dsegs().includes(day(0)) && !dsegs().includes(day(15)) && !dsegs().some((x) => x.startsWith("older")), "day ↓: newest 14");
+  await click(dv, "costs-sort-day-day"); await settle();
+  check(dayHead()[0] === "day ↑" && dsegs().some((x) => x.startsWith("older")) && dsegs().includes(day(19)) && !dsegs().includes(day(0)), `day ↑: older first, then the oldest days (got ${dsegs().slice(-60).join(" | ")})`);
+  check(dsegs().findIndex((x) => x.startsWith("older")) < dsegs().indexOf(day(19)), "older before the oldest day");
+  await click(dv, "costs-days-more"); await settle();
+  check(dsegs().includes(day(0)) && dsegs().indexOf(day(0)) > dsegs().indexOf(day(1)), "Show more after the sort: every day, ascending");
+  await click(dv, "costs-sort-day-cost"); await settle();
+  check(dayHead()[1] === "cost ↓" && dsegs().indexOf(day(19)) < dsegs().indexOf(day(0)), "day cost ↓");
+  await click(dv, "costs-sort-day-cost"); await settle();
+  check(dayHead()[1] === "cost ↑" && dsegs().findIndex((x) => x.startsWith("older")) < dsegs().indexOf(day(0)), "day cost ↑: older (cheapest) first");
+  check(JSON.stringify(st177(dv).dir) === JSON.stringify({ task: null, day: "asc" }), `the state (got ${JSON.stringify(st177(dv).dir)})`);
+};
+
+cases["P177-hostile"] = async () => { // P6 H11, H12: a label that looks like markup is text; malformed accounts draw no chip and never throw
+  const odd = "a.b-c_d";
+  const s = acctSummary({ byAccount: [{ key: odd, tokens: 700, money: 8.5, calls: 4 }, { key: NRK, tokens: 300, money: 4, calls: 3, notRecorded: true }] });
+  s.sessions[0].account = odd;
+  s.byTask[0].accounts = "x";
+  s.byTask[1] = { ...s.byTask[1], account: undefined, accounts: [{ tokens: 1 }, { key: NRK, money: 1 }] };
+  s.byTask[2] = { ...s.byTask[2], account: undefined, accounts: [{ key: odd, money: "5", tokens: 1 }, { key: NRK, money: 1, tokens: 1 }] };
+  s.byKind.kind[0].accounts = [null, 5];
+  const { v } = await costsWorld({ summary: s });
+  const { text, clicks } = costsView(v);
+  check(text.includes(`| ${odd} |`), `the label drawn as text (got ${text.slice(0, 1500)})`);
+  check(!clicks["costs-acct-task-0"] && !clicks["costs-acct-task-1"] && !clicks["costs-acct-task-2"] && !clicks["costs-acct-kind-0"], `no chips for malformed entries (have ${Object.keys(clicks).filter((k) => k.startsWith("costs-acct"))})`);
+  await click(v, "costs-acctf-0"); await settle();
+  check(costsView(v).text.includes(`By task · account ${odd}`), "filtering by it works");
+  await click(v, "costs-task-0"); await settle();
+  check(!g.__rejected.length, `nothing thrown (${g.__rejected})`);
+};
+
+cases["P177-billed"] = async () => { // R16: the not-recorded part is one dim line beside the bill, never compared
+  const reply = { ...noRows(), notRecorded: { money: 13, partial: false } };
+  const { v } = await costsWorld({ summary: acctSummary(), tool: { "billed compare": () => json0(reply) } });
+  await settle();
+  const text = costsView(v).text;
+  check(/Account not recorded: this space ≈ [^|]*13\.00[^|]* est\.; not compared with any bill/.test(text), `the line (got ${text.slice(-700)})`);
+  const plain = (await costsWorld({ summary: acctSummary() })).v;
+  check(!costsView(plain).text.includes("Account not recorded"), "absent without notRecorded");
 };
 
 // ---- t-045: a decision card stays answered once the person submits (Wanted 1-4) ----

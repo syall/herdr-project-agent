@@ -117,3 +117,19 @@ def reset_record(at, frm, to, ctx=260000, reason="pass-cap", pass_no=7, terminal
 def compact_record(at, session, trigger="auto"):
     """A sessions.jsonl `compact` record as t-041 R5 specifies it (J3's PostCompact hook writes them; J1 reads them)."""
     return {"ev": "compact", "trigger": trigger, "session": session, "at": at}
+
+
+# ---- t-177: launchAccounts entries (generic names only: tool-a, agent-a, acct-a, ~/s/own.json) ----
+
+def launch_entry(account, **match):
+    """One profile launchAccounts entry: {"account": account, <program|path|settings|tool>: ...}."""
+    entry = {"account": account}
+    entry.update(match)
+    return entry
+
+
+def launch_profile(*entries, claude=("true",), **extra):
+    """A test profile.json object that declares launchAccounts (entries in order: the first match wins)."""
+    prof = {"name": "test", "claude": list(claude), "codex": ["true"], "launchAccounts": list(entries)}
+    prof.update(extra)
+    return prof

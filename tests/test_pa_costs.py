@@ -7911,6 +7911,453 @@ class T070_Net(J2Base):
             self.assertEqual(W_CloseAndGuard.guard(self, command)[0], 0, command)
 
 
+# ---- t-177: costs per billing account, decided by how each session was started (spec R1-R11, H1-H10) ----------------
+
+NR = "(not recorded)"
+OWN = "~/s/own-t177.json"  # a settings path: only ever compared, never opened, stored or printed
+
+
+class T177Base(CostsBase):
+    def set_launch(self, *entries, **extra):
+        dump(fx.launch_profile(*entries, **extra), os.path.join(self.profile_dir, "profile.json"))
+        return pa.load_profile("test")
+
+    def acct(self, entries, command, kind="claude", own=None, env=None, extra=None):
+        prof = fx.launch_profile(*entries, **(extra or {})) if entries is not None else {"name": "test", "claude": ["true"]}
+        f = pa_costs.launch_facts(prof, kind, None, self.dir, env={} if env is None else env, command=command, own=own)
+        return f["account"], f["accountBy"]
+
+
+class T177_Rules(T177Base):
+    """T1 (R1, R2, H3): launch_account_rules keeps valid entries in order, drops and names the others."""
+
+    def test_t1_valid_entries_kept_in_order(self):
+        prof = fx.launch_profile(fx.launch_entry("acct-a", program="agent-a"),
+                                 fx.launch_entry("acct-b", path="~/x/bin/agent-b", tool="claude"),
+                                 fx.launch_entry("acct-c", settings=OWN, tool="codex"))
+        rules, problems, declared = pa_costs.launch_account_rules(prof)
+        self.assertEqual(problems, [])
+        self.assertTrue(declared)
+        self.assertEqual([r["account"] for r in rules], ["acct-a", "acct-b", "acct-c"])
+        self.assertEqual(pa_costs.launch_account_rules({"name": "test"}), ([], [], False))
+        self.assertEqual(pa_costs.launch_account_rules(None), ([], [], False))
+
+    def test_h3_malformed_entries_dropped_and_named(self):
+        bad = [{}, {"account": "acct-a"}, {"progam": "agent-a", "account": "acct-a"}, {"program": "", "account": "acct-a"},
+               {"program": 3, "account": "acct-a"}, {"program": "agent-a", "account": TWELVE},
+               {"program": "agent-a", "account": "a b"}, {"program": "agent-a", "account": NR},
+               {"program": "agent-a", "account": "x" * 65}, {"program": "agent-a", "account": "acct-a", "tool": "other"},
+               {"program": "agent-a", "account": 7}, "x", None, {"program": "agent-a", "account": "acct-a", "settings": ""}]
+        for entry in bad:
+            rules, problems, declared = pa_costs.launch_account_rules({"launchAccounts": [entry]})
+            self.assertEqual(rules, [], entry)
+            self.assertEqual(len(problems), 1, (entry, problems))
+            self.assertTrue(problems[0].startswith("launchAccounts[0]"), problems)
+            self.assertNotIn(TWELVE, problems[0])
+            self.assertTrue(declared)
+        for block in ({}, "x", 3):
+            rules, problems, declared = pa_costs.launch_account_rules({"launchAccounts": block})
+            self.assertEqual((rules, len(problems), declared), ([], 1, True), block)
+        # a bad entry never hides the good ones after it, and never matches every launch (fail closed)
+        prof = fx.launch_profile({"progam": "agent-a", "account": "acct-x"}, fx.launch_entry("acct-a", program="agent-a"))
+        rules, problems, _d = pa_costs.launch_account_rules(prof)
+        self.assertEqual([r["account"] for r in rules], ["acct-a"])
+        self.assertEqual(self.acct([{"progam": "agent-a", "account": "acct-x"}], ["tool-z"]), (None, "not-recorded"))
+
+    def test_t1_problems_in_the_summary_and_prices(self):
+        self.set_launch({"progam": "agent-a", "account": "acct-a"})
+        s = pa_costs.summarize(self.dir, [], [], None, None, "test", T0, cc=[])
+        self.assertTrue(any(p.startswith("launchAccounts[0]") for p in s["problems"]), s["problems"])
+        _r, out, _e = self.run_cmd(pa_costs.cmd_prices, self.dir)
+        self.assertIn("launchAccounts[0]", out)
+
+
+class T177_Launch(T177Base):
+    """T2 (R3, R4; H1, H2, H4-H7): the account a start record gets from its command."""
+    PROG = [fx.launch_entry("acct-a", program="agent-a")]
+    PATH = [fx.launch_entry("acct-a", path="~/x/bin/agent-a")]
+    SETS = [fx.launch_entry("acct-b", settings=OWN)]
+
+    def test_h1_program_and_path_match(self):
+        for cmd in (["agent-a"], ["/opt/x/bin/agent-a"], ["~/x/bin/agent-a", "go"], ["./agent-a"]):
+            self.assertEqual(self.acct(self.PROG, cmd), ("acct-a", "command"), cmd)
+        for cmd in (["~/x/bin/agent-a"], [os.path.expanduser("~/x/bin/agent-a"), "--model", "m"]):
+            self.assertEqual(self.acct(self.PATH, cmd), ("acct-a", "command"), cmd)
+
+    def test_h2_no_match(self):
+        link = os.path.join(TMP, "t177-bin", "b")
+        os.makedirs(os.path.dirname(link), exist_ok=True)
+        if not os.path.lexists(link):
+            os.symlink("agent-a", link)
+        for cmd in (["Agent-A"], ["agent-a.bak"], ["agent-a "], [link], ["env", "A=1", "agent-a"], ["sh", "-c", "agent-a"],
+                    ["nice", "agent-a"], [""], ["--settings"], [], [3]):
+            self.assertEqual(self.acct(self.PROG, cmd), (None, "not-recorded"), cmd)
+        for cmd in (["./agent-a"], ["~/x/bin/../bin/agent-a"], ["~/x//bin/agent-a"], ["x/bin/agent-a"], ["agent-a"]):
+            self.assertEqual(self.acct(self.PATH, cmd), (None, "not-recorded"), cmd)
+
+    def test_h4_settings_match(self):
+        for cmd, own in ((["tool-a", "--settings", OWN], None), (["tool-a", "--settings=" + OWN], None),
+                         (["tool-a", "--model", "m", "--settings", os.path.expanduser(OWN), "go"], 5),
+                         (["tool-a", "--settings", OWN, "--model", "x", "--append-system-prompt", "t"], 3)):
+            self.assertEqual(self.acct(self.SETS, cmd, own=own), ("acct-b", "settings"), cmd)
+
+    def test_h5_settings_no_match(self):
+        cases = [(["tool-a", "--settings"], None), (["tool-a", "--settings", "--model", "x"], None), (["tool-a", "--settings="], None),
+                 (["tool-a", "--settings", '{"a":1}'], None), (["tool-a", "--", "--settings", OWN], None),
+                 (["tool-a", "--append-system-prompt", "--settings", OWN], None), (["tool-a", "--name", "--settings", OWN], None),
+                 (["tool-a", "--system-prompt", "--settings=" + OWN], None),
+                 (["tool-a", "go", "--settings", OWN], 2),  # inside the arguments pa adds
+                 (["tool-a", "--settings", "./own-t177.json"], None), (["tool-a", "--settings", "~/s/../s/own-t177.json"], None),
+                 (["tool-a", "--SETTINGS", OWN], None), (["tool-a", "-settings", OWN], None)]
+        for cmd, own in cases:
+            self.assertEqual(self.acct(self.SETS, cmd, own=own), (None, "not-recorded"), cmd)
+
+    def test_h5_the_file_is_never_opened(self):
+        path = os.path.join(TMP, "t177-no-such-parent", "x", "own.json")
+        entries = [fx.launch_entry("acct-b", settings=path)]
+        touched = []
+        real_open, real_stat, real_exists = open, os.stat, os.path.exists
+
+        def spy(fn):
+            def wrapped(p, *a, **kw):
+                if "t177-no-such-parent" in str(p):
+                    touched.append(str(p))
+                return fn(p, *a, **kw)
+            return wrapped
+        with mock.patch("builtins.open", spy(real_open)), mock.patch("os.stat", spy(real_stat)), \
+                mock.patch("os.path.exists", spy(real_exists)):
+            got = self.acct(entries, ["tool-a", "--settings", path])
+        self.assertEqual(got, ("acct-b", "settings"))
+        self.assertEqual(touched, [])
+
+    def test_h6_first_entry_wins_and_second_settings(self):
+        both = self.PROG + self.SETS
+        self.assertEqual(self.acct(both, ["agent-a", "--settings", OWN]), ("acct-a", "command"))
+        self.assertEqual(self.acct(self.SETS + self.PROG, ["agent-a", "--settings", OWN]), ("acct-b", "settings"))
+        self.assertEqual(self.acct(self.SETS, ["tool-a", "--settings", "~/s/other.json", "--settings", OWN]), ("acct-b", "settings"))
+        mixed = [fx.launch_entry("acct-m", program="agent-a", settings=OWN)]
+        self.assertEqual(self.acct(mixed, ["agent-a", "--settings", OWN]), ("acct-m", "settings"))
+        self.assertEqual(self.acct(mixed, ["agent-a"]), (None, "not-recorded"))  # every field it gives must match
+        tooled = [fx.launch_entry("acct-x", program="agent-a", tool="codex")]
+        self.assertEqual(self.acct(tooled, ["agent-a"], kind="claude"), (None, "not-recorded"))
+        self.assertEqual(self.acct(tooled, ["agent-a"], kind="codex"), ("acct-x", "command"))
+
+    def test_h7_env_and_rule_first(self):
+        self.assertEqual(self.acct(self.PROG, ["agent-a"], env={"PA_COST_ACCOUNT": "acct-z"}), ("acct-z", "env"))
+        prof = fx.launch_profile(*self.PROG)
+        f = pa_costs.launch_facts(prof, "claude", None, self.dir, env={"PA_COST_ACCOUNT": TWELVE}, command=["agent-a"])
+        self.assertEqual((f["account"], f["accountBy"]), ("acct-a", "command"))
+        self.assertIn("PA_COST_ACCOUNT", f.get("refused") or [])
+        dump({"version": 1, "defaultProfile": "test", "costs": {"accountRules": [{"env": "T177_ACCT", "match": "^y$", "account": "acct-r"}]}},
+             os.path.join(pa.ROOT, "config.json"))
+        self.assertEqual(self.acct(self.PROG, ["agent-a"], env={"T177_ACCT": "y"}), ("acct-r", "rule"))
+
+    def test_t2_undeclared_profile_keeps_the_chain(self):
+        self.assertEqual(self.acct(None, ["agent-a"]), ("default", "default"))
+        f = pa_costs.launch_facts({"name": "test", "claude": ["true"]}, "claude", None, self.dir, env={})
+        self.assertEqual((f["account"], f["accountBy"]), ("default", "default"))
+        f = pa_costs.launch_facts(fx.launch_profile(*self.PROG), "claude", None, self.dir, env={})  # no command given
+        self.assertEqual((f["account"], f["accountBy"]), (None, "not-recorded"))
+
+    def test_t2_never_raises(self):
+        with mock.patch.object(pa_costs, "provider_rule", side_effect=RuntimeError("x")):
+            f = pa_costs.launch_facts(fx.launch_profile(*self.PROG), "claude", None, self.dir, env={}, command=["agent-a"])
+            self.assertEqual((f["account"], f["accountBy"]), (None, "not-recorded"))
+            f = pa_costs.launch_facts({"name": "test"}, "claude", None, self.dir, env={}, command=["agent-a"])
+            self.assertEqual((f["account"], f["accountBy"]), ("default", "default"))
+
+
+class T177_Records(Base):
+    """T3 (R5): pa-claude and the Project Agent record the label from their own command, never a path or a value."""
+    launch = L_LaunchRecords.launch
+    records = L_LaunchRecords.records
+    last = J1B_Launch.last
+
+    def setUp(self):
+        super().setUp()
+        self.assertIsNotNone(pa_costs, COSTS_MISSING)
+        for k in J1_ENV:
+            self.addCleanup(os.environ.pop, k, None)
+            os.environ.pop(k, None)
+        self.ledger({"version": 1, "tasks": [{"id": "t-010", "state": "in-progress", "workers": []}]})
+        self.hc.terminals["t5"] = {"address": "t5", "name": "t-010-build", "parent": "t0", "state": "live", "labels": {"herdr.space": "sp1"}}
+        os.environ["HC_TERMINAL_ID"] = "t5"
+        os.environ["PA_PRINT"] = "1"
+        self.addCleanup(os.environ.pop, "HC_TERMINAL_ID", None)
+        self.addCleanup(os.environ.pop, "PA_PRINT", None)
+
+    def profile_with(self, claude=("true",)):
+        dump(fx.launch_profile(fx.launch_entry("acct-b", settings=OWN), fx.launch_entry("acct-a", program="true"),
+                               claude=claude, models={"worker": "model-a"}), os.path.join(self.profile_dir, "profile.json"))
+
+    def assert_no_path(self):
+        self.assertNotIn(b"own-t177", every_file_bytes(os.path.join(self.dir, "costs")))
+
+    def test_t3_worker_records_its_command(self):
+        self.profile_with()
+        r = self.last("claude", "go")
+        self.assertEqual((r["account"], r["accountBy"]), ("acct-a", "command"))
+        r = self.last("claude", "--settings", OWN, "go")
+        self.assertEqual((r["account"], r["accountBy"]), ("acct-b", "settings"))
+        self.profile_with(claude=("true", "--settings=" + OWN))
+        r = self.last("claude", "go")
+        self.assertEqual((r["account"], r["accountBy"]), ("acct-b", "settings"))
+        self.assert_no_path()
+
+    def test_t3_worker_own_is_the_profile_and_argv(self):
+        self.profile_with()
+        command = ["true", "--model", "m", "--settings", OWN]
+        got = pa_costs.record_launch(self.dir, "sp1", "claude", [], command, [{"name": "t-010-build"}], profile=pa.load_profile("test"))
+        self.assertEqual(got[:len(command)], command)
+        r = self.records()[-1]
+        self.assertEqual((r["account"], r["accountBy"]), ("acct-a", "command"))  # pa's own --settings is not the person's
+        self.assert_no_path()
+
+    def test_t3_project_agent_records_its_argv(self):
+        self.profile_with()
+        prof = pa.load_profile("test")
+        agent = {"sessionId": "s-pa-1", "space": "sp1"}
+        pa_costs.record_agent_start(self.dir, agent, "t0", self.project, "model-a", False, profile=prof,
+                                    command=["/usr/bin/true", "--model", "model-a", "--settings", OWN])
+        r = self.records()[-1]
+        self.assertEqual((r["account"], r["accountBy"]), ("acct-a", "command"))
+        self.profile_with(claude=("true", "--settings", OWN))
+        prof = pa.load_profile("test")
+        pa_costs.record_agent_start(self.dir, agent, "t0", self.project, "model-a", True, profile=prof,
+                                    command=["/usr/bin/true", "--settings", OWN, "--resume", "s-pa-1"])
+        r = self.records()[-1]
+        self.assertEqual((r["account"], r["accountBy"]), ("acct-b", "settings"))
+        self.assert_no_path()
+        with open(os.path.join(TOOLS, "pa.py")) as f:  # the launcher passes the argv it built (wiring)
+            self.assertRegex(f.read(), r"record_agent_start\([^)]*command=argv")
+
+
+class T177_Summary(Collecting):
+    """T4 (R6, R9, R10; H8-H10): attribution, byAccount's not-recorded part, per-entry accounts, fold and shrink."""
+
+    def declare(self, *entries):
+        dump(fx.launch_profile(*(entries or (fx.launch_entry("acct-a", program="agent-a"),))), os.path.join(self.profile_dir, "profile.json"))
+
+    def two(self):
+        self.ledger({"version": 1, "tasks": [{"id": "t-001", "state": "in-progress", "workers": []}]})
+        self.record(session=SID, task="t-001", model="model-a", account="work", accountBy="profile")
+        self.add(self.prompt(T0 + 10), self.call(T0 + 12, "a1", lines=1, out=1000000))
+        self.record(session=SID2, task="t-001", model="model-a", account="acct-a", accountBy="command")
+        self.add(self.prompt(T0 + 20, sid=SID2), self.call(T0 + 22, "b1", sid=SID2, lines=1, out=1000000), sid=SID2)
+        self.collect(T0 + 5000)
+        return load(self.costs("summary.json"))
+
+    def test_h8_declared_profile_attribution(self):
+        self.prices()
+        self.declare()
+        s = self.two()
+        acc = {e["key"]: e for e in s["byAccount"]}
+        self.assertEqual(set(acc), {NR, "acct-a"})
+        self.assertTrue(acc[NR].get("notRecorded"))
+        self.assertNotIn("notRecorded", acc["acct-a"])
+        self.assertTrue(s.get("accountsDeclared"))
+        self.assertTrue(any(e["key"].endswith(" · " + NR) and e["scope"][3] is None for e in s["byScope"]), s["byScope"])
+        self.assertTrue(all((e["account"], e["accountBy"]) in ((None, "not-recorded"), ("acct-a", "command")) for e in s["byDayModel"]))
+        task = s["byTask"][0]
+        self.assertNotIn("account", task)
+        self.assertEqual({a["key"] for a in task["accounts"]}, {NR, "acct-a"})
+        self.assertEqual(sum(a["tokens"] for a in task["accounts"]), task["tokens"])
+        sess = {e["key"]: e for e in s["sessions"]}
+        self.assertEqual((sess[SID[:8]]["account"], sess[SID2[:8]]["account"]), (NR, "acct-a"))
+        self.assertEqual({a["key"] for a in s["byDay"][0]["accounts"]}, {NR, "acct-a"})
+        self.assertEqual({a["key"] for a in s["byKind"]["kind"][0]["accounts"]}, {NR, "acct-a"})
+        # rows from a bind record or reconstructed, and rows with no account: not recorded; recorded ones keep their label
+        rules = {}
+        for row, sess_ in (({"source": "reconstructed"}, {}), ({"account": "work", "accountBy": "profile"}, {}),
+                           ({}, {"starts": [{"bind": "launch-window", "account": "work", "accountBy": "profile"}]}), ({}, {})):
+            rf = pa_costs.row_facts(row, sess_, rules, ("work", "profile"), declared=True)
+            self.assertEqual((rf["account"], rf["accountBy"]), (None, "not-recorded"), row)
+        for by in ("env", "rule", "command", "settings"):
+            rf = pa_costs.row_facts({"account": "acct-q", "accountBy": by}, {}, rules, ("work", "profile"), declared=True)
+            self.assertEqual((rf["account"], rf["accountBy"]), ("acct-q", by))
+        rf = pa_costs.row_facts({"source": "reconstructed"}, {"starts": [{"account": "acct-q", "accountBy": "command"}]}, rules,
+                                ("work", "profile"), declared=True)
+        self.assertEqual((rf["account"], rf["accountBy"]), ("acct-q", "command"))
+        rf = pa_costs.row_facts({"account": TWELVE, "accountBy": "command"}, {}, rules, ("work", "profile"), declared=True)
+        self.assertEqual((rf["account"], rf["accountBy"]), (None, "not-recorded"))
+
+    def test_h8_undeclared_profile_unchanged(self):
+        self.prices()
+        s = self.two()
+        self.assertEqual({e["key"] for e in s["byAccount"]}, {"default", "acct-a"})
+        self.assertNotIn("accountsDeclared", s)
+        self.assertFalse(any(e.get("notRecorded") for e in s["byAccount"]))
+        rf = pa_costs.row_facts({"account": "work", "accountBy": "profile"}, {}, {}, ("acct-c", "machine"))
+        self.assertEqual((rf["account"], rf["accountBy"]), ("acct-c", "machine"))
+
+    def test_h9_resumed_on_another_account(self):
+        self.prices()
+        self.declare()
+        self.ledger({"version": 1, "tasks": [{"id": "t-001", "state": "in-progress", "workers": []}]})
+        self.record(session=SID, task="t-001", model="model-a", account="acct-a", accountBy="command", at=iso(T0))
+        self.add(self.prompt(T0 + 10), self.call(T0 + 12, "r1", lines=1, out=1000000))
+        self.record(session=SID, task="t-001", model="model-a", account="acct-b", accountBy="command", at=iso(T0 + 100), resumed=True)
+        self.add(self.prompt(T0 + 200), self.call(T0 + 202, "r2", lines=1, out=2000000))
+        self.collect(T0 + 5000)
+        rows = sorted(self.rows(), key=lambda r: r["from"])
+        self.assertEqual([r["account"] for r in rows], ["acct-a", "acct-b"])
+        s = load(self.costs("summary.json"))
+        e = s["sessions"][0]
+        self.assertNotIn("account", e)
+        self.assertEqual([a["key"] for a in e["accounts"]], ["acct-b", "acct-a"])  # by money
+        self.assertEqual({a["key"] for a in s["byAccount"]}, {"acct-a", "acct-b"})
+        sess = {"starts": [{"at": "not a time", "account": "acct-a", "accountBy": "command"},
+                           {"at": iso(T0 + 100), "account": "acct-b", "accountBy": "command"}]}
+        rf = pa_costs.row_facts({"from": iso(T0 + 200)}, sess, {}, ("work", "profile"), declared=True)
+        self.assertEqual(rf["account"], "acct-b")
+
+    def test_h10_renamed_label_keeps_old_rows(self):
+        self.prices()
+        self.declare(fx.launch_entry("acct-old", program="agent-a"))
+        self.record(session=SID, model="model-a", account="acct-old", accountBy="command")
+        self.add(self.prompt(T0 + 10), self.call(T0 + 12, "n1", lines=1, out=1000))
+        self.collect(T0 + 5000)
+        self.declare(fx.launch_entry("acct-new", program="agent-a"))
+        self.collect(T0 + 6000, resummarize=True)
+        s = load(self.costs("summary.json"))
+        self.assertEqual([e["key"] for e in s["byAccount"]], ["acct-old"])
+
+    def test_t4_one_account_shape_and_fold_and_shrink(self):
+        self.prices()
+        self.declare()
+        self.record(session=SID, task=None, model="model-a", account="acct-a", accountBy="command")
+        self.add(self.prompt(T0 + 10), self.call(T0 + 12, "o1", lines=1, out=1000))
+        self.collect(T0 + 5000)
+        s = load(self.costs("summary.json"))
+        self.assertEqual((s["byTask"][0]["account"], "accounts" in s["byTask"][0]), ("acct-a", False))
+        self.assertEqual(s["byDay"][0]["account"], "acct-a")
+        entries = [{"key": "t-1", "tokens": 10, "money": 1.0, "calls": 1, "account": "acct-a"},
+                   {"key": "t-2", "tokens": 6, "money": 0.6, "calls": 2, "accounts": [
+                       {"key": "acct-b", "tokens": 4, "money": 0.4, "calls": 1}, {"key": NR, "tokens": 2, "money": 0.2, "calls": 1}]},
+                   {"key": "t-3", "tokens": 3, "money": None, "calls": 1, "account": "acct-b"}]
+        other = pa_costs.fold_tasks(entries, 1)[-1]
+        self.assertEqual(other["key"], "(other tasks)")
+        got = {a["key"]: a for a in other["accounts"]}
+        self.assertEqual(set(got), {"acct-b", NR})
+        self.assertEqual((got["acct-b"]["tokens"], got["acct-b"]["calls"]), (7, 2))
+        self.assertAlmostEqual(got["acct-b"]["money"], 0.4)
+        self.assertEqual(got["acct-b"].get("unpricedTokens"), 3)
+        one = pa_costs.fold_tasks([entries[0], entries[2], dict(entries[2], key="t-4")], 1)[-1]
+        self.assertEqual((one.get("account"), "accounts" in one), ("acct-b", False))
+        s = {"sessions": [{"key": "a", "accounts": [{"key": "x"}, {"key": "y"}]}, {"key": "b", "account": "x"}], "byTask": [],
+             "passes": [], "byDayModel": []}
+        self.assertTrue(pa_costs.shrink(s))
+        self.assertEqual(len(s["sessions"]), 2)
+        self.assertNotIn("accounts", s["sessions"][0])
+        self.assertEqual(s["sessions"][1]["account"], "x")
+        self.assertTrue(pa_costs.shrink(s))
+        self.assertEqual(len(s["sessions"]), 1)
+
+    def test_c4_a_summary_at_the_real_size_still_fits(self):
+        self.prices()
+        self.declare()
+        records, rows = [], []
+        for n in range(240):
+            sid = "{:08x}-0000-4000-8000-{:012x}".format(n, n)
+            acct = ("acct-a", "command") if n % 3 else (None, "not-recorded") if n % 2 else ("acct-b", "settings")
+            records.append({"v": 1, "ev": "start", "at": iso(T0 + n), "session": sid, "program": "claude", "kind": "worker",
+                            "host": "h1", "account": acct[0], "accountBy": acct[1]})
+            for k in range(2):
+                at = T0 + n * 60 + k * 20 + (86400 * (n % 30))
+                rows.append({"session": sid, "program": "claude", "kind": "worker", "model": "model-a", "from": iso(at), "to": iso(at + 5),
+                             "day": iso(at)[:10], "calls": 1, "tokens": toks(out=1000 + n), "long": {}, "task": "t-{:03d}".format(n % 150),
+                             "activity": "build", "phase": "build", "role": "build", "account": acct[0], "accountBy": acct[1]})
+        table, _p = pa_costs.load_prices(pa.load_profile("test"))
+        s = pa_costs.summarize(self.dir, rows, records, table, None, "test", T0 + 40 * 86400, cc=[])
+        money, tokens = s["totals"]["money"], s["totals"]["tokens"]["all"]
+        text = pa_costs.fit_summary(s)
+        self.assertLessEqual(len(text.encode()), pa_costs.SUMMARY_MAX)
+        back = json.loads(text)
+        self.assertEqual((back["totals"]["money"], back["totals"]["tokens"]["all"]), (money, tokens))
+        self.assertEqual({e["key"] for e in back["byAccount"]}, {"acct-a", "acct-b", NR})
+        self.assertAlmostEqual(sum(e["money"] for e in back["byTask"]), money, places=4)
+
+
+class T177_Money(Collecting):
+    """T5 (R8): the same ledger with and without launchAccounts: the same money, priced from the same scopes."""
+
+    def test_t5_money_and_priced_as_unchanged(self):
+        self.prices()
+        self.record(session=SID, model="model-a", account="work", accountBy="profile")
+        self.add(self.prompt(T0 + 10), self.call(T0 + 12, "m1", lines=1, out=1000000))
+        self.record(session=SID2, model="model-a", account="acct-a", accountBy="command")
+        self.add(self.prompt(T0 + 20, sid=SID2), self.call(T0 + 22, "m2", sid=SID2, lines=1, out=500000), sid=SID2)
+        self.collect(T0 + 5000)
+        before = load(self.costs("summary.json"))
+        dump(fx.launch_profile(fx.launch_entry("acct-a", program="agent-a")), os.path.join(self.profile_dir, "profile.json"))
+        self.collect(T0 + 6000, resummarize=True)
+        after = load(self.costs("summary.json"))
+        self.assertIsNotNone(before["totals"]["money"])
+        self.assertEqual(before["totals"]["money"], after["totals"]["money"])
+        self.assertEqual(sorted(json.dumps(e["pricedAs"]) for e in before["byScope"]), sorted(json.dumps(e["pricedAs"]) for e in after["byScope"]))
+        self.assertAlmostEqual(money_of(after["byAccount"]), after["totals"]["money"], places=6)
+
+
+class T177_Billed(BillingBase):
+    """T6 (R11): the not-recorded part is never added to a label, never compared; billed compare says it apart."""
+
+    def summary(self, declared=True):
+        days = ["2026-11-1{}".format(i) for i in range(3, 6)]
+        bdm = [{"day": d, "model": "model-a", "tokens": toks(out=1000000), "money": 8.0, "account": "acct1", "accountBy": "command"} for d in days]
+        bdm += [{"day": d, "model": "model-a", "tokens": toks(out=500000), "money": 4.0, "account": None, "accountBy": "not-recorded"} for d in days]
+        bdm += [{"day": days[0], "model": "model-a", "tokens": toks(out=100), "money": 1.0, "account": "work", "accountBy": "profile"}]
+        s = {"v": 1, "space": "sp1", "updated": "2026-11-17T09:00:00Z", "account": "acct1", "accountBy": "profile",
+             "prices": {"profile": "test", "source": "test table", "asOf": "2026-11-01", "currency": "USD", "missing": []}, "byDayModel": bdm}
+        if declared:
+            s["accountsDeclared"] = True
+        return s
+
+    def test_t6_entry_account_and_estimates(self):
+        e_nr = {"account": None, "accountBy": "not-recorded"}
+        self.assertIsNone(pa_costs.entry_account(e_nr, "acct1"))
+        self.assertIsNone(pa_costs.entry_account({"account": "work", "accountBy": "profile"}, "acct1", True))
+        self.assertEqual(pa_costs.entry_account({"account": "work", "accountBy": "profile"}, "acct1"), "acct1")
+        self.assertEqual(pa_costs.entry_account({"account": "acct-q", "accountBy": "settings"}, "acct1", True), "acct-q")
+        s = self.summary()
+        self.assertEqual(pa_costs.space_accounts(s), ["acct1"])
+        self.assertEqual(pa_costs.space_estimate(s, "acct1")["money"], 24.0)
+        self.assertEqual(pa_costs.space_estimate(s, None)["money"], 13.0)
+        old = self.summary(declared=False)  # an older summary (no accountsDeclared): its chain entries follow the summary
+        self.assertEqual(pa_costs.space_estimate(old, "acct1")["money"], 25.0)
+
+    def test_t6_account_wide_and_compare(self):
+        dump(self.summary(), self.costs("summary.json"))
+        wide = pa_costs.account_wide_summary("acct1", T0)
+        self.assertAlmostEqual(sum(e["money"] for e in wide["byDayModel"]), 24.0)
+        days = ["2026-11-1{}".format(i) for i in range(3, 6)]
+        pa_costs.append_billed([pa_costs.validate_row(brow(day=d, amount=10.0), "query:q1", "acct1", T0) for d in days])
+        _r, out, err = self.run_cmd(pa_costs.main, ["billed", "compare", "--json", "--space", "sp1"])
+        j = json.loads(out)
+        self.assertAlmostEqual(j["comparison"]["total"]["thisSpace"], 24.0)
+        self.assertEqual(j["notRecorded"], {"money": 13.0, "partial": False})
+        self.assertNotIn(None, [o.get("account") for o in j.get("others") or []])
+        lines_ = pa_costs.billed_lines(load(self.costs("summary.json")), T0)
+        self.assertTrue(any("account not recorded" in x and "not compared" in x for x in lines_), lines_)
+        dump(self.summary(declared=False), self.costs("summary.json"))
+        _r, out, _e = self.run_cmd(pa_costs.main, ["billed", "compare", "--json", "--space", "sp1"])
+        self.assertEqual(json.loads(out)["notRecorded"]["money"], 12.0)
+
+
+class T177_Report(Collecting):
+    """T7: report --by account prints the not-recorded part in words."""
+    declare = T177_Summary.declare
+    two = T177_Summary.two
+
+    def test_t7_report_by_account(self):
+        self.prices()
+        self.declare()
+        self.two()
+        _r, out, _e = self.run_cmd(pa_costs.report, self.dir, by="account", now=T0 + 5000)
+        self.assertIn(NR, out)
+        self.assertIn("acct-a", out)
+        self.assertNotIn("own-t177", out)
+
+
 class ZZ_V1_Privacy(unittest.TestCase):
     """Run last: the canary of every fixture reached no file under costs/ or billing/ and no captured output."""
 
