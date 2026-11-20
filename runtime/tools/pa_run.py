@@ -380,8 +380,9 @@ def filtered(err):
     return (m.group(1), m.group(2)) if m else None
 
 
-def tree_to_run(h, top, commit=None, overlay=None, secrets=None):
-    """R4-R6, R8: {commit, head, tree, patch (bytes), paths}. secrets: [(pattern, what)] checked against the changed
+def tree_to_run(h, top, commit=None, overlay=None, secrets=None, *, cwd=None):
+    """R4-R6, R8: {commit, head, tree, patch (bytes), paths} (and, with cwd, "cwd": whether it is a folder in the
+    tree, read while the temp objects still exist: R10, t-117 fix round 2). secrets: [(pattern, what)] checked against the changed
     paths (with .claude/), or None to skip (a local run: nothing is sent). Raises NotRun. Writes nothing in .git:
     git add and write-tree see only the temp object folder (with the repo's objects as alternates, git would
     "freshen" an existing object by setting its mtime), so every object they write lands there; read-tree and diff,
@@ -467,6 +468,9 @@ def tree_to_run(h, top, commit=None, overlay=None, secrets=None):
             code, patch, err = git_bytes(top, env, *(diff + ["--binary", "--full-index", base, tree]))
             if code:
                 raise NotRun("git diff --binary: " + text(err))
+        if cwd:
+            code, out, _ = git_bytes(top, env, "ls-tree", "-d", "-z", tree, "--", cwd)
+            cwd_dir = not code and is_dir_entry(out.decode("utf-8", "surrogateescape"), cwd)
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
     if secrets is not None:
@@ -476,7 +480,15 @@ def tree_to_run(h, top, commit=None, overlay=None, secrets=None):
             for pattern, what in secrets:
                 if re.search(pattern, p):
                     raise NotRun("{} is {}: never sent".format(p, what))
-    return {"commit": base, "head": head, "tree": tree, "patch": patch, "paths": paths}
+    found = {"commit": base, "head": head, "tree": tree, "patch": patch, "paths": paths}
+    if cwd:
+        found["cwd"] = cwd_dir
+    return found
+
+
+def is_dir_entry(listing, path):
+    """git ls-tree -d -z output names path as a folder (mode 040000)."""
+    return any(e.partition("\t")[2] == path and e.split(" ")[0] == "040000" for e in listing.split("\0"))
 
 
 # ---- records (R18, R19) ----
@@ -612,13 +624,18 @@ def refuse(r, line, code=NOT_RUN):
 
 
 def cwd_missing(r, tree=None):
-    """R10 (t-117): why --cwd (r.subdir) is not a folder in the tree to run (tree: its id, read with git ls-tree -d;
-    else the worktree), or None."""
+    """R10 (t-117): why --cwd (r.subdir) is not a folder in the tree to run, or None. tree: tree_to_run's dict (its
+    "cwd" answer, read while the tree's objects existed; fix round 2: they are gone once it returns), or without
+    that answer its id, read with git ls-tree -d from the repo's objects; no tree: the worktree."""
     if not r.subdir:
         return None
-    if tree:
-        code, out, _ = r.h.git(r.top, "ls-tree", "-d", "-z", tree, "--", r.subdir)
-        if not code and any(e.partition("\t")[2] == r.subdir and e.split(" ")[0] == "040000" for e in out.split("\0")):
+    if isinstance(tree, dict) and "cwd" in tree:
+        if tree["cwd"]:
+            return None
+    elif tree:
+        code, out, _ = r.h.git(r.top, "ls-tree", "-d", "-z", tree["tree"] if isinstance(tree, dict) else tree, "--",
+                               r.subdir)
+        if not code and is_dir_entry(out, r.subdir):
             return None
     elif os.path.isdir(os.path.join(r.top, r.subdir)):
         return None
@@ -654,12 +671,12 @@ def place_and_run(r):
     probes, chosen, slot = {}, None, None
     try:
         try:  # R4: inside the try that catches a signal
-            tree = tree_to_run(r.h, r.top, args.commit, r.overlay, secret_patterns(r.h, r.profile))
+            tree = tree_to_run(r.h, r.top, args.commit, r.overlay, secret_patterns(r.h, r.profile), cwd=r.subdir)
         except NotRun as e:
             return refuse(r, "not run on {}: {}".format(name, e))
         r.tree = tree
         S.update_progress(r.progress, commit=tree["commit"], tree=tree["tree"])
-        why = cwd_missing(r, tree["tree"])
+        why = cwd_missing(r, tree)
         if why:
             return refuse(r, "not run on {}: {}".format(name, why))
         size = len(base64.b64encode(tree["patch"])) if tree["patch"] else 0
@@ -922,8 +939,9 @@ def run_local(r, why):
         if r.args.commit:
             t = time.time()
             try:
-                tree = getattr(r, "tree", None) or tree_to_run(r.h, r.top, r.args.commit, r.overlay, None)
-                missing = cwd_missing(r, tree["tree"])  # R10
+                tree = getattr(r, "tree", None) or tree_to_run(r.h, r.top, r.args.commit, r.overlay, None,
+                                                                     cwd=r.subdir)
+                missing = cwd_missing(r, tree)  # R10
                 if missing:
                     raise NotRun(missing)
                 scratch = tempfile.mkdtemp(prefix="pa-run-")
