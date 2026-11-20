@@ -2462,10 +2462,12 @@ def fit_summary(s):
 
 def shrink(s):
     """One step towards SUMMARY_MAX: the sessions' accounts lists (t-177 R10), fewer sessions, then shorter session
-    lists per task, then fewer tasks (paContext is never shrunk: fit_summary sets it aside first)."""
+    lists per task, then fewer tasks (paContext is never shrunk: fit_summary sets it aside first). A mixed session's
+    `account` (its largest scope's, DECISIONS D2) goes with its list: alone it would read as the whole session's."""
     if any("accounts" in x for x in s["sessions"]):
         for x in s["sessions"]:
-            x.pop("accounts", None)
+            if x.pop("accounts", None) is not None:
+                x.pop("account", None)
     elif s["sessions"]:
         s["sessions"] = s["sessions"][:len(s["sessions"]) * 3 // 4]
     elif any(t["sessions"] for t in s["byTask"]):
