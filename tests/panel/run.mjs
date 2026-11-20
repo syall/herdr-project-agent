@@ -8552,6 +8552,29 @@ cases["P116-watch-retry"] = async () => { // RL-6: a refused folder watch is sta
   check(g.__watchers.length === 1, "and the watch goes on");
 };
 
+cases["P116-push-refused"] = async () => { // RL-2: a run the runtime refused (nothing started) is said as not started: no lock, no "result unknown", no notice; Submit works again
+  let refuse = true;
+  const LIMIT116 = "a HostModule's async function exceeded the per-runtime outstanding host task limit of 1024";
+  const { v } = await pushWorld({ opts: { records: alive() }, tool: { run: () => { if (refuse) throw new RangeError(LIMIT116); return json(0, runPushed); } } });
+  await click(v, `opt-${PID}-0`); await settle();
+  const checks = pushExecs("check").length;
+  await click(v, `submit-${PID}`); await settle(); await settle();
+  let { text, clicks } = look(v);
+  check(text.includes("Not pushed: not started: too many calls waiting"), `the plain line (got ${text.slice(0, 1500)})`);
+  check(!/result (is )?unknown/i.test(text), `never "result unknown" (got ${text.slice(0, 1500)})`);
+  check(sends().length === 0, `no notice to the orchestrator (got ${JSON.stringify(sends())})`);
+  check(!v.push.locked(S, PID) && !v.push.kept(S, PID), "not locked, not kept");
+  check(!(g.__shared["project-agent.answering"] ?? {})[PKEY], `no shared mark left (got ${JSON.stringify(g.__shared["project-agent.answering"])})`);
+  check(pushExecs("check").length === checks, "no check after it: the card is as before the click");
+  check(Boolean(clicks[`submit-${PID}`]) && /Ready: Push pushes exactly this\./.test(text), `Submit is there again (have ${Object.keys(clicks).filter((k) => k.includes(PID))})`);
+  refuse = false;
+  if (!look(v).clicks[`submit-${PID}`]) await click(v, `opt-${PID}-0`);
+  await click(v, `submit-${PID}`); await settle(); await settle();
+  ({ text } = look(v));
+  check(pushExecs("run").length === 1 && text.includes(`Pushed ${PURL} main`), `the next click runs it (runs ${pushExecs("run").length}; got ${text.slice(0, 1500)})`);
+  check(sends().length === 1 && sends()[0][2].startsWith(`decision ${PID} answered Push; result:`), `told once, for the run that ran (got ${JSON.stringify(sends())})`);
+};
+
 // --list prints the names that would run and runs none. An unknown name or option exits 2.
 const refuse = (why) => { fs.rmSync(dst, { recursive: true, force: true }); console.error(`run.mjs: ${why}`); process.exit(2); };
 const pick = [];
