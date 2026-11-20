@@ -18,18 +18,23 @@ export const ALLOW_EVERY = 30000; // the push allowlist is read at most this oft
 // once the file is written: "rules changed: <ids>" (main.js rulesChanged: one per space while unsent, later ids
 // joined to it). Approving or declining a proposal keeps its own notice (main.js ruleDecided) and sends no second.
 export const NOTICE = "rules changed", NOTICE_MAX = 10;
-export function noticeText(ids) { // each id on one line (t-085: an imported id can hold anything)
+// Each id on one line (t-085: an imported id can hold anything), at most NOTICE_ID characters, cut with "…" (t-134:
+// not oneLine's card tail; a rules notice has no card, the agent re-reads rules.json).
+export const NOTICE_ID = 80;
+const noticeId = (id) => { const s = oneLine(id, Infinity); return s.length > NOTICE_ID ? `${s.slice(0, NOTICE_ID - 1)}…` : s; };
+export function noticeText(ids) {
   const shown = ids.slice(0, NOTICE_MAX), more = ids.length - shown.length;
-  return `${NOTICE}: ${shown.map((id) => oneLine(id, 80)).join(", ")}${more > 0 ? ` and ${more} more` : ""}`;
+  return `${NOTICE}: ${shown.map(noticeId).join(", ")}${more > 0 ? ` and ${more} more` : ""}`;
 }
 // t-085 (t-101 RL2): a space's rules notices become one, the first (a kept one keeps its place and its why), each id
 // named once. Two arise when a change is made while the space's notice is being sent, and that send fails.
+// The kept item is a copy (t-134): the items given are not changed.
 export function mergeNotices(items) {
   const first = new Map(), out = [];
   for (const u of items) {
     const into = Array.isArray(u.rules) ? first.get(u.spaceId) : null;
     if (!Array.isArray(u.rules)) out.push(u);
-    else if (!into) { first.set(u.spaceId, u); out.push(u); }
+    else if (!into) { const kept = { ...u, rules: [...u.rules] }; first.set(u.spaceId, kept); out.push(kept); }
     else { for (const id of u.rules) if (!into.rules.includes(id)) into.rules.push(id); into.message = noticeText(into.rules); }
   }
   return out;
@@ -122,9 +127,11 @@ export class RulesPane {
   // with this task's live cx: the click's is gone by then. `ids` (a list, or a function giving it once the change
   // ran): the rules the person changed, for the "rules changed" notice; none for a proposal's approve or decline.
   // Only ids in the file before or after the change are named (t-085: a rule deleted meanwhile is not).
-  save(space, cx, change, after, ids) {
+  // `failed()`: runs when the write itself was refused (nothing written; not when `after` fails), t-134.
+  save(space, cx, change, after, ids, failed) {
     this.error = null; this.message = null;
     const there = new Set();
+    let written = false;
     cx.spawn(async (cx) => {
       try {
         await changeRules(space, (rules) => {
@@ -134,21 +141,24 @@ export class RulesPane {
           for (const r of next) there.add(r.id);
           return next;
         });
+        written = true;
         const named = (typeof ids === "function" ? ids() : ids)?.filter((id) => there.has(id));
         if (named?.length) this.changed?.(space, named, cx);
         if (after) await after(cx);
       }
-      catch (e) { this.error = String(e.message ?? e); }
+      catch (e) { this.error = String(e.message ?? e); if (!written) failed?.(); }
       try { await this.load(space); } catch {}
       cx.notify();
     });
   }
 
-  edit(rule, approve) {
+  // `typed` (t-134): what the person typed in a form whose write was refused ({ title, text, why, appliesTo, id }),
+  // shown instead of the rule's own values.
+  edit(rule, approve, typed) {
     for (const s of Object.values(this.form?.inputs ?? {})) s.release?.();
     const inputs = {};
-    for (const [key, placeholder] of FIELDS) inputs[key] = this.field({ placeholder, value: String(rule?.[key] ?? (key === "appliesTo" ? "all" : "")) });
-    if (!rule) inputs.id = this.field({ placeholder: "Id (optional): r-lowercase-words; empty makes one from the title" }); // t-085: fixed once made
+    for (const [key, placeholder] of FIELDS) inputs[key] = this.field({ placeholder, value: String(typed?.[key] ?? rule?.[key] ?? (key === "appliesTo" ? "all" : "")) });
+    if (!rule) inputs.id = this.field({ placeholder: "Id (optional): r-lowercase-words; empty makes one from the title", ...(typed?.id ? { value: typed.id } : {}) }); // t-085: fixed once made
     this.form = { id: rule?.id ?? null, approve: Boolean(approve), inputs };
   }
 
@@ -162,6 +172,8 @@ export class RulesPane {
     const problem = named && ruleIdProblem(named, this.data?.rules); // checked again against the file when written
     if (problem) { this.error = problem; cx.notify(); return; }
     let made = id; // the new rule's id, chosen against the file as it is when written
+    // t-085 RL1 (t-134): a refused write brings the form back as typed, unless another form was opened meanwhile.
+    const refill = () => { if (!this.form) this.edit(id ? { id } : null, approve, { ...v, id: named }); };
     this.closeForm();
     this.save(space, cx, (rules) => {
       if (!id) {
@@ -171,7 +183,7 @@ export class RulesPane {
         return [touched({ id: made, ...v, status: "active", order: top + 10, source: "person" }, "created"), ...rules];
       }
       return rules.map((r) => (r.id === id ? touched({ ...r, ...v, ...(approve ? { status: "active" } : {}) }, approve ? "edited and approved" : "edited") : r));
-    }, approve ? (cx) => onDecided(id, "approved", cx) : null, approve ? null : () => [made]);
+    }, approve ? (cx) => onDecided(id, "approved", cx) : null, approve ? null : () => [made], refill);
   }
 
   setStatus(space, cx, id, status, what, onDecided) {
