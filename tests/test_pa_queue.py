@@ -1745,7 +1745,12 @@ class O176Outside(O176Base):
         self.assertEqual(self.reviews(), [])
 
     def test_t14_add_since_is_the_commit_time(self):
-        tip = self.rebase_outside()
+        os.environ["GIT_COMMITTER_DATE"] = "2001-01-01T00:00:00Z"  # not now(): the two can never meet by the clock
+        try:
+            tip = self.rebase_outside()
+        finally:
+            os.environ.pop("GIT_COMMITTER_DATE", None)
+        self.assertEqual(self.committed(tip), "2001-01-01T00:00:00Z")
         self.write_review()
         self.verify()
         self.gate("t-B")
