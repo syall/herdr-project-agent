@@ -7363,6 +7363,25 @@ cases["P134-6-open-form-not-saved-in-other-space"] = async () => { // an A form 
   check(JSON.parse(g.__files[R2]).rules.map((r) => r.id).join(",") === "r-in-b,r-one", `a form opened in B saves into B (got ${g.__files[R2]})`);
 };
 
+cases["P134-7-import-reload-not-in-other-space"] = async () => { // t-134 round 3: an import in A ending after a switch to B loads nothing into B's view
+  const v = await ruleWorld();
+  const { S2, R2 } = ruleSpace2();
+  const IMP = ":/home/u/imp.json";
+  g.__files[IMP] = JSON.stringify({ version: 1, rules: [rule("r-imported", "Imported into A")] });
+  await press(v, "rule-import"); v.rules.importPath.set("/home/u/imp.json");
+  g.__hang = [IMP];
+  await press(v, "rule-import"); await settle();
+  show(S2); v.reload(cx); await settle();
+  check(v.space === S2 && look(v).text.includes("Other one"), `B's Rules view is shown (got ${v.space})`);
+  g.__hang = []; await settle(); await settle();
+  check(JSON.parse(g.__files[RULES]).rules.some((r) => r.id === "r-imported"), `the import was written into A (got ${g.__files[RULES]})`);
+  check(look(v).text.includes("Other one") && !look(v).text.includes("Imported into A") && !look(v).text.includes("One text"), `B's view still lists B's rules, not A's (got ${look(v).text.slice(0, 300)})`);
+  await press(v, "rule-edit-r-one");
+  check(v.rules.form?.inputs.title.value() === "Other one", `an Edit in B opens B's rule (got ${v.rules.form?.inputs.title.value()})`);
+  await press(v, "rule-save"); await settle();
+  check(JSON.parse(g.__files[R2]).rules.find((r) => r.id === "r-one")?.title === "Other one" && !JSON.parse(g.__files[R2]).rules.some((r) => r.id === "r-imported"), `no A rule or value in B (got ${g.__files[R2]})`);
+};
+
 // ---- t-131: limits from t-100, t-061/t-054 (t-064), t-046 J3 (t-075) and t-020 J6 ----------------------------------
 cases["P131-push-chosen-slow-reload"] = async () => { // t-100 RL1: after a Push from here, before the slow reload reads it answered, Push is drawn chosen
   let file;
