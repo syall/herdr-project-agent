@@ -204,28 +204,37 @@ function limitsOf(rules) {
 // (doc: the last good answer, error: the last read's, at: when doc was read) or null (not answered yet). isLive(address):
 // the worker's terminal is live; here: the label of the tool's own machine ("this Mac", or the space's machine). Each
 // holder line: { key, id, worker, live, status, text }; id and worker only when its worker's terminal is live (a link, R5). shown:
-// a configured machine or a slot holder (R6).
+// a configured machine or a slot holder (R6). t-155: the text is the one-line worker item, as the other Places rows
+// (worker, task and job, role, since the slot's start), its job and role from the ledger worker of the holder's task
+// with that address, live or not; the holder's command (`what`) is never shown.
 const SLOT_ID = (place, i) => `places-slot-${place}-${i}`;
-function slotLines(place, holders, isLive, statusOf) {
+function ledgerWorker(ledger, task, address) {
+  const t = (Array.isArray(ledger?.tasks) ? ledger.tasks : []).find((x) => obj(x) && x.id === task);
+  const ws = (obj(t) && Array.isArray(t.workers) ? t.workers : []).filter((w) => obj(w) && String(w.address ?? "") === address);
+  return ws.filter((w) => !w.finished).pop() ?? ws.pop() ?? null;
+}
+function slotLines(place, holders, isLive, statusOf, ledger) {
   return (Array.isArray(holders) ? holders : []).filter(obj).map((h, i) => {
     const worker = typeof h.worker === "string" && h.worker ? h.worker : null, live = Boolean(worker && isLive(worker));
-    const text = [h.task ?? "?", worker ? `worker ${worker}` : "no worker recorded", `since ${h.start ? at(h.start) : "?"}`, ...(h.what ? [h.what] : [])].join(" · ");
+    const task = h.task ?? "?", since = `since ${h.start ? at(h.start) : "?"}`, w = worker && ledgerWorker(ledger, h.task, worker);
+    const text = worker ? [`${worker} · ${task} ${w ? jobWord(h.task, w.name) : ""}`.trimEnd(), (w && w.role) ?? "?", since].join(" · ")
+      : [task, "no worker recorded", since].join(" · ");
     return { key: `slot:${place}:${i}`, id: live ? SLOT_ID(place, i) : null, worker: live ? worker : null, live, status: live ? statusOf(worker) : null, text: live ? `${text} ↗` : text };
   });
 }
 const slotHead = (name, cap, n) => `${name} · ${n} of ${cap ?? "?"} slots held`;
-export function machinesRows(m, { isLive = () => false, statusOf = () => null, here = "this Mac" } = {}) {
+export function machinesRows(m, { isLive = () => false, statusOf = () => null, here = "this Mac", ledger = null } = {}) {
   const out = { state: "checking", line: null, error: m?.error ?? null, asOf: null, notes: [], places: [], shown: false };
   const doc = m?.doc;
   if (!doc) return { ...out, state: m?.error ? "error" : "checking" };
   out.state = "ok"; out.asOf = m.at ? at(new Date(m.at).toISOString()).slice(6) : null;
   out.notes = (Array.isArray(doc.notes) ? doc.notes : []).map(String);
   for (const x of doc.machines.filter(obj)) {
-    const name = String(x.machine ?? "?"), holders = slotLines(name, x.holders, isLive, statusOf);
+    const name = String(x.machine ?? "?"), holders = slotLines(name, x.holders, isLive, statusOf, ledger);
     const state = x.reachable ? "reachable" : `not reachable${x.reason ? ` (${x.reason})` : ""}`;
     out.places.push({ name, head: `${name} · ${state} · ${holders.length} of ${x.cap ?? "?"} slots held`, over: !x.reachable, holders });
   }
-  const local = slotLines("local", doc.local?.holders, isLive, statusOf);
+  const local = slotLines("local", doc.local?.holders, isLive, statusOf, ledger);
   out.places.push({ name: "local", head: slotHead(here, doc.local?.cap, local.length), over: false, holders: local });
   out.shown = doc.machines.length > 0 || out.places.some((p) => p.holders.length > 0);
   return out;
@@ -247,7 +256,7 @@ export function placesRows({ waiting, startOrder, rules, ledger, isLive, statusO
   if (x || extra.length) kinds.push({ kind: "no-test", head: `No-test extra · ${extra.length} of ${x}`, over: extra.length > x, holders: extra.map((h) => line(h)) });
   if (cap !== null) kinds.push({ kind: "suite", head: `Suite step · ${s} of ${cap}  (held within Working)`, over: s > cap, holders: holders.filter((h) => h.place === "suite").map((h) => line(h, true)) });
   const named = [...new Set(KINDS.map((k) => sources[k]).filter((v) => v !== "default"))];
-  const slots = machinesRows(machines, { isLive, statusOf, here }); // t-119: the suite machines' slots
+  const slots = machinesRows(machines, { isLive, statusOf, here, ledger }); // t-119: the suite machines' slots
   const out = { shown: false, state: "loading", kinds, slots, notes, limitsLine: `limits: ${named.length ? named.join(", ") : "default"}`, jobs: [], badges: {}, effective: [], orderKnown: false,
     orderLine: null, reset: false, orderTextRead: null, waitingLine: null, head: `Places · ${used} of ${w} working` };
   const badge = (task, b) => { (out.badges[task] ??= []).push(b); };
