@@ -99,6 +99,7 @@ class Base(unittest.TestCase):
         self.project = os.path.join(TMP, "proj")
         os.makedirs(self.project, exist_ok=True)
         self.saved = {k: getattr(pa, k) for k in ("live_terminals", "hc_get", "call", "__file__")}
+        self.addCleanup(child_fakes.unfaked(pa))  # t-049 (t-037 RL8): pa.spawn raises until a test fakes it
         self.saved_os = os.execv
         self.calls = []
         pa.call = lambda argv, check=True: self.calls.append(list(argv)) or ""
@@ -140,6 +141,28 @@ class Base(unittest.TestCase):
 
 
 # ---- J1 limits (card d-107) -------------------------------------------------------------------------------------
+
+class SpawnGuard(Base):  # t-049 (t-059, t-037 J2 REVIEW RL8)
+    def test_spawn_raises_unless_a_test_fakes_it(self):
+        calls = []
+        saved = pa.subprocess.call
+        pa.subprocess.call = lambda argv, cwd=None: calls.append(argv) or 0  # faking only subprocess.call is not enough
+        try:
+            ctx = {}
+            with self.assertRaises(child_fakes.SpawnNotFaked):
+                pa.run_child(ctx, ["true"], TMP)
+            self.assertIsNone(ctx.get("child"))
+        finally:
+            pa.subprocess.call = saved
+        self.assertEqual(calls, [])
+        undo = child_fakes.patch(pa, lambda argv, cwd=None: 7)  # a faked spawn runs
+        try:
+            self.assertEqual(pa.run_child({}, ["true"], TMP), 7)
+        finally:
+            undo()
+        with self.assertRaises(child_fakes.SpawnNotFaked):  # and the guard is back after its undo
+            pa.spawn(["true"], TMP)
+
 
 class L1_RestartCapable(Base):
     def test_record_is_version_2_and_accepts_restart(self):
@@ -991,6 +1014,71 @@ class Prompt(Requests):  # spec S1, S2: what the model runs with on a resume
         finally:
             undo()
         self.assertIn("--system-prompt-snapshot", starts[0])
+
+    # t-049 (t-059, t-037 J2 REVIEW RL-r4-1, RL7): unit pins for what only the integration check caught (M3, M4) and
+    # for where the snapshot pair goes.
+    def run_once(self, ctx, fake_call):
+        """run_agent once with spawn faked by fake_call (which stops the loop)."""
+        undo = child_fakes.patch(pa, fake_call)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                pa.run_agent(types.SimpleNamespace(fresh=False), "t1", self.project, pa.load_profile("test"), self.dir,
+                             load(os.path.join(self.dir, "agent.json")), ctx, time.time())
+        finally:
+            undo()
+
+    def test_run_agent_resume_records_rebuilt(self):  # RL-r4-1 M3: starting() hands its snapshot to launcher_session
+        dump({"name": "test", "claude": ["true"], "codex": ["true"], "systemPromptSnapshot": "off"},
+             os.path.join(pa.ROOT, "profiles", "test", "profile.json"))
+        ctx, starts = self.record(), []
+        ctx.update(beat=True, previous=None)
+
+        class Stop(Exception):
+            pass
+
+        def fake_call(argv, cwd=None):
+            starts.append(list(argv))
+            raise Stop()
+        with self.assertRaises(Stop):
+            self.run_once(ctx, fake_call)
+        self.assertIn("--resume", starts[0])
+        self.assertIn("--system-prompt-snapshot", starts[0])
+        self.assertEqual(load(os.path.join(self.dir, "launcher.json"))["session"]["prompt"], "rebuilt")
+
+    def test_restart_taken_during_the_probe_starts_nothing(self):  # RL-r4-1 M4: the take before starting()
+        ctx, spawned, execs = self.record(), [], []
+        ctx.update(beat=True, previous=None)
+        log = os.path.join(self.dir, "session.log")
+        saved = (pa.snapshot_flag, pa.exec_restart)
+
+        def probe(p, c=None):  # a restart is taken while `claude --help` runs
+            c.setdefault("after", {"kind": "exec", "request": {"id": "r-1", "by": "pa-restart"}})
+            return True
+
+        def exec_restart(c, after, project, directory, address):
+            execs.append(after)
+            raise Execd()
+        pa.snapshot_flag, pa.exec_restart = probe, exec_restart
+        try:
+            with self.assertRaises(Execd):
+                self.run_once(ctx, lambda argv, cwd=None: spawned.append(list(argv)) or 0)
+        finally:
+            pa.snapshot_flag, pa.exec_restart = saved
+        self.assertEqual(len(execs), 1)
+        self.assertEqual(spawned, [], "no Claude starts once a restart was taken")
+        with open(log) if os.path.exists(log) else io.StringIO() as f:
+            lines = f.read().splitlines()
+        self.assertEqual([x for x in lines if " start resume=" in x], [], "no start line before the exec")
+
+    def test_snapshot_flag_position(self):  # RL7: right after the --append-system-prompt value; --settings stays last
+        p = pa.load_profile("test")
+        agent = load(os.path.join(self.dir, "agent.json"))
+        for resume in (True, False):
+            plain = pa.launch_command(p, agent, resume, self.dir)[0]
+            flagged = pa.launch_command(p, agent, resume, self.dir, snapshot=True)[0]
+            i = plain.index("--append-system-prompt") + 2
+            self.assertEqual(flagged, plain[:i] + ["--system-prompt-snapshot", "off"] + plain[i:], resume)
+            self.assertEqual(flagged[-2], "--settings", resume)
 
     def test_session_prompt_modes(self):
         ctx = self.record()

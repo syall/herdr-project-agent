@@ -59,6 +59,7 @@ class Base(unittest.TestCase):
         self.project = os.path.join(TMP, "proj")
         os.makedirs(self.project, exist_ok=True)
         self.saved = {k: getattr(pa, k) for k in ("live_terminals", "hc_get", "call", "init_state")}
+        self.addCleanup(child_fakes.unfaked(pa))  # t-049 (t-037 RL8): pa.spawn raises until a test fakes it
 
     def tearDown(self):
         for k, v in self.saved.items():
@@ -143,6 +144,28 @@ class AfterExit(Base):
     def test_u10b_long_run_marks_started(self):
         a = pa.after_exit({"sessionId": SID, "sessionStarted": False}, False, 0, 25, 0, None)
         self.assertIs(a["sessionStarted"], True)
+
+
+class SpawnGuard(Base):  # t-049 (t-059, t-037 J2 REVIEW RL8)
+    def test_spawn_raises_unless_a_test_fakes_it(self):
+        calls = []
+        saved = pa.subprocess.call
+        pa.subprocess.call = lambda argv, cwd=None: calls.append(argv) or 0  # faking only subprocess.call is not enough
+        try:
+            ctx = {}
+            with self.assertRaises(child_fakes.SpawnNotFaked):
+                pa.run_child(ctx, ["true"], TMP)
+            self.assertIsNone(ctx.get("child"))
+        finally:
+            pa.subprocess.call = saved
+        self.assertEqual(calls, [])
+        undo = child_fakes.patch(pa, lambda argv, cwd=None: 7)  # a faked spawn runs
+        try:
+            self.assertEqual(pa.run_child({}, ["true"], TMP), 7)
+        finally:
+            undo()
+        with self.assertRaises(child_fakes.SpawnNotFaked):  # and the guard is back after its undo
+            pa.spawn(["true"], TMP)
 
 
 class Liveness(Base):

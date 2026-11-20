@@ -41,3 +41,26 @@ def patch(pa, fake_call):
         else:
             pa.spawn = saved
     return undo
+
+
+class SpawnNotFaked(AssertionError):
+    pass
+
+
+def unfaked(pa):
+    """t-049 (t-059, t-037 J2 REVIEW RL8): pa.spawn raises until a test fakes it (patch() above, or its own). A test
+    that fakes only subprocess.call then fails at once instead of starting the profile's real program (how c6 hung
+    twice). Installed by the test bases of test_pa_session, test_pa_costs and test_pa_restart; returns its undo."""
+    saved = pa.__dict__.get("spawn")
+
+    def spawn(argv, cwd=None):
+        raise SpawnNotFaked("spawn not faked: this test would start {!r} (fake it with child_fakes.patch)".format(
+            list(argv)[:1]))
+    pa.spawn = spawn
+
+    def undo():
+        if saved is None:
+            pa.__dict__.pop("spawn", None)
+        else:
+            pa.spawn = saved
+    return undo

@@ -179,6 +179,7 @@ class Base(unittest.TestCase):
         for home in (pa.ROOT, pa.CLAUDE_HOME, _HOMES["CODEX_HOME"]):
             shutil.rmtree(home, ignore_errors=True)
         self.saved = {k: getattr(pa, k) for k in ("hc_get", "call", "live_terminals")}
+        self.addCleanup(child_fakes.unfaked(pa))  # t-049 (t-037 RL8): pa.spawn raises until a test fakes it
         self.hc = HcStub({"t0": {"address": "t0", "name": "PA: S", "state": "live",
                                  "labels": {"herdr.pa": "sp1", "herdr.pa.profile": "test", "herdr.space": "sp1"}}})
         pa.hc_get = self.hc.get
@@ -240,6 +241,28 @@ class Base(unittest.TestCase):
                 result = e.code
         OUTPUT_SEEN.append(out.getvalue() + err.getvalue())
         return result, out.getvalue(), err.getvalue()
+
+
+class SpawnGuard(Base):  # t-049 (t-059, t-037 J2 REVIEW RL8)
+    def test_spawn_raises_unless_a_test_fakes_it(self):
+        calls = []
+        saved = pa.subprocess.call
+        pa.subprocess.call = lambda argv, cwd=None: calls.append(argv) or 0  # faking only subprocess.call is not enough
+        try:
+            ctx = {}
+            with self.assertRaises(child_fakes.SpawnNotFaked):
+                pa.run_child(ctx, ["true"], TMP)
+            self.assertIsNone(ctx.get("child"))
+        finally:
+            pa.subprocess.call = saved
+        self.assertEqual(calls, [])
+        undo = child_fakes.patch(pa, lambda argv, cwd=None: 7)  # a faked spawn runs
+        try:
+            self.assertEqual(pa.run_child({}, ["true"], TMP), 7)
+        finally:
+            undo()
+        with self.assertRaises(child_fakes.SpawnNotFaked):  # and the guard is back after its undo
+            pa.spawn(["true"], TMP)
 
 
 class H1_Harness(Base):
