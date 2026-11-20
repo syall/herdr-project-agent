@@ -586,10 +586,15 @@ class Standing(Base):
     def stops(self):
         return [l for l in self.all_journal() if l.get("standing") == "stopped"]
 
+    def stacked_need(self, tid):
+        """The rule's independence need of a stacked entry (fix round 3: needs.stacked, beside a carry need)."""
+        needs = self.entry(tid).get("needs") or {}
+        return needs.get("stacked") or needs.get("independence")
+
     def independence(self, tid):
         reviewer = tid + "i"
         self.add_worker(tid, reviewer, "reviewer")
-        need = self.entry(tid)["needs"]["independence"]
+        need = self.stacked_need(tid)
         write(os.path.join(self.evidence(tid), need["file"]), review_file(self.tip(tid), reviewer, "pass", "yes"))
         code, out, err = self.refresh("--no-merge")
         self.assertEqual(code, 0, out + err)
@@ -712,7 +717,7 @@ class A11Merge(Standing):
         a, b = self.two()
         code, out, err = self.smerge()
         self.assertEqual(self.standing_merged(), ["t-A"], out + err)
-        need = self.entry("t-B")["needs"]["independence"]
+        need = self.stacked_need("t-B")
         self.assertNotEqual(need["oldBase"], need["newBase"], need)
         self.assertEqual((need["oldBase"], need["newBase"]), (self.m0, a), need)
         stacked_on = sh(self.proj, "git", "diff", "--name-only", need["oldBase"], need["newBase"]).split()
@@ -807,6 +812,106 @@ class A11Merge(Standing):
         code, out, err = self.smerge()
         self.assertEqual(self.standing_merged(), ["t-A"], out + err)
         self.assertIn("RL-1: slow on big repos; follow-up t-200", out)
+
+
+class A11StackedOrder(Standing):
+    """Fix round 3: on a stacked entry, merge_check's stops come first, then the stacked review that names this pair
+    and asks its own question, then the merge; the push card plans for the last merge of the run."""
+
+    def carry_review(self, tid):
+        reviewer = tid + "c"
+        self.add_worker(tid, reviewer, "reviewer")
+        need = self.entry(tid)["needs"]["independence"]
+        write(os.path.join(self.evidence(tid), need["file"]), review_file(self.tip(tid), reviewer, "pass", "yes"))
+        return need
+
+    def test_a11_1c_a_carry_review_is_not_the_stacked_review(self):  # REVIEW-r2-1 MF-1
+        self.joined("t-X", "fx.txt")
+        a_old = self.joined("t-A", "fa.txt")
+        self.joined("t-B", "fb.txt")
+        self.suite("t-X", 1)
+        self.suite("t-A", 0)
+        self.suite("t-B", 0)
+        code, out, err = self.refresh("--no-merge")
+        self.assertEqual([e["task"] for e in self.entries()], ["t-A", "t-B"], out + err)
+        for t in ("t-A", "t-B"):
+            self.gate(t)
+        self.carry_review("t-A")
+        carry = self.carry_review("t-B")
+        self.assertEqual((carry["oldBase"], carry["newBase"]), (a_old, self.tip("t-A")), carry)
+        code, out, err = self.refresh("--no-merge")
+        self.assertEqual([e["state"] for e in self.entries()], ["passed", "passed"], out + err)
+        self.approve("Merge up to t-A")
+        code, out, err = self.merge()
+        self.assertEqual(self.merged(), ["t-A"], out + err)
+        a_from = self.qrepo()["merged"][-1]["from"]
+        remote = self.remote()
+        code, out, err = self.smerge()
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(self.standing_merged(), [], out + err)
+        self.assertEqual(self.remote(), remote)
+        self.assertIn("waits at t-B", out)
+        self.assertEqual(self.stops(), [])
+        needs = self.entry("t-B")["needs"]
+        self.assertEqual(needs["independence"]["oldBase"], a_old, needs)  # the carry need is kept
+        self.assertTrue(needs["stacked"]["standing"], needs)
+        self.assertEqual((needs["stacked"]["oldBase"], needs["stacked"]["newBase"]), (a_from, self.tip("t-A")), needs)
+        self.assertNotEqual(needs["stacked"]["file"], needs["independence"]["file"], needs)
+        self.assertIn("what it is stacked on: git diff {} {}".format(a_from, self.tip("t-A")), out)
+        # the stacked review, recorded with its pair, lets the rule merge it
+        self.independence("t-B")
+        line = [r for r in pa_hooks.review_runs(self.dir) if r.get("task") == "t-B" and r.get("standing")]
+        self.assertEqual(len(line), 1)
+        self.assertEqual((line[0]["oldBase"], line[0]["newBase"]), (a_from, self.tip("t-A")))
+        code, out, err = self.smerge()
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(self.standing_merged(), ["t-B"], out + err)
+
+    def test_a11_5b_a_commit_after_the_check_on_a_stacked_entry_stops(self):  # REVIEW-r2-2 MF-1 (probe P1)
+        a, b = self.two()
+        code, out, err = self.smerge()
+        self.assertEqual(self.standing_merged(), ["t-A"], out + err)
+        self.change("t-B", "fb.txt", "later\n")
+        new = self.tip("t-B")
+        code, out, err = self.smerge()
+        self.assertEqual(code, 1, out + err)
+        self.assertEqual(self.standing_merged(), ["t-A"], out + err)
+        s = self.stops()
+        self.assertEqual(len(s), 1, out + err)
+        self.assertIn("a commit after the check", s[0]["why"])
+        self.assertNotIn("Checked: " + new, out)
+        needs = self.entry("t-B").get("needs") or {}
+        self.assertFalse(any(isinstance(n, dict) and n.get("tip") == new for n in needs.values()), needs)
+
+    def test_a11_5c_a_failing_gate_on_a_stacked_entry_stops(self):  # REVIEW-r2-2 MF-1
+        a, b = self.two()
+        code, out, err = self.smerge()
+        self.assertEqual(self.standing_merged(), ["t-A"], out + err)
+        os.remove(os.path.join(self.evidence("t-B"), "REVIEW.md"))
+        code, out, err = self.smerge()
+        self.assertEqual(code, 1, out + err)
+        self.assertEqual(self.standing_merged(), ["t-A"], out + err)
+        self.assertNotIn("SHORT-REVIEW-t-B", out)
+        s = self.stops()
+        self.assertEqual(len(s), 1, out + err)
+        self.assertIn("the gate fails now", s[0]["why"])
+
+    def test_a11_9_a_card_merge_after_a_rule_merge_opens_the_push_card(self):  # REVIEW-r2-2 MF-2 (probe P6)
+        a, b = self.two()
+        self.approve()
+        self.change("t-A", "fa.txt", "later\n")
+        code, out, err = self.merge()
+        self.assertTrue(self.approval("t-A")["void"], out + err)
+        sh(self.trees["t-A"], "git", "reset", "-q", "--hard", a)
+        code, out, err = self.smerge()
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual([(m["task"], m.get("standing")) for m in self.qrepo()["merged"]], [("t-A", RULE), ("t-B", None)])
+        self.assertEqual(self.ref("main"), b)
+        self.assertNotIn("push card not opened", out)
+        cards = self.push_cards()
+        self.assertEqual(len(cards), 1, out + err)
+        card = pa.read_json(os.path.join(self.dir, "decisions", cards[0] + ".json"))
+        self.assertIn(b, json.dumps(card))
 
 
 class A13Stops(Standing):
