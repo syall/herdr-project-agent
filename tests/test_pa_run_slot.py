@@ -19,6 +19,17 @@ machine), and the temp HERDR_PA_HOME, space and worktree come from test_pa_run's
   k1  T1: the kind inferred when --for is not given; --for wins
   t1  T1: a local pa-run records the command's own time and its setup apart
   t2  T2: pa-run --report: counts, medians, a verdict per kind
+t-117 (spec R-numbers): s3a also R15 (the fallback's note and overhead), s5c also R8b (ran and waited), s8c R7 (no
+space rule named);
+  q3  R3: the slot step's refusals before a Run (PA_CHANGED_FILES, the profile) write one test-runs.jsonl line
+  q4  R4: TERM during tree_to_run is 143 and recorded; any other exception in slot_run is 125 with its line
+  q7  R7: could not run only for 124/125 with the slot step's own last line; no space rule in runtime/
+  q8  R8: no remote run when the deadline leaves no time for it; PA_SUITE_RUN_LIMIT ends a remote run
+  q13 R13: the slot step with no usable machine and "none": 125
+  q14 R14: pa-full-suite's remote ran and copyback from the run folder's stamps
+  q18 R18 (X15): this Mac's slot wait ends before the deadline
+  q20 R20 (M11): a remote run past REMOTE_TIMEOUT: 124, `timed out after 2 s there`
+  q21 R21: a start snapshot with no change runs nothing; an edit runs the command with the deadline
 """
 import json
 import os
@@ -46,6 +57,7 @@ case "${1:-}" in
     echo "pcf [$(printf '%s' "${PA_CHANGED_FILES:-}" | tr '\n' ' ')]"
     echo "tree $(git write-tree 2>&1)"
     echo "hcvars [$(env | grep -E '^(HC_|PA_SUITE_HC_)' | sort | tr '\n' ' ')]"
+    echo "runlimit [${PA_SUITE_RUN_LIMIT-unset}]"
     if [ -n "${FAKE_GO:-}" ]; then while [ ! -f "$FAKE_GO" ]; do sleep 0.1; done; fi
     echo "=== summary (each part's whole output: /tmp/x)"
     echo "  unit tests: test_a: ok (1s)"
@@ -189,6 +201,13 @@ class S3Fallback(Slot):
         self.assertEqual(code, 0, out + err)
         self.assertIn("remote=unset", out)
         self.assertRegex(out + err, r"run-all\.sh: on this Mac: box-1 not reachable")
+        # t-117 R15 (Nit-J2-5): the local line says why it ran here and how long the step spent before falling back
+        rows = self.rows(kind="affected")
+        self.assertEqual(len(rows), 1, self.run_rows())
+        self.assertEqual(rows[0]["place"], "local")
+        self.assertRegex(rows[0].get("note") or "", r"^on this Mac: box-1 not reachable", rows)
+        self.assertIsInstance((rows[0].get("overhead") or {}).get("fallback"), (int, float), rows)
+        self.assertIsInstance(rows[0]["ran"], (int, float))
 
     def test_s3b_unreachable_with_none_is_125_never_here(self):
         self.set_fallback("none")
@@ -245,12 +264,21 @@ class S5Deadline(Slot):
         self.assertLess(took, 30, out + err)
 
     def test_s5c_a_run_past_the_deadline_is_ended_there(self):
+        # t-117 R8a: with a 1 s median there the run is started (deadline - median is still ahead)
+        write(os.path.join(pa.ROOT, "test-runs.jsonl"), "".join(json.dumps(
+            {"at": pa.now(), "run": "m{}".format(i), "kind": "affected", "place": "box-1", "machine": "box-1",
+             "seconds": 1, "waited": 0, "exit": 0}) + "\n" for i in range(3)))
         go = os.path.join(self.tmp, "never")
         code, out, err, took = self.slot("--affected", FAKE_GO=go, PA_SUITE_DEADLINE=str(int(time.time()) + 8))
         self.assertEqual(code, 124, out + err)
         self.assertLess(took, 40, out + err)
         self.assertIn("deadline", out.splitlines()[-1])
         self.assertRegex(out.splitlines()[-1], r"^run-all\.sh: did not finish on box-1: ")  # MF-J2-1: it started
+        # t-117 R8b (AC8.2): how long it ran there and how long it waited
+        self.assertRegex(out.splitlines()[-1], r"^run-all\.sh: did not finish on box-1: the deadline \(PA_SUITE_DEADLINE\) "
+                                               r"came after it ran \d+ s there \(waited \d+ s for the slot\); the run "
+                                               r"there was ended$")
+        self.assertTrue(pa_hooks.did_not_finish(out), out)
         self.assertEqual(self.terminals(), [])
         self.assertEqual(self.remote_folders(), [])
 
@@ -377,8 +405,9 @@ class S8Hook(Slot):
                                 (124, "run-all.sh: not run on box-1: no slot came free in 570 s")):
             code, err = self.hook(self.script("echo some output\necho '{}'\nexit {}\n".format(line, exit_code)))
             self.assertEqual(code, ("exit", 2), err)
-            self.assertIn("The affected tests could not run (task t-1): {}. Do not change code for this; report it "
-                          "(r-cloud-runs).".format(line), err)
+            self.assertIn("The affected tests could not run (task t-1): {}. Do not change code for this; report "
+                          "it.\n".format(line), err)  # t-117 R7: no space rule named
+            self.assertNotIn("r-cloud-runs", err)
             self.assertNotIn("Fix the code", err)
 
     def test_s8d_the_stop_variant_lets_the_session_stop(self):
@@ -519,6 +548,326 @@ class T2Report(Slot):
         self.assertRegex(out, r"module: about the same \(local 3 runs")
         self.assertIn("mutation: not enough runs (2 local, 0 on a machine; 3 each needed)", out)
         self.assertRegex(out, r"setup\+transfer")
+
+
+# ---- t-117 ----
+
+def slot_is_free(path):
+    import fcntl
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a+") as f:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return False
+        fcntl.flock(f, fcntl.LOCK_UN)
+    return True
+
+
+def median_rows(seconds=1, kind="affected", place="box-1"):
+    """Three recorded runs of kind at place, so the slot step's wait_end there is the deadline less `seconds`."""
+    write(os.path.join(pa.ROOT, "test-runs.jsonl"), "".join(json.dumps(
+        {"at": pa.now(), "run": "m{}".format(i), "kind": kind, "place": place, "machine": None if place == "local"
+         else place, "seconds": seconds, "waited": 0, "exit": 0}) + "\n" for i in range(3)))
+
+
+class HookCase(Slot):
+    """S8Hook's helpers without its tests."""
+    hook, script = S8Hook.hook, S8Hook.script
+
+    def could_not_run(self, line, exit_code):
+        path = os.path.join(self.tmp, "line.txt")
+        write(path, "some output\n" + line + "\n")
+        code, err = self.hook(self.script("cat {}\nexit {}\n".format(path, exit_code)))
+        self.assertEqual(code, ("exit", 2), err)
+        self.assertIn("The affected tests could not run (task t-1): {}.".format(line.rstrip(".")), err)
+        self.assertNotIn("Fix the code", err)
+
+
+class Q3SlotRecords(HookCase):
+    """R3 (AC3.2): the slot step's refusals before a Run exists write one test-runs.jsonl line (exit 125, the note)."""
+
+    def check(self, code, out, err, reason):
+        self.assertEqual(code, 125, out + err)
+        last = out.splitlines()[-1]
+        self.assertIn(reason, last)
+        rows = self.rows(kind="affected")
+        self.assertEqual(len(rows), 1, self.run_rows())
+        self.assertEqual((rows[0]["exit"], rows[0]["place"]), (125, None), rows)
+        self.assertIn(reason, rows[0].get("note") or "", rows)
+        self.assertEqual(self.remote_runs(), [])
+        self.could_not_run(last, 125)
+
+    def test_q3d_a_bad_changed_files_path(self):
+        code, out, err, _ = self.slot("--affected", PA_CHANGED_FILES="a.txt\n../x.txt")
+        self.check(code, out, err, "../x.txt")
+
+    def test_q3e_a_named_profile_that_cannot_be_read(self):
+        path = os.path.join(pa.ROOT, "profiles", "test", "profile.json")
+        kept = pa.read_text(path)
+        write(path, "{not json\n")
+        code, out, err, _ = self.slot("--affected")
+        write(path, kept)  # the hook (in check) reads it
+        self.check(code, out, err, "cannot be read")
+
+
+class Q4SlotStep(Slot):
+    """R4 for the slot step: TERM during tree_to_run is 143 with a record `interrupted`; any other exception in
+    slot_run is 125 with `the slot step failed (...)`, never 1 (which the hook reads as a test failure)."""
+
+    def test_q4b_term_during_git_add_is_143(self):
+        folder = os.path.join(self.tmp, "stallbin")
+        write(os.path.join(folder, "git"), tpr.GIT_STALL)
+        os.chmod(os.path.join(folder, "git"), 0o755)
+        mark = os.path.join(self.tmp, "stalled")
+        log = os.path.join(self.tmp, "slot.out")
+        env = self.env(PATH=folder + os.pathsep + os.environ["PATH"], GIT_STALL_MARK=mark,
+                       GIT_STALL_REAL=__import__("shutil").which("git"))
+        with open(log, "w") as f:
+            p = subprocess.Popen(self.slot_argv("--affected"), cwd=self.wt, env=env, stdin=subprocess.DEVNULL, stdout=f,
+                                 stderr=subprocess.STDOUT)
+        self.addCleanup(lambda: (p.poll() is None and p.kill(), p.wait()))
+        self.assertTrue(self.until(lambda: os.path.exists(mark)), pa.read_text(log))
+        p.send_signal(signal.SIGTERM)
+        self.assertEqual(p.wait(timeout=60), 143, pa.read_text(log))
+        self.assertNotIn("Traceback", pa.read_text(log))
+        rows = self.rows(kind="affected")
+        self.assertEqual(len(rows), 1, self.run_rows())
+        self.assertEqual(rows[0]["exit"], 143, rows)
+        self.assertIn("interrupted", rows[0].get("note") or "", rows)
+        steps = [pa_suite.read_progress(os.path.join(pa_suite.runs_dir(), n)) for n in os.listdir(pa_suite.runs_dir())
+                 if n.endswith(".json")]
+        steps = [s for s in steps if s.get("kind") == "run-all.sh"]
+        self.assertTrue(steps)
+        self.assertEqual([s.get("state") for s in steps], ["done"] * len(steps), steps)
+
+    def test_q4c_an_exception_in_slot_run_is_125_with_its_line(self):
+        # AC4.2: the evidence folder cannot be made (a file is in its place): os.makedirs raises
+        evidence = os.path.join(self.dir, "evidence", "t-1")
+        if os.path.isdir(evidence):
+            __import__("shutil").rmtree(evidence)
+        write(evidence, "a file where the folder goes\n")
+        code, out, err, _ = self.slot("--affected")
+        self.assertEqual(code, 125, out + err)
+        self.assertNotIn("Traceback", out + err)
+        self.assertRegex(out.splitlines()[-1], r"^run-all\.sh: not run on box-1: the slot step failed \(\w+: .+\)$")
+        self.assertEqual(self.remote_runs(), [])
+
+
+class Q7HookReading(HookCase):
+    """R7 (RL-J2-3, Nit-J2-6): "could not run" only for 124/125 whose last line is the slot step's own."""
+
+    def test_q7a_a_commands_own_124_and_125_are_failures_to_fix(self):
+        for exit_code in (124, 125):
+            for args in ((), ("--stop",)):
+                with self.subTest(exit=exit_code, args=args):
+                    code, err = self.hook(self.script("echo boom\nexit {}\n".format(exit_code)), *args)
+                    self.assertEqual(code, ("exit", 2), err)  # --stop holds the session too
+                    self.assertIn("The tests affected by this session's changes fail (task t-1)", err)
+                    self.assertNotIn("could not run", err)
+
+    def test_q7b_each_producers_line_is_could_not_run(self):
+        self.hold(os.path.join(pa_suite.slot_dir(), "slot-0"))
+        real = []
+        try:  # this Mac's slot: no slot came free, and the caller-gone wait, as acquire says them
+            pa_suite.acquire(1, {}, limit=0, say=lambda m: None, who="tests/run-all.sh")
+        except pa_suite.Waited as e:
+            real.append(str(e))
+        try:
+            pa_suite.acquire(1, {}, limit=60, say=lambda m: None, who="tests/run-all.sh",
+                             gone=lambda: "its caller is gone (pid 1)")
+        except pa_suite.Waited as e:
+            real.append(str(e))
+        self.assertEqual(len(real), 2, real)
+        cases = [(real[0], 124), (real[1], 124),
+                 ("run-all.sh: not run on box-1: not reachable (box-1: needs_login) (suiteFallback \"none\": never this "
+                  "Mac on its own; --local runs here)", 125),
+                 ("run-all.sh: not run on box-1: no slot came free in 840 s (running: box-1 (cap 1): task t-9)", 124),
+                 ("run-all.sh: not run on box-1: the slot step cannot load its parts (SyntaxError: bad)", 125),
+                 ("run-all.sh: not run on box-1: PA_CHANGED_FILES names '../x': not a relative path inside the tree", 125),
+                 ("run-all.sh: not run on box-1: the deadline (PA_SUITE_DEADLINE) leaves no time to run (5 s left, the "
+                  "run takes about 300 s there)", 124)]
+        for line, exit_code in cases:
+            with self.subTest(line=line):
+                self.could_not_run(line, exit_code)
+
+    def test_q7c_no_space_rule_is_named(self):
+        # AC7.3
+        found = []
+        for root, _, files in os.walk(os.path.join(REPO, "runtime")):
+            for name in files:
+                try:
+                    with open(os.path.join(root, name), encoding="utf-8", errors="replace") as f:
+                        if "r-cloud-runs" in f.read():
+                            found.append(os.path.relpath(os.path.join(root, name), REPO))
+                except OSError:
+                    pass
+        self.assertEqual(found, [])
+
+
+class Q8DeadlineAndRunLimit(HookCase):
+    """R8 (RL-J2r2-1; t-079 RL-a as R8c): no remote run starts when the deadline leaves no time for it; a remote run
+    is ended PA_SUITE_RUN_LIMIT s after it took the slot."""
+
+    def test_q8a_a_deadline_that_leaves_no_time_starts_no_run(self):
+        # AC8.1: a free slot, no median there (300 s), the deadline 5 s away
+        code, out, err, took = self.slot("--affected", PA_SUITE_DEADLINE=str(int(time.time()) + 5))
+        self.assertEqual(code, 124, out + err)
+        last = out.splitlines()[-1]
+        self.assertRegex(last, r"^run-all\.sh: not run on box-1: the deadline \(PA_SUITE_DEADLINE\) leaves no time to "
+                               r"run \(\d+ s left, the run takes about \d+ s there\)$")
+        self.assertLess(took, 5, out + err)
+        self.assertEqual(self.remote_runs(), [])
+        self.assertFalse([c for c in self.calls() if c[:2] == ["file", "write"]], self.calls())
+        self.assertEqual(self.remote_folders(), [])
+        self.assertTrue(slot_is_free(self.machine_slot("box-1")))
+        self.could_not_run(last, 124)
+
+    def test_q8c_a_remote_run_past_its_run_limit_is_ended_there(self):
+        # AC8.3: PA_SUITE_RUN_LIMIT=3, a far deadline (20 s, a 1 s median there), a run that never ends
+        median_rows(1)
+        go = os.path.join(self.tmp, "never")
+        code, out, err, took = self.slot("--affected", FAKE_GO=go, PA_SUITE_RUN_LIMIT="3",
+                                         PA_SUITE_DEADLINE=str(int(time.time()) + 20))
+        self.assertEqual(code, 124, out + err)
+        self.assertLess(took, 15, out + err)
+        self.assertEqual(out.splitlines()[-1], "run-all.sh: did not finish on box-1: it ran past its 3 s limit after "
+                                               "taking the slot (PA_SUITE_RUN_LIMIT); the run there was ended")
+        self.assertIn("runlimit [unset]", out)  # the command never sees it
+        self.assertEqual(self.terminals(), [])
+        self.assertEqual(self.remote_folders(), [])
+        rows = [r for r in self.rows(kind="affected", machine="box-1") if r["run"] not in ("m0", "m1", "m2")]
+        self.assertEqual([r["exit"] for r in rows], [124], self.run_rows())
+        self.assertTrue(pa_hooks.did_not_finish(out), out)
+
+
+class Q13SlotNoUsableMachine(Slot):
+    """R13 for the slot step: suiteMachines with no usable entry and "none": --affected is 125."""
+
+    def test_q13c_the_slot_steps_affected_is_125(self):
+        self.configure([{"machine": "bad name!"}])
+        self.set_fallback("none")
+        code, out, err, _ = self.slot("--affected")
+        self.assertEqual(code, 125, out + err)
+        self.assertIn("no usable machine in suiteMachines", out + err)
+        self.assertNotIn("fake --affected", out)
+        self.assertEqual(self.calls(), [])
+
+
+class Q14FullSuiteTimes(Slot):
+    """R14 (RL-J2-1): pa-full-suite's remote line: ran from the run folder's t0/t1 there, copyback after t1."""
+    TIMED = r"""#!/bin/sh
+case "${1:-}" in
+  --except-integration) sleep 2; echo "=== summary (x)"; echo "  unit tests: test_a: ok (2s)"; exit 0 ;;
+  --only-integration) sleep 5; echo "  pa-session integration (private hc core): ok (5s)"; exit 0 ;;
+  *) echo "fake whole run"; exit 0 ;;
+esac
+"""
+
+    def test_q14a_ran_is_the_runs_own_time_there(self):
+        # AC14.1 (s7d extended): the remote part sleeps 2 s, the local part 5 s
+        self.set_command("sh tests/run-all.sh")
+        os.remove(os.path.join(self.wt, "tests", "run-all.sh"))
+        write(os.path.join(self.wt, "tests", "run-all.sh"), self.TIMED)
+        sh(self.wt, "git", "add", "-A")
+        sh(self.wt, "git", "commit", "-q", "-m", "a timed fake run-all")
+        code, out = self.main()
+        self.assertEqual(code, 0, out)
+        rows = [r for r in self.run_rows() if r["kind"] == "full"]
+        self.assertEqual(len(rows), 1, self.run_rows())
+        row = rows[0]
+        self.assertEqual(row["place"], "box-1")
+        self.assertIsInstance(row["ran"], (int, float), row)
+        self.assertLessEqual(abs(row["ran"] - 2), 1, row)
+        self.assertIsInstance(row["overhead"].get("copyback"), (int, float), row)
+        self.assertGreaterEqual(row["seconds"], row["ran"], row)
+
+
+class Q18MacSlotDeadline(HookCase):
+    """R18 (RL-J2r3-1, X15): this Mac's only slot held, no machines, a deadline DEADLINE_MARGIN + 4 s away: the wait
+    ends before the deadline with `no slot came free` (124), read as could not run."""
+
+    def test_q18_the_wait_on_this_macs_slot_ends_before_the_deadline(self):
+        self.configure([])
+        self.hold(os.path.join(pa_suite.slot_dir(), "slot-0"))
+        at = int(time.time()) + pa_suite.DEADLINE_MARGIN + 4
+        began = time.time()
+        r = subprocess.run(self.slot_argv("--module", "test_x"), cwd=self.wt, env=self.env(PA_SUITE_DEADLINE=str(at)),
+                           stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           universal_newlines=True, timeout=30)  # X15 (no cap) waits 840 s: this times out
+        took = time.time() - began
+        self.assertEqual(r.returncode, 124, r.stdout + r.stderr)
+        self.assertLess(took, 12, r.stdout + r.stderr)
+        self.assertLess(time.time(), at)
+        last = r.stdout.splitlines()[-1]
+        self.assertRegex(last, r"^\S+: no slot came free in \d+ s")
+        self.assertNotIn("fake --module", r.stdout)
+        self.could_not_run(last, 124)
+
+
+# pa_suite.py's slot step with REMOTE_TIMEOUT patched (R20): loaded as the module pa_run finds as S
+TIMEOUT_DRIVER = r"""import importlib.util, sys
+spec = importlib.util.spec_from_file_location("pa_suite", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+sys.modules["pa_suite"] = m
+spec.loader.exec_module(m)
+m.pa = None
+m.REMOTE_TIMEOUT = int(sys.argv[2])
+sys.exit(m.run_under_slot(sys.argv[4:]))
+"""
+
+
+class Q20RemoteTimeout(Slot):
+    """R20 (VERIFY J2r2 Nit-J2r2-2, M11): a remote slot-step run past S.REMOTE_TIMEOUT (2 s here) is 124, `timed out
+    after 2 s there`."""
+
+    def test_q20_a_remote_run_past_remote_timeout(self):
+        driver = os.path.join(self.tmp, "timeout_driver.py")
+        write(driver, TIMEOUT_DRIVER)
+        go = os.path.join(self.tmp, "never")
+        argv = [sys.executable, driver, SUITE, "2"] + self.slot_argv("--affected")[2:]
+        began = time.time()
+        r = subprocess.run(argv, cwd=self.wt, env=self.env(FAKE_GO=go, PYTHONPATH=None), stdin=subprocess.DEVNULL,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=60)
+        self.assertEqual(r.returncode, 124, r.stdout + r.stderr)
+        self.assertLess(time.time() - began, 30, r.stdout + r.stderr)
+        self.assertEqual(r.stdout.splitlines()[-1], "run-all.sh: did not finish on box-1: timed out after 2 s there")
+        self.assertEqual(self.terminals(), [])
+        self.assertEqual(self.remote_folders(), [])
+
+
+class Q21StartThenEdit(Slot):
+    """R21 (Nit-J2a-2): a start snapshot and no change: 0, the command not run; then an edit: it runs with t-079's
+    deadline, and its 124 `not run ...` line is could not run."""
+
+    def test_q21_no_change_since_the_start_then_an_edit(self):
+        saved = pa_hooks.START_DIR
+        pa_hooks.START_DIR = os.path.join(self.tmp, "starts")
+        self.addCleanup(setattr, pa_hooks, "START_DIR", saved)
+        seen = os.path.join(self.tmp, "seen")
+        script = S8Hook.script(self, 'echo "$PA_SUITE_DEADLINE" > {}\necho "run-all.sh: not run on box-1: no slot came '
+                                     'free in 5 s (running: x)"\nexit 124\n'.format(seen))
+        agent = pa.read_json(os.path.join(self.dir, "agent.json"))
+        agent["commands"] = {"affected": "sh " + script}
+        dump(agent, os.path.join(self.dir, "agent.json"))
+        write(os.path.join(self.wt, "a.txt"), "edited before the start\n")
+        data = {"cwd": self.wt, "session_id": "s-q21-{}".format(time.time())}
+        self.assertEqual(pa_hooks.hook_session_start(data, []) or 0, 0)
+        self.assertEqual(pa_hooks.hook_affected(data, []), 0)
+        self.assertFalse(os.path.exists(seen), "the command ran with no change since the start")
+        write(os.path.join(self.wt, "a.txt"), "edited after the start\n")
+        err = __import__("io").StringIO()
+        began = time.time()
+        with __import__("contextlib").redirect_stderr(err):
+            try:
+                code = pa_hooks.hook_affected(data, [])
+            except SystemExit as e:
+                code = ("exit", e.code)
+        self.assertEqual(code, ("exit", 2), err.getvalue())
+        self.assertIn("The affected tests could not run (task t-1): run-all.sh: not run on box-1: no slot came free "
+                      "in 5 s (running: x).", err.getvalue())
+        self.assertAlmostEqual(int(pa.read_text(seen).strip()), began + pa_hooks.AFFECTED_LIMIT - pa_hooks.DEADLINE_SPARE,
+                               delta=5)
 
 
 if __name__ == "__main__":

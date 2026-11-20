@@ -5,7 +5,8 @@ shard (run.mjs --shard=<k>/4), each named in the summary; t-072: every run takes
 t-076: a part past its limit (3x its median, at least PA_PART_LIMIT) is stopped and named hung (h1-h3), every run
 has a progress file under HERDR_PA_HOME/suite-runs (p1-p2), --module runs one unit part (m1); t-079: a wait that
 answers at once for a running part waits for its end (r2d), a killed slot step stops the run (r8c), the run's own
-limit after the slot (s10, s11), git link guards (g5, g6). The real script runs
+limit after the slot (s10, s11), git link guards (g5, g6); t-117: the slot step's own variables are not the parts'
+(s12, R16), an inherited PA_SUITE_HC_SCOPE without HC_SCOPE reaches no hc call (h3, R19). The real script runs
 in a temp copy of the repo whose parts are stubs (stub.sh, chosen per part by STUB_<part>), so no real suite runs here."""
 import json
 import fcntl
@@ -60,6 +61,7 @@ except OSError:
     sys.exit(0)
 print('FAIL slot: free during the run'); sys.exit(1)" "$HERDR_PA_HOME/suite-slots/slot-0" || exit 1 ;;
   envs) env | grep -E '^(HC_|PA_SUITE_HC_)' | sort > "$STUB_DIR/$k.env"
+    env | grep -E '^PA_SUITE_(DEADLINE|LOCAL_RUN)=' | sort > "$STUB_DIR/$k.slotenv"
     env | grep -E '^PA_SUITE_RUN_LIMIT=' > "$STUB_DIR/$k.runenv" ;;
   git) { echo "git=$(command -v git)"; echo "python3=$(command -v python3)"; echo "path=$PATH"; } > "$STUB_DIR/$k.git" ;;
   wait:*) other=${m#wait:}; n=0
@@ -890,6 +892,15 @@ class RunAll(unittest.TestCase):
         with open(os.path.join(self.tmp, "keeper.runenv")) as f:
             self.assertEqual(f.read().strip(), "", out)
 
+    def test_s12_the_slot_steps_deadline_and_local_run_are_not_the_parts(self):
+        # t-117 R16 (Nit-J2-2): the second pass (under the slot step) unsets PA_SUITE_DEADLINE and PA_SUITE_LOCAL_RUN
+        # before any part starts; the first pass keeps them for the slot step (its deadline still applies: s5)
+        code, out = self.run_all("--affected", keeper="envs", PA_SUITE_DEADLINE=str(int(time.time()) + 3600),
+                                 PA_SUITE_LOCAL_RUN="0123456789ab")
+        self.assertEqual(code, 0, out)
+        self.assertIn("  keeper harness: ok", self.summary(out))
+        self.assertEqual(pa_text(os.path.join(self.tmp, "keeper.slotenv")), "", out)
+
     # ---- t-076: the per-part limit, the progress file, --module ----
 
     def progress(self):
@@ -1294,6 +1305,26 @@ class RemoteAffected(Fixture):
         self.assertEqual(code, 0, out)
         self.assertNotIn("run-all.sh: on box-1", out)
         self.assertFalse(os.path.exists(self.hclog) and pa_text(self.hclog), "no hc call")
+
+
+class HcScopeNotInherited(RemoteAffected):
+    """t-117 R19 (Nit-J2r3-1, X11): an inherited PA_SUITE_HC_SCOPE without HC_SCOPE is dropped by run-all.sh's
+    unset line: the slot step's hc calls (on a machine, STUB_HC_ENVLOG) and the parts there have no HC_SCOPE."""
+    test_e1_affected_runs_there_in_run_all_shape = test_e2_a_full_run_by_hand_stays_here = None  # RemoteAffected's
+
+    def test_h3_an_inherited_scope_without_hc_scope_reaches_no_hc_call(self):
+        env = self.remote_env(keeper="envs")
+        env.pop("HC_SCOPE")
+        env["PA_SUITE_HC_SCOPE"] = "inherited"
+        code, out = self.run_with(env, "--affected")
+        self.assertEqual(code, 0, out)
+        self.assertRegex(out.splitlines()[0], r"^run-all\.sh: on box-1 ", out)
+        envs = [json.loads(l)["env"] for l in pa_text(self.envlog).splitlines() if l.strip()]
+        self.assertTrue(envs)
+        want = {k: v for k, v in HC_GIVEN.items() if k != "HC_SCOPE"}
+        for e in envs:
+            self.assertEqual(e, want)
+        self.assertEqual(pa_text(os.path.join(self.tmp, "keeper.env")), "", "a part there saw hc variables")
 
 
 class PartTable(unittest.TestCase):

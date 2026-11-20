@@ -17,6 +17,18 @@ worktree come from test_pa_suite's fixture (through test_pa_suite_remote's Remot
   r11 TERM during a remote run: 143, cleaned
   r12 the 1 s start poll (R17)
   r13 docs, help, Python 3.7
+t-117 (the limits from t-107 J1 and J2; spec R-numbers):
+  q1  R1: sh's script, argv[0] and a session-check word judged by realpath; a symlink in --commit C's tree
+  q2  R2: README and the docstring say pa-run trusts the worktree's code (python3 -c, node -e)
+  q3  R3: a refusal after the argv check (a secret, not an ancestor) writes build.log and test-runs.jsonl
+  q4  R4: TERM while the tree to run is made: 143, a record `interrupted`, no traceback, its scratch removed
+  q5  R5: a closed stdout (| head -1) does not end the run: argv's code, records, cleaned, the whole output kept
+  q6  R6: a clean filter never runs (it writes under .git): 125 naming the path and the filter
+  q9  R9: every 124 is listed in the Exit line, run-all.sh's exit comment and README
+  q10 R10: --cwd that is not a folder in the tree to run: 125 before anything runs
+  q11 R11: a patch too large to send: this Mac with "mac" (saying why), 125 with "none"
+  q12 R12: --overlay words are literal paths
+  q13 R13: suiteMachines with no usable entry and "none": 125
 """
 import base64
 import contextlib
@@ -522,6 +534,10 @@ class R6NeverSent(Run):
         self.assert_refused("k/secret.key", out, code)
 
     def test_r6d_too_large_refuses(self):
+        # t-117 R11: a patch too large to send goes the setup-failed way; with suiteFallback "none" that is 125
+        cfg = pa.read_json(os.path.join(pa.ROOT, "config.json"), {}) or {}
+        cfg["suiteFallback"] = "none"
+        dump(cfg, os.path.join(pa.ROOT, "config.json"))
         with open(os.path.join(self.wt, "big.bin"), "wb") as f:
             f.write(os.urandom(5 * 1024 * 1024))
         code, out = self.pa_run("--", "sh", "probe.sh")
@@ -774,6 +790,396 @@ class R13Docs(unittest.TestCase):
         import ast
         with open(os.path.join(REPO, "runtime", "tools", "pa_run.py")) as f:
             ast.parse(f.read(), feature_version=(3, 7))
+
+
+# ---- t-117 ----
+
+def set_fallback(value):
+    cfg = pa.read_json(os.path.join(pa.ROOT, "config.json"), {}) or {}
+    cfg["suiteFallback"] = value
+    dump(cfg, os.path.join(pa.ROOT, "config.json"))
+
+
+def scratch_trees():
+    """tree_to_run's scratch folders (pa-run-tree-*) in this process's temp folder."""
+    import tempfile
+    return {n for n in os.listdir(tempfile.gettempdir()) if n.startswith("pa-run-tree-")}
+
+
+class Q1Symlinks(Run):
+    """R1 (RL-6, RL-1's symlink part, VERIFY J1r3 Nit-7): a script word and an argv[0] path are judged by the
+    realpath of top/subdir/word, with no lexical normalising first."""
+
+    def setUp(self):
+        super().setUp()
+        for rel in ("tests/pa_session_check.sh", "wrap.sh", "tests/sub/f"):
+            write(os.path.join(self.wt, rel), "#!/bin/sh\necho ran {}\n".format(rel))
+        for rel in ("wrap.sh", "tests/sub/f"):
+            os.chmod(os.path.join(self.wt, rel), 0o755)
+        write(os.path.join(self.tmp, "other", "tests", "run-all.sh"), "echo another worktree's run-all.sh\n")
+        os.symlink("tests/sub", os.path.join(self.wt, "lnk"))  # an in-tree folder link
+        os.symlink("../other/tests/run-all.sh", os.path.join(self.wt, "ra1"))  # another worktree's run-all.sh
+        os.symlink("/proc/self/cwd/tests/run-all.sh", os.path.join(self.wt, "ra2"))  # the cwd's run-all.sh there
+        os.symlink("..", os.path.join(self.wt, "lnkw"))  # the folder above the tree
+        os.symlink("/bin/sh", os.path.join(self.wt, "shx"))  # a program outside the tree
+        sh(self.wt, "git", "add", "-A")
+        sh(self.wt, "git", "commit", "-q", "-m", "links")
+
+    def test_q1a_paths_through_symlinks_are_judged_by_realpath(self):
+        # AC1.1. On Linux, `sh ra2` from the tree's top resolves to the top's run-all.sh here (refused before t-117
+        # too); on a Mac /proc is not there, so its realpath leaves the tree.
+        cases = [
+            ([], ["sh", "ra2"], "pa-run: not run"),
+            ([], ["sh", "ra1"], "leaves the tree"),
+            ([], ["sh", "lnk/../run-all.sh"], "use pa-full-suite"),
+            ([], ["sh", "lnk/../pa_session_check.sh", "x"], "pa_session_check.sh"),
+            ([], ["sh", "lnkw/tests/run-all.sh"], "leaves the tree"),
+            (["--cwd", "lnkw"], ["sh", "tests/run-all.sh"], "pa-run: not run"),
+            ([], ["./shx", "-c", "x"], "leaves the tree"),
+            ([], ["python3", "x.py", "lnk/../pa_session_check.sh"], "pa_session_check.sh"),  # any word naming it
+        ]
+        for opts, argv, why in cases:
+            with self.subTest(argv=argv, opts=opts):
+                code, out = self.pa_run(*(opts + ["--"] + argv))
+                self.assertEqual(code, 125, out)
+                self.assertIn("pa-run: not run", out)
+                self.assertIn(why, out)
+        self.assertEqual(self.calls(), [])
+
+    def test_q1b_in_tree_paths_and_links_that_stay_inside_still_run(self):
+        # AC1.2
+        pa_run = pa_hooks.load_tool("pa_run")
+        for argv in (["sh", "wrap.sh"], ["sh", "tests/sub/f"], ["sh", "tests/run-all.sh", "--affected"],
+                     ["sh", "lnk/f"], ["lnk/f"], ["./wrap.sh"]):
+            with self.subTest(argv=argv):
+                self.assertIsNone(pa_run.check_argv(argv, self.wt, "", None, [], pa_hooks), argv)
+
+    def test_q1c_a_hard_link_to_run_all_is_run_all(self):
+        # AC1.3 (pins the samefile compare; VERIFY J1r3 Nit-7, M4)
+        os.link(os.path.join(self.wt, "tests", "run-all.sh"), os.path.join(self.wt, "hard.sh"))
+        why = pa_hooks.load_tool("pa_run").check_argv(["sh", "hard.sh"], self.wt, "", None, [], pa_hooks)
+        self.assertIsNotNone(why)
+        self.assertIn("use pa-full-suite", why)
+
+    def test_q1d_a_symlink_in_the_commits_tree_is_refused(self):
+        # AC1.4: in C, x -> tests/run-all.sh; the worktree's x is a plain file (what runs is C's)
+        os.symlink("tests/run-all.sh", os.path.join(self.wt, "x"))
+        sh(self.wt, "git", "add", "-A")
+        sh(self.wt, "git", "commit", "-q", "-m", "x is a link")
+        base = sh(self.wt, "git", "rev-parse", "HEAD")
+        os.remove(os.path.join(self.wt, "x"))
+        write(os.path.join(self.wt, "x"), "echo plain\n")
+        code, out = self.pa_run("--commit", base, "--", "sh", "x")
+        self.assertEqual(code, 125, out)
+        self.assertIn("pa-run: not run", out)
+        self.assertIn("symlink", out)
+        self.assertEqual(self.remote_runs(), [])
+
+
+class Q2Trust(unittest.TestCase):
+    """R2 (RL-1; Q1 answered: document, no refusal): README and pa_run.py's docstring say pa-run trusts the
+    worktree's code as the suite does."""
+    read = R13Docs.read
+
+    def test_q2a_readme_and_docstring_say_the_tree_is_trusted(self):
+        for path in (("README.md",), ("runtime", "tools", "pa_run.py")):
+            with self.subTest(path=path):
+                text = self.read(*path)
+                self.assertIn("trusts the worktree's code", text)
+                self.assertIn("python3 -c", text)
+                self.assertIn("node -e", text)
+
+    def test_q2b_python3_c_and_node_e_are_not_refused(self):
+        pa_run = pa_hooks.load_tool("pa_run")
+        for argv in (["python3", "-c", "print(1)"], ["node", "-e", "1"]):
+            self.assertIsNone(pa_run.check_argv(argv, REPO, "", None, []), argv)
+
+
+class Q3RefusedRecords(Run):
+    """R3 (RL-2, VERIFY Nit-J2-1): a pa-run that passed the argv check and then did not run writes its records:
+    one build.log line `-> exit 125` with the reason, one test-runs.jsonl line exit 125 with the note."""
+
+    def assert_recorded(self, code, out, reason):
+        self.assertEqual(code, 125, out)
+        self.assertIn(reason, out)
+        log = [l for l in (self.build_log() or "").splitlines() if " pa-run " in l]
+        self.assertEqual(len(log), 1, self.build_log())
+        self.assertIn("-> exit 125", log[0])
+        self.assertIn(reason, log[0])
+        rows = self.run_rows()
+        self.assertEqual(len(rows), 1, rows)
+        self.assertEqual(rows[0]["exit"], 125, rows)
+        self.assertIn(reason, rows[0].get("note") or "", rows)
+        self.assertEqual(self.remote_runs(), [])
+
+    def test_q3a_a_changed_env_file_is_recorded(self):
+        # AC3.1
+        write(os.path.join(self.wt, "conf", ".env"), "X=1\n")
+        code, out = self.pa_run("--", "sh", "probe.sh")
+        self.assert_recorded(code, out, "conf/.env")
+
+    def test_q3b_a_commit_that_is_not_an_ancestor_is_recorded(self):
+        sh(self.wt, "git", "checkout", "-q", "-b", "side")
+        write(os.path.join(self.wt, "side.txt"), "s\n")
+        sh(self.wt, "git", "add", "-A")
+        sh(self.wt, "git", "commit", "-q", "-m", "side")
+        side = sh(self.wt, "git", "rev-parse", "HEAD")
+        sh(self.wt, "git", "checkout", "-q", "main")
+        code, out = self.pa_run("--commit", side, "--", "sh", "probe.sh")
+        self.assert_recorded(code, out, "ancestor")
+
+    def test_q3c_a_refused_argv_stays_unrecorded(self):
+        # J1-D10, unchanged
+        code, out = self.pa_run("--", "hc", "ls")
+        self.assertEqual(code, 125, out)
+        self.assertEqual(self.run_rows(), [])
+        self.assertNotIn(" pa-run ", self.build_log() or "")
+
+
+GIT_STALL = r"""#!/bin/sh
+# git, except that the first `add` touches $GIT_STALL_MARK and sleeps (in place of git) until it is killed
+if [ ! -e "$GIT_STALL_MARK" ]; then
+  for a in "$@"; do
+    if [ "$a" = add ]; then : > "$GIT_STALL_MARK"; exec sleep 60; fi
+  done
+fi
+exec "$GIT_STALL_REAL" "$@"
+"""
+
+
+class Q4TermInTheTree(Run):
+    """R4 (RL-3, Nit-J2-4): TERM while tree_to_run runs (its git add here) ends 143, records `interrupted`, prints
+    no traceback, and leaves no scratch folder."""
+
+    def test_q4a_term_during_git_add_is_143_and_recorded(self):
+        folder = os.path.join(self.tmp, "stallbin")
+        write(os.path.join(folder, "git"), GIT_STALL)
+        os.chmod(os.path.join(folder, "git"), 0o755)
+        mark = os.path.join(self.tmp, "stalled")
+        temp = os.path.join(self.tmp, "runtmp")
+        os.makedirs(temp)
+        self.dirty()
+        env = dict(os.environ, PATH=folder + os.pathsep + os.environ["PATH"], GIT_STALL_MARK=mark,
+                   GIT_STALL_REAL=shutil.which("git"), TMPDIR=temp)
+        log = os.path.join(self.tmp, "bg.out")
+        with open(log, "w") as f:
+            p = subprocess.Popen([sys.executable, PA_RUN, "--", "sh", "probe.sh"], cwd=self.wt, env=env,
+                                 stdin=subprocess.DEVNULL, stdout=f, stderr=subprocess.STDOUT)
+        self.addCleanup(lambda: (p.poll() is None and p.kill(), p.wait()))
+        self.assertTrue(self.until(lambda: os.path.exists(mark)), pa.read_text(log))
+        p.send_signal(signal.SIGTERM)
+        self.assertEqual(p.wait(timeout=60), 143, pa.read_text(log))
+        out = pa.read_text(log)
+        self.assertNotIn("Traceback", out)
+        rows = self.run_rows()
+        self.assertEqual(len(rows), 1, rows)
+        self.assertEqual(rows[0]["exit"], 143, rows)
+        self.assertIn("interrupted", rows[0].get("note") or "", rows)
+        self.assertEqual([n for n in os.listdir(temp) if n.startswith("pa-run-tree-")], [])
+        self.assertEqual(self.remote_runs(), [])
+
+
+class Q5ClosedStdout(Run):
+    """R5 (RL-4): `pa-run ... | head -1`: the reader goes after the first line; the run goes on to its end."""
+
+    def closed_after_first_line(self, *args):
+        go = os.path.join(self.tmp, "go")
+        err = os.path.join(self.tmp, "err.out")
+        with open(err, "w") as f:
+            p = subprocess.Popen([sys.executable, PA_RUN] + list(args) + ["--", "sh", "probe.sh", "wait=" + go,
+                                                                         "after", "exit=3"],
+                                 cwd=self.wt, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=f)
+        self.addCleanup(lambda: (p.poll() is None and p.kill(), p.wait()))
+        first = p.stdout.readline()
+        p.stdout.close()  # the reader is gone
+        write(go, "")
+        code = p.wait(timeout=60)
+        return code, first.decode(), pa.read_text(err)
+
+    def check(self, code, first, err, place):
+        self.assertTrue(first.startswith("cwd "), first)
+        self.assertEqual(code, 3, err)
+        self.assertNotIn("Traceback", err)
+        self.assertNotIn("BrokenPipeError", err)
+        run = self.run_id(err)
+        self.assertIn("arg [after]", self.run_out(run))  # the whole output, after the reader went
+        log = [l for l in self.build_log().splitlines() if " pa-run " in l]
+        self.assertEqual(len(log), 1, self.build_log())
+        self.assertIn("-> exit 3", log[0])
+        rows = self.run_rows()
+        self.assertEqual([(r["run"], r["exit"], r["place"]) for r in rows], [(run, 3, place)], rows)
+        self.assertEqual(self.progress(run).get("state"), "done")
+        return run
+
+    def test_q5a_a_local_run(self):
+        code, first, err = self.closed_after_first_line("--local")
+        self.check(code, first, err, "local")
+
+    def test_q5b_a_remote_run(self):
+        code, first, err = self.closed_after_first_line()
+        run = self.check(code, first, err, "box-1")
+        self.assertFalse(os.path.exists(self.remote_folder(run)))
+        self.assertEqual([n for n in os.listdir(os.path.join(self.stub, "box-1", "terminals")) if n.endswith(".json")],
+                         [])
+
+
+class Q6CleanFilter(Run):
+    """R6 (RL-5): tree_to_run never runs a repo's clean filter (it could write under .git): a path that needs one
+    is 125, naming the path and the filter; a filter attribute with no driver configured is no filter."""
+
+    def setUp(self):
+        super().setUp()
+        write(os.path.join(self.wt, ".gitattributes"), "*.bin filter=mark\n")
+        write(os.path.join(self.wt, "x.bin"), "x old\n")
+        sh(self.wt, "git", "add", "-A")
+        sh(self.wt, "git", "commit", "-q", "-m", "a filtered file")  # before the filter is configured
+        self.marker = os.path.join(self.wt, ".git", "filter-ran")
+
+    def configure_filter(self):
+        import shlex
+        sh(self.wt, "git", "config", "filter.mark.clean", "touch {}; cat".format(shlex.quote(self.marker)))
+
+    def test_q6a_a_changed_filtered_file_is_refused_and_nothing_written_under_git(self):
+        # AC6.1
+        self.configure_filter()
+        write(os.path.join(self.wt, "x.bin"), "x new\n")
+        before, scratch = git_state(os.path.join(self.wt, ".git")), scratch_trees()
+        code, out = self.pa_run("--", "sh", "probe.sh")
+        self.assertEqual(code, 125, out)
+        self.assertIn("x.bin", out)
+        self.assertIn("mark", out)
+        self.assertIn("clean filter", out)
+        self.assertFalse(os.path.exists(self.marker), "the clean filter ran")
+        self.assertEqual(git_state(os.path.join(self.wt, ".git")), before)
+        self.assertEqual(scratch_trees(), scratch)
+        self.assertEqual(self.remote_runs(), [])
+
+    def test_q6b_an_attribute_with_no_driver_is_no_filter(self):
+        # AC6.2
+        write(os.path.join(self.wt, "x.bin"), "x new\n")
+        code, out = self.pa_run("--", "sh", "probe.sh", "cat=x.bin")
+        self.assertEqual(code, 0, out)
+        self.assertIn("file x.bin: x new", out)
+
+    def test_q6c_an_overlay_through_the_filter_is_refused(self):
+        # AC6.3
+        self.configure_filter()
+        write(os.path.join(self.wt, "x.bin"), "x new\n")
+        code, out = self.pa_run("--commit", "HEAD", "--overlay", "x.bin", "--", "sh", "probe.sh")
+        self.assertEqual(code, 125, out)
+        self.assertIn("x.bin", out)
+        self.assertIn("mark", out)
+        self.assertFalse(os.path.exists(self.marker), "the clean filter ran")
+        self.assertEqual(self.remote_runs(), [])
+
+
+class Q9Exit124(unittest.TestCase):
+    """R9 (Nit-1): pa_run.py's Exit line, run-all.sh's exit comment and README's pa-run paragraph list every 124."""
+    read = R13Docs.read
+    WHY = (("no slot came free", r"no slot came free"), ("the deadline", r"deadline"), ("the machine lost", r"\blost\b"),
+           ("the machine's REMOTE_TIMEOUT", r"REMOTE_TIMEOUT|timed out"),
+           ("the run limit", r"PA_SUITE_RUN_LIMIT|run limit"))
+
+    def check(self, text, where):
+        for what, pattern in self.WHY:
+            with self.subTest(where=where, what=what):
+                self.assertRegex(text, pattern, "{} does not name {} as a 124: {!r}".format(where, what, text))
+
+    def test_q9a_the_exit_line_the_comment_and_readme(self):
+        doc = self.read("runtime", "tools", "pa_run.py")
+        self.check(doc[doc.index("Exit:"):doc.index('"""', doc.index("Exit:"))], "pa_run.py's Exit line")
+        sh_text = self.read("tests", "run-all.sh")
+        self.check(sh_text[sh_text.index("# Exit:"):sh_text.index("# Node:")], "run-all.sh's exit comment")
+        readme = self.read("README.md")
+        start = readme.index("124:", readme.index("pa-run -- <command>"))
+        self.check(readme[start:readme.index("Each run is one line", start)], "README's pa-run paragraph")
+
+
+class Q10Cwd(Run):
+    """R10 (Nit-2): --cwd that is not a folder in the tree to run is 125 before anything runs."""
+
+    def test_q10a_a_folder_of_ignored_files_on_a_machine(self):
+        write(os.path.join(self.wt, ".gitignore"), ".claude/\nbuild/\n")
+        sh(self.wt, "git", "commit", "-q", "-am", "ignore build")
+        write(os.path.join(self.wt, "build", "out.txt"), "made\n")
+        code, out = self.pa_run("--cwd", "build", "--", "sh", "../probe.sh")
+        self.assertEqual(code, 125, out)
+        self.assertIn("--cwd build is not a folder in the tree to run", out)
+        self.assertEqual(self.remote_runs(), [])
+        self.assertFalse([c for c in self.calls() if c[:2] == ["file", "write"]], self.calls())
+
+    def test_q10b_a_missing_folder_locally(self):
+        code, out = self.pa_run("--local", "--cwd", "nope", "--", "sh", "../probe.sh")
+        self.assertEqual(code, 125, out)
+        self.assertIn("--cwd nope is not a folder in the tree to run", out)
+
+
+class Q11TooLarge(Run):
+    """R11 (Nit-3): a patch too large to send goes the way of a setup failure: this Mac with "mac", saying why;
+    125 with "none" (r6d)."""
+
+    def test_q11a_too_large_with_mac_runs_here_and_says_why(self):
+        with open(os.path.join(self.wt, "big.bin"), "wb") as f:
+            f.write(os.urandom(5 * 1024 * 1024))
+        code, out = self.pa_run("--", "sh", "probe.sh")
+        self.assertEqual(code, 0, out)
+        self.assertIn("this Mac", out)
+        self.assertIn("too large", out)
+        self.assertIn("remote unset", out)
+        row = self.run_rows()[-1]
+        self.assertEqual(row["place"], "local")
+        self.assertIn("too large", row.get("note") or "")
+        self.assertEqual(self.remote_runs(), [])
+
+
+class Q12LiteralOverlay(Run):
+    """R12 (Nit-5): --overlay words are literal paths (git add --literal-pathspecs)."""
+
+    def test_q12a_a_glob_that_names_no_file_is_refused(self):
+        write(os.path.join(self.wt, "tests", "t1.py"), "old\n")
+        sh(self.wt, "git", "add", "-A")
+        sh(self.wt, "git", "commit", "-q", "-m", "t1")
+        write(os.path.join(self.wt, "tests", "t1.py"), "new\n")  # a glob would take it
+        code, out = self.pa_run("--commit", "HEAD", "--overlay", "tests/*.py", "--", "sh", "probe.sh")
+        self.assertEqual(code, 125, out)
+        self.assertIn("tests/*.py", out)
+        self.assertEqual(self.remote_runs(), [])
+
+    def test_q12b_a_name_with_a_star_takes_only_that_file(self):
+        for name in ("a*.py", "ab.py"):
+            write(os.path.join(self.wt, name), "old\n")
+        sh(self.wt, "git", "add", "-A")
+        sh(self.wt, "git", "commit", "-q", "-m", "two")
+        for name in ("a*.py", "ab.py"):
+            write(os.path.join(self.wt, name), "new\n")
+        code, out = self.pa_run("--commit", "HEAD", "--overlay", "a*.py", "--", "sh", "probe.sh", "cat=a*.py",
+                                "cat=ab.py")
+        self.assertEqual(code, 0, out)
+        self.assertIn("file a*.py: new", out)
+        self.assertIn("file ab.py: old", out)
+
+
+class Q13NoUsableMachine(Run):
+    """R13 (Nit-6): suiteMachines set with no usable entry: 125 with "none", naming the bad entries; this Mac with
+    "mac", saying why."""
+
+    def test_q13a_none_is_125(self):
+        self.configure([{"machine": "bad name!"}])
+        set_fallback("none")
+        code, out = self.pa_run("--", "sh", "probe.sh")
+        self.assertEqual(code, 125, out)
+        self.assertIn("suiteMachines in ", out)
+        self.assertIn("bad name!", out)
+        self.assertIn("no usable machine in suiteMachines", out)
+        self.assertNotIn("cwd ", out)
+        self.assertEqual(self.calls(), [])
+
+    def test_q13b_mac_runs_here(self):
+        self.configure([{"machine": "bad name!"}])
+        code, out = self.pa_run("--", "sh", "probe.sh")
+        self.assertEqual(code, 0, out)
+        self.assertIn("remote unset", out)
+        self.assertIn("bad name!", out)
 
 
 if __name__ == "__main__":
