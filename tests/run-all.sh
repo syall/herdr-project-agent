@@ -8,7 +8,9 @@
 #                                core and scratch folder, each step in exactly one part (t-112)
 #   tests/run-all.sh --affected  the fast set only (no integration check). With PA_CHANGED_FILES
 #                                (paths separated by spaces or newlines), parts whose files did not
-#                                change are skipped; without it, the whole fast set runs.
+#                                change are skipped; without it, the whole fast set runs. A mods/* or
+#                                tests/panel/* change also runs tests/test_panel_shards.py and
+#                                tests/test_mod_imports.py (not every unit module) (t-065)
 #   tests/run-all.sh --module test_x  one unit test module (tests/test_x.py) as one part: the same slot, limit,
 #                                progress file and summary as in a full run (pa-full-suite --module runs it)
 #   tests/run-all.sh --except-integration  every part of the full run but the integration check (same order, names,
@@ -82,11 +84,15 @@ PY=$(command -v python3)
 
 # Which parts the changed files touch (only with --affected and PA_CHANGED_FILES).
 want_py=1 want_keeper=1 want_panel=1 want_store=1
+py_some=  # t-065: with want_py=0, these unit modules only (each read files that are not Python)
 if [ "$affected" = 1 ] && [ -n "${PA_CHANGED_FILES:-}" ]; then
   want_py=0 want_keeper=0 want_panel=0 want_store=0
   for f in $PA_CHANGED_FILES; do
     case "$f" in
       *runtime/tools/*|*tests/*.py|*tests/run-all.sh) want_py=1 ;;  # the test helpers too (queue_fixtures.py ...)
+    esac
+    case "$f" in  # t-060 RL-3, t-069: they read run.mjs, the gpui stand-ins and the mod's imports
+      *mods/*|*tests/panel/*) py_some="test_panel_shards test_mod_imports" ;;
     esac
     case "$f" in
       *mods/project-agent/*|*tests/keeper/*|*tests/run-all.sh) want_keeper=1 ;;
@@ -98,7 +104,7 @@ if [ "$affected" = 1 ] && [ -n "${PA_CHANGED_FILES:-}" ]; then
       *mods/project-agent/*|*tests/store/*|*tests/panel/stubs.mjs|*tests/keeper/stubs.mjs|*tests/run-all.sh) want_store=1 ;;
     esac
   done
-  [ "$want_py" = 0 ] && [ "$want_keeper" = 0 ] && [ "$want_panel" = 0 ] && [ "$want_store" = 0 ] && { echo "no tested files changed: nothing to run"; exit 0; }
+  [ "$want_py" = 0 ] && [ -z "$py_some" ] && [ "$want_keeper" = 0 ] && [ "$want_panel" = 0 ] && [ "$want_store" = 0 ] && { echo "no tested files changed: nothing to run"; exit 0; }
 fi
 
 parse37() { "$PY" -c "import ast,sys
@@ -148,6 +154,8 @@ if [ "$want_py" = 1 ]; then
     k=1
     while [ "$k" -le "$n" ]; do add shard "unit tests: $m $k/$n" "$m@$k"; k=$((k + 1)); done
   done
+elif [ -n "$py_some" ] && [ -z "$module" ] && [ "$place" != only-integration ]; then
+  for m in $py_some; do [ -f "tests/$m.py" ] && add units "unit tests: $m" "$m"; done
 fi
 [ "$want_keeper" = 1 ] && add keeper "keeper harness"
 if [ "$want_panel" = 1 ]; then
