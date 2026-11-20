@@ -2002,13 +2002,26 @@ def standing_stops(directory, rule):
             if not name.endswith(".json"):
                 continue
             card = pa.read_json_safe(os.path.join(folder, name))
-            if not isinstance(card, dict) or card.get("status") != "answered" or not after(card.get("answered")):
+            if not isinstance(card, dict):
+                continue
+            if worktree_note(card) and after(card.get("previousAnswered") or card.get("answered")):
+                return ("card {} carries a note the person wrote ({}), withdrawn or asked again before it was acted on".format(
+                    name[:-5], card.get("previousAnswered") or card.get("answered")), True)
+            if card.get("status") != "answered" or not after(card.get("answered")):
                 continue
             if pa.is_other(card):
                 return ("card {} was answered Other at {}".format(name[:-5], card.get("answered")), True)
             if str(card.get("note") or "").strip() and str(card.get("answeredBy") or "").startswith("person, in the panel"):
                 return ("card {} has a note written in the panel ({})".format(name[:-5], card.get("answered")), True)
     return None
+
+
+def worktree_note(card):
+    """A worktree card (single or batch) withdrawn, or asked again and not answered yet, that carries the person's note
+    from its last answer (t-168 round 3): pa-worktree remove withdraws a card for its note without reading it, and the
+    note may say to keep any of them, so it stops the rule as the answered note did (R13), whoever answered (fail closed)."""
+    tree = card.get("kind") == "worktrees" or bool(card.get("worktree"))
+    return tree and card.get("status") in ("withdrawn", "open") and bool(str(card.get("previousNote") or "").strip())
 
 
 def write_stop(directory, rule_id, why, task=None):
