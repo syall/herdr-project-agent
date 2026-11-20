@@ -20,7 +20,7 @@ import { loadSpace, loadLedger, loadQueue, loadWaiting, loadStartOrder, writeSta
 import { RulesPane, arm, armHolds, fieldState, noticeText as rulesNotice, mergeNotices as mergeRuleNotices } from "./rules.js"; // arm, armHolds: the two-click Delete (ARM_WAIT, 10 s)
 import { queueRows, queueLabel, renderQueue, at as atZone } from "./queue.js"; // t-055: the Queue view (read only)
 import { placesRows, renderPlaces, pinsAfter, orderText, NOTICE as ORDER_NOTICE } from "./places.js"; // t-083 J2: places and the start order (Tasks)
-import { readTaskOrder, effectiveTasks, hasTaskOrder, moveTask, startNextOrder, pruneOrder, freshOrder, taskOrderText, taskSections, foldLine, chipText, afterLine, orderLine as taskOrderLine, doneLine, NOTICE as TASK_ORDER_NOTICE } from "./tasks.js"; // t-097 J2: the person's task order (Tasks)
+import { readTaskOrder, effectiveTasks, hasTaskOrder, moveTask, startNextOrder, pruneOrder, freshOrder, taskOrderText, taskSections, foldLine, chipText, afterLine, orderLine as taskOrderLine, doneLine, workerItem, NOTICE as TASK_ORDER_NOTICE } from "./tasks.js"; // t-097 J2: the person's task order (Tasks)
 import { SetupPane } from "./setup.js";
 import { Keeper, idleShell } from "./keeper.js";
 import { WorkerPane } from "./worker.js";
@@ -31,6 +31,7 @@ import { tick, cadence, holdReason, setSchedule, requestPass, PRESETS, MIN_MINUT
 import { Awake } from "./awake.js";
 
 const ACTIVE = ["needs-decision", "review", "in-progress", "investigating", "queued"];
+const TASK_FOCUS = ["head", "top", "up", "down", "bottom", "next"]; // t-142: a task head's focus handles (wantTaskFocus)
 const OPEN_WAIT = 30000; // an Open request with nothing started by then: say why, offer the button again
 const OPEN_SLOW = 180000; // its new tab is recorded but its launcher has not started by then: say so
 const paRecords = (spaceId) => Object.values(shared("project-agent.tabs") ?? {}).filter((r) => r?.space === spaceId);
@@ -148,6 +149,7 @@ export default class ProjectAgent extends View {
     this.space = null;
     this.cardsFor = null; // the space this.cards belong to
     this.dataAt = 0; // when the data shown was loaded
+    this.hovered = null; this.taskFocus = new Map(); this.taskFocusAsked = false; // t-142: the task under the pointer; task id -> its focus handles
     this.cache = new Map(); // space id -> { data, cards, rules, at }: its last finished load (most recently shown last)
     this.loads = {}; // space id -> { token, at }: the load in flight (at: its last progress)
     this.committed = {}; // space id -> the token of its last load that committed; an older one commits nothing
@@ -1001,9 +1003,9 @@ export default class ProjectAgent extends View {
   // t-083 J2: the Places section's rows for the space as loaded: limits from the load's rules, holders from the ledger
   // with their terminals looked up as the task rows do (the machine prefix on a remote space).
   placesOf(space, data) {
-    const live = (address) => { const a = space.machine ? `${space.machine}/${address}` : address; return terminals().some((x) => x.address === a && x.state === "live"); };
+    const term = (address) => { const a = space.machine ? `${space.machine}/${address}` : address; return terminals().find((x) => x.address === a && x.state === "live"); };
     const o = this.taskOrderOf(data);
-    return placesRows({ waiting: data?.waiting, startOrder: data?.startOrder, rules: this.rules.data, ledger: data?.ledger, isLive: live, rank: o.has ? o.ranking.map((r) => r.id) : null, rankKnown: o.known,
+    return placesRows({ waiting: data?.waiting, startOrder: data?.startOrder, rules: this.rules.data, ledger: data?.ledger, isLive: (a) => Boolean(term(a)), statusOf: (a) => term(a)?.status ?? null, rank: o.has ? o.ranking.map((r) => r.id) : null, rankKnown: o.known,
       machines: this.machines[space.id] ?? null, here: space.machine ? `${space.machine} (the space's machine)` : "this Mac" }); // t-119: the suite machines' slots
   }
 
@@ -1295,6 +1297,19 @@ export default class ProjectAgent extends View {
     ];
   }
 
+  // t-142: a task's moves and Start next show while the pointer is over it or while its head or one of those buttons
+  // has the keyboard. Their focus handles (TASK_FOCUS, per task) are made in a task, never in render; one ask at a time.
+  wantTaskFocus(ids, cx) {
+    const missing = ids.filter((id) => !this.taskFocus.has(id));
+    if (!missing.length || this.taskFocusAsked) return;
+    this.taskFocusAsked = true;
+    cx.spawn(async (cx) => {
+      this.taskFocusAsked = false;
+      for (const id of missing) if (!this.taskFocus.has(id)) this.taskFocus.set(id, Object.fromEntries(TASK_FOCUS.map((k) => [k, cx.focus_handle()])));
+      cx.notify();
+    });
+  }
+
   // row (t-097 J2): the task's place in its section (tasks.js taskSections: n, source, quote, the moves that apply).
   task(t, task, space, badges = [], row = null) {
     const open = this.open.has(task.id), armed = open && this.armedTask(space.id) === task.id, doneArmed = open && this.armedTask(space.id, "done") === task.id;
@@ -1302,17 +1317,21 @@ export default class ProjectAgent extends View {
     const waitsOn = task.state === "needs-decision" ? this.cards.find((c) => c.card?.status === "open" && c.card.task === task.id) : null;
     const unread = task.state === "needs-decision" && this.cardsFor !== space.id; // t-120 (t-097 REVIEW J2 RL-3): its cards not read yet
     const busy = Boolean(this.taskOrderBusy[space.id]), orderKnown = this.taskOrderOf(this.data).known;
-    const mini = (id, label, on, dim = false) => div().id(id).flex_none().px(5).h(20).flex().items_center().rounded(5).border(1).border_color(t.border).text_size(11)
-      .text_color(dim ? t.dim : t.foreground).when(!dim, (b) => b.cursor_pointer().hover((x) => x.bg(t.hover)))
+    const focus = this.taskFocus.get(task.id) ?? null; // t-142
+    const near = this.hovered === task.id || Boolean(focus && Object.values(focus).some((h) => h.is_focused()));
+    const mini = (id, label, on, dim = false, fh = null) => div().id(id).flex_none().px(5).h(20).flex().items_center().rounded(5).border(1).border_color(t.border).text_size(11)
+      .text_color(dim ? t.dim : t.foreground).when(!dim, (b) => b.cursor_pointer().hover((x) => x.bg(t.hover))).when(Boolean(fh), (b) => b.track_focus(fh).tab_index(0))
       .on_click((_e, cx) => { cx.stop_propagation(); if (!dim) on(cx); }).child(label);
-    const moves = row && orderKnown ? [["top", "⤒"], ["up", "↑"], ["down", "↓"], ["bottom", "⤓"]].filter(([m]) => row[m]) : [];
+    const moves = row && orderKnown && near ? [["top", "⤒"], ["up", "↑"], ["down", "↓"], ["bottom", "⤓"]].filter(([m]) => row[m]) : [];
     const chip = row ? chipText(row.source) : null;
     // A press on the armed Delete or its Cancel stops here: a press anywhere else in the panel disarms (render's root).
     const keep = (el) => el.on_mouse_down("left", (_e, cx) => cx.stop_propagation());
     const crew = (task.workers ?? []).filter((w) => !(w?.finished && w?.closed));
     const tone = { "needs-decision": t.blocked, review: t.done, "in-progress": t.working, investigating: t.working, queued: t.muted, parked: t.dim, done: t.dim }[task.state] ?? t.muted;
     return v_flex().id(`task-${task.id}`).flex_none().rounded(7).border(1).border_color(t.border).bg(t.surface)
+      .on_hover((on, cx) => { if (on) this.hovered = task.id; else if (this.hovered === task.id) this.hovered = null; cx.notify(); }) // t-142
       .child(h_flex().id(`task-head-${task.id}`).h(32).px(9).gap(7).items_center().cursor_pointer().hover((s) => s.bg(t.hover))
+        .when(Boolean(focus), (el) => el.track_focus(focus.head).tab_index(0))
         .on_click((_e, cx) => { if (open) { this.open.delete(task.id); if (this.armed?.id === task.id) this.armed = null; } else this.open.add(task.id); cx.notify(); })
         .child(div().flex_none().text_size(11).text_color(t.dim).child(open ? "▾" : "▸"))
         .when(Boolean(row?.n), (el) => el.child(div().flex_none().text_size(11.5).text_color(t.muted).child(String(row?.n)))) // R15: its place in the section
@@ -1328,8 +1347,8 @@ export default class ProjectAgent extends View {
           .on_click((_e, cx) => { cx.stop_propagation(); this.placesFolded = false; this.placeMark = { space: space.id, key: b.key, until: Date.now() + 3000 }; cx.notify(); })
           .child(b.text)))
         // t-097 J2: the moves within the section (R7) and the category moves (R18, R19); dimmed while an order write is in flight.
-        .children(moves.map(([m, label]) => mini(`tmove-${m}-${task.id}`, label, (cx) => this.moveTaskOrder(space, task.id, m, task.state, cx), busy)))
-        .when(task.state === "queued" && orderKnown, (el) => el.child(mini(`next-${task.id}`, "Start next", (cx) => this.startNext(space, task, cx), busy)))
+        .children(moves.map(([m, label]) => mini(`tmove-${m}-${task.id}`, label, (cx) => this.moveTaskOrder(space, task.id, m, task.state, cx), busy, focus?.[m])))
+        .when(task.state === "queued" && orderKnown && near, (el) => el.child(mini(`next-${task.id}`, "Start next", (cx) => this.startNext(space, task, cx), busy, focus?.next)))
         .when(task.state === "queued" && Boolean(task.paused), (el) => el.child(mini(`unpause-${task.id}`, "Unpause", (cx) => this.changeTask(space, task, "unpause", cx))))
         .when(task.state === "in-progress" || task.state === "investigating", (el) => el.child(mini(`pause-${task.id}`, "Pause", (cx) => this.changeTask(space, task, "pause", cx))))
         .child(this.chip(t, String(task.state ?? "?"), tone)))
@@ -1346,17 +1365,15 @@ export default class ProjectAgent extends View {
           const term = terminals().find((x) => x.address === address && x.state === "live");
           // Read-only marks the tools write: "kept" (pa-worker keep); "(closed)" only for a finished entry with no closed stamp.
           const label = `${w.role ?? "worker"} ${w.address ?? ""}`.trim() + (w.keep ? " · kept" : "");
-          return h_flex().id(`worker-${task.id}-${i}`).flex_none().px(8).h(24).gap(6).items_center().rounded(6).border(1).border_color(t.border).text_size(11.5)
-            .text_color(term ? t.foreground : t.dim)
-            .when(Boolean(term), (b) => b.cursor_pointer().hover((s) => s.bg(t.hover)).on_click(() => this.showAgent(address)))
-            .child(div().size(6).rounded(3).bg(term ? t[term.status] ?? t.idle : t.dim))
-            .child(term ? `${label} ↗` : w.finished ? `${label} (closed)` : `${label} (ended)`)
+          // t-142: the shared worker item (tasks.js workerItem), also drawn for the worker lines in Places.
+          return workerItem(t, { id: `worker-${task.id}-${i}`, live: Boolean(term), status: term?.status ?? null, onClick: term ? () => this.showAgent(address) : null,
+            text: term ? `${label} ↗` : w.finished ? `${label} (closed)` : `${label} (ended)`,
             // The × opens the delete dialog: the person's way to close any worker (the agent closes finished ones itself).
             // It stops the press, so it drops an armed Delete itself (the root never sees this press).
-            .child(div().id(`worker-x-${task.id}-${i}`).flex_none().px(3).text_color(t.dim).cursor_pointer().hover((s) => s.text_color(t.blocked))
+            trailing: div().id(`worker-x-${task.id}-${i}`).flex_none().px(3).text_color(t.dim).cursor_pointer().hover((s) => s.text_color(t.blocked))
               .on_mouse_down("left", (_e, cx) => { cx.stop_propagation(); if (this.armed || this.rules.armed) { this.disarm(); cx.notify(); } })
               .on_click((_e, cx) => { cx.stop_propagation(); openOverlay({ mod: "project-agent", kind: "dialog", width: 540, height: 400, props: { deleteWorker: { space: space.id, machine: space.machine ?? null, address, name: w.name ?? label } } }); })
-              .child("×"));
+              .child("×") });
         }))))
         // Its open decisions: one button each, straight to the card.
         .when(this.cards.some((c) => c.card?.status === "open" && c.card.task === task.id), (e) => e.child(h_flex().gap(6).flex_wrap()
@@ -1678,6 +1695,7 @@ export default class ProjectAgent extends View {
           .when(Boolean(tasksOrder.read && tasksOrder.read.error !== null && tasksOrder.read.error !== "missing"), (x) => x.child(this.button(t, "task-order-reset", "Reset order", (_e, cx) => this.moveTaskOrder(space, null, "reset", null, cx))))))
         .when(Boolean(this.taskOrderError[space.id]), (e) => e.child(div().px(4).text_size(11.5).text_color(t.blocked).child(this.taskOrderError[space.id] ?? "")))
         .children(sections.flatMap((s) => {
+          this.wantTaskFocus(s.items.flatMap((i) => (i.kind === "fold" ? i.rows : [i])).map((i) => i.task.id), cx); // t-142
           const folded = this.folded.has(s.state), count = s.items.reduce((n, i) => n + (i.kind === "fold" ? i.count : 1), 0);
           const row = (i) => this.task(t, i.task, space, places.badges[i.task.id] ?? [], i);
           return [

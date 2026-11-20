@@ -4,6 +4,9 @@
 // runtime/tools/pa_places.py's read_task_order, effective_tasks and move_task: both are checked against
 // tests/samples/task-order-cases.json, so the panel and pa-places tasks give the same ranking.
 
+import { div } from "gpui-kit";
+import { h_flex } from "gpui-base";
+
 export const RANKED = ["in-progress", "investigating", "review", "queued"]; // drawn with numbers and moves (R5)
 export const HIDDEN = ["needs-decision", "parked"]; // a place in the ranking, no number, no moves
 export const NOTICE = "task order changed";
@@ -231,4 +234,17 @@ export function doneLine({ changeRequest = null, worktrees = 0, queueEntries = 0
   if (queueEntries > 0) parts.push(`${queueEntries} merge-queue ${queueEntries === 1 ? "entry stays" : "entries stay"}`);
   for (const a of live) parts.push(`${a} keeps running until you close it`);
   return `Done merges nothing: ${parts.length ? parts.join(" · ") : "nothing is left open"}.`;
+}
+
+// A worker item (t-142): the box a task card draws for each of its workers, also drawn for each worker line in
+// Places. live: its terminal is live; status: that terminal's (hc state: working, blocked, idle, done), drawn as the
+// dot's color (unknown: idle; not live: dim). id and onClick only for a link; text: the label as shown; trailing: an
+// element after it (the task card's ×). Returns the element, for the caller's own .when(...) marks.
+export function workerItem(t, { id = null, text, live, status = null, onClick = null, trailing = null }) {
+  const el = h_flex().flex_none().px(8).h(24).gap(6).items_center().rounded(6).border(1).border_color(t.border).text_size(11.5).text_color(live ? t.foreground : t.dim);
+  return (id ? el.id(id) : el)
+    .when(Boolean(id && onClick), (b) => b.cursor_pointer().hover((s) => s.bg(t.hover)).on_click(onClick))
+    .child(div().size(6).rounded(3).bg(live ? t[status] ?? t.idle : t.dim))
+    .child(text)
+    .when(Boolean(trailing), (b) => b.child(trailing));
 }

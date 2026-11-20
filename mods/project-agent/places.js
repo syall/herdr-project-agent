@@ -11,6 +11,7 @@ import { div } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
 import { gaveUp } from "./host.js";
 import { at } from "./queue.js";
+import { workerItem } from "./tasks.js"; // t-142: a worker line is the task card's worker item
 
 export const KINDS = ["working", "no-test", "suite"];
 export const DEFAULTS = { working: 4, "no-test": 0, suite: null }; // suite null: no cap beyond working
@@ -202,51 +203,51 @@ function limitsOf(rules) {
 // The suite machines' slots (t-119 R4-R6), from loadMachines's answers as main.js keeps them: m = { doc, error, at }
 // (doc: the last good answer, error: the last read's, at: when doc was read) or null (not answered yet). isLive(address):
 // the worker's terminal is live; here: the label of the tool's own machine ("this Mac", or the space's machine). Each
-// holder line: { key, id, worker, text }; id and worker only when its worker's terminal is live (a link, R5). shown:
+// holder line: { key, id, worker, live, status, text }; id and worker only when its worker's terminal is live (a link, R5). shown:
 // a configured machine or a slot holder (R6).
 const SLOT_ID = (place, i) => `places-slot-${place}-${i}`;
-function slotLines(place, holders, isLive) {
+function slotLines(place, holders, isLive, statusOf) {
   return (Array.isArray(holders) ? holders : []).filter(obj).map((h, i) => {
     const worker = typeof h.worker === "string" && h.worker ? h.worker : null, live = Boolean(worker && isLive(worker));
     const text = [h.task ?? "?", worker ? `worker ${worker}` : "no worker recorded", `since ${h.start ? at(h.start) : "?"}`, ...(h.what ? [h.what] : [])].join(" · ");
-    return { key: `slot:${place}:${i}`, id: live ? SLOT_ID(place, i) : null, worker: live ? worker : null, text: live ? `${text} ↗` : text };
+    return { key: `slot:${place}:${i}`, id: live ? SLOT_ID(place, i) : null, worker: live ? worker : null, live, status: live ? statusOf(worker) : null, text: live ? `${text} ↗` : text };
   });
 }
 const slotHead = (name, cap, n) => `${name} · ${n} of ${cap ?? "?"} slots held`;
-export function machinesRows(m, { isLive = () => false, here = "this Mac" } = {}) {
+export function machinesRows(m, { isLive = () => false, statusOf = () => null, here = "this Mac" } = {}) {
   const out = { state: "checking", line: null, error: m?.error ?? null, asOf: null, notes: [], places: [], shown: false };
   const doc = m?.doc;
   if (!doc) return { ...out, state: m?.error ? "error" : "checking" };
   out.state = "ok"; out.asOf = m.at ? at(new Date(m.at).toISOString()).slice(6) : null;
   out.notes = (Array.isArray(doc.notes) ? doc.notes : []).map(String);
   for (const x of doc.machines.filter(obj)) {
-    const name = String(x.machine ?? "?"), holders = slotLines(name, x.holders, isLive);
+    const name = String(x.machine ?? "?"), holders = slotLines(name, x.holders, isLive, statusOf);
     const state = x.reachable ? "reachable" : `not reachable${x.reason ? ` (${x.reason})` : ""}`;
     out.places.push({ name, head: `${name} · ${state} · ${holders.length} of ${x.cap ?? "?"} slots held`, over: !x.reachable, holders });
   }
-  const local = slotLines("local", doc.local?.holders, isLive);
+  const local = slotLines("local", doc.local?.holders, isLive, statusOf);
   out.places.push({ name: "local", head: slotHead(here, doc.local?.cap, local.length), over: false, holders: local });
   out.shown = doc.machines.length > 0 || out.places.some((p) => p.holders.length > 0);
   return out;
 }
 
 // What the section draws (pure). waiting, startOrder: the load's results (null or a give-up: not known yet); rules:
-// loadRules's; isLive(address): the worker's terminal is live; rank: the ranked task ids once a task order exists
+// loadRules's; isLive(address): the worker's terminal is live; statusOf(address): that terminal's status (t-142); rank: the ranked task ids once a task order exists
 // (t-097 R9, J1-D10), else null (the added order); machines, here: machinesRows's (t-119). shown: false with no
 // waiting list, no holder and no suite machine or slot holder (D3, t-119 R6).
-export function placesRows({ waiting, startOrder, rules, ledger, isLive, rank = null, rankKnown = true, machines = null, here = "this Mac" }) {
+export function placesRows({ waiting, startOrder, rules, ledger, isLive, statusOf = () => null, rank = null, rankKnown = true, machines = null, here = "this Mac" }) {
   const holders = holdersFrom(ledger, isLive);
   const { limits, sources, notes } = limitsOf(rules);
   const w = limits.working, x = limits["no-test"], cap = limits.suite;
   const [b, n, s] = counts(holders.map((h) => h.place)), used = workingUsed(b, n, w);
   const inWorking = holders.filter((h) => h.place !== "no-test"), noTest = holders.filter((h) => h.place === "no-test");
   const seated = [...inWorking, ...noTest.slice(0, used - b)], extra = noTest.slice(used - b);
-  const line = (h, inSuite) => ({ key: holderKey(h), address: h.address, text: holderLine(h, inSuite) });
+  const line = (h, inSuite) => ({ key: holderKey(h), address: h.address, status: statusOf(h.address), text: holderLine(h, inSuite) });
   const kinds = [{ kind: "working", head: `Working · ${used} of ${w}${sources.working === "default" ? " (default)" : ""}`, over: used > w, holders: seated.map((h) => line(h)) }];
   if (x || extra.length) kinds.push({ kind: "no-test", head: `No-test extra · ${extra.length} of ${x}`, over: extra.length > x, holders: extra.map((h) => line(h)) });
   if (cap !== null) kinds.push({ kind: "suite", head: `Suite step · ${s} of ${cap}  (held within Working)`, over: s > cap, holders: holders.filter((h) => h.place === "suite").map((h) => line(h, true)) });
   const named = [...new Set(KINDS.map((k) => sources[k]).filter((v) => v !== "default"))];
-  const slots = machinesRows(machines, { isLive, here }); // t-119: the suite machines' slots
+  const slots = machinesRows(machines, { isLive, statusOf, here }); // t-119: the suite machines' slots
   const out = { shown: false, state: "loading", kinds, slots, notes, limitsLine: `limits: ${named.length ? named.join(", ") : "default"}`, jobs: [], badges: {}, effective: [], orderKnown: false,
     orderLine: null, reset: false, orderTextRead: null, waitingLine: null, head: `Places · ${used} of ${w} working` };
   const badge = (task, b) => { (out.badges[task] ??= []).push(b); };
@@ -281,7 +282,7 @@ export function placesRows({ waiting, startOrder, rules, ledger, isLive, rank = 
 }
 
 // t-119 R4, R5: the Suite machines block's elements (read only: a holder with a live worker opens it, nothing else).
-function slotsBlock(t, s, o, line, marked) {
+function slotsBlock(t, s, o, line, marked, items) {
   if (!s) return [];
   const head = div().pt(6).text_size(12).font_semibold().text_color(t.foreground);
   if (s.state === "checking") return [head.child("Suite machines: checking…")];
@@ -295,9 +296,8 @@ function slotsBlock(t, s, o, line, marked) {
     ...s.notes.map((x) => line(x, t.blocked)),
     ...s.places.flatMap((p) => [
       div().pl(4).text_size(12).text_color(p.over ? t.blocked : t.foreground).child(p.head),
-      ...(p.holders.length ? p.holders.map((h) => (h.id
-        ? marked(div().id(h.id).pl(12).cursor_pointer().hover((x) => x.bg(t.hover)).on_click(() => o.onWorker?.(h.worker)), h.key).child(line(h.text))
-        : div().pl(12).child(line(h.text)))) : [div().pl(12).child(line("free", t.dim))]),
+      ...(p.holders.length ? [items(p.holders.map((h) => marked(workerItem(t, { id: h.id, text: h.text, live: h.live, status: h.status, onClick: h.id ? () => o.onWorker?.(h.worker) : null }), h.key)))]
+        : [div().pl(12).child(line("free", t.dim))]),
     ]),
   ];
 }
@@ -311,6 +311,8 @@ export function renderPlaces(t, rows, o) {
   const btn = (id, label, on) => div().id(id).flex_none().px(6).h(20).flex().items_center().rounded(5).border(1).border_color(t.border).text_size(11.5)
     .text_color(o.busy ? t.dim : t.foreground).when(!o.busy, (b) => b.cursor_pointer().hover((s) => s.bg(t.hover))).on_click(on).child(label);
   const marked = (el, key) => el.when(o.mark === key, (x) => x.bg(t.selected).rounded(4));
+  // t-142: the worker lines, one worker item each (its own rounding kept when marked)
+  const items = (list) => v_flex().pl(12).gap(4).items_start().children(list), markedItem = (el, key) => el.when(o.mark === key, (x) => x.bg(t.selected));
   const box = v_flex().id("pa-places").flex_none().p(10).gap(4).rounded(7).border(1).border_color(t.border).bg(t.surface)
     .child(h_flex().id("places-head").gap(8).items_center().cursor_pointer().on_click(o.onFold)
       .child(div().flex_none().text_size(11).text_color(t.dim).child(o.folded ? "▸" : "▾"))
@@ -321,10 +323,10 @@ export function renderPlaces(t, rows, o) {
     .children(rows.notes.map((x) => line(x, t.blocked)))
     .children(rows.kinds.flatMap((k) => [
       div().pt(2).text_size(12).text_color(k.over ? t.blocked : t.foreground).child(k.head),
-      ...(k.holders.length ? k.holders.map((h) => marked(div().id(`places-holder-${h.address}`).pl(12).cursor_pointer().hover((s) => s.bg(t.hover)).on_click(() => o.onWorker?.(h.address)), h.key)
-        .child(line(`${h.text} ↗`))) : [div().pl(12).child(line("free", t.dim))]),
+      ...(k.holders.length ? [items(k.holders.map((h) => markedItem(workerItem(t, { id: `places-holder-${h.address}`, text: `${h.text} ↗`, live: true, status: h.status, onClick: () => o.onWorker?.(h.address) }), h.key)))]
+        : [div().pl(12).child(line("free", t.dim))]),
     ]))
-    .children(slotsBlock(t, rows.slots, o, line, marked))
+    .children(slotsBlock(t, rows.slots, o, line, markedItem, items))
     .when(Boolean(o.error), (el) => el.child(line(o.error ?? "", t.blocked)))
     .when(rows.state === "loading", (el) => el.child(line("Loading waiting list…", t.dim)))
     .when(rows.state === "missing" || rows.state === "error", (el) => el.child(line(rows.waitingLine ?? "", rows.state === "error" ? t.blocked : t.dim)))
