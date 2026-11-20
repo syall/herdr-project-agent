@@ -715,11 +715,17 @@ def sync_main(ctx, rec):
 
 # ---- restack ------------------------------------------------------------------------------------
 
-def touched(ctx, a, b):
+def changed_files(ctx, a, b):
+    """The paths that differ between a and b, or None when git cannot say (t-109 N-4: r-disjoint-carry fails closed)."""
     try:
         return {f["path"] for f in pa_hooks.raw_files(ctx.run, ctx.repo, a, b)}
     except pa_hooks.ContentError:
-        return set()
+        return None
+
+
+def touched(ctx, a, b):
+    found = changed_files(ctx, a, b)
+    return set() if found is None else found
 
 
 def restack(ctx, data, rec, dry=False):
@@ -1205,10 +1211,11 @@ def carry(ctx, rec, e, tip, tree, task, d, suites, reviews):
         return no("no earlier passing suite of the same content")
     run, at, at_base = found
     c, new_base = e.get("checked") or {}, e.get("base")
-    files = touched(ctx, c.get("base"), c.get("commit")) if c.get("base") and c.get("commit") else set()
-    if not files or not new_base or not ctx.tree(new_base) or not ctx.tree(at_base):
+    files = changed_files(ctx, c.get("base"), c.get("commit")) if c.get("base") and c.get("commit") else None
+    under = [changed_files(ctx, c.get("base"), new_base), changed_files(ctx, at_base, new_base)] if files and new_base else [None]
+    if not files or not new_base or not ctx.tree(new_base) or not ctx.tree(at_base) or any(u is None for u in under):
         return no("the files of the change, or of what moved under it, cannot be read")
-    shared = sorted(files & (touched(ctx, c["base"], new_base) | touched(ctx, at_base, new_base)))
+    shared = sorted(files & (under[0] | under[1]))
     if shared:
         return no("a file of the change changed under it since its check: " + ", ".join(shared[:5]))
     r = latest(reviews, lambda x: x.get("task") == e["task"] and (x.get("job") or None) == (e.get("job") or None)
@@ -1404,7 +1411,10 @@ def cmd_refresh(args):
         save(ctx, data, rec)
         if not args.no_merge and any(card_approval(e) for e in rec["entries"]):
             # Wanted 1 (Q-J3-3): an approved entry merges the moment it passed and every entry ahead merged
-            lines += merge_run(ctx, data, rec)
+            try:
+                lines += merge_run(ctx, data, rec)
+            except Refused as r:  # t-109 RL-1: a busy push lock; refresh's own work is saved and still printed
+                lines.append("merge skipped: {}".format(r))
         lines += ["{}. {}: {}".format(i, e["task"], e.get("state")) for i, e in enumerate(rec["entries"], 1)] + ctx.notes
         lines.append("pa-queue show --repo {} reads every state now".format(ctx.repo))
     print("\n".join(lines))
@@ -1463,18 +1473,23 @@ def ready_for_card(ctx, rec, e, n):
 
 
 def cmd_card(args):
+    most = CARD_MAX if args.max is None else args.max
+    if not 1 <= most <= CARD_MAX:
+        raise Refused("--max must be 1 to {} (the entries one queue card lists): got {}".format(CARD_MAX, most))
     with writing(args) as (ctx, data, rec):
         sync_main(ctx, rec)
         void_standing(ctx, rec)
         pairs = derive(ctx, rec)
-        listed = {(x.get("task"), x.get("job") or None) for _i, c in queue_cards(ctx.directory, rec["common"], "open")
-                  for x in c["queue"].get("entries") or [] if isinstance(x, dict)}
+        # t-109 N-3: an open card holds the entry instance it lists (only that one can it approve, D-J3b-10)
+        listed = {(x.get("task"), x.get("job") or None, x.get("instance")) for _i, c in queue_cards(ctx.directory, rec["common"], "open")
+                  for x in c["queue"].get("entries") or [] if isinstance(x, dict) and isinstance(x.get("instance"), str) and x["instance"]}
         chosen = []
         for e, n in pairs:
-            held = valid_approval(e) or e.get("heldApproval") or (e["task"], e.get("job") or None) in listed
+            # t-109 N-2: only a card's approval (with its digests) can merge, so only it holds the entry off a card
+            held = card_approval(e) or e.get("heldApproval") or (e["task"], e.get("job") or None, e.get("instance")) in listed
             if held and not chosen:
                 continue  # ahead: approved, or on an open card (Q-J3-2)
-            if held or len(chosen) == CARD_MAX or not ready_for_card(ctx, rec, e, n):
+            if held or len(chosen) == most or not ready_for_card(ctx, rec, e, n):
                 break
             chosen.append((e, n))
         if not chosen:
@@ -1507,7 +1522,8 @@ def cmd_card(args):
         text = "\n".join(context)
         if len(text) > pa_hooks.CONTEXT_MAX:  # t-109 MF-1, AC10.3: a Recorded limit is never cut from the card
             raise Refused("the card's facts and --limits come to {} characters, over the card's {}: list fewer entries "
-                          "or shorten the limits (name a file with them), no limit is cut".format(len(text), pa_hooks.CONTEXT_MAX))
+                          "(--max N, now {}) or shorten the limits: name each limit by its id in one line and point at a "
+                          "file for the detail; no limit is cut".format(len(text), pa_hooks.CONTEXT_MAX, len(chosen)))
         tasks = [label(e) for e, _n in chosen]
         main = rec["main"]
         if pushing:
@@ -1745,6 +1761,7 @@ def merge_front(ctx, data, rec, only=None):
     entries, in order)."""
     lines, merged = [], []
     suites, reviews = pa_hooks.suite_runs(ctx.directory), pa_hooks.review_runs(ctx.directory)
+    expected = ctx.tip(rec["main"])  # t-109 N-1, R9 (6): where local main is at the start, then the tip merged last
     while rec["entries"]:
         e = rec["entries"][0]
         if only is not None and (e["task"], e.get("job") or None) not in only:
@@ -1752,7 +1769,10 @@ def merge_front(ctx, data, rec, only=None):
                 lines.append("stopped at {}: not an entry of this answer".format(label(e)))
             break
         main_tip = ctx.tip(rec["main"])
-        why, void, suite = merge_check(ctx, rec, e, main_tip, suites, reviews)
+        if main_tip != expected:
+            why, void = "local {} moved during the run (at {}, expected {})".format(rec["main"], short(main_tip), short(expected)), False
+        else:
+            why, void, suite = merge_check(ctx, rec, e, main_tip, suites, reviews, expected=expected)
         if not why:
             why = ff_merge(ctx, rec, e, e["tip"])
         if why:
@@ -1760,6 +1780,7 @@ def merge_front(ctx, data, rec, only=None):
             break
         merged_record(ctx, data, rec, e, main_tip, suite, lines)
         merged.append(e)
+        expected = e["tip"]
     return lines, merged
 
 
@@ -2107,6 +2128,8 @@ def parser():
             s.add_argument("--no-merge", action="store_true", help="record and restack only; merge nothing (Q-J3-3)")
         if name == "card":
             s.add_argument("--limits", required=True, help="the Recorded limits of each listed task ('none' for none)")
+            s.add_argument("--max", type=int, help="list at most N entries of the ready front (1 to {}, default {}; "
+                                                   "t-109 RL-2)".format(CARD_MAX, CARD_MAX))
         if name == "merge":
             s.add_argument("--standing", help="the id of the person's standing rule to merge and push (t-140 R11): merge "
                                               "the passed entries it covers, with no queue card")
