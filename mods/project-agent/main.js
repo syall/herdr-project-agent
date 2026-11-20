@@ -39,6 +39,7 @@ const TASK_FOCUS = ["head", "top", "up", "down", "bottom", "next"]; // t-142: a 
 const OPEN_WAIT = 30000; // an Open request with nothing started by then: say why, offer the button again
 const OPEN_SLOW = 180000; // its new tab is recorded but its launcher has not started by then: say so
 const paRecords = (spaceId) => Object.values(shared("project-agent.tabs") ?? {}).filter((r) => r?.space === spaceId);
+const NOT_READ_LINE = "PA context: the Costs view has not read the summary yet."; // t-116 (RL-J5-1)
 const WATCH_BACKOFF_MAX = 60000; // t-116: a refused folder watch is tried again at most this far apart
 const LOAD_LIMIT = READ_LIMIT + 1000; // a load with no read settled or timed out for this long is given up: a new one may start
 const CACHE_MAX = 8; // spaces whose last load is kept (in memory), the least recently shown dropped first
@@ -821,7 +822,9 @@ export default class ProjectAgent extends View {
     const read = at !== null ? contextLine(costs.summary?.paContext, at, now) : null;
     const readIso = at !== null ? new Date(at).toISOString() : null;
     const asOf = readIso && readIso.slice(0, 10) !== new Date(now).toISOString().slice(0, 10) ? atZone(readIso) : clock(readIso);
-    const line = read ? `${read} (as of ${asOf})` : null;
+    // t-116 (RL-J5-1): no read of the Costs view has answered yet (it runs, or it failed): said, never silent. A read
+    // that answered with no summary draws no line; a later read that failed keeps the old figures and their "as of".
+    const line = read ? `${read} (as of ${asOf})` : !costs?.readAt ? NOT_READ_LINE : null;
     const reset = resetLine(launcher, data.agent?.sessionId, clock);
     if (!line && !reset) return null;
     return v_flex().px(12).py(6).gap(4).flex_none().border_b(1).border_color(t.border).text_size(11.5).text_color(t.dim)
