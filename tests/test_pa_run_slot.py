@@ -427,11 +427,71 @@ class S8Hook(Slot):
 
     def test_s8e_the_hooks_own_timeout_is_a_failure_to_fix(self):
         # MF-J2-1 (review-j2-hang.py): a test the change makes hang outlives run_shell's limit (900 s; 1 s here)
-        saved = pa_hooks.AFFECTED_LIMIT
-        pa_hooks.AFFECTED_LIMIT = 1
-        self.addCleanup(setattr, pa_hooks, "AFFECTED_LIMIT", saved)
+        self.limits(1, 1)  # t-147: a command that never entered the slot step ends at AFFECTED_RUN
         code, err = self.hook(self.script("echo '=== unit tests: test_x'\nexec sleep 20\n"))
         self.assert_did_not_finish(code, err, "(timed out after 1 s)")
+
+    def limits(self, run, limit, grace=None):
+        for name, value in (("AFFECTED_RUN", run), ("AFFECTED_LIMIT", limit), ("KILL_GRACE", grace)):
+            if value is not None:
+                self.addCleanup(setattr, pa_hooks, name, getattr(pa_hooks, name, None))
+                setattr(pa_hooks, name, value)
+
+    def gone(self, pid, within=3.0):
+        end = time.time() + within
+        while time.time() < end:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return True
+            if subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], stdout=subprocess.PIPE,
+                              universal_newlines=True).stdout.strip().startswith("Z"):
+                return True  # a zombie: ended, not yet reaped by its new parent
+            time.sleep(0.1)
+        return False
+
+    def test_s8j_a_command_that_never_enters_the_slot_step_ends_at_its_own_run_limit(self):
+        # t-147 item 1 (RL-b): a profile's own affected command (no slot step) that hangs is ended at AFFECTED_RUN
+        # (900 s; 2 s here), not after the slot wait it never had (AFFECTED_LIMIT 1740 s; 60 s here)
+        self.limits(2, 60)
+        began = time.time()
+        code, err = self.hook(self.script("echo '=== unit tests: test_x'\nexec sleep 40\n"))
+        self.assertLess(time.time() - began, 15)
+        self.assert_did_not_finish(code, err, "(timed out after 2 s)")
+
+    def test_s8k_a_command_in_the_slot_step_keeps_the_whole_limit(self):
+        # t-147 item 1: once run-all.sh made the hook's mark (it entered the slot step), the run has AFFECTED_LIMIT
+        seen = os.path.join(self.tmp, "mark-seen")
+        self.limits(2, 30)
+        code, err = self.hook(self.script('echo "$PA_HOOK_SLOT_MARK" > {}\n[ -n "$PA_HOOK_SLOT_MARK" ] && '
+                                          ': > "$PA_HOOK_SLOT_MARK"\nsleep 4\nexit 0\n'.format(seen)))
+        self.assertEqual(code, 0, err)
+        self.assertNotEqual(pa.read_text(seen).strip(), "")
+
+    def test_s8l_the_whole_group_is_ended_at_the_limit(self):
+        # t-147 item 1: run_shell ends the command's process group, not only `sh -c`: a grandchild that ignores TERM
+        # is killed after KILL_GRACE, and a member still holding the output does not hold run_shell
+        self.limits(None, None, grace=0.5)
+        pid_file = os.path.join(self.tmp, "grandchild")
+        script = self.script("sh -c 'trap \"\" TERM; echo $$ > {}; exec sleep 60' &\nwait\n".format(pid_file))
+        began = time.time()
+        code, out = pa_hooks.run_shell("sh " + script, self.tmp, [], 1)
+        self.assertLess(time.time() - began, 8, out)
+        self.assertEqual(code, 124, out)
+        self.assertEqual(out.strip().splitlines()[-1], "(timed out after 1 s)")
+        self.assertTrue(self.gone(int(pa.read_text(pid_file).strip())), "the grandchild still runs")
+
+    def test_s8m_a_clean_exit_leaves_nothing_running_and_is_not_held(self):
+        # t-147 item 1: the shell exits 0 leaving a background member that holds stdout: run_shell returns the
+        # shell's own code and output at once, and the member is ended
+        self.limits(None, None, grace=0.5)
+        pid_file = os.path.join(self.tmp, "member")
+        script = self.script("echo hello\nsh -c 'echo $$ > {}; exec sleep 60' &\nsleep 0.3\nexit 0\n".format(pid_file))
+        began = time.time()
+        code, out = pa_hooks.run_shell("sh " + script, self.tmp, [], 10)
+        self.assertLess(time.time() - began, 5, out)
+        self.assertEqual((code, out), (0, "hello\n"))
+        self.assertTrue(self.gone(int(pa.read_text(pid_file).strip())), "the member still runs")
 
     def test_s8f_review_j2_hang_run_shell_timing_out(self):
         # the reviewer's case as it was written: run_shell returns what it returns on its own timeout

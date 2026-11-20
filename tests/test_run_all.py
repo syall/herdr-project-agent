@@ -65,7 +65,8 @@ except OSError:
 print('FAIL slot: free during the run'); sys.exit(1)" "$HERDR_PA_HOME/suite-slots/slot-0" || exit 1 ;;
   envs) env | grep -E '^(HC_|PA_SUITE_HC_)' | sort > "$STUB_DIR/$k.env"
     env | grep -E '^PA_SUITE_(DEADLINE|LOCAL_RUN)=' | sort > "$STUB_DIR/$k.slotenv"
-    env | grep -E '^PA_SUITE_RUN_LIMIT=' > "$STUB_DIR/$k.runenv" ;;
+    env | grep -E '^PA_SUITE_RUN_LIMIT=' > "$STUB_DIR/$k.runenv"
+    env | grep -E '^PA_HOOK_SLOT_MARK=' > "$STUB_DIR/$k.markenv" ;;
   git) { echo "git=$(command -v git)"; echo "python3=$(command -v python3)"; echo "path=$PATH"; } > "$STUB_DIR/$k.git" ;;
   wait:*) other=${m#wait:}; n=0
     until grep -q "start $other" "$STUB_DIR/events"; do
@@ -1013,6 +1014,20 @@ class RunAll(unittest.TestCase):
         self.assertEqual(code, 0, out)
         with open(os.path.join(self.tmp, "keeper.runenv")) as f:
             self.assertEqual(f.read().strip(), "", out)
+
+    def test_s13_the_hooks_slot_mark_is_made_when_the_slot_step_is_entered(self):
+        # t-147 item 1 (RL-b): the affected-tests hook gives a run 1740 s only once it entered the slot step (which
+        # may wait 840 s); run-all.sh makes the hook's mark just before it, and the variable goes no further
+        mark = os.path.join(self.tmp, "slot-mark")
+        code, out = self.run_all("--affected", keeper="envs", PA_HOOK_SLOT_MARK=mark)
+        self.assertEqual(code, 0, out)
+        self.assertTrue(os.path.isfile(mark), out)
+        with open(os.path.join(self.tmp, "keeper.markenv")) as f:
+            self.assertEqual(f.read().strip(), "", out)
+        os.remove(mark)  # a run that selects no part enters no slot step: no mark
+        code, out = self.run_all("--affected", PA_CHANGED_FILES="README.md", PA_HOOK_SLOT_MARK=mark)
+        self.assertEqual((code, out.strip()), (0, "no tested files changed: nothing to run"))
+        self.assertFalse(os.path.exists(mark))
 
     def test_s12_the_slot_steps_deadline_and_local_run_are_not_the_parts(self):
         # t-117 R16 (Nit-J2-2): the second pass (under the slot step) unsets PA_SUITE_DEADLINE and PA_SUITE_LOCAL_RUN
