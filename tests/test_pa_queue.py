@@ -1487,5 +1487,336 @@ class T86HeldApproval(UBase):
         self.held_with(None)
 
 
+# ---- t-176: a short review of a branch rebased outside the queue counts ------------------------------------
+
+class O176Base(UBase):
+    """t-176: helpers for a task t-B checked on main and rebased by hand (outside the queue)."""
+
+    FILE = "SHORT-REVIEW-t-B-1.md"
+
+    def rebase_outside(self, onto="main"):
+        sh(self.trees["t-B"], "git", "rebase", "-q", onto)
+        self.assertNotEqual(self.tip("t-B"), self.checked_tip)
+        return self.tip("t-B")
+
+    def reviews(self):
+        p = os.path.join(self.dir, "content", "reviews.jsonl")
+        return [json.loads(l) for l in read(p).splitlines()] if os.path.exists(p) else []
+
+    def write_review(self, tip=None, reviewer="t-Bs", role="reviewer", started=None, name=None, ledger=True, **kw):
+        if ledger:
+            self.add_worker("t-B", reviewer, role, started=started)
+        write(os.path.join(self.evidence("t-B"), name or self.FILE), review_text(tip or self.tip("t-B"), reviewer, **kw))
+
+    def committed(self, sha):
+        return pa_hooks.iso_at(int(sh(self.proj, "git", "show", "-s", "--format=%ct", sha)))
+
+    def verify(self, tid="t-B"):
+        return self.queue("verify", tid, "--repo", self.proj)
+
+    def not_recorded(self, word):
+        code, out, err = self.verify()
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("{} not recorded".format(self.FILE), out)
+        self.assertIn(word, out)
+        self.assertEqual(self.reviews(), [])
+        self.assertEqual(self.gate("t-B")[0], 1)
+        return out
+
+
+class O176Outside(O176Base):
+    """t-B is checked on main, main moves (a.txt line 30), and t-B is rebased onto main by hand (outside the queue):
+    its change lines only moved. pa-queue verify names the short review and, once a fresh reviewer wrote it, records
+    it; then pa-gate passes and pa-queue add joins with no recheck."""
+
+    def setUp(self):
+        super().setUp()
+        self.task("t-B", [("a.txt", (100, "hundred"))])
+        self.checked_tip = self.tip("t-B")
+        self.on_main("a.txt", (30, "thirty"))
+
+    def test_t1_outside_review_is_recorded_then_gate_and_add(self):
+        tip = self.rebase_outside()
+        code, out, _ = self.gate("t-B")
+        self.assertEqual(code, 1, out)
+        self.assertIn("a short review is needed", out)
+        self.write_review()
+        code, out, err = self.verify()
+        self.assertEqual(code, 0, out + err)
+        self.assertIn(": moved", out)
+        self.assertIn("short review {} recorded (pass)".format(self.FILE), out)
+        self.assertIn("pa-gate t-B", out)
+        lines = self.reviews()
+        self.assertEqual(len(lines), 1, lines)
+        r = lines[0]
+        self.assertEqual((r["kind"], r["task"], r["job"], r["tip"], r["verdict"], r["worker"], r["about"], r["source"], r["file"]),
+                         ("short-review", "t-B", None, tip, "pass", "t-Bs", "moved", "verify", self.FILE))
+        self.assertEqual(r["tree"], sh(self.proj, "git", "rev-parse", tip + "^{tree}"))  # H7: the tool records tree(tip)
+        self.assertEqual(r["common"], os.path.realpath(os.path.join(self.proj, ".git")))
+        for k in ("started", "ended", "seconds", "fileSha256", "branch", "repo"):
+            self.assertIn(k, r)
+        ev = self.journal("review")
+        self.assertEqual(len(ev), 1, ev)
+        self.assertEqual((ev[0]["task"], ev[0]["file"], ev[0]["verdict"], ev[0]["worker"], ev[0]["outside"]),
+                         ("t-B", self.FILE, "pass", "t-Bs", True))
+        for k in ("started", "ended", "seconds"):
+            self.assertIn(k, ev[0])
+        result = pa_hooks.evaluate_gate(self.dir, self.ledger_task("t-B"), "review")
+        self.assertTrue(result["passed"], result)
+        code, out, _ = self.gate("t-B")
+        self.assertEqual(code, 0, out)
+        self.assertIn("short review", out)
+        self.add("t-B")
+        e = self.entry("t-B")
+        self.assertEqual((e["onto"], e["tip"], e["rebases"], e["state"]), ("main", tip, [], "checking"))
+        self.assertEqual(e["needs"]["shortReview"]["file"], self.FILE)
+        code, out, _ = self.queue("show", "--repo", self.proj)
+        self.assertIn("carry-over: suite\n", out)
+        self.assertNotIn("waiting for its short review", out)
+        self.assertEqual(len(self.reviews()), 1)
+
+    def test_t2_waiting_before_the_file(self):
+        self.rebase_outside()
+        code, out, err = self.verify()
+        self.assertEqual(code, 0, out + err)
+        self.assertIn(": moved", out)
+        self.assertIn("waiting for its short review ({})".format(self.FILE), out)
+        self.assertEqual(self.reviews(), [])
+        self.assertEqual(self.journal("review"), [])
+
+    def test_t3_the_build_worker_is_an_author(self):
+        self.rebase_outside()
+        self.write_review(reviewer="t-Bb", ledger=False)
+        self.not_recorded("is an author of the task")
+
+    def test_t3b_a_design_worker_is_an_author(self):
+        self.rebase_outside()
+        self.write_review(reviewer="t-Bd", role="design")
+        self.not_recorded("is an author of the task")
+
+    def test_t4_not_a_worker_of_the_task(self):
+        self.rebase_outside()
+        for who in ("zz9", "t0"):
+            with self.subTest(who):
+                self.write_review(reviewer=who, ledger=False)
+                self.not_recorded("is not a reviewer of the task started after the rebase")
+
+    def test_t5_ledger_reviewer_started_before_the_commit(self):
+        self.rebase_outside()
+        self.write_review(reviewer="t-Br", ledger=False)  # the fixture's reviewer, started in 2000
+        self.not_recorded("is not a reviewer of the task started after the rebase")
+
+    def test_t6_file_start_before_the_commit(self):
+        tip = self.rebase_outside()
+        self.write_review(start="2000-01-03T00:00:00Z")
+        out = self.not_recorded("its Start: is before HEAD {} was committed".format(tip[:7]))
+        self.assertNotIn("Start: and End:", out)
+
+    def test_t7_checked_names_the_old_tip(self):
+        self.rebase_outside()
+        self.write_review(tip=self.checked_tip)
+        self.not_recorded("its Checked: line must name the tip")
+
+    def test_t7b_recorded_then_a_new_tip(self):
+        t1 = self.rebase_outside()
+        self.write_review()
+        self.assertEqual(self.verify()[0], 0)
+        self.assertEqual(self.gate("t-B")[0], 0)
+        self.on_main("b.txt", "bee\n")
+        sh(self.trees["t-B"], "git", "rebase", "-q", "main")
+        t2 = self.tip("t-B")
+        self.assertNotEqual(t1, t2)
+        code, out, err = self.verify()
+        self.assertEqual(code, 0, out + err)
+        self.assertIn(": moved", out)
+        self.assertIn("waiting for its short review (SHORT-REVIEW-t-B-2.md)", out)  # a new tip needs a new review
+        self.assertEqual([r["tip"] for r in self.reviews()], [t1])
+        self.assertEqual(self.gate("t-B")[0], 1)
+
+    def test_t8_must_fix_is_recorded_and_stands(self):
+        self.rebase_outside()
+        self.write_review(verdict="must fix (2)")
+        code, out, err = self.verify()
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("t-B: short review {} must fix: the branch needs the R8 check (a check worker and "
+                      "pa-full-suite)".format(self.FILE), out)
+        self.assertEqual([r["verdict"] for r in self.reviews()], ["must fix"])
+        self.assertEqual(self.gate("t-B")[0], 1)
+        code, out, err = self.add("t-B", ok=False)
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("gate", err)
+        self.write_review(reviewer="t-Bs2")  # a pass written after, at the same tip
+        code, out, err = self.verify()
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("must fix", out)
+        self.assertEqual([r["verdict"] for r in self.reviews()], ["must fix"])
+        self.assertEqual(self.gate("t-B")[0], 1)
+
+    def test_t9_no_verdict_line(self):
+        self.rebase_outside()
+        for what, verdict in (("none", None), ("passed", "passed")):
+            with self.subTest(what):
+                self.write_review(verdict=verdict)
+                self.not_recorded("it has no Verdict: line")
+
+    def test_t11_changed_records_nothing(self):
+        self.rebase_outside()
+        self.change("t-B", "c.txt", "c\n")
+        self.write_review()
+        code, out, err = self.verify()
+        self.assertEqual(code, 1, out + err)
+        self.assertIn(": changed", out)
+        self.assertEqual(self.reviews(), [])
+        self.assertEqual(self.journal("review"), [])
+
+    def test_t11b_stale_records_nothing(self):
+        self.write_review(tip=self.checked_tip)  # not rebased: it does not sit on main's tip
+        code, out, err = self.verify()
+        self.assertEqual(code, 1, out + err)
+        self.assertIn(": stale", out)
+        self.assertEqual(self.reviews(), [])
+
+    def test_t12_recorded_once(self):
+        self.rebase_outside()
+        self.write_review()
+        self.assertEqual(self.verify()[0], 0)
+        code, out, err = self.verify()
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("recorded (pass)", out)
+        self.assertEqual(len(self.reviews()), 1)
+        self.assertEqual(len(self.journal("review")), 1)
+        self.gate("t-B")
+        self.add("t-B")
+        self.suite("t-B", 0)
+        code, out, err = self.queue("refresh", "--repo", self.proj, "--no-merge")
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(len(self.reviews()), 1)
+        self.assertEqual(self.entry("t-B")["state"], "passed")
+
+    def test_t12b_a_line_of_another_job_does_not_skip(self):
+        tip = self.rebase_outside()
+        other = {"kind": "short-review", "task": "t-B", "job": "j9", "common": os.path.realpath(os.path.join(self.proj, ".git")),
+                 "tip": tip, "tree": "0" * 40, "file": "SHORT-REVIEW-t-B-j9-1.md", "verdict": "must fix", "about": "moved",
+                 "source": "verify", "worker": "t-Bs", "started": pa.now()}
+        os.makedirs(os.path.join(self.dir, "content"), exist_ok=True)
+        with open(os.path.join(self.dir, "content", "reviews.jsonl"), "a") as f:
+            f.write(json.dumps(other) + "\n")
+        self.write_review()
+        code, out, err = self.verify()
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual([(r["job"], r["verdict"]) for r in self.reviews()], [("j9", "must fix"), (None, "pass")])
+
+    def test_t13_queue_ahead_verify_against_main_then_add_rebases(self):
+        self.task("t-A", [("fa.txt", "a\n")])
+        self.add("t-A")
+        old = self.rebase_outside()
+        self.write_review()
+        code, out, err = self.verify()
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("t-B at {} on main: moved".format(old[:7]), out)
+        self.assertIn("add will rebase it onto t-A-x (a new short review is asked then)", out)
+        self.assertEqual([r["tip"] for r in self.reviews()], [old])
+        self.assertEqual(self.gate("t-B")[0], 0)
+        code, out, err = self.add("t-B")
+        e = self.entry("t-B")
+        new = self.tip("t-B")
+        self.assertNotEqual(new, old)
+        self.assertEqual((e["onto"], e["rebases"][-1]["result"]), ("t-A-x", "moved"))
+        need = e["needs"]["shortReview"]
+        self.assertEqual(need["tip"], new)
+        self.assertNotEqual(need["file"], self.FILE)  # the outside file is not asked again for another tip
+        self.assertIn(need["file"], out)
+        self.assertEqual(self.gate("t-B")[0], 1)
+        code, out, err = self.queue("show", "--repo", self.proj)
+        self.assertIn("needed: " + need["file"], out)
+        self.queue("refresh", "--repo", self.proj, "--no-merge")
+        self.assertEqual([r["tip"] for r in self.reviews()], [old])
+
+    def test_t13b_branch_on_the_last_entry_keeps_todays_decision(self):
+        """A branch put on the queue's last entry by hand (the gate compares it against main there): verify decides
+        against that entry as before and records nothing (the queue records it after add)."""
+        self.task("t-A", [("fa.txt", "a\n")])
+        self.add("t-A")
+        self.rebase_outside("t-A-x")
+        self.write_review()
+        code, out, err = self.verify()
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("on t-A-x: moved", out)
+        self.assertEqual(self.reviews(), [])
+
+    def test_t14_add_since_is_the_commit_time(self):
+        tip = self.rebase_outside()
+        self.write_review()
+        self.verify()
+        self.gate("t-B")
+        self.add("t-B")
+        self.assertEqual(self.entry("t-B")["needs"]["shortReview"]["since"], self.committed(tip))
+
+    def test_t15_gate_names_the_written_file(self):
+        self.rebase_outside()
+        code, out, _ = self.gate("t-B")
+        self.assertEqual(code, 1, out)
+        self.assertIn("a short review is needed", out)
+        self.assertNotIn("is written", out)
+        self.write_review()
+        before = snapshot(os.path.join(self.dir, "content"))
+        code, out, _ = self.gate("t-B")
+        self.assertEqual(code, 1, out)
+        self.assertIn("{} is written: pa-queue verify t-B records it".format(self.FILE), out)
+        self.assertEqual({k: v for k, v in snapshot(os.path.join(self.dir, "content")).items() if "reviews" in k},
+                         {k: v for k, v in before.items() if "reviews" in k})
+        self.assertEqual(self.reviews(), [])
+
+    def test_t16_a_worker_shell_cannot_record(self):
+        self.rebase_outside()
+        self.write_review()
+        inside = os.path.join(self.tmp, "w")
+        dump({"task": "t-B", "space": SPACE}, os.path.join(inside, ".claude", "pa-task.json"))
+        os.chdir(inside)
+        try:
+            code, out, err = self.verify()
+        finally:
+            os.chdir(self.tmp)
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("worker", err)
+        os.environ["HC_TERMINAL_ID"] = "t-Bs"
+        try:
+            code, out, err = self.verify()
+        finally:
+            os.environ.pop("HC_TERMINAL_ID", None)
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("worker", err)
+        self.assertEqual(self.reviews(), [])
+
+
+
+class O176Union(O176Base):
+    """t-B changes a.txt line 2, main changes it too; a rebase worker onto main (outside the queue) keeps both."""
+
+    def setUp(self):
+        super().setUp()
+        self.task("t-B", [("a.txt", (2, "two B"))])
+        self.checked_tip = self.tip("t-B")
+        self.on_main("a.txt", (2, "two M"))
+
+    def test_t10_union_outside_records_a_doc_only_review(self):
+        tip = self.resolve("t-B", "main", "a.txt", union_text("two B", "two M"))
+        code, out, err = self.verify()
+        self.assertEqual(code, 0, out + err)
+        self.assertIn(": union", out)
+        self.assertIn("waiting for its short review ({})".format(self.FILE), out)
+        self.write_review()
+        code, out, err = self.verify()
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("recorded (pass)", out)
+        self.assertEqual([(r["about"], r["tip"], r["source"]) for r in self.reviews()], [("doc-only", tip, "verify")])
+        code, out, _ = self.gate("t-B")
+        self.assertEqual(code, 0, out)
+        self.assertIn("doc-only short review", out)
+        self.add("t-B")
+        self.assertEqual(self.entry("t-B")["needs"]["shortReview"]["kind"], "doc-only")
+        self.assertEqual(len(self.reviews()), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
