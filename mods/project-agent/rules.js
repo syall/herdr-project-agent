@@ -312,7 +312,7 @@ export class RulesPane {
               try {
                 this.message = `Imported ${await importRules(space, path, added)} new rules.`; this.importPath.release?.(); this.importPath = null;
                 if (added.length) this.changed?.(space, added, cx);
-                await this.load(space);
+                if (this.shows(space.id)) await this.load(space); // t-134 round 3: not into another space's view
               }
               catch (e) { this.error = String(e.message ?? e); }
               cx.notify();
