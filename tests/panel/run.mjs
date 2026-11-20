@@ -2747,6 +2747,68 @@ cases["P143-drill-scroll"] = async () => { // I2: a task with many workers: its 
   check(keys.every((k) => text.includes(k)), "every session is in the drill box");
 };
 
+// ---- t-189 a Costs box that scrolls keeps the wheel: the page does not scroll with it (evidence/t-189/plan.md) ----
+// The element in the Costs view whose kids hold the one with id `key` (null: none).
+function costsParentOf(v, key) {
+  let found = null;
+  const walk = (x) => { if (found || !x || typeof x !== "object") return; if ((x.kids ?? []).some((k) => k?.key === key)) { found = x; return; } for (const k of x.kids ?? []) walk(k); };
+  walk(v.render(cx));
+  return found;
+}
+// Whether this element's wheel handler stops the event (calls stop_propagation), as the host would call it.
+function wheelStops(el) {
+  const h = el?.style?.on_scroll_wheel?.[0];
+  if (typeof h !== "function") return false;
+  let stopped = false;
+  h({ delta: { x: 0, y: -40 } }, { ...cx, stop_propagation() { stopped = true; } });
+  return stopped;
+}
+const wheelOn = (x) => Boolean(x?.style?.on_scroll_wheel);
+const longTasks = () => { const s = costsSummary(); s.byTask = Array.from({ length: 30 }, (_, i) => ({ key: `t-${i + 1}`, title: `Task ${i + 1}`, state: "queued", tokens: 10, money: 0.1, calls: 1, phases: [], sessions: [] })); return s; };
+
+cases["P189-list-wheel"] = async () => { // R1: a long By task list keeps the wheel (the stop on its box's parent); the page box has none
+  const { v } = await costsWorld({ summary: longTasks() });
+  const parent = costsParentOf(v, "costs-list-task");
+  check(wheelStops(parent), `the costs-list-task box's parent stops the wheel (parent ${parent?.key ?? parent?.kind}, style ${JSON.stringify(Object.keys(parent?.style ?? {}))})`);
+  check(Boolean(costsEl(v, "costs-list-task")?.style?.overflow_y_scrollbar), "the list box still scrolls");
+  check(!wheelOn(costsEl(v, "pa-costs")), "pa-costs has no wheel handler (the page scrolls elsewhere)");
+};
+
+cases["P189-drill-wheel"] = async () => { // R1: a long open drill (By task, By session type) keeps the wheel
+  const s = costsSummary();
+  const keys = Array.from({ length: 25 }, (_, i) => `w${String(i).padStart(3, "0")}aaaa`);
+  s.sessions = keys.map((key) => ({ key, tokens: 10, money: 0.1, calls: 1, kind: "worker", role: "build", program: "claude", task: "t-1", model: "model-a", from: isoAt(T0 - 7200000), to: isoAt(T0 - 3600000), state: "closed", source: "recorded" }));
+  s.byTask[0].sessions = keys;
+  const { v } = await costsWorld({ summary: s });
+  await click(v, "costs-task-0"); await settle();
+  const tp = costsParentOf(v, "costs-drill-task");
+  check(wheelStops(tp), `the costs-drill-task box's parent stops the wheel (parent ${tp?.key ?? tp?.kind}, style ${JSON.stringify(Object.keys(tp?.style ?? {}))})`);
+  check(Boolean(costsEl(v, "costs-drill-task")?.style?.overflow_y_scrollbar), "the task drill box still scrolls");
+  const many = (await costsWorld({ summary: s })).v;
+  await click(many, "costs-kind-0"); await settle();
+  const kp = costsParentOf(many, "costs-drill-kind");
+  check(Boolean(costsEl(many, "costs-drill-kind")?.style?.overflow_y_scrollbar), "the kind drill box scrolls");
+  check(wheelStops(kp), `the costs-drill-kind box's parent stops the wheel (parent ${kp?.key ?? kp?.kind})`);
+  check(!wheelOn(costsEl(many, "pa-costs")), "pa-costs has no wheel handler");
+};
+
+cases["P189-short-no-wheel"] = async () => { // R2: a short list or drill does not scroll and keeps no wheel: the page scrolls over it
+  // Control first: a long list does keep it, so this case cannot pass by the stop being absent everywhere.
+  const long = (await costsWorld({ summary: longTasks() })).v;
+  check(wheelStops(costsParentOf(long, "costs-list-task")), "control: a 30-task list's box parent stops the wheel");
+  const { v } = await costsWorld();
+  const listPath = pathTo(v.render(cx), "costs-list-task") ?? [];
+  const from = listPath.findIndex((x) => x.key === "pa-costs");
+  check(listPath.length > 0 && from >= 0, "a path pa-costs -> costs-list-task");
+  const listHas = listPath.slice(from).filter(wheelOn).map((x) => x.key ?? x.kind);
+  check(listHas.length === 0, `three tasks: no wheel handler from pa-costs to costs-list-task (on ${JSON.stringify(listHas)})`);
+  await click(v, "costs-task-0"); await settle();
+  const drillPath = pathTo(v.render(cx), "costs-drill-task") ?? [];
+  check(drillPath.length > 0 && !drillPath.at(-1).style?.overflow_y_scrollbar, "a short open drill (two sessions) that does not scroll");
+  const drillHas = drillPath.filter(wheelOn).map((x) => x.key ?? x.kind);
+  check(drillHas.length === 0, `no wheel handler on the short drill or any ancestor (on ${JSON.stringify(drillHas)})`);
+};
+
 cases["P143-sort"] = async () => { // I3: By task sorts by cost (default: the summary's order), task id, recent; By day by day (default) or cost
   const { v } = await costsWorld({ summary: sortSummary() });
   const keys = ["t-2", "t-10", "t-3"];
