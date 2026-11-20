@@ -703,13 +703,23 @@ class L_LaunchRecords(Base):
     def test_l5_held_append_lock_does_not_hold_the_launch(self):
         import fcntl
         os.makedirs(os.path.join(self.dir, "costs"), exist_ok=True)
-        with open(self.costs(".append.lock"), "a") as held:
-            fcntl.flock(held, fcntl.LOCK_EX)
+        # t-173: the bound is on the lock wait (APPEND_WAIT, 1 s), timed around append_session alone: the rest of an
+        # in-process launch is CPU work that load slows (the whole launch took 1.25-1.51 s at 128 busy loops on 32 cores)
+        costs = pa.costs_module()
+        real, spans = costs.append_session, []
+
+        def timed(*args, **kwargs):
             began = time.time()
+            try:
+                return real(*args, **kwargs)
+            finally:
+                spans.append(time.time() - began)
+        with open(self.costs(".append.lock"), "a") as held, mock.patch.object(costs, "append_session", timed):
+            fcntl.flock(held, fcntl.LOCK_EX)
             argv = self.launch("claude", "job")
-            took = time.time() - began
         self.assertIn("--session-id", argv)
-        self.assertLess(took, 1.2)
+        self.assertEqual(len(spans), 1)
+        self.assertLess(spans[0], 1.2)
         self.assertEqual(self.records(), [])
 
     def test_l6_codex_records_the_launch_only(self):
@@ -2785,6 +2795,8 @@ CC_SCRIPTS = {
     "ok": "#!/bin/sh\ncat > /dev/null\nprintf 'STATUS-LINE ok'\n",
     "copy": "#!/bin/sh\ncat > \"$1\"\nprintf copied\n",
     "slow": "#!/bin/sh\ncat > /dev/null\nsleep 5\nprintf late\n",
+    "ok-marked": "#!/bin/sh\n: > \"$1\"\ncat > /dev/null\nprintf 'STATUS-LINE ok'\n",  # t-173: $1's mtime = its start
+    "slow-marked": "#!/bin/sh\n: > \"$1\"\ncat > /dev/null\nsleep 5\nprintf late\n",  # t-173: $1's mtime = its start
     "fail": "#!/bin/sh\ncat > /dev/null\nprintf 'partial line'\necho oops >&2\nexit 1\n",
     "big": "#!/bin/sh\ncat > /dev/null\nhead -c 2097152 /dev/zero | tr '\\000' x\n",
     "noread": "#!/bin/sh\nprintf 'no-read'\n",
@@ -2953,9 +2965,9 @@ class CC_StatusLine(CCBase):
         os.makedirs(os.path.join(self.dir, "costs", "cc"), exist_ok=True)
         with open(os.path.join(self.dir, "costs", "cc", ".lock"), "a") as held:
             fcntl.flock(held, fcntl.LOCK_EX)
-            began = time.time()
-            out = self.run_sl(cc_bytes())
-            took = time.time() - began
+            mark = os.path.join(self.dir, "inner-started")
+            out = self.run_sl(cc_bytes(), then=("ok-marked", mark))
+            took = time.time() - os.stat(mark).st_mtime  # t-173: from the inner start, as RECORD_BUDGET counts
         self.assertEqual(out, b"STATUS-LINE ok")
         self.assertIsNone(self.cc_record())
         self.assertLess(took, 1.0)
@@ -3011,11 +3023,12 @@ class CC_StatusLine(CCBase):
             self.assert_slow_inner_killed()
 
     def assert_slow_inner_killed(self):
-        """The slow inner command is cut at INNER_TIMEOUT: nothing returned, recorded while it ran."""
+        """The slow inner command is cut at INNER_TIMEOUT: nothing returned, recorded while it ran. Timed from the
+        inner command's own start (t-173: a Popen slowed by load is not the timeout's), to the return."""
         sid = "cc000000-0000-4000-8000-abcd000000aa"
-        began = time.time()
-        self.assertEqual(self.run_sl(cc_bytes(sid=sid), then=("slow",)), b"")
-        self.assertLess(time.time() - began, 2.5)
+        mark = os.path.join(self.dir, "inner-started")
+        self.assertEqual(self.run_sl(cc_bytes(sid=sid), then=("slow-marked", mark)), b"")
+        self.assertLess(time.time() - os.stat(mark).st_mtime, 2.5)
         self.assertIsNotNone(self.cc_record(sid))  # recorded while the inner command ran
 
 
@@ -3087,11 +3100,19 @@ class CC_Script(CCBase):
         self.assert_killed_at_2_s(entry=late)
 
     def assert_killed_at_2_s(self, entry=None):
-        """The slow inner command is killed at about 2 s (INNER_TIMEOUT), nothing printed, recorded while it ran."""
+        """The slow inner command is killed at about 2 s (INNER_TIMEOUT), nothing printed, recorded while it ran.
+        t-173: INNER_TIMEOUT counts from the inner command's start; the time before it (interpreter start, loading pa
+        and pa_costs, Popen) is cs4's to bound. At load that time was 0.14-0.62 s (64 busy loops on 32 cores) while the
+        inner run, start to exit, stayed 1.97-2.01 s. So the upper bound is timed from the inner command's own mark
+        (written as it starts: never before the timeout's start, so never stricter than INNER_TIMEOUT), and the lower
+        bound from the launch (never after the timeout's start: load only lengthens it). A first exec of a new stub on
+        macOS can write the mark 0.3 s late, which is why the mark is not used for the lower bound."""
         sid = "cc000000-0000-4000-8000-abcd000000cc"
-        out, took = self.script(["--space", "sp1", "--then", cc_stub("slow")], cc_bytes(sid=sid), entry=entry)
+        mark = os.path.join(self.dir, "inner-started")
+        out, took = self.script(["--space", "sp1", "--then", cc_stub("slow-marked"), mark], cc_bytes(sid=sid), entry=entry)
+        ran = time.time() - os.stat(mark).st_mtime
         self.assertEqual(out, b"")
-        self.assertLess(took, 2.5)
+        self.assertLess(ran, 2.5)
         self.assertGreaterEqual(took, 1.9)
         self.assertIsNotNone(self.cc_record(sid))
 
