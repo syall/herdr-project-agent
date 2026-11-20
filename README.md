@@ -271,7 +271,9 @@ push it yourself with one click in the panel.
   id>` in your own terminal (`--unbind` removes it; any edit of the rule's text ends it until you
   bind again). Then the Project Agent merges passed entries with `pa-queue merge --standing` and
   pushes them with `pa-push-main run --standing`, with every check above except that no card is
-  shown; high tier entries still get a card. A hold, an Other answer or a note on any card, a
+  shown; high tier entries still get a card. A stacked entry must first be found independent of
+  the one it is stacked on: `pa-queue brief` asks that with the entry's other checks, in the same
+  review file as its shared-file review when it has one, and that one file must answer both. A hold, an Other answer or a note on any card, a
   failed check or gate, a commit after the checked commit, or a refused push stops it and the
   cards come back; you resume it by turning the rule off and on in the panel.
 - **Turning it off:** set `"enabled": false` on the file or on an entry, run `pa-push-allow off`,

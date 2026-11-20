@@ -216,7 +216,9 @@ class OneReview(mp.Standing):
         self.write_review("t-B", need["file"], review_file(tip, "t-Bq", "pass", "yes"))
         code, out, err = self.refresh("--no-merge")
         self.assertEqual(self.stacked_reviews("t-B"), [], out)
-        self.assertEqual(self.entry("t-B")["needs"]["stacked"]["file"], "SHORT-REVIEW-t-B-stacked-1.md", out)
+        n = len(self.entry("t-B")["rebases"])  # joined on t-X's chain, then restacked: its second rebase
+        self.assertEqual(self.entry("t-B")["needs"]["stacked"]["file"], "SHORT-REVIEW-t-B-stacked-{}.md".format(n), out)
+        self.assertNotEqual(self.entry("t-B")["needs"]["stacked"]["file"], need["file"])
 
 
 class NoRule(MBase):
