@@ -336,6 +336,35 @@ class R2Tree(Run):
         found = pa_hooks.load_tool("pa_run").tree_to_run(pa_hooks, self.wt)
         self.assertFalse(found["patch"])
 
+    def test_r2d_a_same_size_edit_in_the_second_of_a_checkout_is_sent(self):
+        """t-130: an entry as new as the index file is racy, so git re-hashes it. The scratch index must keep the
+        real index's mtime, or git trusts the stat data and stages HEAD's blob for a same-size edit made in the same
+        second as the checkout that wrote the index."""
+        path = os.path.join(self.wt, "r.txt")
+        index = os.path.join(self.wt, sh(self.wt, "git", "rev-parse", "--git-path", "index"))
+        write(path, "racy-old\n")
+        sh(self.wt, "git", "add", "r.txt")
+        sh(self.wt, "git", "commit", "-q", "-m", "racy")
+        for _ in range(20):
+            while time.time() % 1 > 0.3:  # start early in a second, so checkout and edit fit in it
+                time.sleep(0.02)
+            write(path, "racy-mid\n")
+            sh(self.wt, "git", "checkout", "--", "r.txt")  # writes r.txt and the index, now
+            with open(path, "r+b") as f:  # same size, same inode, in place
+                f.write(b"racy-new\n")
+            if int(os.stat(index).st_mtime) == int(os.stat(path).st_mtime):
+                break
+        else:
+            self.fail("could not make the edit in the same second as the index write")
+        self.assertEqual(os.path.getsize(path), len(b"racy-old\n"))
+        second = int(os.stat(index).st_mtime)
+        while int(time.time()) <= second + 1:  # a copy of the index made now is newer than the entry
+            time.sleep(0.05)
+        found = pa_hooks.load_tool("pa_run").tree_to_run(pa_hooks, self.wt)
+        self.assertIn("r.txt", found["paths"])
+        patch = found["patch"] if isinstance(found["patch"], bytes) else found["patch"].encode()
+        self.assertIn(b"+racy-new", patch)
+
 
 class R3NoGitWrites(Run):
     def test_r3a_the_tree_alone_writes_nothing_under_git(self):
