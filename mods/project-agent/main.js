@@ -33,6 +33,8 @@ import { Awake } from "./awake.js";
 // t-145: the active states, in the order the profile line counts them (never parked or done).
 const ACTIVE = ["needs-decision", "in-progress", "investigating", "review", "queued"];
 const FINISHED_SHOWN = 10; // t-145: finished decisions and done tasks drawn before their Archived (n) row
+// t-157: a finished heading's counts: "10 shown · 190 archived", then " · 164 older not loaded" (cards the list left out).
+const finishedCounts = (shown, archived, notLoaded = 0) => `${shown} shown${archived > 0 ? ` · ${archived} archived` : ""}${notLoaded > 0 ? ` · ${notLoaded} older not loaded` : ""}`;
 const TASK_FOCUS = ["head", "top", "up", "down", "bottom", "next"]; // t-142: a task head's focus handles (wantTaskFocus)
 const OPEN_WAIT = 30000; // an Open request with nothing started by then: say why, offer the button again
 const OPEN_SLOW = 180000; // its new tab is recorded but its launcher has not started by then: say so
@@ -1705,7 +1707,7 @@ export default class ProjectAgent extends View {
             h_flex().id(`tasks-${s.state}`).h(24).px(4).gap(6).flex_none().items_center().cursor_pointer().text_size(11.5).text_color(t.dim).hover((x) => x.text_color(t.foreground))
               .on_click((_e, cx) => { folded ? this.folded.delete(s.state) : this.folded.add(s.state); cx.notify(); })
               .child(div().child(folded ? "▸" : "▾")).child(div().font_semibold().child(String(s.state ?? "no state").replace(/-/g, " ")))
-              .child(div().child(String(count))),
+              .child(div().child(capped ? finishedCounts(FINISHED_SHOWN, s.items.length - FINISHED_SHOWN) : String(count))), // t-157
             ...(folded ? [] : items.flatMap((i) => {
               if (i === "archived") return archived;
               if (i.kind !== "fold") return [row(i)];
@@ -1729,7 +1731,8 @@ export default class ProjectAgent extends View {
         .children(listed.map((c) => this.card(t, c, space)))
         .when(this.cards.missing > 0, (e) => e.child(note(`${this.cards.missing} card${this.cards.missing === 1 ? "" : "s"} could not be read now; the next load reads ${this.cards.missing === 1 ? "it" : "them"} again.`))) // t-131: never silently missing
         .when(answered.length > 0 || this.cards.omitted > 0, (e) => e.child(div().id("pa-older").px(4).py(4).text_size(11.5).text_color(t.dim).cursor_pointer().hover((s) => s.text_color(t.foreground))
-          .on_click((_e, cx) => { this.older = !this.older; cx.notify(); }).child(`${this.older ? "▾" : "▸"} ${answered.length} answered${this.cards.omitted > 0 ? ` · ${this.cards.omitted} older not shown` : ""}`)))
+          .on_click((_e, cx) => { this.older = !this.older; cx.notify(); }).child(`${this.older ? "▾" : "▸"} ${answered.length <= FINISHED_SHOWN && !(this.cards.omitted > 0) ? `${answered.length} answered` // t-157
+            : `answered · ${finishedCounts(Math.min(answered.length, FINISHED_SHOWN), answered.length - FINISHED_SHOWN, this.cards.omitted)}`}`)))
         // t-145: the 10 most recent finished cards; the rest, and decisions-archive/ (read on its open), behind Archived (n).
         .when(this.older, (e) => e.children(answered.slice(0, FINISHED_SHOWN).map((c) => this.card(t, c, space))))
         .when(this.older, (e) => e.child(this.archiveLine(t, space, Math.max(0, answered.length - FINISHED_SHOWN))))
