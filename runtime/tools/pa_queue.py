@@ -1923,6 +1923,8 @@ def merge_standing(ctx, data, rec, rule, binding, space_id):
             why = why or ff_merge(ctx, rec, e, e["tip"])
             if why:
                 stop_at(ctx, e, why, void, main_tip, lines)
+                if stop_cause(why, void):  # fix round 4: an R13 cause on a card entry stops the rule too; a wait waits
+                    stopped = "{}: {}".format(e["task"], why)
                 break
             merged_record(ctx, data, rec, e, main_tip, suite, lines)
             merged.append((e, False))
