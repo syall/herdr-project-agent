@@ -3169,7 +3169,8 @@ def leftover_targets(rows, me, tty, uid):
     by_pid = {r["pid"]: r for r in rows}
     spared = {me} | ancestors_of(me, by_pid) | descendants_of({me}, rows)
     first = {r["pid"] for r in rows if r.get("tty") == tty and r["pid"] not in spared}
-    chosen = first | (descendants_of(first, rows) - spared)
+    # Only a leftover it signals brings what it started; one of another uid (left, R1.5) does not (t-193 REVIEW M1).
+    chosen = first | (descendants_of({p for p in first if by_pid[p].get("uid") == uid}, rows) - spared)
     picked = [by_pid[p] for p in sorted(chosen)]
     return [r for r in picked if r.get("uid") == uid], [r for r in picked if r.get("uid") != uid]
 
@@ -4533,14 +4534,15 @@ def recover_targets(rows, space, ids, me):
     for r in rows:
         if r.get("uid") == uid and user_init(r, by_pid) and session_flag(r.get("argv"), ids):
             what.setdefault(r["pid"], "orphan")
-    for p in descendants_of(set(what), rows):
-        what.setdefault(p, "started by one")
-    ended = []
-    for p in sorted(what):
+    def ends(p):
         r = by_pid.get(p)
-        if not r or p in spared or r.get("uid") != uid or (own_group is not None and r.get("pgid") == own_group):
-            continue
-        ended.append(dict(r, what=what[p]))
+        return bool(r) and p not in spared and r.get("uid") == uid and not (own_group is not None
+                                                                           and r.get("pgid") == own_group)
+    # Only what is ended brings what it started: a spared or never-signalled one (a leader, an ancestor, own group,
+    # another uid) does not (t-193 REVIEW M1).
+    for p in descendants_of({p for p in what if ends(p)}, rows):
+        what.setdefault(p, "started by one")
+    ended = [dict(by_pid[p], what=what[p]) for p in sorted(what) if ends(p)]
     return {"ended": ended, "running": running}
 
 
