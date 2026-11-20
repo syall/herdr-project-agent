@@ -1702,6 +1702,29 @@ def conflict_regions(data, size=7):
     return regions
 
 
+def raw_blobs(raw, common, folder, shas):
+    """({key: file name}, {key: bytes}) of each (key, blob sha) written raw (git unpack-file: no filter, no attribute)
+    into folder. ContentError when one cannot be read."""
+    names, blobs = {}, {}
+    for key, sha in shas:
+        code, out, err = raw(folder, *(CONTENT_GIT + ("--git-dir=" + common, "unpack-file", sha)))
+        name = (out or "").strip()
+        if code or not re.match(r"^\.merge_file_[A-Za-z0-9_]+$", name):
+            raise ContentError("cannot read blob {} ({})".format(str(sha)[:7], clean(err)[-200:]))
+        names[key] = name
+        with open(os.path.join(folder, name), "rb") as f:
+            blobs[key] = f.read()
+    return names, blobs
+
+
+def union_pair(x, y):
+    """True when file entries x (before the rebase) and y (after) may be compared by content: status M on both, the
+    same regular modes, another base blob (t-052 J3c, t-086, t-116: one guard for union_only and commit_union)."""
+    return x.get("status") == "M" and y.get("status") == "M" and x.get("baseBlob") != y.get("baseBlob") and \
+        (x.get("baseMode"), x.get("tipMode")) == (y.get("baseMode"), y.get("tipMode")) and \
+        x.get("tipMode") in REGULAR_MODES and x.get("baseMode") in REGULAR_MODES
+
+
 def union_of(raw, common, mine, old, new, tip):
     """(order, regions) when blob tip is exactly `git merge-file --union` of the checked tip `mine` and the new base
     `new` over the old base `old`, in either order ("checked first": mine's lines first; "base first"), and the plain
@@ -1710,17 +1733,7 @@ def union_of(raw, common, mine, old, new, tip):
     attributes, no merge driver; nothing is written to the repository (t-052 J3c, V-U2)."""
     folder = tempfile.mkdtemp(prefix="pa-union-")
     try:
-        names = {}
-        for key, sha in (("mine", mine), ("old", old), ("new", new), ("tip", tip)):
-            code, out, err = raw(folder, *(CONTENT_GIT + ("--git-dir=" + common, "unpack-file", sha)))
-            name = (out or "").strip()
-            if code or not re.match(r"^\.merge_file_[A-Za-z0-9_]+$", name):
-                raise ContentError("cannot read blob {} ({})".format(str(sha)[:7], clean(err)[-200:]))
-            names[key] = name
-        blobs = {}
-        for key, name in names.items():
-            with open(os.path.join(folder, name), "rb") as f:
-                blobs[key] = f.read()
+        names, blobs = raw_blobs(raw, common, folder, (("mine", mine), ("old", old), ("new", new), ("tip", tip)))
         want = blobs["tip"]
         size = marker_size(*blobs.values())
         for order, (first, second) in (("checked first", ("mine", "new")), ("base first", ("new", "mine"))):
@@ -1747,33 +1760,38 @@ def union_of(raw, common, mine, old, new, tip):
 
 
 def commit_union(raw, common, x, y):
-    """True when file entry y (a commit's) makes x's change (the same commit before the rebase) by keeping both sides
-    of a conflict unchanged: status M on both, the same regular modes, another parent blob, and union_of finds y's
-    blob (t-086, RL-J3c-1)."""
-    if x.get("status") != "M" or y.get("status") != "M" or x.get("baseBlob") == y.get("baseBlob") or \
-            (x.get("baseMode"), x.get("tipMode")) != (y.get("baseMode"), y.get("tipMode")) or \
-            x.get("tipMode") not in REGULAR_MODES or x.get("baseMode") not in REGULAR_MODES:
-        return False
-    return bool(union_of(raw, common, x["tipBlob"], x["baseBlob"], y["baseBlob"], y["tipBlob"])[0])
+    """(order, regions) when file entry y (a commit's) makes x's change (the same commit before the rebase) by keeping
+    both sides of a conflict unchanged: union_pair, and union_of finds y's blob (t-086, RL-J3c-1); the regions are lines
+    of y's blob (t-116: listed for the short reviewer). Else None."""
+    if not union_pair(x, y):
+        return None
+    order, regions = union_of(raw, common, x["tipBlob"], x["baseBlob"], y["baseBlob"], y["tipBlob"])
+    return (order, regions) if order else None
 
 
 def union_only(run, raw, path, checked, now):
-    """(True, "", unions, shared) when now makes checked's change with a rebase conflict resolved by keeping both
+    """union_check's first four values: (ok, why, unions, shared)."""
+    return union_check(run, raw, path, checked, now)[:4]
+
+
+def union_check(run, raw, path, checked, now):
+    """(True, "", unions, shared, commit_unions) when now makes checked's change with a rebase conflict resolved by keeping both
     sides unchanged (d-166, t-052 J3c): the same paths; each differing file either moved only (same_lines: in shared)
     or a union: status M on both sides, the same regular modes, another base, and its tip blob exactly the
     merge-file --union of the checked tip and the new base (union_of); at least one union; the same commits (count,
     messages, paths), each the same, moved, or touching union files differently only as a union of its own
-    (commit_union, t-086: every commit is checked, not just the tip). unions: [{path, oldBase,
-    newBase, checkedTip, tip, order, regions}]. Else (False, why, [], []). Never raises; never clean alone: a short
-    reviewer judges that every region is only docstrings or comments."""
+    (commit_union, t-086: every commit is checked, not just the tip). unions: [{path, oldBase, newBase, checkedTip, tip, order, regions}]. commit_unions
+    (t-116, t-086 finding 1): [{commit, path, blob, regions, order}] of each commit's union, except one that is the tip's
+    own (the same blob and regions as a tip union): a one-commit union gives []. Else (False, why, [], [], []). Never
+    raises; never clean alone: a short reviewer judges that every region is only docstrings or comments."""
     try:
         a = {f.get("path"): f for f in checked.get("files") or [] if isinstance(f, dict)}
         b = {f.get("path"): f for f in now.get("files") or [] if isinstance(f, dict)}
         if set(a) != set(b):
-            return False, "the files touched differ", [], []
+            return False, "the files touched differ", [], [], []
         code, common, err = common_dir(run, path)
         if code or not common:
-            return False, "cannot find the repository's objects ({})".format(clean(err)[-200:]), [], []
+            return False, "cannot find the repository's objects ({})".format(clean(err)[-200:]), [], [], []
         unions, shared = [], []
         for p in sorted(x for x in a if isinstance(x, str)):
             x, y = a[p], b[p]
@@ -1782,43 +1800,51 @@ def union_only(run, raw, path, checked, now):
             if same_lines(run, path, x, y):
                 shared.append({"path": p, "oldBase": x["baseBlob"], "newBase": y["baseBlob"], "tip": y["tipBlob"]})
                 continue
-            if x.get("status") != "M" or y.get("status") != "M" or x.get("baseBlob") == y.get("baseBlob") or \
-                    (x.get("baseMode"), x.get("tipMode")) != (y.get("baseMode"), y.get("tipMode")) or \
-                    x.get("tipMode") not in REGULAR_MODES or x.get("baseMode") not in REGULAR_MODES:
-                return False, "{} changed".format(clean(p)), [], []
+            if not union_pair(x, y):
+                return False, "{} changed".format(clean(p)), [], [], []
             order, regions = union_of(raw, common, x["tipBlob"], x["baseBlob"], y["baseBlob"], y["tipBlob"])
             if not order:
-                return False, "{} changed ({})".format(clean(p), regions), [], []
+                return False, "{} changed ({})".format(clean(p), regions), [], [], []
             unions.append({"path": p, "oldBase": x["baseBlob"], "newBase": y["baseBlob"], "checkedTip": x["tipBlob"],
                            "tip": y["tipBlob"], "order": order, "regions": regions})
         if not unions:
-            return False, "no file is a conflict kept on both sides", [], []
+            return False, "no file is a conflict kept on both sides", [], [], []
         union_paths = {u["path"] for u in unions}
+        tip_own = {(u["path"], u["tip"], json.dumps(u["regions"])) for u in unions}
+        commit_unions = []
         ca, cb = checked.get("commits") or [], now.get("commits") or []
         if len(ca) != len(cb) or [c.get("message") for c in ca] != [c.get("message") for c in cb]:
-            return False, "the commits changed", [], []
+            return False, "the commits changed", [], [], []
         for x, y in zip(ca, cb):
             if x.get("raw") == y.get("raw"):
                 continue
             for sha in (x.get("sha"), y.get("sha")):
                 if not isinstance(sha, str) or not is_commit(run, path, sha):
-                    return False, "cannot compare the commits (one is not in the repository)", [], []
+                    return False, "cannot compare the commits (one is not in the repository)", [], [], []
             fx = {f["path"]: f for f in raw_files(run, path, x["sha"] + "^", x["sha"])}
             fy = {f["path"]: f for f in raw_files(run, path, y["sha"] + "^", y["sha"])}
             if set(fx) != set(fy):
-                return False, "the commits changed", [], []
-            for p in fx:
+                return False, "the commits changed", [], [], []
+            for p in sorted(fx):
                 if fx[p] == fy[p] or same_lines(run, path, fx[p], fy[p]):
                     continue
                 # t-086 (RL-J3c-1): a union file is checked in every commit that changes it otherwise, the same way
                 # as at the tip: that commit's blob must be the union of its old change on its new parent
-                if p not in union_paths or not commit_union(raw, common, fx[p], fy[p]):
-                    return False, "the commits changed ({})".format(clean(p)), [], []
-        return True, "", unions, shared
+                if p not in union_paths:
+                    return False, "the commits changed ({})".format(clean(p)), [], [], []
+                found = commit_union(raw, common, fx[p], fy[p])
+                if found:
+                    order, regions = found
+                    if (p, fy[p]["tipBlob"], json.dumps(regions)) not in tip_own:
+                        commit_unions.append({"commit": y["sha"], "path": p, "blob": fy[p]["tipBlob"],
+                                              "regions": regions, "order": order})
+                else:
+                    return False, "the commits changed ({})".format(clean(p)), [], [], []
+        return True, "", unions, shared, commit_unions
     except ContentError as e:
-        return False, str(e), [], []
+        return False, str(e), [], [], []
     except Exception as e:  # an unexpected answer: never a union
-        return False, "{}: {}".format(type(e).__name__, clean(e)[:200]), [], []
+        return False, "{}: {}".format(type(e).__name__, clean(e)[:200]), [], [], []
 
 
 def iso_at(ts):

@@ -406,8 +406,9 @@ def differing(a, b):
 
 def decide(ctx, checked, tip, onto, onto_tip):
     """R6, the shared-file rule and d-166: {result: clean|moved|union|changed|stale, files, why, record, shared,
-    unions, checked}."""
-    out = {"result": "changed", "files": [], "why": "", "record": None, "shared": [], "unions": [], "checked": checked.get("commit")}
+    unions, commitUnions, checked}. commitUnions (t-116): each commit's own union regions (pa_hooks.union_check)."""
+    out = {"result": "changed", "files": [], "why": "", "record": None, "shared": [], "unions": [], "commitUnions": [],
+           "checked": checked.get("commit")}
     if not tip or not onto_tip or ctx.merge_base(tip, onto_tip) != onto_tip:
         return dict(out, result="stale", why="it does not sit on the tip of {}".format(onto))
     now_rec = pa_hooks.content_record(ctx.run, ctx.repo, tip, onto)
@@ -423,10 +424,10 @@ def decide(ctx, checked, tip, onto, onto_tip):
     files = differing(seen, now_rec)
     if moved:
         return dict(out, result="moved", files=[s["path"] for s in shared], shared=shared)
-    union, uwhy, unions, ushared = pa_hooks.union_only(ctx.run, ctx.s.gate_git, ctx.repo, seen, now_rec)
+    union, uwhy, unions, ushared, cunions = pa_hooks.union_check(ctx.run, ctx.s.gate_git, ctx.repo, seen, now_rec)
     if union:  # d-166 (t-052 J3c): never clean alone, a doc-only short review decides
         return dict(out, result="union", files=sorted([u["path"] for u in unions] + [s["path"] for s in ushared]),
-                    shared=ushared, unions=unions)
+                    shared=ushared, unions=unions, commitUnions=cunions)
     return dict(out, files=files, why=pa_hooks.compare_records(seen, now_rec) or why)
 
 
@@ -504,6 +505,9 @@ def needs_for(ctx, entry, tip, decision, old_base, new_base, since=None):
     if decision.get("unions"):  # d-166 (t-052 J3c): the reviewer judges the conflict regions, lines of the tip's file
         need.update(kind="doc-only", checked=decision.get("checked"),
                     unions=[{"path": u["path"], "regions": u["regions"], "order": u["order"]} for u in decision["unions"]])
+        if decision.get("commitUnions"):  # t-116 (t-086 finding 1): a commit's union the tip no longer shows
+            need["commitUnions"] = [{"commit": c["commit"], "path": c["path"], "regions": c["regions"], "order": c["order"]}
+                                    for c in decision["commitUnions"]]
     return need
 
 
@@ -515,6 +519,9 @@ def handoff_lines(entry, need):
         lines.append("  {}: conflict regions at lines {} of {}:{} ({}); git diff {} {} -- {} (what the resolution added to "
                      "the checked change)".format(u["path"], ", ".join("{}-{}".format(a, b) for a, b in u["regions"]),
                                                   need["tip"], u["path"], u["order"], need.get("checked"), need["tip"], u["path"]))
+    for c in need.get("commitUnions") or []:
+        lines.append("  {} in commit {}: conflict regions at lines {} of {}:{} ({})".format(
+            c["path"], c["commit"], ", ".join("{}-{}".format(a, b) for a, b in c["regions"]), c["commit"], c["path"], c["order"]))
     if doc:
         lines.append("  question: " + DOC_QUESTION + "; then 'Verdict: pass' or 'Verdict: must fix (<n>)'.")
     for f in need["files"]:
