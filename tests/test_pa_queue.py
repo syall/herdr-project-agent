@@ -1487,6 +1487,81 @@ class T86HeldApproval(UBase):
         self.held_with(None)
 
 
+# ---- t-116: the union checks' limits from t-086 (REVIEW findings 1-2) ------------------------------------------
+
+class T116Union(UBase):
+    """t-086 finding 1: each commit's union regions go to the short reviewer."""
+
+    records = T86Limits.records
+
+    def manual(self, onto, texts):
+        """t-B-x rebuilt by hand on onto: one commit per text of a.txt (message 't-B a.txt', as the checked ones)."""
+        wt = self.trees["t-B"]
+        sh(wt, "git", "checkout", "-q", "-B", "t-B-x", onto)
+        shas = []
+        for text in texts:
+            write(os.path.join(wt, "a.txt"), text)
+            sh(wt, "git", "commit", "-q", "-am", "t-B a.txt")
+            shas.append(self.tip("t-B"))
+        return shas
+
+    def handoff(self, out):
+        """The handoff lines of verify's output: from 'a short review is needed' to 'the file has'."""
+        lines = out.splitlines()
+        first = next(i for i, l in enumerate(lines) if "a short review is needed" in l)
+        last = next(i for i in range(first, len(lines)) if lines[i].startswith("  the file has"))
+        return lines[first:last + 1]
+
+    def test_t1_a_commits_union_edited_away_later_is_listed(self):
+        """c1 changes line 2, c2 edits it again: c1' keeps both sides (lines 2-3 of c1'), c2' edits B's line; the tip's
+        union shows c2's text, so c1's regions are listed for the reviewer, by commit (t-086 finding 1)."""
+        self.task("t-A", [("a.txt", (2, "two A"))])
+        self.add("t-A")
+        self.task("t-B", [("a.txt", (2, "two B")), ("a.txt", (2, "two B2"))])
+        checked_tip = self.tip("t-B")
+        self.assertIn("needs a rebase worker onto t-A-x", self.add("t-B", ok=False)[2])
+        c1, c2 = self.manual(self.ref("t-A-x"), [union_text("two B", "two A"), union_text("two B2", "two A")])
+        code, out, err = self.verify("t-B")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn(": union", out)
+        self.assertIn("  a.txt in commit {}: conflict regions at lines 2-3 of {}:a.txt (checked first)".format(c1, c1), out)
+        run, checked, now = self.records("t-B", checked_tip, "t-A-x")
+        ok, why, unions, shared, commits = pa_hooks.union_check(run, pa_hooks.git, self.proj, checked, now)
+        self.assertTrue(ok, why)
+        self.assertEqual([(u["path"], u["regions"]) for u in unions], [("a.txt", [[2, 3]])])
+        blob = sh(self.proj, "git", "rev-parse", c1 + ":a.txt")
+        self.assertEqual(commits, [{"commit": c1, "path": "a.txt", "blob": blob, "regions": [[2, 3]], "order": "checked first"}])
+        self.assertEqual(pa_hooks.union_only(run, pa_hooks.git, self.proj, checked, now), (ok, why, unions, shared))
+        self.gate("t-B")
+        self.add("t-B")
+        need = self.entry("t-B")["needs"]["shortReview"]
+        self.assertEqual(need["kind"], "doc-only")
+        self.assertEqual(need["commitUnions"], [{"commit": c1, "path": "a.txt", "regions": [[2, 3]], "order": "checked first"}])
+
+    def test_t1b_a_one_commit_union_keeps_the_handoff(self):
+        """The tip's own union is not listed twice: the handoff is the one before t-116, line for line."""
+        self.task("t-A", [("a.txt", (2, "two A"))])
+        self.add("t-A")
+        self.task("t-B", [("a.txt", (2, "two B"))])
+        checked_tip = self.tip("t-B")
+        self.assertIn("needs a rebase worker onto t-A-x", self.add("t-B", ok=False)[2])
+        tip = self.resolve("t-B", "t-A-x", "a.txt", union_text("two B", "two A"))
+        code, out, err = self.verify("t-B")
+        self.assertEqual(code, 0, out + err)
+        onto = self.ref("t-A-x")
+        self.assertEqual(self.handoff(out), [
+            "t-B: a short review is needed (doc-only: a conflict kept on both sides, d-166): a fresh reviewer writes "
+            "evidence/t-B/SHORT-REVIEW-t-B-1.md",
+            "  a.txt: conflict regions at lines 2-3 of {}:a.txt (checked first); git diff {} {} -- a.txt (what the "
+            "resolution added to the checked change)".format(tip, checked_tip, tip),
+            "  question: " + pa_queue.DOC_QUESTION + "; then 'Verdict: pass' or 'Verdict: must fix (<n>)'.",
+            "  a.txt: git diff {} {} -- a.txt (the base's change); git diff {} {} -- a.txt (the change); none within 30 "
+            "lines".format(self.ref("main"), onto, onto, tip),
+            "  the file has the lines Start: <UTC time>, End: <UTC time>, Reviewer: <its address>, Checked: {}, and its "
+            "Verdict: line".format(tip)])
+        self.assertNotIn("in commit", out)
+
+
 # ---- t-176: a short review of a branch rebased outside the queue counts ------------------------------------
 
 class O176Base(UBase):
