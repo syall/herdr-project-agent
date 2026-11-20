@@ -5915,7 +5915,7 @@ cases["A7-script-fake-caffeinate"] = async () => { // VP1, VP2: the real script,
 // pane, tab, layout slot or overlay goes, or Herdr quits). Only the lease holder stops it; fakes only (__execFn). ----
 const t065Close = async (v) => { check(typeof v.close === "function", "the view has close(cx)"); await v.close(cx); await settle(); };
 
-cases["A9-close-stops-the-hold"] = awWrap(async () => {
+cases["A10-close-stops-the-hold"] = awWrap(async () => {
   awSetup();
   const v = await mount(); awHold(v);
   await fire(1000);
@@ -5927,7 +5927,7 @@ cases["A9-close-stops-the-hold"] = awWrap(async () => {
   check(g.localStorage.getItem("project-agent.awake") !== "off", "the toggle stays on (a later copy holds it again)");
 });
 
-cases["A9-close-a-start-in-flight"] = awWrap(async () => { // the holder closes before its first start answered: still stopped
+cases["A10-close-a-start-in-flight"] = awWrap(async () => { // the holder closes before its first start answered: still stopped
   awSetup({ reply: (act) => (act === "start" ? new Promise(() => {}) : { code: 0, stdout: "off\n", stderr: "" }) });
   const v = await mount(); awHold(v);
   await fire(1000);
@@ -5936,7 +5936,7 @@ cases["A9-close-a-start-in-flight"] = awWrap(async () => { // the holder closes 
   check(c.length === 2 && c[0][0] === "start" && c[1][0] === "stop", `a stop while the start has not answered (got ${JSON.stringify(c)})`);
 });
 
-cases["A9-close-not-the-holder"] = awWrap(async () => { // another copy closing leaves the holder's hold alone
+cases["A10-close-not-the-holder"] = awWrap(async () => { // another copy closing leaves the holder's hold alone
   awSetup();
   const v = await mount(), w = await mount(); awHold(v);
   await fire(1000);
@@ -5944,7 +5944,7 @@ cases["A9-close-not-the-holder"] = awWrap(async () => { // another copy closing 
   check(awCalls().length === 1, `no stop from a copy without the lease (got ${JSON.stringify(awCalls())})`);
 });
 
-cases["A9-close-while-off"] = awWrap(async () => { // turned off: already stopped, close runs nothing more
+cases["A10-close-while-off"] = awWrap(async () => { // turned off: already stopped, close runs nothing more
   awSetup({ storage: awFakeStorage({ "project-agent.awake": "off" }) });
   const v = await mount(); awHold(v);
   await fire(1000);
@@ -5953,7 +5953,7 @@ cases["A9-close-while-off"] = awWrap(async () => { // turned off: already stoppe
   check(awCalls().length === n, `nothing more on close while off (got ${JSON.stringify(awCalls())})`);
 });
 
-cases["A9-close-not-macos"] = awWrap(async () => {
+cases["A10-close-not-macos"] = awWrap(async () => {
   awSetup({ platform: "linux" });
   const v = await mount(); awHold(v);
   await t065Close(v);

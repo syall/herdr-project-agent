@@ -1538,6 +1538,10 @@ export default class ProjectAgent extends View {
       .when(Boolean(this.failed[entry.id]), (el) => el.child(div().text_size(11.5).text_color(t.blocked).child(this.failed[entry.id])));
   }
 
+  // t-065 (t-060 RL-2): Herdr's one final call when it closes this copy (its block leaves the layout, the mod is turned
+  // off, or Herdr quits): the keep-awake hold this copy keeps ends with it (awake.js). Dialog copies have none.
+  async close(_cx) { await this.awake?.close(); }
+
   render(cx) {
     if (this.worker) return this.worker.render();
     if (this.setup) return this.setup.render();

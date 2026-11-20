@@ -1,6 +1,8 @@
 // Keep awake (t-060): while Herdr runs on a Mac and the toggle is on, one `caffeinate -d -i -u -w <Herdr's pid>` holds
 // the Mac awake: no idle sleep (-i), no display sleep or dimming and so no automatic lock (-d), the user counted active
-// (-u). A lock by hand still works (an assertion only stops idle timers). It ends when Herdr quits or crashes (-w).
+// (-u). A lock by hand still works (an assertion only stops idle timers). It ends when Herdr quits or crashes (-w),
+// and when Herdr closes the copy holding it (t-065: View.close, the mod's unload hook: its block leaves the layout, or
+// the mod is turned off); another copy that takes the lease starts it again.
 // One hold per machine: only the copy holding the timer lease runs the script, and the script itself keeps at most one
 // caffeinate for Herdr's pid (pgrep on its exact arguments). The toggle is on by default, kept in localStorage (it
 // survives a restart) and mirrored to shared AWAKE so every copy sees a click at once. Off macOS it does nothing.
@@ -82,6 +84,17 @@ export class Awake {
       setShared(AWAKE_STATE, ok ? { state: on ? "held" : "off", at: Date.now() } : { state: "failed", on, why, at: Date.now() });
       cx.notify?.();
     }, { what: "the keep-awake call", background: false });
+  }
+
+  // t-065 (t-060 RL-2): from main.js's close(cx), Herdr's one final call for this copy. The lease holder stops the hold
+  // (unless its last answer was off), a start not answered yet included: one stop, awaited directly, short timeout
+  // (the host allows 250 ms; an exec already started keeps running). The toggle is not changed.
+  async close() {
+    if (!this.mine() || !isMac() || this.applied === false) return;
+    this.applied = false; this.failed = null;
+    let r;
+    try { r = await hostRun("sh", ["-c", SCRIPT, "sh", "stop", OWNER, CAFFEINATE], { timeout: 2000 }, this.host); } catch { return; }
+    if (!gaveUp(r) && r?.code === 0) setShared(AWAKE_STATE, { state: "off", why: "the panel closed", at: Date.now() });
   }
 
   // The panel's toggle: kept for restarts, shown to every copy at once; the holder acts in its next tick (this one now).
