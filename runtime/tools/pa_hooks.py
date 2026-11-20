@@ -2829,9 +2829,10 @@ def worktrees_cards(directory, listing=None):
     return cards
 
 
-def next_batch_id(directory):
-    """The first d-wt-batch-<n> above every one held in decisions/ or the archive: ids are never reused."""
-    used = [int(c[len(BATCH):]) for c in card_listing(directory) if is_batch_id(c)]
+def next_batch_id(directory, listing=None):
+    """The first d-wt-batch-<n> above every one held in decisions/ or the archive: ids are never reused. listing: the
+    run's card_listing (a batch card is only ever added by this run after it)."""
+    used = [int(c[len(BATCH):]) for c in (card_listing(directory) if listing is None else listing) if is_batch_id(c)]
     return BATCH + str(1 + max(used or [0]))
 
 
@@ -3008,11 +3009,13 @@ def batch_options(shown):
     return options, options[0]["label"] if k else options[-1]["label"]
 
 
-def open_worktrees_card(directory, candidates, profile, old=None):
+def open_worktrees_card(directory, candidates, profile, old=None, listing=None):
     """Writes one batch card for two or more candidates (R1-R3, R10): their items in task order, then job; the open
     single cards of the ones on it are withdrawn (moved to it, R8). old: the batch card it replaces (carried)."""
     ordered = sorted(candidates, key=lambda c: (task_key(c["owner"][0]), str(c["owner"][1])))
-    cid = next_batch_id(directory)
+    cid = next_batch_id(directory, listing)
+    if listing is not None:
+        listing.add(cid)
     built = [worktree_item(directory, c, profile, cid) for c in ordered[:BATCH_MAX]]
     shown, context = worktrees_card_text([b[0] for b in built], len(ordered))
     for (item, text_), c in zip(built[:len(shown)], ordered):
@@ -3059,7 +3062,7 @@ def finish_candidates(directory, candidates, leaving, profile, open_cards, listi
     its worktrees are the candidates (new ones wait when it is full); else it is withdrawn and one card is opened for all
     of them, a single card when only one is left."""
     old = None
-    for cid, card in sorted(worktrees_cards(directory).items(), key=lambda x: task_key(x[0])):
+    for cid, card in sorted(worktrees_cards(directory, listing).items(), key=lambda x: task_key(x[0])):
         if card.get("status") != "open":
             continue
         keys = {(c["row"]["path"], c["row"]["facts"].get("branch") or None) for c in candidates}
@@ -3096,7 +3099,12 @@ def finish_candidates(directory, candidates, leaving, profile, open_cards, listi
             print("{}; --open-cards puts it on one card with the other {}".format(
                 c["line"] if not c.get("single") else "{}: card {} is open".format(c["owner"][0], c["single"][0]), len(candidates) - 1))
         return
-    open_worktrees_card(directory, candidates, profile, old)
+    if old is None:  # the person's earlier words on these worktrees stay in sight (carried): the newest withdrawn card's
+        paths = {c["row"]["path"] for c in candidates}
+        held = [(str(c.get("answered") or ""), c) for c in worktrees_cards(directory, listing).values() if c.get("status") == "withdrawn"
+                and c.get("previousAnswer") is not None and any(os.path.realpath(str(i.get("path"))) in paths for i in c["items"])]
+        old = max(held, key=lambda x: x[0])[1] if held else None
+    open_worktrees_card(directory, candidates, profile, old, listing)
 
 
 # ---- worktrees no task records (t-020 J4, spec R4, R5) ---------------------------------------------
@@ -3489,18 +3497,23 @@ def cmd_worktree(args):
             else:
                 # Every task is done or parked and nothing runs inside: a candidate, however its workers ended.
                 candidates.append(dict(cand, rule="a", line="{}: candidate, every task done or parked ({})".format(task, gone)))
-        finish_candidates(directory, candidates, leaving, profile, args.open_cards)
-        withdraw_stale(directory, rows, entries, args.open_cards, card_listing(directory))
+        finish_candidates(directory, candidates, leaving, profile, args.open_cards, listing)
+        withdraw_stale(directory, rows, entries, args.open_cards, listing)
         if not rows:
             print("No task in the ledger has a worktree.")
         check_unrecorded(directory, agent, profile, rows, args.open_cards)
         return
     # remove: only what an answered card allows, re-checked now.
+    if getattr(args, "card", None):
+        return remove_card(directory, agent, profile, args.card)
     row = pick_row(rows, args.task, args.job)
     owner = card_owner(row)
     task, job, main = owner
     _cid, path, card = card_for(directory, row, task, entries.get(task), listing)
     card = card or {}
+    if card.get("batch"):
+        raise pa.Problem("{} is on card {} ({}); run `pa-worktree remove --card {}`: it removes each worktree on it through "
+                         "these checks. Nothing was removed".format(row["path"], card["id"], card.get("status"), card["id"]))
     if card.get("status") != "answered":
         refuse_others(directory, row, task, entries.get(task), listing)
     if card.get("status") == "answered" and pa.is_other(card):
@@ -3512,10 +3525,23 @@ def cmd_worktree(args):
         raise pa.Problem("no answered \"Delete\" decision card for this worktree (run `pa-worktree check --open-cards`; the person answers it)")
     if os.path.realpath(card.get("worktree") or "") != row["path"]:
         raise pa.Problem("the card is for {}, not {}".format(card.get("worktree"), row["path"]))
+    remove_one(directory, row, card, path, owner, profile)
+    return 0
+
+
+class RemoveFailed(pa.Problem):
+    """The removal itself failed (git or the profile's script refused): not a check that stopped it."""
+
+
+def remove_one(directory, row, card, path, owner, profile):
+    """Removes one worktree on its answered Delete card (a single card, or a batch item's view), after every check made
+    again now; raises pa.Problem (RemoveFailed when the removal itself failed) and removes nothing on a failed check.
+    True when removed, None when it was already gone. path: the card's file."""
+    task, job, main = owner
     facts = row["facts"]
     if not facts:
         print("Already gone: " + row["path"])
-        return
+        return None
     if facts.get("unreadable"):
         raise pa.Problem("could not read {} ({}); nothing was removed".format(row["path"], facts["unreadable"]))
     if facts.get("main"):
@@ -3555,27 +3581,192 @@ def cmd_worktree(args):
         raise pa.Problem(changed + "; the card is withdrawn and the next `pa-worktree check --open-cards` asks again. Nothing was removed")
     try:
         done = remove_worktree(row["path"], facts)
-    except pa.Problem:
+    except pa.Problem as e:
         if not os.path.lexists(row["path"]):  # it failed, but the folder is gone: the ledger must not name it
             spend_card(directory, path, card)
             mark_removed_everywhere(directory, row, "the worktree {} is gone after a failed removal (card {})".format(row["path"], card["id"]))
-        raise
+        raise RemoveFailed(str(e))
     spend_card(directory, path, card)
     print(done + " (card {})".format(card["id"]))
     tidy = remove_container(row["given"])
     if tidy:
         print(tidy)
     mark_removed_everywhere(directory, row, "removed the worktree {} (card {})".format(row["path"], card["id"]))
+    return True
+
+
+@contextlib.contextmanager
+def worktree_lock(directory):
+    """One pa-worktree remove --card or --standing at a time per space (R11): <state>/.worktree.lock, waited for up to
+    WORKTREE_LOCK_WAIT seconds; then refused, nothing removed."""
+    import fcntl
+    with open(os.path.join(directory, WORKTREE_LOCK), "a") as lock:
+        deadline = time.monotonic() + WORKTREE_LOCK_WAIT
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise pa.Problem("another pa-worktree remove is running (it holds {}); nothing was removed. Run it again once "
+                                     "that one has ended".format(os.path.join(directory, WORKTREE_LOCK)))
+                time.sleep(0.1)
+        yield
+
+
+def refresh_busy(row, agent, profile):
+    """Reads a row's facts, its workers' state and the other terminals in it again, right before it is removed (R5)."""
+    row["facts"] = worktree_facts(row["path"], profile)
+    for w in row["workers"]:
+        if pa.hc_get(w.get("address")).get("state") == "live":
+            w["fate"] = "live"
+    mine = {w["address"] for w in row["workers"]}
+    live = pa.live_terminals() or {}
+    row["others"] = sorted(a for a, info in live.items() if a not in mine and a != agent.get("terminal") and (
+        inside(info.get("cwd"), row["path"]) or inside((info.get("foreground") or {}).get("cwd"), row["path"])))
+
+
+def answered_batch(directory, cid):
+    """(path, card) of an answered batch card that pa-worktree remove --card may act on, or a refusal (R4, R7)."""
+    path = pa.card_file(directory, cid) if is_batch_id(cid) else None
+    card = pa.read_json_safe(path) if path else None
+    if not isinstance(card, dict) or card.get("kind") != "worktrees" or not isinstance(card.get("items"), list):
+        raise pa.Problem("no batch card {}; nothing was removed".format(cid))
+    if card.get("status") == "open":
+        raise pa.Problem("card {} is not answered yet; the person answers it in the panel. Nothing was removed".format(cid))
+    if card.get("status") != "answered":
+        raise pa.Problem("card {} is {}; nothing was removed".format(cid, card.get("status")))
+    if "in conversation" in str(card.get("answeredBy") or ""):
+        raise pa.Problem("card {} is answered in the panel only; nothing was removed".format(cid))
+    if pa.is_other(card):
+        raise pa.Problem('card {id} was answered Other, in the person\'s own words: "{words}". pa-worktree removes nothing on it. '
+                         'Act on their words; if they ask for the worktrees to go, withdraw the card (pa-decide {id} --withdraw '
+                         '--why "<reason>") and the next pa-worktree check --open-cards asks again.'.format(
+                             id=cid, words=cut(clean(card.get("note")), 200)))
+    if str(card.get("note") or "").strip():
+        # A note is never read: it could name a worktree to keep in any words. Remove nothing and ask again (as d-leftovers).
+        words = cut(clean(card["note"]), 200)
+        pa.keep_previous(card, card.get("answer"))
+        card.update(status="withdrawn", answer=None, answered=pa.now(), answeredBy="pa-worktree remove: withdrawn",
+                    note="Withdrawn by pa-worktree remove: it was answered with a note")
+        pa.write_card(directory, path, card)
+        append_journal(directory, {"by": "agent" if by_an_agent() else "person", "trigger": "worktree", "task": None,
+                                   "why": "withdrew card {}: it was answered with a note ({}); nothing was removed".format(cid, words)})
+        raise pa.Problem('card {} has a note, so nothing was removed: "{}". The note is not read. Ask the person to say "keep tNN" '
+                         'for each worktree to keep (then set keep on it); the next pa-worktree check --open-cards asks again on '
+                         'a new card'.format(cid, words))
+    if answer_scope(card) is None:
+        raise pa.Problem("card {} was answered {!r}, which is none of its options; nothing was removed".format(cid, card.get("answer")))
+    return path, card
+
+
+def remove_card(directory, agent, profile, cid):
+    """pa-worktree remove --card <batch id> (R5, R6): each worktree the answer covers, through every check that
+    pa-worktree remove <task> makes, read now and again right before each one. One that fails a check is skipped and
+    listed (and asked again when it changed); the others are removed. 0 when nothing was skipped or failed this run."""
+    with worktree_lock(directory):
+        path, card = answered_batch(directory, cid)
+        scope = answer_scope(card)
+        if scope == "keep":
+            print("card {} answered {!r}: nothing is removed; none of them is asked about again".format(cid, card.get("answer")))
+            return 0
+        rows = worktree_state(directory, agent, profile)
+        entries = ledger_tasks(directory)
+        covered = removed = 0
+        names, skipped, already, earlier = [], [], [], []
+        for i in range(len(card["items"])):
+            card = pa.read_json(path)
+            item = card["items"][i]
+            label = item_who(item)
+            if scope == "lossless" and not item.get("lossless"):
+                continue
+            covered += 1
+            if item.get("removed"):
+                print("{}: already removed ({})".format(label, clean(item["removed"])))
+                already.append(label)
+                continue
+            if item.get("withdrawn"):
+                print("{}: skipped earlier ({}); the next card asks about it again".format(label, cut(clean(item["withdrawn"]), 200)))
+                earlier.append(label)
+                continue
+            view = item_view(cid, card, i)
+            real = os.path.realpath(os.path.expanduser(str(item.get("path") or "/nonexistent")))
+
+            def skip(why, withdraw=False):
+                why = cut(clean(why), 300)
+                update_item(directory, view, skipped=why, **({"withdrawn": why} if withdraw else {}))
+                skipped.append("{} ({})".format(label, why))
+                print("{}: skipped: {}".format(label, why))
+            spent = card_spent(view, entries.get(item.get("task")))
+            if spent:
+                skip("the ledger records it removed after the card ({}); a worktree there now gets its own card".format(spent), True)
+                continue
+            row = rows.get(real)
+            if row is None:
+                if not os.path.lexists(real):
+                    update_item(directory, view, removed=pa.now(), skipped=None)
+                    print("{}: already gone: {}".format(label, real))
+                    removed += 1
+                    names.append(label)
+                else:
+                    skip("no task records {} now".format(real), True)
+                continue
+            refresh_busy(row, agent, profile)
+            if not row["facts"]:
+                update_item(directory, view, removed=pa.now(), skipped=None)
+                print("{}: already gone: {}".format(label, real))
+                mark_removed_everywhere(directory, row, "the worktree {} is already gone (card {})".format(real, cid))
+                removed += 1
+                names.append(label)
+                continue
+            differs = branch_differs(view, row["facts"])
+            if differs:
+                skip(differs, True)
+                continue
+            owner = card_owner(row)
+            if owner[0] != item.get("task"):
+                skip("its card is {}'s now".format(clean(owner[0])), True)
+                continue
+            try:
+                done = remove_one(directory, row, view, path, owner, profile)
+            except RemoveFailed as e:
+                skip("failed: {}".format(e))
+                continue
+            except pa.Problem as e:
+                skip(str(e))  # remove_one withdrew the item when the person must be asked again
+                continue
+            if done:
+                removed += 1
+                names.append(label)
+        line = "Removed {} of {} on card {}: {}".format(removed, covered, cid, ", ".join(names) or "none")
+        if already:
+            line += "; already removed {}: {}".format(len(already), ", ".join(already))
+        if earlier:
+            line += "; skipped earlier {}: {}".format(len(earlier), ", ".join(earlier))
+        if skipped:
+            line += "; skipped {}: {}; the next pa-worktree check --open-cards asks again about the ones that changed".format(
+                len(skipped), ", ".join(skipped))
+        print(line)
+        return 1 if skipped else 0
 
 
 def spend_card(directory, path, card):
     """After its worktree is removed (or gone after a failed removal), the card never counts again (t-073 R3b)."""
     card["worktreeRemoved"] = pa.now()
+    if card.get("batch"):
+        update_item(directory, card, removed=card["worktreeRemoved"], skipped=None)
+        return
     pa.write_card(directory, path, card)
 
 
 def withdraw_answered(directory, path, card, task, why):
-    """pa-worktree remove withdraws an answered card that no longer stands; the next check asks again."""
+    """pa-worktree remove withdraws an answered card that no longer stands; the next check asks again. A batch item's
+    view: that item only (its `withdrawn`), the card and its other items stay as they are."""
+    if card.get("batch"):
+        update_item(directory, card, withdrawn=why)
+        append_journal(directory, {"by": "agent" if by_an_agent() else "person", "trigger": "worktree", "task": task,
+                                   "why": "withdrew {} on card {}: {}".format(card.get("worktree"), card["id"], why)})
+        return
     pa.keep_previous(card, card.get("answer"))
     card.update(status="withdrawn", answer=None, answered=pa.now(),
                 answeredBy="pa-worktree remove: withdrawn", note="Withdrawn by pa-worktree remove: " + why)
@@ -5265,11 +5456,17 @@ def main():
         parser.add_argument("task", nargs="?")
         parser.add_argument("--open-cards", action="store_true", help="open a decision card for each candidate")
         parser.add_argument("--job", help="remove: the job whose worktree to remove (default: the task's main worktree)")
+        parser.add_argument("--card", help="remove: every worktree on this answered batch card d-wt-batch-<n> (t-168)")
         parser.add_argument("--space")
         args = parser.parse_args()
-        if args.action == "remove" and not args.task:
-            raise pa.Problem("pa-worktree remove needs a task id")
-        return cmd_worktree(args)
+        if args.action == "remove" and sum(map(bool, (args.task, args.card))) != 1:
+            raise pa.Problem("pa-worktree remove needs a task id, or --card <id>")
+        if args.card and (args.action != "remove" or args.job):
+            raise pa.Problem("--card is for pa-worktree remove, with nothing else")
+        code = cmd_worktree(args)
+        if code:
+            sys.exit(code)
+        return code
     if kind == "pa-worker":
         parser.add_argument("action", choices=("info", "delete", "close", "keep"))
         parser.add_argument("address", nargs="?")

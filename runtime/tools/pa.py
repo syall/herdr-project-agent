@@ -4860,6 +4860,8 @@ def decide_card(directory, path, args):
     else:
         if card.get("worktree"):
             raise Problem("a card that deletes a worktree is answered in the panel, not in conversation")
+        if card.get("kind") == "worktrees":
+            raise Problem("a card that deletes worktrees is answered in the panel, not in conversation")
         if card.get("push") or card.get("kind") == "push":
             raise Problem("a push card is answered in the panel, not in conversation (its answer runs the push)")
         if pushing_queue_card(card):
