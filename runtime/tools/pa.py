@@ -47,6 +47,7 @@ import select
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -698,10 +699,105 @@ def context_notes(directory, ledger, environ=None):
                     handoffs.append("worker {} ({} {}) has no handoff file {}".format(
                         w.get("address"), t.get("id"), os.path.basename(expected)[len("handoff-"):-len(".md")],
                         os.path.relpath(expected, directory)))
-        for group in (due, handoffs):
+        blocks = []
+        for t in tasks:
+            for w in t.get("workers") or [] if isinstance(t.get("workers"), list) else []:
+                if isinstance(w, dict) and not w.get("finished"):
+                    found, expected = handoff_file(directory, t.get("id"), w)
+                    why = handoff_block(directory, t.get("id"), found) if found else None
+                    if why:
+                        blocks.append("worker {} ({} {}) handoff {}".format(
+                            w.get("address"), t.get("id"), os.path.basename(expected)[len("handoff-"):-len(".md")], why))
+        for group in (due, handoffs, blocks):
             notes.extend(group[:5])
             if len(group) > 5:
                 notes.append("and {} more".format(len(group) - 5))
+    except Exception:  # noqa: BLE001 - notes only
+        pass
+    notes.extend(rules_notes(directory, ledger))
+    return notes
+
+
+RULES_BLOCK = "Space rules for this job"  # the first words of pa-handoff's rules block (t-190 R3, R7)
+HANDOFF_READ_MAX = 64 * 1024  # bytes pa-doctor reads of a handoff (t-190 H13)
+
+
+def handoff_block(directory, task_id, path):
+    """None when the handoff at path has a line starting RULES_BLOCK; else what pa-doctor notes: 'has no rules block'
+    or 'not read (<why>)' (a symlink, outside evidence/<task>/, not a file, over HANDOFF_READ_MAX, not UTF-8)."""
+    folder = os.path.realpath(os.path.join(directory, "evidence", str(task_id)))
+    if os.path.islink(path):
+        return "not read (a symlink)"
+    if os.path.dirname(os.path.realpath(path)) != folder:
+        return "not read (outside evidence/{}/)".format(task_id)
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    except OSError as e:
+        return "not read ({})".format(e.strerror or type(e).__name__)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            return "not read (not a file)"
+        if st.st_size > HANDOFF_READ_MAX:
+            return "not read (over 64 KB)"
+        data = os.read(fd, HANDOFF_READ_MAX + 1)
+    finally:
+        os.close(fd)
+    if len(data) > HANDOFF_READ_MAX:
+        return "not read (over 64 KB)"
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return "not read (not UTF-8)"
+    if any(line.startswith(RULES_BLOCK) for line in text.splitlines()):
+        return None
+    return "has no rules block"
+
+
+def rules_notes(directory, ledger):
+    """pa-doctor's notes on rules.json (t-190 R6, H4): the active rules (id, appliesTo, title), duplicate ids, and the
+    rules with a history entry later than the checkpoint's `at` (I1: strictly later; a time not in the UTC Z form is
+    listed 'time unreadable', H8). Nothing when rules.json gives no rules list (pa-doctor has that problem).
+    Notes only; never raises."""
+    notes = []
+    try:
+        active, why = read_rules(directory)
+        if why:
+            return notes
+        listed = []
+        for r in active:
+            target = one_line(r.get("appliesTo"), 30) or "all"
+            title = one_line(r.get("title"), RULE_TITLE_MAX)
+            listed.append("{} ({}){}".format(r["id"], target, ": " + title if title else ""))
+        notes.append(capped_list("rules: {} active: ".format(len(active)) if active else "rules: 0 active", listed,
+                                 "", RULES_LINE_MAX))
+        rules = [r for r in read_json(os.path.join(directory, "rules.json"), {})["rules"] if isinstance(r, dict)
+                 and isinstance(r.get("id"), str) and RULE_ID.match(r["id"])]
+        seen, dup = set(), []
+        for r in rules:
+            if r["id"] in seen and r["id"] not in dup:
+                dup.append(r["id"])
+            seen.add(r["id"])
+        notes.extend("rules: duplicate id {}".format(rid) for rid in dup[:5])
+        ctx = as_dict(ledger).get("context")
+        if ctx is None or checkpoint_problems(ctx):
+            notes.append("rules: no checkpoint; read every active rule")
+            return notes
+        since = parse_time(ctx["at"])
+        changed = []
+        for r in rules:
+            for h in r.get("history") if isinstance(r.get("history"), list) else []:
+                if not isinstance(h, dict):
+                    continue
+                at = parse_time(h["at"]) if isinstance(h.get("at"), str) else None
+                if at is None:
+                    changed.append("{} time unreadable".format(r["id"]))
+                elif at > since:
+                    change = one_line(h.get("change") if isinstance(h.get("change"), str) else h.get("what"), 30)
+                    changed.append("{} {} {}".format(r["id"], change or "changed", h["at"]))
+        if changed:
+            notes.append(capped_list("rules changed since your checkpoint ({}): ".format(ctx["at"]), changed, "",
+                                     RULES_LINE_MAX))
     except Exception:  # noqa: BLE001 - notes only
         pass
     return notes
@@ -4575,18 +4671,24 @@ def cmd_doctor(args):
             return None
         try:
             with open(path) as f:
-                return json.load(f)
+                value = json.load(f)
         except ValueError as e:
             problems.append("{}: not valid JSON ({})".format(name, e))
             return None
+        if not isinstance(value, dict):  # t-190 H1: `[]` is JSON, but no file here is a list
+            problems.append("{}: not an object".format(name))
+            return None
+        return value
 
     ledger = load("ledger.json")
     if ledger is not None:
         if not isinstance(ledger.get("tasks"), list):
             problems.append("ledger.json: no tasks list")
         else:
-            ids = [t.get("id") for t in ledger["tasks"]]
-            for t in ledger["tasks"]:
+            for t in [t for t in ledger["tasks"] if not isinstance(t, dict)]:
+                problems.append("ledger.json: task {!r} is not an object".format(t))
+            ids = [t.get("id") for t in ledger["tasks"] if isinstance(t, dict)]
+            for t in [t for t in ledger["tasks"] if isinstance(t, dict)]:
                 if not t.get("id") or t.get("state") not in states:
                     problems.append("ledger.json: task {!r} has state {!r}".format(t.get("id"), t.get("state")))
             if len(ids) != len(set(ids)):
