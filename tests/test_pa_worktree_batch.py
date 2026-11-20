@@ -857,6 +857,71 @@ class RuleInForce(Standing):
         write(os.path.join(self.dir, "journal.jsonl"), "")
 
 
+class NoteStops(Standing):
+    """R13, R15, R7 (round 3 MF1): a panel note on a worktree card stops the rule, answered or then withdrawn or asked
+    again, so remove --card's withdrawal never lets the next standing run delete what the note said to keep."""
+
+    def two_on_a_batch(self, scope, note):
+        self.clean("t-003")
+        self.clean("t-004")
+        self.check()
+        self.answer("d-wt-batch-1", self.label("d-wt-batch-1", scope), note=note)
+
+    def test_v13_11b_keep_all_with_a_note_then_remove_card_then_standing(self):  # probe A
+        self.two_on_a_batch("keep", "keep t-004")
+        self.assertEqual(self.remove_card()[0], 2)
+        self.assertEqual(self.dec("d-wt-batch-1")["status"], "withdrawn")
+        self.refused(self.standing(), "card d-wt-batch-1 carries a note", stop=True)
+        self.check()  # asked again on a new card, carrying the note: the rule stays stopped
+        self.refused(self.standing(), "the rule stopped", stop=True)
+
+    def test_v13_11c_delete_all_with_a_note_then_remove_card_then_standing(self):  # probe B
+        self.two_on_a_batch("all", "but keep t-004")
+        self.assertEqual(self.remove_card()[0], 2)
+        self.refused(self.standing(), "card d-wt-batch-1 carries a note", stop=True)
+
+    def test_v13_11d_standing_before_remove_card(self):  # probe C: both orders end with nothing removed
+        self.two_on_a_batch("keep", "keep t-004")
+        self.refused(self.standing(), "card d-wt-batch-1 has a note written in the panel", stop=True)
+        self.assertEqual(self.remove_card()[0], 2)
+        self.refused(self.standing(), "the rule stopped", stop=True)
+
+    def test_v13_11e_keep_all_without_a_note(self):  # probe D (control): kept, and the rule does not stop
+        self.two_on_a_batch("keep", None)
+        code, out, err = self.standing()
+        self.assertEqual(code, 0, err)
+        self.assertIn("answered 'Keep all 2' on card d-wt-batch-1", out)
+        self.assertTrue(all(os.path.isdir(p) for p in self.trees.values()))
+        self.assertEqual(self.stops(), [])
+
+    def test_v13_11f_a_single_card_withdrawn_or_asked_again_with_a_note(self):
+        self.clean("t-003")
+        self.check()
+        cid = "d-wt-t-003"
+        card = self.answer(cid, "Delete", note="wait, keep it")
+        pa.keep_previous(card, card["answer"])
+        card.update(status="withdrawn", answer=None, answered=pa.now(), answeredBy="pa-worktree remove: withdrawn", note="Withdrawn")
+        dump(card, self.path(cid))
+        self.refused(self.standing(), "card d-wt-t-003 carries a note", stop=True)
+        write(os.path.join(self.dir, "journal.jsonl"), "")
+        card.update(status="open", answer=None, note=None, answered=None, answeredBy=None)  # asked again, the note carried
+        dump(card, self.path(cid))
+        self.refused(self.standing(), "card d-wt-t-003 carries a note", stop=True)
+
+    def test_v13_11g_a_note_before_the_rule_changed_does_not_stop_it(self):
+        self.clean("t-003")
+        self.check()
+        cid = "d-wt-t-003"
+        card = self.answer(cid, "Delete", note="old words")
+        card.update(answered="2026-10-01T00:00:00Z")
+        pa.keep_previous(card, card["answer"])
+        card.update(status="open", answer=None, note=None, answered=None, answeredBy=None)
+        dump(card, self.path(cid))
+        code, out, err = self.standing()
+        self.assertEqual(code, 0, err)
+        self.assertFalse(os.path.isdir(self.trees["t-003"]))
+
+
 class Caller(Standing):
     """R14: only this space's Project Agent."""
 
