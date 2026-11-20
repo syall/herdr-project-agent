@@ -6306,14 +6306,153 @@ cases["P37-confirm-dry-run"] = async () => { // R13: the click asks first: one d
   noEnding();
 };
 
-cases["P37-confirm-refused"] = async () => { // R13: a refused dry run: its text, no Restart choice
-  liveWorld({ tool: () => ({ code: 2, stdout: "", stderr: "cannot restart: the heartbeat is 40 s old: its launcher is not running\n" }) });
+cases["P37-confirm-refused"] = async () => { // R13: a refused dry run: its text, no Restart choice (t-193 H20: a refusal that is not "its launcher is not running" keeps only Cancel)
+  for (const why of ["cannot restart: terminal t4w has a parent (t1): not a Project Agent's tab", "cannot restart: terminal t4w has no herdr.pa label for this space", "cannot restart: agent.json names no terminal for this Project Agent"]) {
+    liveWorld({ tool: () => ({ code: 2, stdout: "", stderr: `${why}\n` }) });
+    const v = await liveMount();
+    await click(v, "pa-restart"); await settle();
+    const { text, clicks } = look(v);
+    check(text.includes(why.slice(16)), `the refusal (got ${text.slice(0, 600)})`);
+    check(!clicks["pa-restart-go"] && !clicks["pa-restart-now"] && Boolean(clicks["pa-restart-cancel"]), `only Cancel (got ${Object.keys(clicks)})`);
+    check(!clicks["pa-recover"] && !clicks["pa-recover-fresh"] && !/Start it again/.test(text), `H20: no Start it again for ${why} (got ${Object.keys(clicks)})`);
+    check(realRuns().length === 0, "nothing restarted");
+  }
+};
+
+// ---- t-193 R5.3: a launcher that is not running (stale heartbeat): Start it again (pa-restart --recover, then the
+// keeper's open request), never only Cancel. The panel ends nothing itself: the tool does, on the space's machine. ----
+const NOT_RUNNING = "cannot restart: the heartbeat is 36 s old: its launcher is not running\n";
+const RECOVER_WHY = "the Start it again button in the Project Agent panel";
+const recoverRuns = () => toolRuns().filter(([, a]) => a.includes("--recover"));
+const RECOVERED = (outcome = "recovered", why = null) => ({ code: outcome === "refused" ? 2 : 0, stdout: `${JSON.stringify({ outcome, ended: outcome === "recovered" ? [{ pid: 7424, what: "launcher" }] : [], left: [], why })}\n`, stderr: "" });
+const notRunningWorld = ({ machine = null, reply = RECOVERED() } = {}) => liveWorld({ machine, tool: (args) => (args.includes("--dry-run") ? { code: 2, stdout: "", stderr: NOT_RUNNING } : args.includes("--recover") ? (typeof reply === "function" ? reply(args) : reply) : OK_REPLY()) });
+
+cases["P193-not-running-box"] = async () => { // F8: the refusal names "its launcher is not running": Start it again, in a new conversation, Cancel
+  notRunningWorld();
   const v = await liveMount();
   await click(v, "pa-restart"); await settle();
   const { text, clicks } = look(v);
-  check(text.includes("the heartbeat is 40 s old"), `the refusal (got ${text.slice(0, 600)})`);
-  check(!clicks["pa-restart-go"] && !clicks["pa-restart-now"] && Boolean(clicks["pa-restart-cancel"]), `only Cancel (got ${Object.keys(clicks)})`);
-  check(realRuns().length === 0, "nothing restarted");
+  check(text.includes("Its launcher is not running."), `says so (got ${text.slice(0, 600)})`);
+  check(/Start it again/.test(text) && /Start it again in a new conversation/.test(text), `the two choices (got ${text.slice(0, 600)})`);
+  check(Boolean(clicks["pa-recover"]) && Boolean(clicks["pa-recover-fresh"]) && Boolean(clicks["pa-restart-cancel"]), `Start it again, … in a new conversation, Cancel (got ${Object.keys(clicks)})`);
+  check(!clicks["pa-restart-go"] && !clicks["pa-restart-now"], "no Restart choice");
+  check(recoverRuns().length === 0 && !(g.__shared[REQ] ?? {})[S], "nothing run, no open request before a click");
+  await click(v, "pa-restart-cancel");
+  check(!look(v).clicks["pa-recover"] && recoverRuns().length === 0, "Cancel: gone, nothing run");
+};
+
+cases["P193-start-again"] = async () => { // F8: the click runs --recover on the space's machine, then files the open request
+  notRunningWorld();
+  const v = await liveMount();
+  await click(v, "pa-restart"); await settle();
+  await click(v, "pa-recover"); await settle(); await settle();
+  check(recoverRuns().length === 1, `one --recover run (got ${JSON.stringify(toolRuns())})`);
+  const [, args, on] = recoverRuns()[0];
+  check(JSON.stringify(args) === JSON.stringify(["--space", S, "--recover", "--json", "--by", "panel", "--why", RECOVER_WHY]) && on === null, `its argv (got ${JSON.stringify(recoverRuns()[0])})`);
+  const req = (g.__shared[REQ] ?? {})[S];
+  check(req && req.by === "panel", `the open request filed after it (got ${JSON.stringify(g.__shared[REQ])})`);
+  check(realRuns().filter(([, a]) => !a.includes("--recover")).length === 0, "no restart run");
+  noEnding();
+};
+
+cases["P193-start-again-fresh"] = async () => { // F8: … in a new conversation adds --fresh
+  notRunningWorld();
+  const v = await liveMount();
+  await click(v, "pa-restart"); await settle();
+  await click(v, "pa-recover-fresh"); await settle(); await settle();
+  check(recoverRuns().length === 1, "one run");
+  const args = recoverRuns()[0][1];
+  check(args[args.length - 1] === "--fresh" && args.filter((x) => x === "--fresh").length === 1 && args.includes("--recover"), `--recover … --fresh (got ${JSON.stringify(args)})`);
+  check(Boolean((g.__shared[REQ] ?? {})[S]), "the open request filed");
+};
+
+cases["P193-nothing-opens-too"] = async () => { // R5.3: outcome nothing (nothing left to end): the open request is filed too
+  notRunningWorld({ reply: RECOVERED("nothing") });
+  const v = await liveMount();
+  await click(v, "pa-restart"); await settle();
+  await click(v, "pa-recover"); await settle(); await settle();
+  check(Boolean((g.__shared[REQ] ?? {})[S]), `filed (got ${JSON.stringify(g.__shared[REQ])})`);
+};
+
+cases["P193-recover-refused"] = async () => { // F8: a refusal is shown as a line; no open request
+  notRunningWorld({ reply: RECOVERED("refused", "its launcher runs but does not beat: pid 7424; look at its tab") });
+  const v = await liveMount();
+  await click(v, "pa-restart"); await settle();
+  await click(v, "pa-recover"); await settle(); await settle();
+  check(look(v).text.includes("its launcher runs but does not beat: pid 7424; look at its tab"), `the why (got ${look(v).text.slice(0, 700)})`);
+  check(!(g.__shared[REQ] ?? {})[S], `no open request (got ${JSON.stringify(g.__shared[REQ])})`);
+  noEnding();
+};
+
+cases["P193-recover-failed-run"] = async () => { // the tool not answering or missing: said, no open request
+  notRunningWorld({ reply: () => { throw new Error(`exec: ${TOOL}: not found`); } });
+  const v = await liveMount();
+  await click(v, "pa-restart"); await settle();
+  await click(v, "pa-recover"); await settle(); await settle();
+  check(/not installed/.test(look(v).text), `says so (got ${look(v).text.slice(0, 700)})`);
+  check(!(g.__shared[REQ] ?? {})[S], "no open request");
+};
+
+cases["P193-recover-once"] = async () => { // H21: two clicks: one --recover run per space at a time; another window's mark: none
+  let release;
+  notRunningWorld({ reply: () => new Promise((r) => { release = () => r(RECOVERED()); }) });
+  const v = await liveMount();
+  await click(v, "pa-restart"); await settle();
+  const { clicks } = look(v);
+  clicks["pa-recover"]({}, cx); clicks["pa-recover"]({}, cx); await flush();
+  if (look(v).clicks["pa-recover"]) await click(v, "pa-recover");
+  check(recoverRuns().length === 1, `one run (got ${JSON.stringify(recoverRuns())})`);
+  check(/Starting it again…/.test(look(v).text), `Starting it again… while it runs (got ${look(v).text.slice(0, 500)})`);
+  release(); await settle(); await settle();
+  check(recoverRuns().length === 1, "still one");
+  // another panel window runs one: this one runs none
+  notRunningWorld();
+  const w = await liveMount();
+  await click(w, "pa-restart"); await settle();
+  const before = recoverRuns().length;
+  g.__shared[RESTART_MARK_KEY] = { [S]: { by: "other-copy", at: g.__now, instance: null } };
+  const kept = look(w).clicks["pa-recover"];
+  if (kept) { kept({}, cx); await flush(); await settle(); }
+  check(recoverRuns().length === before, `no run while another window runs one (got ${JSON.stringify(recoverRuns())})`);
+  check(!(g.__shared[REQ] ?? {})[S], "no open request");
+};
+const RESTART_MARK_KEY = "project-agent.restarting";
+
+// The header: not running (down) with a launcher.json: the same choice instead of Open; without one, Open as before.
+const downWithLauncher = ({ machine = null, reply = RECOVERED() } = {}) => {
+  world({ machine });
+  const dir = machine ? `${machine}:.config/herdr-pa/spaces/${S}` : `:${DIR}`;
+  g.__files[`${dir}/launcher.json`] = JSON.stringify(LREC());
+  g.__files[`${machine ? `${machine}:.config/herdr-pa` : ":/home/u/.config/herdr-pa"}/installed.json`] = JSON.stringify(INSTALLED);
+  g.__execFn = (command, args) => (command === TOOL ? (args.includes("--recover") ? (typeof reply === "function" ? reply(args) : reply) : { code: 2, stdout: "", stderr: NOT_RUNNING }) : undefined);
+};
+
+cases["P193-header-down"] = async () => { // R5.3: known down and launcher.json there: Start it again (and fresh) in the header, no Open
+  downWithLauncher();
+  const v = await liveMount();
+  const { text, clicks } = look(v);
+  check(/Not running/.test(text), `Not running (got ${text.slice(0, 300)})`);
+  check(Boolean(clicks["pa-recover-head"]) && Boolean(clicks["pa-recover-head-fresh"]) && !clicks["pa-open"], `the choice, not Open (got ${Object.keys(clicks)})`);
+  await click(v, "pa-recover-head"); await settle(); await settle();
+  check(recoverRuns().length === 1 && !recoverRuns()[0][1].includes("--fresh"), `one --recover (got ${JSON.stringify(toolRuns())})`);
+  check(toolRuns().length === 1, "no dry run first: the header's click is the recover itself");
+  check(Boolean((g.__shared[REQ] ?? {})[S]), "the open request filed");
+  noEnding();
+};
+
+cases["P193-header-down-fresh-remote"] = async () => { // R5.3: on the space's machine, --fresh for the second button
+  downWithLauncher({ machine: M });
+  const v = await liveMount();
+  await click(v, "pa-recover-head-fresh"); await settle(); await settle();
+  check(recoverRuns().length === 1 && recoverRuns()[0][2] === M && recoverRuns()[0][1].includes("--fresh"), `on ${M}, --fresh (got ${JSON.stringify(toolRuns())})`);
+  check(!recoverRuns()[0][1].includes("--on"), "no --on: the exec runs there");
+};
+
+cases["P193-header-down-no-launcher"] = async () => { // R5.3: no launcher.json: Open as before
+  world();
+  const v = await liveMount();
+  const { clicks } = look(v);
+  check(Boolean(clicks["pa-open"]) && !clicks["pa-recover-head"], `Open, no Start it again (got ${Object.keys(clicks)})`);
 };
 
 cases["P37-restart-ok"] = async () => { // R13: the one run, its argv, Restarting…, then what it loaded (60 s)

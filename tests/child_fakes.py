@@ -1,7 +1,10 @@
 """t-037 J2: the launcher starts Claude through pa.spawn (a Popen handle it keeps). Tests written for
 subprocess.call hand their fake call to popen_of(), which gives a Popen-shaped stand-in: the fake runs when the
 "process" is created (so an exception it raises comes from the start, as Popen's would), and wait() returns its
-result. patch(pa, fake_call) installs it and returns the function that undoes it."""
+result. patch(pa, fake_call) installs it and returns the function that undoes it.
+t-193: patch() and unfaked() also replace pa.end_leftovers (the sweep before each start, which signals what an
+earlier launch left on the launcher's terminal) with a no-op: a test that fakes the start never sweeps the test
+runner's own terminal. test_pa_leftovers tests the sweep itself."""
 import signal
 
 
@@ -30,12 +33,27 @@ def popen_of(fake_call, signals=None):
     return FakePopen
 
 
+def no_sweep(pa):
+    """pa.end_leftovers replaced by a no-op; returns its undo."""
+    saved = pa.__dict__.get("end_leftovers")
+    pa.end_leftovers = lambda ctx, address=None: None
+
+    def undo():
+        if saved is None:
+            pa.__dict__.pop("end_leftovers", None)
+        else:
+            pa.end_leftovers = saved
+    return undo
+
+
 def patch(pa, fake_call):
     saved = pa.__dict__.get("spawn")
     fake = popen_of(fake_call)
     pa.spawn = lambda argv, cwd=None: fake(argv, cwd=cwd)
+    undo_sweep = no_sweep(pa)
 
     def undo():
+        undo_sweep()
         if saved is None:
             pa.__dict__.pop("spawn", None)
         else:
@@ -57,8 +75,10 @@ def unfaked(pa):
         raise SpawnNotFaked("spawn not faked: this test would start {!r} (fake it with child_fakes.patch)".format(
             list(argv)[:1]))
     pa.spawn = spawn
+    undo_sweep = no_sweep(pa)
 
     def undo():
+        undo_sweep()
         if saved is None:
             pa.__dict__.pop("spawn", None)
         else:
