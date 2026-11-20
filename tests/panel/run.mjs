@@ -494,6 +494,30 @@ cases["P1-context-lines"] = async () => { // a multi-line context renders one ro
   check(one.length === 1 && one[0].kind === "div", `a one-line context is one row, as before (got ${one.length})`);
 };
 
+cases["P168-batch-card"] = async () => { // t-168 V10.3: a batch Delete card of 48 worktrees: one indented row each, options in order
+  world();
+  const rows = Array.from({ length: 48 }, (_, i) => `  t-${100 + i} main · t-${100 + i}-x · 2 commits, 2 merged, 2 pushed · clean`);
+  const context = ["48 worktrees whose jobs are over. Deleting removes each folder; branches are kept unless a line says otherwise.",
+    "Nothing is lost (45):", ...rows.slice(0, 45), "Deleting loses something (3):", ...rows.slice(45).map((r) => `${r} · uncommitted files discarded`),
+    "Each worktree's full list: WORKTREE*.md in its task's evidence folder."].join("\n");
+  const options = [{ label: "Delete the 45 where nothing is lost", scope: "lossless" }, { label: "Delete all 48", scope: "all" }, { label: "Keep all 48", scope: "keep" }];
+  g.__files[`:${DIR}/decisions/d-wt-batch-1.json`] = JSON.stringify({ id: "d-wt-batch-1", kind: "worktrees", task: null, status: "open",
+    question: "Delete 48 worktrees whose jobs are over?", context, options, recommendation: options[0].label, items: [], created: "2026-11-16T10:00:00Z" });
+  g.__ls[`:${DIR}/decisions`] = ["d-wt-batch-1.json"];
+  const v = await mount();
+  const tree = v.render(cx);
+  const indented = rows.map((r) => stubs.findText(tree, r.trimStart() + (rows.indexOf(r) >= 45 ? " · uncommitted files discarded" : "")));
+  check(indented.every((x) => x.length === 1 && JSON.stringify(x[0].style?.pl) === "[12]"), `48 rows, each indented (got ${indented.map((x) => x.length).join(",")})`);
+  for (const head of ["Nothing is lost (45):", "Deleting loses something (3):"]) {
+    const h = stubs.findText(tree, head);
+    check(h.length === 1 && !h[0].style?.pl, `${head} is a row of its own, not indented`);
+  }
+  const { text, clicks } = look(v);
+  const at = options.map((o) => text.indexOf(o.label));
+  check(at.every((i) => i >= 0) && at[0] < at[1] && at[1] < at[2], `the options in R3's order (got ${at})`);
+  check(Boolean(clicks["opt-d-wt-batch-1-0"]) && Boolean(clicks["opt-d-wt-batch-1-2"]) && Boolean(clicks["opt-d-wt-batch-1-other"]), "each option and Other answerable");
+};
+
 cases["P2-worker-chips"] = async () => { // a closed worker is not drawn (t-011), a kept one "· kept"; others unchanged
   world({ extraTerms: [{ address: "t32", state: "live", argv: ["claude"], labels: {}, status: "idle", program: claude },
                        { address: "t33", state: "live", argv: ["claude"], labels: {}, status: "working", program: claude }] });
