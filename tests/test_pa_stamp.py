@@ -512,7 +512,17 @@ class NoEnding(unittest.TestCase):
     def test_v9_no_new_process_ending(self):
         with open(os.path.join(REPO, "runtime", "tools", "pa.py")) as f:
             text = f.read()
-        self.assertNotIn("os.kill(", text)
+        # t-193: the one os.kill is signal_pid's (end_leftovers' and pa-restart --recover's steps, end_pids, call it)
+        import ast as _ast
+        _tree = _ast.parse(text)
+        _kills = {fn.name for fn in _ast.walk(_tree) if isinstance(fn, _ast.FunctionDef) for n in _ast.walk(fn)
+                  if isinstance(n, _ast.Call) and isinstance(n.func, _ast.Attribute) and n.func.attr == "kill"
+                  and getattr(n.func.value, "id", None) == "os"}
+        self.assertEqual(_kills, {"signal_pid"}, "os.kill outside signal_pid")
+        self.assertEqual(text.count("os.kill("), 1)
+        _callers = {fn.name for fn in _ast.walk(_tree) if isinstance(fn, _ast.FunctionDef) for n in _ast.walk(fn)
+                    if isinstance(n, _ast.Call) and getattr(n.func, "id", None) == "signal_pid"}
+        self.assertEqual(_callers, {"end_pids", "send"}, "signal_pid called outside end_pids (its send step)")
         self.assertEqual(text.count('"kill"'), 2, "hc kill only in cmd_cleanup (today's) and end_terminal (t-037 J3, R10)")
 
 

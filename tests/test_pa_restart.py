@@ -1426,7 +1426,17 @@ class AC9_1_OnlyTheOwnChild(unittest.TestCase):
         import ast
         with open(os.path.join(REPO, "runtime", "tools", "pa.py")) as f:
             text = f.read()
-        self.assertNotIn("os.kill(", text)
+        # t-193: the one os.kill is signal_pid's (end_leftovers' and pa-restart --recover's steps, end_pids, call it)
+        import ast as _ast
+        _tree = _ast.parse(text)
+        _kills = {fn.name for fn in _ast.walk(_tree) if isinstance(fn, _ast.FunctionDef) for n in _ast.walk(fn)
+                  if isinstance(n, _ast.Call) and isinstance(n.func, _ast.Attribute) and n.func.attr == "kill"
+                  and getattr(n.func.value, "id", None) == "os"}
+        self.assertEqual(_kills, {"signal_pid"}, "os.kill outside signal_pid")
+        self.assertEqual(text.count("os.kill("), 1)
+        _callers = {fn.name for fn in _ast.walk(_tree) if isinstance(fn, _ast.FunctionDef) for n in _ast.walk(fn)
+                    if isinstance(n, _ast.Call) and getattr(n.func, "id", None) == "signal_pid"}
+        self.assertEqual(_callers, {"end_pids", "send"}, "signal_pid called outside end_pids (its send step)")
         self.assertEqual(text.count('"kill"'), 2, "hc kill only in cmd_cleanup and end_terminal (spec AC9.1, R10)")
         tree = ast.parse(text)
         # t-184 R6: end_child also signals the launch's own process group (os.killpg, the pgid spawn made); no other
@@ -1454,7 +1464,7 @@ class AC9_1_OnlyTheOwnChild(unittest.TestCase):
                             and node.func.attr in ("send_signal", "kill", "terminate")):
                         found.append(fn.name)
         self.assertTrue(found)
-        self.assertEqual(set(found) - {"end_child", "run_child"}, set(), found)
+        self.assertEqual(set(found) - {"end_child", "run_child", "signal_pid"}, set(), found)  # t-193: signal_pid
 
 
 # ---- J2 round 2: the seven Must fix items (REVIEW J2 A M1-M5, B M1-M3; VERIFY J2 MF1-MF4; handoff-fix-j2.md) -------
