@@ -320,7 +320,8 @@ function slotsBlock(t, s, o, line, marked, items) {
 
 // Draws the section (R1, R9). o: { folded, mark (a line key or null), busy, error, asOf, onFold, onMove(id, move, cx), onReset(cx),
 // onWorker(address), onTask(task, cx) (t-156: a job's task id), onRule(id, cx) (t-156: a limits rule id) } (each handler gets its click's cx: a cx is valid only for the call that gave it). t-084 R5: a
-// holder line opens its worker in the Agents view (a holder's terminal is live: holdersFrom).
+// holder line opens its worker in the Agents view (a holder's terminal is live: holdersFrom). t-172: a suite holder is
+// drawn under Working and under Suite step; its Suite step row's id is places-suite-<address>, so each row has its own.
 
 export function renderPlaces(t, rows, o) {
   const line = (text, color) => div().text_size(11.5).text_color(color ?? t.muted).child(text);
@@ -339,7 +340,7 @@ export function renderPlaces(t, rows, o) {
     .children(rows.notes.map((x) => line(x, t.blocked)))
     .children(rows.kinds.flatMap((k) => [
       div().pt(2).text_size(12).text_color(k.over ? t.blocked : t.foreground).child(k.head),
-      ...(k.holders.length ? [items(k.holders.map((h) => markedItem(workerItem(t, { id: `places-holder-${h.address}`, text: `${h.text} ↗`, live: true, status: h.status, onClick: () => o.onWorker?.(h.address) }), h.key)))]
+      ...(k.holders.length ? [items(k.holders.map((h) => markedItem(workerItem(t, { id: `places-${k.kind === "suite" ? "suite" : "holder"}-${h.address}`, text: `${h.text} ↗`, live: true, status: h.status, onClick: () => o.onWorker?.(h.address) }), h.key)))]
         : [div().pl(12).child(line("free", t.dim))]),
     ]))
     .children(slotsBlock(t, rows.slots, o, line, markedItem, items))
