@@ -605,3 +605,429 @@ class RemoveCard(Batch):
         self.assertEqual(code, 2)
         self.assertIn("another pa-worktree remove is running", err)
         self.assertTrue(all(os.path.isdir(p) for p in self.trees.values()))
+
+
+RULE_TEXT = ("Delete a worktree with no card when every commit in it is merged into main and pushed, nothing is uncommitted "
+             "or untracked, no terminal is in it, and no keep is set.")
+AGENT_ENV = {"CLAUDECODE": "1", "HC_TERMINAL_ID": "t0"}
+AGENT_TREE = [{"pid": 40, "comm": "claude", "args": "claude"}, {"pid": 1, "comm": "launchd", "args": ""}]
+PERSON_TREE = [{"pid": 50, "comm": "zsh", "args": "-zsh"}, {"pid": 1, "comm": "launchd", "args": ""}]
+
+
+class Standing(Batch):
+    """Part B: pa-worktree-allow (R12) and pa-worktree remove --standing (R13-R16). A remote holds main; clean worktrees
+    sit under <tmp>/worktrees/<task>/proj."""
+
+    def setUp(self):
+        super().setUp()
+        self.remote = os.path.join(self.tmp, "remote.git")
+        sh(self.tmp, "git", "init", "-q", "--bare", self.remote)
+        sh(self.proj, "git", "remote", "add", "origin", self.remote)
+        sh(self.proj, "git", "push", "-q", "origin", "main")
+        self.rule()
+        self.bind()
+        here = os.getcwd()
+        os.chdir(self.tmp)  # no task record above the caller's folder
+        self.addCleanup(os.chdir, here)
+        self.push = pa_hooks.push_tool()
+
+    # ---- the rule and its binding ----
+    def rule(self, **over):
+        rule = dict({"id": "r-wt", "text": RULE_TEXT, "status": "active", "appliesTo": "all", "source": "person",
+                     "history": [{"at": "2026-11-01T00:00:00Z", "by": "person", "change": "created"}]}, **over)
+        dump({"version": 1, "rules": [rule]}, os.path.join(self.dir, "rules.json"))
+        return rule
+
+    def allow_file(self):
+        return os.path.join(pa.ROOT, "worktree-allow.json")
+
+    def bind(self, rule="r-wt", text=RULE_TEXT, enabled=True, entry_enabled=True, **extra):
+        dump(dict({"version": 1, "enabled": enabled, "spaces": [{"space": "sp1", "enabled": entry_enabled, "standing": {
+            "rule": rule, "textSha": self.push.text_sha(text) if hasattr(self, "push") else pa_hooks.push_tool().text_sha(text)}}]}, **extra),
+             self.allow_file())
+
+    # ---- worktrees ----
+    def clean(self, tid, commit=True, state="done"):
+        """A worktree under a worktrees folder whose every commit is merged into main and pushed."""
+        path = os.path.join(self.tmp, "worktrees", tid, "proj")
+        sh(self.proj, "git", "worktree", "add", "-q", "-b", tid, path, "main")
+        if commit:
+            self.commit(path, tid + ".txt", tid + "\n", "work of " + tid)
+            sh(self.proj, "git", "merge", "-q", "--no-edit", tid)
+            sh(self.proj, "git", "push", "-q", "origin", "main")
+        self.trees[tid] = path
+        self.add_task(tid, state, path, [])
+        return path
+
+    # ---- running it ----
+    def standing(self, rule="r-wt", env=AGENT_ENV, tree=AGENT_TREE):
+        drop = {k: "" for k in ("CLAUDE_PROJECT_DIR",)}
+        with mock.patch.dict(os.environ, dict(env)), mock.patch.object(self.push, "ancestors", lambda *a, **k: tree):
+            for k in drop:
+                os.environ.pop(k, None)
+            return self.run_cmd("pa-worktree", "remove", "--standing", rule, "--space", "sp1")
+
+    def allow(self, *argv, env=None, tree=PERSON_TREE):
+        with mock.patch.dict(os.environ, dict(env or {})), mock.patch.object(self.push, "ancestors", lambda *a, **k: tree):
+            return self.run_cmd("pa-worktree-allow", *argv)
+
+    def stops(self):
+        return [l for l in self.journal() if l.get("standing") == "stopped"]
+
+    def refused(self, result, *fragments, stop=False):
+        code, out, err = result
+        self.assertEqual(code, 2, out + err)
+        for f in fragments:
+            self.assertIn(f, err)
+        self.assertTrue(all(os.path.isdir(p) for p in self.trees.values()), "nothing is removed")
+        self.assertEqual(bool(self.stops()), stop, self.journal())
+
+
+class AllowFile(Standing):
+    def test_v12_1_set_refuses_an_agent(self):
+        os.unlink(self.allow_file())
+        code, out, err = self.allow("set", "--space", "sp1", "--standing", "r-wt", env=AGENT_ENV, tree=AGENT_TREE)
+        self.assertNotEqual(code, 0)
+        self.assertIn("is the person's command", err)
+        self.assertFalse(os.path.exists(self.allow_file()))
+
+    def test_v12_2_set_as_the_person(self):
+        before = raw(self.allow_file())
+        self.rule(text=RULE_TEXT + " Edited.", history=[{"at": "2026-11-01T00:00:00Z", "by": "person", "change": "created"}])
+        code, out, err = self.allow("set", "--space", "sp1", "--standing", "r-wt")
+        self.assertEqual(code, 0, err)
+        data = load(self.allow_file())
+        self.assertEqual(data["spaces"][0]["standing"], {"rule": "r-wt", "textSha": self.push.text_sha(RULE_TEXT + " Edited.")})
+        self.assertEqual(raw(self.allow_file() + ".bak-pa-worktree-allow"), before)
+        self.assertIsNone(pa_hooks.worktree_allow_validate(data))
+
+    def test_v12_2b_show_unbind_on_off(self):
+        code, out, err = self.allow("show", "--space", "sp1", env=AGENT_ENV, tree=AGENT_TREE)
+        self.assertEqual(code, 0, err)
+        self.assertIn("on", out)
+        self.assertIn("r-wt", out)
+        code, out, _ = self.allow("show", "--json")
+        self.assertTrue(json.loads(out)["valid"])
+        self.assertEqual(self.allow("off", "--space", "sp1")[0], 0)
+        self.assertFalse(load(self.allow_file())["spaces"][0]["enabled"])
+        self.assertEqual(self.allow("off")[0], 0)
+        self.assertFalse(load(self.allow_file())["enabled"])
+        self.assertEqual(self.allow("on")[0], 0)
+        self.assertEqual(self.allow("unbind", "--space", "sp1")[0], 0)
+        self.assertNotIn("standing", load(self.allow_file())["spaces"][0])
+
+    def test_v12_3_an_invalid_file_refuses(self):
+        self.clean("t-003")
+        data = load(self.allow_file())
+        data["extra"] = 1
+        dump(data, self.allow_file())
+        self.refused(self.standing(), "worktree-allow.json is not valid: unknown key extra")
+
+    def test_v12_3b_validation_is_all_or_nothing(self):
+        good = load(self.allow_file())
+        sha = good["spaces"][0]["standing"]["textSha"]
+        bad = [dict(good, version=2), dict(good, enabled="yes"), dict(good, spaces={}),
+               dict(good, spaces=[{"space": "sp1", "enabled": True, "bogus": 1}]),
+               dict(good, spaces=[{"space": "s p", "enabled": True}]),
+               dict(good, spaces=[{"space": "sp1", "enabled": True, "standing": {"rule": "r-wt", "textSha": "x"}}]),
+               dict(good, spaces=[{"space": "sp1", "enabled": True, "note": "n" * 201}]),
+               dict(good, spaces=[{"space": "sp1", "enabled": True, "standing": {"rule": "r-wt", "textSha": sha}},
+                                  {"space": "sp1", "enabled": False}])]
+        for data in bad:
+            with self.subTest(data=data):
+                self.assertIsNotNone(pa_hooks.worktree_allow_validate(data))
+        self.assertIsNone(pa_hooks.worktree_allow_validate(good))
+
+
+class RuleInForce(Standing):
+    """R13: each condition, read now; a refusal removes nothing and writes no stop line, but for a new stop cause."""
+
+    def setUp(self):
+        super().setUp()
+        self.clean("t-003")
+
+    def test_v13_0_in_force_removes(self):
+        code, out, err = self.standing()
+        self.assertEqual(code, 0, err)
+        self.assertFalse(os.path.isdir(self.trees["t-003"]))
+
+    def test_v13_1_no_file(self):
+        os.unlink(self.allow_file())
+        self.refused(self.standing(), "no worktree-allow.json")
+
+    def test_v13_2_file_off(self):
+        self.bind(enabled=False)
+        self.refused(self.standing(), "turned off")
+
+    def test_v13_3_space_off_or_not_listed(self):
+        self.bind(entry_enabled=False)
+        self.refused(self.standing(), "turned off for space sp1")
+        dump({"version": 1, "enabled": True, "spaces": []}, self.allow_file())
+        self.refused(self.standing(), "space sp1 is not in worktree-allow.json")
+
+    def test_v13_4_bound_to_another_rule(self):
+        self.bind(rule="r-other")
+        self.refused(self.standing(), "bound to rule r-other, not r-wt")
+
+    def test_v13_4b_a_push_binding_does_not_count(self):
+        os.unlink(self.allow_file())
+        dump({"version": 1, "enabled": True, "repos": [{"path": self.proj, "url": "file://" + self.remote, "branch": "main",
+              "space": "sp1", "enabled": True, "standing": {"rule": "r-wt", "textSha": self.push.text_sha(RULE_TEXT)}}]},
+             os.path.join(pa.ROOT, "push-allow.json"))
+        self.refused(self.standing(), "no worktree-allow.json")
+
+    def test_v13_5_rule_missing_or_twice(self):
+        dump({"version": 1, "rules": []}, os.path.join(self.dir, "rules.json"))
+        self.refused(self.standing(), "no rule r-wt in this space's rules.json")
+        rule = self.rule()
+        dump({"version": 1, "rules": [rule, rule]}, os.path.join(self.dir, "rules.json"))
+        self.refused(self.standing(), "2 rules have the id r-wt")
+
+    def test_v13_6_not_active(self):
+        self.rule(status="paused")
+        self.refused(self.standing(), "rule r-wt is paused, not active")
+
+    def test_v13_7_applies_to_all_only(self):
+        self.rule(appliesTo="release")
+        self.refused(self.standing(), "applies to release, not all")
+
+    def test_v13_8_the_persons_only(self):
+        self.rule(source="orchestrator", history=[{"at": "2026-11-01T00:00:00Z", "by": "orchestrator", "change": "created"}])
+        self.refused(self.standing(), "is not the person's: the person never approved it")
+        self.rule(history=[{"at": "2026-11-01T00:00:00Z", "by": "person", "change": "created"},
+                           {"at": "2026-11-02T00:00:00Z", "by": "orchestrator", "change": "edited"}])
+        self.refused(self.standing(), "a later change by orchestrator")
+
+    def test_v13_9_text_changed(self):
+        self.rule(text=RULE_TEXT + " And more.")
+        self.refused(self.standing(), "text of rule r-wt changed since the person bound it")
+
+    def test_v13_10_a_hold_stops_it_with_a_stop_line(self):
+        with open(os.path.join(self.dir, "journal.jsonl"), "a") as f:
+            f.write(json.dumps({"at": pa.now(), "hold": "on"}) + "\n")
+        self.refused(self.standing(), "a hold is on", stop=True)
+        self.refused(self.standing(), "the rule stopped", stop=True)
+        self.assertEqual(len(self.stops()), 1, "an existing stop writes no second line")
+
+    def test_v13_11_an_other_answer_or_a_panel_note_stops_it(self):
+        dump({"id": "d-x", "status": "answered", "answer": "Other", "other": True, "note": "no", "answered": pa.now(),
+              "answeredBy": PANEL}, self.path("d-x"))
+        self.refused(self.standing(), "card d-x was answered Other", stop=True)
+        os.unlink(self.path("d-x"))
+        self.journal_reset()
+        dump({"id": "d-y", "status": "answered", "answer": "A", "note": "but wait", "answered": pa.now(), "answeredBy": PANEL},
+             self.path("d-y"))
+        self.refused(self.standing(), "card d-y has a note written in the panel", stop=True)
+
+    def journal_reset(self):
+        write(os.path.join(self.dir, "journal.jsonl"), "")
+
+
+class Caller(Standing):
+    """R14: only this space's Project Agent."""
+
+    def setUp(self):
+        super().setUp()
+        self.clean("t-003")
+
+    def test_v14_1a_a_workers_terminal(self):
+        led = self.ledger()
+        led["tasks"][0]["workers"] = [{"address": "t51", "role": "build", "name": "w", "finished": True}]
+        self.ledger(led)
+        self.refused(self.standing(env={"CLAUDECODE": "1", "HC_TERMINAL_ID": "t51"}), "a worker of t-003")
+
+    def test_v14_1b_a_folder_with_a_task_record(self):
+        folder = os.path.join(self.tmp, "w")
+        dump({"task": "t-777", "space": "sp1"}, os.path.join(folder, ".claude", "pa-task.json"))
+        os.chdir(folder)
+        self.refused(self.standing(), "a worker's folder")
+
+    def test_v14_1c_the_persons_own_shell(self):
+        self.refused(self.standing(env={"HC_TERMINAL_ID": "t0"}, tree=PERSON_TREE), "not an agent")
+
+    def test_v14_1d_another_spaces_project_agent(self):
+        self.refused(self.standing(env={"CLAUDECODE": "1", "HC_TERMINAL_ID": "t9"}), "not this space's Project Agent terminal")
+
+
+class Clean(Standing):
+    """R15: what it deletes without a card; everything else stays for the cards."""
+
+    def kept(self, tid, why):
+        self.clean("t-001")
+        code, out, err = self.standing()
+        self.assertEqual(code, 0, err)
+        self.assertFalse(os.path.isdir(self.trees["t-001"]), "the clean one beside it is removed")
+        self.assertTrue(os.path.isdir(self.trees[tid]), tid)
+        self.assertIn(why, out)
+        return out
+
+    def test_v15_1a_not_under_a_worktrees_folder(self):
+        self.done("t-003")
+        sh(self.proj, "git", "push", "-q", "origin", "main")
+        self.kept("t-003", "t-003 (main) (not under a worktrees folder)")
+
+    def test_v15_1b_uncommitted(self):
+        self.clean("t-003")
+        write(os.path.join(self.trees["t-003"], "README"), "changed\n")
+        self.kept("t-003", "t-003 (main) (1 uncommitted")
+
+    def test_v15_1c_not_merged(self):
+        path = self.clean("t-003", commit=False)
+        self.commit(path, "x.txt", "x\n", "not merged")
+        self.kept("t-003", "t-003 (main) (not every commit is merged into main and pushed")
+
+    def test_v15_1d_a_terminal_in_it(self):
+        self.clean("t-003")
+        self.term("t77", "someone", cwd=self.trees["t-003"])
+        self.clean("t-001")
+        code, out, err = self.standing()
+        self.assertEqual(code, 0, err)
+        self.assertTrue(os.path.isdir(self.trees["t-003"]))
+        self.assertFalse(os.path.isdir(self.trees["t-001"]))
+
+    def test_v15_1e_keep(self):
+        self.clean("t-003")
+        led = self.ledger()
+        led["tasks"][0]["keepWorktree"] = True
+        self.ledger(led)
+        self.clean("t-001")
+        self.standing()
+        self.assertTrue(os.path.isdir(self.trees["t-003"]))
+        self.assertFalse(os.path.isdir(self.trees["t-001"]))
+
+    def test_v15_1f_answered_keep_or_other(self):
+        for label in ("Keep", "Other"):
+            with self.subTest(label=label):
+                tid = "t-00{}".format(3 if label == "Keep" else 4)
+                path = self.clean(tid)
+                dump({"id": "d-wt-" + tid, "task": tid, "worktree": os.path.realpath(path), "branch": tid, "status": "answered",
+                      "answer": label, "note": "keep it" if label == "Other" else None, "answeredBy": "person, in conversation",
+                      "answered": "2026-10-01T00:00:00Z", "tasks": [tid]}, self.path("d-wt-" + tid))
+        self.kept("t-003", "t-003 (main) (answered 'Keep' on card d-wt-t-003)")
+        self.assertTrue(os.path.isdir(self.trees["t-004"]))
+
+    def test_v15_1g_an_open_card_is_spent(self):
+        self.clean("t-003")
+        self.clean("t-004")
+        self.check()
+        code, out, err = self.standing()
+        self.assertEqual(code, 0, err)
+        self.assertFalse(os.path.isdir(self.trees["t-003"]))
+        self.assertTrue(all(i["removed"] for i in self.dec("d-wt-batch-1")["items"]))
+
+    def test_v15_1h_not_a_candidate_is_not_touched(self):
+        self.clean("t-003", state="in-progress")
+        code, out, err = self.standing()
+        self.assertEqual(code, 0, err)
+        self.assertTrue(os.path.isdir(self.trees["t-003"]))
+
+    def test_v15_2_pushed_to_its_own_branch_only(self):
+        path = self.clean("t-003", commit=False)
+        self.commit(path, "x.txt", "x\n", "on its own branch")
+        sh(path, "git", "push", "-q", "origin", "t-003")
+        self.kept("t-003", "not every commit is merged into main and pushed")
+
+    def test_v15_3_an_untracked_file(self):
+        self.clean("t-003")
+        write(os.path.join(self.trees["t-003"], "new.txt"), "x\n")
+        self.kept("t-003", "uncommitted or untracked")
+
+    def test_v15_4_a_profile_worktree(self):
+        kind = os.path.join(self.tmp, "Ws", "worktrees", "t-003-pkg")
+        repos = []
+        for name in ("A", "B"):
+            folder = os.path.join(kind, "src", name)
+            remote = os.path.join(self.tmp, name + ".git")
+            sh(self.tmp, "git", "init", "-q", "--bare", remote)
+            os.makedirs(folder)
+            sh(folder, "git", "init", "-q", "-b", "main")
+            self.commit(folder, "README", "base\n", "base")
+            sh(folder, "git", "remote", "add", "origin", remote)
+            sh(folder, "git", "checkout", "-q", "-b", "feat")
+            self.commit(folder, "f.txt", "x\n", name + " work")
+            sh(folder, "git", "checkout", "-q", "main")
+            sh(folder, "git", "merge", "-q", "--ff-only", "feat")
+            sh(folder, "git", "push", "-q", "origin", "main")
+            sh(folder, "git", "checkout", "-q", "feat")
+            repos.append(folder)
+        write(os.path.join(kind, "marker.txt"), "")
+        status, remove, log = (os.path.join(self.tmp, n) for n in ("status.sh", "remove.sh", "remove.log"))
+        write(status, "#!/bin/sh\ncat <<'JSON'\n{}\nJSON\n".format(json.dumps(
+            {"uncommitted": 0, "unpushed": 0, "branch": "A:feat, B:feat", "removesBranches": True, "kind": "custom worktree",
+             "repos": repos})))
+        write(remove, '#!/bin/sh\necho "$@" >> "{}"\nmv "$1" "$1.gone"\n'.format(log))
+        os.chmod(status, 0o755)
+        os.chmod(remove, 0o755)
+        dump({"name": "test2", "claude": ["true"], "codex": ["true"],
+              "worktree": {"marker": "marker.txt", "status": status, "remove": remove}}, os.path.join(pa.ROOT, "profiles", "test2", "profile.json"))
+        agent = load(os.path.join(self.dir, "agent.json"))
+        agent["profile"] = "test2"
+        dump(agent, os.path.join(self.dir, "agent.json"))
+        self.add_task("t-003", "done", kind, [])
+        code, out, err = self.standing()
+        self.assertEqual(code, 0, err + out)
+        self.assertFalse(os.path.isdir(kind))
+        with open(log) as f:
+            self.assertEqual(f.read().split(), [os.path.realpath(kind)], "the profile's remove script, with no --force")
+
+
+class OneRun(Standing):
+    """R16: one run, one report line, one standing journal line."""
+
+    def test_v16_1_three_clean_two_not(self):
+        for tid in ("t-003", "t-004", "t-005"):
+            self.clean(tid)
+        self.clean("t-006")
+        write(os.path.join(self.trees["t-006"], "README"), "x\n")
+        path = self.clean("t-007", commit=False)
+        self.commit(path, "x.txt", "x\n", "not merged")
+        code, out, err = self.standing()
+        self.assertEqual(code, 0, err)
+        lines = out.strip().split("\n")
+        report = [l for l in lines if l.startswith("Removed ")]
+        self.assertEqual(len(report), 1, out)
+        self.assertIn("Removed 3 worktrees on rule r-wt: t-003 (main), t-004 (main), t-005 (main); 2 not clean, left for cards: "
+                      "t-006 (main) (", report[0])
+        self.assertIn("t-007 (main) (not every commit", report[0])
+        standing = [l for l in self.journal() if l.get("trigger") == "standing"]
+        self.assertEqual(len(standing), 1)
+        self.assertEqual((standing[0]["by"], standing[0]["rule"], standing[0]["textSha"], len(standing[0]["removed"])),
+                         ("agent", "r-wt", self.push.text_sha(RULE_TEXT), 3))
+        self.assertEqual(len([l for l in self.journal() if "on rule r-wt" in str(l.get("why")) and l.get("trigger") == "worktree"]), 3)
+
+    def test_v16_1b_nothing_clean(self):
+        code, out, err = self.standing()
+        self.assertEqual(code, 0, err)
+        self.assertIn("Removed 0 worktrees on rule r-wt: nothing is clean", out)
+        self.assertEqual([l for l in self.journal() if l.get("trigger") == "standing"], [])
+
+    def test_v16_2_a_failed_removal_stops_the_rule(self):
+        for tid in ("t-003", "t-004", "t-005"):
+            self.clean(tid)
+        saved, calls = pa_hooks.remove_worktree, []
+        def second_fails(path, facts):
+            calls.append(path)
+            if len(calls) == 2:
+                raise pa.Problem("git would not remove it: locked")
+            return saved(path, facts)
+        pa_hooks.remove_worktree = second_fails
+        self.addCleanup(setattr, pa_hooks, "remove_worktree", saved)
+        code, out, err = self.standing()
+        self.assertNotEqual(code, 0)
+        self.assertFalse(os.path.isdir(self.trees["t-003"]))
+        self.assertTrue(os.path.isdir(self.trees["t-004"]))
+        self.assertTrue(os.path.isdir(self.trees["t-005"]), "the run stops")
+        self.assertEqual(len(self.stops()), 1)
+        pa_hooks.remove_worktree = saved
+        code, out, err = self.standing()
+        self.assertEqual(code, 2)
+        self.assertIn("the rule stopped", err)
+        self.assertTrue(os.path.isdir(self.trees["t-005"]))
+
+    def test_v16_3_under_the_lock(self):
+        self.clean("t-003")
+        lock = open(os.path.join(self.dir, ".worktree.lock"), "a+")
+        self.addCleanup(lock.close)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        with mock.patch.object(pa_hooks, "WORKTREE_LOCK_WAIT", 0.3):
+            self.refused(self.standing(), "another pa-worktree remove is running")

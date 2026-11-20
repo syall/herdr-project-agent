@@ -1068,6 +1068,32 @@ class T070Prices(GuardTest):
                     self.assertEqual(len(counted), calls)
 
 
+class T168WorktreeTools(GuardTest):  # t-168 V12.4: workers never delete worktrees, nor bind the person's rule to
+    def test_d3_pa_worktree_remove_in_any_form(self):
+        for line in ("pa-worktree remove --standing r-x", "pa-worktree remove --card d-wt-batch-1", "pa-worktree remove t-003",
+                     "pa-worktree --space sp1 remove t-003", "~/.local/bin/pa-worktree remove --standing r-x --space sp1",
+                     "sh -c 'pa-worktree remove --standing r-x'"):
+            with self.subTest(line=line):
+                self.assertIn("deletes a branch or a worktree", str(self.check(line)))
+
+    def test_d4_pa_worktree_allow_in_any_form(self):
+        for line in ("pa-worktree-allow set --space sp1 --standing r-x", "pa-worktree-allow show", "env X=1 pa-worktree-allow on",
+                     "y=$(pa-worktree-allow unbind --space sp1)"):
+            with self.subTest(line=line):
+                self.assertIn("pa-worktree-allow is the person's command", str(self.check(line)))
+
+    def test_nearby_lines_still_run(self):
+        for line in ("pa-worktree check", "pa-worktree check --open-cards --space sp1", "echo pa-worktree remove"):
+            with self.subTest(line=line):
+                self.assertIsNone(self.check(line))
+
+    def test_the_allow_file_is_not_edited(self):
+        home = os.path.join(TMP, "pa-home")
+        spaces = os.path.join(home, "spaces")
+        path = os.path.join(home, "worktree-allow.json")
+        self.assertIsNotNone(guard.check_edit(path, spaces, cwd=self.cwd, home=home))
+
+
 D7_SPLIT_FORMS = [("pa_co''sts prices fetch", "pa_costs prices fetch"), ("pa\\_costs prices fetch", "pa_costs prices fetch"),
                   ('"pa"-costs prices fetch', "pa-costs prices fetch"), ("Pa-Co'S'ts prices fetch", "Pa-CoSts prices fetch"),
                   ("pa$'_costs' prices fetch", "pa_costs prices fetch"), ("pa_\\\ncosts prices fetch", "pa_costs prices fetch"),
