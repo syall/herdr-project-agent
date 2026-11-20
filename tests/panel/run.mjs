@@ -6191,7 +6191,7 @@ cases["Q154-2-worker-items"] = async () => { // R2: the entry's workers are the 
   check(!/worker t72|t72 \(ended\)|t72 \(closed\)/.test(text), `t72 (no ledger record, no terminal) is not drawn (got ${text})`);
   check(!/t73/.test(text), `t-160 R1: an unfinished recorded worker with no terminal is not drawn (got ${text})`);
   check(text.includes("reviewer t74 (closed)"), `finished, no closed stamp: (closed), as the task card (got ${text})`);
-  const dim = P142.find(root, `queue-worker-${Q154.key(0)}-1`);
+  const dim = P142.find(root, `queue-worker-${Q154.key(1)}-0`); // t-160: t74 (closed), the one not-live worker still drawn
   check(P142.dot(dim)?.bg === "#dim", `not live: the dim dot (got ${JSON.stringify(P142.dot(dim))})`);
   check(queueClicks(v, /^queue-worker-/).length === 1, `one link: the live worker (got ${queueClicks(v, /^queue-worker-/)})`);
   await click(v, "view-tasks"); await click(v, "task-head-t-A");
