@@ -4,6 +4,7 @@ Python standard library only (3.7+).
 
   pa-handoff check|recheck|fix|verify|review|queue <task> [--job J] [--base B] [--round N] [--diff] [--logic]
              [--no-mutations] [--public] [--items TEXT | --items-file PATH] [--repo R] [--space S] [--force]
+  pa-handoff rules <task> --role design|build|verifier|reviewer|check [--space S]
 
 It writes <space>/evidence/<task>/handoff-<kind>[-<job>][-r<round>].md and prints its path; the Project Agent adds
 only its judgement lines (--items). What it reads:
@@ -22,6 +23,9 @@ queue wraps `pa-queue brief <task> --repo <main checkout>` from the task's queue
 falls back to --repo, else the ledger worktree's main checkout (pa-queue brief then says why it refuses).
 It never starts a worker and never writes the ledger or any file but the handoff; an existing handoff is kept
 unless --force. check and recheck are the low tier's (a normal or high tier task gets verify and review).
+Every handoff ends with the space's rules for its job (t-190 R3), before its last line: each active rule that
+applies, highest order first, with its id and title, and the full text of those aimed at the job's role.
+`pa-handoff rules` prints that block alone, for the handoffs the Project Agent writes itself; it writes no file.
 """
 import argparse
 import contextlib
@@ -35,6 +39,13 @@ import pa  # noqa: E402
 import pa_hooks  # noqa: E402
 
 KINDS = ("check", "recheck", "fix", "verify", "review", "queue")
+ROLES = ("design", "build", "verifier", "reviewer", "check")  # pa-handoff rules --role (t-190 R3)
+KIND_ROLE = {"check": "check", "recheck": "check", "queue": "check", "fix": "build", "verify": "verifier",
+             "review": "reviewer"}
+ROLE_TARGETS = {"design": ("design",), "build": ("build", "plan", "test"), "verifier": ("verifier", "test"),
+                "reviewer": ("reviewer", "review"), "check": ("check", "verifier", "reviewer", "test", "review")}
+BLOCK_MAX = 6000  # characters of the rules block
+FILE_OPTIONS = ("job", "base", "round", "diff", "logic", "no_mutations", "public", "items", "items_file", "repo", "force")
 TIERS = ("low", "normal", "high")
 FLAKES_FILE = "flakes.txt"
 QUEUE_FILE = "queue.json"  # pa-queue's file (read only here)
@@ -188,6 +199,49 @@ def main_checkout(worktree):
     return os.path.realpath(os.path.dirname(os.path.realpath(common)))
 
 
+def rule_targets(rule):
+    """appliesTo case-folded and stripped; 'all' when it is not text or empty (H6: fail toward showing)."""
+    target = rule.get("appliesTo")
+    target = target.strip().casefold() if isinstance(target, str) else ""
+    return target or "all"
+
+
+def rules_block(directory, task, role):
+    """(lines, note) of the rules block for a job of `role` on ledger task `task` (a dict): the active rules whose
+    appliesTo is all, one of the role's targets, the task's type or '<tier> tier', highest order first. note: why
+    rules.json gives none (for stderr), else None."""
+    rules, why = pa.read_rules(directory)
+    path = os.path.join(directory, "rules.json")
+    if why:
+        return (["Space rules for this job: rules.json not readable ({}); ask the Project Agent before you "
+                 "start.".format(why)], "rules.json not readable ({})".format(why))
+    kind = str(task.get("type") or "").strip().casefold()
+    tier = "{} tier".format(str(task.get("tier") or "").strip().casefold())
+    own = ROLE_TARGETS[role]
+    shown = [r for r in rules if rule_targets(r) in ("all", tier) + own or (kind and rule_targets(r) == kind)]
+    if not shown:
+        return ["Space rules for this job: none active ({}).".format(path)], None
+    times = [h["at"] for r in shown for h in (r.get("history") if isinstance(r.get("history"), list) else [])
+             if isinstance(h, dict) and isinstance(h.get("at"), str) and pa.parse_time(h["at"]) is not None]
+    stamp = max(times, key=pa.parse_time) if times else "unknown"
+    head = "Space rules for this job ({}, active, highest order first; last change {}):".format(path, stamp)
+    tail = ("Read each one's text in rules.json before you start and follow it; where this handoff disagrees with an "
+            "active rule, follow the rule and say so in your report.")
+    lines, size = [head], len(head) + len(tail) + 2
+    for n, r in enumerate(shown):
+        line = "- " + pa.rule_named(r)
+        if rule_targets(r) in own:
+            text = pa.rule_text(r)
+            line += (". " + text) if text else ""
+        more = "- and {} more in rules.json".format(len(shown) - n)
+        if size + len(line) + 1 + len(more) + 1 > BLOCK_MAX:
+            lines.append(more)
+            break
+        lines.append(line)
+        size += len(line) + 1
+    return lines + [tail], None
+
+
 # ---- the facts of one handoff --------------------------------------------------------------------------------------
 
 class Facts(object):
@@ -202,6 +256,7 @@ def gather(args, directory, agent):
     if not task:
         raise Refused("{} is not in the ledger".format(args.task))
     f.task, f.title, f.tier = args.task, task.get("title") or "", task.get("tier")
+    f.entry = task
     if f.tier not in TIERS:
         raise Refused("{} has no tier in the ledger (low, normal or high)".format(args.task))
     if f.kind in ("check", "recheck") and f.tier != "low":
@@ -483,6 +538,10 @@ def cmd_write(args):
     builders = {"check": text_check, "recheck": text_recheck, "fix": text_fix, "verify": text_verify,
                 "review": text_review}
     lines = text_queue(f, args.repo) if f.kind == "queue" else builders[f.kind](f)
+    block, note = rules_block(directory, f.entry, KIND_ROLE[f.kind])
+    lines[-1:] = block + lines[-1:]  # t-190 R3: before the last line (the Rules: and report line)
+    if note:
+        f.notes.append(note)
     path = os.path.join(f.ev, file_name(f))
     if os.path.exists(path) and not args.force:
         raise Refused("{} is there; pass --force to write it again".format(path))
@@ -497,9 +556,24 @@ def cmd_write(args):
     return 0
 
 
+def cmd_rules(args):
+    """pa-handoff rules <task> --role <role>: the rules block on stdout, a note on stderr; writes nothing."""
+    directory, _agent = pa.space_for_command(args.space)
+    ledger = pa_hooks.read_ledger(directory)
+    task = next((t for t in ledger.get("tasks") or [] if isinstance(t, dict) and t.get("id") == args.task), None)
+    if not task:
+        raise Refused("{} is not in the ledger".format(args.task))
+    lines, note = rules_block(directory, task, args.role)
+    if note:
+        print("pa-handoff: note: {}".format(note), file=sys.stderr)
+    print("\n".join(lines))
+    return 0
+
+
 def parser():
     p = argparse.ArgumentParser(prog="pa-handoff", description="Write a worker's handoff (t-169).")
-    p.add_argument("command", choices=KINDS)
+    p.add_argument("command", choices=KINDS + ("rules",))
+    p.add_argument("--role", help="rules: the job's role ({})".format(", ".join(ROLES)))
     p.add_argument("task")
     p.add_argument("--job", help="the job (its worktrees entry); default main")
     p.add_argument("--base", help="the base commit (a fix: the checked commit)")
@@ -521,6 +595,15 @@ def main(argv=None):
     args = parser().parse_args(sys.argv[1:] if argv is None else argv)
     try:
         pa.ident(args.task, "task id")
+        if args.command == "rules":
+            given = [o for o in FILE_OPTIONS if getattr(args, o) not in (None, False)]
+            if given:
+                raise pa.Problem("rules takes only <task>, --role and --space (not --{})".format(given[0].replace("_", "-")))
+            if args.role not in ROLES:
+                raise pa.Problem("--role must be one of {} (got {!r})".format(", ".join(ROLES), args.role))
+            return cmd_rules(args)
+        if args.role is not None:
+            raise pa.Problem("--role is for pa-handoff rules")
         if args.job:
             pa.ident(args.job, "job")
         return cmd_write(args)
