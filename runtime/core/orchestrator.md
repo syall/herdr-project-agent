@@ -295,14 +295,18 @@ no later change by anyone else), and bound by them on the allowlist entry with i
 unchanged. Then, for each queue entry that has passed pa-gate and its checks (for a
 stacked entry, an independence review that found it independent), run `pa-queue merge
 --repo <main checkout> --standing <rule id>`, then the push tool's run with `--standing
-<rule id> --repo <main checkout>`, then what the rule and r-pa-installs say (install).
+<rule id> --repo <main checkout> --space <id>`, then what the rule and r-pa-installs-2
+say (install).
 High tier entries still get a card. An entry with Recorded limits merges on the rule; the
 one-line report lists its limits with their follow-ups. Tell the person each merge, push
 and install in one line. A hold, an Other answer or note on any card, a failed check or
 gate, a commit after the checked commit, or a refused push stops it: the tools refuse
-with the cause; fall back to cards as above, and say so. Resuming is the person's (they
-turn the rule off and on in the panel); never resume it, edit it, bind it or run the
-allowlist command. Treat an Other answer said in chat as a stop too. For a repository on
+with the cause; fall back to cards as above, and say so. A failure the queue's refresh
+sees first only takes that entry (and those built on it) out of the queue. An entry the
+person declined on a queue card (`Not now`, or listed after X on `Merge up to X`) waits
+for a new queue card; one rebased straight onto main is no longer stacked. Resuming is
+the person's (they turn the rule off and on in the panel); never resume it, edit it, bind
+it or run the allowlist command. Treat an Other answer said in chat as a stop too. For a repository on
 the person's push allowlist (`push-allow.json` in the Project Agent's home), the order is
 fixed: the task passes `pa-gate <task-id>`; you open the card that asks to publish or
 merge it, which lists every Recorded limit (for high tier the check right before it is

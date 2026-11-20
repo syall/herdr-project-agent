@@ -529,8 +529,9 @@ def seed_rules(p):
         for r in (read_json(path, {}) or {}).get("rules", []):
             r = dict(r)
             r.setdefault("status", "active")
-            r.setdefault("source", source)
-            r.setdefault("history", [{"at": now(), "by": source, "change": "seeded"}])
+            # t-163 R9: a seeded rule is its file's, whatever the file says (never the person's: no standing approval)
+            r["source"] = source
+            r["history"] = [{"at": now(), "by": source, "change": "seeded"}]
             rules.append(r)
     for i, r in enumerate(rules):
         r.setdefault("order", (len(rules) - i) * 10)

@@ -789,6 +789,9 @@ def restack(ctx, data, rec, dry=False):
         last.update(to=new, result=d["result"], files=d["files"])
         if d["result"] in ("clean", "moved", "union"):
             e.update(onto=prev, base=prev_tip, tip=new, suite=None, review=None)
+            # t-163 R7, R15 (d-291 Q3): stacked on the entry it now sits on; rebased straight onto main, no longer stacked
+            ahead = next((x for x in rec["entries"] if x.get("branch") == prev), None) if prev != rec["main"] else None
+            e.update(stacked=ahead is not None, stackedOn=below_of(ahead) if ahead else None)
             set_state(ctx, e, "checking", "restacked onto {} ({})".format(prev, d["result"]))
             if d["result"] in ("moved", "union"):
                 e["needs"] = {"shortReview": needs_for(ctx, e, new, d, e["checked"]["base"], prev_tip)}
@@ -1140,6 +1143,7 @@ def add(ctx, data, rec, tid, job):
              "needs": None, "suite": None, "review": None, "rebases": [], "approval": None}
     if onto != rec["main"]:
         entry["stacked"] = True  # t-140 R12: the person's rule asks a stacked entry for its independence review
+    entry["stackedOn"] = below_of(rec["entries"][-1]) if onto != rec["main"] else None  # t-163 R7, R15
     lines = []
     if not ok and entry["base"] != onto_tip:
         raise Refused("the gate does not pass now: {} (a branch whose conflict was kept on both sides joins only from "
@@ -1900,10 +1904,17 @@ def merge_front(ctx, data, rec, only=None):
             why, void = "local {} moved during the run (at {}, expected {})".format(rec["main"], short(main_tip), short(expected)), False
         else:
             why, void, suite = merge_check(ctx, rec, e, main_tip, suites, reviews, expected=expected)
+        approved = card_approval(e)
         if not why:
             why = ff_merge(ctx, rec, e, e["tip"])
         if why:
             stop_at(ctx, e, why, void, main_tip, lines)
+            if approved and stop_cause(why, void):
+                # t-163 R3: a cause the rule names, seen at a card's merge step, stops the rule too (d-291 Q1)
+                rid = rule_in_force(ctx)
+                if rid:
+                    pa_push.write_stop(ctx.directory, rid, "{}: {}".format(e["task"], why), task=e["task"])
+                    lines.append("the standing rule {} stopped: {}: {}".format(rid, label(e), why))
             break
         merged_record(ctx, data, rec, e, main_tip, suite, lines)
         merged.append(e)
@@ -1928,6 +1939,8 @@ def merged_record(ctx, data, rec, e, main_tip, suite, lines, **extra):
               "card": e["approval"].get("card"), "commits": int(count) if count and count.isdigit() else None,
               "suite": dict({k: suite.get(k) for k in ("tree", "worker", "started", "ended")},
                             **({"carried": suite["carried"]} if suite.get("carried") else {}))}
+    if "stackedOn" in e:  # t-163 R7: the stack walk goes on below a merged entry that was stacked
+        record["stackedOn"] = e["stackedOn"]
     record.update(extra)
     rec["merged"].append(record)
     rec["entries"].remove(e)
@@ -1959,9 +1972,20 @@ def void_standing(ctx, rec):
             ctx.event("void", e, why=STANDING_VOID, rule=a.get("standing"))
 
 
+def below_of(x):
+    """The {task, job} an entry is stacked on (t-163 R7), as stackedOn records it."""
+    return {"task": x["task"], "job": x.get("job")}
+
+
 def stacked(e, rec):
-    """The entry joined on another entry's branch, or was restacked onto one (R12): the rule asks for its independence."""
-    if e.get("stacked") or (e.get("onto") and e.get("onto") != rec["main"]):
+    """The entry sits on another entry's branch, or on the change of an entry that merged below it (R12): the rule asks
+    for its independence. t-163 R15 (d-291 Q3): an entry restacked straight onto main is not stacked (stackedOn None).
+    An entry queued before stackedOn existed is read as before (it joined, or was restacked, onto another entry)."""
+    if e.get("onto") and e.get("onto") != rec["main"]:
+        return True
+    if "stackedOn" in e:
+        return bool(e["stackedOn"])
+    if e.get("stacked"):
         return True
     return any(isinstance(r, dict) and r.get("onto") and r.get("onto") != rec["main"] for r in e.get("rebases") or [])
 
@@ -1977,15 +2001,38 @@ def independence_passed(ctx, rec, e, tip, reviews, below):
     return r, tree
 
 
-def stacked_on(rec, e):
-    """What a stacked entry at the front was stacked on (R12): the merged entry whose tip is its base, as (the main tip
-    before that entry merged, its tip), so `git diff old new` is that entry's change. None when it cannot be told (no
-    merged entry ends at its base, or that diff would be empty): the rule then waits, it never asks an empty review."""
+def stack_pair(rec, e):
+    """t-163 R7 (d-291 Q2): the whole stack below e, as (where its lowest entry started, e's base), so `git diff old
+    new` is every change e is stacked on. The walk follows stackedOn: the entry below is the queue entry, or else the
+    merged record, of that task and job whose tip is the base of the one above it; it goes on from that entry's base
+    (a queue entry) or from (a merged record, which moved main: from != tip), while that one was stacked too. None
+    when a link cannot be followed (an entry queued before stackedOn existed, a record that ends elsewhere) or the
+    diff would be empty: the rule then waits, it never asks an empty or a partial review."""
+    if not e.get("stackedOn"):
+        return None
     base = e.get("base")
-    for m in reversed(rec.get("merged") or []):
-        if isinstance(m, dict) and base and m.get("tip") == base and m.get("from") and m["from"] != base:
-            return m["from"], base
-    return None
+    low, below, at, seen = None, e["stackedOn"], base, 0
+    while below and at and seen <= len(rec.get("entries") or []) + len(rec.get("merged") or []):
+        seen += 1
+        key = (below.get("task"), below.get("job") or None) if isinstance(below, dict) else (None, None)
+        x = next((x for x in rec.get("entries") or [] if x is not e and (x.get("task"), x.get("job") or None) == key
+                  and x.get("tip") == at), None)
+        if x is not None:
+            low, at, below = x.get("base"), x.get("base"), x.get("stackedOn")
+            continue
+        m = next((m for m in reversed(rec.get("merged") or []) if isinstance(m, dict) and (m.get("task"), m.get("job") or None) == key
+                  and m.get("tip") == at and m.get("from") and m["from"] != m["tip"]), None)
+        if m is None:
+            return None
+        low, at, below = m["from"], m["from"], m.get("stackedOn")
+    if below or not low or low == base:
+        return None
+    return low, base
+
+
+def stacked_on(rec, e):
+    """What a stacked entry at the front is stacked on (R12): stack_pair's (t-163 R7). None when it cannot be told."""
+    return stack_pair(rec, e)
 
 
 def standing_need(ctx, rec, e, tip, below):
@@ -2019,15 +2066,10 @@ def rule_in_force(ctx):
 
 
 def stacked_below(rec, e):
-    """The pair whose diff is the change e is stacked on (t-170): at the front, stacked_on's (the merged entry ending
-    at its base); behind an entry a not merged yet, (a's base, a's tip), the pair stacked_on gives once a merges as it
-    stands (a fast-forward from its base). Else None. merge --standing compares the pair again at the front."""
-    if e.get("onto") == rec["main"]:
-        return stacked_on(rec, e)
-    a = next((x for x in rec["entries"] if x.get("branch") == e.get("onto")), None)
-    if a and a.get("base") and a.get("tip") and a["base"] != a["tip"] and e.get("base") == a["tip"]:
-        return a["base"], a["tip"]
-    return None
+    """The pair whose diff is the change e is stacked on (t-170), at the front or behind entries not merged yet: the
+    one stack_pair gives (t-163 R7), the pair it gives at the front once those merge as they stand (fast-forwards
+    from their bases). merge --standing compares the pair again at the front."""
+    return stack_pair(rec, e)
 
 
 def pair_stacked(ctx, rec):
@@ -2146,10 +2188,50 @@ def standing_wait(ctx, rec, e, task):
     return None
 
 
+def declined_by(ctx, rec, e):
+    """t-163 R1 (d-291 Q4): why a queue card the person answered holds e back from the rule, or None. A card of this
+    repository (decisions/ or the archive), answered and not Other (that is a stop already), that lists this entry's
+    instance (task, job, instance id) and did not approve it: Not now, or past the prefix it approved (Merge up to X,
+    or the prefix apply_cards recorded). A later card that approves the instance gives a card approval (merged as the
+    card's, before this is read); a new instance is not held by an old card."""
+    inst = e.get("instance")
+    if not inst:
+        return None
+    key = (e["task"], e.get("job") or None)
+    for cid, card in queue_cards(ctx.directory, rec["common"]) + archived_queue_cards(ctx.directory, rec["common"]):
+        if card.get("status") != "answered" or pa.is_other(card):
+            continue
+        q = card["queue"]
+        listed = [x for x in q.get("entries") or [] if isinstance(x, dict)]
+        if not any((x.get("task"), x.get("job") or None) == key and x.get("instance") == inst for x in listed):
+            continue
+        applied = q.get("applied") if isinstance(q.get("applied"), dict) else None
+        if applied is not None:
+            ok = {(a.get("task"), a.get("job") or None) for a in applied.get("approved") or [] if isinstance(a, dict)}
+        else:
+            option = next((o for o in card.get("options") or [] if isinstance(o, dict) and o.get("label") == card.get("answer")), None)
+            k = option.get("count") if option and isinstance(option.get("count"), int) and option.get("label") != NOT_NOW else 0
+            ok = {(x.get("task"), x.get("job") or None) for x in listed[:max(0, k)]}
+        if key not in ok:
+            return "the person answered {} '{}' for it; open a new queue card".format(cid, card.get("answer"))
+    return None
+
+
+def archived_queue_cards(directory, common):
+    """[(id, card)] of the queue cards of this repository in decisions-archive/ (t-163 R1)."""
+    folder = os.path.join(directory, pa.ARCHIVE)
+    out = []
+    for name in sorted(os.listdir(folder), key=lambda x: (card_number(x) or 0, x)) if os.path.isdir(folder) else []:
+        card = pa.read_json_safe(os.path.join(folder, name)) if card_number(name) is not None else None
+        q = card.get("queue") if isinstance(card, dict) and card.get("kind") == "queue" else None
+        if isinstance(q, dict) and q.get("common") == common:
+            out.append((name[:-5], card))
+    return out
+
+
 def stop_cause(why, void):
     """A merge_check refusal that stops the rule (R13): one that voids the approval, a failing gate, a failed suite."""
-    return void or why.startswith("the gate fails now") or why.startswith("not passed: the full suite exited") or \
-        why.startswith("short review:")
+    return void or why.startswith("the gate fails now") or why.startswith("not passed: the full suite exited")
 
 
 def merge_standing(ctx, data, rec, rule, binding, space_id):
@@ -2175,7 +2257,11 @@ def merge_standing(ctx, data, rec, rule, binding, space_id):
             merged_record(ctx, data, rec, e, main_tip, suite, lines)
             merged.append((e, False))
             continue
-        wait = standing_wait(ctx, rec, e, ctx.task(e["task"]))
+        a = e.get("approval")
+        if isinstance(a, dict) and a.get("card") and a.get("void"):  # t-163 R3: the rule never replaces it
+            wait = "its approval by {} is void ({}); open a new queue card".format(a["card"], a["void"])
+        else:
+            wait = declined_by(ctx, rec, e) or standing_wait(ctx, rec, e, ctx.task(e["task"]))
         if wait:
             lines.append("waits at {}: {}".format(label(e), wait))
             break
@@ -2225,7 +2311,7 @@ def merge_standing(ctx, data, rec, rule, binding, space_id):
         lines += push_card(ctx, rec, merged[-1][0]["task"])  # D13: the push card is for the last merge of the run
     elif merged and not stopped:
         lines.append("next: pa-push-main run --standing {} --repo {} --space {} (pushes the rule's merges; then "
-                     "pa-install-all as r-pa-installs says)".format(rid, ctx.repo, space_id))
+                     "pa-install-all as r-pa-installs-2 says)".format(rid, ctx.repo, space_id))
     return lines, stopped
 
 
@@ -2233,6 +2319,8 @@ def cmd_merge_standing(args):
     with writing(args) as (ctx, data, rec):
         sync_main(ctx, rec)
         void_standing(ctx, rec)
+        applied = apply_cards(ctx, rec)  # t-163 R2: a card answered since the last refresh merges as the card's
+        save(ctx, data, rec)
         directory = ctx.directory
         space_id = space_id_of(directory)
         try:
@@ -2247,6 +2335,7 @@ def cmd_merge_standing(args):
                         pa_push.write_stop(directory, rule["id"], stop[0], task=None)
                     raise Refused("the standing rule {} stops here: {}; fall back to cards".format(rule["id"], stop[0]))
                 lines, stopped = merge_standing(ctx, data, rec, rule, binding, space_id)
+                lines = applied + lines
                 if stopped:
                     pa_push.write_stop(directory, rule["id"], stopped, task=stopped.split(":")[0])
                 save(ctx, data, rec)

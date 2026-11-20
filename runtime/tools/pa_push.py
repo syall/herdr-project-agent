@@ -1780,17 +1780,47 @@ def run_queue_locked(Q, directory, space, card_id, answer, note, seen, deadline)
         s.close()
 
 
+def queue_error(Q, ctx, data, rec, directory, card, label, main_before, err):
+    """t-163 R10: an error after the person's answer was saved (the queue tool refused, git could not say, a file
+    could not be written): the queue is saved if it can be, the card's push result says failed with the message, one
+    journal line, exit 1. Nothing is retried and nothing is pushed (the push comes after the merges)."""
+    words = pa_hooks.cut(pa_hooks.clean(str(err) or type(err).__name__), 300)
+    try:
+        Q.save(ctx, data, rec)
+    except (Q.Refused, OSError) as again:
+        words += "; queue.json not saved: " + pa_hooks.cut(pa_hooks.clean(str(again)), 100)
+    card_id = card["id"]
+    card = pa.read_json_safe(card_file(directory, card_id)) or card
+    card["id"] = card_id
+    now_main = ctx.tip(rec["main"])
+    done = "local {} {}".format(rec["main"], "unchanged" if now_main == main_before else "moved {}..{}".format(
+        short(main_before), short(now_main)))
+    message = "{} answered {}: an error after the answer: {} ({}); nothing was pushed".format(card_id, label, words, done)
+    result = {"at": pa.now(), "state": "failed", "from": None, "to": None, "commits": 0, "check": "error",
+              "message": message, "merged": [], "pushCard": None}
+    card["queue"].setdefault("push", {})["result"] = result
+    try:
+        save_card(directory, card)
+    except OSError:
+        pass
+    queue_journal(directory, card, message)
+    return 1, outcome(False, False, label, refusal={"check": "error", "message": message}, result=result, message=message)
+
+
 def queue_merge_and_push(s, Q, ctx, data, rec, directory, space, card, option, note):
     """R3 (5)-(8), R5, R6: the answer, its approvals, the merges of the option's entries, then the push of exactly the
     merged commits, or why not and the push card that follows. Nothing is retried."""
     card_id, label, repo = card["id"], option["label"], ctx.repo
     answered(card, label, note)
     save_card(directory, card)
-    Q.apply_cards(ctx, rec)  # the approvals, bound as a card's (task, job, instance, added, checked digests)
     main_before = ctx.tip(rec["main"])
-    only = [(x.get("task"), x.get("job") or None) for x in card["queue"]["entries"][:option["count"]] if isinstance(x, dict)]
-    lines, merged = Q.merge_front(ctx, data, rec, only=only)
-    Q.save(ctx, data, rec)
+    try:
+        Q.apply_cards(ctx, rec)  # the approvals, bound as a card's (task, job, instance, added, checked digests)
+        only = [(x.get("task"), x.get("job") or None) for x in card["queue"]["entries"][:option["count"]] if isinstance(x, dict)]
+        lines, merged = Q.merge_front(ctx, data, rec, only=only)
+        Q.save(ctx, data, rec)
+    except (Q.Refused, pa_hooks.ContentError, OSError) as err:
+        return queue_error(Q, ctx, data, rec, directory, card, label, main_before, err)
     card = pa.read_json_safe(card_file(directory, card_id)) or card  # apply_cards wrote it again
     card["id"] = card_id
     stop = next((l for l in lines if l.startswith("stopped at")), None)
@@ -1900,6 +1930,10 @@ def standing_rule(directory, space, repo, rule_id):
     return rule, entry
 
 
+PERSON_APPROVED = ("approved", "edited and approved")  # t-163 R13: the panel's words (rules.js), exactly
+RESUMES = ("created", "approved", "edited and approved", "turned on")  # t-163 R6: the person's changes that resume the rule
+
+
 def not_persons(rule):
     """None when the rule is the person's (R10 (4)): source person and created by them, or source orchestrator and
     approved by them; and every history entry after that is theirs. Else why not."""
@@ -1911,7 +1945,7 @@ def not_persons(rule):
             return "its first history entry is not its creation by the person"
         start = 0
     elif rule.get("source") == "orchestrator":
-        start = next((i for i, h in enumerate(history) if h.get("by") == "person" and str(h.get("change") or "").startswith("approved")), None)
+        start = next((i for i, h in enumerate(history) if h.get("by") == "person" and h.get("change") in PERSON_APPROVED), None)
         if start is None:
             return "the person never approved it"
     else:
@@ -1923,8 +1957,12 @@ def not_persons(rule):
 
 
 def since_of(rule):
-    """The rule's last change by the person (R13: the Other/note window starts there; a stop before it is resumed, Q4)."""
-    times = [pa.parse_time(str(h.get("at"))) for h in rule.get("history") or [] if isinstance(h, dict) and h.get("by") == "person"]
+    """When the person last created, approved or turned on the rule (R13: the Other/note window starts there; a stop
+    before it is resumed, Q4: off and on). t-163 R6: only those changes, spelled exactly as the panel writes them, by
+    the person, with a time in pa.now()'s form; an edit, a reorder or any other entry does not resume it. None when
+    there is none (everything counts)."""
+    times = [pa.parse_time(str(h.get("at"))) if isinstance(h.get("at"), str) else None for h in rule.get("history") or []
+             if isinstance(h, dict) and h.get("by") == "person" and h.get("change") in RESUMES]
     times = [t for t in times if t is not None]
     return max(times) if times else None
 
@@ -1987,12 +2025,18 @@ def standing_stops(directory, rule):
     """What stops the rule now (R13), as (why, fresh) or None. fresh is False for a stop already written (it stays until
     the person changes the rule, Q4)."""
     since = since_of(rule)
-    after = lambda at: since is None or (pa.parse_time(str(at)) or 0) > since
+
+    def after(at):  # t-163 R5: at or after since; a time that is missing or not pa.now()'s form counts (fail closed)
+        t = pa.parse_time(at) if isinstance(at, str) else None
+        return since is None or t is None or t >= since
+
+    def when(at):
+        return at if isinstance(at, str) and pa.parse_time(at) is not None else "time unreadable"
     lines, _doubt = journal_lines(directory)
     for l in reversed(lines):
         if l.get("standing") == "stopped" and l.get("rule") == rule.get("id") and after(l.get("at")):
             return ("the rule stopped at {}: {}; the person resumes it by turning it off and on in the panel".format(
-                l.get("at"), pa_hooks.cut(pa_hooks.clean(str(l.get("why"))), 200)), False)
+                when(l.get("at")), pa_hooks.cut(pa_hooks.clean(str(l.get("why"))), 200)), False)
     hold = journal_hold(directory)
     if hold != "off":
         return ("a hold is {} (the journal read as pa-places reads it)".format(hold), True)
@@ -2004,15 +2048,16 @@ def standing_stops(directory, rule):
             card = pa.read_json_safe(os.path.join(folder, name))
             if not isinstance(card, dict):
                 continue
-            if worktree_note(card) and after(card.get("previousAnswered") or card.get("answered")):
+            at = card.get("previousAnswered") or card.get("answered")
+            if worktree_note(card) and after(at):
                 return ("card {} carries a note the person wrote ({}), withdrawn or asked again before it was acted on".format(
-                    name[:-5], card.get("previousAnswered") or card.get("answered")), True)
+                    name[:-5], when(at)), True)
             if card.get("status") != "answered" or not after(card.get("answered")):
                 continue
             if pa.is_other(card):
-                return ("card {} was answered Other at {}".format(name[:-5], card.get("answered")), True)
+                return ("card {} was answered Other at {}".format(name[:-5], when(card.get("answered"))), True)
             if str(card.get("note") or "").strip() and str(card.get("answeredBy") or "").startswith("person, in the panel"):
-                return ("card {} has a note written in the panel ({})".format(name[:-5], card.get("answered")), True)
+                return ("card {} has a note written in the panel ({})".format(name[:-5], when(card.get("answered"))), True)
     return None
 
 
@@ -2068,9 +2113,10 @@ def standing_caller_refusal(env, ancs, cwd, directory):
             if isinstance(w, dict) and pa.local_id(str(w.get("address") or "")) == me:
                 return "{} is a worker of {} in the ledger: workers never push".format(me, t.get("id"))
     agent = pa.read_json_safe(os.path.join(directory, "agent.json")) or {}
-    mine = {pa.local_id(str(x)) for x in [agent.get("terminal")] + list(agent.get("terminals") or []) if x}
-    if me not in mine:
-        return "{} is not this space's Project Agent terminal ({})".format(me, ", ".join(sorted(mine)) or "none recorded")
+    # t-163 R8: the current terminal only; `terminals` keeps old addresses (a restart's), which never push
+    mine = pa.local_id(str(agent.get("terminal") or "")) if isinstance(agent, dict) else ""
+    if not mine or me != mine:
+        return "{} is not this space's Project Agent terminal ({})".format(me, mine or "none recorded")
     return None
 
 
@@ -2108,10 +2154,9 @@ def run_standing(space, rule_id, repo, env, ancs, cwd=None, deadline=None):
                 common = os.path.realpath(os.path.join(repo, ".git"))
                 merged = queue_merged(directory, common)
                 last = merged[-1] if merged else None
-                if not last or last.get("standing") != rule_id:
-                    raise Refused("standing", "the last merge of {} was not made on rule {} ({}): commits not merged on the "
-                                              "rule; a push card lists them".format(repo, rule_id, "no merge" if not last else
-                                                                                   "approved by " + str(last.get("card") or last.get("by"))))
+                if not last:  # t-163 R12: nothing merged is nothing to push, not a stop
+                    return 0, outcome(True, False, None, result={"state": "none"},
+                                      message="nothing merged on the rule; nothing to push ({})".format(repo))
                 task = last.get("task")
                 push = {"version": 1, "space": space, "task": task, "path": repo}
                 try:
@@ -2121,6 +2166,10 @@ def run_standing(space, rule_id, repo, env, ancs, cwd=None, deadline=None):
                         return 0, outcome(True, True, None, result={"state": "already", "to": facts["commit"]},
                                           message="already on the remote: {} {} is at {}".format(facts["url"], facts["branch"], short(facts["commit"])))
                     raise
+                if last.get("standing") != rule_id:  # t-163 R12: after gather, so a merge already pushed is not a stop
+                    raise Refused("standing", "the last merge of {} was not made on rule {} (approved by {}): commits not "
+                                              "merged on the rule; a push card lists them".format(
+                                                  repo, rule_id, last.get("card") or last.get("by")))
                 if facts.get("merge") or facts.get("localNow") != facts.get("commit"):
                     raise Refused("C10a", "local {} is at {}, not at the merged commit {}; nothing is pushed on this path".format(
                         facts["branch"], short(facts.get("localNow")), short(facts.get("commit"))))
@@ -2146,7 +2195,7 @@ def run_standing(space, rule_id, repo, env, ancs, cwd=None, deadline=None):
                 refresh_tracking(s, facts)
                 return 0, outcome(True, True, None, result={"state": "pushed", "from": facts["remoteNow"], "to": facts["commit"],
                                                             "count": facts["count"], "output": tail(output)},
-                                  message="{} (rule {}); next: pa-install-all as r-pa-installs says".format(message, rule_id))
+                                  message="{} (rule {}); next: pa-install-all as r-pa-installs-2 says".format(message, rule_id))
             except Refused as r:
                 write_stop(directory, rule_id, "{} ({})".format(r.message, r.check), task)
                 raise
