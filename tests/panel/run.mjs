@@ -1620,7 +1620,7 @@ cases["Q6-short-hour"] = async () => { // V2.6: 7:30 is a time, written as 07:30
 
 // ---- t-011: workers closed with pa-worker close leave the task card ----
 const closedW = (address) => ({ address, role: "build", name: `w-${address}`, finished: true, closed: "2026-11-16T10:00:00Z", closedBy: "agent", report: "FINDINGS.md" });
-cases["W1-closed-not-listed"] = async () => { // V3.1: closed ones go; working, blocked, kept and ended-not-closed stay, labels as before
+cases["W1-closed-not-listed"] = async () => { // V3.1: closed ones go; working, blocked, kept stay, labels as before (t-160 R1: ended-not-closed goes too)
   world({ extraTerms: [{ address: "t41", state: "live", argv: ["claude"], labels: {}, status: "working", program: claude },
                        { address: "t42", state: "live", argv: ["claude"], labels: {}, status: "blocked", program: claude },
                        { address: "t43", state: "live", argv: ["claude"], labels: {}, status: "idle", program: claude }] });
@@ -1633,9 +1633,9 @@ cases["W1-closed-not-listed"] = async () => { // V3.1: closed ones go; working, 
   await click(v, "view-tasks"); await click(v, "task-head-t-5");
   const { text, clicks } = look(v);
   check(!/t40/.test(text) && !/t45/.test(text) && !/\(closed\)/.test(text), `closed workers not drawn (got ${text.slice(-500)})`);
-  check(/build t41 ↗/.test(text) && /reviewer t42 ↗/.test(text) && /verifier t43 · kept ↗/.test(text) && /build t44 \(ended\)/.test(text), `the others as before (got ${text.slice(-500)})`);
+  check(/build t41 ↗/.test(text) && /reviewer t42 ↗/.test(text) && /verifier t43 · kept ↗/.test(text) && !/t44/.test(text), `the others as before; t-160 R1: t44 (ended, not closed) not drawn (got ${text.slice(-500)})`);
   const chips = Object.keys(clicks).filter((k) => k.startsWith("worker-x-t-5-"));
-  check(chips.length === 4, `four worker × (got ${chips})`);
+  check(chips.length === 3, `three worker × (got ${chips})`);
 };
 cases["W2-all-closed-no-row"] = async () => { // V3.2, V3.3: every worker closed: no workers row at all; the ledger is not written
   world();
@@ -1734,8 +1734,8 @@ async function down(v, id) {
   }
   await flush();
 }
-async function crewWorld() {
-  world();
+async function crewWorld() { // t-160: the workers' terminals live (R1 draws no unfinished worker without one)
+  world({ extraTerms: ["w1", "w2"].map((address) => ({ address, state: "live", argv: ["claude"], labels: {}, status: "idle", program: claude })) });
   g.__files[`:${DIR}/ledger.json`] = JSON.stringify({ tasks: [
     { id: "t-1", title: "One", state: "in-progress", updated: "2026-11-16T10:02:00Z", workers: [{ address: "w1", role: "build", name: "a" }] },
     { id: "t-2", title: "Two", state: "in-progress", updated: "2026-11-16T10:01:00Z", workers: [{ address: "w2", role: "build", name: "b" }] }] });
