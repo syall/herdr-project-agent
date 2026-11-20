@@ -22,7 +22,7 @@
 //           space's machine, Turn off (`pa-costs billed disable`, here). Nothing else writes (R12).
 //   layout: (t-143) each section a bordered card: its head (title, count, controls, Copy), its rows with tokens and est. in
 //           right-aligned columns. A list over LIST_ROWS rows, and an open drill over DRILL_ROWS lines (a task's many
-//           sessions), scrolls in a fixed-height box. By task sorts (cost: the summary's order; task id; recent: its last
+//           sessions), scrolls in a fixed-height box; a box that scrolls keeps the wheel (t-189). By task sorts (cost: the summary's order; task id; recent: its last
 //           session's end) and filters (a field made on its click: id, title or state); By day sorts by day or cost. Row ids
 //           stay the summary's index in any order. A task id is a link: shared "project-agent.show" (main.js shows the
 //           Tasks tab with it open), the only shared key this view sets; it reads and runs nothing.
@@ -523,9 +523,14 @@ export class CostsPane {
       .bg(on ? t.selected : t.chrome).text_color(on ? t.foreground : t.muted).cursor_pointer().hover((x) => x.bg(t.hover)).on_click(click).child(label);
     const titled = (key, text, meta = null, controls = []) => { begin(key, text); return h_flex().gap(6).items_center().flex_wrap().child(head(text))
       .when(Boolean(meta), (x) => x.child(div().flex_none().text_size(10.5).text_color(t.dim).child(meta))).child(div().flex_1()).children(controls).child(copy(key)); };
+    // t-189: a box that scrolls keeps the wheel: the stop on its parent, so the box's own scroll runs first (the host's
+    // Settings font list does the same) and the Costs tab does not move with it. A short list or drill has no handler.
+    const keepWheel = (id, box) => v_flex().id(id).on_scroll_wheel((_e, cx) => cx.stop_propagation()).child(box);
     const card = (key, top, rows) => v_flex().id(`costs-sec-${key}`).gap(2).p(6).rounded(7).border(1).border_color(t.border)
       .children(Array.isArray(top) ? top : [top])
-      .child(v_flex().id(`costs-list-${key}`).gap(1).when(rows.length > LIST_ROWS, (x) => x.h(LIST_ROWS * ROW_H).overflow_y_scrollbar()).children(rows));
+      .child(rows.length > LIST_ROWS
+        ? keepWheel(`costs-keep-list-${key}`, v_flex().id(`costs-list-${key}`).gap(1).h(LIST_ROWS * ROW_H).overflow_y_scrollbar().children(rows))
+        : v_flex().id(`costs-list-${key}`).gap(1).children(rows));
     // t-177 R17: the active chip says its direction; clicking it again flips it; another chip starts at its default.
     st.dir = st.dir && typeof st.dir === "object" ? st.dir : { task: null, day: null };
     const dirOf = (section) => st.dir[section] ?? DEFAULT_DIR[section]?.[st.sort[section]] ?? "desc";
@@ -565,7 +570,9 @@ export class CostsPane {
     // A drill line that starts with a task id: the id a link, the rest selectable; its Copy line is the whole text.
     const subLink = (id, key, rest) => { lines.push(`  ${key} ${rest}`); return h_flex().pl(20).gap(4).items_center().child(link(id, key, 11)).child(div().min_w(0).text_size(11).text_color(t.muted).child(sel(`costs-sel-sub-${n++}`, rest))); };
     // An open drill: in its own box, which scrolls at a fixed height when it is long (a task's many sessions).
-    const drillBox = (section, kids) => v_flex().id(`costs-drill-${section}`).when(kids.length > DRILL_ROWS, (x) => x.h(DRILL_ROWS * SUB_H).overflow_y_scrollbar()).children(kids);
+    const drillBox = (section, kids) => kids.length > DRILL_ROWS
+      ? keepWheel(`costs-keep-drill-${section}`, v_flex().id(`costs-drill-${section}`).h(DRILL_ROWS * SUB_H).overflow_y_scrollbar().children(kids))
+      : v_flex().id(`costs-drill-${section}`).children(kids);
     // linkTo: { key, rest }: the label's leading task id drawn as a link, the rest after it.
     const row = (section, i, entry, label, extra, drill, linkTo = null, opts = {}) => {
       const key = str(entry.key), open = st.open[section] === key, of = opts.base ?? totalMoney, chipEl = opts.chip ?? null;
