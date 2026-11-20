@@ -7238,8 +7238,8 @@ cases["P155-1-no-command"] = async () => { // a long, multi-line command: the on
     const hit = stubs.findText(root, head);
     check(hit.length === 1 && JSON.stringify(P155.strings(hit[0])) === JSON.stringify([head]), `${head}: its own line (got ${JSON.stringify(hit.map(P155.strings))})`);
   }
-  const at = (s) => text.indexOf(s);
-  check(at("box-1 · reachable") < at("t53 · t-020 verify") && at("t53 · t-020 verify") < at("box-2 ·") && at("box-2 ·") < at("this Mac ·") && at("this Mac ·") < at("t54 · t-041 review"),
+  const at = (s) => text.indexOf(s, text.indexOf("Suite machines")); // inside the block: t53 is also drawn under Working above it
+  check(at("Suite machines") >= 0 && at("box-1 · reachable") >= 0 && at("box-1 · reachable") < at("t53 · t-020 verify") && at("t53 · t-020 verify") < at("box-2 ·") && at("box-2 ·") < at("this Mac ·") && at("this Mac ·") < at("t54 · t-041 review"),
     `each holder under its machine (got ${text.slice(at("Suite machines"), at("Suite machines") + 600)})`);
 };
 
