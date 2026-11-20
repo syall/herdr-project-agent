@@ -1045,7 +1045,7 @@ class A13Stops(Standing):
         dump({"id": "d-8", "task": "t-Z", "status": "answered", "answer": "Other", "other": True, "note": "wait",
               "answered": EARLY, "question": "Q?", "options": []}, os.path.join(self.dir, "decisions", "d-8.json"))
         self.rules([person_rule(history=[{"at": EARLY, "by": "person", "change": "created"},
-                                          {"at": "2000-06-01T00:00:00Z", "by": "person", "change": "edited"}])])
+                                          {"at": "2000-06-01T00:00:00Z", "by": "person", "change": "turned on"}])])  # t-163 R6
         code, out, err = self.smerge()
         self.assertEqual(self.standing_merged(), ["t-A"], out + err)
 

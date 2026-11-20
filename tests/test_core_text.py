@@ -592,13 +592,17 @@ PUSH_STANDING = (
     "approved by them, with no later change by anyone else), and bound by them on the allowlist entry with its text "
     "unchanged. Then, for each queue entry that has passed pa-gate and its checks (for a stacked entry, an independence "
     "review that found it independent), run `pa-queue merge --repo <main checkout> --standing <rule id>`, then the push "
-    "tool's run with `--standing <rule id> --repo <main checkout>`, then what the rule and r-pa-installs say (install). "
+    "tool's run with `--standing <rule id> --repo <main checkout> --space <id>`, then what the rule and r-pa-installs-2 "
+    "say (install). "
     "High tier entries still get a card. An entry with Recorded limits merges on the rule; the one-line report lists its "
     "limits with their follow-ups. Tell the person each merge, push and install in one line. A hold, an Other answer or "
     "note on any card, a failed check or gate, a commit after the checked commit, or a refused push stops it: the tools "
-    "refuse with the cause; fall back to cards as above, and say so. Resuming is the person's (they turn the rule off "
+    "refuse with the cause; fall back to cards as above, and say so. A failure the queue's refresh sees first only takes "
+    "that entry (and those built on it) out of the queue. An entry the person declined on a queue card (`Not now`, or "
+    "listed after X on `Merge up to X`) waits for a new queue card; one rebased straight onto main is no longer "
+    "stacked. Resuming is the person's (they turn the rule off "
     "and on in the panel); never resume it, edit it, bind it or run the allowlist command. Treat an Other answer said "
-    "in chat as a stop too.")  # t-140 R16 (3), Q2, Q3, Q4
+    "in chat as a stop too.")  # t-140 R16 (3), Q2, Q3, Q4; t-163 R14, d-291 Q1, Q3, Q4
 PUSH_QUEUE_CARD = (
     "There, `pa-queue card` words its merge options \"... and push\": that answer merges the entries that can merge now "
     "and pushes exactly those commits, and a push it could not make opens a push card. Such a card is answered in the "
