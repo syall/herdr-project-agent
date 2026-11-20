@@ -207,7 +207,7 @@ export default class ProjectAgent extends View {
     this.openMsg = {}; // space id -> why the last Open did not start anything
     this.confirmOpen = {}; // space id -> { tab, terminal }: a look-alike agent runs; asking first
     // t-037 J4, the Restart button: the confirm (its dry run's lines), this copy's run in flight, the result line.
-    this.restartAsk = {}; // space id -> { busy, lines, refused, capable, instance, prompt, older }
+    this.restartAsk = {}; // space id -> { busy, lines, refused, capable, instance }
     this.restarting = {}; // space id -> { at, instance }: this copy's one run, set before it starts (never twice)
     this.restartMsg = {}; // space id -> { ok, text, at }
     // t-041 J5, t-145: the fresh-contexts switch: this copy's run in flight, the result.
@@ -675,7 +675,7 @@ export default class ProjectAgent extends View {
   askRestart(space, cx) {
     if (this.restartBusy(space) || this.restartAsk[space.id]?.busy) return;
     const code = this.space === space.id ? this.codeOf(space, this.data) : null;
-    const ask = { busy: true, lines: [], refused: false, capable: code ? code.capable : true, instance: code?.instance ?? null, prompt: code?.prompt ?? null, older: code?.word ?? null };
+    const ask = { busy: true, lines: [], refused: false, capable: code ? code.capable : true, instance: code?.instance ?? null };
     this.restartAsk[space.id] = ask;
     delete this.restartMsg[space.id];
     cx.notify();
@@ -735,13 +735,13 @@ export default class ProjectAgent extends View {
             .child(h_flex().gap(6).items_center().child(div().flex_1().min_w(0).child(sel("pa-restart-end-line", line))).child(this.copier.button(t, "copy-end-terminal", () => line))))
           .child(h_flex().gap(6).child(this.button(t, "pa-restart-cancel", "Cancel", (_e, cx) => { delete this.restartAsk[space.id]; cx.notify(); })));
       }
-      const fresh = ask.prompt === "recorded" || /core/.test(String(ask.older ?? ""));
+      // t-187: every ask offers a new conversation, whatever the launcher's prompt; the help line says what it does.
       return lines
-        .child(div().text_color(t.dim).child(`Restart: when its current turn ends. Restart now: its current turn is cut off.${fresh ? " A new conversation loads the current core text; the previous one stays in /resume." : ""}`))
+        .child(div().text_color(t.dim).child("Restart: when its current turn ends. Restart now: its current turn is cut off. A new conversation loads the current core text; the previous one stays in /resume."))
         .child(h_flex().gap(6)
           .child(this.button(t, "pa-restart-go", "Restart", (_e, cx) => this.confirmRestart(space, {}, cx), true))
           .child(this.button(t, "pa-restart-now", "Restart now", (_e, cx) => this.confirmRestart(space, { now: true }, cx)))
-          .when(fresh, (e) => e.child(this.button(t, "pa-restart-fresh", "Restart in a new conversation", (_e, cx) => this.confirmRestart(space, { fresh: true }, cx))))
+          .child(this.button(t, "pa-restart-fresh", "Restart in a new conversation", (_e, cx) => this.confirmRestart(space, { fresh: true }, cx)))
           .child(this.button(t, "pa-restart-cancel", "Cancel", (_e, cx) => { delete this.restartAsk[space.id]; cx.notify(); })));
     }
     const m = this.restartMsg[space.id];

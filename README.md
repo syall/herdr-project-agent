@@ -123,7 +123,8 @@ resuming the same conversation. Its launcher (`pa-session`) ends its own Claude 
 - **From the panel:** **Restart** in the Project view's header (and beside the "Its instructions or tools
   changed" notice) asks first: it runs `pa-restart --dry-run` on the space's machine and shows its lines.
   **Restart** waits for the turn, **Restart now** cuts it off, and **Restart in a new conversation**
-  shows when the resumed conversation would keep older core text. Confirming runs `pa-restart` once,
+  (always offered) starts a new conversation that loads the current core text; the previous one stays in
+  `/resume`. Confirming runs `pa-restart` once,
   tied to the launcher it showed (a hidden `--expect-instance`): a second click, or another window or
   Herdr client, after a restart finds a new launcher and restarts nothing. The header then says
   "Restarted: tools …, core …, profile read …" for a minute, or why it did not happen.
