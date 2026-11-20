@@ -1061,8 +1061,9 @@ def compact_instructions():
     return ("This is the Project Agent's conversation. In the summary, keep: the open asks (what was asked of or "
             "promised to the person and is not answered yet, with what waits on it); the person's own words since the "
             "last ledger checkpoint, quoted exactly; each running worker's address, task and job; the next step per "
-            "task; and any hold or resume the person said. The ledger, the journal and standing.md are read again "
-            "after the compaction, so do not copy them.\n")
+            "task; any hold or resume the person said; and the ids of the active rules in rules.json and the numbers "
+            "in them that handoffs follow. The ledger, the journal and standing.md are read again after the "
+            "compaction, so do not copy them.\n")
 
 
 START_PACK_BODY = ("Your state is on disk. This is not a new space. Do as orchestrator.md says under 'After a restart "
@@ -1086,11 +1087,42 @@ def start_pack(directory, head):
     block.extend("standing.md: {}".format(p) for p in problems[:5])
     parts.append("\n".join(b.rstrip("\n") for b in block))
     try:
-        ledger = read_json(os.path.join(directory, "ledger.json"), {})
-        parts.append(checkpoint_line(ledger))
+        ledger = read_json(os.path.join(directory, "ledger.json"), None)
+        if ledger is None:
+            parts.append(checkpoint_line({}))
+        else:
+            n = as_dict(ledger).get("passCount")
+            nxt = n + 1 if isinstance(n, int) and not isinstance(n, bool) and n >= 0 else None
+            parts.append(checkpoint_line(ledger) + ("\nYour next pass is {}.".format(nxt) if nxt is not None else ""))
     except Exception:  # noqa: BLE001
         parts.append("checkpoint: ledger not readable")
+    rules = active_rules_line(directory)
+    if rules:
+        parts.append(rules)
     return "\n\n".join(parts)[:START_PACK_MAX]
+
+
+RULES_LINE_MAX = 400  # characters of the start pack's active-rules line (t-041 J7-R4)
+
+
+def active_rules_line(directory):
+    """'Active rules (rules.json): <id>, ...; read it before you write a handoff.' for the rules whose status is
+    active, at most RULES_LINE_MAX characters; None when rules.json is missing, invalid or has none. Never raises."""
+    try:
+        rules = as_dict(read_json_safe(os.path.join(directory, "rules.json"))).get("rules")
+        ids = [r["id"] for r in rules if isinstance(r, dict) and r.get("status") == "active"
+               and isinstance(r.get("id"), str) and re.match(r"^[\w.-]{1,80}$", r["id"])] if isinstance(rules, list) else []
+    except Exception:  # noqa: BLE001
+        return None
+    if not ids:
+        return None
+    head, tail = "Active rules (rules.json): ", "; read it before you write a handoff."
+    shown = []
+    for rid in ids:
+        if len(head) + len(", ".join(shown + [rid])) + len(", …") + len(tail) > RULES_LINE_MAX:
+            return head + ", ".join(shown + ["…"]) + tail
+        shown.append(rid)
+    return head + ", ".join(shown) + tail
 
 
 def parse_amount(text):
@@ -1196,9 +1228,13 @@ def context_set(args):
         print(json.dumps({k: new.get(k) for k in ("v", "mode", "taskCap", "passCap", "net", "enabledAt", "by")}))
 
 
+NET_MARGIN = 34000  # Claude Code compacts about this far below the window it is given (t-041 J7-R3: 365-367k at 400k)
+
+
 def context_summary(settings, saved):
-    return "mode {}  taskCap {:,}  passCap {:,}  net {:,}  enabledAt {}  by {}{}".format(
-        settings["mode"], settings["taskCap"], settings["passCap"], settings["net"], settings.get("enabledAt") or "-",
+    return "mode {}  taskCap {:,}  passCap {:,}  net {:,} (compacts at about {}k)  enabledAt {}  by {}{}".format(
+        settings["mode"], settings["taskCap"], settings["passCap"], settings["net"],
+        (settings["net"] - NET_MARGIN) // 1000, settings.get("enabledAt") or "-",
         settings.get("by") or "-", "" if saved else "  (the defaults: no context.json)")
 
 
@@ -1212,7 +1248,10 @@ CONTEXT_REQUEST = "context-request.json"
 CONTEXT_REQUEST_LIFE = 7200  # a context request expires 2 h after it was written (R6)
 CONTEXT_REQUEST_BY = ("person", "panel", "orchestrator")
 TAIL_MAX = 1 << 20  # bytes of the transcript one check reads (R1)
-JOURNAL_TAIL = 256 * 1024  # bytes of journal.jsonl the clean-point check reads
+JOURNAL_TAIL = 256 * 1024  # bytes of journal.jsonl the clean-point check reads at a time
+JOURNAL_BACK_MAX = 4 << 20  # bytes of journal.jsonl it reads back at most to cover R2 (c)'s window (t-041 J7-R1)
+UNACTED_SLACK = 1800  # R2 (c) also looks at cards answered this long before this conversation began (J7-R1)
+UNACTED_DAY = 86400  # ... and never further back than this (J7-R1)
 IDLE_MIN = 20  # seconds the PA must have been idle (R2 a)
 RESET_GAP = 600  # seconds between two resets (R2 f)
 NUDGE_GAP = 3600  # seconds between two of the launcher's lines (R2)
@@ -1397,15 +1436,51 @@ def remove_context_request(directory, rid=None, text=None):
         return False
 
 
-def journal_tail(directory):
+def line_stamp(line):
     try:
-        return read_tail(os.path.join(directory, "journal.jsonl"), JOURNAL_TAIL).decode("utf-8", "replace").splitlines()
+        return parse_stamp(as_dict(json.loads(line)).get("at"))
+    except ValueError:
+        return None
+
+
+def journal_tail(directory, since=None):
+    """The journal's last JOURNAL_TAIL bytes as lines. With `since` (epoch), it reads back in JOURNAL_TAIL steps
+    until a line stamped before `since` is read or JOURNAL_BACK_MAX bytes are (t-041 J7-R1), and returns (lines,
+    earliest): `earliest` is the first stamp read, or None when the whole journal was read."""
+    path = os.path.join(directory, "journal.jsonl")
+    if since is None:
+        try:
+            return read_tail(path, JOURNAL_TAIL).decode("utf-8", "replace").splitlines()
+        except OSError:
+            return []
+    data, start = b"", 0
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = start = f.tell()
+            while start > 0 and size - start < JOURNAL_BACK_MAX:
+                step = min(JOURNAL_TAIL, start, JOURNAL_BACK_MAX - (size - start))
+                start -= step
+                f.seek(start)
+                data = f.read(step) + data
+                whole = data.split(b"\n")[1 if start else 0:]
+                first = next((t for t in (line_stamp(x) for x in whole[:50]) if t is not None), None)
+                if first is not None and first < since:
+                    break
     except OSError:
-        return []
+        return [], None
+    if start:
+        cut = data.find(b"\n")
+        data = data[cut + 1:] if cut >= 0 else b""
+    lines = data.decode("utf-8", "replace").splitlines()
+    earliest = next((t for t in (line_stamp(x) for x in lines) if t is not None), None) if start else None
+    return lines, earliest
 
 
-def answered_unacted(directory, lines):
-    """Ids of cards in decisions/ answered with no later journal line naming them (R2 c): an answer being acted on."""
+def answered_unacted(directory, lines, since=None, earliest=None):
+    """(id, far) of cards in decisions/ answered with no later journal line naming them (R2 c): an answer being
+    acted on. With `since`, only cards answered at or after it (J7-R1); `far` when the answer is older than
+    `earliest`, the first journal stamp read, so the lines read cannot show it acted on."""
     folder, out = os.path.join(directory, "decisions"), []
     names = sorted(os.listdir(folder)) if os.path.isdir(folder) else []
     stamped = []
@@ -1424,9 +1499,14 @@ def answered_unacted(directory, lines):
         answered = parse_stamp(card.get("answered"))
         if card.get("status") != "answered" or answered is None or not cid:
             continue
+        if since is not None and answered < since:
+            continue
+        if earliest is not None and answered < earliest:
+            out.append((cid, True))
+            continue
         named = re.compile(r"(?<![A-Za-z0-9_])" + re.escape(cid) + r"(?![A-Za-z0-9_])")
         if not any(at >= int(answered) and named.search(line) for at, line in stamped):
-            out.append(cid)
+            out.append((cid, False))
     return out
 
 
@@ -1473,14 +1553,22 @@ def clean_point(ctx, directory, agent, size, at, address):
         written = parse_time(check["at"])
         turn_start = (size or {}).get("turnStart")
         began = as_dict(ctx.get("running")).get("since")
-        if check.get("session") is not None and check["session"] != sid:
-            reasons.append(("b", "checkpoint of another session"))
+        ours = turn_start is not None and written >= int(turn_start) and began is not None and written >= int(began)
+        if check.get("session") is not None and check["session"] != sid and not ours:
+            reasons.append(("b", "checkpoint of another session ({} not {})".format(check["session"][:8], str(sid)[:8])))
+        elif check.get("session") is not None and check["session"] != sid:
+            # written in this conversation's current turn whatever id it names (t-041 J7-R2): said once, not refused
+            ctx["checkpointNote"] = "checkpoint names session {}, this session {}: accepted by its time".format(
+                check["session"][:8], str(sid)[:8])
         elif check.get("session") is None and (began is None or written < int(began)):
             reasons.append(("b", "checkpoint older than this session"))
         elif turn_start is None or written < int(turn_start):
             reasons.append(("b", "checkpoint older than the turn"))
-    for cid in answered_unacted(directory, journal_tail(directory)):
-        reasons.append(("c", "card {} answered, not acted on".format(cid)))
+    began = as_dict(ctx.get("running")).get("since")
+    window = max(began - UNACTED_SLACK, at - UNACTED_DAY) if isinstance(began, (int, float)) else at - UNACTED_DAY
+    lines, earliest = journal_tail(directory, window)
+    for cid, far in answered_unacted(directory, lines, window, earliest):
+        reasons.append(("c", "card {} answered, {}".format(cid, "journal not read back that far" if far else "not acted on")))
     terminals = live_terminals()
     if terminals is None:  # hc ls failed: which workers are live is unknown, so no reset (REVIEW J4 MF-J4-2)
         reasons.append(("d", "terminal list unavailable"))
@@ -1600,7 +1688,12 @@ def context_once(ctx, directory, address, space, at=None):
     reason = reset_reason(size, ledger.get("context"), settings, req)
     if not reason:
         return
+    ctx.pop("checkpointNote", None)
     ok, reasons = clean_point(ctx, directory, agent, size, at, address)
+    note = ctx.pop("checkpointNote", None)
+    if note and ctx.get("checkpointNoted") != (ctx.get("idleSince"), note):
+        ctx["checkpointNoted"] = (ctx.get("idleSince"), note)
+        session_log(directory, note)
     if ok:
         begin_fresh(ctx, directory, address, {
             "reason": reason, "ctx": (size or {}).get("ctx"), "pass": as_dict(ledger.get("context")).get("pass"),
@@ -1834,6 +1927,31 @@ def followup_report(directory, since, until=None):
                 if card.get("status") == "answered" and answered is not None and t - 1800 <= answered <= t:
                     judgement.append("reset at {} within 30 min of card {} answered at {}".format(
                         r["at"], card.get("id") or name[:-5], card["answered"]))
+    refusals, by_refusal, accepted = 0, {}, 0
+    for line in read_text(os.path.join(directory, "session.log")).splitlines():
+        stamp, _sp, text = line.partition(" ")
+        if not inside(parse_stamp(stamp)):
+            continue
+        if text.startswith("context not reset"):
+            refusals += 1
+            for part in text.partition("): ")[2].split("; "):
+                key = refusal_key(part)
+                by_refusal[key] = by_refusal.get(key, 0) + 1
+        elif text.startswith("checkpoint names session ") and text.endswith(": accepted by its time"):
+            accepted += 1
+    per_pass = {}
+    for t, e in journal:
+        n = e.get("pass")
+        if isinstance(n, int) and not isinstance(n, bool):
+            p = per_pass.setdefault(n, {"pass": n, "lines": 0, "from": e["at"], "to": e["at"], "_lo": t, "_hi": t})
+            p["lines"] += 1
+            if t < p["_lo"]:
+                p["_lo"], p["from"] = t, e["at"]
+            if t > p["_hi"]:
+                p["_hi"], p["to"] = t, e["at"]
+    long_passes = [{k: p[k] for k in ("pass", "lines", "from", "to")} for _n, p in sorted(per_pass.items())
+                   if p["lines"] > PASS_LONG_LINES or p["_hi"] - p["_lo"] > PASS_LONG_SECONDS]
+    passes = {"ids": len(per_pass), "maxLines": max([p["lines"] for p in per_pass.values()] or [0]), "long": long_passes}
     if any(m["kind"] in ("repeat", "reask") for m in markers) or most > 1:
         verdict = "tune"
     elif fell is not None and fell >= 0.25:
@@ -1843,7 +1961,19 @@ def followup_report(directory, since, until=None):
     return {"since": since, "until": until, "days": days, "before": before, "after": after, "fell": fell,
             "resets": {"total": len(resets), "byReason": by_reason, "maxPerHour": most},
             "compact": sum(1 for r in records if r["ev"] == "compact"), "markers": markers, "standing": standing,
-            "judgement": judgement, "verdict": verdict}
+            "judgement": judgement, "verdict": verdict, "refusals": {"total": refusals, "byReason": by_refusal},
+            "acceptedByTime": accepted, "passes": passes}
+
+
+PASS_LONG_LINES = 20  # a pass id on more journal lines than this, or
+PASS_LONG_SECONDS = 1800  # ... spanning longer than this, is listed as long by the follow-up (t-041 J7-R5)
+
+
+def refusal_key(text):
+    """A clean-point reason without its ids and numbers, so the follow-up counts like reasons together (J7-R7)."""
+    text = re.sub(r"\s*\([^)]*\)", "", text)
+    text = re.sub(r"\s+[^\s]*\d[^\s]*", "", " " + text).strip()
+    return text[:120]
 
 
 def context_followup(args):
@@ -1864,6 +1994,10 @@ def context_followup(args):
     print("  USD/pass fell: {}".format("{:.1%}".format(r["fell"]) if r["fell"] is not None else "unknown"))
     print("  resets {} (by reason {}; most in one hour {}); compactions {}".format(
         r["resets"]["total"], r["resets"]["byReason"], r["resets"]["maxPerHour"], r["compact"]))
+    print("  refusals {} (by reason {}); checkpoints accepted by their time {}".format(
+        r["refusals"]["total"], r["refusals"]["byReason"], r["acceptedByTime"]))
+    print("  passes {} (most lines on one {}; long {})".format(
+        r["passes"]["ids"], r["passes"]["maxLines"], ", ".join(str(p["pass"]) for p in r["passes"]["long"]) or "none"))
     for m in r["markers"]:
         print("  marker {} at {}: {}".format(m["kind"], m["at"], m["text"]))
     for line in r["judgement"]:

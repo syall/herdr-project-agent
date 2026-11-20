@@ -595,7 +595,10 @@ shows its size and any problem. Business data only: no secrets, no customer cont
 Claude Code compacts a conversation by itself when it fills its window (about 967,000 tokens for a 1M
 model), which makes every call before that expensive. For the Project Agent's own session only,
 `pa-session` adds:
-- `--autocompact 400000` (the net): Claude Code compacts at 400,000 tokens instead. A flag, not an
+- `--autocompact 400000` (the net): Claude Code compacts at a 400,000-token window instead. It keeps
+  about 34,000 tokens of margin below the window it is given, so the net fires at about 366,000 tokens
+  (measured: 7 compactions from 2026-11-18 to 11-20, at 365-367k), as the 1M default fires at about
+  967,000. The settings line shows it as `net 400,000 (compacts at about 366k)`. A flag, not an
   environment variable, so the workers it starts get nothing of it. Needs Claude Code v2.1.221 or later.
 - In its one `--settings`: `"idleCompaction": false` (v2.1.290 or later) and three hooks, added to your own
   hooks, not replacing them. Before a compaction, `pa-context compact-instructions` tells the summary what to
@@ -626,7 +629,8 @@ apply to resets at the launcher's next check.
 Before the net is reached, the launcher starts the Project Agent in a fresh session, in the same terminal:
 same address, same labels, its workers keep running. It does so only at a clean point: Claude idle for 20
 seconds with nothing waiting, the ledger's checkpoint written clean by this session in its last turn, no
-answered card it is still acting on, a handoff file for every live worker, a valid `standing.md`, no
+answered card it is still acting on (a card answered in this conversation, or in the 30 minutes before
+it began, and at most a day back, with no journal line naming it since), a handoff file for every live worker, a valid `standing.md`, no
 restart request, and no other reset in the last 10 minutes. Then it resets when the context (read from the
 session's transcript) is at `taskCap` at a task boundary, or at `passCap` at any clean point. When only the
 checkpoint is missing it types one line into the tab (`[launcher] context ...`, at most once an hour).

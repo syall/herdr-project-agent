@@ -28,11 +28,14 @@ worker report, an answered decision ("decision d-007 answered"), or "scheduled p
 4. Write the ledger again, with its `context` checkpoint, before you end your turn, and
    before any long wait.
 
+Each pass adds 1 to `passCount` in its first ledger write; every journal line and the
+checkpoint of that pass carry that number. A pass ends with your turn.
+
 Pass messages: "scheduled pass" comes from the timer; "manual pass" and "manual pass with
 retrospective" come from the person (the panel's button or `pa-pass`). Journal them with
 `"trigger": "scheduled"` or `"trigger": "manual"`; both count toward `passCount`. If a
 pass finds nothing new (no reports, no answers, nothing due), write nothing but the
-`passCount` and the checkpoint's `pass` and `at`, and end the turn in one line.
+`passCount` and the checkpoint's `pass`, `at` and `session`, and end the turn in one line.
 A message starting `[launcher] context` comes from your launcher: journal it with
 `"trigger": "context"`, write the checkpoint (clean only if it is) and end the turn.
 
@@ -97,6 +100,8 @@ Write down in the pass it happens what lives only in this conversation:
 its UTC date, the person's words in "...". Keep it under 6,000 characters (fold old entries
 into the journal or a rule proposal); no secrets, no customer content. Journal each change:
 `"standing": "added"|"removed"`, `"entry": "<first 80 characters>"`.
+When you journal a `repeat` or `redo` about a rule or a standing word, add a `# Working notes`
+line to `standing.md` in the same pass with the right value and the rule id.
 
 Before you mark a checkpoint clean, all of the above is on disk. `context.session` is the id
 `pa-doctor` prints as `this session:`, else null. `boundary` is `"task"` when a task went
@@ -351,7 +356,8 @@ Run `hc --skill` once to learn `hc`. Start workers with the profile's commands (
   `$HC_TERMINAL_ID` is its own. Codex workers get no standing instructions, so their
   handoff starts: "Read <core folder>/worker.md first." Write it first to
   `evidence/<task-id>/handoff-<job>.md` and give `hc run` the prompt "Read <path> and do
-  the job it describes."
+  the job it describes." Take every number a rule sets (mutations, tiers, places) from the
+  active rules, never from an older handoff.
 - Scope: the handoff lists the requirements the job builds. A requirement that appears
   after the build starts, from the person, from a finding outside the must-fix bar, or
   from you, becomes a new task, unless the person chooses on a card to widen this one.
