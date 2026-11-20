@@ -207,6 +207,9 @@ class RunAll(unittest.TestCase):
         write(self.node, '#!/bin/sh\nexec sh "$@"\n', 0o755)
         self.events = os.path.join(self.tmp, "events")
         write(self.events, "")
+        # t-192 R4: the integration parts' scratch root, a folder of this test's own: never the real /tmp
+        self.scratch = os.path.join(self.tmp, "scratch")
+        os.makedirs(self.scratch)
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -215,7 +218,7 @@ class RunAll(unittest.TestCase):
         # PA_SUITE_*: a marker or cap inherited from the suite running this test is not this run's.
         env = {k: v for k, v in os.environ.items() if not k.startswith(("STUB_", "PA_SERIAL", "PA_CHANGED", "PA_SUITE_"))}
         env.update({"NODE": self.node, "STUB_DIR": self.tmp, "TMPDIR": self.tmp, "HERDR_PA_HOME": self.home,
-                    "PY_PROBE": sys.executable})
+                    "PY_PROBE": sys.executable, "PA_INTEGRATION_SCRATCH": self.scratch})
         env.update({k if k.startswith("PA_") else "STUB_" + k: v for k, v in stubs.items()})
         return env
 
@@ -758,7 +761,7 @@ class RunAll(unittest.TestCase):
         with open(os.path.join(self.tmp, "integrationargs")) as f:
             args = sorted(f.read().splitlines())
         self.assertEqual(sorted(a.split(" ", 1)[1] for a in args), ["--part 1", "--part 2", "--part 3"], args)
-        self.assertTrue(all(a.split(" ", 1)[0].startswith("/tmp/t001.") for a in args), args)
+        self.assertTrue(all(a.split(" ", 1)[0].startswith(self.scratch + "/t001.") for a in args), args)
         self.assertEqual(len(set(a.split(" ", 1)[0] for a in args)), 3, args)  # its own scratch per part
         self.assertIn("  suite slot: waited", tail)
         self.assertEqual(self.progress()[-1]["parts"]["total"], 3)
@@ -1739,6 +1742,137 @@ class CheckArgs(unittest.TestCase):
 def pa_text(path):
     with open(path) as f:
         return f.read()
+
+
+class T192Scratch(unittest.TestCase):
+    """t-192 R4: the integration check's scratch (t001.XXXXXX under PA_INTEGRATION_SCRATCH, this test's own folder for
+    /tmp) is removed on any exit, and part 1 sweeps the stale ones of killed runs only (H4.1-H4.6). RunAll's fixture,
+    not its tests."""
+    setUp, tearDown, env_for, run_all = RunAll.setUp, RunAll.tearDown, RunAll.env_for, RunAll.run_all
+
+    def left(self):
+        return sorted(n for n in os.listdir(self.scratch) if n.startswith("t001."))
+
+    def test_vp6_scratch_is_under_the_root_and_gone_after_a_run(self):
+        code, out = self.run_all("--only-integration")
+        self.assertEqual(code, 0, out)
+        with open(os.path.join(self.tmp, "integrationargs")) as f:
+            made = [a.split(" ", 1)[0] for a in f.read().splitlines()]
+        self.assertEqual(len(made), 3, made)
+        self.assertTrue(all(m.startswith(self.scratch + "/t001.") for m in made), made)
+        self.assertEqual(self.left(), [], out)
+        self.assertIn("integration scratch: removed 0 stale folder(s) in " + self.scratch, out)
+
+    def test_vp6_a_failing_part_keeps_its_code_and_leaves_nothing(self):
+        code, out = self.run_all("--only-integration", integration2="fail")
+        self.assertEqual(code, 1, out)
+        self.assertIn("--- pa-session integration 2/3 (private hc core): FAILED", out)
+        self.assertEqual(self.left(), [], out)
+
+    def wait_pids(self, k):
+        path = os.path.join(self.tmp, k + ".pids")
+        end = time.time() + 30
+        while not os.path.exists(path) and time.time() < end:
+            time.sleep(0.05)
+        with open(path) as f:
+            return [int(p) for p in f.read().split()]
+
+    def run_bg(self, **stubs):
+        log = open(os.path.join(self.tmp, "bg.out"), "w")
+        self.addCleanup(log.close)
+        proc = subprocess.Popen(["sh", os.path.join(self.repo, "tests", "run-all.sh"), "--only-integration"], cwd=self.tmp,
+                                env=self.env_for(**stubs), stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                                start_new_session=True)
+
+        def end():
+            if proc.poll() is None:
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait()
+        self.addCleanup(end)
+        return proc
+
+    def gone_soon(self):
+        end = time.time() + 10
+        while self.left() and time.time() < end:
+            time.sleep(0.05)
+        return self.left()
+
+    def test_vp6_term_to_the_run_leaves_no_scratch(self):
+        proc = self.run_bg(integration1="child", integration2="child", integration3="child")
+        for k in (1, 2, 3):
+            self.wait_pids("integration{}".format(k))
+        self.assertEqual(len(self.left()), 3)
+        os.kill(proc.pid, signal.SIGTERM)
+        self.assertEqual(proc.wait(timeout=20), 143)
+        self.assertEqual(self.gone_soon(), [])
+
+    def test_vp6_term_to_one_part_leaves_no_scratch(self):  # as pa_suite's part limit sends it (TERM to the part's group)
+        proc = self.run_bg(integration2="child")
+        shell, _child = self.wait_pids("integration2")
+        self.assertEqual(len(self.left()), 1, "only part 2 is still running")
+        os.killpg(os.getpgid(shell), signal.SIGTERM)
+        self.assertEqual(proc.wait(timeout=30), 1)
+        self.assertEqual(self.gone_soon(), [])
+
+    # ---- the sweep (R4.3, H4.1-H4.6) ----
+    def started(self, pid):
+        r = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], stdout=subprocess.PIPE, universal_newlines=True)
+        return "_".join(r.stdout.split())
+
+    def folder(self, name, owner=None, old=False, link_owner=False):
+        path = os.path.join(self.scratch, name)
+        os.makedirs(path)
+        write(os.path.join(path, "inside"), "x\n")
+        if owner is not None:
+            target = os.path.join(self.tmp, name + ".owner") if link_owner else os.path.join(path, ".owner")
+            write(target, owner)
+            if link_owner:
+                os.symlink(target, os.path.join(path, ".owner"))
+        if old:
+            then = time.time() - 2 * 86400
+            os.utime(path, (then, then))
+        return path
+
+    def test_vp6_h4_the_sweep_removes_only_stale_scratch(self):
+        dead = subprocess.Popen(["true"])
+        dead.wait()
+        me = os.getpid()
+        live = "{} {}\n".format(me, self.started(me))
+        removed = {
+            "t001.dead01": self.folder("t001.dead01", "{} Mon_Jan_1_00:00:00_2024\n".format(dead.pid)),
+            "t001.reuse1": self.folder("t001.reuse1", "{} Mon_Jan_1_00:00:00_2024\n".format(me)),  # H4.5 pid reused
+            "t001.noown1": self.folder("t001.noown1", old=True),  # Q6: before this change, older than 24 h
+            "t001.badow1": self.folder("t001.badow1", "-1 x\n", old=True),  # H4.4: no owner, the 24 h rule
+        }
+        elsewhere = os.path.join(self.tmp, "elsewhere")
+        os.makedirs(elsewhere)
+        os.utime(elsewhere, (time.time() - 3 * 86400,) * 2)
+        os.symlink(elsewhere, os.path.join(self.scratch, "t001.link01"))  # H4.1
+        kept = {"t001.live01": self.folder("t001.live01", live),  # H4.5 same pid and start
+                "t001.fresh1": self.folder("t001.fresh1"),  # H4.6 just made, no .owner yet
+                "t001.x": self.folder("t001.x", old=True),  # H4.2
+                "t001.abcdefg": self.folder("t001.abcdefg", old=True),
+                "t002.abcdef": self.folder("t002.abcdef", old=True)}
+        for i, text in enumerate(("", "abc def\n", "0 x\n", "-1 x\n", "12x x\n", "{}\n".format(dead.pid),
+                                  "{} a b\n".format(dead.pid))):  # H4.4: never read as dead
+            kept["t001.bad{:03d}".format(i)] = self.folder("t001.bad{:03d}".format(i), text)
+        kept["t001.lnkown"] = self.folder("t001.lnkown", "{} Mon_Jan_1_00:00:00_2024\n".format(dead.pid), link_owner=True)
+        unreadable = self.folder("t001.unread", "{} Mon_Jan_1_00:00:00_2024\n".format(dead.pid))
+        os.chmod(os.path.join(unreadable, ".owner"), 0)
+        if os.access(os.path.join(unreadable, ".owner"), os.R_OK):  # root reads anything: then it is a dead owner
+            removed["t001.unread"] = unreadable
+        else:
+            kept["t001.unread"] = unreadable
+        code, out = self.run_all("--only-integration")
+        self.assertEqual(code, 0, out)
+        for name in removed:
+            self.assertFalse(os.path.lexists(removed[name]), name)
+        for name, path in kept.items():
+            self.assertTrue(os.path.isdir(path), name)
+        self.assertTrue(os.path.islink(os.path.join(self.scratch, "t001.link01")), "a symlink is never followed or removed")
+        self.assertTrue(os.path.isdir(elsewhere))
+        self.assertIn("integration scratch: removed {} stale folder(s) in {}".format(len(removed), self.scratch), out)
+        self.assertEqual(out.count("integration scratch: removed"), 1, "part 1 only sweeps")
 
 
 if __name__ == "__main__":
