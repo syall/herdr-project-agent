@@ -5838,10 +5838,10 @@ cases["Q55-1-tab-order"] = async () => { // R1: Decisions, Tasks, Queue, Rules, 
   check(at("Queue · 3") > at("Tasks · ") && at("Rules · ") > at("Queue · 3") && at("Tasks · ") > at("Decisions") && at("Decisions") >= 0, `order and count (got ${text.slice(0, 600)})`);
 };
 
-cases["Q55-2-entries"] = async () => { // R2: entries in merge order, state, stack, depends on, waiting, suite
+cases["Q55-2-entries"] = async () => { // R2: entries in merge order (t-154: slots, no numbers; Q154-3), state, stack, depends on, waiting, suite
   const v = await queueWorld(twoRepos());
   const { text } = look(v);
-  const order = ["1. t-A", "2. t-B", "3. t-C"].map((s) => text.indexOf(s));
+  const order = ["t-A", "t-B", "t-C"].map((s) => text.indexOf(s));
   check(order.every((i) => i >= 0) && order[0] < order[1] && order[1] < order[2], `entries in order (got ${text})`);
   check(/herdr-project-agent/.test(text) && /\bother\b/.test(text), `each repository by its folder name (got ${text})`);
   check(/passed/.test(text) && /checking/.test(text), "states");
@@ -5900,11 +5900,11 @@ cases["Q55-5-left"] = async () => { // R3: left newest first, why, void, the fix
   const v = await queueWorld(qDoc({ [QA]: qRepo([], { left }) }), { ledger });
   const { text } = look(v);
   check(/Left · 12/.test(text), `the left count (got ${text})`);
-  check(text.indexOf("t-B left 11-18 10:20: the full suite exited 1 on its tree") >= 0 && text.indexOf("t-B left") < text.indexOf("t-C left"), `newest first, with why (got ${text})`);
+  check(/t-B \| \(untitled\) \| in-progress \| left 11-18 10:20: the full suite exited 1 on its tree/.test(text) && text.indexOf("left 11-18 10:20") < text.indexOf("left 11-18 10:15"), `newest first, with why; t-154: a task item (got ${text})`);
   check(/went to fix round 2 \(t15, fix\)/.test(text), `t-B's fix round (got ${text})`);
-  check(/t-C left 11-18 10:15: conflict/.test(text) && /no fix round yet/.test(text), `t-C: no fix round yet (got ${text})`);
+  check(/t-C \| \(untitled\) \| in-progress \| left 11-18 10:15: conflict/.test(text) && /no fix round yet/.test(text), `t-C: no fix round yet (got ${text})`);
   check(/approval voided: the full suite exited 1 on its tree/.test(text), "the void");
-  check(/and 2 earlier/.test(text) && !/t-L1 left/.test(text) && !/t-L2 left/.test(text) && /t-L3 left/.test(text), `10 shown (got ${text})`);
+  check(/and 2 earlier/.test(text) && !/t-L1 \| left/.test(text) && !/t-L2 \| left/.test(text) && /t-L3 \| left/.test(text), `10 shown (got ${text})`);
 };
 
 cases["Q55-6-merged"] = async () => { // R3: the last merged (t-145: 10, the 11th behind Archived; P145-10), newest first, by hand or by the queue with its card
@@ -5913,9 +5913,9 @@ cases["Q55-6-merged"] = async () => { // R3: the last merged (t-145: 10, the 11t
   merged.unshift(...Array.from({ length: 5 }, (_, i) => ({ task: `t-old${i}`, job: null, tip: sha("f"), from: sha("a"), to: sha("b"), at: `2026-11-17T08:0${i}:00Z`, by: "hand" }))); // t-145: 11 in all
   const v = await queueWorld(qDoc({ [QA]: qRepo([], { merged }) }));
   const { text } = look(v);
-  check(/t-M6 merged 11-18 08:05 at 6666666 \(queue, d-queue-1\)/.test(text), `by the queue (got ${text})`);
-  check(/t-M2 merged 11-18 08:01 at 2222222 \(hand\)/.test(text) && /t-M1 merged/.test(text) && /t-old1 merged/.test(text) && !/t-old0 merged/.test(text), `the last 10 (got ${text})`);
-  check(text.indexOf("t-M6 merged") < text.indexOf("t-M2 merged"), "newest first");
+  check(/t-M6 \| merged 11-18 08:05 at 6666666 \(queue, d-queue-1\)/.test(text), `by the queue (got ${text})`);
+  check(/t-M2 \| merged 11-18 08:01 at 2222222 \(hand\)/.test(text) && /t-M1 \| merged/.test(text) && /t-old1 \| merged/.test(text) && !/t-old0 \| merged/.test(text), `the last 10 (got ${text})`);
+  check(text.indexOf("t-M6 | merged") < text.indexOf("t-M2 | merged"), "newest first");
 };
 
 cases["Q55-7-missing"] = async () => { // R7: no queue.json
@@ -6003,7 +6003,7 @@ cases["Q55-14-titles-skipped"] = async () => { // R2, R7: two repositories with 
   const v = await queueWorld(qDoc({ "/w/a/proj": qRepo([qEntry("t-A"), 7, { branch: "x" }]), "/w/b/proj": qRepo([qEntry("t-B")]) }));
   const { text } = look(v);
   check(/\/w\/a\/proj/.test(text) && /\/w\/b\/proj/.test(text), `full paths when the names clash (got ${text})`);
-  check(/2 entries could not be read/.test(text) && /1\. t-A/.test(text), `the rest shown, the skipped counted (got ${text})`);
+  check(/2 entries could not be read/.test(text) && /t-A/.test(text) && !/1\. t-A/.test(text), `the rest shown, the skipped counted (got ${text})`);
   check(/Queue · 2/.test(text), `only readable entries counted (got ${text.slice(0, 400)})`);
 };
 
@@ -6067,6 +6067,113 @@ cases["Q84-5-remote"] = async () => { // R1: on a remote space the worker opens 
   g.__runs = [];
   await click(v, ids[0]);
   check(g.__runs.some(([n, a]) => n === "terminal.peek" && a?.terminal === `${M}/t70`), `opens ${M}/t70 (got ${JSON.stringify(g.__runs)})`);
+};
+
+// ---- t-154: the Queue tab's task links, worker items (status, gone once closed), slots, Left without later merges ----
+const Q154 = {
+  ledger: () => ({ tasks: [
+    { id: "t-A", title: "A", state: "in-progress", workers: [
+      { address: "t70", role: "queue", name: "t-A-queue", worktree: "/wt/t-A", started: "2026-11-18T10:00:00Z" },
+      { address: "t71", role: "reviewer", name: "t-A-review", worktree: "/wt/rev", started: "2026-11-18T10:00:00Z", finished: true, closed: "2026-11-18T10:30:00Z" },
+      { address: "t73", role: "verifier", name: "t-A-gone", worktree: "/wt/t-A", started: "2026-11-18T10:00:00Z" },
+      { address: "t74", role: "reviewer", name: "t-A-done", worktree: "/wt/rev2", started: "2026-11-18T10:00:00Z", finished: true }] },
+    { id: "t-L", title: "L", state: "in-progress", workers: [] },
+    { id: "t-M", title: "M", state: "done", workers: [] },
+  ] }),
+  key: (i) => `${QA}#${i}`,
+};
+
+cases["Q154-1-task-links"] = async () => { // R1: the task id of an entry, a Left item and a Merged item is a link to the task; one the ledger lacks is not
+  const left = [{ task: "t-L", job: null, branch: "t-L-b", state: "failed", why: "conflict", at: "2026-11-18T09:00:00Z", tip: sha("f"), approval: null },
+    { task: "t-gone", job: null, branch: "t-gone-b", state: "failed", why: "conflict", at: "2026-11-18T09:01:00Z", tip: sha("f"), approval: null }];
+  const merged = [{ task: "t-M", job: null, tip: sha("1"), from: sha("a"), to: sha("b"), at: "2026-11-18T08:00:00Z", by: "hand" }];
+  const v = await queueWorld(qDoc({ [QA]: qRepo([qEntry("t-A"), qEntry("t-Z", { onto: "t-A-b" })], { left, merged }) }), { ledger: Q154.ledger() });
+  const { clicks, text } = look(v);
+  check(Boolean(clicks[`queue-task-${Q154.key(0)}`]) && !clicks[`queue-task-${Q154.key(1)}`], `the entry t-A links, t-Z (not in the ledger) does not (have ${Object.keys(clicks).filter((k) => k.startsWith("queue-"))})`);
+  check(Boolean(clicks["queue-left-task-0-0"]) !== Boolean(clicks["queue-left-task-0-1"]), `one Left link: t-L, not t-gone (have ${Object.keys(clicks).filter((k) => k.startsWith("queue-left"))})`);
+  check(Boolean(clicks["queue-merged-task-0-0"]), `the Merged t-M links (have ${Object.keys(clicks).filter((k) => k.startsWith("queue-merged"))})`);
+  check(/t-Z/.test(text) && /t-gone/.test(text), `the unlinked ids still drawn (got ${text})`);
+  await click(v, `queue-task-${Q154.key(0)}`); await settle();
+  check(g.__shared["project-agent.show"]?.task === "t-A" && g.__shared["project-agent.show"]?.space === S, `the show request (got ${JSON.stringify(g.__shared["project-agent.show"])})`);
+  look(v);
+  check(v.view === "tasks" && v.open.has("t-A"), `the Tasks tab with t-A open (view ${v.view}, open ${[...v.open]})`);
+  await click(v, "view-queue"); await settle();
+  const lid = look(v).clicks["queue-left-task-0-0"] ? "queue-left-task-0-0" : "queue-left-task-0-1";
+  await click(v, lid); await settle(); look(v);
+  check(g.__shared["project-agent.show"]?.task === "t-L" && v.view === "tasks" && v.open.has("t-L"), `Left t-L opens (got ${JSON.stringify(g.__shared["project-agent.show"])}, view ${v.view})`);
+  await click(v, "view-queue"); await settle();
+  await click(v, "queue-merged-task-0-0"); await settle(); look(v);
+  check(g.__shared["project-agent.show"]?.task === "t-M" && v.view === "tasks" && v.open.has("t-M"), `Merged t-M opens (got ${JSON.stringify(g.__shared["project-agent.show"])}, view ${v.view})`);
+};
+
+cases["Q154-2-worker-items"] = async () => { // R2: the entry's workers are the task card's worker item with its status color; a closed one is not drawn
+  const doc = qDoc({ [QA]: qRepo([qEntry("t-A", { suite: { exit: 0, ended: "2026-11-18T10:05:00Z", worker: "t72" }, review: { verdict: "pass", worker: "t71", tip: sha("b") } }), qEntry("t-B", { onto: "t-A-b", review: { verdict: "pass", worker: "t74", tip: sha("b") } })]) });
+  const v = await queueWorld(doc, { ledger: Q154.ledger(), opts: { extraTerms: [q84Term("t70")] } });
+  g.__themeNames = true;
+  P142.status("t70", "blocked");
+  const root = v.render(cx), { text } = inspect(root);
+  const item = P142.find(root, `queue-worker-${Q154.key(0)}-0`);
+  check(Boolean(item) && text.includes("queue t70 ↗"), `the live worker drawn first (got ${text})`);
+  check(P142.dot(item)?.bg === "#blocked", `its dot the terminal's status (got ${JSON.stringify(P142.dot(item))})`);
+  check(!/reviewer t71/.test(text) && !P142.find(root, `queue-worker-${Q154.key(0)}-3`), `the closed reviewer t71 is not drawn (got ${text})`);
+  check(!/worker t72|t72 \(ended\)|t72 \(closed\)/.test(text), `t72 (no ledger record, no terminal) is not drawn (got ${text})`);
+  check(text.includes("verifier t73 (ended)"), `an unfinished recorded worker with no terminal stays, dim (got ${text})`);
+  check(text.includes("reviewer t74 (closed)"), `finished, no closed stamp: (closed), as the task card (got ${text})`);
+  const dim = P142.find(root, `queue-worker-${Q154.key(0)}-1`);
+  check(P142.dot(dim)?.bg === "#dim", `not live: the dim dot (got ${JSON.stringify(P142.dot(dim))})`);
+  check(queueClicks(v, /^queue-worker-/).length === 1, `one link: the live worker (got ${queueClicks(v, /^queue-worker-/)})`);
+  await click(v, "view-tasks"); await click(v, "task-head-t-A");
+  const card = P142.find(v.render(cx), "worker-t-A-0");
+  check(Boolean(card) && JSON.stringify(P142.shape(item)) === JSON.stringify(P142.shape(card)) && JSON.stringify(P142.dot(item)) === JSON.stringify(P142.dot(card)), `the task card's box and dot (queue ${JSON.stringify(P142.shape(item))} ${JSON.stringify(P142.dot(item))}, card ${JSON.stringify(P142.shape(card))} ${JSON.stringify(P142.dot(card))})`);
+};
+
+cases["Q154-3-slots"] = async () => { // R3: no numbers; each entry a slot, the top one entries[0] (stacked on main, merging first)
+  const v = await queueWorld(twoRepos());
+  const root = v.render(cx), { text } = inspect(root);
+  check(!/(^|\| )\d+\. t-/.test(text), `no "1." numbers (got ${text})`);
+  const slots = [0, 1, 2].map((i) => P142.find(root, `queue-slot-${Q154.key(i)}`));
+  check(slots.every((s) => s && JSON.stringify(s.style?.border) === "[1]" && s.style?.rounded), `each entry its own bordered slot (got ${slots.map((s) => JSON.stringify(s?.style ?? null)).join(" ; ")})`);
+  const seq = slots.map((s) => inspect(s).text);
+  check(/t-A/.test(seq[0]) && /on main/.test(seq[0]) && /t-B/.test(seq[1]) && /t-C/.test(seq[2]), `top slot t-A on main, then t-B, t-C (got ${seq.join(" ; ")})`);
+  check(text.indexOf(seq[0]) < text.indexOf(seq[1]) && text.indexOf(seq[1]) < text.indexOf(seq[2]), "slots drawn top to bottom in merge order");
+};
+
+cases["Q154-4-left-then-merged"] = async () => { // the PA's item: an entry that left and merged later leaves the Left list (and its count)
+  const l = (task, at, job = null) => ({ task, job, branch: `${task}-b`, state: "failed", why: "conflict", at, tip: sha("f"), approval: null });
+  const m = (task, at, job = null) => ({ task, job, tip: sha("1"), from: sha("a"), to: sha("b"), at, by: "queue", card: "d-1" });
+  const left = [l("t-130", "2026-11-18T09:00:00Z"), l("t-B", "2026-11-18T12:00:00Z"), l("t-C", "2026-11-18T09:30:00Z", "api")];
+  const merged = [m("t-130", "2026-11-18T11:00:00Z"), m("t-B", "2026-11-18T11:30:00Z"), m("t-C", "2026-11-18T11:40:00Z", "web")];
+  const v = await queueWorld(qDoc({ [QA]: qRepo([], { left, merged }) }));
+  const { text } = look(v);
+  const leftPart = text.slice(text.indexOf("Left · "), text.indexOf("Merged"));
+  check(/Left · 2/.test(text), `two left (got ${text})`);
+  check(!/t-130/.test(leftPart) && /t-130/.test(text.slice(text.indexOf("Merged"))), `t-130 merged after it left: only under Merged (got ${leftPart})`);
+  check(/t-B/.test(leftPart), `t-B left after its merge: stays (got ${leftPart})`);
+  check(/t-C/.test(leftPart), `t-C api: another job merged, it stays (got ${leftPart})`);
+  const v2 = await queueWorld(qDoc({ [QA]: qRepo([], { left: [l("t-130", "2026-11-18T09:00:00Z")], merged: [m("t-130", "2026-11-18T11:00:00Z")] }) }));
+  check(!/Left · /.test(look(v2).text), `every left one merged: no Left heading (got ${look(v2).text})`);
+};
+
+cases["Q154-5-left-merged-items"] = async () => { // Added (d-270): Left and Merged entries are task items as in the Tasks tab (id, title, state), the facts as the detail line
+  const left = [{ task: "t-L", job: "api", branch: "t-L-b", state: "failed", why: "conflict", at: "2026-11-18T09:00:00Z", tip: sha("f"), approval: null },
+    { task: "t-gone", job: null, branch: "t-gone-b", state: "failed", why: "conflict", at: "2026-11-18T09:01:00Z", tip: sha("f"), approval: null }];
+  const merged = [{ task: "t-M", job: null, tip: sha("1"), from: sha("a"), to: sha("b"), at: "2026-11-18T08:00:00Z", by: "queue", card: "d-9" }];
+  const v = await queueWorld(qDoc({ [QA]: qRepo([], { left, merged }) }), { ledger: Q154.ledger() });
+  g.__themeNames = true;
+  const root = v.render(cx);
+  const lItem = P142.find(root, "queue-left-0-1"), gItem = P142.find(root, "queue-left-0-0"), mItem = P142.find(root, "queue-merged-0-0");
+  const lt = inspect(lItem ?? {}).text, gt = inspect(gItem ?? {}).text, mt = inspect(mItem ?? {}).text;
+  check(/^t-L \| L \| in-progress \| api · left 11-18 09:00: conflict/.test(lt), `Left: id, title, state, then the facts (got ${lt})`);
+  check(/^t-gone \| left 11-18 09:01: conflict/.test(gt), `a task the ledger lacks: its id and the facts (got ${gt})`);
+  check(/^t-M \| M \| done \| merged 11-18 08:00 at 1111111 \(queue, d-9\)/.test(mt), `Merged: id, title, state, then the facts (got ${mt})`);
+  const box = (el) => el && { rounded: JSON.stringify(el.style?.rounded ?? null), border: JSON.stringify(el.style?.border ?? null), bg: el.style?.bg?.[0] ?? null };
+  check(JSON.stringify(box(lItem)) === JSON.stringify({ rounded: "[7]", border: "[1]", bg: "#surface" }) && JSON.stringify(box(mItem)) === JSON.stringify(box(lItem)), `each a bordered item, as a task card (got ${JSON.stringify(box(lItem))} ${JSON.stringify(box(mItem))})`);
+  const chipOf = (el, text) => { const [c] = stubs.findText(el, text); return c && Object.fromEntries(["px", "h", "rounded", "bg", "text_size", "text_color"].map((k) => [k, JSON.stringify(c.style?.[k] ?? null)])); };
+  const qChip = chipOf(lItem, "in-progress");
+  await click(v, "view-tasks");
+  const card = P142.find(v.render(cx), "task-head-t-L");
+  const tChip = chipOf(card, "in-progress");
+  check(Boolean(qChip) && JSON.stringify(qChip) === JSON.stringify(tChip), `the state chip is the Tasks tab's (queue ${JSON.stringify(qChip)}, tasks ${JSON.stringify(tChip)})`);
 };
 
 cases["P84-1-holder"] = async () => { // R5: a Places holder line opens its worker in the Agents view
@@ -7461,11 +7568,11 @@ cases["P145-10-merged-archived"] = async () => { // I8c: the queue's Merged show
   const merged = Array.from({ length: 13 }, (_, i) => ({ task: `t-M${i + 1}`, job: null, tip: sha("e"), from: sha("a"), to: sha("b"), at: `2026-11-18T08:${String(i + 10)}:00Z`, by: "hand" }));
   const v = await queueWorld(qDoc({ [QA]: qRepo([], { merged }) }));
   let text = look(v).text;
-  check(/t-M13 merged/.test(text) && /t-M4 merged/.test(text) && !/t-M3 merged/.test(text), `the 10 most recent (got ${text})`);
+  check(/t-M13 \| merged/.test(text) && /t-M4 \| merged/.test(text) && !/t-M3 \| merged/.test(text), `the 10 most recent (got ${text})`);
   check(Boolean(look(v).clicks["queue-merged-archived-0"]) && /▸ Archived \(3\)/.test(text), `the row (got ${text})`);
   await click(v, "queue-merged-archived-0");
   text = look(v).text;
-  check(/t-M3 merged/.test(text) && /t-M1 merged/.test(text) && text.indexOf("t-M3 merged") < text.indexOf("t-M1 merged"), `opened: the rest, newest first (got ${text})`);
+  check(/t-M3 \| merged/.test(text) && /t-M1 \| merged/.test(text) && text.indexOf("t-M3 | merged") < text.indexOf("t-M1 | merged"), `opened: the rest, newest first (got ${text})`);
 };
 
 // --list prints the names that would run and runs none. An unknown name or option exits 2.
