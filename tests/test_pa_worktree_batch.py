@@ -1076,6 +1076,93 @@ class NoteStops(Standing):
         self.assertFalse(any(os.path.isdir(p) for p in self.trees.values()), out)
 
 
+    # ---- round 6 (review r5 RL1 / verify r5 RL7): a batch card shows every hold's words, on each worktree's line ----
+    def withdraw_with(self, cid, label, note, when):
+        """Card cid answered `label` (with `note`) at `when`, then withdrawn, the answer carried (keep_previous)."""
+        card = self.answer(cid, label, note=note)
+        card["answered"] = when
+        pa.keep_previous(card, card["answer"])
+        card.update(status="withdrawn", answer=None, answered=when, answeredBy="pa-worktree remove: withdrawn", note="Withdrawn")
+        dump(card, self.path(cid))
+
+    def two_holds_then_a_batch(self, first, second):
+        """t-003's single card withdrawn with `first` (label, note), then t-004's with `second`; check puts both on
+        d-wt-batch-1. Returns its context lines."""
+        self.clean("t-003")
+        self.check()
+        self.withdraw_with("d-wt-t-003", first[0], first[1], "2026-11-10T00:00:00Z")
+        self.term("t98", "busy", cwd=self.trees["t-003"])  # t-003 stops being a candidate while t-004 is asked alone
+        self.clean("t-004")
+        self.check()
+        self.withdraw_with("d-wt-t-004", second[0], second[1], "2026-11-12T00:00:00Z")
+        self.terms.pop("t98")
+        self.check()
+        batch = self.dec("d-wt-batch-1")
+        self.assertEqual(batch["status"], "open")
+        return batch["context"].split("\n")
+
+    def worktree_lines(self, lines, task):
+        """The line of `task` on a batch card and the indented lines under it."""
+        at = next(n for n, line in enumerate(lines) if line.startswith("  " + task + " "))
+        out = [lines[at]]
+        for line in lines[at + 1:]:
+            if not line.startswith("    "):
+                break
+            out.append(line)
+        return "\n".join(out)
+
+    def test_v13_11s_a_note_and_a_keep_each_on_its_own_line(self):  # review r5 Q1
+        lines = self.two_holds_then_a_batch(("Delete", "keep t-003"), ("Keep", None))
+        t3, t4 = self.worktree_lines(lines, "t-003"), self.worktree_lines(lines, "t-004")
+        self.assertIn("keep t-003", t3, "the person's note on t-003 is on the card, under t-003")
+        self.assertIn("d-wt-t-003", t3)
+        self.assertIn("'Keep'", t4, "the person's Keep on t-004 is on the card, under t-004")
+        self.assertNotIn("keep t-003", t4)
+        self.assertNotIn("'Keep'", t3)
+        held = {i["task"]: [(h.get("answer"), h.get("note")) for h in i.get("held") or []] for i in self.dec("d-wt-batch-1")["items"]}
+        self.assertEqual(held, {"t-003": [("Delete", "keep t-003")], "t-004": [("Keep", None)]})
+
+    def test_v13_11t_two_notes_both_on_the_card(self):  # verify r5 probe A
+        lines = self.two_holds_then_a_batch(("Delete", "keep 3"), ("Delete", "keep 4"))
+        self.assertIn("keep 3", self.worktree_lines(lines, "t-003"))
+        self.assertIn("keep 4", self.worktree_lines(lines, "t-004"))
+        self.resume()
+        self.kept("Removed 0 worktrees")  # held until the person answers the card that shows both notes
+        self.answer("d-wt-batch-1", self.label("d-wt-batch-1", "all"))
+        self.assertEqual(self.remove_card()[0], 0)
+        self.assertFalse(any(os.path.isdir(p) for p in self.trees.values()))
+
+    def test_v13_11u_a_delete_older_than_the_hold_does_not_end_it(self):  # N9, M16 (verify r5 probe C)
+        self.clean("t-003")
+        self.clean("t-004")
+        self.check()
+        card = self.answer("d-wt-batch-1", self.label("d-wt-batch-1", "all"))
+        card.update(created="2026-11-09T00:00:00Z", answered="2026-11-10T00:00:00Z")
+        dump(card, self.path("d-wt-batch-1"))
+        write(os.path.join(self.trees["t-003"], "new.txt"), "x\n")
+        self.remove_card()  # t-004 removed; t-003 changed since the card: skipped, asked again
+        self.assertTrue(self.items()["t-003"].get("withdrawn"))
+        os.remove(os.path.join(self.trees["t-003"], "new.txt"))
+        self.check()
+        single = [c[:-5] for c in self.files() if c.startswith("d-wt-t-003")]
+        self.assertEqual(len(single), 1, self.files())
+        self.answer(single[0], "Keep")
+        code, out, err = self.standing()
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("answered 'Keep' on card " + single[0], out)
+        self.assertTrue(os.path.isdir(self.trees["t-003"]), out)
+
+    def test_v13_11v_a_delete_for_another_branch_does_not_end_the_hold(self):  # N9, M17
+        self.clean("t-003")
+        self.check()
+        card = self.answer("d-wt-t-003", "Keep")
+        card.update(created="2026-11-09T00:00:00Z", answered="2026-11-10T00:00:00Z")
+        dump(card, self.path("d-wt-t-003"))
+        other = dict(card, id="d-wt-t-003-other", branch="some-other-branch", answer="Delete", note=None,
+                     created="2026-11-11T00:00:00Z", answered="2026-11-12T00:00:00Z")
+        dump(other, self.path("d-wt-t-003-other"))
+        self.kept("answered 'Keep' on card d-wt-t-003")
+
 class Caller(Standing):
     """R14: only this space's Project Agent."""
 
