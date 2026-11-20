@@ -1039,8 +1039,10 @@ cases["S83-rows"] = async () => { // R1 AC1.1-1.4, R9, R11 without rendering: pl
   check(!lines.some((l) => /t60|t61/.test(l)), "AC1.2 finished and not live hold nothing");
   check(rows.head === "Places · 3 of 4 working · 3 waiting", `head (got ${rows.head})`);
   check(rows.limitsLine === "limits: r-places", `limits line (got ${rows.limitsLine})`);
-  const jl = rows.jobs.map((j) => [j.label, j.reason, j.up, j.down, j.top, j.fixed]);
-  check(rows.jobs[0].label === "1. t-020 verify-2 · build · suite step" && rows.jobs[2].label === "3. t-083 design · build · no-test", `labels (got ${JSON.stringify(jl)})`);
+  const jl = rows.jobs.map((j) => [j.task, j.job, j.meta, j.linked, j.reason, j.up, j.down, j.top, j.fixed]);
+  // t-156: no number; the slot's head parts (the task linked when the ledger has it)
+  check(!("label" in rows.jobs[0]) && same(jl[0].slice(0, 4), ["t-020", "verify-2", "build · suite step", true]) && same(jl[2].slice(0, 4), ["t-083", "design", "build · no-test", false]), `heads (got ${JSON.stringify(jl)})`);
+  check(same(rows.limitRules, ["r-places"]), `t-156: the limits' rule ids to link (got ${JSON.stringify(rows.limitRules)})`);
   check(rows.jobs[0].reason === "next to start" && rows.jobs[2].reason === "next to start: the no-test extra place is free", `reasons (got ${JSON.stringify(jl)})`);
   check(rows.jobs[1].fixed && rows.jobs[1].note === "merge queue order (Queue tab)" && rows.jobs[1].reason === "waits for a suite place (2 of 2)" && !rows.jobs[1].up && !rows.jobs[1].down && !rows.jobs[1].top, `the queue job: fixed, no buttons (got ${JSON.stringify(jl[1])})`);
   check(!rows.jobs[0].up && !rows.jobs[0].top && rows.jobs[0].down && rows.jobs[2].up && rows.jobs[2].top && !rows.jobs[2].down, `AC9.1 (got ${JSON.stringify(jl)})`);
