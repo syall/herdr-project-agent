@@ -5947,11 +5947,11 @@ cases["Q55-9-hung"] = async () => { // R5: a hung read is never "no queue"; afte
   g.__hang = [];
   advance(3000); v.reload(cx); await settle();
   ({ text } = look(v));
-  check(/1\. t-A/.test(text), `read once it answers (got ${text})`);
+  check(/\| t-A \| passed/.test(text), `read once it answers (got ${text})`);
   g.__hang = [QPATH];
   advance(3000); v.reload(cx); await settle(); await step(11000);
   ({ text } = look(v));
-  check(/1\. t-A/.test(text) && /Queue · 3/.test(text), `the last known stays (got ${text})`);
+  check(/\| t-A \| passed/.test(text) && /Queue · 3/.test(text), `the last known stays (got ${text})`);
 };
 
 cases["Q55-10-read-only"] = async () => { // R4: the view writes nothing and runs nothing
@@ -5984,7 +5984,7 @@ cases["Q55-12-remote"] = async () => { // R5: a remote space's queue.json is rea
   const v = await mount(); await settle();
   await click(v, "view-queue");
   check(g.__issued.some((x) => x.kind === "read" && x.on === M && x.path === `${RDIR}/queue.json`), `read on ${M} (got ${JSON.stringify(g.__issued.filter((x) => /queue/.test(x.path ?? "")))})`);
-  check(/1\. t-A/.test(look(v).text), "shown");
+  check(/\| t-A \| /.test(look(v).text) && !/1\. t-A/.test(look(v).text), "shown");
 };
 
 cases["Q55-13-watch"] = async () => { // R5: a watch batch naming queue.json reloads; the queue's lock reloads nothing
@@ -6107,7 +6107,7 @@ cases["Q154-1-task-links"] = async () => { // R1: the task id of an entry, a Lef
 };
 
 cases["Q154-2-worker-items"] = async () => { // R2: the entry's workers are the task card's worker item with its status color; a closed one is not drawn
-  const doc = qDoc({ [QA]: qRepo([qEntry("t-A", { suite: { exit: 0, ended: "2026-11-18T10:05:00Z", worker: "t72" }, review: { verdict: "pass", worker: "t71", tip: sha("b") } }), qEntry("t-B", { onto: "t-A-b", review: { verdict: "pass", worker: "t74", tip: sha("b") } })]) });
+  const doc = qDoc({ [QA]: qRepo([qEntry("t-A", { suite: { exit: 0, ended: "2026-11-18T10:05:00Z", worker: "t72" }, review: { verdict: "pass", worker: "t71", tip: sha("b") } }), qEntry("t-A", { job: "two", branch: "t-A2-b", worktree: "/wt/t-A2", onto: "t-A-b", review: { verdict: "pass", worker: "t74", tip: sha("b") } })]) });
   const v = await queueWorld(doc, { ledger: Q154.ledger(), opts: { extraTerms: [q84Term("t70")] } });
   g.__themeNames = true;
   P142.status("t70", "blocked");

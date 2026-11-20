@@ -864,7 +864,7 @@ cases["S55-queue-rows"] = async () => { // queueRows: the waiting and approval r
   check(rows[1].waits === "waits for its doc-only short review (S.md)", `t-B (got ${rows[1].waits})`);
   check(rows[2].waits === "waits for pa-gate at its tip, or the next pa-queue refresh", `t-C: its review is recorded for its tip (got ${rows[2].waits})`);
   check(rows[3].waits === "waits for pa-queue restack", `t-D (got ${rows[3].waits})`);
-  check(rows[4].label === "5. t-E J2" && rows[4].waits === "waits for its suite", `t-E (got ${JSON.stringify(rows[4])})`);
+  check(rows[4].label === "t-E J2" && rows[4].job === "J2" && rows[4].task === "t-E" && /* t-154: no number */ rows[4].waits === "waits for its suite", `t-E (got ${JSON.stringify(rows[4])})`);
   check(rows[0].approval === "approval: card asked (d-queue-9)" && rows[1].approval === "approval: not asked yet", `approvals (got ${rows[0].approval}; ${rows[1].approval})`);
   check(rows[4].approval === "approval: approved: Merge up to t-E (d-queue-1, 11-18 10:10)", `approved (got ${rows[4].approval})`);
   check(queueMod.queueRows(null, null, []).state === "loading" && queueMod.queueRows(store.TIMED_OUT, null, []).state === "loading", "unknown: loading");
