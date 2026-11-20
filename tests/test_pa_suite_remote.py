@@ -1430,6 +1430,24 @@ class X25Sent(StepBase):
                 self.assertIn(name, out)
                 self.assertFalse([c for c in self.calls() if c[0] == "file"], self.calls())
 
+    def test_x25g_a_replace_ref_hides_no_history(self):
+        """t-123 round 2 (REVIEW Herdr R1): `git replace HEAD <parentless copy>` hides the history from a plain
+        git log, while the bundle still ships it; never_sent reads the history without replace objects."""
+        name = "." + "env"
+        write(os.path.join(self.wt, name), "x\n")
+        sh(self.wt, "git", "add", "-f", name)
+        sh(self.wt, "git", "commit", "-q", "-m", "a secret")
+        sh(self.wt, "git", "rm", "-q", name)
+        sh(self.wt, "git", "commit", "-q", "-m", "gone from HEAD")
+        tree = sh(self.wt, "git", "rev-parse", "HEAD^{tree}").strip()
+        copy = sh(self.wt, "git", "commit-tree", tree, "-m", "a parentless copy").strip()
+        sh(self.wt, "git", "replace", "HEAD", copy)
+        self.assertNotIn(name, sh(self.wt, "git", "log", "--format=", "--name-only", "HEAD"))
+        self.fresh_log()
+        out = self.check_refused_on("never sent")
+        self.assertIn(name, out)
+        self.assertFalse([c for c in self.calls() if c[0] == "file"], self.calls())
+
 
 class X26Prepare(StepBase):
     """R6: the step's probe and prepare; each bad prepare output is a setup failure."""
