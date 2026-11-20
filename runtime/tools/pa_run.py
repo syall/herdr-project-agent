@@ -45,8 +45,9 @@ to stderr); pa-run exits with argv's code.
   run-all.sh under it stays here and is not recorded twice.
   pa-run --report [--days N]   per kind: runs and medians here and on each machine, and which is faster (T2)
 Exit: argv's code; 125 not run (with the reason; recorded once it passed the argv check); 124: no slot came free,
-the deadline (PA_SUITE_DEADLINE, before or during a run), the machine lost, the machine's REMOTE_TIMEOUT, or the
-slot step's run limit (PA_SUITE_RUN_LIMIT) after it took the slot.
+the deadline (PA_SUITE_DEADLINE, before or during a run), the machine lost, the run there ended without an exit code
+(killed; t-103 R5), the machine's REMOTE_TIMEOUT, or the slot step's run limit (PA_SUITE_RUN_LIMIT) after it took
+the slot.
 """
 import base64
 import fcntl
@@ -785,6 +786,7 @@ def argv_script(folder, tools, argv, subdir):
     command = words([first] + list(argv[1:]))
     changed = os.environ.get("PA_CHANGED_FILES", "")
     return "\n".join([
+        "echo $$ > {}/pid".format(folder),  # t-103 R5: the watcher reads a run that ended without its code as dead
         "date +%s > {}/t0".format(folder),
         "unset HC_TERMINAL_ID HC_SOCKET HC_TERMINAL_SOCKET HC_SCOPE CLAUDECODE",
         "export HERDR_PA_HOME={0}/home TMPDIR={0}/tmp XDG_CACHE_HOME={0}/xdg/cache XDG_CONFIG_HOME={0}/xdg/config "
@@ -823,8 +825,12 @@ def run_remote(r, machine, found, slot):
             r.overhead["start"] = round(time.time() - t, 1)
             started = time.time()  # R8b: how long it ran there
         except S.SetupFailed:
-            S.cleanup(machine, r.run, terminal)
-            S.update_progress(r.progress, cleaned=True, place="local", machine=None, remote=None)
+            left = S.cleanup(machine, r.run, terminal)
+            for n in left:
+                say("cleanup on {}: {}".format(machine, n))
+            # t-103 R7: a folder left there stays named for the next run's sweep (not marked cleaned)
+            S.update_progress(r.progress, place="local", machine=None, remote=None,
+                              **S.leftover_of(left, machine, r.run, terminal))
             raise
         S.update_progress(r.progress, state="running", start=pa.now(), remote={"folder": folder, "terminal": terminal})
         watcher = S.RemoteWatcher(machine, folder, r.output, r.progress, None, sink=r.sink, fast=True)
@@ -854,6 +860,9 @@ def run_remote(r, machine, found, slot):
         elif watcher.lost is not None:
             code = NO_SLOT
             r.notes.append("machine {} lost after {:.0f} s".format(machine, watcher.lost))
+        elif watcher.dead is not None:  # t-103 R5: ended there without its code: as a lost machine
+            code = NO_SLOT
+            r.notes.append("the run on {} ended without an exit code after {:.0f} s".format(machine, watcher.dead))
         elif watcher.timed_out:
             code = NO_SLOT
             r.notes.append("did not finish on {}: timed out after {} s there".format(machine, S.REMOTE_TIMEOUT))

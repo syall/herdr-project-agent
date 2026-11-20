@@ -706,7 +706,15 @@ each command it runs with the real HOME; `run` runs the suite from that folder. 
 runs on this Mac), and the record keeps the step's sha256, the facts key and the keep state.
 Then: a `git bundle` of the pinned commit is sent,
 and its commit and tree are checked there. If every machine is busy for `PA_SUITE_PREFER_WAIT` (300) s, or
-none is reachable, or the setup there fails, the run is on this Mac and says why. The output, `--status`,
+none is reachable, or the setup there fails, the run is on this Mac and says why. A tree whose `tests/run-all.sh`
+has no `--except-integration` (made before the remote mode) stays on this Mac with that reason (rebase onto main to
+run it on a machine; exit 2 with `--on`), and nothing is sent. A machine needs python3 3.8 or later (the suite's
+tests parse with `feature_version`); a machine name starts with a letter or digit. A run there that ended without an
+exit code (killed) ends at once with 124, as a lost machine does; when the last copy of its output is still
+incomplete after a second read, the record says `partial: true` and takes no parts from it (the exit stays the
+run's own). A run folder there whose removal failed after a setup failure stays named as `leftover` in the run's
+progress file, and the next run on that machine removes it. The record's parts are the summary's list after its
+`=== parts` line. The output, `--status`,
 `--wait`, `build.log` and the record name the place; a pass there counts for the tree. `pa-full-suite --local`
 runs on this Mac, `--on <machine>` only there (exit 2 if it cannot), and `--places` shows each machine,
 whether it is reachable, its cap and who holds its slots. After updating, run `pa-sync --on <machine>` before installing the mod, so remote launchers
@@ -726,8 +734,8 @@ the tree run as written. On a machine such a run has its own HOME, TMPDIR and XD
 first on PATH and its run folder removed after; nothing stops a command that reads absolute paths of the
 machine's account. It takes the same machine slots as `pa-full-suite`, streams the output back (a reader that
 closes early, `| head -1`, does not end the run) and exits with the command's code (125: not run, with the reason;
-124: no slot came free, the deadline `PA_SUITE_DEADLINE` before or during a run, the machine lost, the machine's
-`REMOTE_TIMEOUT`, or the run limit `PA_SUITE_RUN_LIMIT` after it took the slot). Each run is one line in
+124: no slot came free, the deadline `PA_SUITE_DEADLINE` before or during a run, the machine lost, the run there
+ended without an exit code, the machine's `REMOTE_TIMEOUT`, or the run limit `PA_SUITE_RUN_LIMIT` after it took the slot). Each run is one line in
 `~/.config/herdr-pa/test-runs.jsonl` (a run refused after its command was checked too). When no machine can take a run, it runs on this Mac unless config.json says
 
 ```json

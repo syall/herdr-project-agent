@@ -18,8 +18,9 @@
 #                                the part pa-full-suite keeps on this Mac while the rest runs on a machine
 # The parts run at the same time (they share no temp folder, home, port or hc core); PA_SERIAL=1 runs them
 # one after another, each streamed as it runs. Each part's whole output is kept in its own file in one temp
-# folder and printed in the order above, then a summary: every part with ok or FAILED and its seconds, for a failed part its
-# failing tests (lines starting FAIL or ERROR), else its last 40 lines. The last line names the folder.
+# folder and printed in the order above, then a summary: for a failed part its failing tests (lines starting FAIL or
+# ERROR), else its last 40 lines; then the line `=== parts` and every part with ok or FAILED and its seconds (t-103:
+# pa-full-suite's record reads its parts after that line only). The last line names the folder.
 # Each part's TMPDIR is its own folder in there (<n>.tmp), so no part sees another's temp files, nor another
 # suite's running beside it.
 # The suite slot (t-072): a run with parts to run takes pa-full-suite's slot first (runtime/tools/pa_suite.py: an
@@ -44,7 +45,8 @@
 # the step; when it is not (the step was killed, even with SIGKILL, and the slot is free again), every part is
 # stopped as for TERM and the run says so (exit 143).
 # Exit: 0 all passed, 1 a part failed, 2 a usage error or no temp folder, 124: no slot came free, the deadline
-# (PA_SUITE_DEADLINE, before or during a run), the machine lost, the machine's REMOTE_TIMEOUT, or the run limit
+# (PA_SUITE_DEADLINE, before or during a run), the machine lost, the run there ended without an exit code
+# (killed), the machine's REMOTE_TIMEOUT, or the run limit
 # (PA_SUITE_RUN_LIMIT) after it took the slot; 125 not run on a machine (refused, not reachable with suiteFallback
 # "none", no usable machine in suiteMachines with "none", the slot step failed),
 # 130/143/129 interrupt, terminate, hangup.
@@ -343,6 +345,7 @@ while [ "$i" -le "$count" ]; do
   fi
   i=$((i + 1))
 done
+echo "=== parts"  # t-103 R14: the part list follows (pa_suite.parse_parts reads only the lines after it)
 i=1
 while [ "$i" -le "$count" ]; do
   eval "name=\$name_$i; code=\$code_$i"

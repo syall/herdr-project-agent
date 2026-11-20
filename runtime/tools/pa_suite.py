@@ -53,7 +53,8 @@ The remote mode (t-089): HERDR_PA_HOME/config.json (this Mac's, never synced) ma
 in order of preference (a bad entry is named and skipped; a cap over 32 is used as 32). Then a run of the command
 `sh tests/run-all.sh` from a clean one-repo worktree (not --module; or a profile full command its tests.fullIsRunAll
 declares to be that in a plain git repo, see as_run_all) goes to the first reachable machine (one
-`hc exec` probe: uname and the paths and versions of git, python3 >= 3.7, node and sh) with a free slot: a local flock
+`hc exec` probe: uname and the paths and versions of git, python3 >= 3.8 (t-103 R13: the suite's tests parse with
+feature_version), node and sh) with a free slot: a local flock
 under suite-slots/<machine>/ (its cap), held by this pa-full-suite for the whole run. All busy: it waits, and after
 PA_SUITE_PREFER_WAIT (300) s this Mac's slot counts too; none reachable: this Mac at once. There: mkdir -m 700
 /tmp/pa-suite-<run>, a `git bundle` of HEAD (exactly the pinned commit; at most 6 MB base64) by `hc file write`, one
@@ -62,10 +63,15 @@ terminal (`hc run --bg --rm`) running `tests/run-all.sh --except-integration` wi
 XDG folders, HOME and an `hc` that refuses (no test there reaches an hc core). Here, at the same time, under the
 machine's slot (not this Mac's): `tests/run-all.sh --only-integration`. Every PA_SUITE_REMOTE_POLL (5) s the output
 and the remote progress are copied back (--status says `on <machine>`); PA_SUITE_LOST_GRACE (300) s without a good
-read ends the run with 124. The exit is the remote one if it failed, else the local one; the output, build.log and
+read ends the run with 124, as does a read that finds the run there ended without an exit code (t-103 R5: its pid
+file names no live process and there is no code). A last copy still incomplete after a second read makes the record
+`partial: true`, with no parts from it (R6). A tree whose tests/run-all.sh has no --except-integration stays here
+(R16). The exit is the remote one if it failed, else the local one; the output, build.log and
 the record (machine, os, tools, places, note; each part with its place) say where. Then the terminal is ended and
 the folder removed (`rm -rf -- /tmp/pa-suite-<run>`, the run id checked); TERM, INT or HUP does the same and exits
-143, 130 or 129, with no record. A setup failure runs on this Mac in the same call (exit 2 with --on). Part medians
+143, 130 or 129, with no record (a second signal while it cleans up is ignored, R10). A setup failure runs on this
+Mac in the same call (exit 2 with --on); a folder its cleanup could not remove is the progress file's `leftover`,
+removed by the next run on that machine (R7). Part medians
 and limits use only times of the same place. Every hc call is an argv list built from fixed text, the checked
 machine name, run id and pins, and the probe's tool paths.
 
@@ -116,6 +122,7 @@ POLL = 2
 WAIT_LIMIT = 7200  # longer than a run's own 3600 s timeout
 SLOT_WAIT_LIMIT = 840  # script mode (run-all.sh): the affected-tests hook's limit is this wait plus its run's own 900 s
 PART = re.compile(r"^  (.+): (ok|FAILED|HUNG) \((\d+)s\)$")
+PARTS_MARK = "=== parts"  # t-103 R14: run-all.sh's line right before its part list
 PART_FLOOR = 900  # a part's limit is at least this (PA_PART_LIMIT), else 3x its recorded median
 STOP_GRACE = 10  # seconds from TERM to KILL for a hung part
 HEARTBEAT = 60  # a status line this often while a run or a --wait goes on (PA_SUITE_HEARTBEAT)
@@ -124,7 +131,7 @@ STILL_RUNNING = 75  # --wait's exit when the run goes on past its timeout
 KEEP_DONE = 7 * 86400  # progress files of runs that ended are pruned after this
 MODULE = re.compile(r"^test_[A-Za-z0-9_]+$")
 # t-089: the remote mode (see the top)
-MACHINE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+MACHINE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")  # t-103 R11: never `.`, `..` or a leading `-`
 RUN_ID = re.compile(r"^[0-9a-f]{12}$")
 SHA = re.compile(r"^[0-9a-f]{40}$")
 TOOL_PATH = re.compile(r"^/[A-Za-z0-9._/+-]+$")
@@ -195,9 +202,15 @@ def slot_dir():
 
 
 def parse_parts(text):
-    """run-all.sh's summary list: `  <name>: ok (<n>s)` or `  <name>: FAILED (<n>s)`, in order."""
+    """run-all.sh's summary list: `  <name>: ok (<n>s)` or `  <name>: FAILED (<n>s)`, in order. t-103 R14: only the
+    lines after the last `=== parts` line when there is one (a failed part's tail above it is not read); a text
+    with none (an older run-all.sh, bare part lines) is read whole."""
     parts = []
-    for m in (PART.match(l) for l in text.splitlines()):
+    lines = text.splitlines()
+    marks = [i for i, l in enumerate(lines) if l.rstrip() == PARTS_MARK]
+    if marks:
+        lines = lines[marks[-1] + 1:]
+    for m in (PART.match(l) for l in lines):
         if m:
             part = {"name": m.group(1), "ok": m.group(2) == "ok", "seconds": int(m.group(3))}
             if m.group(2) == "HUNG":
@@ -1255,7 +1268,7 @@ def machines(cfg):
             continue
         name, cap_value = entry.get("machine"), entry.get("cap", 1)
         if not isinstance(name, str) or not MACHINE.match(name):
-            bad.append("entry {} ignored: machine {!r} is not a machine name (A-Z a-z 0-9 . _ -, 1-64)".format(i, name))
+            bad.append("entry {} ignored: machine {!r} is not a machine name (A-Z a-z 0-9 . _ -, 1-64, starting with a letter or digit)".format(i, name))
             continue
         if isinstance(cap_value, bool) or not isinstance(cap_value, int) or cap_value < 1:
             bad.append("entry {} ({}) ignored: cap {!r} is not a whole number 1..{}".format(i, name, cap_value, MACHINE_CAP))
@@ -1318,7 +1331,7 @@ for t in git python3 node sh; do
   p=$(command -v "$t") || { echo "missing $t"; continue; }
   case $t in
     git) v=$("$p" --version 2>&1) ;;
-    python3) v=$("$p" -c 'import sys; print("%d.%d.%d" % sys.version_info[:3]); sys.exit(0 if sys.version_info >= (3, 7) else 3)' 2>&1) || { echo "missing python3 (3.7 or later; $p is $v)"; continue; } ;;
+    python3) v=$("$p" -c 'import sys; print("%d.%d.%d" % sys.version_info[:3]); sys.exit(0 if sys.version_info >= (3, 8) else 3)' 2>&1) || { echo "missing python3 (3.8 or later; $p is $v)"; continue; } ;;
     node) v=$("$p" --version 2>&1) ;;
     sh) v=- ;;
   esac
@@ -1579,6 +1592,34 @@ def remote_ok(command, found, module, why_not=None, step=False):
     return None
 
 
+PLACE_FLAGS = ("--except-integration", "--only-integration")
+
+
+def old_run_all(h, root, commit):
+    """t-103 R16: why the commit's tests/run-all.sh cannot run in two places (it has no place flags: made before the
+    remote mode), or None. Read with git (no checkout); a file that cannot be read is said the same way."""
+    code, text, _ = h.git(root, "show", "{}:tests/run-all.sh".format(commit or "HEAD"))
+    missing = [f for f in PLACE_FLAGS if code or f not in (text or "")]
+    if not missing:
+        return None
+    return ("this tree's tests/run-all.sh has no {} (made before the remote mode): rebase onto main to run it on a "
+            "machine".format(missing[0]))
+
+
+def hush():
+    """t-103 R10: TERM, INT and HUP ignored from here until run_remote returns (its finally restores them), so a
+    second signal during cleanup, or one after the result is known, never raises outside a handler."""
+    for sig in SIGNAL_EXIT:
+        signal.signal(sig, signal.SIG_IGN)
+
+
+def leftover_of(left, machine, run, terminal):
+    """t-103 R7: a setup failure's cleanup notes -> the progress fields: cleaned, or the leftover for the sweep."""
+    if [n for n in left if n.startswith("rm -rf")]:
+        return {"leftover": {"machine": machine, "folder": "/tmp/pa-suite-" + run, "terminal": terminal}}
+    return {"cleaned": True}
+
+
 def folder_of(run):
     if not RUN_ID.match(run or ""):
         raise SetupFailed("bad run id {!r}".format(run))
@@ -1687,19 +1728,24 @@ def run_script(folder, tools, command=None, cwd=None, extra=None):
     started with a minimal env gets nothing a wrapper's sh would add (SHLVL, PWD); made at setup. Only it goes ahead of the machine's PATH: a probed tool's folder is never put first, so
     another tool in it (an older python3 beside git) cannot shadow the probed one, and the record names what ran.
     t-106: command (a step run's `<run>/step run <run>`) in place of run-all.sh, started in <folder>/<cwd> (checked
-    by prepare_step), with the extra export line (step_env); t0, t1, out and code at the run folder's top."""
+    by prepare_step), with the extra export line (step_env); t0, t1, out and code at the run folder's top.
+    t-103: the script's own pid first (R5: STATUS reads a run that ended without its code as dead), and t1 before
+    code (R15: once code is there, t1 is too)."""
     if command is None:
         lines = env_lines(folder, tools)
-        return "\n".join(["date +%s > ../t0"] + lines + [
+        return "\n".join(["echo $$ > {}/pid".format(folder), "date +%s > ../t0"] + lines + [
             "sh tests/run-all.sh --except-integration > ../out 2>&1",
-            "echo $? > ../code.new && mv ../code.new ../code",
-            "date +%s > ../t1", ""])
+            "rc=$?",
+            "date +%s > ../t1",
+            "echo $rc > ../code.new && mv ../code.new ../code", ""])
     return "\n".join([
+        "echo $$ > {}/pid".format(folder),
         "cd {}/{} || exit 3".format(folder, cwd),
         "date +%s > {}/t0".format(folder)] + env_lines(folder, tools) + ([extra] if extra else []) + [
         "{} > {}/out 2>&1".format(command, folder),
-        "echo $? > {0}/code.new && mv {0}/code.new {0}/code".format(folder),
-        "date +%s > {}/t1".format(folder), ""])
+        "rc=$?",
+        "date +%s > {}/t1".format(folder),
+        "echo $rc > {0}/code.new && mv {0}/code.new {0}/code".format(folder), ""])
 
 
 def step_action(machine, folder, tools, real_home, action, timeout):
@@ -1814,7 +1860,10 @@ def start_remote(machine, run, folder, tools, script=None, cwd=None):
     return address if isinstance(address, str) and address else "{}/pa-suite-{}".format(machine, run)
 
 
+# t-103 R5: `dead` is read before `code`: the run's script writes code before it ends, so dead with no code in one
+# read is a run that ended without one (killed); a pid that was reused reads alive (the run waits as before)
 STATUS = """cd {0} || exit 3
+if [ -f pid ] && p=$(cat pid) && [ -n "$p" ] && ! kill -0 "$p" 2>/dev/null; then echo dead; fi
 if [ -f code ]; then printf 'code %s\\n' "$(cat code)"; fi
 if [ -f out ]; then printf 'lines %s\\n' "$(wc -l < out)"; fi
 for f in home/suite-runs/*.json; do if [ -f "$f" ]; then printf 'progress '; cat "$f"; echo; fi; done
@@ -1822,14 +1871,18 @@ for f in home/suite-runs/*.json; do if [ -f "$f" ]; then printf 'progress '; cat
 
 
 def remote_status(machine, folder):
-    """One exec: (ok, code or None, remote line count or None, the remote run-all's progress row or {})."""
+    """One exec: (ok, code or None, remote line count or None, the remote run-all's progress row or {}, dead: the
+    run's script has ended (its pid not alive), t-103 R5)."""
     code, out, _ = hc(["exec", "--on", machine, "--timeout", "30", "--", "sh", "-c", STATUS.format(folder)], timeout=60)
     if code:
-        return False, None, None, {}
+        return False, None, None, {}, False
     rc = lines = None
     progress = {}
+    dead = False
     for line in out.splitlines():
-        if line.startswith("code ") and line[5:].strip().lstrip("-").isdigit():
+        if line == "dead":
+            dead = True
+        elif line.startswith("code ") and line[5:].strip().lstrip("-").isdigit():
             rc = int(line[5:].strip())
         elif line.startswith("lines ") and line[6:].strip().isdigit():
             lines = int(line[6:].strip())
@@ -1840,23 +1893,31 @@ def remote_status(machine, folder):
                 continue
             if isinstance(row, dict) and isinstance(row.get("parts"), dict):
                 progress = row
-    return True, rc, lines, progress
+    return True, rc, lines, progress, dead
 
 
 def merge_parts(*rows):
+    """The parts of progress rows added up. t-103 R12: a value of a wrong shape counts as absent: total and done
+    whole numbers (not bool), failed and hung lists of names, running a list of objects (the Watcher's rows)."""
     total = {"total": 0, "done": 0, "running": [], "failed": [], "hung": []}
     for parts in rows:
-        parts = parts or {}
+        if not isinstance(parts, dict):
+            continue
         for key in ("total", "done"):
-            total[key] += parts.get(key) or 0
-        for key in ("running", "failed", "hung"):
-            total[key] += parts.get(key) or []
+            value = parts.get(key)
+            if isinstance(value, int) and not isinstance(value, bool):
+                total[key] += value
+        for key, kind in (("running", dict), ("failed", str), ("hung", str)):
+            value = parts.get(key)
+            if isinstance(value, list) and all(isinstance(v, kind) for v in value):
+                total[key] += value
     return total
 
 
 class RemoteWatcher(threading.Thread):
     """R15, R17: copies a remote run's output (whole lines) and progress back while it runs; ends when its code
-    is there, after REMOTE_TIMEOUT, or after LOST_GRACE s with no good read."""
+    is there, after REMOTE_TIMEOUT, after LOST_GRACE s with no good read, or (t-103 R5) once a read finds the run's
+    script ended with no code (dead: the seconds from the watcher's start)."""
 
     def __init__(self, machine, folder, output, progress, side, sink=None, fast=False):
         threading.Thread.__init__(self, daemon=True)
@@ -1864,6 +1925,7 @@ class RemoteWatcher(threading.Thread):
         self.poll, self.grace = env_seconds("PA_SUITE_REMOTE_POLL", REMOTE_POLL), env_seconds("PA_SUITE_LOST_GRACE", LOST_GRACE)
         self.sink, self.fast = sink, fast  # t-107: each copied text to sink too; fast: 1 s polls for the first 60 s
         self.lines, self.code, self.remote_lines, self.lost, self.timed_out = 0, None, None, None, False
+        self.dead, self.partial = None, False  # t-103 R5: ended there without a code; R6: the last copy incomplete
         self.began = self.last_ok = time.time()
         self.ended_at = None  # when it ended (t-117 R14: the copy back counts from the run's end there to this)
         self.stopping, self.ended = threading.Event(), threading.Event()
@@ -1877,7 +1939,7 @@ class RemoteWatcher(threading.Thread):
                 except Exception:  # a view: a bad read counts as no read
                     pass
                 now = time.time()
-                if self.code is not None:
+                if self.code is not None or self.dead is not None:
                     break
                 if now - self.last_ok > self.grace:
                     self.lost = now - self.last_ok
@@ -1900,7 +1962,7 @@ class RemoteWatcher(threading.Thread):
                 self.lines += whole.count("\n")
                 if self.sink:
                     self.sink(whole)
-        ok, rc, lines, row = remote_status(self.machine, self.folder)
+        ok, rc, lines, row, dead = remote_status(self.machine, self.folder)
         if not ok:
             return
         self.last_ok = time.time()
@@ -1909,6 +1971,8 @@ class RemoteWatcher(threading.Thread):
         update_progress(self.progress, parts=merge_parts(row.get("parts"), local))
         if rc is not None:
             self.code = rc
+        elif dead:
+            self.dead = round(time.time() - self.began, 1)
 
     def stop(self):
         """Ends the watcher; safe when a signal cut start() short (t-144): a thread never started is not joined
@@ -1918,7 +1982,21 @@ class RemoteWatcher(threading.Thread):
             self.join(30)
 
     def final(self):
-        """The remote output whole, replacing the copy (checked against the remote line count): a note, or None."""
+        """The remote output whole, replacing the copy (checked against the remote line count): a note, or None.
+        t-103 R6: a read that fails or comes short is tried once more after one poll; still so, self.partial is set
+        (the record says partial and takes no parts from it) and the note stays."""
+        note = None
+        for attempt in (0, 1):
+            if attempt:
+                time.sleep(self.poll)
+            note = self.read_whole()
+            if note is None:
+                self.partial = False
+                return None
+        self.partial = True
+        return note
+
+    def read_whole(self):
         code, out, err = hc(["file", "read", "--on", self.machine, self.folder + "/out"])
         if code:
             return "the last read of the remote output failed ({}); the output has the {} lines copied before".format(
@@ -1972,10 +2050,21 @@ def cleanup(machine, run, terminal=None):
 
 
 def sweep(machine, current):
-    """R18: the leftovers of this Mac's earlier remote runs on machine (done or gone, not cleaned): cleaned."""
+    """R18: the leftovers of this Mac's earlier remote runs on machine (done or gone, not cleaned): cleaned.
+    t-103 R7: also a row whose setup failed and whose cleanup failed then (its `leftover` names this machine and its
+    own folder, /tmp/pa-suite-<run>): nothing runs there any more, so in any state; `leftover` cleared when done."""
     notes = []
     for row in all_progress():
         run = row.get("run")
+        left = row.get("leftover")
+        if (run != current and isinstance(left, dict) and left.get("machine") == machine and RUN_ID.match(run or "")
+                and left.get("folder") == "/tmp/pa-suite-" + run and not row.get("cleaned")):
+            terminal = left.get("terminal") if isinstance(left.get("terminal"), str) else None
+            done = cleanup(machine, run, terminal)
+            if not [n for n in done if n.startswith("rm -rf")]:
+                update_progress(os.path.join(runs_dir(), run + ".json"), cleaned=True, leftover=None)
+            notes += done
+            continue
         if run == current or row.get("machine") != machine or not isinstance(row.get("remote"), dict) or row.get("cleaned"):
             continue
         if not RUN_ID.match(run or "") or not (row.get("state") == "done" or gone(row)):
@@ -2140,6 +2229,8 @@ def full_suite(h, args):
                 step, step_why = step_full(h, command, agent, profile, record["root"], entry)
     if remote_mode:
         why = step_why or remote_ok(eligible, found, module, why_not, step=step is not None)
+        if not why and step is None:  # t-103 R16: a run-all.sh that can run in two places (never sent otherwise)
+            why = old_run_all(h, record["root"], found[0].get("commit"))
         if on and not [m for m in good if m["machine"] == on]:
             print("pa-full-suite: --on {}: not a machine of suiteMachines in {}".format(on, config_path))
             return sys.exit(2)
@@ -2342,6 +2433,8 @@ def run_remote(h, args, record, directory, command, evidence, build_log, where, 
     why = remote_ok(eligible or command, found, None, step=step is not None)
     if not why and step:
         why = never_sent(h, root, step["secrets"])
+    if not why and not step:
+        why = old_run_all(h, root, found[0].get("commit"))  # t-103 R16, on the tree pinned again
     if why:
         raise SetupFailed(why)
     waited = round(time.time() - queued, 1)
@@ -2381,9 +2474,10 @@ def run_remote(h, args, record, directory, command, evidence, build_log, where, 
                 terminal = start_remote(machine, run, folder, tools)
             times["start"] = round(time.time() - t, 1)
         except SetupFailed:
-            for n in cleanup(machine, run, terminal):
+            left = cleanup(machine, run, terminal)
+            for n in left:
                 log("pa-full-suite: cleanup on {}: {}".format(machine, n))
-            update_progress(progress, cleaned=True)
+            update_progress(progress, **leftover_of(left, machine, run, terminal))  # t-103 R7
             raise
         update_progress(progress, state="running", start=start, commit=found[0].get("commit"), tree=found[0].get("tree"),
                         remote={"folder": folder, "terminal": terminal})
@@ -2410,7 +2504,7 @@ def run_remote(h, args, record, directory, command, evidence, build_log, where, 
                 local_code = 128 - child.returncode if child.returncode < 0 else child.returncode
                 local_seconds = round(time.time() - local_began, 1)
             if watcher.ended.is_set():
-                if (watcher.lost is not None or watcher.timed_out) and local_code is None:
+                if (watcher.lost is not None or watcher.timed_out or watcher.dead is not None) and local_code is None:
                     local_code, local_stopped = stop_group(child), True
                     local_seconds = round(time.time() - local_began, 1)
                 if local_code is not None:
@@ -2419,10 +2513,14 @@ def run_remote(h, args, record, directory, command, evidence, build_log, where, 
                 local_code, local_stopped = stop_group(child), True
                 local_seconds = round(time.time() - local_began, 1)
             time.sleep(0.2)
-        remote_seconds = round(time.time() - (ran_from or began), 1)
+        # t-103 R15: the place's own seconds: t1 - t0 there when read (below), else the watcher's time to its end
+        remote_seconds = round((watcher.ended_at or time.time()) - (ran_from or watcher.began), 1)
         if watcher.lost is not None:
             remote_code = 124
             notes.append("machine {} lost after {:.0f} s".format(machine, watcher.lost))
+        elif watcher.dead is not None:  # t-103 R5: it ended there without writing its code
+            remote_code = 124
+            notes.append("the run on {} ended without an exit code after {:.0f} s".format(machine, watcher.dead))
         elif watcher.timed_out:
             remote_code = 124
             notes.append("the remote part timed out after {} s".format(REMOTE_TIMEOUT))
@@ -2440,6 +2538,7 @@ def run_remote(h, args, record, directory, command, evidence, build_log, where, 
             stamps = [int(x) for x in stamps_out.split() if x.isdigit()] if not c else []
             if len(stamps) == 2:
                 ran_there = stamps[1] - stamps[0]
+                remote_seconds = ran_there
                 times["copyback"] = round(max(0.0, (watcher.ended_at or time.time()) - stamps[1]) + final_seconds, 1)
             else:
                 notes.append("the run's times there could not be read ({})".format(
@@ -2447,6 +2546,7 @@ def run_remote(h, args, record, directory, command, evidence, build_log, where, 
         if local_stopped:
             notes.append("the local part was stopped")
         code = remote_code if remote_code or step else local_code
+        hush()  # t-103 R10: the result is known: written and cleaned whatever signal comes now
         seconds, end = round(time.time() - began, 1), pa.now()
         change = moved(found, pins(h, root))
         remote_text = pa.read_text(output) or ""
@@ -2476,7 +2576,8 @@ def run_remote(h, args, record, directory, command, evidence, build_log, where, 
         with open(build_log, "a") as f:
             f.write("=== {} full suite: `{}` in {} on {} ({}) -> exit {} after {:.0f}s ===\n{}\n".format(
                 end, command, root, machine, os_name, code, seconds, h.tail(out, 200)))
-        parts = [dict(p, place=machine) for p in parse_parts(remote_text)] + \
+        partial = watcher.partial  # t-103 R6: no parts from an incomplete copy
+        parts = ([] if partial else [dict(p, place=machine) for p in parse_parts(remote_text)]) + \
                 [dict(p, place="local") for p in parse_parts(local_text)]
         extra = {"run": run, "start": start, "end": end, "waited": waited, "load": load, "parts": parts, "output": output,
                  "machine": machine, "os": os_name, "tools": dict(tools, **step_tools),
@@ -2487,6 +2588,8 @@ def run_remote(h, args, record, directory, command, evidence, build_log, where, 
                              "homeExceptions": prep["homes"]}
         if notes:
             extra["note"] = "; ".join(notes)
+        if partial:
+            extra["partial"] = True
         if change:
             extra["moved"] = True
         try:
@@ -2512,6 +2615,7 @@ def run_remote(h, args, record, directory, command, evidence, build_log, where, 
             code, machine, os_name, "" if step else " and this Mac", build_log, recorded))
         return code
     except Interrupted as e:
+        hush()  # t-103 R10: a second signal while this cleans up is ignored (each hc call below has its timeout)
         print("pa-full-suite: interrupted: ending the run on {} and cleaning up".format(machine), flush=True)
         if child is not None:
             stop_group(child)
