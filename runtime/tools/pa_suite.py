@@ -1562,11 +1562,13 @@ def step_full(h, command, agent, profile, root, entry):
 def never_sent(h, root, secrets):
     """t-106 R5 (t-107 R8's list): why the HEAD tree may not be sent (a path under .claude/ or matching a secret
     pattern), or None. t-123 (t-106 J1 RL1): the bundle carries HEAD's whole history, so every path any commit of it
-    added, changed or deleted is checked too (git log --name-only, merges against each parent), after HEAD's tree."""
-    code, out, err = h.git(root, "ls-tree", "-r", "-z", "--name-only", "HEAD")
+    added, changed or deleted is checked too (git log --name-only, merges against each parent), after HEAD's tree.
+    Both read without replace objects (t-123 round 2): a refs/replace/* ref could hide history the bundle ships."""
+    code, out, err = h.git(root, "--no-replace-objects", "ls-tree", "-r", "-z", "--name-only", "HEAD")
     if code:
         return "git ls-tree: " + first_line(err, "exit {}".format(code))
-    code, history, err = h.git(root, "log", "--format=", "--name-only", "--no-renames", "-z", "-m", "HEAD")
+    code, history, err = h.git(root, "--no-replace-objects", "log", "--format=", "--name-only", "--no-renames", "-z",
+                                  "-m", "HEAD")
     if code:
         return "git log: " + first_line(err, "exit {}".format(code))
     seen = set()
