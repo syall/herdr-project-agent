@@ -616,7 +616,7 @@ class RemoveCard(Batch):
         saved = pa_hooks.in_worktrees_folder
         moved = os.path.realpath(self.trees["t-004"])
         self.addCleanup(setattr, pa_hooks, "in_worktrees_folder", saved)
-        pa_hooks.in_worktrees_folder = lambda path: os.path.realpath(path) != moved and saved(path)
+        pa_hooks.in_worktrees_folder = lambda path, profile=None: os.path.realpath(path) != moved and saved(path, profile)
         code, out, err = self.remove_card()
         self.assertEqual(code, 1, err + out)
         self.assertIn("is not under a worktrees folder; nothing was removed", out)

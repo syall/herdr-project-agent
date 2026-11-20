@@ -2791,11 +2791,55 @@ def refuse_others(directory, row, task, entry, listing=None):
             max(found)[1], row["path"]))
 
 
-def in_worktrees_folder(path):
+def in_worktrees_folder(path, profile=None):
     """True when the worktree sits in a folder named `worktrees`: <project>/worktrees/<container>/<repo> or
-    <workspace>/worktrees/<name>. A job's worktree elsewhere is neither offered nor removed (D4)."""
+    <workspace>/worktrees/<name>, or (t-192 R3) it is a package of a holder in one (holder_of). A job's worktree
+    elsewhere is neither offered nor removed (D4)."""
     parent = os.path.dirname(path)
-    return os.path.basename(parent) == "worktrees" or os.path.basename(os.path.dirname(parent)) == "worktrees"
+    return os.path.basename(parent) == "worktrees" or os.path.basename(os.path.dirname(parent)) == "worktrees" or \
+        holder_of(path, profile) is not None
+
+
+WARNED = set()  # the profile glob warnings already printed by this process
+
+
+def holder_glob(profile):
+    """The profile's `worktree.repos` glob as its parts (each one path component, `*` matching within it), or [] when
+    the profile names no marker or no glob (H3.6), or the glob is not a plain relative one (H3.7: warned once)."""
+    custom = (profile or {}).get("worktree") or {}
+    glob = custom.get("repos") if isinstance(custom, dict) else None
+    if not isinstance(custom, dict) or not isinstance(custom.get("marker"), str) or not custom["marker"] or \
+            not isinstance(glob, str) or not glob:
+        return []
+    parts = glob.split("/")
+    if os.path.isabs(glob) or any(p in ("", ".", "..") for p in parts) or "\\" in glob:
+        if glob not in WARNED:
+            WARNED.add(glob)
+            print("pa-worktree: the profile's worktree.repos {!r} is not a relative glob of plain parts; no holder is "
+                  "looked for".format(clean(glob)), file=sys.stderr)
+        return []
+    return parts
+
+
+def holder_of(path, profile):
+    """t-192 R3: (H, P) when the recorded path's realpath P is a package of a holder H: H is as many folders above P as
+    the profile's `worktree.repos` glob has parts, P's path below H matches it part by part, H holds the profile's
+    `worktree.marker`, and H's parent folder is named `worktrees`; else None. Realpaths, so `..` and links resolve
+    first and a package linked out of H is not in it."""
+    import fnmatch
+    parts = holder_glob(profile)
+    if not parts or not isinstance(path, str) or not path.strip():
+        return None
+    p = os.path.realpath(os.path.expanduser(path))
+    h = p
+    for _ in parts:
+        h = os.path.dirname(h)
+    rel = os.path.relpath(p, h).split(os.sep)
+    if len(rel) != len(parts) or not all(fnmatch.fnmatchcase(r, g) for r, g in zip(rel, parts)):
+        return None
+    if os.path.basename(os.path.dirname(h)) != "worktrees" or not os.path.isfile(os.path.join(h, profile["worktree"]["marker"])):
+        return None
+    return h, p
 
 
 def not_over(desc):
@@ -3097,7 +3141,7 @@ def candidate_why(row, profile, owner, card=None):
         return "the project's main checkout", None, None
     if row["keep"]:
         return "keep is set", None, None
-    if not main and not in_worktrees_folder(row["path"]):
+    if not main and not in_worktrees_folder(row["path"], profile):
         return "not under a worktrees folder", None, None
     mismatch = card and card_mismatch(row, card, False)
     if mismatch:
@@ -3629,7 +3673,7 @@ def cmd_worktree(args):
                 print("{}: {} is the project's main checkout; never removed".format(task, row["path"]))
             elif row["keep"]:
                 print("{}: kept (keepWorktree is set)".format(task))
-            elif not main and not in_worktrees_folder(row["path"]):
+            elif not main and not in_worktrees_folder(row["path"], profile):
                 print("{}: {} is not under a worktrees folder; not offered".format(task, row["path"]))
             elif card and card.get("status") == "answered" and pa.is_other(card):
                 # The person's own words: never read as Delete or Keep, and nothing is opened.
@@ -3742,7 +3786,7 @@ def remove_one(directory, row, card, path, owner, profile):
         raise pa.Problem("{} is the project's main checkout; it is never removed".format(row["path"]))
     if row["keep"]:
         raise pa.Problem("keepWorktree is set on the task")
-    if not main and not in_worktrees_folder(row["path"]):
+    if not main and not in_worktrees_folder(row["path"], profile):
         raise pa.Problem("{} is not under a worktrees folder; nothing was removed".format(row["path"]))
     still = tasks_still(row)
     if still and not under_rule_b(row, card):
@@ -4185,7 +4229,7 @@ def standing_clean(directory, row, owner, profile, entries, listing=None, holds=
     hold = worktree_hold(worktree_holds(directory, listing, entries) if holds is None else holds, row)
     if hold:
         return hold_line(hold)
-    if not in_worktrees_folder(row["path"]):
+    if not in_worktrees_folder(row["path"], profile):
         return "not under a worktrees folder"
     if facts.get("uncommitted"):
         return "{} uncommitted or untracked file(s)".format(facts["uncommitted"])

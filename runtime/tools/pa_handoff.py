@@ -294,6 +294,7 @@ def gather(args, directory, agent):
     f.notes = []
     if f.kind == "queue":
         return f  # pa-queue brief reads the repository itself: no git here
+    f.wt = holder_package(f, agent)
     # git
     f.branch = git(f.wt, "rev-parse", "--abbrev-ref", "HEAD")
     f.head = short(f.wt, "HEAD")
@@ -319,6 +320,36 @@ def gather(args, directory, agent):
     f.mutations = mutation_numbers(rules)
     f.runs = RUNS if active_rule(rules, "r-test-runs") else RUNS_LOCAL
     return f
+
+
+def holder_package(f, agent):
+    """t-192 R3.2: the worktree to hand off. A recorded holder root (the profile's worktree.marker in it, not a git top
+    level) stands for the one git repository below it that matches the profile's worktree.repos, with a note; none or
+    several are refused. Any other recorded path is itself."""
+    try:
+        profile = pa.load_profile(agent.get("profile")) if agent.get("profile") else None
+    except (pa.Problem, OSError, ValueError):
+        profile = None
+    parts = pa_hooks.holder_glob(profile)
+    if not parts or not os.path.isfile(os.path.join(f.wt, profile["worktree"]["marker"])):
+        return f.wt
+    root = os.path.realpath(f.wt)
+    code, top, _err = pa_hooks.git(root, "rev-parse", "--show-toplevel")
+    if not code and top and os.path.realpath(top) == root:
+        return f.wt
+    import glob
+    found = []
+    for cand in sorted(glob.glob(os.path.join(glob.escape(root), *parts))):
+        real = os.path.realpath(cand)
+        if os.path.isdir(cand) and pa_hooks.inside(real, root) and real != root:
+            code, top, _err = pa_hooks.git(real, "rev-parse", "--show-toplevel")
+            if not code and top and os.path.realpath(top) == real:
+                found.append(real)
+    if len(found) != 1:
+        raise Refused("{} is a holder, not a git repository, and holds {} git repositories matching {}{}: record the "
+                      "package path".format(f.wt, len(found) or "no", "/".join(parts), " ({})".format(", ".join(found)) if found else ""))
+    f.notes.append("{} is a holder; its package {} is used (record the package path)".format(f.wt, found[0]))
+    return found[0]
 
 
 def items_text(args):
