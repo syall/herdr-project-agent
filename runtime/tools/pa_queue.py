@@ -1991,13 +1991,18 @@ def pair_stacked(ctx, rec):
 
 def standing_lines(e, need):
     t = e["task"]
+    # t-170 RL-1: a need still joint with the carry review's file (its suite then ran at the tree, so the carry block
+    # is not printed) is recorded only from 'Independent (stacked):' or '(both):' (record_reviews); ask that form
+    label = "Independent (stacked)" if need.get("joint") == "independence" else "Independent"
+    question = STACKED_QUESTION.replace("'Independent: yes' or 'Independent: no'",
+                                        "'{0}: yes' or '{0}: no'".format(label))
     return ["{}: a short review of independence is needed (the person's standing rule: stacked entries must first be "
             "found independent): a fresh reviewer writes evidence/{}/{}".format(t, t, need["file"]),
             "  the change: git diff {} {}; what it is stacked on: git diff {} {}".format(
                 need.get("newBase"), need["tip"], need.get("oldBase"), need.get("newBase")),
-            "  question: " + STACKED_QUESTION + "; then 'Verdict: pass' or 'Verdict: must fix (<n>)'.",
-            "  the file has the lines Start: <UTC time>, End: <UTC time>, Reviewer: <its address>, Independent: yes|no, "
-            "Checked: {}, and its Verdict: line".format(need["tip"])]
+            "  question: " + question + "; then 'Verdict: pass' or 'Verdict: must fix (<n>)'.",
+            "  the file has the lines Start: <UTC time>, End: <UTC time>, Reviewer: <its address>, {}: yes|no, "
+            "Checked: {}, and its Verdict: line".format(label, need["tip"])]
 
 
 def joint_lines(partner, e, need):
