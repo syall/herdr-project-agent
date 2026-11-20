@@ -2702,6 +2702,68 @@ cases["P143-link"] = async () => { // I4: a task id is a link: the Tasks tab ope
   check(!costsView(v).clicks["costs-link-activity-2-0"], "no link for (no task)");
 };
 
+// ---- t-151 By session type: a row opens to its sessions (task links, the drill box), or shows no fold icon ----
+// The fold mark of a By session type row: "▸" / "▾" when it can open, nothing else.
+const kindFold = (v, i) => { const el = costsEl(v, `costs-kind-${i}`); return el ? (/[▸▾]/.exec(inspect(el).text)?.[0] ?? "") : null; };
+// The By session type section's text segments (between its head and the next section's).
+const kindSegs = (v) => { const segs = costsView(v).text.split(" | "); const a = segs.indexOf("By session type"), b = segs.findIndex((x, i) => i > a && /^(Accounts|By scope|By day)/.test(x)); return segs.slice(a, b < 0 ? undefined : b); };
+
+cases["P151-sessions"] = async () => { // a session-type row with sessions opens to them, in the drill box, in the By task drill's order; each task id is a link
+  const { v } = await costsWorld();
+  check(kindFold(v, 0) === "▸", `kind worker can open (got ${JSON.stringify(kindFold(v, 0))})`);
+  await click(v, "costs-kind-0"); await settle();
+  check(kindFold(v, 0) === "▾", "open: ▾");
+  const box = costsEl(v, "costs-drill-kind"), text = inspect(box ?? {}).text;
+  check(Boolean(box) && /aaaa1111/.test(text) && /bbbb2222/.test(text) && !/cccc3333/.test(text), `worker -> its two sessions in costs-drill-kind (got ${text.slice(0, 1500)})`);
+  check(text.indexOf("aaaa1111") < text.indexOf("bbbb2222"), "the summary's order, as in the By task drill");
+  const { clicks } = costsView(v);
+  check(Boolean(clicks["costs-link-kind-0-0"]) && Boolean(clicks["costs-link-kind-0-1"]), `a task link on each session line (have ${Object.keys(clicks).filter((k) => k.startsWith("costs-link"))})`);
+  check(/t-1/.test(inspect(costsEl(v, "costs-link-kind-0-0") ?? {}).text), "the link names its task");
+  await click(v, "costs-link-kind-0-0"); await settle();
+  check(g.__shared["project-agent.show"]?.task === "t-1" && g.__shared["project-agent.show"]?.space === S, `the show request (got ${JSON.stringify(g.__shared["project-agent.show"])})`);
+  look(v);
+  check(v.view === "tasks" && v.open.has("t-1"), `the Tasks tab with t-1 open (view ${v.view}, open ${[...v.open]})`);
+  check(v.costs.peek(S).open.kind === "worker", "a link click does not toggle the row");
+  // A session with no task is listed, without a link.
+  await click(v, "view-costs"); await settle();
+  await click(v, "costs-kind-1"); await settle();
+  const pa = costsView(v);
+  check(/cccc3333/.test(inspect(costsEl(v, "costs-drill-kind") ?? {}).text) && !pa.clicks["costs-link-kind-1-0"], `pa -> cccc3333, no link (have ${Object.keys(pa.clicks).filter((k) => k.startsWith("costs-link"))})`);
+  // Many sessions of a type: the drill scrolls in its fixed-height box, every one listed.
+  const s = costsSummary();
+  const keys = Array.from({ length: 25 }, (_, i) => `w${String(i).padStart(3, "0")}bbbb`);
+  s.sessions = keys.map((key) => ({ key, tokens: 10, money: 0.1, calls: 1, kind: "worker", role: "build", program: "claude", task: "t-1", model: "model-a", from: isoAt(T0 - 7200000), to: isoAt(T0 - 3600000), state: "closed", source: "recorded" }));
+  const many = (await costsWorld({ summary: s })).v;
+  await click(many, "costs-kind-0"); await settle();
+  const mbox = costsEl(many, "costs-drill-kind");
+  check(Boolean(mbox?.style?.overflow_y_scrollbar) && Array.isArray(mbox?.style?.h), `the drill scrolls at a fixed height (style ${JSON.stringify(mbox?.style)})`);
+  check(keys.every((k) => inspect(mbox ?? {}).text.includes(k)) && Boolean(costsView(many).clicks["costs-link-kind-0-24"]), "every session listed, each with its link");
+  check(moneyLabelled(many).length === 0, `labelled (${JSON.stringify(moneyLabelled(many))})`);
+};
+
+cases["P151-nofold"] = async () => { // a session-type row with nothing to show has no fold icon, and a click on it opens nothing
+  const s = costsSummary();
+  s.byKind = { ...s.byKind, kind: [...s.byKind.kind, { key: "helper", tokens: 5, money: 0.05, calls: 1 }], model: [{ key: "model-a", tokens: 900, money: 11, calls: 6 }, { key: "model-b", tokens: 100, money: 1.5, calls: 1 }] };
+  let { v } = await costsWorld({ summary: s });
+  check(kindFold(v, 0) === "▸" && kindFold(v, 1) === "▸", `worker and pa have sessions: ▸ (got ${kindFold(v, 0)}, ${kindFold(v, 1)})`);
+  check(kindFold(v, 2) === "", `helper has no sessions: no fold icon (got ${JSON.stringify(kindFold(v, 2))})`);
+  const before = kindSegs(v).join(" | ");
+  if (costsView(v).clicks["costs-kind-2"]) { await click(v, "costs-kind-2"); await settle(); }
+  check(!costsEl(v, "costs-drill-kind") && kindFold(v, 2) === "", `nothing opens under helper (got ${kindSegs(v).join(" | ")}; before ${before})`);
+  // By model: model-b is no session's model (a session is listed under its main model): no fold icon.
+  await click(v, "costs-dim-model"); await settle();
+  check(kindFold(v, 0) === "▸" && kindFold(v, 1) === "", `model-a ▸, model-b none (got ${JSON.stringify(kindFold(v, 0))}, ${JSON.stringify(kindFold(v, 1))})`);
+  // A summary whose session list was shrunk away: no session-type row shows a fold icon.
+  ({ v } = await costsWorld({ summary: costsSummary({ sessions: [] }) }));
+  for (const d of ["kind", "role", "program", "model", "machine"]) {
+    await click(v, `costs-dim-${d}`); await settle();
+    const n = d === "machine" ? 1 : costsSummary().byKind[d].length;
+    const marks = Array.from({ length: n }, (_, i) => kindFold(v, i));
+    check(marks.every((m) => m === ""), `${d}: no fold icons without sessions (got ${JSON.stringify(marks)})`);
+  }
+  check(moneyLabelled(v).length === 0, `labelled (${JSON.stringify(moneyLabelled(v))})`);
+};
+
 cases["P-costs-machine"] = async () => { // §5.1: the machine row is Herdr's machine name or "this computer", never a host key
   for (const [machine, want] of [[null, "this computer"], [M, M]]) {
     const { v } = await costsWorld({ machine });
