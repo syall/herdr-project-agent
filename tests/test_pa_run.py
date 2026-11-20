@@ -1073,6 +1073,45 @@ class Q5RemoteError(Run):
         self.assertIn("-> exit 1 ", log[0])
         self.assertEqual(self.progress(run).get("state"), "done")
 
+    def test_q5e_a_watcher_start_that_raises_is_cleaned_recorded_and_raised(self):
+        """t-152 (t-117 RL-r2-1): watcher.start() raises (Thread.start's "can't start new thread"; the thread is
+        left unstarted, as the real failure leaves it). The catch-all's watcher.stop() must not join it (that raised
+        before S.cleanup and again in the finally): the run there is cleaned, one record exit 1 is written, and the
+        first error is the one raised."""
+        import threading
+        real = threading.Thread.start
+        hit = []
+
+        def start(thread):
+            if type(thread).__name__ == "RemoteWatcher":
+                hit.append(thread)
+                raise RuntimeError("can't start new thread")
+            return real(thread)
+        out, saved, sys.argv = io.StringIO(), sys.argv, ["pa-run", "--", "sh", "probe.sh"]
+        threading.Thread.start = start
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+                with self.assertRaises(RuntimeError) as caught:
+                    pa_hooks.main()
+        finally:
+            threading.Thread.start = real
+            sys.argv = saved
+        text = out.getvalue()
+        self.assertTrue(hit, text)
+        self.assertEqual(str(caught.exception), "can't start new thread", text)
+        run = self.run_id(text)
+        self.assertTrue(self.remote_runs(), self.calls())  # it was started there
+        self.assertFalse(os.path.exists(self.remote_folder(run)), text)
+        self.assertEqual([n for n in os.listdir(os.path.join(self.stub, "box-1", "terminals")) if n.endswith(".json")],
+                         [])
+        rows = self.run_rows()
+        self.assertEqual([(r["run"], r["exit"], r["place"]) for r in rows], [(run, 1, "box-1")], rows)
+        self.assertIn("pa-run failed: RuntimeError: can't start new thread", rows[0].get("note") or "", rows)
+        log = [l for l in (self.build_log() or "").splitlines() if " pa-run " in l]
+        self.assertEqual(len(log), 1, self.build_log())
+        self.assertIn("-> exit 1 ", log[0])
+        self.assertEqual(self.progress(run).get("state"), "done")
+
 
 class Q6CleanFilter(Run):
     """R6 (RL-5): tree_to_run never runs a repo's clean filter (it could write under .git): a path that needs one
