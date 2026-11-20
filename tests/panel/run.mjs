@@ -80,6 +80,8 @@ async function hoverTask(v, id, on = true) {
 async function click(v, id) {
   const task = /^(?:tmove-[a-z]+-|next-)(.+)$/.exec(id)?.[1];
   if (task && !look(v).clicks[id]) await hoverTask(v, task);
+  // t-145: the schedule's controls live in the Passes tab: open it first.
+  if (/^(sched-|every-|quiet-|pass-now|pass-retro)/.test(id) && !look(v).clicks[id] && look(v).clicks["view-schedule"]) { look(v).clicks["view-schedule"]({}, cx); await flush(); }
   const { clicks } = look(v);
   check(Boolean(clicks[id]), `a click target ${id} (have ${Object.keys(clicks).join(", ")})`);
   clicks[id]({}, cx); await flush();
@@ -7273,6 +7275,184 @@ cases["P142-4-focus"] = async () => { // R4: and while the task or one of those 
   check(moveIds(look(v).clicks, "t-2").length === 5, "Start next focused: they stay");
   g.__focus = null;
   check(!Object.keys(look(v).clicks).some((k) => /^(tmove-|next-)/.test(k)), "focus elsewhere: none");
+};
+
+// ---- t-145: the top bar's two toggles, the Passes tab, the profile link, the counts, the archive trims ----
+const P145 = {
+  el: (v, id) => pathTo(v.render(cx), id)?.at(-1) ?? null,
+  tip: (v, id) => String(P145.el(v, id)?.style?.tooltip?.[0] ?? ""),
+  own: (v, id) => (P145.el(v, id)?.kids ?? []).filter((k) => typeof k !== "object").join(""),
+  // The element is in the PA head row: an ancestor that names the agent and holds no view tab.
+  inHead: (v, id) => (pathTo(v.render(cx), id) ?? []).some((x) => { const s = inspect(x).text; return /PA: proj/.test(s) && !/Decisions/.test(s); }),
+  parts: (v) => look(v).text.split(" | "),
+  ledger: (tasks, extra = {}) => { g.__files[`:${DIR}/ledger.json`] = JSON.stringify({ tasks, ...extra }); },
+};
+
+cases["P145-1-coffee"] = awWrap(async () => { // I1: one coffee button beside the PA status; no text; the state and limits in its tooltip
+  awSetup(); g.__themeNames = true;
+  const v = await mount(); awHold(v);
+  await fire(1000);
+  const { text, clicks } = look(v);
+  check(Boolean(clicks["awake-toggle"]) && P145.inHead(v, "awake-toggle"), `the button in the PA head row (clicks ${Object.keys(clicks)})`);
+  check(P145.own(v, "awake-toggle") === "☕", `a coffee glyph only (got ${P145.own(v, "awake-toggle")})`);
+  check(!/Keep this Mac awake|Turn off|Turn on|Closing the lid|Remote machines/.test(text), `no keep-awake text in the panel (got ${text.slice(0, 600)})`);
+  const tip = P145.tip(v, "awake-toggle");
+  check(/Keep this Mac awake while Herdr runs: on/.test(tip) && /holding/.test(tip) && /lock the screen by hand/.test(tip) && /lid/.test(tip) && /Remote machines you work on are not affected/.test(tip), `the tooltip says the state and the limits (got ${tip})`);
+  const onBg = JSON.stringify(P145.el(v, "awake-toggle").style?.bg);
+  await click(v, "awake-toggle"); await settle();
+  check(awCalls().at(-1)?.[0] === "stop", `a click stops it, as before (got ${JSON.stringify(awCalls())})`);
+  check(/runs: off/.test(P145.tip(v, "awake-toggle")), `the tooltip says off (got ${P145.tip(v, "awake-toggle")})`);
+  check(JSON.stringify(P145.el(v, "awake-toggle").style?.bg) !== onBg, `on and off look different (both ${onBg})`);
+  awSetup({ platform: "linux" });
+  const w = await mount();
+  check(!look(w).clicks["awake-toggle"] && !/macOS only|Keep this Mac/.test(look(w).text), `off macOS: no button, no text (got ${look(w).text.slice(0, 400)})`);
+});
+
+cases["P145-2-fresh-toggle"] = async () => { // I2: one fresh-contexts switch beside the coffee button; no force control; the mode in its tooltip
+  const { dir } = ctxWorld({ fresh: (args) => {
+    if (args[0] !== "set") return args.includes("--dry-run") ? DRY41() : ASKED41;
+    const mode = args[args.indexOf("--mode") + 1];
+    g.__files[`${dir}/context.json`] = JSON.stringify({ v: 1, mode, taskCap: 150000, passCap: 250000, net: 400000, enabledAt: null, by: "panel" });
+    return SET41(mode);
+  } });
+  g.__themeNames = true;
+  const v = await liveMount();
+  const { text, clicks } = look(v);
+  check(Boolean(clicks["pa-context-mode"]) && P145.inHead(v, "pa-context-mode"), `the switch in the PA head row (clicks ${Object.keys(clicks)})`);
+  check(P145.own(v, "pa-context-mode") === "↻", `a glyph only (got ${P145.own(v, "pa-context-mode")})`);
+  check(!clicks["pa-fresh"] && !/Fresh context|Turn fresh contexts|mode fresh|PA context/.test(text), `no force control, no context text (got ${text.slice(0, 700)})`);
+  check(/Fresh contexts: on/.test(P145.tip(v, "pa-context-mode")) && /turn them off/i.test(P145.tip(v, "pa-context-mode")), `the tooltip (got ${P145.tip(v, "pa-context-mode")})`);
+  const onBg = JSON.stringify(P145.el(v, "pa-context-mode").style?.bg);
+  await click(v, "pa-context-mode"); await settle(); await settle();
+  check(ctxWrites().length === 1 && JSON.stringify(ctxWrites()[0][1]) === JSON.stringify(["set", "--space", S, "--by", "panel", "--mode", "off", "--json"]), `the same set (got ${JSON.stringify(ctxWrites())})`);
+  check(/Fresh contexts: off/.test(P145.tip(v, "pa-context-mode")) && /turn them on/i.test(P145.tip(v, "pa-context-mode")), `off after the reload (got ${P145.tip(v, "pa-context-mode")})`);
+  check(JSON.stringify(P145.el(v, "pa-context-mode").style?.bg) !== onBg, "on and off look different");
+  check(!/Context mode off/.test(look(v).text), `no result line in the panel (got ${look(v).text.slice(0, 700)})`);
+  await click(v, "pa-context-mode"); await settle(); await settle();
+  check(ctxWrites().length === 2 && ctxWrites()[1][1].includes("fresh"), "and back on");
+};
+
+cases["P145-3-context-rows-in-costs"] = async () => { // I2: the context size line and the reset line live in the Costs tab; a failed switch says so; an invalid file in the tooltip
+  const lastReset = { at: `${DAY41}T07:02:00Z`, from: "3f2a9c1e-aaaa-bbbb-cccc-dddddddddddd", to: "s1", reason: "pass-cap", ctx: 260000 };
+  ctxWorld({ launcher: LREC({ accepts: ["restart", "context"], lastReset }) });
+  let v = await liveMount();
+  check(!look(v).text.includes("Fresh context at 07:02") && !look(v).clicks["copy-previous-session"], `not above the tabs (got ${look(v).text.slice(0, 700)})`);
+  await click(v, "view-costs"); await settle();
+  let text = look(v).text;
+  check(text.includes("PA context today (UTC): mean 158k · peak 254k · resets 6 (fresh 6, compact 0) (as of 07:59)"), `the size line in Costs (got ${text.slice(0, 900)})`);
+  check(text.includes("Fresh context at 07:02 (pass cap, 260k) · previous session 3f2a9c1e…") && Boolean(look(v).clicks["copy-previous-session"]), `the reset line and its Copy in Costs (got ${text.slice(0, 900)})`);
+  await click(v, "view-tasks");
+  check(!look(v).text.includes("PA context today"), "not in another tab");
+  ctxWorld({ context: "{not json" });
+  v = await liveMount();
+  check(!/context\.json is not valid/.test(look(v).text) && /context\.json is not valid/.test(P145.tip(v, "pa-context-mode")), `the invalid file in the tooltip (got ${P145.tip(v, "pa-context-mode")})`);
+  ctxWorld({ fresh: (args) => (args[0] === "set" ? { code: 2, stdout: "", stderr: `${CTX}: refused for the test\n` } : DRY41()) });
+  v = await liveMount();
+  await click(v, "pa-context-mode"); await settle(); await settle();
+  text = look(v).text;
+  check(text.includes(`${CTX}: refused for the test`), `a failed switch is said (got ${text.slice(0, 700)})`);
+};
+
+cases["P145-4-passes-tab"] = async () => { // I3: the schedule is a tab between Rules and Costs; its label says the state
+  world();
+  g.__files[`:${DIR}/schedule.json`] = JSON.stringify({ everyMinutes: 15 });
+  const v = await mount(); await settle();
+  let { text, clicks } = look(v);
+  check(!clicks["sched-summary"] && !clicks["pass-now"] && !/Passes every 15 min/.test(text), `not shown outside its tab (got ${text.slice(0, 500)})`);
+  const at = (x) => text.indexOf(x);
+  check(at("| Passes · 15 min |") > at("| Rules") && at("| Passes · 15 min |") < at("| Costs") && at("| Rules") >= 0, `between Rules and Costs (got ${text.slice(0, 500)})`);
+  await click(v, "view-schedule");
+  ({ text, clicks } = look(v));
+  check(Boolean(clicks["sched-summary"]) && Boolean(clicks["pass-now"]) && Boolean(clicks["pass-retro"]) && Boolean(clicks["sched-pause-top"]) && /Passes every 15 min/.test(text), `the bar in its tab (got ${text.slice(0, 500)})`);
+  await click(v, "sched-summary");
+  check(Boolean(look(v).clicks["every-15"]) && Boolean(look(v).clicks["quiet-set"]), "its settings unfold as before");
+  await click(v, "every-30"); await settle();
+  check(JSON.parse(g.__files[`:${DIR}/schedule.json`]).everyMinutes === 30 && /\| Passes · 30 min \|/.test(look(v).text), `a setting writes as before; the label follows (got ${look(v).text.slice(0, 400)})`);
+  for (const [s, label] of [[{ everyMinutes: 0 }, "Passes · off"], [{ everyMinutes: 15, paused: true }, "Passes · paused"], [null, "Passes · !"]]) {
+    world();
+    if (s) g.__files[`:${DIR}/schedule.json`] = JSON.stringify(s);
+    const w = await mount(); await settle();
+    check(look(w).text.includes(`| ${label} |`), `${JSON.stringify(s)}: ${label} (got ${look(w).text.slice(0, 400)})`);
+    check(!/schedule\.json is missing/.test(look(w).text), "the missing-file line only in its tab");
+  }
+};
+
+cases["P145-5-profile-link"] = async () => { // I4: the profile name opens its profile.json in the Files view
+  world();
+  const v = await mount(); await settle();
+  check(Boolean(look(v).clicks["pa-profile"]) && P145.own(v, "pa-profile") === "test", `the name is a link (got ${P145.own(v, "pa-profile")})`);
+  await click(v, "pa-profile");
+  const r = g.__shared["my-files.root"];
+  check(r?.space === S && r?.path === "/home/u/.config/herdr-pa/profiles/test" && r?.file === "profile.json", `the Files view at profile.json (got ${JSON.stringify(r)})`);
+  check(g.__runs.some(([n, a]) => n === "layout.select" && a.child === "files"), `Files selected (got ${JSON.stringify(g.__runs)})`);
+};
+
+cases["P145-6-tasks-count"] = async () => { // I5: the Tasks tab counts the tasks not parked and not done
+  world();
+  P145.ledger([tq("t-1", "queued", 1), tq("t-2", "queued", 2), tq("t-3", "in-progress", 3), tq("t-4", "done", 4), tq("t-5", "done", 5), tq("t-6", "done", 6), tq("t-7", "parked", 7), tq("t-8", "parked", 8)]);
+  const v = await mount(); await settle();
+  check(/\| Tasks · 3 \|/.test(look(v).text), `Tasks · 3 (got ${look(v).text.slice(0, 400)})`);
+};
+
+cases["P145-7-state-counts-pass"] = async () => { // I6, I7: a count per active state; the pass number only while passes are on
+  world();
+  P145.ledger([tq("t-1", "needs-decision", 1), tq("t-2", "in-progress", 2), tq("t-3", "in-progress", 3), tq("t-4", "review", 4), tq("t-5", "queued", 5), tq("t-6", "queued", 6), tq("t-7", "queued", 7), tq("t-8", "done", 8), tq("t-9", "parked", 9)], { passCount: 7 });
+  g.__files[`:${DIR}/schedule.json`] = JSON.stringify({ everyMinutes: 0 });
+  const v = await mount(); await settle();
+  let text = look(v).text;
+  check(text.includes("needs decision 1 · in progress 2 · review 1 · queued 3") && !/active of|investigating|parked \d|done \d/.test(text), `the counts per active state (got ${text.slice(0, 500)})`);
+  check(!/pass 7/.test(text), `no pass number while passes are off (got ${text.slice(0, 500)})`);
+  g.__files[`:${DIR}/schedule.json`] = JSON.stringify({ everyMinutes: 15 });
+  v.reload(cx); await settle();
+  check(/queued 3 · pass 7/.test(look(v).text), `the pass number while on (got ${look(v).text.slice(0, 500)})`);
+  g.__files[`:${DIR}/schedule.json`] = JSON.stringify({ everyMinutes: 15, paused: true });
+  v.reload(cx); await settle();
+  check(!/pass 7/.test(look(v).text), "none while paused");
+  P145.ledger([tq("t-8", "done", 8)]);
+  v.reload(cx); await settle();
+  check(look(v).text.includes("no active tasks"), `none active (got ${look(v).text.slice(0, 500)})`);
+};
+
+cases["P145-8-decisions-archived"] = async () => { // I8a: the 10 most recent finished cards; the rest behind one Archived (n) row
+  world(); localCards(15, { open: 1 }); // d-001 open; d-002..d-015 answered, d-015 the newest
+  const v = await mount(); await settle();
+  await click(v, "pa-older");
+  let p = P145.parts(v);
+  check(p.includes("Q d-015?") && p.includes("Q d-006?") && !p.includes("Q d-005?"), `the 10 most recent (got ${look(v).text.slice(0, 1500)})`);
+  check(/^▸ Archived \(4\)/.test(P145.own(v, "pa-archive")), `one collapsed row (got ${P145.own(v, "pa-archive")})`);
+  await click(v, "pa-archive"); await settle();
+  p = P145.parts(v);
+  check(p.includes("Q d-005?") && p.includes("Q d-002?") && /^▾ Archived \(4\)/.test(P145.own(v, "pa-archive")), `opened: the rest (got ${P145.own(v, "pa-archive")})`);
+  await click(v, "pa-archive"); await settle();
+  check(!P145.parts(v).includes("Q d-005?"), "folded again");
+};
+
+cases["P145-9-done-archived"] = async () => { // I8b: the done section draws its 10 most recent; the rest behind Archived (n)
+  world();
+  P145.ledger(Array.from({ length: 13 }, (_, i) => tq(`t-${i + 1}`, "done", i + 1)));
+  const v = await mount(); await settle();
+  await click(v, "view-tasks"); await click(v, "tasks-done");
+  let p = P145.parts(v);
+  check(p.includes("Task t-13") && p.includes("Task t-4") && !p.includes("Task t-3") && p.includes("13"), `the 10 most recent, the section counts 13 (got ${look(v).text.slice(0, 1200)})`);
+  check(/^▸ Archived \(3\)/.test(look(v).text.split(" | ").find((x) => /Archived/.test(x)) ?? "") && Boolean(look(v).clicks["tasks-done-archived"]), `the row (got ${look(v).text.slice(0, 1200)})`);
+  await click(v, "tasks-done-archived");
+  p = P145.parts(v);
+  check(p.includes("Task t-3") && p.includes("Task t-1"), "opened: the rest");
+  await click(v, "tasks-done-archived");
+  check(!P145.parts(v).includes("Task t-1"), "folded again");
+  g.__shared["project-agent.show"] = { space: S, task: "t-1", at: 1 };
+  check(P145.parts(v).includes("Task t-1"), "a task shown from another view opens its archived row");
+};
+
+cases["P145-10-merged-archived"] = async () => { // I8c: the queue's Merged shows the 10 most recent; the rest behind Archived (n)
+  const merged = Array.from({ length: 13 }, (_, i) => ({ task: `t-M${i + 1}`, job: null, tip: sha("e"), from: sha("a"), to: sha("b"), at: `2026-11-18T08:${String(i + 10)}:00Z`, by: "hand" }));
+  const v = await queueWorld(qDoc({ [QA]: qRepo([], { merged }) }));
+  let text = look(v).text;
+  check(/t-M13 merged/.test(text) && /t-M4 merged/.test(text) && !/t-M3 merged/.test(text), `the 10 most recent (got ${text})`);
+  check(Boolean(look(v).clicks["queue-merged-archived-0"]) && /▸ Archived \(3\)/.test(text), `the row (got ${text})`);
+  await click(v, "queue-merged-archived-0");
+  text = look(v).text;
+  check(/t-M3 merged/.test(text) && /t-M1 merged/.test(text) && text.indexOf("t-M3 merged") < text.indexOf("t-M1 merged"), `opened: the rest, newest first (got ${text})`);
 };
 
 // --list prints the names that would run and runs none. An unknown name or option exits 2.
