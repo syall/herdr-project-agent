@@ -74,7 +74,9 @@ class Shards(unittest.TestCase):
             os.makedirs(os.path.join(tmp, "tests", "panel"))
             os.symlink(os.path.join(REPO, "mods"), os.path.join(tmp, "mods"))
             os.symlink(os.path.join(HERE, "keeper"), os.path.join(tmp, "tests", "keeper"))
-            os.symlink(os.path.join(HERE, "panel", "stubs.mjs"), os.path.join(tmp, "tests", "panel", "stubs.mjs"))
+            for name in os.listdir(os.path.join(HERE, "panel")):  # stubs.mjs, gpui-kit.mjs, gpui-base.mjs (t-049)
+                if name.endswith(".mjs") and name != "run.mjs":
+                    os.symlink(os.path.join(HERE, "panel", name), os.path.join(tmp, "tests", "panel", name))
             with open(RUN) as f:
                 text = f.read()
             at = text.index("\nconst pick = ")
