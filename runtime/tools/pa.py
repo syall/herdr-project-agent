@@ -2871,6 +2871,26 @@ def give_tty(group):
         signal.pthread_sigmask(signal.SIG_SETMASK, previous)
 
 
+def take_tty_back(ended):
+    """t-195 round 2 (REVIEW L1): after a child that may have held the terminal ended without settle_child (reaped by
+    an exec that could not adopt it, an adopted child with no group, one waited out before an error): the terminal
+    back to this launcher's group and reset, as settle_child does, so the next Claude starts with the foreground and
+    an error is shown on a reset terminal. Taken only from a group that ended (`ended`: the reaped pids, each its own
+    group as spawn made it) or that has no live member left; never from a live group of someone else's, and nothing
+    is written then. Nothing when fd 0 is not a terminal. Never raises."""
+    try:
+        if not os.isatty(0):
+            return
+        fg = os.tcgetpgrp(0)
+    except OSError:
+        return
+    if fg != os.getpgrp():
+        if fg not in set(ended) and group_size(fg) != 0:
+            return
+        give_tty(os.getpgrp())
+    reset_tty()
+
+
 def child_setup(tty):
     """The child's first steps after the fork, before the exec: a process group of its own and, when the launcher
     had the terminal, that group in the foreground. Only setpgid / sigmask / tcsetpgrp (no lock the launcher's
@@ -2893,7 +2913,12 @@ def child_setup(tty):
 
 def spawn(argv, cwd):
     tty = foreground_tty()
-    child = subprocess.Popen(argv, cwd=cwd, preexec_fn=child_setup(tty))
+    try:
+        child = subprocess.Popen(argv, cwd=cwd, preexec_fn=child_setup(tty))
+    except BaseException:  # t-195 round 2 (L1): the child's setup may have taken the terminal before its exec failed
+        if tty:
+            give_tty(os.getpgrp())
+        raise
     try:
         os.setpgid(child.pid, child.pid)  # the race-free pair with the child's own call (EACCES after its exec)
     except OSError:
@@ -3017,6 +3042,9 @@ def settle_child(ctx, child, done):
     """After the child's wait (any end): the terminal back to the launcher when the child had it (R3), then its
     group gone (R2, R5). Only for a child spawn put in a group (a test's stand-in has none)."""
     group = ctx.get("childGroup")
+    if isinstance(child, AdoptedChild) and (not group or child.pa_group != group):
+        take_tty_back({child.pid})  # t-195 round 2 (L1): a swap adopted it without a group; its own group is unknown
+        return
     if not group or getattr(child, "pa_group", None) != group:
         return
     if getattr(child, "pa_tty", False):
@@ -4195,14 +4223,17 @@ def swap_started(ctx, directory, address, notes):
 
 
 def reap_children(directory):
-    """R2.6: every child of this process (what an exec it could not adopt from left) waited for, each exit logged."""
+    """R2.6: every child of this process (what an exec it could not adopt from left) waited for, each exit logged.
+    Returns their pids (take_tty_back's ended groups)."""
+    reaped = []
     while True:
         try:
             pid, status = os.waitpid(-1, 0)
         except ChildProcessError:
-            return
+            return reaped
         except InterruptedError:
             continue
+        reaped.append(pid)
         if directory:
             try:
                 session_log(directory, "swap: reaped pid={} code={}".format(pid, exit_code(status)))
@@ -4215,11 +4246,12 @@ def swap_wait_out(ctx):
     adopted Claude, or the children it could not adopt, have ended (waited for silently); then stdout is back."""
     if ctx is None:
         return
-    child = ctx.get("adoptedChild")
-    if child is not None and child.poll() is None:
+    child = ctx.pop("adoptedChild", None)
+    if child is not None:
         child.wait()
+        take_tty_back({child.pid})  # t-195 round 2 (L1): never settled (run_agent did not run it): as settle_child
     if ctx.pop("reapFirst", False):
-        reap_children(ctx.get("directory"))
+        take_tty_back(reap_children(ctx.get("directory")))
     swap_loud(ctx)
 
 
@@ -4288,7 +4320,7 @@ def run_agent(args, address, project, p, directory, agent, ctx, started):
     if not ctx["beat"]:  # one heartbeat thread, also when a start is retried after an error
         threading.Thread(target=beat, daemon=True).start()
     if ctx.pop("reapFirst", False):  # t-195 R2.6: before the watcher (its pre-checks are children too) and any start
-        reap_children(directory)
+        take_tty_back(reap_children(directory))  # round 2 (L1): what it reaped may have held the terminal
         swap_loud(ctx)
     if not ctx["beat"]:
         if ctx.get("launcher"):  # the request watcher (t-037 R6); a separate thread keeps the heartbeat's pace
