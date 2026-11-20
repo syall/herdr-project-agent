@@ -901,6 +901,26 @@ cases["S84-queue-links"] = async () => { // t-084 R1-R4: an entry's workers and 
   check(a.approval === "approval: not asked yet", `t-A: no card (got ${a.approval})`);
 };
 
+cases["S116-queue-approval-reentry"] = async () => { // t-084 RL-1: an answered merge card older than the task's last merge is not its approval
+  const zoneMod = await import(path.join(dst, "zone.js"));
+  zoneMod.zone.offsetAt = () => 0;
+  const e = (task, x = {}) => ({ task, job: null, branch: `${task}-b`, worktree: `/wt/${task}`, onto: "main", state: "checking", tip: "b".repeat(40), needs: null, suite: null, review: null, approval: null, ...x });
+  const T0 = "2026-11-19T01:00:00Z", T1 = "2026-11-19T02:00:00Z", T2 = "2026-11-19T03:00:00Z";
+  const merged = [{ task: "t-A", job: null, tip: "a".repeat(40), at: T1 }, { task: "t-B", job: "J2", tip: "c".repeat(40), at: T1 }, { task: "t-C", job: "J1", tip: "d".repeat(40), at: T1 }];
+  const doc = { version: 1, repos: { "/w/p": { main: "main", entries: [e("t-A"), e("t-B", { job: "J2" }), e("t-C", { job: "J2" })], left: [], merged } } };
+  const card = (id, task, answered, question = `Merge ${task} into main?`) => ({ id, card: { id, task, status: "answered", answer: "Merge", question, answered } });
+  const rows = (cards) => queueMod.queueRows({ doc, error: null, missing: false }, { tasks: [] }, cards).repos[0].entries;
+  let [a, b, c] = rows([card("d-1", "t-A", T0), card("d-3", "t-B", T0, "Merge t-B J2 into main?"), card("d-5", "t-C", T0, "Merge t-C J2 into main?")]);
+  check(a.approval === "approval: not asked yet", `t-A merged at T1 with d-1 (T0), added again: not asked yet (got ${a.approval})`);
+  check(b.approval === "approval: not asked yet", `t-B J2, the same job merged after its card: not asked yet (got ${b.approval})`);
+  check(c.approval === "approval: approved on d-5 (Merge, 11-19 01:00)", `t-C J2: only a J1 merge, which is not its job: its card stands (got ${c.approval})`);
+  [a, b] = rows([card("d-1", "t-A", T0), card("d-2", "t-A", T2), card("d-3", "t-B", T0, "Merge t-B J2 into main?"), card("d-4", "t-B", T2, "Merge t-B J2 into main?")]);
+  check(a.approval === "approval: approved on d-2 (Merge, 11-19 03:00)", `a card answered after the merge: approved (got ${a.approval})`);
+  check(b.approval === "approval: approved on d-4 (Merge, 11-19 03:00)", `t-B J2: the card after its merge (got ${b.approval})`);
+  [a] = rows([{ id: "d-6", card: { id: "d-6", task: "t-A", status: "answered", answer: "Merge", question: "Merge t-A into main?" } }]);
+  check(a.approval === "approval: not asked yet", `a card with no answered time after a merge: not taken (got ${a.approval})`);
+};
+
 // ---- t-083 J2: worker places, the waiting list and the person's start order (places.js, store.js) ----
 const placesMod = await import(path.join(dst, "places.js")).catch(() => null);
 const SHARED = JSON.parse(fs.readFileSync(path.join(here, "..", "samples", "places-cases.json"), "utf8"));
