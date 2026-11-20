@@ -2797,7 +2797,8 @@ CC_SCRIPTS = {
     "copy": "#!/bin/sh\ncat > \"$1\"\nprintf copied\n",
     "slow": "#!/bin/sh\ncat > /dev/null\nsleep 5\nprintf late\n",
     "ok-marked": "#!/bin/sh\n: > \"$1\"\ncat > /dev/null\nprintf 'STATUS-LINE ok'\n",  # t-173: $1's mtime = its start
-    "slow-marked": "#!/bin/sh\n: > \"$1\"\ncat > /dev/null\nsleep 5\nprintf late\n",  # t-173: $1's mtime = its start
+    # t-173: $1's mtime = its start; round 2: $1 holds its pid, which is its process group (start_new_session)
+    "slow-marked": "#!/bin/sh\necho $$ > \"$1\"\ncat > /dev/null\nsleep 5\nprintf late\n",
     "fail": "#!/bin/sh\ncat > /dev/null\nprintf 'partial line'\necho oops >&2\nexit 1\n",
     "big": "#!/bin/sh\ncat > /dev/null\nhead -c 2097152 /dev/zero | tr '\\000' x\n",
     "noread": "#!/bin/sh\nprintf 'no-read'\n",
@@ -2862,6 +2863,27 @@ class CCBase(CostsBase):
     def cc_record(self, sid=CC_SID):
         data = raw(self.cc_path(sid))
         return json.loads(data.decode()) if data else None
+
+    def assert_inner_killed(self, mark):
+        """t-173 round 2 (REVIEW M1): the inner command's process group is gone after the statusline returns, a direct
+        check, not a timing margin (not killed, the statusline still returns at ~2.5 s). The marked stub wrote its pid
+        (= its group) into mark. Polled 1 s: its `sleep`, orphaned by the kill, is reaped by init. Kills what is left."""
+        with open(mark) as f:
+            group = int(f.read())
+        deadline = time.monotonic() + 1.0
+        while True:
+            try:
+                os.killpg(group, 0)
+            except ProcessLookupError:
+                return
+            if time.monotonic() > deadline:
+                break
+            time.sleep(0.02)
+        try:
+            os.killpg(group, 9)
+        except OSError:
+            pass
+        self.fail("inner command not killed: its process group %d still runs after the return" % group)
 
     def run_sl(self, data, then=("ok",), space="sp1", now=T0, extra=()):
         argv = (["--space", space] if space is not None else []) + list(extra)
@@ -3046,7 +3068,9 @@ class CC_StatusLine(CCBase):
         sid = "cc000000-0000-4000-8000-abcd000000aa"
         mark = os.path.join(self.dir, "inner-started")
         self.assertEqual(self.run_sl(cc_bytes(sid=sid), then=("slow-marked", mark)), b"")
-        self.assertLess(time.time() - os.stat(mark).st_mtime, 2.5)
+        ran = time.time() - os.stat(mark).st_mtime
+        self.assert_inner_killed(mark)
+        self.assertLess(ran, 2.5)
         self.assertIsNotNone(self.cc_record(sid))  # recorded while the inner command ran
 
 
@@ -3139,6 +3163,7 @@ class CC_Script(CCBase):
         out, took = self.script(["--space", "sp1", "--then", cc_stub("slow-marked"), mark], cc_bytes(sid=sid), entry=entry)
         ran = time.time() - os.stat(mark).st_mtime
         self.assertEqual(out, b"")
+        self.assert_inner_killed(mark)
         self.assertLess(ran, 2.5)
         self.assertGreaterEqual(took, 1.9)
         self.assertIsNotNone(self.cc_record(sid))
