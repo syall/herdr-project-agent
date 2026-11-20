@@ -2772,6 +2772,9 @@ cases["P189-list-wheel"] = async () => { // R1: a long By task list keeps the wh
   check(wheelStops(parent), `the costs-list-task box's parent stops the wheel (parent ${parent?.key ?? parent?.kind}, style ${JSON.stringify(Object.keys(parent?.style ?? {}))})`);
   check(Boolean(costsEl(v, "costs-list-task")?.style?.overflow_y_scrollbar), "the list box still scrolls");
   check(!wheelOn(costsEl(v, "pa-costs")), "pa-costs has no wheel handler (the page scrolls elsewhere)");
+  // t-192 R5.1 (t-189 RL1): the stop is the list's own wrapper, never its card (costs-sec-*): the card holds the head too.
+  check(!String(parent?.key ?? "").startsWith("costs-sec-") && parent?.key === "costs-keep-list-task", `the wheel stops at the list's wrapper, not its card (parent ${parent?.key})`);
+  check(!wheelOn(costsEl(v, "costs-sec-task")), "costs-sec-task (the card) has no wheel handler");
 };
 
 cases["P189-drill-wheel"] = async () => { // R1: a long open drill (By task, By session type) keeps the wheel
@@ -2790,6 +2793,13 @@ cases["P189-drill-wheel"] = async () => { // R1: a long open drill (By task, By 
   check(Boolean(costsEl(many, "costs-drill-kind")?.style?.overflow_y_scrollbar), "the kind drill box scrolls");
   check(wheelStops(kp), `the costs-drill-kind box's parent stops the wheel (parent ${kp?.key ?? kp?.kind})`);
   check(!wheelOn(costsEl(many, "pa-costs")), "pa-costs has no wheel handler");
+  // t-192 R5.1 (t-189 RL1): each stop is the drill's own wrapper: not its card (costs-sec-*), not the row it opens under.
+  for (const [p, section] of [[tp, "task"], [kp, "kind"]]) {
+    check(!String(p?.key ?? "").startsWith("costs-sec-") && p?.key === `costs-keep-drill-${section}`, `the ${section} drill's wheel stops at its wrapper, not its card or row (parent ${p?.key})`);
+  }
+  check(!wheelOn(costsEl(v, "costs-sec-task")), "costs-sec-task (the card) has no wheel handler");
+  const rowOf = costsParentOf(v, "costs-task-0");
+  check(Boolean(rowOf) && !wheelOn(rowOf), `the open row (the parent of costs-task-0) has no wheel handler (style ${JSON.stringify(Object.keys(rowOf?.style ?? {}))})`);
 };
 
 cases["P189-short-no-wheel"] = async () => { // R2: a short list or drill does not scroll and keeps no wheel: the page scrolls over it
