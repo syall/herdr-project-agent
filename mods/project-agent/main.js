@@ -826,7 +826,12 @@ export default class ProjectAgent extends View {
     const asOf = readIso ? `${readIso.slice(0, 10) !== new Date(now).toISOString().slice(0, 10) ? `${readIso.slice(5, 10)} ` : ""}${readIso.slice(11, 16)} UTC` : null;
     // t-116 (RL-J5-1): no read of the Costs view has answered yet (it runs, or it failed): said, never silent. A read
     // that answered with no summary draws no line; a later read that failed keeps the old figures and their "as of".
-    const line = read ? `${read} (as of ${asOf})` : !costs?.readAt ? NOT_READ_LINE : null;
+    // t-116 (RL-J5r3-1): a summary written by a clock ahead of this Mac's (a remote space's) keeps its own day, as pa-costs
+    // report prints it there, and says how far ahead, past a minute: its updated later than this Mac's clock when the
+    // Costs view read it (the read's time, not now: the figure does not shrink while the tab stays open).
+    const skew = at !== null ? at - costs.readAt : 0;
+    const ahead = skew > 60000 ? ` · its clock is ${Math.round(skew / 60000)} min ahead of this Mac` : "";
+    const line = read ? `${read} (as of ${asOf})${ahead}` : !costs?.readAt ? NOT_READ_LINE : null;
     const reset = resetLine(launcher, data.agent?.sessionId, clock);
     if (!line && !reset) return null;
     return v_flex().px(12).py(6).gap(4).flex_none().border_b(1).border_color(t.border).text_size(11.5).text_color(t.dim)
