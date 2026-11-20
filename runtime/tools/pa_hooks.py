@@ -4264,6 +4264,44 @@ def merged_and_pushed(path, profile, rev="HEAD"):
     return False
 
 
+def status_branches_why(text, repos, name, profile):
+    """t-192 round 3 (R6.2a): why the branches a profile worktree's removal deletes are not all merged into main and
+    pushed, or None. text: its status script's "branch", one '<Pkg>:<branch>' item per repository joined by ', ' (Pkg
+    the repository folder's name, 'HEAD' when it is detached), as the profile's status scripts print it; repos: the
+    repositories in it. Fails closed: a text it cannot read item for item (not a string, an item naming no repository
+    or one named twice, a repository it names no branch for), a named branch that is not there, or two repositories
+    of one name keep the worktree. In each repository the branch named after the worktree (name), the one the
+    profile's remove script deletes with it even when no HEAD is on it, is checked too when it is there."""
+    if not isinstance(text, str) or not text:
+        return "its status script names no branch for its repositories"
+    names = {}
+    for repo in repos:
+        n = os.path.basename(repo.rstrip(os.sep))
+        if n in names:
+            return "two of its repositories are named {}".format(clean(n))
+        names[n] = repo
+    named = {}
+    for item in text.split(", "):
+        hits = [n for n in names if item.startswith(n + ":")]
+        if len(hits) != 1 or hits[0] in named:
+            return "cannot read the branches its status script names ({})".format(cut(clean(text), 200))
+        named[hits[0]] = item[len(hits[0]) + 1:]
+    for n in sorted(set(names) - set(named)):
+        return "its status script names no branch for {}".format(clean(n))
+    for n in sorted(names):
+        repo, b = names[n], named[n]
+        if not b:
+            return "its status script names no branch for {}".format(clean(n))
+        for branch, said in ([] if b == "HEAD" else [(b, True)]) + ([(name, False)] if name and name != b else []):
+            code, sha, _err = git(repo, "rev-parse", "--verify", "-q", "refs/heads/" + branch)
+            if code or not sha:
+                if said:
+                    return "branch {} its status script names is not in {}".format(clean(branch), clean(n))
+                continue
+            if not merged_and_pushed(repo, profile, "refs/heads/" + branch):
+                return "branch {} is not merged into main and pushed in {}".format(clean(branch), clean(n))
+    return None
+
 def standing_clean(directory, row, owner, profile, entries, listing=None, holds=None):
     """Why a candidate worktree is not clean enough to delete on the rule (R15), or None. Fails closed. holds: the run's
     worktree_holds (None: read now, as standing_recheck does)."""
@@ -4289,6 +4327,8 @@ def standing_clean(directory, row, owner, profile, entries, listing=None, holds=
             return "{} uncommitted or untracked file(s) in {}".format(len(files), clean(name))
         if not merged_and_pushed(repo, profile):
             return "not every commit is merged into main and pushed in {}".format(clean(name))
+    if facts.get("remove") and facts.get("removesBranches"):  # t-192 round 3: the branches its removal deletes
+        return status_branches_why(facts.get("branch"), repos, os.path.basename(row["path"].rstrip(os.sep)), profile)
     return None
 
 
@@ -4724,7 +4764,6 @@ def holder_why(directory, profile, h, p, status):
         return "{} is not one of its packages".format(clean(p))
     for extra in sorted(listed - set(repos)):
         return "its status script lists {}, which is not one of its packages".format(clean(extra))
-    branch = status.get("branch") if isinstance(status.get("branch"), str) else None
     for repo in repos:
         name = os.path.relpath(repo, h)
         if repo not in listed:
@@ -4739,10 +4778,8 @@ def holder_why(directory, profile, h, p, status):
             return "{} uncommitted or untracked file(s) in {}".format(len(files), clean(name))
         if not merged_and_pushed(repo, profile):
             return "not every commit is merged into main and pushed in {}".format(clean(name))
-        if branch and git(repo, "rev-parse", "--verify", "-q", "refs/heads/" + branch)[0] == 0 and \
-                not merged_and_pushed(repo, profile, "refs/heads/" + branch):
-            return "branch {} is not merged into main and pushed in {}".format(clean(branch), clean(name))
-    return None
+    # the branches the remove script deletes with it: each the status script names, and the one named after H
+    return status_branches_why(status.get("branch"), repos, os.path.basename(h), profile)
 
 
 def holder_note(row, profile):
@@ -4838,7 +4875,11 @@ def old_branches(directory, agent, profile, rows):
     if project:
         project = os.path.realpath(os.path.expanduser(project))
         src = os.path.join(project, "src")
-        for place in [project] + ([os.path.join(src, n) for n in sorted(os.listdir(src))] if os.path.isdir(src) else []):
+        try:
+            inner = [os.path.join(src, n) for n in sorted(os.listdir(src))] if os.path.isdir(src) else []
+        except OSError:  # unreadable: its repositories are not searched (nothing is deleted from them)
+            inner = []
+        for place in [project] + inner:
             code, top, _ = git(place, "rev-parse", "--path-format=absolute", "--show-toplevel")
             if not code and os.path.realpath(top) == os.path.realpath(place):
                 repos.add(os.path.realpath(place))
@@ -4915,7 +4956,7 @@ def branch_after(directory, facts, profile):
             entries = rec.get("entries") if isinstance(rec, dict) and isinstance(rec.get("entries"), list) else []
             if any(isinstance(e, dict) and e.get("branch") == b for e in entries):
                 return "Branch {} is kept: a queue entry names it".format(shown)
-        code, _out, err = git(repo, "update-ref", "-d", "refs/heads/" + b, sha)
+        code, _out, err = git(repo, "update-ref", "--no-deref", "-d", "refs/heads/" + b, sha)
         if code:
             return "Branch {} is kept: it moved (git update-ref refused: {})".format(shown, clean(err)[-200:])
         git(repo, "config", "--remove-section", "branch." + b)

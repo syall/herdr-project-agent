@@ -561,6 +561,7 @@ class Session:
         self.deadline = deadline
         self.hooks = tempfile.mkdtemp(prefix="pa-push-hooks-")
         self.cache = pa_hooks.ContentCache()
+        self.check_files = None  # (verify, review, gate) of the gate C8 read (t-192 round 3: a job's own files)
 
     def left(self):
         return float("inf") if self.deadline is None else self.deadline - time.monotonic()
@@ -800,7 +801,8 @@ def gather(s, directory, space, push, facts, plan=False, ontos=None):
     # its GATE-<job>.json); read from the gate files alone, so the main job's path runs exactly as before
     job = push_job(directory, task, common)
     tree = pa_hooks.gate_job(task, job) if job else task.get("worktree")
-    gname, again = pa_hooks.check_files(job)[2], task_id + (" --job " + job if job else "")
+    s.check_files = pa_hooks.check_files(job)
+    gname, again = s.check_files[2], task_id + (" --job " + job if job else "")
     why = task_settings_refusal(s, tree)
     if why:
         raise Refused("C8a", why)
@@ -1257,7 +1259,7 @@ def plan_card(directory, space, task_id, path):
                 "options": [{"label": "Push", "detail": "Fast-forward local {} to {} if needed, then push {}..{}. No force.".format(
                                 push["branch"], short(push["commit"]), short(push["remoteBefore"]), short(push["commit"]))},
                             {"label": "Not now", "detail": "Nothing is pushed. The card closes."}],
-                "evidence": ["GATE.json", "REVIEW.md"], "recommendation": "Push", "status": "open", "answer": None, "note": None,
+                "evidence": [(s.check_files or pa_hooks.check_files(None))[i] for i in (2, 1)], "recommendation": "Push", "status": "open", "answer": None, "note": None,
                 "created": pa.now(), "answered": None, "push": push}
         pa.put_card(directory, card_id, card)
         by = "agent" if pa_hooks.by_an_agent() else "person"

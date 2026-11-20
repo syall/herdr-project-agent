@@ -1674,6 +1674,7 @@ def cmd_card(args):
         entries = []
         context = ["Main {} of {} is at {}. In merge order, each stacked on the one ahead; an entry merges only after every "
                    "entry ahead of it merged:".format(rec["main"], ctx.repo, short(main_tip))]
+        reviews = []  # t-192 round 3 (RL1): the card's evidence, each entry's own review file
         for i, (e, n) in enumerate(chosen, 1):
             c = e["checked"]
             entries.append({"task": e["task"], "job": e.get("job"), "branch": e["branch"], "tip": n["tip"], "onto": e["onto"],
@@ -1681,6 +1682,8 @@ def cmd_card(args):
                             "verify": c.get("verify"), "review": c.get("review"), "state": n["state"], "added": e.get("added"),
                             "instance": instance_of(e)})
             cfiles = entry_files(ctx, e["task"], e.get("job")) or pa_hooks.check_files(None)
+            if cfiles[1] not in reviews:
+                reviews.append(cfiles[1])
             context.append("{}. {} {} on {}: tip {}, content {} (as checked at {}: {} {}, {} {}), state {}{}; "
                            "evidence/{}/".format(i, label(e), e["branch"], e["onto"], short(n["tip"]), n["content"], short(c["commit"]),
                                                  cfiles[0], short(c.get("verify")), cfiles[1], short(c.get("review")), n["state"],
@@ -1714,7 +1717,7 @@ def cmd_card(args):
                                                                               main, os.path.basename(ctx.repo))
         card = {"id": cid, "task": chosen[0][0]["task"], "kind": "queue", "question": question,
                 "context": text, "options": options,
-                "evidence": ["REVIEW.md"], "recommendation": options[0]["label"], "status": "open", "answer": None, "note": None,
+                "evidence": reviews, "recommendation": options[0]["label"], "status": "open", "answer": None, "note": None,
                 "created": now(), "answered": None,
                 "queue": {"version": 1, "repo": ctx.repo, "common": rec["common"], "mainBefore": main_tip, "entries": entries}}
         if pushing:
