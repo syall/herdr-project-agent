@@ -2126,8 +2126,7 @@ def followup_report(directory, since, until=None):
             continue
         if text.startswith("context not reset"):
             refusals += 1
-            for part in text.partition("): ")[2].split("; "):
-                key = refusal_key(part)
+            for key in {refusal_key(part) for part in reason_parts(text.partition("): ")[2])}:  # t-190 T5: once a line
                 by_refusal[key] = by_refusal.get(key, 0) + 1
         elif text.startswith("checkpoint names session ") and text.endswith(": accepted by its time"):
             accepted += 1
@@ -2161,9 +2160,21 @@ PASS_LONG_LINES = 20  # a pass id on more journal lines than this, or
 PASS_LONG_SECONDS = 1800  # ... spanning longer than this, is listed as long by the follow-up (t-041 J7-R5)
 
 
+def reason_parts(text):
+    """A 'context not reset' line's reasons: split at '; ' outside parentheses (a reason's own words may hold one)."""
+    parts, depth, start = [], 0, 0
+    for i, c in enumerate(text):
+        depth += (c == "(") - (c == ")" and depth > 0)
+        if depth == 0 and text.startswith("; ", i):
+            parts.append(text[start:i])
+            start = i + 2
+    return parts + [text[start:]]
+
+
 def refusal_key(text):
     """A clean-point reason without its ids and numbers, so the follow-up counts like reasons together (J7-R7)."""
-    text = re.sub(r"\s*\([^)]*\)", "", text)
+    while re.search(r"\([^()]*\)", text):  # innermost first: nested parentheses go whole
+        text = re.sub(r"\s*\([^()]*\)", "", text)
     text = re.sub(r"\s+[^\s]*\d[^\s]*", "", " " + text).strip()
     return text[:120]
 
