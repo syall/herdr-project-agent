@@ -1754,7 +1754,9 @@ class T192Scratch(unittest.TestCase):
         return sorted(n for n in os.listdir(self.scratch) if n.startswith("t001."))
 
     def test_vp6_scratch_is_under_the_root_and_gone_after_a_run(self):
-        code, out = self.run_all("--only-integration")
+        # PA_SERIAL=1: part 1's sweep runs before the others start, so a part ending at that moment (its owner gone, its
+        # trap removing its folder) cannot be counted (they run at once in a full run: harmless, and a counted one).
+        code, out = self.run_all("--only-integration", PA_SERIAL="1")
         self.assertEqual(code, 0, out)
         with open(os.path.join(self.tmp, "integrationargs")) as f:
             made = [a.split(" ", 1)[0] for a in f.read().splitlines()]
@@ -1809,6 +1811,9 @@ class T192Scratch(unittest.TestCase):
     def test_vp6_term_to_one_part_leaves_no_scratch(self):  # as pa_suite's part limit sends it (TERM to the part's group)
         proc = self.run_bg(integration2="child")
         shell, _child = self.wait_pids("integration2")
+        end = time.time() + 20
+        while len(self.left()) > 1 and time.time() < end:  # parts 1 and 3 end on their own
+            time.sleep(0.05)
         self.assertEqual(len(self.left()), 1, "only part 2 is still running")
         os.killpg(os.getpgid(shell), signal.SIGTERM)
         self.assertEqual(proc.wait(timeout=30), 1)
@@ -1863,7 +1868,7 @@ class T192Scratch(unittest.TestCase):
             removed["t001.unread"] = unreadable
         else:
             kept["t001.unread"] = unreadable
-        code, out = self.run_all("--only-integration")
+        code, out = self.run_all("--only-integration", PA_SERIAL="1")  # the sweep's count without the others' end
         self.assertEqual(code, 0, out)
         for name in removed:
             self.assertFalse(os.path.lexists(removed[name]), name)
