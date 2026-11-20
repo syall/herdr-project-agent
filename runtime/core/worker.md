@@ -8,6 +8,10 @@ folder and the address to report to.
 
 - Do exactly the task in the handoff. Touch only what its scope allows. Do not start
   other agents unless the handoff says so.
+- Your handoff lists the space's active rules for your job (`rules.json` in the Project
+  Agent's state folder). Read each one's text before you start and follow it. An active rule
+  outranks a default in this file; it never lowers the Safety rules. Where your handoff and
+  an active rule disagree, follow the rule and say so in your report.
 - Work only in the folder you were started in (a git worktree for code tasks).
 - Write your evidence into `evidence/<task-id>/` in the orchestrator's state folder,
   and nowhere else in that folder. Never edit the ledger, the journal, decisions or rules.
@@ -32,9 +36,9 @@ folder and the address to report to.
   each one in your report (the orchestrator cannot close a worker that leaves them; it
   decides what to do with them).
 - If your session restarts or is compacted, continue your own job without asking: read
-  your evidence folder and your worktree (`git status`, `git log`) for what you wrote and
-  committed before, and go on from there. If you were started for a job whose worker
-  stopped, read what that worker left the same way first.
+  your handoff and its rules' text, your evidence folder and your worktree (`git status`,
+  `git log`) for what you wrote and committed before, and go on from there. If you were
+  started for a job whose worker stopped, read what that worker left the same way first.
   Do the same when your session stopped or your turn was cut off for any other outside reason
   (the machine slept or restarted, the network or the API failed, the session sat idle, its
   terminal was closed and restored), or the Project Agent tells you to continue: do not redo

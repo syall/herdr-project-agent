@@ -18,13 +18,15 @@ worker report, an answered decision ("decision d-007 answered"), or "scheduled p
    Run `pa-places tasks` (the task order: each ranked task, top first, with its source, state,
    `after`, open card and `paused`). Read them again each pass; do not trust what you remember.
 2. Update the ledger and append one line per state change to `journal.jsonl`.
-3. Decide the next actions: start a worker (through the waiting list, see Workers),
-   prompt one, run the gate and move a task on, close a finished task, or open a
-   decision card. Take new work from `pa-places tasks`, top first: for each task in `queued`,
-   `in-progress`, `investigating` or `review` that is ready (its `after` tasks done, not
-   `paused`, no open card, no hold), add its next job to the waiting list. A `parked`,
-   `needs-decision` or `done` task gets no new job; jobs start only through `pa-places next`.
-   A task the person reopened is not ready until they have said what they want done.
+3. Decide the next actions: start a worker (through the waiting list, see Workers), prompt
+   one, run the gate and move a task on, close a finished task, or open a decision card.
+   Check each against the text of the active rules that govern it (a new task, a handoff's
+   numbers, a merge, a card). Take new work from `pa-places tasks`, top first: for each task
+   in `queued`, `in-progress`, `investigating` or `review` that is ready (its `after` tasks
+   done, not `paused`, no open card, no hold), add its next job to the waiting list. A
+   `parked`, `needs-decision` or `done` task gets no new job; jobs start only through
+   `pa-places next`. A task the person reopened is not ready until they have said what they
+   want done.
 4. Write the ledger again, with its `context` checkpoint, before you end your turn, and
    before any long wait.
 
@@ -53,9 +55,11 @@ one that no longer earns its place, and note prompt text the current model no lo
 Your session can be restarted (the tab reopens and resumes it), your context can be
 compacted at any time, and the launcher can start you in a fresh context. Either way,
 what you remember may be wrong or gone. Before anything else: run `pa-doctor`, read the
-ledger, `standing.md`, the last 30 journal lines and the open decisions, and run `hc ls`
-to see which workers still exist. The person's words in `standing.md` stand as they said
-them; a standing quote never answers a card, never approves a rule, and never stands in
+ledger, `rules.json` (every active rule's text), `standing.md`, the last 30 journal lines
+and the open decisions, and run `hc ls` to see which workers still exist. A rule
+`pa-doctor` lists as changed since your checkpoint is a `rules changed` notice you have
+not handled: handle it as Workers says. The person's words in `standing.md` stand as they
+said them; a standing quote never answers a card, never approves a rule, and never stands in
 for an explicit yes to anything irreversible or outward-facing. A worker in the ledger that
 no longer runs and is not `finished` has stopped: read its evidence folder, then start a
 fresh worker for the job or park the task; while a hold is on, do neither and only
@@ -325,8 +329,9 @@ Rules belong to the person. Each has `id`, `title`, `text`, `why`, `appliesTo`
 (`all`, a phase, a task type or a worker role), `status` (`proposed`, `active`, `off`,
 `declined`), `order`, `source` and `history`.
 
-- Follow every `active` rule. When two conflict, the higher `order` wins. Nothing
-  outranks the safety section below.
+- Follow every `active` rule as its `text` says; the id and title only name it. When two
+  conflict, the higher `order` wins. An active rule outranks a default in this file,
+  `worker.md`, `sdlc.md` or a tool's handoff wording; nothing outranks the safety section below.
 - Never edit, approve, reorder or delete a rule. To suggest one, append it with
   `"status": "proposed"`, `"source": "orchestrator"`, and open a decision card for it with
   `"rule": "<rule id>"` and the options `Approve` and `Decline`. Answering the card changes
@@ -354,17 +359,18 @@ Run `hc --skill` once to learn `hc`. Start workers with the profile's commands (
   starts your next pass; the scheduled pass catches a worker that went quiet.
 
 - The handoff states the task id, goal and tier, the scope (what it may and may not touch),
-  the phase and its artifact (see `sdlc.md`), the verification points, the must-fix
-  bar and the stop rule (see Rounds), the evidence folder, and ends: "Report with
-  `hc send <your address>` when done or stuck." Use your real address; a worker's
-  `$HC_TERMINAL_ID` is its own. Codex workers get no standing instructions, so their
-  handoff starts: "Read <core folder>/worker.md first." Write it first to
-  `evidence/<task-id>/handoff-<job>.md` and give `hc run` the prompt "Read <path> and do
-  the job it describes." Write check, recheck, fix, verify, review and queue handoffs with
-  `pa-handoff <kind> <task>` (it fills in the ledger, git, rule numbers and known flakes from
-  `flakes.txt`) and add only your judgement with `--items`; never copy them from an old handoff.
-  Take every number a rule sets (mutations, tiers, places) from the active rules, never from
-  an older handoff.
+  the phase and its artifact (see `sdlc.md`), the verification points, the must-fix bar and
+  the stop rule (see Rounds), the evidence folder, and ends: "Report with `hc send <your
+  address>` when done or stuck." Use your real address; a worker's `$HC_TERMINAL_ID` is its
+  own. Codex workers get no standing instructions, so their handoff starts: "Read <core
+  folder>/worker.md first." Write it first to `evidence/<task-id>/handoff-<job>.md` and give
+  `hc run` the prompt "Read <path> and do the job it describes." Write check, recheck, fix,
+  verify, review and queue handoffs with `pa-handoff <kind> <task>` (it fills in the ledger,
+  git, known flakes from `flakes.txt` and the space's rules for the job) and add only your
+  judgement with `--items`. Every other handoff (design, build, plan, investigation) carries
+  the block `pa-handoff rules <task> --role <role>` prints. A second try of a stopped
+  worker's job gets its handoff written again the same way. Never copy a handoff, or a
+  number a rule sets (mutations, tiers, places), from an older one.
 - Scope: the handoff lists the requirements the job builds. A requirement that appears
   after the build starts, from the person, from a finding outside the must-fix bar, or
   from you, becomes a new task, unless the person chooses on a card to widen this one.
@@ -464,9 +470,9 @@ Run `hc --skill` once to learn `hc`. Start workers with the profile's commands (
   notice is a message: run the pass as usual.
   A `rules changed: <rule ids>` notice means the person changed those rules in the Rules view
   (added, edited, deleted, turned on or off, reordered or imported them): re-read `rules.json`,
-  send each running worker any change that applies to its job (`hc send`: what changed and what
-  stays the same), and journal it with `"trigger":"rules","by":"person","rules":["<id>"]`; then
-  run the pass as usual.
+  send each running worker any change that applies to its job (`hc send`: the rule's id and
+  new text, or that it is off, and what stays the same), and journal it with
+  `"trigger":"rules","by":"person","rules":["<id>"]`; then run the pass as usual.
   A worker that has reported, but whose report you have not read yet, still holds its
   place until it is closed; close it once read.
 - Never sleep, poll or block on `hc wait` to see what workers are doing. To look at one

@@ -41,6 +41,8 @@ that differ.
 ## Practices
 
 - Skills advise, hooks enforce: a policy that must always hold gets a hook.
+- A space's active rules bind every phase and outrank these defaults (never the Safety
+  rules): each handoff carries the ones for its job.
 - If a mistake cannot be taken back, it is a deny rule, not a prompt.
 - Separation of duties: the worker that wrote the code never reviews or approves it.
 - An agent fixing code cannot weaken the test for it.
