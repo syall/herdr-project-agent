@@ -1322,7 +1322,7 @@ cases["S41-8-context-line-day"] = async () => { // MF-J5-1: the day of the read,
 cases["S41-9-context-at"] = async () => { // MF-J5r2-1: the summary's own time (updated), else the read's
   const READ = T0 + 60000, UP = `${TODAY}T07:59:00Z`;
   check(store.contextAt({ updated: UP }, READ) === Date.parse(UP), `updated (got ${store.contextAt({ updated: UP }, READ)})`);
-  for (const [summary, what] of [[{}, "no updated"], [{ updated: "not a time" }, "unreadable"], [{ updated: 1800000000 }, "a number"], [{ updated: null }, "null"], [null, "no summary"], [undefined, "undefined"]]) {
+  for (const [summary, what] of [[{}, "no updated"], [{ updated: "not a time" }, "unreadable"], [{ updated: 1800000000 }, "a number"], [{ updated: 2026 }, "a year-like number (Date.parse reads 2026-01-01)"], [{ updated: 0 }, "zero (Date.parse reads 2000-01-01)"], [{ updated: null }, "null"], [null, "no summary"], [undefined, "undefined"]]) {
     check(store.contextAt(summary, READ) === READ, `${what}: the read's time (got ${store.contextAt(summary, READ)})`);
   }
 };
