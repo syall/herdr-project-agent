@@ -2282,3 +2282,23 @@ class T190Doctor(Doctor):
         self.ledger({"version": 1, "tasks": [1, {"id": "t-1", "state": "queued"}]})
         code, out = self.doctor()
         self.assertIn("PROBLEM ledger.json: task 1 is not an object", out)
+
+
+# ---- t-190 T3: a `claude --version` with a build number (a wrapper's own Claude Code build) is read ---------------
+
+class T190Version(J3Base):
+    def test_t3_four_part_versions(self):
+        self.assertEqual(pa.parse_cc_version("claude 2.1.328.1782 (Wrapped Claude Code, channel stable)\n"), (2, 1, 328))
+        self.assertEqual(pa.parse_cc_version("2.1.300.5 (Claude Code)\n"), V300)
+        self.assertEqual(pa.parse_cc_version("2.1.300.5\n"), V300)
+        self.assertEqual(pa.parse_cc_version("v2.1.300\n"), V300)
+        self.assertEqual(pa.parse_cc_version("\x1b[1m2.1.300\x1b[0m (Claude Code)\r\n"), V300)
+        for text in ("my-wrapper 4.2.0.1\n", "error: 2.1.300.1 not found\n", "1.2\n", "2.1\n"):
+            self.assertIsNone(pa.parse_cc_version(text), text)
+
+    def test_t3_probe_and_launch_with_such_a_command(self):
+        p = dict(self.profile(), claude=["sh", "-c", "echo 'claude 2.1.328.1782 (Wrapped Claude Code, channel stable)'", "x"])
+        self.assertEqual(pa.probe_version(p), (2, 1, 328))
+        self.assertEqual(self.net(self.launch(pa.probe_version(p))), 400000)
+        notes = pa.context_launch(self.dir, pa.probe_version(p))["notes"]
+        self.assertFalse([n for n in notes if "not known" in n], notes)
