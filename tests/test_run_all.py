@@ -172,7 +172,7 @@ class RunAll(unittest.TestCase):
         self.repo = os.path.join(self.tmp, "repo")
         os.makedirs(os.path.join(self.repo, "tests"))
         shutil.copy(os.path.join(HERE, "run-all.sh"), os.path.join(self.repo, "tests", "run-all.sh"))
-        for name in ("pa", "pa_hooks", "pa_guard", "pa_costs", "pa_push", "pa_queue", "pa_places"):
+        for name in ("pa", "pa_hooks", "pa_guard", "pa_costs", "pa_push", "pa_queue", "pa_places", "pa_statusline"):
             write(os.path.join(self.repo, "runtime", "tools", name + ".py"), "x = 1\n")
         shutil.copy(os.path.join(HERE, "..", "runtime", "tools", "pa_suite.py"), os.path.join(self.repo, "runtime", "tools"))
         self.home = os.path.join(self.tmp, "pa")  # HERDR_PA_HOME: the slots are under it, never the real one

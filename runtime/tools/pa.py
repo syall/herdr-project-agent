@@ -3109,6 +3109,9 @@ def costs_module():
         try:
             spec = importlib.util.spec_from_file_location("pa_costs", COSTS_FILE)
             module = importlib.util.module_from_spec(spec)
+            # t-135: no tools/__pycache__/pa_costs.*.pyc (the loader writes it before running the code). Not restored:
+            # pa_costs sets the same flag itself when it runs, so the state after is what it was before t-135.
+            sys.dont_write_bytecode = True
             spec.loader.exec_module(module)
         finally:
             if me is not None:
@@ -4145,6 +4148,28 @@ def cache_notes(directory, agent):
         ttl or "Claude Code's default", shown)]
 
 
+def statusline_cache_note():
+    """pa-doctor's line on the status line's compiled-code cache (t-111, t-135): used, none yet, or not used and why
+    (pa_statusline.refused: the launcher itself cannot say so, its output is the status line). A note only."""
+    folder = os.path.join(ROOT, "cache", "pycache")
+    try:
+        import types
+        with open(STATUSLINE_FILE) as f:
+            code = compile(f.read(), STATUSLINE_FILE, "exec", dont_inherit=True)  # compiled here: no .pyc in tools/
+        sl = types.ModuleType("pa_statusline")
+        sl.__file__ = STATUSLINE_FILE
+        exec(code, sl.__dict__)
+        bad = sl.refused(folder, missing_ok=True)
+    except Exception as e:  # noqa: BLE001 - a note only
+        return "status line cache: not checked ({})".format(e)
+    if bad:
+        fix = " (fix: chmod 700 {})".format(bad[0]) if bad[1] == "is writable by group or others" else ""
+        return "status line cache: NOT used: {} {}; the status line compiles its code on every run{}".format(bad[0], bad[1], fix)
+    if not os.path.isdir(folder):
+        return "status line cache: none yet"
+    return "status line cache: used, {} file(s) in {}".format(len([n for n in os.listdir(folder) if n.endswith(".pyc")]), folder)
+
+
 def cmd_doctor(args):
     """Checks one space's state files. For the orchestrator after a restart or a compaction, and for people."""
     directory, agent = space_for_command(args.space)
@@ -4233,6 +4258,7 @@ def cmd_doctor(args):
     if why:  # a note only: the launches go on without the recording status line
         notes.append("profile statusLine is malformed ({}): Claude Code's own cost figure is not recorded".format(why))
     notes.extend(cache_notes(directory, agent))
+    notes.append(statusline_cache_note())
     notes.extend(context_notes(directory, ledger))
     term = hc_get(agent.get("terminal"))
     running = term.get("state") == "live" and (term.get("labels") or {}).get("herdr.pa") == agent.get("space")

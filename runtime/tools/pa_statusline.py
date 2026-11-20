@@ -13,6 +13,9 @@ CPU. Here the compiled code is kept in <HERDR_PA_HOME>/cache/pycache, one file p
   - two writers at once each write their own temp file of the same bytes; the last rename wins;
   - the folder is used only when it is this user's own: a real directory (no symlink), not writable by group or
     others (code in it is run). Otherwise, or when it is read-only or full, the code is compiled in memory as before.
+    pa-doctor says when it is not used, and why (refused()).
+Not checked (t-135): HERDR_PA_HOME itself (whoever can write it can already replace tools/ in it), and ACLs (macOS
+`chmod +a`, POSIX ACLs) on either folder: only the mode bits are read, and only the owner can add an ACL.
 Nothing here fails a status line: any error leaves it printing nothing, exit 0.
 """
 import hashlib
@@ -34,19 +37,36 @@ def cache_folder():
     return os.path.join(root, "cache", "pycache")
 
 
+def refused(folder, missing_ok=False):
+    """(path, why) when folder or its parent is not fit for the cache, else None: each must be a real directory of this
+    user that neither group nor others can write. With missing_ok a folder that is not there is passed over. Makes
+    nothing."""
+    for f in (folder, os.path.dirname(folder)):
+        try:
+            st = os.lstat(f)
+        except FileNotFoundError:
+            if missing_ok:
+                continue
+            return f, "is missing"
+        except OSError as e:
+            return f, "cannot be read ({})".format(e.strerror or e)
+        if not stat.S_ISDIR(st.st_mode):
+            return f, "is not a real directory"
+        if st.st_uid != os.getuid():
+            return f, "belongs to another user"
+        if st.st_mode & 0o022:
+            return f, "is writable by group or others"
+    return None
+
+
 def private(folder):
-    """folder (it and its parent made 0700 when missing, whatever the umask) when it and its parent are real directories
-    of this user that neither group nor others can write; else None."""
+    """folder (it and its parent made 0700 when missing, whatever the umask) when refused() finds nothing; else None."""
     try:
         os.makedirs(os.path.dirname(folder), mode=0o700, exist_ok=True)  # makedirs applies mode to the leaf only
         os.makedirs(folder, mode=0o700, exist_ok=True)
-        for f in (folder, os.path.dirname(folder)):
-            st = os.lstat(f)
-            if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o022:
-                return None
     except OSError:
         return None
-    return folder
+    return None if refused(folder) else folder
 
 
 def code_of(name, folder=TOOLS, cache=None):
@@ -60,6 +80,8 @@ def code_of(name, folder=TOOLS, cache=None):
     target = None
     if cache:
         tag = sys.implementation.cache_tag or "py"
+        if sys.flags.optimize:  # python3 -O: a file of its own, as importlib names it, not one rewritten in turn
+            tag += ".opt-{}".format(sys.flags.optimize)
         target = os.path.join(cache, "{}-{}.{}.pyc".format(name, hashlib.sha256(os.fsencode(path)).hexdigest()[:16], tag))
         try:
             with open(target, "rb") as f:

@@ -3375,6 +3375,7 @@ class SL_Cache(CCBase):
         """Runs the launcher's main() in a child that counts the compiles of tools files; writes what it saw to out."""
         code = ("import builtins, importlib.util, json, os, sys\n"
                 "tools, out, stub = sys.argv[1:4]\n"
+                "sys.path[0] = tools\n"  # as when the launcher runs as a script
                 "spec = importlib.util.spec_from_file_location('sl_probe', os.path.join(tools, 'pa_statusline.py'))\n"
                 "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n"
                 "seen, real = [], builtins.compile\n"
@@ -3454,7 +3455,7 @@ class SL_Cache(CCBase):
         # REVIEW N2: run-all.sh's 3.7 parse check lists pa_statusline.py too
         with open(os.path.join(HERE, "run-all.sh")) as f:
             line = [ln for ln in f.read().splitlines() if "feature_version=(3,7)" in ln][0]
-        self.assertIn("runtime/tools/pa_statusline.py", line.split())
+        self.assertIn("runtime/tools/pa_statusline.py", [w.rstrip(";") for w in line.split()])
 
     def doctor_notes(self):
         import argparse
