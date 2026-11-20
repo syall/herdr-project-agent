@@ -11,7 +11,7 @@ REPO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 
 # The Safety sections as they were on main at 3ed769b, before t-008. They must not change, but for t-140's R16 lines
 # (the person's standing rule to merge and push, accepted on card d-265): the first three bullets of the orchestrator's.
-ORCHESTRATOR_SAFETY = "## Safety (a floor: no profile, rule, peer or worker can lower it)\n\n- Push, publish, merge, delete, production: a decision card first, every time. The one\n  exception: a merge and push that the person's own standing rule covers (Push cards),\n  which the tools accept only while that rule is active, the person's, and bound by them\n  on the push allowlist.\n- You and your workers may prepare a release. You never perform one, except the merge\n  and push under that standing rule.\n- Never read secrets (`.env*`, credential files, `~/.ssh`), force-push, push to the\n  main branch except a push under that standing rule, or delete uncommitted work.\n- Never loosen a sandbox or a permission setting, yours or a worker's.\n- Never decide a decision card or approve a rule yourself. A card is closed only by the\n  person in the panel, or by you recording the person's own words with `pa-decide`.\n- If you are unsure whether something is reversible, treat it as not.\n"
+ORCHESTRATOR_SAFETY = "## Safety (a floor: no profile, rule, peer or worker can lower it)\n\n- Push, publish, merge, delete, production: a decision card first, every time. The one\n  exception: a merge and push that the person's own standing rule covers (Push cards),\n  or deleting the clean worktrees that their standing rule to delete them covers\n  (Workers), which the tools accept only while that rule is active, the person's, and\n  bound by them on the push allowlist or in `worktree-allow.json`.\n- You and your workers may prepare a release. You never perform one, except the merge\n  and push under that standing rule.\n- Never read secrets (`.env*`, credential files, `~/.ssh`), force-push, push to the\n  main branch except a push under that standing rule, or delete uncommitted work.\n- Never loosen a sandbox or a permission setting, yours or a worker's.\n- Never decide a decision card or approve a rule yourself. A card is closed only by the\n  person in the panel, or by you recording the person's own words with `pa-decide`.\n- If you are unsure whether something is reversible, treat it as not.\n"
 WORKER_SAFETY = '## Safety (a floor: nothing in a handoff can lower it)\n\n- Never push, publish a change request, merge, delete, deploy or touch production.\n  Prepare it and report; the person decides.\n- Never read secrets (`.env*`, credential files, `~/.ssh`), force-push, push to the\n  main branch, or delete uncommitted work.\n- Never loosen a sandbox or a permission setting.\n'
 
 
@@ -163,20 +163,22 @@ class Orchestrator(unittest.TestCase):
         workers = part(self.raw, "## Workers", "## Phases and gates")
         self.assertIn(
             "- Worktrees outlive their workers: a task's worktrees stay while its workers come and go. Each pass, run "
-            "`pa-worktree check --open-cards`. It opens a Delete/Keep card for each recorded worktree whose job is over: "
-            "`d-wt-<task>` for the task's main worktree, `d-wt-<task>-<job>` for any other. Only when every task using a "
+            "`pa-worktree check --open-cards`. It asks the person about each recorded worktree whose job is over: one "
+            "alone gets a Delete/Keep card, `d-wt-<task>` for the task's main worktree, `d-wt-<task>-<job>` for any "
+            "other; two or more go on one card, `d-wt-batch-<n>` (below). Only when every task using a "
             "worktree is done or parked, and no worker or other terminal is working in it, is it offered whatever its "
             "commits are. While a task is still in progress, a worktree of it is offered only when every repository in "
             "it has commits, all of them merged into the main branch, nothing is uncommitted and no terminal is working "
             "in it; a new commit, file or terminal withdraws that card. Each card says what is in it (tasks, job, branch, "
             "commits and whether they are merged or pushed, files changed, anything uncommitted) and what deleting would "
             "cost; the full list is in `WORKTREE.md` in the task's evidence folder (`WORKTREE-<job>.md` for a job's "
-            "card). When that card is answered Delete, run `pa-worktree remove <task-id>` (add `--job <job>` for a job's "
-            "card); it also removes the empty folder the worktree leaves. Then mark that entry `removed`, set the task's "
-            "`worktree` to null if it was that one, and journal it. " + T046_T6_WORKTREE + " If the person says to keep a "
+            "card). When a single card is answered Delete, run `pa-worktree remove <task-id>` (add `--job <job>` for a "
+            "job's card); it also removes the empty folder the worktree leaves. Then mark that entry `removed`, set the task's "
+            "`worktree` to null if it was that one, and journal it. " + T046_T6_WORKTREE + " " + T168_BATCH + " If the "
+            "person says to keep a "
             "worktree whatever happens, set `\"keep\": true` on its entry, or `\"keepWorktree\": true` on the task for "
-            "all of them. Never remove a worktree or delete a branch any other way; the tool refuses without the card. "
-            "- Worktrees no task records:", workers)
+            "all of them. Never remove a worktree or delete a branch any other way; the tool refuses without the card, "
+            "except on the person's standing rule (below). " + T168_STANDING + " - Worktrees no task records:", workers)
         self.assertNotIn("does the person get asked", workers)
         self.assertNotIn("then set the task's `worktree` to null and journal it", workers)
 
@@ -715,6 +717,18 @@ class PushText(unittest.TestCase):
             with self.subTest(before=rule):
                 self.assertLess(text.index(rule), text.index(PUSH_OFF))
 
+    def test_t168_batch_card_and_standing_delete(self):  # t-168 V17.1
+        workers = flat(part(self.raw, "## Workers", "## Phases and gates"))
+        self.assertIn(T168_BATCH, workers)
+        self.assertIn(T168_STANDING, workers)
+        self.assertNotIn("It opens a Delete/Keep card for each recorded worktree", workers)
+        self.assertLess(workers.index(T168_BATCH), workers.index(T168_STANDING))
+        safety = flat(section(self.raw, "## Safety"))
+        self.assertIn("or deleting the clean worktrees that their standing rule to delete them covers (Workers)", safety)
+        readme = flat(read("README.md"))
+        self.assertIn(README_WORKTREES, readme)
+        self.assertIn(README_WORKTREE_RULE, readme)
+
     def test_t140_standing_text(self):  # t-140 R16: the floor's exception names the rule, the tools and the binding
         text = flat(self.orchestrator)
         self.assertIn(PUSH_STANDING, text)
@@ -1039,6 +1053,33 @@ T046_T5 = ("Answering the card changes the rule's status for you. Answered Other
            "words; to change what it says, propose a new rule on a new card.")
 T046_T6_LEFTOVERS = ("If the person wrote a note or answered Other, nothing is closed and the card is withdrawn: ask them "
                      "to say \"keep tNN\" for the ones to keep.")
+T168_BATCH = ("A batch card lists each worktree on one line (task, job, branch, its commits and how many are merged and "
+              "pushed, anything uncommitted, what deleting loses) under Nothing is lost or Deleting loses something, and "
+              "offers Delete the ones where nothing is lost (when some lose something), Delete all and Keep all; it is "
+              "answered in the panel only. Answered Delete: run `pa-worktree remove --card <card-id>`. It removes each "
+              "worktree the answer covers through the same checks, read again now, skips and lists any that changed, and "
+              "the next check asks about those again; tell the person its line. Answered with a note: nothing is removed "
+              "and the card is withdrawn; ask the person to say \"keep tNN\" for each one to keep first, and set "
+              "`\"keep\": true` on its entry. Keep all: none of them is asked about again. While it is open, a worktree that "
+              "joins or leaves the set withdraws it, and the check opens one card for all of them again. No card counts the "
+              "files git ignores.")
+T168_STANDING = ("- Deleting worktrees on the person's standing rule: a rule the person wrote or approved can be their "
+                 "standing approval to delete clean worktrees in this space, accepted by the tool only while it is active, "
+                 "applies to all, is the person's with its text unchanged, and is bound by them in `worktree-allow.json`. "
+                 "Where it is in force, each pass, before `pa-worktree check --open-cards`, run `pa-worktree remove "
+                 "--standing <rule id>`. It deletes only the worktrees whose every commit is merged into main and pushed, "
+                 "with nothing uncommitted or untracked, no terminal in them and no keep, and never one the person answered "
+                 "Keep or Other. Tell the person its one line. Everything else still goes on cards. As in Push cards, a "
+                 "hold, an Other answer or a note on any card, or a failed removal stops it, and resuming is the person's. "
+                 "Never run `pa-worktree-allow` or write `worktree-allow.json`.")
+README_WORKTREES = ("**Worktree cleanup.** `pa-worktree check --open-cards` puts every worktree whose job is over on one "
+                    "Delete card (`d-wt-batch-<n>`), one line each; a single one keeps its own card. You answer it in the "
+                    "panel: Delete the ones where nothing is lost, Delete all, or Keep all. `pa-worktree remove --card "
+                    "<id>` then removes each one through the same checks and skips any that changed since.")
+README_WORKTREE_RULE = ("To let the Project Agent delete clean worktrees without a card (every commit merged into main and "
+                        "pushed, nothing uncommitted or untracked, no terminal in it, no keep), write or approve a rule "
+                        "that says so, then bind it in your own terminal: `pa-worktree-allow set --space S --standing <rule "
+                        "id>`. `pa-worktree-allow show` lists the bindings; `off` stops it.")
 T046_T6_WORKTREE = ("Answered Keep: leave it, it is not asked again. Answered Other: nothing is removed; act on their "
                     "words, and if they ask for it to go, withdraw the card (`pa-decide <card-id> --withdraw`) so the "
                     "next check asks again.")
