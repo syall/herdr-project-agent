@@ -91,6 +91,56 @@ class Shards(unittest.TestCase):
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def scratch(self, drop):
+        """A scratch harness (tests/panel/*.mjs, tests/keeper linked) whose mods/project-agent copy lacks `drop`, and
+        its own TMPDIR (drop None: the whole mod); (run.mjs path, env, tmpdir)."""
+        tmp = tempfile.mkdtemp(prefix="t065-load-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        mods = os.path.join(tmp, "mods", "project-agent")
+        shutil.copytree(os.path.join(REPO, "mods", "project-agent"), mods)
+        if drop:
+            os.remove(os.path.join(mods, drop))
+        os.makedirs(os.path.join(tmp, "tests", "panel"))
+        os.symlink(os.path.join(HERE, "keeper"), os.path.join(tmp, "tests", "keeper"))
+        for name in os.listdir(os.path.join(HERE, "panel")):  # run.mjs copied: node runs a linked main at its target
+            if name.endswith(".mjs") and name != "run.mjs":
+                os.symlink(os.path.join(HERE, "panel", name), os.path.join(tmp, "tests", "panel", name))
+        shutil.copy(RUN, os.path.join(tmp, "tests", "panel", "run.mjs"))
+        temp = os.path.join(tmp, "temp")
+        os.makedirs(temp)
+        return os.path.join(tmp, "tests", "panel", "run.mjs"), dict(os.environ, TMPDIR=temp), temp
+
+    def test_t065_awake_missing_fails_the_cases_by_name_and_leaves_no_temp_copy(self):
+        # t-060 RL-4: with awake.js missing the harness names each failing case (the A* ones too) and the reason,
+        # instead of aborting at load; no t003-panel-* copy is left in TMPDIR, on --list or on a run.
+        run, env, temp = self.scratch("awake.js")
+        r = subprocess.run([node(), run, "A1-one-hold", "A7-script-fake-caffeinate", "P-baseline"], cwd=REPO, env=env,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=120)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        for name in ("A1-one-hold", "A7-script-fake-caffeinate", "P-baseline"):
+            self.assertRegex(r.stdout, r"(?m)^FAIL {}: .*awake\.js".format(re.escape(name)), r.stdout + r.stderr)
+        self.assertIn("3 case(s) failed", r.stdout)
+        self.assertEqual(os.listdir(temp), [], "no temp copy left")
+        r = subprocess.run([node(), run, "--list"], cwd=REPO, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           universal_newlines=True, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("A1-one-hold", r.stdout.splitlines())
+        self.assertEqual(os.listdir(temp), [], "no temp copy left after --list")
+
+    def test_t065_a_top_level_error_leaves_no_temp_copy(self):
+        # Any exit, a module that throws at load included, removes the temp copy (the exit handler).
+        run, env, temp = self.scratch(None)
+        with open(run) as f:
+            text = f.read()
+        at = text.index("\nconst pick = ")
+        with open(run, "w") as f:
+            f.write(text[:at] + '\nthrow new Error("t065 boom at load");\n' + text[at:])
+        r = subprocess.run([node(), run, "--list"], cwd=REPO, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           universal_newlines=True, timeout=120)
+        self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("t065 boom at load", r.stderr)
+        self.assertEqual(os.listdir(temp), [], "no temp copy left")
+
     def test_refused(self):
         for args in (["--shard=0/4"], ["--shard=5/4"], ["--shard=x"], ["--shard=1/0"], ["--nope"], ["No-such-case"]):
             with self.subTest(args=args):
