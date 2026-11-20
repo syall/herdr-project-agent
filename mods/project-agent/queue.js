@@ -13,7 +13,7 @@ import { home } from "herdr";
 import { gaveUp } from "./host.js";
 import { zone } from "./zone.js";
 
-export const LEFT_SHOWN = 10, MERGED_SHOWN = 5;
+export const LEFT_SHOWN = 10, MERGED_SHOWN = 10; // t-145: the 10 most recent merged; the rest behind Archived (n)
 export const STORED_LINE = "As pa-queue last wrote it; pa-queue show reads each state now.";
 export const MISSING_LINE = "No merge queue in this space yet. pa-queue add starts one.";
 
@@ -123,10 +123,11 @@ export function queueRows(q, ledger, cards = []) {
       void: obj(l.approval) && str(l.approval.void) ? `approval voided: ${l.approval.void}` : null,
       resumable: l.resumable === true ? "approval kept for a doc-only rejoin" : null,
     }));
-    const merged = list(rec.merged).filter(readable).slice(-MERGED_SHOWN).reverse()
+    const mergedAll = list(rec.merged).filter(readable).reverse() // newest first
       .map((m) => `${who(m)} merged ${at(m.at)} at ${short(m.tip)} (${m.by ?? "queue"}${m.card ? `, ${m.card}` : ""})`);
+    const merged = mergedAll.slice(0, MERGED_SHOWN), mergedRest = mergedAll.slice(MERGED_SHOWN);
     return { path, title: clash(path) ? path.replace(home(), "~") : base(path), main, intoLine: `into ${main}`, entries: shown, skipped: all.length - entries.length,
-      left, leftCount: leftAll.length, leftMore: Math.max(0, leftAll.length - LEFT_SHOWN), merged };
+      left, leftCount: leftAll.length, leftMore: Math.max(0, leftAll.length - LEFT_SHOWN), merged, mergedRest };
   });
   return { state: "ok", repos, count };
 }
@@ -139,7 +140,8 @@ export function queueLabel(rows) {
 const TONE = { checking: "working", passed: "done", failed: "blocked", invalidated: "dim" };
 
 // Draws the view; starts nothing (t-053). o (t-084): { isLive(address), onWorker(address), evidence (the load's Map of
-// task -> files, or undefined: not known), onFile(task, file) }; a click only opens a view.
+// task -> files, or undefined: not known), onFile(task, file) }; a click only opens a view. t-145: mergedOpen(path) (the
+// repository's merged entries past MERGED_SHOWN are shown), onMerged(path, cx) (its Archived (n) row clicked).
 export function renderQueue(t, rows, o = {}) {
   const note = (text, color) => div().px(4).py(4).text_size(12).text_color(color ?? t.dim).child(text);
   const line = (text, color) => div().text_size(11.5).text_color(color ?? t.muted).child(text);
@@ -163,7 +165,7 @@ export function renderQueue(t, rows, o = {}) {
     .child(div().text_size(12).text_color(t.blocked).child(rows.error))
     .child(div().text_size(11.5).text_color(t.muted).child("pa-queue refuses it too; fix it by hand. This view never writes it.")));
   return box.child(note(STORED_LINE))
-    .children(rows.repos.map((r) => v_flex().flex_none().p(10).gap(4).rounded(7).border(1).border_color(t.border).bg(t.surface)
+    .children(rows.repos.map((r, k) => v_flex().flex_none().p(10).gap(4).rounded(7).border(1).border_color(t.border).bg(t.surface)
       .child(h_flex().gap(8).items_center()
         .child(div().flex_1().min_w(0).truncate().text_size(12.5).font_semibold().child(r.title))
         .child(div().text_size(11).text_color(t.dim).child(r.intoLine)))
@@ -188,5 +190,11 @@ export function renderQueue(t, rows, o = {}) {
           .when(Boolean(l.resumable), (x) => x.child(line(l.resumable ?? "", t.dim)))))
         .when(r.leftMore > 0, (x) => x.child(line(`and ${r.leftMore} earlier`, t.dim))))
       .when(r.merged.length > 0, (el) => el.child(div().pt(4).text_size(11.5).font_semibold().text_color(t.dim).child("Merged"))
-        .children(r.merged.map((m) => line(m, t.dim))))));
+        .children(r.merged.map((m) => line(m, t.dim)))
+        .when(r.mergedRest.length > 0, (x) => {
+          const open = Boolean(o.mergedOpen?.(r.path));
+          return x.child(div().id(`queue-merged-archived-${k}`).py(1).text_size(11.5).text_color(t.dim).cursor_pointer().hover((s) => s.text_color(t.foreground))
+            .on_click((_e, cx) => o.onMerged?.(r.path, cx)).child(`${open ? "▾" : "▸"} Archived (${r.mergedRest.length})`))
+            .when(open, (y) => y.children(r.mergedRest.map((m) => line(m, t.dim))));
+        }))));
 }

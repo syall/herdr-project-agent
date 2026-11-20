@@ -7,7 +7,6 @@
 // Every call goes through host.js (key "awake", a limit, the budget).
 
 import { div } from "gpui-kit";
-import { h_flex, v_flex } from "gpui-base";
 import { shared, setShared, window as herdrWindow } from "herdr";
 import { run as hostRun, gaveUp } from "./host.js";
 
@@ -95,19 +94,21 @@ export class Awake {
     cx.notify();
   }
 
-  // One row under the schedule bar: the state, the toggle, and what it does not cover.
-  bar(t) {
-    const row = v_flex().px(12).py(6).gap(2).flex_none().border_b(1).border_color(t.border).text_size(11.5);
-    if (!isMac()) return row.child(div().text_color(t.dim).child("Keep awake works on macOS only: it does nothing on this system."));
+  // t-145: what the button's tooltip says: the state and what it does not cover (no text in the panel).
+  tip() {
     const on = wanted(), s = shared(AWAKE_STATE);
     const status = !on ? (s?.state === "held" ? " · stopping…" : "")
       : s?.state === "held" ? " · holding" : s?.state === "failed" && s.on !== false ? ` · could not keep it awake: ${s.why}` : " · starting…";
-    return row
-      .child(h_flex().gap(6).items_center()
-        .child(div().flex_1().min_w(0).text_color(s?.state === "failed" && on ? t.blocked : t.muted).child(`Keep this Mac awake while Herdr runs: ${on ? "on" : "off"}${status}`))
-        .child(div().id("awake-toggle").flex_none().px(7).h(22).flex().items_center().rounded(6).text_size(11.5).cursor_pointer()
-          .bg(on ? t.selected : t.chrome).border(1).border_color(on ? t.accent : t.border).text_color(on ? t.foreground : t.muted).hover((x) => x.bg(t.hover))
-          .on_click((_e, cx) => this.toggle(cx)).child(on ? "Turn off" : "Turn on")))
-      .child(div().text_size(10.5).text_color(t.dim).child("While on: no idle sleep, no dimming, no automatic lock; you can still lock the screen by hand. Closing the lid still sleeps the Mac. Remote machines you work on are not affected."));
+    return `Keep this Mac awake while Herdr runs: ${on ? "on" : "off"}${status}. While on: no idle sleep, no dimming, no automatic lock; you can still lock the screen by hand. Closing the lid still sleeps the Mac. Remote machines you work on are not affected. Click to turn it ${on ? "off" : "on"}.`;
+  }
+
+  // t-145: one small coffee button beside the PA status (the head row), or null off macOS (it would do nothing there).
+  // On: filled, accent border; off: no fill, dim; on but failed: blocked border (the why in the tooltip).
+  button(t) {
+    if (!isMac()) return null;
+    const on = wanted(), failed = on && shared(AWAKE_STATE)?.state === "failed";
+    return div().id("awake-toggle").flex_none().w(22).h(20).flex().items_center().justify_center().rounded(5).text_size(12).cursor_pointer()
+      .bg(on ? t.selected : t.chrome).border(1).border_color(failed ? t.blocked : on ? t.accent : t.border).text_color(on ? t.foreground : t.dim)
+      .hover((x) => x.bg(t.hover)).tooltip(this.tip()).on_click((_e, cx) => this.toggle(cx)).child("☕");
   }
 }

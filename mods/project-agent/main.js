@@ -9,14 +9,14 @@
 // read-only `pa-costs billed compare`; its Refresh, Reconstruct and Turn off run `pa-costs` on a click.
 // Restart (t-037 J4) runs `pa-restart --dry-run` on its click and `pa-restart` (in place, once) on its confirm, on the
 // space's machine; never `--end-terminal`: the panel ends no terminal.
-// Fresh context (t-041 J5) runs the context tool's `fresh --dry-run` on its click and one `fresh` request (or its
-// withdrawal) on its confirm; its mode switch runs the tool's `set`; both on the space's machine, with --by panel.
+// Fresh contexts (t-041 J5, t-145): one on/off switch in the head row runs the context tool's `set` on its click, on the
+// space's machine, with --by panel. The panel no longer asks for a fresh context itself (the tool still can).
 
 import { View, div } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, ScrollHandle } from "gpui-base";
 import { spaces, panes, agents, terminals, machines, theme, run, props, home, notify, shared, setShared, closeOverlay, openOverlay, window, layout } from "herdr";
 import { Host, gaveUp, read as hostRead, run as hostRun, watch, refusalLine } from "./host.js";
-import { loadSpace, loadLedger, loadQueue, loadWaiting, loadStartOrder, writeStartOrder, loadMachines, loadTaskOrder, writeTaskOrder, loadProfile, loadDecisions, loadRules, TIMED_OUT, READ_LIMIT, answerDecision, notifyOrchestrator, changeRules, touched, localId, paHome, stateDir, taskActions, taskLinks, evidenceTasks, cardEvidence, staleInstructions, liveTarget, lookAlike, OPEN_REQUESTS, keeperJudging, startingLabels, OTHER, OTHER_MAX, OTHER_TOO_LONG, isOther, oneLine, codeState, codeBadge, loadCode, restartArgs, runRestart, restartOutcome, endTerminalLine, RESTART_MARK, RESTART_MARK_TTL, RESTARTED_FOR, RESTART_TIMEOUT, DRY_TIMEOUT, contextCapable, contextSettings, loadContext, contextLine, contextAt, contextArgs, runContext, contextOutcome, contextDry, resetLine, lastRequestLine, CONTEXT_FOR } from "./store.js";
+import { loadSpace, loadLedger, loadQueue, loadWaiting, loadStartOrder, writeStartOrder, loadMachines, loadTaskOrder, writeTaskOrder, loadProfile, loadDecisions, loadRules, TIMED_OUT, READ_LIMIT, answerDecision, notifyOrchestrator, changeRules, touched, localId, paHome, stateDir, taskActions, taskLinks, evidenceTasks, cardEvidence, staleInstructions, liveTarget, lookAlike, OPEN_REQUESTS, keeperJudging, startingLabels, OTHER, OTHER_MAX, OTHER_TOO_LONG, isOther, oneLine, codeState, codeBadge, loadCode, restartArgs, runRestart, restartOutcome, endTerminalLine, RESTART_MARK, RESTART_MARK_TTL, RESTARTED_FOR, RESTART_TIMEOUT, DRY_TIMEOUT, contextSettings, loadContext, contextLine, contextAt, contextArgs, runContext, contextOutcome, resetLine, CONTEXT_FOR } from "./store.js";
 import { RulesPane, arm, armHolds, fieldState, noticeText as rulesNotice, mergeNotices as mergeRuleNotices } from "./rules.js"; // arm, armHolds: the two-click Delete (ARM_WAIT, 10 s)
 import { queueRows, queueLabel, renderQueue, at as atZone } from "./queue.js"; // t-055: the Queue view (read only)
 import { placesRows, renderPlaces, pinsAfter, orderText, NOTICE as ORDER_NOTICE } from "./places.js"; // t-083 J2: places and the start order (Tasks)
@@ -30,7 +30,9 @@ import { Copier, sel } from "./copy.js";
 import { tick, cadence, holdReason, setSchedule, requestPass, PRESETS, MIN_MINUTES } from "./timer.js";
 import { Awake } from "./awake.js";
 
-const ACTIVE = ["needs-decision", "review", "in-progress", "investigating", "queued"];
+// t-145: the active states, in the order the profile line counts them (never parked or done).
+const ACTIVE = ["needs-decision", "in-progress", "investigating", "review", "queued"];
+const FINISHED_SHOWN = 10; // t-145: finished decisions and done tasks drawn before their Archived (n) row
 const TASK_FOCUS = ["head", "top", "up", "down", "bottom", "next"]; // t-142: a task head's focus handles (wantTaskFocus)
 const OPEN_WAIT = 30000; // an Open request with nothing started by then: say why, offer the button again
 const OPEN_SLOW = 180000; // its new tab is recorded but its launcher has not started by then: say so
@@ -174,6 +176,8 @@ export default class ProjectAgent extends View {
     this.open = new Set(); // expanded task ids
     this.folded = new Set(["done", "parked"]); // task sections folded away (finished work starts folded)
     this.older = false; // answered cards shown
+    this.doneArchive = new Set(); // t-145: space ids whose done tasks past the 10 most recent are shown
+    this.mergedOpen = new Set(); // t-145: `${space id}\0${repo path}`: a queue's merged entries past the 10 most recent shown
     this.archive = {}; // t-054: space id -> { open, busy, cards, error }: decisions-archive/, read only on a click
     this.output = {}; // `${task}:${label}` -> { text, code, running }
     this.armed = null; // arm() (rules.js): the task whose Delete was clicked once (a second click deletes); see armedTask()
@@ -203,8 +207,7 @@ export default class ProjectAgent extends View {
     this.restartAsk = {}; // space id -> { busy, lines, refused, capable, instance, prompt, older }
     this.restarting = {}; // space id -> { at, instance }: this copy's one run, set before it starts (never twice)
     this.restartMsg = {}; // space id -> { ok, text, at }
-    // t-041 J5, Fresh context and the mode switch: the confirm (its dry run), this copy's run in flight, the result line.
-    this.contextAsk = {}; // space id -> { busy, ok, ctx, source, due, request, expires, reasons, text }
+    // t-041 J5, t-145: the fresh-contexts switch: this copy's run in flight, the result.
     this.contextBusy = {}; // space id -> { what: "ask" | "withdraw" | "mode" }
     this.contextMsg = {}; // space id -> { ok, text, at }
     this.me = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`; // this copy, for the timer lease
@@ -343,11 +346,12 @@ export default class ProjectAgent extends View {
 
   // The archive (t-054): old answered cards pa-task archive moved to decisions-archive/. Never read on a reload; each
   // click that opens it reads it once (batch only), newest first, at most 50 shown.
-  archiveLine(t, space) {
+  // t-145: one row, "Archived (n)" (n: the finished cards past the 10 shown); opened, it draws them and the archive's.
+  archiveLine(t, space, rest = 0) {
     const a = this.archive[space.id];
-    const said = a?.busy ? " · reading…" : a?.error ? ` · ${a.error}` : a?.cards ? ` · ${a.cards.length}${a.cards.omitted ? ` (${a.cards.omitted} older not shown)` : ""}` : "";
+    const said = !a?.open ? "" : a?.busy ? " · reading…" : a?.error ? ` · ${a.error}` : a?.cards ? ` · ${a.cards.length} in decisions-archive${a.cards.omitted ? ` (${a.cards.omitted} older not shown)` : ""}` : "";
     return div().id("pa-archive").px(4).py(4).text_size(11.5).text_color(t.dim).cursor_pointer().hover((s) => s.text_color(t.foreground))
-      .on_click((_e, cx) => { this.toggleArchive(space, cx); cx.notify(); }).child(`${a?.open ? "▾" : "▸"} Archive${said}`);
+      .on_click((_e, cx) => { this.toggleArchive(space, cx); cx.notify(); }).child(`${a?.open ? "▾" : "▸"} Archived (${rest})${said}`);
   }
   toggleArchive(space, cx) {
     const a = (this.archive[space.id] ??= { open: false, busy: false, cards: null, error: null });
@@ -740,34 +744,14 @@ export default class ProjectAgent extends View {
     return null;
   }
 
-  // ---- t-041 J5: the context line (R15), Fresh context (R6), the mode switch (R13), the reset line (C6) ----
-  // Only the context tool on the space's machine (store.runContext), with --by panel; the panel writes neither
-  // context-request.json nor context.json. One run per space at a time in this copy (no shared mark: Q3, the tool keeps
-  // one request).
+  // ---- t-041 J5, t-145: the fresh-contexts switch (R13) in the head row; the context line (R15) and the reset line (C6)
+  // in the Costs tab. Only the context tool on the space's machine (store.runContext), with --by panel; the panel writes
+  // neither context-request.json nor context.json. One run per space at a time in this copy. ----
   contextClock(iso) { const s = atZone(iso); return /^\d\d-\d\d \d\d:\d\d$/.test(s) ? s.slice(6) : "?"; }
 
-  // The click: one dry run, shown as the confirm.
-  askFresh(space, cx) {
-    if (this.contextBusy[space.id] || this.contextAsk[space.id]?.busy) return;
-    const ask = { busy: true };
-    this.contextAsk[space.id] = ask;
-    delete this.contextMsg[space.id];
-    cx.notify();
-    const started = this.host.spawn(cx, async (cx) => {
-      const res = await runContext(this.host.ctx(cx, { origin: "context", background: false }), space, contextArgs(space, { dry: true }));
-      if (this.contextAsk[space.id] !== ask) return; // cancelled meanwhile
-      const d = contextDry(res, space, (iso) => this.contextClock(iso));
-      if (!d) delete this.contextAsk[space.id]; // busy: a run of this space is still pending; nothing to say
-      else Object.assign(ask, d, { busy: false });
-      cx.notify();
-    }, { what: "the fresh context check", background: false });
-    if (!started) { Object.assign(ask, { busy: false, ok: false, text: "Too many calls waiting; try again." }); cx.notify(); }
-  }
-
-  // One run that writes (the request, its withdrawal, or the mode), then its line and a reload.
+  // One run that writes the mode, then its result and a reload.
   contextRun(space, what, args, cx) {
     if (this.contextBusy[space.id] || !args) return;
-    delete this.contextAsk[space.id];
     delete this.contextMsg[space.id];
     const mark = { what };
     this.contextBusy[space.id] = mark;
@@ -780,64 +764,54 @@ export default class ProjectAgent extends View {
     const started = this.host.spawn(cx, async (cx) => {
       let msg;
       try { msg = contextOutcome(await runContext(this.host.ctx(cx, { origin: "context", background: false }), space, args), space, (iso) => this.contextClock(iso)); }
-      catch (e) { msg = { ok: false, text: `${what === "mode" ? "The switch" : "The request"} could not run: ${String(e?.message ?? e)}` }; }
+      catch (e) { msg = { ok: false, text: `The switch could not run: ${String(e?.message ?? e)}` }; }
       end(msg, cx);
       this.reload(cx);
-    }, { what: what === "mode" ? "the context mode switch" : "the fresh context request", background: false });
+    }, { what: "the context mode switch", background: false });
     if (!started) end({ ok: false, text: "Not run: too many calls waiting. Try again." }, cx);
   }
 
-  // The rows under the profile line: the line and its controls, a settings note, the reset line, the box, the result.
-  contextBar(t, space, data, known) {
+  // The switch (t-145): ↻, on while the mode is fresh; its state, what it does and an invalid context.json in its
+  // tooltip; the last switch's line there too for CONTEXT_FOR. null while context.json is not read or the machine is offline.
+  contextToggle(t, space, data, known) {
     const c = data?.context;
     if (!c || typeof c !== "object" || known === "offline") return null;
-    const s = c.settings ?? contextSettings(null), launcher = data.code?.launcher ?? null, busy = this.contextBusy[space.id];
-    const clock = (iso) => this.contextClock(iso), costs = this.costs.peek(space.id); // the Costs view's last read (J5-D1)
+    const s = c.settings ?? contextSettings(null), busy = this.contextBusy[space.id], m = this.contextMsg[space.id];
+    const on = s.mode === "fresh";
+    const said = m?.ok && Date.now() - m.at < CONTEXT_FOR ? ` ${m.text}` : "";
+    const tip = busy ? "Fresh contexts: switching…" : `Fresh contexts: ${on ? "on" : "off"}. ${on ? "The Project Agent starts a new conversation at a clean point when its context grows large; the previous one stays in /resume." : "No fresh contexts are taken."} Click to turn them ${on ? "off" : "on"}.${s.problem ? ` context.json is not valid (${s.problem}): the launcher uses the defaults.` : ""}${said}`;
+    return div().id("pa-context-mode").flex_none().w(22).h(20).flex().items_center().justify_center().rounded(5).text_size(12)
+      .bg(on ? t.selected : t.chrome).border(1).border_color(s.problem ? t.blocked : on ? t.accent : t.border).text_color(on && !busy ? t.foreground : t.dim)
+      .when(!busy, (b) => b.cursor_pointer().hover((x) => x.bg(t.hover)).on_click((_e, cx) => this.contextRun(space, "mode", contextArgs(space, { mode: on ? "off" : "fresh" }), cx)))
+      .tooltip(tip).child("↻");
+  }
+
+  // A switch that failed: one line under the head (until the next switch).
+  contextFailed(t, space) {
+    const m = this.contextMsg[space.id];
+    if (!m || m.ok) return null;
+    return div().px(12).py(6).flex_none().border_b(1).border_color(t.border).text_size(11.5).text_color(t.blocked).child(sel("pa-context-result", m.text));
+  }
+
+  // The top of the Costs tab: the context line from the Costs view's last read (J5-D1) and the reset line with its Copy.
+  costsContext(t, space, data, known) {
+    const c = data?.context;
+    if (!c || typeof c !== "object" || known === "offline") return null;
+    const launcher = data.code?.launcher ?? null, clock = (iso) => this.contextClock(iso), costs = this.costs.peek(space.id);
     // The day of the summary's figures (its updated, else the read: MF-J5r2-1), not today's (MF-J5-1); an earlier day
     // is named, and so is the date in its "as of". One time gives both the day and the "as of".
     const now = Date.now(), at = costs && costs.readAt ? contextAt(costs.summary, costs.readAt) : null;
     const read = at !== null ? contextLine(costs.summary?.paContext, at, now) : null;
     const readIso = at !== null ? new Date(at).toISOString() : null;
     const asOf = readIso && readIso.slice(0, 10) !== new Date(now).toISOString().slice(0, 10) ? atZone(readIso) : clock(readIso);
-    const line = !costs || !costs.readAt ? "PA context: open the Costs tab to read it." : read ? `${read} (as of ${asOf})` : null;
-    const button = known === "live" && contextCapable(launcher) && s.mode === "fresh" && !busy;
-    const other = s.mode === "fresh" ? "off" : "fresh";
+    const line = read ? `${read} (as of ${asOf})` : null;
     const reset = resetLine(launcher, data.agent?.sessionId, clock);
-    const ask = this.contextAsk[space.id], m = this.contextMsg[space.id];
-    const box = () => v_flex().px(12).py(8).gap(4).flex_none().border_b(1).border_color(t.border).text_size(11.5).text_color(t.foreground);
-    const rows = v_flex().flex_none()
-      .child(h_flex().px(12).py(6).gap(8).items_center().flex_none().border_b(1).border_color(t.border).text_size(11.5).text_color(t.dim)
-        .child(div().id("pa-context-line").flex_1().min_w(0).child(line ? sel("pa-context-text", line) : ""))
-        .child(div().flex_none().child(`mode ${s.mode}`))
-        .child(this.button(t, "pa-context-mode", `Turn fresh contexts ${other === "off" ? "off" : "on"}`, (_e, cx) => this.contextRun(space, "mode", contextArgs(space, { mode: other }), cx)))
-        .when(button, (e) => e.child(this.button(t, "pa-fresh", "Fresh context", (_e, cx) => this.askFresh(space, cx)))))
-      .when(Boolean(s.problem), (e) => e.child(div().px(12).py(4).border_b(1).border_color(t.border).text_size(11.5).text_color(t.blocked)
-        .child(`context.json is not valid (${s.problem}): the launcher uses the defaults.`)))
-      .when(Boolean(reset), (e) => e.child(h_flex().px(12).py(4).gap(8).items_center().border_b(1).border_color(t.border).text_size(11.5).text_color(t.dim)
+    if (!line && !reset) return null;
+    return v_flex().px(12).py(6).gap(4).flex_none().border_b(1).border_color(t.border).text_size(11.5).text_color(t.dim)
+      .when(Boolean(line), (e) => e.child(div().id("pa-context-line").child(sel("pa-context-text", line ?? ""))))
+      .when(Boolean(reset), (e) => e.child(h_flex().gap(8).items_center()
         .child(div().flex_1().min_w(0).child(sel("pa-reset-line", reset?.text ?? "")))
         .child(this.copier.button(t, "copy-previous-session", () => `/resume ${reset?.previous ?? ""}`))));
-    if (busy) return rows.child(box().bg(t.working + "1a").child(div().child(busy.what === "mode" ? "Switching…" : busy.what === "withdraw" ? "Withdrawing…" : "Asking…")));
-    if (ask) {
-      const b = box().bg(t.working + "1a"), cancel = this.button(t, "pa-fresh-cancel", "Cancel", (_e, cx) => { delete this.contextAsk[space.id]; cx.notify(); });
-      if (ask.busy) return rows.child(b.child(div().text_color(t.dim).child("Checking what a fresh context meets now…")));
-      if (!ask.ok) return rows.child(b.child(div().child(sel("pa-fresh-refused", ask.text ?? ""))).child(h_flex().gap(6).child(cancel)));
-      const last = lastRequestLine(launcher, clock);
-      const lines = [
-        ask.ctx !== null ? `Context now ${Math.round(ask.ctx / 1000)}k${ask.source ? ` (${ask.source})` : ""}.` : "Context size unknown (no transcript read).",
-        ask.due ? `A reset is due: ${String(ask.due).replace(/-/g, " ")}.` : "No reset is due by size: a request is taken at the next clean point anyway.",
-        ask.reasons.length ? `Not a clean point now: ${ask.reasons.join("; ")}` : "Clean point now: yes.",
-        ...(ask.request ? [`Pending request ${ask.request.slice(0, 8)}, until ${clock(ask.expires)}.`] : []),
-        ...(last ? [last] : []),
-      ];
-      return rows.child(b.children(lines.map((l, i) => div().child(sel(`pa-fresh-line-${i}`, l))))
-        .child(div().text_color(t.dim).child("It waits for the Project Agent's next clean point (up to 2 h); a pass is never cut short. The conversation in its tab restarts; the previous one stays in /resume."))
-        .child(h_flex().gap(6)
-          .child(this.button(t, "pa-fresh-go", ask.request ? "Ask again (replaces the pending one)" : "Ask for a fresh context", (_e, cx) => this.contextRun(space, "ask", contextArgs(space, {}), cx), true))
-          .when(Boolean(ask.request), (e) => e.child(this.button(t, "pa-fresh-withdraw", "Withdraw the request", (_e, cx) => this.contextRun(space, "withdraw", contextArgs(space, { withdraw: true }), cx))))
-          .child(cancel)));
-    }
-    if (m && (!m.ok || Date.now() - m.at < CONTEXT_FOR)) return rows.child(box().child(div().text_color(m.ok ? t.foreground : t.blocked).child(sel("pa-context-result", m.text))));
-    return rows;
   }
 
   start(space, folder) {
@@ -1144,6 +1118,18 @@ export default class ProjectAgent extends View {
       try { await work(stateDir(space), space.machine ?? null); } catch (e) { this.schedule.error = String(e.message ?? e); }
       this.reload(cx); cx.notify();
     });
+  }
+
+  // t-145: the Passes tab's label: off, paused, a pass queued, its cadence, or ! (schedule.json missing or invalid).
+  scheduleLabel(data) {
+    const s = data.schedule, every = s ? cadence(s) : 0;
+    return !s ? "Passes · !" : data.request?.pending ? "Passes · queued" : !every ? "Passes · off" : s.paused ? "Passes · paused" : `Passes · ${every} min`;
+  }
+
+  // Points the Files view at a folder; `file` opens that file in it (else its list). The evidence and profile links.
+  showFile(space, path, label, file, task = null) {
+    setShared("my-files.root", { space: space.id, path, label, file: file ?? null, ...(task ? { task } : {}), at: Date.now() });
+    run("layout.select", { stack: "panel-body", child: "files" });
   }
 
   scheduleBar(t, space, data) {
@@ -1616,7 +1602,10 @@ export default class ProjectAgent extends View {
     // One section per state, in the order that needs you first; ranked sections in the task order (t-097 J2, R5).
     const tasksOrder = this.taskOrderOf(data);
     const sections = taskSections(tasks, tasksOrder.ranking);
-    const active = tasks.filter((x) => ACTIVE.includes(x.state)).length;
+    // t-145: a count per active state (none: "no active tasks"); the Tasks tab counts every task not parked or done.
+    const counts = ACTIVE.map((st) => [st, tasks.filter((x) => x.state === st).length]).filter(([, n]) => n > 0).map(([st, n]) => `${st.replace(/-/g, " ")} ${n}`).join(" · ") || "no active tasks";
+    const current = tasks.filter((x) => x.state !== "parked" && x.state !== "done").length;
+    const passesOn = Boolean(data.schedule) && cadence(data.schedule) > 0 && !data.schedule.paused; // t-145: the pass number only then
     const openCards = this.cards.filter((c) => !c.card || (c.card.status === "open" && !this.mark(space, c))); // one answered here is not counted (t-045)
     // A push card pushed from here stays with the open ones, answered, until the person leaves it (push.js kept).
     const kept = (c) => Boolean(c.card) && c.card.status !== "open" && this.push.kept(space.id, c.id);
@@ -1628,6 +1617,7 @@ export default class ProjectAgent extends View {
       this.shownAt = ask.at; this.view = "tasks"; this.open.add(ask.task); this.disarm();
       const state = tasks.find((x) => x.id === ask.task)?.state;
       if (state) this.folded.delete(state);
+      if (state === "done" && tasks.filter((x) => x.state === "done").findIndex((x) => x.id === ask.task) >= FINISHED_SHOWN) this.doneArchive.add(space.id); // t-145: past the 10 shown
     }
     const view = this.view ?? (listed.length || !tasks.length ? "decisions" : "tasks");
     const queue = queueRows(data.queue, data.ledger, this.cardsFor === space.id ? this.cards : []); // t-055: drawn only from what the load read
@@ -1642,15 +1632,19 @@ export default class ProjectAgent extends View {
     const code = this.codeOf(space, data), badge = codeBadge(code), restartable = known === "live" && !this.restartBusy(space);
     const older = /^older/.test(code?.word ?? ""), changed = [...(data.stale ?? []).slice(0, 3), ...(/tools/.test(older ? code.word : "") ? ["tools"] : []), ...(/core/.test(older ? code.word : "") && !(data.stale ?? []).length ? ["core text"] : [])];
     const restartBox = this.restartBox(t, space, live);
-    const contextBar = this.contextBar(t, space, data, known);
+    const costsContext = view === "costs" ? this.costsContext(t, space, data, known) : null;
+    const contextToggle = this.contextToggle(t, space, data, known), contextFailed = this.contextFailed(t, space), awake = this.awake.button(t); // t-145: beside the status
     return root
       .child(head(`PA: ${a.name ?? space.name}`, h_flex().flex_none().gap(6).items_center()
         .child(div().size(7).rounded(4).bg(live ? t[live.status] ?? t.idle : t.dim))
         .child(div().text_size(11).text_color(t.dim).child(live ? live.status ?? "running" : stateText))
+        .when(Boolean(awake), (el) => el.child(awake)) // t-145: keep awake (awake.js)
+        .when(Boolean(contextToggle), (el) => el.child(contextToggle)) // t-145: fresh contexts on or off
         .when(Boolean(badge) && known !== "down", (el) => el.child(div().text_size(11).text_color(older || !code?.capable ? t.working : t.dim).child(badge ?? "")))
         .when(restartable, (el) => el.child(this.restartButton(t, space, code, "pa-restart")))
         .when(known === "down", (el) => el.child(this.openButton(t, space, a, "pa-open", waiting)))))
       .when(Boolean(restartBox), (el) => el.child(restartBox))
+      .when(Boolean(contextFailed), (el) => el.child(contextFailed))
       .when((known === "down" || known === "restoring") && Boolean(startingNow?.error), (el) => el.child(div().px(12).py(6).border_b(1).border_color(t.border).text_size(11.5).text_color(t.blocked)
         .child(`The Project Agent is waiting: ${startingNow?.error}. Fix it, then press Enter in its tab.`)))
       .when(Boolean(like), (el) => el.child(v_flex().px(12).py(8).gap(6).flex_none().border_b(1).border_color(t.border).bg(t.working + "1a").text_size(11.5).text_color(t.foreground)
@@ -1661,19 +1655,22 @@ export default class ProjectAgent extends View {
       .when(known === "down" && Boolean(this.openMsg[space.id]), (el) => el.child(div().px(12).py(6).border_b(1).border_color(t.border).text_size(11.5).text_color(t.blocked).child(this.openMsg[space.id] ?? "")))
       .child(v_flex().px(12).py(8).gap(2).flex_none().border_b(1).border_color(t.border).text_size(11.5).text_color(t.dim)
         .child(div().truncate().child(String(a.project ?? "").replace(home(), "~")))
-        .child(div().child(`profile ${a.profile ?? "?"} · ${active} active of ${tasks.length} tasks · pass ${data.ledger?.passCount ?? 0}${this.inFlight(space.id) && now - this.dataAt > CACHE_OLD ? " · updating…" : ""}`)))
-      .when(Boolean(contextBar), (el) => el.child(contextBar)) // t-041 J5: the context line, Fresh context, the mode switch
+        // t-145: the profile name opens its profile.json in the Files view.
+        .child(h_flex().gap(4).items_center().flex_wrap()
+          .child(div().flex_none().child("profile"))
+          .child(a.profile && data.profileDir ? div().id("pa-profile").flex_none().text_color(t.accent).cursor_pointer().hover((x) => x.text_color(t.foreground))
+            .on_click(() => this.showFile(space, data.profileDir, `profile ${a.profile}`, "profile.json")).child(String(a.profile)) : div().flex_none().child(String(a.profile ?? "?")))
+          .child(div().min_w(0).child(`· ${counts}${passesOn ? ` · pass ${data.ledger?.passCount ?? 0}` : ""}${this.inFlight(space.id) && now - this.dataAt > CACHE_OLD ? " · updating…" : ""}`))))
       // Its instructions or its tools changed since its launcher started (R14): Restart reloads them (R7: /exit too).
       .when(changed.length > 0 && Boolean(live), (el) => el.child(h_flex().px(12).py(6).gap(8).items_center().border_b(1).border_color(t.border).bg(t.working + "1a").text_size(11.5).text_color(t.foreground)
         .child(div().flex_1().min_w(0).child(`Its instructions or tools changed since it started (${changed.join(", ")}). Restart reloads them (or /exit in its tab).${code?.prompt === "recorded" ? " Restart in place keeps the core text this conversation began with; Restart in a new conversation loads it." : ""}`))
         .when(restartable, (e) => e.child(this.restartButton(t, space, code, "pa-restart-notice")))))
-      .child(this.scheduleBar(t, space, data))
-      .child(this.awake.bar(t))
       .child(h_flex().px(8).py(6).gap(4).flex_none().border_b(1).border_color(t.border)
         .child(tab("decisions", openCards.length ? `Decisions · ${openCards.length}` : "Decisions"))
-        .child(tab("tasks", `Tasks · ${tasks.length}`))
+        .child(tab("tasks", `Tasks · ${current}`))
         .child(tab("queue", queueLabel(queue)))
         .child(tab("rules", this.rules.data?.error ? "Rules · !" : `Rules · ${(this.rules.data?.rules ?? []).filter((r) => r.status === "active").length}`))
+        .child(tab("schedule", this.scheduleLabel(data))) // t-145: scheduled passes, between Rules and Costs
         .child(tab("costs", this.costs.tabLabel(space.id))))
       .children((data.errors ?? []).map((e) => div().px(12).py(6).text_size(11.5).text_color(t.blocked).child(e)))
       .when(unsent.length > 0 && !live, (el) => el.child(h_flex().px(12).py(6).gap(8).items_center().text_size(11.5).text_color(t.foreground)
@@ -1698,12 +1695,19 @@ export default class ProjectAgent extends View {
           this.wantTaskFocus(s.items.flatMap((i) => (i.kind === "fold" ? i.rows : [i])).map((i) => i.task.id), cx); // t-142
           const folded = this.folded.has(s.state), count = s.items.reduce((n, i) => n + (i.kind === "fold" ? i.count : 1), 0);
           const row = (i) => this.task(t, i.task, space, places.badges[i.task.id] ?? [], i);
+          // t-145: done draws its 10 most recent; the rest behind one Archived (n) row.
+          const capped = s.state === "done" && s.items.length > FINISHED_SHOWN, archOpen = this.doneArchive.has(space.id);
+          const archived = capped ? [div().id("tasks-done-archived").flex_none().px(9).h(26).flex().items_center().rounded(7).border(1).border_color(t.border).text_size(12).text_color(t.muted)
+            .cursor_pointer().hover((x) => x.bg(t.hover)).on_click((_e, cx) => { archOpen ? this.doneArchive.delete(space.id) : this.doneArchive.add(space.id); cx.notify(); })
+            .child(`${archOpen ? "▾" : "▸"} Archived (${s.items.length - FINISHED_SHOWN})`)] : [];
+          const items = capped ? [...s.items.slice(0, FINISHED_SHOWN), "archived", ...(archOpen ? s.items.slice(FINISHED_SHOWN) : [])] : s.items;
           return [
             h_flex().id(`tasks-${s.state}`).h(24).px(4).gap(6).flex_none().items_center().cursor_pointer().text_size(11.5).text_color(t.dim).hover((x) => x.text_color(t.foreground))
               .on_click((_e, cx) => { folded ? this.folded.delete(s.state) : this.folded.add(s.state); cx.notify(); })
               .child(div().child(folded ? "▸" : "▾")).child(div().font_semibold().child(String(s.state ?? "no state").replace(/-/g, " ")))
               .child(div().child(String(count))),
-            ...(folded ? [] : s.items.flatMap((i) => {
+            ...(folded ? [] : items.flatMap((i) => {
+              if (i === "archived") return archived;
               if (i.kind !== "fold") return [row(i)];
               const openFold = this.foldOpen.has(`${space.id}:${i.key}`); // R14: starts folded
               return [div().id(`fold-${i.key}`).flex_none().px(9).h(26).flex().items_center().rounded(7).border(1).border_color(t.border).text_size(12).text_color(t.muted)
@@ -1713,8 +1717,10 @@ export default class ProjectAgent extends View {
           ];
         }))))
       .when(view === "queue", (el) => el.child(renderQueue(t, queue, { isLive: (a) => terminals().some((x) => x.address === onMachine(a) && x.state === "live"), onWorker: (a) => this.showAgent(onMachine(a)),
-        evidence: data.evidence, onFile: (task, file) => this.showEvidence(space, task, file) }))) // t-084: worker and evidence links
-      .when(view === "costs", (el) => el.child(this.costs.render(t, space, (shared("project-agent.costs") ?? {})[space.id] ?? null)))
+        evidence: data.evidence, onFile: (task, file) => this.showEvidence(space, task, file), // t-084: worker and evidence links
+        mergedOpen: (path) => this.mergedOpen.has(`${space.id}\0${path}`), onMerged: (path, cx) => { const k = `${space.id}\0${path}`; this.mergedOpen.has(k) ? this.mergedOpen.delete(k) : this.mergedOpen.add(k); cx.notify(); } }))) // t-145
+      .when(view === "costs", (el) => el.when(Boolean(costsContext), (e) => e.child(costsContext)).child(this.costs.render(t, space, (shared("project-agent.costs") ?? {})[space.id] ?? null))) // t-145: the context rows on top
+      .when(view === "schedule", (el) => el.child(v_flex().id("pa-schedule").flex_1().min_h(0).overflow_y_scrollbar().child(this.scheduleBar(t, space, data)))) // t-145
       .when(view === "rules", (el) => el.child(this.rules.render(t, space, (id, what, cx) => this.ruleDecided(space, id, what, cx))))
       .when(view === "decisions", (el) => el.child(v_flex().id("pa-decisions").flex_1().min_h(0).p(8).gap(8).overflow_y_scrollbar().track_scroll(this.cardScroll)
         .when(!listed.length && this.cardsFor !== space.id, (e) => e.child(note("Loading decisions…")))
@@ -1723,8 +1729,10 @@ export default class ProjectAgent extends View {
         .when(this.cards.missing > 0, (e) => e.child(note(`${this.cards.missing} card${this.cards.missing === 1 ? "" : "s"} could not be read now; the next load reads ${this.cards.missing === 1 ? "it" : "them"} again.`))) // t-131: never silently missing
         .when(answered.length > 0 || this.cards.omitted > 0, (e) => e.child(div().id("pa-older").px(4).py(4).text_size(11.5).text_color(t.dim).cursor_pointer().hover((s) => s.text_color(t.foreground))
           .on_click((_e, cx) => { this.older = !this.older; cx.notify(); }).child(`${this.older ? "▾" : "▸"} ${answered.length} answered${this.cards.omitted > 0 ? ` · ${this.cards.omitted} older not shown` : ""}`)))
-        .when(this.older, (e) => e.children(answered.slice(0, 50).map((c) => this.card(t, c, space))))
-        .when(this.older, (e) => e.child(this.archiveLine(t, space)))
-        .when(this.older && Boolean(this.archive[space.id]?.open), (e) => e.children((this.archive[space.id]?.cards ?? []).filter((c) => !this.cards.some((x) => x.id === c.id)).slice(0, 50).map((c) => this.card(t, c, space))))));
+        // t-145: the 10 most recent finished cards; the rest, and decisions-archive/ (read on its open), behind Archived (n).
+        .when(this.older, (e) => e.children(answered.slice(0, FINISHED_SHOWN).map((c) => this.card(t, c, space))))
+        .when(this.older, (e) => e.child(this.archiveLine(t, space, Math.max(0, answered.length - FINISHED_SHOWN))))
+        .when(this.older && Boolean(this.archive[space.id]?.open), (e) => e.children(answered.slice(FINISHED_SHOWN).map((c) => this.card(t, c, space)))
+          .children((this.archive[space.id]?.cards ?? []).filter((c) => !this.cards.some((x) => x.id === c.id)).slice(0, 50).map((c) => this.card(t, c, space))))));
   }
 }

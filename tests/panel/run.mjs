@@ -1194,7 +1194,7 @@ cases["P-full-ledger-timeout"] = async () => { // I1 (AC4.6): a ledger or profil
     check(!v.loads[RS], `${how}: the load ended`);
     const { text } = look(v);
     check(snap() === before, `${how}: every shared key as it was (before ${before}, after ${snap()})`);
-    check(/Tasks · 1/.test(text) && /1 active of 1 tasks/.test(text) && /Decisions · 2/.test(text), `${how}: the last known tasks and cards are shown (got ${text.slice(0, 400)})`);
+    check(/Tasks · 1/.test(text) && /in progress 1/.test(text) && /Decisions · 2/.test(text), `${how}: the last known tasks and cards are shown (got ${text.slice(0, 400)})`);
     check(error.test(text), `${how}: the error is shown (got ${text.slice(0, 400)})`);
     check(v.cache.get(RS)?.data?.ledger?.tasks?.length === 1, `${how}: the kept entry keeps the ledger (got ${JSON.stringify(v.cache.get(RS)?.data?.ledger)})`);
     check(JSON.stringify(v.cache.get(RS)?.data?.profile?.mainBranches) === '["trunk"]', `${how}: the kept entry keeps the profile`);
@@ -1205,7 +1205,7 @@ cases["P-full-ledger-timeout"] = async () => { // I1 (AC4.6): a ledger or profil
   const v = await mount(); await settle();
   delete g.__files[LEDGER];
   advance(12000); v.reload(cx); await settle();
-  check(!(RS in (g.__shared["project-agent.worktrees"] ?? {})) && !(RS in (g.__shared["project-agent.workers"] ?? {})) && /0 active of 0 tasks/.test(look(v).text), `a missing ledger clears (got ${JSON.stringify(g.__shared["project-agent.worktrees"])}, ${look(v).text.slice(0, 300)})`);
+  check(!(RS in (g.__shared["project-agent.worktrees"] ?? {})) && !(RS in (g.__shared["project-agent.workers"] ?? {})) && /no active tasks/.test(look(v).text), `a missing ledger clears (got ${JSON.stringify(g.__shared["project-agent.worktrees"])}, ${look(v).text.slice(0, 300)})`);
 };
 
 cases["P-full-profile-config-timeout"] = async () => { // I1: config.json (needed for the profile name) timing out keeps the main branches
@@ -1227,12 +1227,12 @@ cases["P-full-schedule-timeout"] = async () => { // I1 / M3: schedule.json and p
   g.__files[`${M}:${RDIR}/schedule.json`] = JSON.stringify({ everyMinutes: 15 });
   g.__files[`${M}:${RDIR}/pass-request.json`] = JSON.stringify({ pending: true, at: "2026-11-16T10:00:00Z" });
   const v = await mount(); await settle();
-  check(!/schedule\.json is missing/.test(look(v).text) && /Pass queued/.test(look(v).text), `loaded (got ${look(v).text.slice(0, 400)})`);
+  check(!/Passes · !/.test(look(v).text) && /Passes · queued/.test(look(v).text), `loaded (got ${look(v).text.slice(0, 400)})`);
   g.__hang = [`${M}:${RDIR}/schedule.json`, `${M}:${RDIR}/pass-request.json`];
   advance(12000); v.reload(cx); await settle();
   for (let t = 0; t < 12; t++) await step(1000);
   const { text } = look(v);
-  check(!v.loads[RS] && !/schedule\.json is missing/.test(text) && /Pass queued/.test(text), `the schedule and the queued pass are kept (got ${text.slice(0, 400)})`);
+  check(!v.loads[RS] && !/Passes · !/.test(text) && /Passes · queued/.test(text), `the schedule and the queued pass are kept (got ${text.slice(0, 400)})`);
   check(v.cache.get(RS)?.data?.schedule?.everyMinutes === 15 && v.cache.get(RS)?.data?.request?.pending === true, "and kept");
 };
 
@@ -1519,7 +1519,7 @@ cases["A3-press-elsewhere"] = async () => { // V1.3: a press anywhere else in th
   await press(v, null); // empty space in the panel
   check(!armedText(v), "a press on empty space disarms");
   await press(v, "delete-t-1");
-  await press(v, "sched-summary"); // another control
+  await press(v, "awake-toggle"); // another control (t-145: the schedule line is in its tab)
   check(!armedText(v), "a press on another control disarms");
   await press(v, "delete-t-1");
   await press(v, "task-head-t-2"); // another task's header (expands it)
@@ -1686,9 +1686,9 @@ cases["R2-cancel"] = async () => {
   await press(v, "rule-delete-r-one");
   check(ruleArmed(v) && ruleIds() === "r-one,r-two", "after Cancel one click only arms");
 };
-cases["R3-press-elsewhere"] = async () => { // empty space, another Rules control (they stop the press), the schedule line
+cases["R3-press-elsewhere"] = async () => { // empty space, another Rules control (they stop the press), the coffee button (t-145)
   const v = await ruleWorld();
-  for (const where of [null, "pa-rules", "rule-export", "rule-edit-r-one", "rule-toggle-r-two", "sched-summary"]) {
+  for (const where of [null, "pa-rules", "rule-export", "rule-edit-r-one", "rule-toggle-r-two", "awake-toggle"]) {
     await press(v, "rule-delete-r-one");
     check(ruleArmed(v), `armed before ${where}`);
     await press(v, where);
@@ -3685,7 +3685,7 @@ cases["A8-live-arm"] = async () => { // A1: a click on a Delete drawn armed afte
 };
 cases["A9-field-focus-disarms"] = async () => { // A2: focus in a panel text field disarms (whether or not the Input stops the press)
   const v = await armWorld();
-  look(v).clicks["sched-summary"]({}, cx); await flush(); // the schedule opens (its click alone)
+  await click(v, "sched-summary"); await click(v, "view-tasks"); // the schedule opens in its tab (t-145), then back to the task
   for (const k of ["quietFrom", "quietTo", "custom"]) {
     await press(v, "delete-t-1");
     check(armedText(v), `armed before ${k}`);
@@ -5329,6 +5329,7 @@ const awSetup = ({ storage = awFakeStorage(), platform = "macos", reply = null }
     return { code: 0, stdout: args[3] === "start" ? "held 5001 4001\n" : "off\n", stderr: "" };
   };
 };
+const awTip = (v) => P145.tip(v, "awake-toggle"); // t-145: the state and limits are the coffee button's tooltip
 const awHold = (v) => { g.__shared["project-agent.timer"] = { id: v.me, at: g.__now }; }; // v holds the timer lease
 const awDone = () => { g.__platform = undefined; };
 const awWrap = (fn) => async () => { try { await fn(); } finally { awDone(); } };
@@ -5342,7 +5343,7 @@ cases["A1-one-hold"] = awWrap(async () => { // VP1, VP2: the holder starts one c
   check(/-d -i -u -w "\$pid"/.test(AW.SCRIPT), "the script holds -d -i -u -w <Herdr's pid>");
   await fire(1000); await fire(1000);
   check(awCalls().length === 1, `no second start while it holds (got ${awCalls().length})`);
-  check(/Keep this Mac awake while Herdr runs: on/.test(look(v).text) && /holding/.test(look(v).text), `bar says on, holding (got ${look(v).text.slice(0, 600)})`);
+  check(/Keep this Mac awake while Herdr runs: on/.test(awTip(v)) && /holding/.test(awTip(v)), `bar says on, holding (got ${awTip(v)})`);
   advance(31000); await fire(1000);
   c = awCalls();
   check(c.length === 2 && c[1][0] === "start", `after 30 s it checks again with an idempotent start (got ${JSON.stringify(c)})`);
@@ -5353,7 +5354,7 @@ cases["A1-two-copies"] = awWrap(async () => { // VP2: two panel copies, one hold
   const v = await mount(), w = await mount(); awHold(v);
   await fire(1000); await fire(1000);
   check(awCalls().length === 1, `one start for two copies (got ${JSON.stringify(awCalls())})`);
-  check(/holding/.test(look(w).text), `the other copy shows the hold (got ${look(w).text.slice(0, 600)})`);
+  check(/holding/.test(awTip(w)), `the other copy shows the hold (got ${awTip(w)})`);
 });
 
 cases["A2-toggle"] = awWrap(async () => { // VP2, VP3: off ends it at once, on starts it again
@@ -5364,7 +5365,7 @@ cases["A2-toggle"] = awWrap(async () => { // VP2, VP3: off ends it at once, on s
   let c = awCalls();
   check(c.length === 2 && c[1][0] === "stop", `Turn off stops at once (got ${JSON.stringify(c)})`);
   check(g.localStorage.getItem("project-agent.awake") === "off", `kept off (got ${g.localStorage.getItem("project-agent.awake")})`);
-  check(/Keep this Mac awake while Herdr runs: off/.test(look(v).text) && Boolean(look(v).clicks["awake-toggle"]) && /Turn on/.test(look(v).text), `bar says off with Turn on (got ${look(v).text.slice(0, 600)})`);
+  check(/Keep this Mac awake while Herdr runs: off/.test(awTip(v)) && Boolean(look(v).clicks["awake-toggle"]) && /turn it on/.test(awTip(v)), `bar says off with Turn on (got ${awTip(v)})`);
   await fire(1000);
   check(awCalls().length === 2, "no call while off");
   await click(v, "awake-toggle"); await settle();
@@ -5379,7 +5380,7 @@ cases["A2-toggle-other-copy"] = awWrap(async () => { // VP2: a click in a copy t
   await fire(1000);
   await click(w, "awake-toggle");
   check(awCalls().length === 1, "the clicked copy runs nothing itself");
-  check(/runs: off/.test(look(w).text), `the clicked copy shows off at once (got ${look(w).text.slice(0, 400)})`);
+  check(/runs: off/.test(awTip(w)), `the clicked copy shows off at once (got ${awTip(w)})`);
   await fire(1000);
   const c = awCalls();
   check(c.length === 2 && c[1][0] === "stop", `the holder stops it within its 1 s tick (got ${JSON.stringify(c)})`);
@@ -5389,30 +5390,30 @@ cases["A3-default-and-restart"] = awWrap(async () => { // VP3: on by default; th
   const storage = awFakeStorage();
   awSetup({ storage });
   let v = await mount(); awHold(v);
-  check(/runs: on/.test(look(v).text), `on by default (got ${look(v).text.slice(0, 400)})`);
+  check(/runs: on/.test(awTip(v)), `on by default (got ${awTip(v)})`);
   await click(v, "awake-toggle"); await settle();
   awSetup({ storage }); // Herdr restarted: new shared state, the same storage file
   v = await mount(); awHold(v);
-  check(/runs: off/.test(look(v).text), `still off after a restart (got ${look(v).text.slice(0, 400)})`);
+  check(/runs: off/.test(awTip(v)), `still off after a restart (got ${awTip(v)})`);
   await fire(1000);
   check(awCalls().every((x) => x[0] === "stop"), `nothing started while off (got ${JSON.stringify(awCalls())})`);
 });
 
-cases["A4-says-limits"] = awWrap(async () => { // VP1, VP4: the bar says the manual lock, the lid, and that remote machines are not affected
+cases["A4-says-limits"] = awWrap(async () => { // VP1, VP4: the button's tooltip says the manual lock, the lid, and that remote machines are not affected (t-145)
   awSetup();
   const v = await mount();
-  const { text } = look(v);
+  const text = awTip(v);
   check(/still lock the screen by hand/.test(text), `manual lock (got ${text.slice(0, 600)})`);
   check(/Closing the lid still sleeps the Mac/.test(text), "the lid");
   check(/Remote machines you work on are not affected/.test(text), "remote machines");
 });
 
-cases["A5-not-macos"] = awWrap(async () => { // VP5: does nothing and says so
+cases["A5-not-macos"] = awWrap(async () => { // VP5: does nothing (t-145: and draws no button)
   awSetup({ platform: "linux" });
   const v = await mount(); awHold(v);
   await fire(1000); advance(31000); await fire(1000);
   check(awCalls().length === 0, `no call off macOS (got ${JSON.stringify(awCalls())})`);
-  check(/macOS only/.test(look(v).text) && !look(v).clicks["awake-toggle"], `says macOS only, no toggle (got ${look(v).text.slice(0, 400)})`);
+  check(!look(v).clicks["awake-toggle"] && !/Keep this Mac/.test(look(v).text), `no button, no text (t-145) (got ${look(v).text.slice(0, 400)})`);
 });
 
 cases["A6-not-holder"] = awWrap(async () => { // VP2: a copy without the timer lease never holds
@@ -5427,7 +5428,7 @@ cases["A8-failure"] = awWrap(async () => { // a hold that could not start says s
   awSetup({ reply: () => ({ code: 3, stdout: "no Herdr process above this one\n", stderr: "" }) });
   const v = await mount(); awHold(v);
   await fire(1000);
-  check(/could not keep it awake/.test(look(v).text), `says it could not (got ${look(v).text.slice(0, 600)})`);
+  check(/could not keep it awake/.test(awTip(v)), `says it could not (got ${awTip(v)})`);
   await fire(1000); advance(5000); await fire(1000);
   check(awCalls().length === 1, `no retry within 30 s (got ${awCalls().length})`);
   advance(31000); await fire(1000);
@@ -5844,13 +5845,14 @@ cases["Q55-5-left"] = async () => { // R3: left newest first, why, void, the fix
   check(/and 2 earlier/.test(text) && !/t-L1 left/.test(text) && !/t-L2 left/.test(text) && /t-L3 left/.test(text), `10 shown (got ${text})`);
 };
 
-cases["Q55-6-merged"] = async () => { // R3: the last 5 merged, newest first, by hand or by the queue with its card
+cases["Q55-6-merged"] = async () => { // R3: the last merged (t-145: 10, the 11th behind Archived; P145-10), newest first, by hand or by the queue with its card
   const merged = Array.from({ length: 6 }, (_, i) => ({ task: `t-M${i + 1}`, job: null, tip: `${i + 1}`.repeat(40), from: sha("a"), to: sha("b"), at: `2026-11-18T08:0${i}:00Z`, by: "hand" }));
   merged[5] = { ...merged[5], by: "queue", card: "d-queue-1" };
+  merged.unshift(...Array.from({ length: 5 }, (_, i) => ({ task: `t-old${i}`, job: null, tip: sha("f"), from: sha("a"), to: sha("b"), at: `2026-11-17T08:0${i}:00Z`, by: "hand" }))); // t-145: 11 in all
   const v = await queueWorld(qDoc({ [QA]: qRepo([], { merged }) }));
   const { text } = look(v);
   check(/t-M6 merged 11-18 08:05 at 6666666 \(queue, d-queue-1\)/.test(text), `by the queue (got ${text})`);
-  check(/t-M2 merged 11-18 08:01 at 2222222 \(hand\)/.test(text) && !/t-M1 merged/.test(text), `the last 5 (got ${text})`);
+  check(/t-M2 merged 11-18 08:01 at 2222222 \(hand\)/.test(text) && /t-M1 merged/.test(text) && /t-old1 merged/.test(text) && !/t-old0 merged/.test(text), `the last 10 (got ${text})`);
   check(text.indexOf("t-M6 merged") < text.indexOf("t-M2 merged"), "newest first");
 };
 
@@ -6133,7 +6135,7 @@ cases["P83-1-places"] = async () => { // AC1.1, AC1.2: the kinds, their limits a
   check(text.includes("t53 · t-020 verify · verifier · suite step · since 11-19 10:02") && text.includes("t54 · t-041 review · reviewer · since 11-19 10:02"), `AC1.1 holder lines (got ${text.slice(0, 900)})`);
   check(text.includes("limits: r-places"), "the limits' rule");
   check(!/t59 ·/.test(text), "AC1.2: a finished worker is not drawn");
-  check(text.indexOf("Places ·") < text.indexOf("in progress"), "the section comes before the task sections");
+  check(text.indexOf("Places ·") < text.indexOf("| in progress |"), "the section comes before the task sections");
 };
 
 cases["P83-2-waiting"] = async () => { // R9: effective order, kind labels, reasons, the queue job without buttons; AC9.1
@@ -6540,16 +6542,14 @@ function ctxWorld({ machine = null, launcher = LREC({ accepts: ["restart", "cont
 const ctxRuns = () => g.__execs.filter(([c]) => c === CTX);
 const ctxWrites = () => ctxRuns().filter(([, a]) => !a.includes("--dry-run"));
 const summaryReads = (dir) => g.__reads.filter((r) => r === `${dir}/costs/summary.json`);
-const ASK_ARGV = ["fresh", "--space", S, "--by", "panel", "--json", "--why", "the Fresh context button in the Project Agent panel"];
 
-cases["P41-1-context-line"] = async () => { // R15, J5-D1: the line from the Costs view's own read (as of its time), the switch and the button
+cases["P41-1-context-line"] = async () => { // R15, J5-D1: the line from the Costs view's own read (as of its time), in the Costs tab (t-145); the switch
   const { dir } = ctxWorld();
   const v = await liveMount();
   const { text, clicks } = look(v);
-  check(text.includes("PA context: open the Costs tab to read it.") && !text.includes("PA context today"), `before any Costs read (got ${text.slice(0, 900)})`);
+  check(!text.includes("PA context"), `no context line outside the Costs tab (got ${text.slice(0, 900)})`);
   check(summaryReads(dir).length === 0, `no summary.json read outside the Costs view (got ${summaryReads(dir).length})`);
-  check(Boolean(clicks["pa-fresh"]) && /Fresh context/.test(text), `the button (clicks ${Object.keys(clicks)})`);
-  check(Boolean(clicks["pa-context-mode"]) && /Turn fresh contexts off/.test(text) && /mode fresh/.test(text), "the mode and its switch");
+  check(Boolean(clicks["pa-context-mode"]) && /Fresh contexts: on/.test(P145.tip(v, "pa-context-mode")), "the switch, on");
   check(Boolean(clicks["pa-restart"]), "Restart still there");
   check(ctxRuns().length === 0, "nothing run without a click");
   await click(v, "view-costs"); await settle();
@@ -6563,109 +6563,22 @@ cases["P41-2-no-summary"] = async () => { // R15, J5-D1: no summary: no line onc
   await click(v, "view-costs"); await settle();
   const { text, clicks } = look(v);
   check(!text.includes("PA context today") && !text.includes("open the Costs tab"), `no line (got ${text.slice(0, 600)})`);
-  check(Boolean(clicks["pa-fresh"]) && Boolean(clicks["pa-context-mode"]) && Boolean(clicks["pa-restart"]), `button, switch, Restart (got ${Object.keys(clicks)})`);
+  check(Boolean(clicks["pa-context-mode"]) && Boolean(clicks["pa-restart"]), `switch, Restart (got ${Object.keys(clicks)})`);
 };
 
-cases["P41-3-button-when"] = async () => { // R6: only live + accepts "context" + mode fresh; the switch while not offline
+cases["P41-3-button-when"] = async () => { // R13 (t-145): the switch while not offline, whatever the launcher accepts; its state in its tooltip
   ctxWorld({ launcher: LREC({ accepts: ["restart"] }) });
   let v = await liveMount();
-  check(!look(v).clicks["pa-fresh"] && Boolean(look(v).clicks["pa-context-mode"]), "accepts restart only: no button, the switch stays");
+  check(Boolean(look(v).clicks["pa-context-mode"]) && !look(v).clicks["pa-fresh"], "accepts restart only: the switch, no force control");
   ctxWorld({ context: { v: 1, mode: "off", taskCap: 150000, passCap: 250000, net: 400000, enabledAt: null, by: "person" } });
   v = await liveMount();
-  check(!look(v).clicks["pa-fresh"] && /Turn fresh contexts on/.test(look(v).text) && /mode off/.test(look(v).text), `mode off: no button, Turn on (got ${look(v).text.slice(0, 700)})`);
+  check(/Fresh contexts: off/.test(P145.tip(v, "pa-context-mode")) && /turn them on/.test(P145.tip(v, "pa-context-mode")), `mode off (got ${P145.tip(v, "pa-context-mode")})`);
   world(); // not running
-  g.__files[`:${DIR}/costs/summary.json`] = JSON.stringify(SUMMARY41);
   v = await liveMount();
-  check(!look(v).clicks["pa-fresh"] && Boolean(look(v).clicks["pa-context-mode"]) && look(v).text.includes("PA context: open the Costs tab to read it."), `down: no button; the line and the switch stay (got ${look(v).text.slice(0, 700)})`);
+  check(Boolean(look(v).clicks["pa-context-mode"]), "down: the switch stays");
   world({ machine: M }); g.__machines = [{ name: null, layout: "ready" }, { name: M, layout: "offline" }];
   v = await liveMount();
-  check(!look(v).clicks["pa-fresh"] && !look(v).clicks["pa-context-mode"], "offline: neither");
-};
-
-cases["P41-4-dry-run"] = async () => { // R6: the click asks first: one dry run on the space's machine, its lines
-  let release;
-  ctxWorld({ fresh: (args) => (args.includes("--dry-run") ? new Promise((r) => { release = () => r(DRY41({ reasons: ["turn working", "checkpoint none"] })); }) : ASKED41) });
-  const v = await liveMount();
-  await click(v, "pa-fresh");
-  check(/Checking/.test(look(v).text), `checking (got ${look(v).text.slice(0, 500)})`);
-  if (look(v).clicks["pa-fresh"]) await click(v, "pa-fresh");
-  check(ctxRuns().length === 1, `one dry run (got ${JSON.stringify(ctxRuns())})`);
-  check(JSON.stringify(ctxRuns()[0][1]) === JSON.stringify(["fresh", "--space", S, "--dry-run", "--json"]) && ctxRuns()[0][2] === null, `its argv (got ${JSON.stringify(ctxRuns()[0])})`);
-  release(); await settle(); await settle();
-  const { text, clicks } = look(v);
-  check(text.includes("Context now 260k (transcript).") && text.includes("A reset is due: pass cap."), `size and due (got ${text.slice(0, 1200)})`);
-  check(text.includes("Not a clean point now: turn working; checkpoint none"), "the reasons");
-  check(text.includes("It waits for the Project Agent's next clean point (up to 2 h); a pass is never cut short."), "what it does");
-  check(Boolean(clicks["pa-fresh-go"]) && Boolean(clicks["pa-fresh-cancel"]) && !clicks["pa-fresh-withdraw"], `Ask, Cancel, no Withdraw (got ${Object.keys(clicks)})`);
-  check(/Ask for a fresh context/.test(text), "the ask's label");
-  check(ctxWrites().length === 0, "nothing asked yet");
-  await click(v, "pa-fresh-cancel");
-  check(!look(v).clicks["pa-fresh-go"] && ctxWrites().length === 0, "Cancel: gone, nothing run");
-};
-
-cases["P41-5-ask"] = async () => { // R6: the request with --by panel; its line; a reload; nothing else run or ended
-  const { dir } = ctxWorld();
-  const v = await liveMount();
-  await click(v, "pa-fresh"); await settle();
-  check(look(v).text.includes("Clean point now: yes."), `clean (got ${look(v).text.slice(0, 900)})`);
-  const before = g.__reads.filter((r) => r === `${dir}/context.json`).length;
-  await click(v, "pa-fresh-go"); await settle(); await settle();
-  check(ctxWrites().length === 1 && JSON.stringify(ctxWrites()[0][1]) === JSON.stringify(ASK_ARGV) && ctxWrites()[0][2] === null, `its argv (got ${JSON.stringify(ctxWrites())})`);
-  check(look(v).text.includes("Fresh context asked for: it is taken at the Project Agent's next clean point (the request waits until 10:00)."), `the result (got ${look(v).text.slice(0, 900)})`);
-  check(g.__reads.filter((r) => r === `${dir}/context.json`).length > before, "a reload read context.json again");
-  check(!g.__hcs.some((a) => a[0] === "send"), `no hc send (got ${JSON.stringify(g.__hcs)})`);
-  check(!g.__writes.some((w) => /context(-request)?\.json/.test(JSON.stringify(w))), "the panel wrote neither file");
-  noEnding();
-  check(Boolean(look(v).clicks["pa-fresh"]), "the button is back");
-  advance(61000); await settle();
-  check(!look(v).text.includes("Fresh context asked for"), "the line goes after 60 s");
-};
-
-cases["P41-6-pending"] = async () => { // R6: a pending request: Ask again and Withdraw
-  ctxWorld({ fresh: (args) => (args.includes("--dry-run") ? DRY41({ request: "rq-abcdefgh-1", expires: `${DAY41}T09:30:00Z` })
-    : args.includes("--withdraw") ? { code: 0, stdout: `Withdrawn (rq-abcdefgh-1).\n${JSON.stringify({ outcome: "withdrawn", request: "rq-abcdefgh-1" })}\n`, stderr: "" } : ASKED41) });
-  const v = await liveMount();
-  await click(v, "pa-fresh"); await settle();
-  const { text, clicks } = look(v);
-  check(text.includes("Pending request rq-abcde, until 09:30.") && /Ask again \(replaces the pending one\)/.test(text), `pending (got ${text.slice(0, 900)})`);
-  check(Boolean(clicks["pa-fresh-withdraw"]), "Withdraw offered");
-  await click(v, "pa-fresh-withdraw"); await settle(); await settle();
-  check(ctxWrites().length === 1 && JSON.stringify(ctxWrites()[0][1]) === JSON.stringify(["fresh", "--space", S, "--withdraw", "--by", "panel", "--json", "--why", "the Fresh context button in the Project Agent panel"]), `withdraw argv (got ${JSON.stringify(ctxWrites())})`);
-  check(look(v).text.includes("Request withdrawn."), "said");
-};
-
-cases["P41-7-dry-refused"] = async () => { // R6: a refused dry run: its text, only Cancel
-  ctxWorld({ fresh: () => ({ code: 2, stdout: "", stderr: `${CTX}: no Project Agent in this space\n` }) });
-  const v = await liveMount();
-  await click(v, "pa-fresh"); await settle();
-  const { text, clicks } = look(v);
-  check(text.includes(`Not done: ${CTX}: no Project Agent in this space`), `the refusal (got ${text.slice(0, 700)})`);
-  check(!clicks["pa-fresh-go"] && !clicks["pa-fresh-withdraw"] && Boolean(clicks["pa-fresh-cancel"]), `only Cancel (got ${Object.keys(clicks)})`);
-  await click(v, "pa-fresh-cancel");
-  check(!look(v).text.includes("Not done:") && ctxWrites().length === 0, "Cancel: gone, nothing asked");
-};
-
-cases["P41-8-ask-refused"] = async () => { // R6: the tool refuses (mode off meanwhile); a missing tool on m1
-  ctxWorld({ fresh: (args) => (args.includes("--dry-run") ? DRY41() : { code: 2, stdout: "", stderr: `${CTX}: the context mode is off (context.json), so no fresh context is taken\n` }) });
-  let v = await liveMount();
-  await click(v, "pa-fresh"); await settle();
-  await click(v, "pa-fresh-go"); await settle(); await settle();
-  check(look(v).text.includes(`Not done: ${CTX}: the context mode is off (context.json), so no fresh context is taken`), `refused (got ${look(v).text.slice(0, 700)})`);
-  ctxWorld({ machine: M, fresh: () => { throw new Error(`exec: ${CTX}: not found`); } });
-  v = await liveMount();
-  await click(v, "pa-fresh"); await settle();
-  check(look(v).text.includes(`${CTX} is not installed on ${M}; run pa-sync --on ${M}.`), `missing (got ${look(v).text.slice(0, 700)})`);
-};
-
-cases["P41-9-hung"] = async () => { // R6: the request never answers: given up after its limit, said, the button back
-  ctxWorld({ fresh: (args) => (args.includes("--dry-run") ? DRY41() : new Promise(() => {})) });
-  const v = await liveMount();
-  await click(v, "pa-fresh"); await settle();
-  await click(v, "pa-fresh-go"); await settle();
-  check(/Asking…/.test(look(v).text) && !look(v).clicks["pa-fresh"], `Asking…, no button (got ${look(v).text.slice(0, 600)})`);
-  for (let i = 0; i < 6; i++) { advance(10000); await settle(); }
-  check(look(v).text.includes(`${CTX} did not answer in 35 s; the panel shows what it reads next.`), `given up (got ${look(v).text.slice(0, 700)})`);
-  check(Boolean(look(v).clicks["pa-fresh"]), "the button is back");
+  check(!look(v).clicks["pa-context-mode"], "offline: none");
 };
 
 cases["P41-10-mode-switch"] = async () => { // R13: one click each way; its line; the reload shows the new mode
@@ -6678,19 +6591,19 @@ cases["P41-10-mode-switch"] = async () => { // R13: one click each way; its line
   const v = await liveMount();
   await click(v, "pa-context-mode"); await settle(); await settle();
   check(ctxWrites().length === 1 && JSON.stringify(ctxWrites()[0][1]) === JSON.stringify(["set", "--space", S, "--by", "panel", "--mode", "off", "--json"]), `off argv (got ${JSON.stringify(ctxWrites())})`);
-  check(look(v).text.includes("Context mode off: no fresh contexts from now; the 400k net ends at its next start. Turn fresh contexts on undoes it."), `its line (got ${look(v).text.slice(0, 900)})`);
-  check(!look(v).clicks["pa-fresh"] && /Turn fresh contexts on/.test(look(v).text), "after the reload: no button, Turn on");
+  check(P145.tip(v, "pa-context-mode").includes("Context mode off: no fresh contexts from now; the 400k net ends at its next start. Turn fresh contexts on undoes it."), `its line, in the tooltip (t-145) (got ${P145.tip(v, "pa-context-mode")})`);
+  check(/Fresh contexts: off/.test(P145.tip(v, "pa-context-mode")), "after the reload: off");
   await click(v, "pa-context-mode"); await settle(); await settle();
   check(ctxWrites().length === 2 && JSON.stringify(ctxWrites()[1][1]) === JSON.stringify(["set", "--space", S, "--by", "panel", "--mode", "fresh", "--json"]), `fresh argv (got ${JSON.stringify(ctxWrites())})`);
-  check(Boolean(look(v).clicks["pa-fresh"]) && /Turn fresh contexts off/.test(look(v).text), "the button is back");
+  check(/Fresh contexts: on/.test(P145.tip(v, "pa-context-mode")), "on again");
   check(!g.__writes.some((w) => /context\.json/.test(JSON.stringify(w))), "the panel wrote no context.json itself");
 };
 
 cases["P41-11-invalid-settings"] = async () => { // R13: an invalid context.json: its note; the switch still runs the tool
   ctxWorld({ context: "{not json" });
   const v = await liveMount();
-  check(/context\.json is not valid \(.*\): the launcher uses the defaults/.test(look(v).text), `the note (got ${look(v).text.slice(0, 900)})`);
-  check(/Turn fresh contexts off/.test(look(v).text) && Boolean(look(v).clicks["pa-fresh"]), "the defaults: mode fresh");
+  check(/context\.json is not valid \(.*\): the launcher uses the defaults/.test(P145.tip(v, "pa-context-mode")), `the note, in the tooltip (t-145) (got ${P145.tip(v, "pa-context-mode")})`);
+  check(/Fresh contexts: on/.test(P145.tip(v, "pa-context-mode")), "the defaults: mode fresh");
   await click(v, "pa-context-mode"); await settle();
   check(ctxWrites().length === 1 && ctxWrites()[0][1][0] === "set", "the switch ran the tool");
 };
@@ -6699,11 +6612,13 @@ cases["P41-12-reset-line"] = async () => { // C6: the line while this conversati
   const lastReset = { at: `${DAY41}T07:02:00Z`, from: "3f2a9c1e-aaaa-bbbb-cccc-dddddddddddd", to: "s1", reason: "pass-cap", ctx: 260000 };
   ctxWorld({ launcher: LREC({ accepts: ["restart", "context"], lastReset }) });
   let v = await liveMount();
+  await click(v, "view-costs"); await settle(); // t-145: in the Costs tab
   check(look(v).text.includes("Fresh context at 07:02 (pass cap, 260k) · previous session 3f2a9c1e…"), `the line (got ${look(v).text.slice(0, 900)})`);
   await click(v, "copy-previous-session");
   check((g.__clipboard ?? []).includes(`/resume ${lastReset.from}`), `copied (got ${JSON.stringify(g.__clipboard)})`);
   ctxWorld({ launcher: LREC({ accepts: ["restart", "context"], lastReset }), sessionId: "s2" });
   v = await liveMount();
+  await click(v, "view-costs"); await settle();
   check(!look(v).text.includes("Fresh context at 07:02") && !look(v).clicks["copy-previous-session"], "another session: no line");
 };
 
@@ -6716,7 +6631,7 @@ cases["P41-13-no-summary-read"] = async () => { // J5-D1, t-009 R11: no summary.
   for (let i = 0; i < 3; i++) { advance(31000); await fire(10000); await settle(); }
   check(ctxReads() > c0, "context.json read again");
   check(summaryReads(dir).length === 0, `no summary.json read (got ${summaryReads(dir).length})`);
-  check(look(v).text.includes("PA context: open the Costs tab to read it."), `the line (got ${look(v).text.slice(0, 700)})`);
+  check(!look(v).text.includes("PA context"), `no line outside the Costs tab (t-145) (got ${look(v).text.slice(0, 700)})`);
 };
 
 cases["P41-14-remote"] = async () => { // R6, R13: a space on m1: reads and runs there; no --on
@@ -6724,17 +6639,8 @@ cases["P41-14-remote"] = async () => { // R6, R13: a space on m1: reads and runs
   const v = await liveMount();
   check(g.__reads.includes(`${dir}/context.json`) && summaryReads(dir).length === 0, `context.json on ${M}, no summary read (got ${JSON.stringify(g.__reads.filter((r) => /context|summary/.test(r)))})`);
   check(!g.__reads.some((r) => /context\.json|summary\.json/.test(r) && !r.startsWith(`${M}:`)), "nothing local");
-  await click(v, "pa-fresh"); await settle();
-  await click(v, "pa-fresh-go"); await settle();
   await click(v, "pa-context-mode"); await settle();
-  check(ctxRuns().length === 3 && ctxRuns().every(([, a, on]) => on === M && !a.includes("--on")), `all on ${M}, no --on (got ${JSON.stringify(ctxRuns())})`);
-};
-
-cases["P41-15-last-outcome"] = async () => { // Q7: the last request's outcome in the confirm when it was not taken
-  ctxWorld({ launcher: LREC({ accepts: ["restart", "context"], context: { request: "rq0", outcome: "expired", why: null, at: `${DAY41}T06:00:00Z` } }) });
-  const v = await liveMount();
-  await click(v, "pa-fresh"); await settle();
-  check(look(v).text.includes("Last request: expired at 06:00"), `said (got ${look(v).text.slice(0, 900)})`);
+  check(ctxRuns().length === 1 && ctxRuns().every(([, a, on]) => on === M && !a.includes("--on")), `all on ${M}, no --on (got ${JSON.stringify(ctxRuns())})`);
 };
 
 cases["P41-16-cross-midnight"] = async () => { // MF-J5-1: a read from an earlier UTC day names its day, never "no calls yet"
@@ -6745,6 +6651,7 @@ cases["P41-16-cross-midnight"] = async () => { // MF-J5-1: a read from an earlie
   check(look(v).text.includes("PA context today (UTC): mean 158k · peak 254k · resets 6 (fresh 6, compact 0) (as of 23:50)"), `at read time (got ${look(v).text.slice(0, 900)})`);
   await click(v, "view-tasks"); await settle();
   advance(20 * 60000); await fire(1000); await settle(); // 00:10 UTC the next day; the Costs view is not shown
+  v.view = "costs"; // t-145: the line is in the Costs tab; drawn from the read already made
   const text = look(v).text;
   check(!text.includes("no Project Agent calls yet") && !text.includes("PA context today"), `not today's, not "no calls" (got ${text.slice(0, 900)})`);
   check(text.includes(`PA context ${DAY41} (UTC): mean 158k · peak 254k · resets 6 (fresh 6, compact 0) (as of ${DAY41.slice(5)} 23:50)`), `the read's day named (got ${text.slice(0, 900)})`);
@@ -6756,6 +6663,7 @@ cases["P41-17-summary-yesterday"] = async () => { // MF-J5r2-1: the summary's ow
   g.__now = T0 + (16 * 60 + 10) * 60000; // 00:10 UTC the day after DAY41
   await click(v, "view-costs"); await settle();
   await click(v, "view-tasks"); await settle();
+  v.view = "costs"; // t-145: the line is in the Costs tab; drawn from the read already made
   const text = look(v).text;
   check(!text.includes("no Project Agent calls yet") && !text.includes("PA context today"), `not today's, not "no calls" (got ${text.slice(0, 900)})`);
   check(text.includes(`PA context ${DAY41} (UTC): mean 158k · peak 254k · resets 6 (fresh 6, compact 0) (as of ${DAY41.slice(5)} 23:50)`), `the summary's day and time (got ${text.slice(0, 900)})`);
@@ -6771,6 +6679,7 @@ cases["P41-18-no-updated"] = async () => { // MF-J5r2-1: no updated, or one that
     check(look(v).text.includes("PA context today (UTC): mean 158k · peak 254k · resets 6 (fresh 6, compact 0) (as of 23:50)"), `${updated}: at read time (got ${look(v).text.slice(0, 900)})`);
     await click(v, "view-tasks"); await settle();
     advance(20 * 60000); await fire(1000); await settle(); // 00:10 UTC the next day
+    v.view = "costs"; // t-145: the line is in the Costs tab; drawn from the read already made
     check(look(v).text.includes(`PA context ${DAY41} (UTC): mean 158k · peak 254k · resets 6 (fresh 6, compact 0) (as of ${DAY41.slice(5)} 23:50)`), `${updated}: the read's day (got ${look(v).text.slice(0, 900)})`);
   }
 };
