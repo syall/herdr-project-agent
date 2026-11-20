@@ -6638,6 +6638,33 @@ cases["P37-notice-text"] = async () => { // R14: the notice says tools too, offe
   check(!/changed since it started/.test(look(v).text), "current and nothing stale: no notice");
 };
 
+cases["P195-swap-notice"] = async () => { // t-195 R3.2: what the notice says when only the tools are older
+  const SELF = "It loads the installed tools by itself within a few minutes, without ending its turn (or Restart now).";
+  const TODAY = "Restart reloads them (or /exit in its tab).";
+  const SWAP = ["restart", "context", "swap"], at = "2026-11-20T10:06:00Z";
+  const d = new Date(at), hhmm = `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+  liveWorld({ launcher: LREC({ accepts: SWAP, code: { tools: "X" } }) });
+  let v = await liveMount(), text = look(v).text;
+  check(text.includes(`Its instructions or tools changed since it started (tools). ${SELF}`) && !text.includes(TODAY), `swap-capable, no failure (got ${text.slice(0, 900)})`);
+  check(Boolean(look(v).clicks["pa-restart-notice"]), "Restart now stays");
+  liveWorld({ launcher: LREC({ accepts: SWAP, code: { tools: "X" }, swapFailed: { at, installed: T64, why: "the self-check failed (exit 1)" } }) });
+  v = await liveMount(); text = look(v).text;
+  check(text.includes(`It could not load the installed tools by itself (the self-check failed (exit 1), at ${hhmm}). Restart reloads them.`) && !text.includes(SELF), `failed for the installed hash (got ${text.slice(0, 900)})`);
+  check(Boolean(look(v).clicks["pa-restart-notice"]), "a Restart button with the failure");
+  liveWorld({ launcher: LREC({ accepts: SWAP, code: { tools: "X" }, swapFailed: { at, installed: "Z".repeat(64), why: "older" } }) });
+  v = await liveMount(); text = look(v).text;
+  check(text.includes(SELF) && !/could not load/.test(text), `failed for an older install: no failure (got ${text.slice(0, 900)})`);
+  liveWorld({ launcher: LREC({ code: { tools: "X" } }) });
+  v = await liveMount(); text = look(v).text;
+  check(text.includes(`Its instructions or tools changed since it started (tools). ${TODAY}`) && !text.includes(SELF), `no swap in accepts: today's text (got ${text.slice(0, 900)})`);
+  liveWorld({ launcher: LREC({ accepts: SWAP, code: { tools: "X" }, session: { id: "s1", resume: true, prompt: "rebuilt", promptCore: "Y", core: "Y" } }) });
+  v = await liveMount(); text = look(v).text;
+  check(text.includes(`Its instructions or tools changed since it started (tools, core text). ${TODAY}`) && !text.includes(SELF), `core older: today's text (got ${text.slice(0, 900)})`);
+  liveWorld({ launcher: LREC({ accepts: SWAP, code: { tools: "X" } }), stale: "core/orchestrator.md\n" });
+  v = await liveMount(); text = look(v).text;
+  check(text.includes(TODAY) && !text.includes(SELF), `stale instructions: today's text (got ${text.slice(0, 900)})`);
+};
+
 cases["P37-recorded-core"] = async () => { // R14 + Q-J4-3: a recorded prompt: the notice says so; the confirm offers a new conversation
   liveWorld({ launcher: LREC({ session: { prompt: "recorded", promptCore: "Y" } }) });
   const v = await liveMount();

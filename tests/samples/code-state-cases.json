@@ -449,5 +449,77 @@
   "terminal": "t1",
   "word": "current",
   "capable": false
+ },
+ {
+  "name": "swapped launcher",
+  "launcher": {
+   "version": 2,
+   "accepts": [
+    "restart",
+    "context",
+    "swap"
+   ],
+   "instance": "i1",
+   "terminal": "t1",
+   "code": {
+    "tools": "TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT"
+   },
+   "session": {
+    "id": "s1",
+    "resume": true,
+    "core": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+    "prompt": "recorded",
+    "promptCore": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+   },
+   "swap": {
+    "at": "2026-11-20T10:05:00Z",
+    "fromTools": "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+    "count": 1
+   },
+   "swapFailed": null
+  },
+  "installed": {
+   "version": 1,
+   "tools": "TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT",
+   "core": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+  },
+  "terminal": "t1",
+  "word": "current",
+  "capable": true
+ },
+ {
+  "name": "swap failed, older tools",
+  "launcher": {
+   "version": 2,
+   "accepts": [
+    "restart",
+    "context",
+    "swap"
+   ],
+   "instance": "i1",
+   "terminal": "t1",
+   "code": {
+    "tools": "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+   },
+   "session": {
+    "id": "s1",
+    "resume": true,
+    "core": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+   },
+   "swap": null,
+   "swapFailed": {
+    "at": "2026-11-20T10:06:00Z",
+    "installed": "TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT",
+    "why": "w"
+   }
+  },
+  "installed": {
+   "version": 1,
+   "tools": "TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT",
+   "core": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+  },
+  "terminal": "t1",
+  "word": "older (tools)",
+  "capable": true
  }
 ]

@@ -1737,7 +1737,7 @@ class J4Settings(J4Base):  # R13, resets part
 
 class J4Records(J4Base):  # R16
     def test_r1_accepts(self):
-        self.assertEqual(pa.ACCEPTS, ["restart", "context"])
+        self.assertEqual(pa.ACCEPTS, ["restart", "context", "swap"])  # t-195 R1.2
 
     def test_r2_request_outcome_and_file_removed(self):
         self.request()

@@ -724,6 +724,17 @@ cases["S37-code-parity"] = async () => { // R14 AC14.1: the same table as pa.cod
   }
 };
 
+cases["S195-swap-state"] = async () => { // t-195 R3.2: the panel's reading of launcher.json swap / swapFailed
+  const T = "T".repeat(64), at = "2026-11-20T10:06:00Z", SWAP = ["restart", "context", "swap"];
+  const eq = (got, want, what) => check(JSON.stringify(got) === JSON.stringify(want), `${what}: ${JSON.stringify(want)} (got ${JSON.stringify(got)})`);
+  eq(store.swapState({ accepts: SWAP }, { tools: T }), { kind: "auto", why: null, at: null }, "capable");
+  eq(store.swapState({ accepts: SWAP, swapFailed: { at, installed: T, why: "w" } }, { tools: T }), { kind: "failed", why: "w", at }, "failed now");
+  eq(store.swapState({ accepts: SWAP, swapFailed: { at, installed: "Z", why: "w" } }, { tools: T }), { kind: "auto", why: null, at: null }, "failed for another hash");
+  eq(store.swapState({ accepts: ["restart", "context"] }, { tools: T }), { kind: "none", why: null, at: null }, "not capable");
+  eq(store.swapState(null, null), { kind: "none", why: null, at: null }, "nothing");
+  eq(store.swapState({ accepts: SWAP, swapFailed: { at: 5, installed: T, why: ["x"] } }, { tools: T }), { kind: "failed", why: null, at: null }, "wrong types");
+};
+
 cases["S37-code-state"] = async () => { // instance, prompt and the header's words
   const T = "T".repeat(64), C = "C".repeat(64);
   const rec = { version: 2, accepts: ["restart"], instance: "i-1", terminal: "t1", code: { tools: T }, session: { core: C, prompt: "recorded", promptCore: C } };

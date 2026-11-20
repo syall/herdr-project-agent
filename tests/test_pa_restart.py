@@ -169,7 +169,7 @@ class L1_RestartCapable(Base):
         ctx = self.record()
         rec = load(os.path.join(self.dir, "launcher.json"))
         self.assertEqual(rec["version"], 2)
-        self.assertEqual(rec["accepts"], ["restart", "context"])  # t-041 J4 adds "context" (ACCEPTS)
+        self.assertEqual(rec["accepts"], ["restart", "context", "swap"])  # t-041 J4 adds "context", t-195 "swap" (ACCEPTS)
         self.assertTrue(pa.restart_capable(rec))
         self.assertIs(ctx["launcher"]["accepts"], ctx["launcher"]["accepts"])
 
@@ -1432,8 +1432,14 @@ class AC9_1_OnlyTheOwnChild(unittest.TestCase):
         _kills = {fn.name for fn in _ast.walk(_tree) if isinstance(fn, _ast.FunctionDef) for n in _ast.walk(fn)
                   if isinstance(n, _ast.Call) and isinstance(n.func, _ast.Attribute) and n.func.attr == "kill"
                   and getattr(n.func.value, "id", None) == "os"}
-        self.assertEqual(_kills, {"signal_pid"}, "os.kill outside signal_pid")
-        self.assertEqual(text.count("os.kill("), 1)
+        # t-195 R2.7: and AdoptedChild.send_signal's (the adopted Claude, only while not reaped; end_child calls it)
+        self.assertEqual(_kills, {"signal_pid", "send_signal"}, "os.kill outside signal_pid and AdoptedChild.send_signal")
+        self.assertEqual(text.count("os.kill("), 2)
+        _adopted = [c for c in _ast.walk(_tree) if isinstance(c, _ast.ClassDef) and c.name == "AdoptedChild"]
+        self.assertEqual(len(_adopted), 1)
+        self.assertIn("send_signal", {n.name for n in _ast.walk(_adopted[0]) if isinstance(n, _ast.FunctionDef)
+                                      for k in _ast.walk(n) if isinstance(k, _ast.Call) and getattr(k.func, "attr", None) == "kill"
+                                      and getattr(k.func.value, "id", None) == "os"})
         _callers = {fn.name for fn in _ast.walk(_tree) if isinstance(fn, _ast.FunctionDef) for n in _ast.walk(fn)
                     if isinstance(n, _ast.Call) and getattr(n.func, "id", None) == "signal_pid"}
         self.assertEqual(_callers, {"end_pids", "send"}, "signal_pid called outside end_pids (its send step)")
@@ -1464,7 +1470,7 @@ class AC9_1_OnlyTheOwnChild(unittest.TestCase):
                             and node.func.attr in ("send_signal", "kill", "terminate")):
                         found.append(fn.name)
         self.assertTrue(found)
-        self.assertEqual(set(found) - {"end_child", "run_child", "signal_pid"}, set(), found)  # t-193: signal_pid
+        self.assertEqual(set(found) - {"end_child", "run_child", "signal_pid", "kill"}, set(), found)  # t-193: signal_pid; t-195: AdoptedChild.kill
 
 
 # ---- J2 round 2: the seven Must fix items (REVIEW J2 A M1-M5, B M1-M3; VERIFY J2 MF1-MF4; handoff-fix-j2.md) -------

@@ -518,8 +518,14 @@ class NoEnding(unittest.TestCase):
         _kills = {fn.name for fn in _ast.walk(_tree) if isinstance(fn, _ast.FunctionDef) for n in _ast.walk(fn)
                   if isinstance(n, _ast.Call) and isinstance(n.func, _ast.Attribute) and n.func.attr == "kill"
                   and getattr(n.func.value, "id", None) == "os"}
-        self.assertEqual(_kills, {"signal_pid"}, "os.kill outside signal_pid")
-        self.assertEqual(text.count("os.kill("), 1)
+        # t-195 R2.7: and AdoptedChild.send_signal's (the adopted Claude, only while not reaped; end_child calls it)
+        self.assertEqual(_kills, {"signal_pid", "send_signal"}, "os.kill outside signal_pid and AdoptedChild.send_signal")
+        self.assertEqual(text.count("os.kill("), 2)
+        _adopted = [c for c in _ast.walk(_tree) if isinstance(c, _ast.ClassDef) and c.name == "AdoptedChild"]
+        self.assertEqual(len(_adopted), 1)
+        self.assertIn("send_signal", {n.name for n in _ast.walk(_adopted[0]) if isinstance(n, _ast.FunctionDef)
+                                      for k in _ast.walk(n) if isinstance(k, _ast.Call) and getattr(k.func, "attr", None) == "kill"
+                                      and getattr(k.func.value, "id", None) == "os"})
         _callers = {fn.name for fn in _ast.walk(_tree) if isinstance(fn, _ast.FunctionDef) for n in _ast.walk(fn)
                     if isinstance(n, _ast.Call) and getattr(n.func, "id", None) == "signal_pid"}
         self.assertEqual(_callers, {"end_pids", "send"}, "signal_pid called outside end_pids (its send step)")
