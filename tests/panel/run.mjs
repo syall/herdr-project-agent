@@ -5220,7 +5220,7 @@ const check61 = (v) => {
   check(/Decisions · 30/.test(text), `the Decisions tab counts all 30 open cards (got ${text.match(/Decisions[^\n]{0,8}/)?.[0]})`);
   const shown = v.cards.filter((c) => c.card?.status === "open").map((c) => c.id);
   check(shown.length === 30 && shown.includes("d-wt-t-029"), `every open card listed, the last name too (got ${shown.length})`);
-  check(/170 answered · 30 older not shown/.test(text), `the answered line says how many were left out (got ${text.match(/\d+ answered[^\n]*/)?.[0]})`);
+  check(/answered · 10 shown · 160 archived · 30 older not loaded/.test(text), `the answered line says shown, archived and not loaded (t-157; got ${text.match(/answered[^|]*/)?.[0]})`);
 };
 
 cases["P61-open-last-batch"] = async () => { // R1, R2, R3: local batch, 230 cards, the 30 open ones sorting last: all shown, the count said
@@ -7625,7 +7625,7 @@ cases["P145-9-done-archived"] = async () => { // I8b: the done section draws its
   const v = await mount(); await settle();
   await click(v, "view-tasks"); await click(v, "tasks-done");
   let p = P145.parts(v);
-  check(p.includes("Task t-13") && p.includes("Task t-4") && !p.includes("Task t-3") && p.includes("13"), `the 10 most recent, the section counts 13 (got ${look(v).text.slice(0, 1200)})`);
+  check(p.includes("Task t-13") && p.includes("Task t-4") && !p.includes("Task t-3") && p.includes("10 shown · 3 archived"), `the 10 most recent, the section says 10 shown · 3 archived (t-157) (got ${look(v).text.slice(0, 1200)})`);
   check(/^▸ Archived \(3\)/.test(look(v).text.split(" | ").find((x) => /Archived/.test(x)) ?? "") && Boolean(look(v).clicks["tasks-done-archived"]), `the row (got ${look(v).text.slice(0, 1200)})`);
   await click(v, "tasks-done-archived");
   p = P145.parts(v);
@@ -7645,6 +7645,33 @@ cases["P145-10-merged-archived"] = async () => { // I8c: the queue's Merged show
   await click(v, "queue-merged-archived-0");
   text = look(v).text;
   check(/t-M3 \| merged/.test(text) && /t-M1 \| merged/.test(text) && text.indexOf("t-M3 | merged") < text.indexOf("t-M1 | merged"), `opened: the rest, newest first (got ${text})`);
+};
+
+// ---- t-157: the finished headings say shown and archived, not the loaded total ---------------------------------
+const P157 = { all: (v, id) => { const e = P145.el(v, id); return e ? inspect(e).text : ""; } };
+cases["P157-1-decisions-heading"] = async () => { // R1: 14 answered: 10 shown, 4 archived, the number of the Archived (n) row
+  world(); localCards(15, { open: 1 });
+  const v = await mount(); await settle();
+  check(P145.own(v, "pa-older") === "▸ answered · 10 shown · 4 archived", `folded (got ${P145.own(v, "pa-older")})`);
+  await click(v, "pa-older");
+  check(P145.own(v, "pa-older") === "▾ answered · 10 shown · 4 archived" && /^▸ Archived \(4\)/.test(P145.own(v, "pa-archive")), `opened (got ${P145.own(v, "pa-older")}; ${P145.own(v, "pa-archive")})`);
+  check(!/14 answered/.test(look(v).text), "no loaded total");
+};
+cases["P157-2-done-heading"] = async () => { // R2: done with 13: 10 shown, 3 archived; no bare total
+  world(); P145.ledger(Array.from({ length: 13 }, (_, i) => tq(`t-${i + 1}`, "done", i + 1)));
+  const v = await mount(); await settle();
+  await click(v, "view-tasks");
+  const h = P157.all(v, "tasks-done");
+  check(/done \| 10 shown · 3 archived/.test(h) && !/\b13\b/.test(h), `the heading (got ${h})`);
+};
+cases["P157-4-uncapped-headings"] = async () => { // R1, R2: nothing archived: the headings stay as they were
+  world(); localCards(3, { open: 1 });
+  P145.ledger(Array.from({ length: 3 }, (_, i) => tq(`t-${i + 1}`, "done", i + 1)));
+  const v = await mount(); await settle();
+  check(P145.own(v, "pa-older") === "▸ 2 answered", `decisions (got ${P145.own(v, "pa-older")})`);
+  await click(v, "view-tasks");
+  const h = P157.all(v, "tasks-done");
+  check(/done \| 3$/.test(h) && !/shown|archived/.test(h), `done (got ${h})`);
 };
 
 // --list prints the names that would run and runs none. An unknown name or option exits 2.
