@@ -25,6 +25,7 @@ x37 machine names (R11); x38 merge_parts's types (R12); x39 python3 3.8 (R13); x
 t-123 (earlier limits): x17d/x17e --json's own line and peek's lock (t-119), x25e facts.json counted, x25f a secret
 in the history, x26a/x26g each refusal's reason, x26c the probe's missing lines, x27c a step run (t-106 J1).
 Run in 2 shards by tests/run-all.sh (unit_shards).
+t-165: x43 stub-hc's file read takes --offset and --limit after the path (the watcher's form).
 """
 import json
 import os
@@ -2130,6 +2131,36 @@ class X42Docs(unittest.TestCase):
         self.assertIn("ended without an exit code", run[run.index("Exit:"):run.index('"""', run.index("Exit:"))])
         text = self.read("tests", "run-all.sh")
         self.assertIn("ended without an exit code", text[text.index("# Exit:"):text.index("# Node:")])
+
+
+class X43StubFileRead(unittest.TestCase):
+    """t-165 (VERIFY L2): stub-hc's `file read --on M <path> --offset N [--limit K]`, options after the path as the
+    watcher gives them, reads from line N (not the whole file from line 1) and is not counted as a whole read."""
+
+    def setUp(self):
+        self.root = os.path.realpath(tempfile.mkdtemp(prefix="t165-stub-"))
+        self.addCleanup(shutil.rmtree, self.root, True)
+        path = os.path.join(self.root, "box-1", "tmp", "pa-suite-t165x", "out.log")
+        os.makedirs(os.path.dirname(path))
+        with open(path, "w") as f:
+            f.write("".join("line {}\n".format(n) for n in range(1, 6)))
+
+    def read(self, *args):
+        env = dict(os.environ, STUB_HC_ROOT=self.root, STUB_HC_MACHINES="box-1")
+        env.pop("STUB_HC_FAIL", None)
+        r = subprocess.run([sys.executable, STUB, "file", "read"] + list(args), env=env, stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, universal_newlines=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r.stdout
+
+    def test_x43a_offset_and_limit_after_the_path(self):
+        log = "/tmp/pa-suite-t165x/out.log"
+        self.assertEqual(self.read("--on", "box-1", log, "--offset", "3"), "line 3\nline 4\nline 5\n")
+        self.assertEqual(self.read("--on", "box-1", log, "--offset", "2", "--limit", "2"), "line 2\nline 3\n")
+        self.assertEqual(self.read("--on", "box-1", "--offset", "4", log), "line 4\nline 5\n")  # before it too
+        self.assertFalse(os.path.exists(os.path.join(self.root, "box-1", "fullreads")), "an offset read is not whole")
+        self.assertEqual(self.read("--on", "box-1", log), "".join("line {}\n".format(n) for n in range(1, 6)))
+        self.assertTrue(os.path.exists(os.path.join(self.root, "box-1", "fullreads")), "a read without --offset is")
 
 
 if __name__ == "__main__":

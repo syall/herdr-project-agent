@@ -7,7 +7,8 @@ has a progress file under HERDR_PA_HOME/suite-runs (p1-p2), --module runs one un
 answers at once for a running part waits for its end (r2d), a killed slot step stops the run (r8c), the run's own
 limit after the slot (s10, s11), git link guards (g5, g6); t-117: the slot step's own variables are not the parts'
 (s12, R16), an inherited PA_SUITE_HC_SCOPE without HC_SCOPE reaches no hc call (h3, R19); t-103: the part list
-after its `=== parts` line, a failed part's tail never read as parts (f1, R14). The real script runs
+after its `=== parts` line, a failed part's tail never read as parts (f1, R14). t-165: a part killed from
+outside (no .end) still ends the run (r2e). The real script runs
 in a temp copy of the repo whose parts are stubs (stub.sh, chosen per part by STUB_<part>), so no real suite runs here."""
 import json
 import fcntl
@@ -314,6 +315,68 @@ class RunAll(unittest.TestCase):
                 # the stand-in's own "not a child" lines (stderr, between a part's lines in serial mode) left out
                 body = "".join(l for l in out.splitlines(True) if not l.startswith("wait: pid "))
                 self.assertIn("=== keeper harness\nkeeper says hello\nkeeper done\n--- keeper harness: ok\n", body)
+
+    def test_r2e_a_part_killed_from_outside_still_ends_the_run(self):
+        # t-165 (VERIFY L1): a part whose process group is SIGKILLed from outside writes no .end, .hung or .code;
+        # the shell reaps it, so it is neither running nor a zombie: the poll before `wait` must see it gone and
+        # the run go on (named FAILED), in parallel and serial, not poll until the part limit (900 s).
+        for serial in ("", "1"):
+            with self.subTest(serial=serial):
+                pids_file = os.path.join(self.tmp, "keeper.pids")
+                if os.path.exists(pids_file):
+                    os.remove(pids_file)
+                write(self.events, "")
+                log = os.path.join(self.tmp, "kill.out")
+                before = set(glob.glob(os.path.join(self.tmp, "run-all.*")))
+                with open(log, "w") as out:
+                    proc = subprocess.Popen(["sh", os.path.join(self.repo, "tests", "run-all.sh")], cwd=self.tmp,
+                                            env=self.env_for(PA_SERIAL=serial, keeper="child"),
+                                            stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
+                                            start_new_session=True)
+                stub = []
+                try:
+                    end = time.time() + 30
+                    while not os.path.exists(pids_file) and time.time() < end:
+                        time.sleep(0.05)
+                    with open(pids_file) as f:
+                        stub = [int(p) for p in f.read().split()]  # the part's stub shell and its child
+                    folder = [d for d in glob.glob(os.path.join(self.tmp, "run-all.*")) if d not in before][0]
+                    with open(os.path.join(folder, "parts")) as f:
+                        i = [l.split("\t")[0] for l in f if l.split("\t")[1] == "keeper harness"][0]
+                    with open(os.path.join(folder, i + ".pid")) as f:
+                        part = int(f.read())
+                    group = os.getpgid(part)
+                    if group not in (os.getpgrp(), os.getpgid(proc.pid)):
+                        os.killpg(group, signal.SIGKILL)  # the part's own group: it and everything it started
+                    for p in [part] + stub:
+                        try:
+                            os.kill(p, signal.SIGKILL)
+                        except OSError:
+                            pass
+                    try:
+                        code = proc.wait(timeout=30)
+                    except subprocess.TimeoutExpired:
+                        code = None
+                    with open(log) as f:
+                        text = f.read()
+                    self.assertIsNotNone(code, "the run did not end after its part was killed: " + text)
+                    self.assertEqual(code, 1, text)
+                    self.assertIn("  keeper harness: FAILED", self.summary(text))
+                    self.assertTrue(text.rstrip().splitlines()[-1].startswith(
+                        "=== 1 part(s) failed: keeper harness (outputs: "), text)
+                    self.assertFalse(os.path.exists(os.path.join(folder, i + ".hung")), text)
+                finally:
+                    for p in stub + [proc.pid]:
+                        try:
+                            os.kill(p, signal.SIGKILL)
+                        except OSError:
+                            pass
+                    if proc.poll() is None:
+                        try:
+                            os.killpg(proc.pid, signal.SIGKILL)
+                        except OSError:
+                            pass
+                        proc.wait()
 
     def test_r2b_quiet_failure(self):
         code, out = self.run_all(store="quiet")
