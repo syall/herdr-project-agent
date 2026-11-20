@@ -160,7 +160,9 @@ export const NOT_RECORDED = "(not recorded)";
 export const acctWords = (key) => (key === NOT_RECORDED ? "account not recorded" : `account ${str(key)}`);
 const acctChipText = (key) => (key === NOT_RECORDED ? "not recorded" : str(key));
 // An entry's per-account parts [{key, tokens, money, unpricedTokens}] from its `accounts` (two or more) or its one
-// `account` (the whole entry); [] for an older summary or a malformed one (H12: no chip, no part). Kept per entry object
+// `account` (the whole entry); [] for an older summary or a malformed one (H12: no chip, no part), and [] when `accounts`
+// is a count (pa-costs' shrink dropped a mixed session's list; its `account` stays as its largest scope's, read by factsOf
+// only, t-177 round 3). Kept per entry object
 // (C7: the summary is the same object between renders), so a render looks each entry up once.
 const PARTS = new WeakMap();
 const okMoney = (m) => m === null || m === undefined || (typeof m === "number" && Number.isFinite(m));

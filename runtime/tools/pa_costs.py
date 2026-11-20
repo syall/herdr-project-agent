@@ -1864,9 +1864,11 @@ def account_fields(buckets):
 
 
 def entry_parts(e):
-    """An entry's per-account parts, from its `accounts` or its one `account` (the whole entry); [] without them."""
-    if isinstance(e.get("accounts"), list):
-        return [p for p in e["accounts"] if isinstance(p, dict) and isinstance(p.get("key"), str)]
+    """An entry's per-account parts, from its `accounts` or its one `account` (the whole entry); [] without them, and []
+    when `accounts` is a count (a mixed session whose list shrink dropped: its `account` is then its largest scope's, the
+    scope fact, never the whole session's)."""
+    if "accounts" in e:
+        return [p for p in e["accounts"] if isinstance(p, dict) and isinstance(p.get("key"), str)] if isinstance(e["accounts"], list) else []
     if isinstance(e.get("account"), str):
         return [{"key": e["account"], "tokens": e.get("tokens") or 0, "money": e.get("money"),
                  "unpricedTokens": e.get("unpricedTokens") or 0, "calls": e.get("calls") or 0}]
@@ -2463,11 +2465,13 @@ def fit_summary(s):
 def shrink(s):
     """One step towards SUMMARY_MAX: the sessions' accounts lists (t-177 R10), fewer sessions, then shorter session
     lists per task, then fewer tasks (paContext is never shrunk: fit_summary sets it aside first). A mixed session's
-    `account` (its largest scope's, DECISIONS D2) goes with its list: alone it would read as the whole session's."""
-    if any("accounts" in x for x in s["sessions"]):
+    list is replaced by its count: its `account` (its largest scope's, DECISIONS D2) stays, as t-032's scope fact (the
+    panel's largest-scope words and By scope drill), and the count says the list was dropped, so neither entry_parts
+    nor the panel's entryAccounts reads that account as the whole session's (round 3, DECISIONS D11)."""
+    if any(isinstance(x.get("accounts"), list) for x in s["sessions"]):
         for x in s["sessions"]:
-            if x.pop("accounts", None) is not None:
-                x.pop("account", None)
+            if isinstance(x.get("accounts"), list):
+                x["accounts"] = len(x["accounts"])
     elif s["sessions"]:
         s["sessions"] = s["sessions"][:len(s["sessions"]) * 3 // 4]
     elif any(t["sessions"] for t in s["byTask"]):
