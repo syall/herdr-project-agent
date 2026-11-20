@@ -170,11 +170,11 @@ export function renderQueue(t, rows, o = {}) {
   const note = (text, color) => div().px(4).py(4).text_size(12).text_color(color ?? t.dim).child(text);
   const line = (text, color) => div().text_size(11.5).text_color(color ?? t.muted).child(text);
   const live = (a) => Boolean(o.isLive?.(a));
-  // t-154: the task card's worker item. One with no ledger record and no live terminal is closed for all the view can tell: not drawn.
+  // t-154: the task card's worker item. One with no live terminal is drawn only when finished (t-160: not "(ended)").
   const worker = (e, w, k) => {
     const on = live(w.address);
     return workerItem(t, { id: `queue-worker-${e.key}-${k}`, live: on, status: on ? o.statusOf?.(w.address) ?? null : null, onClick: on ? () => o.onWorker?.(w.address) : null,
-      text: on ? `${w.label} ↗` : `${w.label} ${w.finished ? "(closed)" : "(ended)"}` });
+      text: on ? `${w.label} ↗` : `${w.label} (closed)` });
   };
   const toTask = (task) => (_e, cx) => { cx?.stop_propagation?.(); o.onTask?.(task, cx); };
   // t-154 (d-270): a Left or Merged entry as a task item: the head (id, title, state chip; a link to the task when the
@@ -207,7 +207,8 @@ export function renderQueue(t, rows, o = {}) {
         .child(div().text_size(11).text_color(t.dim).child(r.intoLine)))
       .when(!r.entries.length, (el) => el.child(line("Queue empty.", t.dim)))
       .children(r.entries.map((e) => {
-        const crew = e.workers.filter((w) => w.recorded || live(w.address));
+        // t-160 R1: a live one, or one the ledger records finished ("(closed)"); unfinished with no live terminal: not drawn.
+        const crew = e.workers.filter((w) => live(w.address) || (w.recorded && w.finished));
         return slotBox(t, `queue-slot-${e.key}`) // t-154: a slot, no number
         .child(h_flex().gap(8).items_center()
           .child(taskLink(t, { id: `queue-task-${e.key}`, task: e.task, linked: e.linked, onTask: o.onTask }))

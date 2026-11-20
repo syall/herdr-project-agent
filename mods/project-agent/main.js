@@ -1316,6 +1316,8 @@ export default class ProjectAgent extends View {
     // A press on the armed Delete or its Cancel stops here: a press anywhere else in the panel disarms (render's root).
     const keep = (el) => el.on_mouse_down("left", (_e, cx) => cx.stop_propagation());
     const crew = (task.workers ?? []).filter((w) => !(w?.finished && w?.closed));
+    const drawn = !open ? [] : crew.map((w) => { const address = space.machine ? `${space.machine}/${w.address}` : w.address; return { w, address, term: terminals().find((x) => x.address === address && x.state === "live") }; })
+      .filter((x) => x.term || x.w.finished);
     const tone = { "needs-decision": t.blocked, review: t.done, "in-progress": t.working, investigating: t.working, queued: t.muted, parked: t.dim, done: t.dim }[task.state] ?? t.muted;
     return v_flex().id(`task-${task.id}`).flex_none().rounded(7).border(1).border_color(t.border).bg(t.surface)
       .on_hover((on, cx) => { if (on) this.hovered = task.id; else if (this.hovered === task.id) this.hovered = null; cx.notify(); }) // t-142
@@ -1349,14 +1351,13 @@ export default class ProjectAgent extends View {
         .child(div().text_size(11).text_color(t.dim).child(sel(`sel-kind-${task.id}`, [task.type, task.tier && `${task.tier} tier`].filter(Boolean).join(" · "))))
         // Its workers: a live one opens in the Agents view. One closed with pa-worker close (finished,
         // closed set) is not drawn; its ledger entry stays (only the panel leaves it out). None left: no row.
-        .when(crew.length > 0, (e) => e.child(h_flex().gap(6).flex_wrap().children(crew.map((w, i) => {
-          const address = space.machine ? `${space.machine}/${w.address}` : w.address;
-          const term = terminals().find((x) => x.address === address && x.state === "live");
+        // t-160 R1: one not finished whose terminal is gone is not drawn either (the Copy text still lists it "(ended)").
+        .when(drawn.length > 0, (e) => e.child(h_flex().gap(6).flex_wrap().children(drawn.map(({ w, address, term }, i) => {
           // Read-only marks the tools write: "kept" (pa-worker keep); "(closed)" only for a finished entry with no closed stamp.
           const label = `${w.role ?? "worker"} ${w.address ?? ""}`.trim() + (w.keep ? " · kept" : "");
           // t-142: the shared worker item (tasks.js workerItem), also drawn for the worker lines in Places.
           return workerItem(t, { id: `worker-${task.id}-${i}`, live: Boolean(term), status: term?.status ?? null, onClick: term ? () => this.showAgent(address) : null,
-            text: term ? `${label} ↗` : w.finished ? `${label} (closed)` : `${label} (ended)`,
+            text: term ? `${label} ↗` : `${label} (closed)`,
             // The × opens the delete dialog: the person's way to close any worker (the agent closes finished ones itself).
             // It stops the press, so it drops an armed Delete itself (the root never sees this press).
             trailing: div().id(`worker-x-${task.id}-${i}`).flex_none().px(3).text_color(t.dim).cursor_pointer().hover((s) => s.text_color(t.blocked))
