@@ -40,7 +40,8 @@ none). A wait ends after SLOT_WAIT_LIMIT s (PA_SUITE_WAIT_LIMIT) or once this pr
 The command gets PA_SUITE_SLOT, PA_SUITE_SLOT_PID (this process) and PA_SUITE_HOLD (the seconds waited, or held
 by the caller). t-079 I2: with PA_SUITE_RUN_LIMIT (seconds; the affected-tests hook gives it) a command run on this
 Mac that is still running that long after it got the slot is ended (TERM, KILL after STOP_GRACE): last line
-`run-all.sh: did not finish on this Mac: ...`, exit 124; the variable is not passed on. A run started from a shell
+`run-all.sh: did not finish on this Mac: ...`, exit 124; the variable is not passed on. t-147: a run on this Mac
+is ended at PA_SUITE_DEADLINE too (after a fallback that spent time, say), with the same line naming the deadline. A run started from a shell
 that then exits (nohup ... &) stops waiting for the slot (its caller is gone): start it from a shell that stays. Script mode never loads pa.py (run-all.sh's test fixture stubs it): HERDR_PA_HOME and a UTC clock.
 t-107 J2: with suiteMachines configured, a `--affected` or `--module test_x` run of this tree's run-all.sh that no
 caller placed (no trusted caller slot, PA_SUITE_REMOTE and PA_SUITE_LOCAL_RUN unset) goes to a machine through
@@ -885,7 +886,7 @@ def run_under_slot(argv):
     watcher = Watcher(progress, watch, medians, floor_limit()) if progress else None
     if watcher:
         watcher.start()
-    child, code, over = None, 1, False
+    child, code, over, late = None, 1, False, False
 
     def forward(sig, frame):  # TERM, INT or HUP to this process goes to the run, which stops its parts
         if child is not None and child.poll() is None:
@@ -895,10 +896,14 @@ def run_under_slot(argv):
         for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
             signal.signal(sig, forward)
         child = subprocess.Popen(command, env=env)
+        # t-079 I2: its own limit after the slot; t-147 (t-079 R-2): never past the deadline (a fallback here that
+        # spent time, a deadline nearer than the wait plus the run limit), as on a machine
+        ends = [t for t in (started + run_limit if run_limit else None, at) if t is not None]
         try:
-            code = child.wait(timeout=run_limit)
-        except subprocess.TimeoutExpired:  # t-079 I2: past its own limit after the slot: TERM stops its parts
-            over = True
+            code = child.wait(timeout=max(0.0, min(ends) - time.time()) if ends else None)
+        except subprocess.TimeoutExpired:  # TERM stops its parts
+            late = at is not None and time.time() >= at
+            over = not late
             child.send_signal(signal.SIGTERM)
             try:
                 child.wait(timeout=STOP_GRACE)
@@ -919,6 +924,11 @@ def run_under_slot(argv):
         code = 124
         print("run-all.sh: did not finish on this Mac: it ran past its {} s limit after taking the slot "
               "(PA_SUITE_RUN_LIMIT); the run was ended".format(run_limit), flush=True)
+    elif late:  # the same, at the deadline (the remote path's line, on this Mac)
+        code = 124
+        print("run-all.sh: did not finish on this Mac: the deadline (PA_SUITE_DEADLINE) came after it ran {:.0f} s "
+              "(waited {:.0f} s for the slot); the run was ended".format(time.time() - started, started - queued),
+              flush=True)
     if own:
         update_progress(progress, state="done", exit=code, end=stamp())
     if placing and kind is not None:  # R19, T1: this Mac's run, recorded (a caller's or pa-run's records its own)

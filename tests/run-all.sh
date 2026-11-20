@@ -40,7 +40,8 @@
 # (pa-full-suite --status reads it) and stops a part past max(PA_PART_LIMIT or 900 s, 3x its recorded median),
 # writing <i>.hung; the summary names it HUNG, the other parts finish, and the run exits 1.
 # The run's own limit (t-079 I2): with PA_SUITE_RUN_LIMIT (the affected-tests hook's), the slot step ends a run
-# here still running that long after it took the slot: `run-all.sh: did not finish on this Mac: ...`, 124.
+# here still running that long after it took the slot: `run-all.sh: did not finish on this Mac: ...`, 124; also
+# at PA_SUITE_DEADLINE when that comes first (t-147: after falling back to this Mac, say).
 # A killed slot step (t-079 I3): under the slot step, a watchdog checks every 2 s that this script's parent is still
 # the step; when it is not (the step was killed, even with SIGKILL, and the slot is free again), every part is
 # stopped as for TERM and the run says so (exit 143).

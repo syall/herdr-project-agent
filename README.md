@@ -760,7 +760,8 @@ the same way (their first line says `run-all.sh: on box-1 (...)`); a run under `
 stays where it was placed. The hook's limit is a whole slot wait (840 s) plus the run's own 900 s, so a run that
 waited long for the slot still has its time: on this Mac the run is ended 870 s after it took the slot
 (`PA_SUITE_RUN_LIMIT`, `run-all.sh: did not finish on this Mac`, read as a test that may hang), and the hook gives
-it a deadline 30 s before its own limit (run `pa-hooks install` again in a worktree to get the longer hook
+it a deadline 30 s before its own limit, which ends a run on a machine or on this Mac too (after a fallback to this
+Mac that spent time, say) (run `pa-hooks install` again in a worktree to get the longer hook
 timeout). When the tests
 could not run there (no slot came free in time, not reachable with `"suiteFallback": "none"`) it says so rather than
 asking for a code fix. Every pa-run, run-all.sh and pa-full-suite run records its kind (affected, single, module,
