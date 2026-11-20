@@ -166,7 +166,9 @@ push card can be made and nothing about pushing changes. Agents never push a mai
   per task its main worktree first, exactly `{ task, path, title }`, then each other worktree it records,
   `{ task, path, title, job }`; a reader that wants one path per task takes the entry without `job`), `project-agent.workers`,
   `project-agent.timer`, `my-files.root` and `my-files.places` (for a Files view that honours
-  them). It reads `project-agent.show` (`{ space, task, at }`) to open a task on request.
+  them). It reads `project-agent.show` (`{ space, task, at, copy? }`) to open a task on request; its own task links
+  (Costs, Queue, Places; costs.js) set it with `copy`, the sending copy's id, and only that copy opens the task.
+  Without `copy` (another mod) every copy showing that space opens it; a copy made later never takes an older one.
 - Agents are recognised by the label `herdr.pa=<space-id>` that the launcher sets on its own
   terminal; a launcher waiting for the dialog's choice has `herdr.pa.ask`.
 

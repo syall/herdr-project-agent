@@ -214,6 +214,8 @@ export default class ProjectAgent extends View {
     this.contextBusy = {}; // space id -> { what: "ask" | "withdraw" | "mode" }
     this.contextMsg = {}; // space id -> { ok, text, at }
     this.me = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`; // this copy, for the timer lease
+    this.costs.copy = this.me; // t-160: the task links this copy sends are for this copy only
+    this.shownAt = shared("project-agent.show")?.at; // t-160: a request made before this copy is not for it
     this.schedule = { open: false, error: null, custom: null, quietFrom: null, quietTo: null }; // the schedule bar
     // The 15 s pass: one at a time (t-053: a tick still waiting on a call is not joined by another).
     this.ticking = false;
@@ -1615,9 +1617,10 @@ export default class ProjectAgent extends View {
     const kept = (c) => Boolean(c.card) && c.card.status !== "open" && this.push.kept(space.id, c.id);
     const listed = this.cards.filter((c) => !c.card || c.card.status === "open" || kept(c));
     const answered = this.cards.filter((c) => c.card && c.card.status !== "open" && !kept(c));
-    // Another mod asked to show a task (shared "project-agent.show": { space, task, at }): once.
+    // Another mod asked to show a task (shared "project-agent.show": { space, task, at, copy? }): once. t-160: one naming a
+    // copy (this mod's task links: Costs, Queue, Places) is for that copy only; one without, for a copy showing its space.
     const ask = shared("project-agent.show");
-    if (ask && ask.space === space.id && ask.at !== this.shownAt) {
+    if (ask && ask.space === space.id && ask.at !== this.shownAt && (ask.copy == null || ask.copy === this.me)) {
       this.shownAt = ask.at; this.view = "tasks"; this.open.add(ask.task); this.disarm();
       const state = tasks.find((x) => x.id === ask.task)?.state;
       if (state) this.folded.delete(state);

@@ -167,12 +167,13 @@ export class CostsPane {
     this.spaces = new Map(); // space id -> its state (most recently shown last; at most CACHE_MAX)
     this.seq = 0;
     this.showAt = 0; // t-143: the last task link's request stamp (each one new, so main.js takes it)
+    this.copy = null; // t-160: this panel copy's id (main.js): a request names it, so only this copy takes it
   }
 
   // t-143: a task link: ask the panel to show the task in the Tasks tab (main.js reads "project-agent.show" in render).
   openTask(space, task, cx) {
     this.showAt = Math.max(Date.now(), this.showAt + 1);
-    setShared("project-agent.show", { space: space.id, task, at: this.showAt });
+    setShared("project-agent.show", { space: space.id, task, at: this.showAt, ...(this.copy ? { copy: this.copy } : {}) });
     cx.notify();
   }
 
