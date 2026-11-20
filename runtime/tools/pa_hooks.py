@@ -50,6 +50,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -159,19 +160,26 @@ def command_for(kind, agent, profile):
     return value or None
 
 
-def changed_files(root, every=False):
-    """The worktree's uncommitted files; every=True lists each file under an untracked folder, not the folder."""
+def git_status(root, every=False):
+    """The worktree's uncommitted files, or None when git cannot answer in 30 s; every=True lists each file under an
+    untracked folder, not the folder. -z: paths as they are, never quoted (t-136, t-133 RL6)."""
     try:
-        out = subprocess.run(["git", "status", "--porcelain"] + (["--untracked-files=all"] if every else []), cwd=root, stdout=subprocess.PIPE,
-                             stderr=subprocess.DEVNULL, universal_newlines=True, timeout=30).stdout
+        out = subprocess.run(["git", "status", "--porcelain", "-z"] + (["--untracked-files=all"] if every else []), cwd=root,
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=30).stdout
     except (OSError, subprocess.TimeoutExpired):
-        return []
-    files = []
-    for line in out.splitlines():
-        path = line[3:].split(" -> ")[-1].strip().strip('"')
-        if path and not path.startswith(".claude/"):
-            files.append(path)
+        return None
+    files, fields = [], iter(out.decode("utf-8", "surrogateescape").split("\0"))
+    for entry in fields:
+        if "R" in entry[:2] or "C" in entry[:2]:  # a rename or copy: its source path is the next field
+            next(fields, None)
+        if entry[3:] and not entry[3:].startswith(".claude/"):
+            files.append(entry[3:])
     return files
+
+
+def changed_files(root, every=False):
+    """git_status's list; [] when git cannot answer."""
+    return git_status(root, every) or []
 
 
 TIMED_OUT = "(timed out after {} s)"  # run_shell's last line when the command outlived its limit
@@ -236,62 +244,136 @@ def hook_lint(data, _args):
 
 
 # t-133: a worker that changed nothing in its worktree since it started (a reviewer, verifier, check or design worker)
-# runs no affected tests at its end. The session-start hook records the worktree's state once per worker, in the temp
-# folder (nothing is written into the worktree); first write wins, so a resume or a compaction keeps the first state.
-START_DIR = None  # None: tempfile.gettempdir()
+# runs no affected tests at its end. The session-start hook records the worktree's state once per worker; first write
+# wins, so a resume or a compaction keeps the first state. t-136 (t-133 RL2): the record is in the space's own folder
+# (<space>/.hook-starts/, the user's, fenced for workers' editor writes; nothing is written into the worktree), 0600,
+# and one that is not the user's or that others can write is not read. (RL5) A snapshot that cannot be taken within
+# SNAPSHOT_LIMIT s (git status's own timeout included) is None: no start record, or at the end the tests run.
+START_DIR = None  # None: <space>/.hook-starts (tests set a folder of their own)
+SNAPSHOT_LIMIT = 20  # seconds a snapshot may take, git status and hashing together
+START_KEPT_DAYS = 30  # older records are removed when a new one is written
 
 
-def start_path(root, data):
+class OverBudget(Exception):
+    pass
+
+
+def start_path(record, data):
+    """The worker's start record, or None when the task's space has no folder here."""
     key = os.environ.get("HC_TERMINAL_ID") or "session:" + str(data.get("session_id") or "none")
-    digest = hashlib.sha1("{}\0{}".format(root, key).encode("utf-8")).hexdigest()[:24]
-    return os.path.join(START_DIR or tempfile.gettempdir(), "pa-hook-start-{}.json".format(digest))
+    digest = hashlib.sha1("{}\0{}".format(record["root"], key).encode("utf-8")).hexdigest()[:24]
+    folder = START_DIR
+    if not folder:
+        try:
+            directory = pa.space_dir(str(record.get("space") or ""))
+        except pa.Problem:
+            return None
+        folder = os.path.join(directory, ".hook-starts") if os.path.isdir(directory) else None
+    return folder and os.path.join(folder, "pa-hook-start-{}.json".format(digest))
+
+
+def hashed(path, digest, deadline):
+    """Adds the file's bytes to digest, 1 MB at a time; OverBudget past the deadline."""
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            digest.update(chunk)
+            if time.monotonic() > deadline:
+                raise OverBudget()
+    return digest
+
+
+def entry_state(path, deadline):
+    """A link's target (what git records, t-133 N2), a folder git lists whole (a nested repository: every path and
+    file below it), else the sha1 of the file's bytes."""
+    if os.path.islink(path):
+        return "link:" + os.readlink(path)
+    if not os.path.isdir(path):
+        return hashed(path, hashlib.sha1(), deadline).hexdigest()
+    digest = hashlib.sha1()
+    for top, dirs, names in os.walk(path):
+        dirs.sort()
+        for name in sorted(names) + [d for d in dirs if os.path.islink(os.path.join(top, d))]:
+            full = os.path.join(top, name)
+            digest.update(os.path.relpath(full, path).encode("utf-8", "surrogateescape") + b"\0")
+            try:
+                digest.update(("link:" + os.readlink(full)).encode("utf-8", "surrogateescape") if os.path.islink(full)
+                              else hashed(full, hashlib.sha1(), deadline).digest())
+            except OSError:
+                digest.update(b"gone")
+    return "dir:" + digest.hexdigest()
 
 
 def tree_state(root):
-    """{head, files: {path: sha1 of its bytes, or "gone"}} of the worktree's changed files, each file under an untracked
-    folder listed on its own (changed_files every=True), or None."""
+    """{head, files: {path: entry_state, or "gone"}} of the worktree's changed files, each file under an untracked
+    folder listed on its own (git_status every=True), or None (git did not answer, or over SNAPSHOT_LIMIT)."""
+    deadline = time.monotonic() + SNAPSHOT_LIMIT
     try:
         head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                               universal_newlines=True, timeout=30).stdout.strip()
     except (OSError, subprocess.TimeoutExpired):
         return None
-    files = {}
-    for rel in changed_files(root, every=True):
-        path = os.path.join(root, rel)
+    listed, files = git_status(root, every=True), {}
+    if listed is None or time.monotonic() > deadline:
+        return None
+    for rel in listed:
         try:
-            if os.path.isdir(path):  # a nested repository or a symlink to a folder: git lists no files under it
-                files[rel] = "dir:" + ",".join(sorted(os.listdir(path)))
-            else:
-                with open(path, "rb") as f:
-                    files[rel] = hashlib.sha1(f.read()).hexdigest()
+            files[rel] = entry_state(os.path.join(root, rel), deadline)
+        except OverBudget:
+            return None
         except OSError:
             files[rel] = "gone"
     return {"head": head, "files": files}
 
 
+def write_start(path, state):
+    """Writes the record once: a private temp file linked into place, so the first write wins even in a race."""
+    folder = os.path.dirname(path)
+    os.makedirs(folder, mode=0o700, exist_ok=True)
+    old = time.time() - START_KEPT_DAYS * 86400
+    for name in os.listdir(folder):
+        try:
+            if name.startswith("pa-hook-start-") and os.lstat(os.path.join(folder, name)).st_mtime < old:
+                os.unlink(os.path.join(folder, name))
+        except OSError:
+            pass
+    fd, temp = tempfile.mkstemp(dir=folder, prefix=".pa-hook-start-")  # 0600
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(state, f)
+        os.link(temp, path)
+    except FileExistsError:
+        pass
+    finally:
+        os.unlink(temp)
+
+
 def hook_session_start(data, _args):
     record = find_task(data.get("cwd") or os.getcwd())
-    if not record:
-        return 0
-    path = start_path(record["root"], data)
-    if os.path.exists(path):
+    path = record and start_path(record, data)
+    if not path or os.path.lexists(path):
         return 0
     state = tree_state(record["root"])
     if state is None:
         return 0
     try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        pa.write_json(path, dict(state, root=record["root"], task=record.get("task"), at=pa.now()))
+        write_start(path, dict(state, root=record["root"], task=record.get("task"), at=pa.now()))
     except OSError:
         pass
     return 0
 
 
-def unchanged_since_start(root, data):
-    start = pa.read_json(start_path(root, data))
-    if not isinstance(start, dict) or start.get("root") != root:
+def unchanged_since_start(record, data):
+    path = start_path(record, data)
+    try:
+        info = os.lstat(path) if path else None
+    except OSError:
+        info = None
+    if not info or not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022:
+        return False  # none, or not the user's own: the tests run
+    start = pa.read_json(path)
+    if not isinstance(start, dict) or start.get("root") != record["root"]:
         return False
-    now = tree_state(root)
+    now = tree_state(record["root"])
     return now is not None and now["head"] == start.get("head") and now["files"] == start.get("files")
 
 
@@ -345,7 +427,7 @@ def hook_affected(data, args):
     command = command_for("affected", agent, profile)
     if not files or not command:
         return 0
-    if unchanged_since_start(record["root"], data):
+    if unchanged_since_start(record, data):
         return 0
     # t-107 R14: the slot step's wait and a run on a machine end before this hook's own limit (less 30 s); t-079 I2:
     # a run on this Mac is ended by the slot step once it has run PA_SUITE_RUN_LIMIT s after taking the slot
@@ -3526,15 +3608,18 @@ def end_worker(directory, ledger, task, entry, address, info, report, by, trigge
     live raises, and nothing is recorded. Returns the line to print. Never touches the worktree, the
     branch, the task or the evidence. `by` goes into the entry's closedBy; `actor` (default: `by`) is
     who the journal line says ran it."""
-    note = ""
-    if info:
-        if info.get("state") == "live":
+    note, live = "", False
+    try:
+        if info and info.get("state") == "live":
             pa.call(["hc", "kill", address], check=False)
-            if pa.hc_get(address).get("state") == "live":
-                raise pa.Problem("hc kill did not end {} (it is still live); nothing was recorded".format(address))
-        pa.call(["hc", "rm", address], check=False)
-        if pa.hc_get(address):
-            note = " (ended {} but hc rm did not remove its record)".format(address)
+            live = pa.hc_get(address).get("state") == "live"
+        if info and not live:
+            pa.call(["hc", "rm", address], check=False)
+            note = " (ended {} but hc rm did not remove its record)".format(address) if pa.hc_get(address) else ""
+    except pa.Problem as e:  # t-136 (t-133 RL4): hc did not answer (the waiter's CALL_TIMEOUT); the kill may have landed
+        raise Refused("unsure", "{}: {} while it was being ended; it may have been closed".format(address, e))
+    if live:
+        raise pa.Problem("hc kill did not end {} (it is still live); nothing was recorded".format(address))
     stamp = pa.now()
     entry.update(finished=True, closed=stamp, closedBy=by, report=report)
     task["updated"] = stamp
@@ -3635,6 +3720,9 @@ WHEN_IDLE_POLL = 5  # seconds between its checks
 WHEN_IDLE_HC_TIMEOUT = 30  # seconds one hc call of the waiter may take (t-133: a hung hc cannot hold it, or the lock)
 
 
+WHEN_IDLE_START_GRACE = 60  # seconds a .starting marker counts as a waiter that has not yet taken its lock (t-136)
+
+
 def idle_file(directory, address, ext):
     return os.path.join(directory, ".close-when-idle-{}.{}".format(re.sub(r"[^A-Za-z0-9_-]", "_", address), ext))
 
@@ -3662,8 +3750,16 @@ def close_when_idle(directory, agent, profile, space, address, evidence):
     except FileNotFoundError:
         pass
     turn = pa.hc_get(address).get("status_ms")
-    spawn_idle_closer(directory, space, address, report_path(directory, task["id"], address, evidence),
-                      turn_ms=turn if isinstance(turn, (int, float)) and not isinstance(turn, bool) else None)
+    report = report_path(directory, task["id"], address, evidence)
+    starting = idle_file(directory, address, "starting")  # t-136 (t-133 RL3): a cancel before the child holds its lock
+    with open(starting, "w") as f:
+        f.write(pa.now() + "\n")
+    try:
+        spawn_idle_closer(directory, space, address, report,
+                          turn_ms=turn if isinstance(turn, (int, float)) and not isinstance(turn, bool) else None)
+    except BaseException:
+        os.unlink(starting)
+        raise
     return ["{} is working; it will be closed once it is idle (checked every {} s, for up to {} min), under the same checks, "
             "and the result journaled (trigger close-when-idle). Nothing more to do for it. To send it a follow-up "
             "first, run pa-worker close {} --cancel-when-idle.".format(
@@ -3690,6 +3786,10 @@ def wait_idle(directory, agent, profile, address, evidence, turn_ms=None):
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             return
+        try:
+            os.unlink(idle_file(directory, address, "starting"))  # its lock now says it is here
+        except FileNotFoundError:
+            pass
         saved, pa.CALL_TIMEOUT = pa.CALL_TIMEOUT, WHEN_IDLE_HC_TIMEOUT
         try:
             kind, text = waiting(directory, agent, profile, address, evidence, turn_ms)
@@ -3703,7 +3803,8 @@ def wait_idle(directory, agent, profile, address, evidence, turn_ms=None):
         return
     if kind == "working":
         text = "{} still working after {} s".format(address, WHEN_IDLE_LIMIT)
-    what = "left for the person; not closed" if kind == "blocked" else "not closed"
+    what = {"blocked": "left for the person; not closed",
+            "unsure": "run pa-worker close {} again to record it".format(address)}.get(kind, "not closed")
     task, _entry = recorded(read_ledger(directory), address)
     append_journal(directory, {"by": "agent" if by_an_agent() else "person", "trigger": "close-when-idle",
                                "task": (task or {}).get("id"), "why": "{}: {} (pa-worker close --when-idle)".format(text, what)})
@@ -3738,10 +3839,14 @@ def cancel_when_idle(directory, address):
                 running = False
             except OSError:
                 running = True
+        try:  # t-136 (t-133 RL3): spawned, and not yet holding its lock
+            running = running or time.time() - os.stat(idle_file(directory, address, "starting")).st_mtime < WHEN_IDLE_START_GRACE
+        except OSError:
+            pass
         task, entry = recorded(read_ledger(directory), address)
         done = entry and entry.get("finished")
         if running and done:  # the waiter closed it and has not yet left its lock: nothing is left to cancel
-            return ["{}: close --when-idle already closed {}; nothing to cancel.".format(address, address)]
+            return ["{}: already closed by close --when-idle; nothing to cancel.".format(address)]
         if not running:
             return ["{}: no pa-worker close --when-idle is waiting for {}; nothing to cancel{}.".format(
                 address, address, " (it is already closed)" if done else "")]

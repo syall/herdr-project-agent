@@ -380,8 +380,8 @@ class T025Removed(unittest.TestCase):  # AC1.1, AC2.1, AC3.1, AC4.4, R10
     def test_size(self):  # R10: about 230 lines (the build came to 245: DECISIONS.md, t-025 D4; t-041 J3's pa-context row: 254;
         # t-070 J2's price fetch row: 262; its round 3, a dotted module, runpy and python -c naming the module: 266;
         # its round 6, the D7 scan in its own function, run only on a line that names pa-costs: 269;
-        # t-133's pa-places write row (t-083 RL3): 275)
-        self.assertLessEqual(len(source("pa_guard.py").splitlines()), 275)
+        # t-133's pa-places write row (t-083 RL3): 275; t-136's D8 module and -c forms, in their own function: 288)
+        self.assertLessEqual(len(source("pa_guard.py").splitlines()), 288)
 
 
 class HookGuard(unittest.TestCase):
@@ -939,8 +939,8 @@ D8_MODULE_FORMS = [
     ("python3 -m runpy pa_places start t-1/b --worker t5",), ("python3 -m pdb -m tools.pa_places add t-1",),
     ("python3 -m PA_PLACES add t-1",),
     ("python3 -c '__import__(\"pa_places\").main()' add t-1", 'python3 -c __import__("pa_places").main() add t-1'),
-    ("python3 -c 'import sys,pa_places;sys.argv[1:]=[\"drop\",\"t-1/b\"];pa_places.main()'",
-     'python3 -c import sys,pa_places;sys.argv[1:]=["drop","t-1/b"];pa_places.main()'),
+    ("python3 -c '__import__(\"sys\").argv[1:]=[\"drop\",\"t-1/b\"];__import__(\"pa_places\").main()'",
+     'python3 -c __import__("sys").argv[1:]=["drop","t-1/b"];__import__("pa_places").main()'),
 ]
 D8_MODULE_ALLOWED = ["python3 -m pa_places next", "python3 -m pa_places show --json", "python3 -m pa_places_x add t-1",
                      "python3 -m mypa_places add t-1", "python3 -c 'import pa_places; print(pa_places.__file__)'",

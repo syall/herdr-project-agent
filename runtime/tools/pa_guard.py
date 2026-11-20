@@ -121,6 +121,20 @@ def fetches(words, names, first, n):  # D7: pa-costs, pa_costs.py, a module whos
     return "prices" in rest and "fetch" in rest[rest.index("prices") + 1:]  # t-070 J2 R12: read as words, after quotes and escapes
 
 
+def places_write(words, names, first, n, after, writes=("add", "block", "unblock", "drop", "start")):
+    """D8: pa-places, pa_places.py, a module whose last dotted part is pa_places (as D7) with a write after it, or python
+    -c '<code naming pa_places>' with a write word in or after it (t-136); PYTHON is matched only on a line naming it."""
+    for k in (k for k in range(first, n) if "pa_places" in words[k].lower() or names[k] == "pa-places"):
+        if k != first and not PYTHON.match(names[first]):
+            return False
+        if names[k] in ("pa-places", "pa_places.py") or (re.fullmatch(r"-[a-z]*?m([\w.]+)", names[k]) or (0, names[k]))[1].rsplit(".", 1)[-1] == "pa_places":
+            return after(k) in writes
+        c = k - 1 if k - 1 > first and re.fullmatch(r"-[A-Za-z]*c", words[k - 1]) else k  # -c '<code>' or -c<code>
+        if k > first and re.fullmatch(r"-[A-Za-z]*?c.*", words[c], re.S):
+            return any(w in writes for w in re.findall(r"[\w-]+", " ".join(words[k:])))
+    return False
+
+
 def row_of(words, d7=True):
     """The message of the first row (D1, D2, D3, D4) that this simple command matches, or None."""
     n, names, first = len(words), [program(w) for w in words], program_position(words)
@@ -141,7 +155,6 @@ def row_of(words, d7=True):
     removing = max([k for k, w in enumerate(words) if w in ("-d", "--delete")], default=-1)
     tool = next((word(k + 1) for k in range(first, n) if names[k] == "pa.py" and (k == first or PYTHON.match(names[first]))),
                 names[first][3:] if first < n and names[first][:3] == "pa-" else "")  # pa-<tool>, or pa.py <tool>
-    places = next((k for k, x in enumerate(names) if x in ("pa-places", "pa_places.py") and k >= first and (k == first or PYTHON.match(names[first]))), n)  # D8
     if any(word(j) in ("push", "send-pack", "http-push") or word(j) in ("subtree", "lfs") and after(j) == "push"
            for j in subs) or first < n and names[first] in ("git-push", "git-send-pack", "git-http-push"):
         row = DENY_PUSH
@@ -155,7 +168,7 @@ def row_of(words, d7=True):
         row = DENY_TOOLS
     elif tool in ("restart", "context"):  # pa-restart (t-037 J2), pa-context (t-041 J3), or pa.py restart|context
         row = DENY_RESTART if tool == "restart" else DENY_CONTEXT
-    elif places < n and after(places) in ("add", "block", "unblock", "drop", "start"):
+    elif places_write(words, names, first, n, after):
         row = DENY_PLACES
     elif d7 and fetches(words, names, first, n):  # d7: the line names pa-costs or pa_costs (check_command's prefilter)
         row = DENY_PRICES

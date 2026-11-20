@@ -759,6 +759,12 @@ failing-first, mutation, full), place, wall time, slot wait, the test's own time
 apart; `pa-run --report [--days N]` shows, per kind, the run counts and medians on this Mac and on each machine and
 says which is faster (3 runs each needed).
 
+The affected-tests hook runs nothing for a worker whose worktree is as it was when the worker started (a reviewer
+or a verifier in a worktree the builder left dirty). `pa-hook session-start` records that state once per worker, in
+the space's folder (`.hook-starts/`, readable by you only); a record that is missing, not yours, writable by others,
+or a worktree too big to snapshot in 20 s means the tests run. A worktree whose hooks were installed before this
+has no session-start hook: run `pa-hooks install` in it again to get it.
+
 ## Licence
 
 Apache License 2.0; see `LICENSE` and `NOTICE`.
