@@ -650,14 +650,18 @@ def cmd_hooks(args):
     space = pa.local_id(args.space or space_from_terminal() or "")
     if not space:
         raise pa.Problem("pass --space <id>, or run this from the Project Agent's terminal")
-    load_context(space)
+    _directory, agent, _profile = load_context(space)
+    locked = fix_lock_refusal(root, agent) if args.fix else None
     for event, entries in hook_settings().items():
         hooks.setdefault(event, []).extend(entries)
     deny = settings.setdefault("permissions", {}).setdefault("deny", [])
     deny.extend(r for r in DENY_RULES if r not in deny)
     pa.backup(path, "pa-hooks")
     pa.write_json(path, settings)
-    pa.write_json(task_path, {"task": args.task, "space": space, "fix": bool(args.fix), "installed": pa.now()})
+    record = {"task": args.task, "space": space, "fix": bool(args.fix), "installed": pa.now()}
+    if args.fix:
+        record["lockedAt"] = locked  # t-192 R1.2: HEAD when the lock went on (the tests job's last commit)
+    pa.write_json(task_path, record)
     # Keep both files out of commits without touching the repo's tracked ignore file.
     try:
         exclude = subprocess.run(["git", "rev-parse", "--git-path", "info/exclude"], cwd=root, stdout=subprocess.PIPE,
@@ -673,7 +677,28 @@ def cmd_hooks(args):
                     f.write(("" if have.endswith("\n") or not have else "\n") + "\n".join(missing) + "\n")
     except OSError:
         pass
-    print("Project Agent hooks installed in {} for task {}{}.".format(root, args.task, " (fix task: test files locked)" if args.fix else ""))
+    print("Project Agent hooks installed in {} for task {}{}.".format(
+        root, args.task, " (fix task: test files locked at {})".format(locked or "no commit") if args.fix else ""))
+
+
+def fix_lock_refusal(root, agent):
+    """t-192 R1.2: before `pa-hooks install --fix` locks test files, no live terminal other than the caller (its
+    HC_TERMINAL_ID, the Project Agent's agent.json terminal) may work inside the worktree (its cwd or its foreground's,
+    by realpath): the lock must not switch on under a running tests worker. Raises pa.Problem (fails closed when the
+    terminal list cannot be read); else HEAD's full id (None for no commit)."""
+    live = pa.live_terminals()
+    if live is None:
+        raise pa.Problem("the terminal list cannot be read (hc ls failed), so a tests worker may still be working in {}; "
+                         "the test files are not locked. Run it again once hc answers".format(root))
+    me = {a for a in (os.environ.get("HC_TERMINAL_ID"), agent.get("terminal")) if isinstance(a, str) and a}
+    busy = sorted(a for a, info in live.items() if a not in me and (
+        inside(info.get("cwd"), root) or inside((info.get("foreground") or {}).get("cwd"), root)))
+    if busy:
+        raise pa.Problem("{} {} working in {}: the test files are locked only once the tests worker is closed (close it, "
+                         "then run this again). Nothing was changed".format(", ".join(clean(a) for a in busy),
+                                                                           "is" if len(busy) == 1 else "are", root))
+    code, head, _err = git(root, "rev-parse", "--verify", "-q", "HEAD")
+    return head if not code and head else None
 
 
 # ---- pa-gate ----------------------------------------------------------------------------------

@@ -421,17 +421,17 @@ Run `hc --skill` once to learn `hc`. Start workers with the profile's commands (
   most 15 mutations; high, what the plan's verification points ask. Record a `check`
   worker in the ledger with role `check`; the gate counts it as the reviewer only for a
   low-tier task.
-- One git worktree per job. Record it in the task's `worktrees` with its job in the same
-  ledger write as creating it, before starting a worker in it, and record the worker's
-  `worktree` (its `--cwd`) in its entry. A task's `extraWorktrees` list is the old form:
-  rewrite it as `worktrees` entries the next time you write that task. Parallel workers
-  only when they touch different files.
-- Before starting the first worker in a worktree, install the verification hooks there:
-  `pa-hooks install <worktree> --task <task-id>` (add `--fix` for a bug fix: it locks test
-  files). They lint after each edit, run the affected tests when a task is marked complete
-  and before a session ends (not for a worker that changed nothing in its worktree since it
-  started, so a report-only worker closes at once), and block what cannot be taken back.
-  Never remove or edit them.
+- One git worktree per job (a bug fix's tests and fix jobs share one, in turn). Record it in the
+  task's `worktrees` with its job in the same ledger write as creating it, before starting a worker
+  in it, and record the worker's `worktree` (its `--cwd`) in its entry. A task's `extraWorktrees`
+  list is the old form: rewrite it as `worktrees` entries the next time you write that task.
+  Parallel workers only when they touch different files.
+- Before starting the first worker in a worktree, install the verification hooks there: `pa-hooks
+  install <worktree> --task <task-id>`; for a bug fix, once the tests worker is closed, again with
+  `--fix` (it locks test files) before the fix worker (`--blocked-by "tests job"`). They lint after
+  each edit, run the affected tests when a task is marked complete and before a session ends (not
+  for a worker that changed nothing in its worktree since it started, so a report-only worker
+  closes at once), and block what cannot be taken back. Never remove or edit them.
 - Workers take places. Kinds: `working` (a job that runs tests: build, fix, verifier,
   check), `no-test` (a job that runs none: design, plan-only, reviewer, docs-only, a watch)
   and `suite` (a job whose work includes the full-suite step: verifier, check, and a

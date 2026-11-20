@@ -4761,5 +4761,65 @@ class T136SnapshotLimits(Base):
         self.assertFalse(self.ran())
 
 
+class T192FixLock(Base):
+    """t-192 R1.2 (VP1): pa-hooks install --fix refuses while another live terminal works inside the worktree (a tests
+    worker), by realpath; records and prints lockedAt (HEAD); after it, the test-file lock blocks a tests/ edit."""
+
+    def setUp(self):
+        super().setUp()
+        self.proj = self.repo()
+        self.wt = self.worktree(self.proj, "t-001-fix")
+        self.head = sh(self.wt, "git", "rev-parse", "HEAD")
+
+    def install(self, path=None, *extra):
+        return self.run_cmd("pa-hooks", "install", path or self.wt, "--task", "t-001", "--space", "sp1", *extra)
+
+    def task_file(self):
+        p = os.path.join(self.wt, ".claude", "pa-task.json")
+        return load(p) if os.path.exists(p) else None
+
+    def test_vp1_a_tests_worker_inside_refuses_the_lock(self):
+        self.term("t31", "t-001-tests", cwd=os.path.join(self.wt, "tests"))  # H1.2: a subfolder counts
+        os.makedirs(os.path.join(self.wt, "tests"), exist_ok=True)
+        link = os.path.join(self.tmp, "link-to-wt")
+        os.symlink(self.wt, link)
+        here = os.getcwd()
+        os.chdir(os.path.dirname(self.wt))
+        self.addCleanup(os.chdir, here)
+        for given in (self.wt, self.wt + "/", os.path.basename(self.wt), link):  # H1.1
+            with self.subTest(given=given):
+                code, out, err = self.install(given, "--fix")
+                self.assertEqual(code, 2, out + err)
+                self.assertIn("t31 is working in {}".format(os.path.realpath(self.wt)), err)
+                self.assertIsNone(self.task_file(), "nothing is written")
+        code, out, err = self.install(None)  # without --fix (the tests job's install): no refusal
+        self.assertEqual(code, 0, err)
+        self.assertFalse(self.task_file()["fix"])
+        self.assertNotIn("lockedAt", self.task_file())
+
+    def test_vp1_lock_after_the_tests_worker_is_closed(self):
+        self.term("t31", "t-001-tests", cwd=self.wt, state="finished")
+        self.term("t32", "sibling", cwd=self.wt + "2")  # H1.3: a sibling whose name starts with the worktree's
+        os.makedirs(self.wt + "2")
+        self.term("t0", "the PA", cwd=self.wt)  # H1.4: the caller (agent.json's terminal) is not counted
+        self.term("t40", "me", cwd=self.wt)
+        with mock.patch.dict(os.environ, {"HC_TERMINAL_ID": "t40"}):  # H1.4: nor HC_TERMINAL_ID's
+            code, out, err = self.install(None, "--fix")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("(fix task: test files locked at {})".format(self.head), out)
+        self.assertEqual(self.task_file()["lockedAt"], self.head)
+        self.assertTrue(self.task_file()["fix"])
+        with self.assertRaises(SystemExit) as cm, contextlib.redirect_stderr(io.StringIO()):
+            pa_hooks.hook_test_lock({"cwd": self.wt, "tool_input": {"file_path": os.path.join(self.wt, "tests", "test_a.py")}}, [])
+        self.assertEqual(cm.exception.code, 2)
+
+    def test_h1_5_no_terminal_list_refuses(self):
+        pa.live_terminals = lambda: None
+        code, out, err = self.install(None, "--fix")
+        self.assertEqual(code, 2, out + err)
+        self.assertIn("the terminal list cannot be read", err)
+        self.assertIsNone(self.task_file())
+
+
 if __name__ == "__main__":
     unittest.main()

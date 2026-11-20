@@ -152,7 +152,8 @@ class Orchestrator(unittest.TestCase):
                       "unique in the task); `worktree` is the first of them. Mark an entry `\"removed\": \"<UTC time>\"` "
                       "once its worktree is removed, and `\"keep\": true` to keep that one whatever happens. A worker's "
                       "`worktree` is the folder it was started in.", self.text)
-        self.assertIn("- One git worktree per job. Record it in the task's `worktrees` with its job in the same ledger "
+        self.assertIn("- One git worktree per job (a bug fix's tests and fix jobs share one, in turn). Record it in the "
+                      "task's `worktrees` with its job in the same ledger "
                       "write as creating it, before starting a worker in it, and record the worker's `worktree` (its "
                       "`--cwd`) in its entry. A task's `extraWorktrees` list is the old form: rewrite it as `worktrees` "
                       "entries the next time you write that task. Parallel workers only when they touch different files.",
@@ -1524,6 +1525,12 @@ class T190RulesFollowed(unittest.TestCase):  # t-190 R1-R5, R8, R9: the space's 
     def test_r2_sdlc_practice(self):
         text = part(self.sdlc, "## Practices", "Separation of duties")
         self.assertIn("- Skills advise, hooks enforce: a policy that must always hold gets a hook. " + T190_SDLC, text)
+
+    def test_t192_r1_tests_then_fix_in_one_worktree(self):  # t-192 R1.1 (VP2)
+        text = flat(read("runtime", "core", "orchestrator.md"))
+        self.assertIn("for a bug fix, once the tests worker is closed, again with `--fix` "
+                      "(it locks test files) before the fix worker (`--blocked-by \"tests job\"`).", text)
+        self.assertNotIn("(add `--fix` for a bug fix: it locks test files)", text)
 
     def test_r9_core_stays_short(self):
         grown = {name: len(read("runtime", "core", name).splitlines()) - n for name, n in CORE_LINES_AT_BASE.items()}
