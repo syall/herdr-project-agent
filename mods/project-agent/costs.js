@@ -64,11 +64,13 @@ const NOT_FOUND = /not found|no such file|ENOENT|cannot (start|find)/i;
 export const notInstalled = (machine) => (machine ? `pa-costs is not installed on ${machine}; run pa-sync --on ${machine}.` : "pa-costs is not installed here; run ./install.sh.");
 
 // One pa-costs exec, on `machine` (null: here), given up GRACE after its own timeout. { r } or { error, missing }, or
-// { busy: true } when one of its kind is still pending (t-053: nothing started; the caller says nothing).
+// { busy: true } when one of its kind is still pending (t-053: nothing started; the caller says nothing); a call the
+// runtime refused is busy too, with the plain line a click shows (t-116, t-053 RL-2: "not started", never "skipped").
 // hcx: the task's context (CostsPane.ctx: the copy's Host, keyed per machine and command).
 async function call(hcx, machine, args, timeout) {
   try {
     const r = await capped(hcx, () => run("pa-costs", args, { on: machine ?? null, timeout }), { key: `pa-costs:${machine ?? ""}:${args.slice(0, 2).join(" ")}`, limit: timeout + GRACE, what: `pa-costs ${args[0]}` });
+    if (r?.refused === true) return { busy: true, refused: true, error: "not started: too many calls waiting" };
     if (gaveUp(r) && r !== TIMED_OUT) return { busy: true, error: "skipped" };
     if (r === TIMED_OUT) return { error: `pa-costs ${args[0]} did not answer in ${Math.round((timeout + GRACE) / 1000)} s` };
     if (r.code === 127) return { error: notInstalled(machine), missing: true };
