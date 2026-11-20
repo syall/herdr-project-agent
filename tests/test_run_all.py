@@ -908,8 +908,11 @@ class RunAll(unittest.TestCase):
     def test_s7_without_pa_suite_the_run_goes_on_and_says_so(self):
         os.remove(os.path.join(self.repo, "runtime", "tools", "pa_suite.py"))
         code, out = self.run_all("--affected")
-        self.assertEqual(code, 0, out)
+        # t-147 item 3: the 3.7 parse reads pa_suite.py too, so without it that one part fails; the run goes on
+        self.assertIn(code, (0, 1), out)
         self.assertIn("  suite slot: none", self.summary(out))
+        failed = re.findall(r"^=== \d+ part\(s\) failed: (.*) \(outputs: ", out, re.M)
+        self.assertIn(failed, ([], ["python 3.7 parse"]), out)
 
     def test_s8_a_caller_holding_the_slot_without_a_marker_is_not_waited_for(self):
         # t-072 round 2 (MF-1): a pa-full-suite from before t-072 holds the slot (its pid in the holder line) and
