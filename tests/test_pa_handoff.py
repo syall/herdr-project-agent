@@ -901,6 +901,8 @@ class NamedRefusals(Base):
         (["--mutation", "\u208bx"], 1, "starts with a dash"),
         (["--mutation", "\ufe63x"], 1, "starts with a dash"),
         (["--mutation", "\uff0dx"], 1, "starts with a dash"),
+        (["--mutation", "\u02d7x"], 1, "starts with a dash"),  # modifier letter minus (Sk), found by the probe
+        (["--mutation", "\u2796x"], 1, "starts with a dash"),  # heavy minus sign (So), found by the probe
         (["--mutation", " \u2013x"], 1, "starts with a dash"),
         # a leading Unicode space before '-' is stripped first (str.strip), then refused
         (["--mutation", "\u00a0-x"], 1, "starts with '-'"),
