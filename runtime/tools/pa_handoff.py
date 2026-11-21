@@ -52,6 +52,7 @@ FILE_OPTIONS = ("job", "base", "round", "diff", "logic", "no_mutations", "mutati
                 "repo", "force")
 MUTATION_KINDS = ("check", "recheck", "verify")  # t-198 R4: the kinds with a mutation step
 MUTATION_MAX, MUTATION_CHARS = 3, 240
+MINUS_SIGNS = "\u2212\u207b\u208b\u02d7\u2796"  # minus signs (Sm, Sk, So) that read as a dash; Pd is the rest
 DEFAULT_MUTATIONS = ("No mutations: this handoff names none (the default). A test gap you find is a Recorded limit, "
                      "never a Must fix, unless the spec or plan names it.")
 FEW_NOTE = ("r-few-mutations is active but no longer read: a check names no mutations unless --mutation names one "
@@ -128,8 +129,12 @@ def named_mutations(args):
             raise Refused("{}: one line only (no line break)".format(where))
         if any(unicodedata.category(c) == "Cc" for c in v):
             raise Refused("{}: a control character".format(where))
+        if any(unicodedata.category(c) == "Cf" for c in v):  # round 2: bidi, zero-width, BOM, soft hyphen
+            raise Refused("{}: an invisible format character".format(where))
         if v.startswith("-"):
             raise Refused("{}: starts with '-'".format(where))
+        if unicodedata.category(v[0]) == "Pd" or v[0] in MINUS_SIGNS:  # round 2: a dash that looks like '-'
+            raise Refused("{}: starts with a dash".format(where))
         if len(v) > MUTATION_CHARS:
             raise Refused("{}: too long (over {} characters; put detail in --items)".format(where, MUTATION_CHARS))
         key = v.casefold()
@@ -429,9 +434,10 @@ def mutations_line(f, out):
     if f.no_mutations:
         return "No mutations (a docs-only or test-only change)."
     if f.named:
+        named = "; ".join("({}) {}".format("abc"[i], v) for i, v in enumerate(f.named))  # round 2: no ".." (N1)
         return ("Only the mutations the spec or plan names, each running only the tests that cover it, never the suite "
-                "-> {}: {}. A named one that survives fails its verification point (Must fix). Run no others.".format(
-                    out, "; ".join("({}) {}".format("abc"[i], v) for i, v in enumerate(f.named))))
+                "-> {}: {}{} A named one that survives fails its verification point (Must fix). Run no others.".format(
+                    out, named, "" if named.endswith(".") else "."))
     return DEFAULT_MUTATIONS
 
 
