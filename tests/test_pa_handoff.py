@@ -813,8 +813,34 @@ class Named(Base):
         for n, value in enumerate(("a `$(rm -rf ~)` b", "**bold**", "..", "/etc/passwd", "~/x")):
             with self.subTest(value=value):
                 _p, text, _ = self.ok("check", "t-1", "--mutation", value, "--force")
-                self.assertIn("-> check-mut.log: (a) {}. A named".format(value), text)
+                end = "" if value.endswith(".") else "."  # round 2 (REVIEW N1): no ".." after a final "."
+                self.assertIn("-> check-mut.log: (a) {}{} A named".format(value, end), text)
         self.assertTrue(os.path.isdir(os.path.expanduser("~")))
+
+
+class NamedRound2(Base):
+    """t-198 round 2: REVIEW N1 (no ".." after a value ending in ".") and the L2 refusals' edges that stay accepted."""
+
+    def test_n1_final_full_stop_not_doubled(self):
+        self.write_rules(NO_FEW)
+        _p, text, _ = self.ok("check", "t-1", "--mutation", "drop the re.ASCII flag.")
+        self.assertIn("-> check-mut.log: (a) drop the re.ASCII flag. A named one", text)
+        self.assertNotIn("..", text.split("check-mut.log: ", 1)[1].split(" Run no others.")[0])
+
+    def test_n1_only_the_last_value_ends_the_sentence(self):
+        self.write_rules(NO_FEW)
+        _p, text, _ = self.ok("check", "t-1", "--mutation", "one.", "--mutation", "two", "--force")
+        self.assertIn("-> check-mut.log: (a) one.; (b) two. A named one", text)
+        _p, text, _ = self.ok("check", "t-1", "--mutation", "one", "--mutation", "two...", "--force")
+        self.assertIn("-> check-mut.log: (a) one; (b) two... A named one", text)
+
+    def test_l2_inner_dash_and_space_accepted(self):
+        self.write_rules(NO_FEW)
+        for n, value in enumerate(("a \u2013 b", "x\u00a0y", "a-b", "\u00e9t\u00e9 \u2212 1")):
+            with self.subTest(value=value):
+                _p, text, err = self.ok("check", "t-1", "--mutation", value, "--force")
+                self.assertIn("-> check-mut.log: (a) {}. A named".format(value), text)
+                self.assertEqual(err, "")
 
 
 class NamedRefusals(Base):
@@ -852,6 +878,34 @@ class NamedRefusals(Base):
         (["--mutat", "x"], 2, "unrecognized"),
         (["--no-mut"], 2, "unrecognized"),
         (["-mutation", "x"], 2, "unrecognized"),
+        # round 2 (REVIEW L2, class: a spelling that should be refused but passed): Unicode Cf anywhere
+        (["--mutation", "a\u202eb"], 1, "invisible format character"),
+        (["--mutation", "a\u200bb"], 1, "invisible format character"),
+        (["--mutation", "a\u200cb"], 1, "invisible format character"),
+        (["--mutation", "a\u200db"], 1, "invisible format character"),
+        (["--mutation", "a\ufeffb"], 1, "invisible format character"),
+        (["--mutation", "\ufeffx"], 1, "invisible format character"),
+        (["--mutation", "a\u2066b\u2069"], 1, "invisible format character"),
+        (["--mutation", "a\u00adb"], 1, "invisible format character"),
+        (["--mutation", "a\u2060b"], 1, "invisible format character"),
+        (["--mutation", "\u200b-x"], 1, "invisible format character"),
+        # a leading dash that is not ASCII: Unicode Pd and the minus signs
+        (["--mutation", "\u2010x"], 1, "starts with a dash"),
+        (["--mutation", "\u2011x"], 1, "starts with a dash"),
+        (["--mutation", "\u2012x"], 1, "starts with a dash"),
+        (["--mutation", "\u2013x"], 1, "starts with a dash"),
+        (["--mutation", "\u2014-force"], 1, "starts with a dash"),
+        (["--mutation", "\u2015x"], 1, "starts with a dash"),
+        (["--mutation", "\u2212x"], 1, "starts with a dash"),
+        (["--mutation", "\u207bx"], 1, "starts with a dash"),
+        (["--mutation", "\u208bx"], 1, "starts with a dash"),
+        (["--mutation", "\ufe63x"], 1, "starts with a dash"),
+        (["--mutation", "\uff0dx"], 1, "starts with a dash"),
+        (["--mutation", " \u2013x"], 1, "starts with a dash"),
+        # a leading Unicode space before '-' is stripped first (str.strip), then refused
+        (["--mutation", "\u00a0-x"], 1, "starts with '-'"),
+        (["--mutation", "\u3000-x"], 1, "starts with '-'"),
+        (["--mutation", "\u202f\u2013x"], 1, "starts with a dash"),
     ]
 
     def test_h1_h12_h14_h15(self):
