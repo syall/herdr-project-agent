@@ -5,7 +5,7 @@ Worktree <WT>, branch t-1-widget, HEAD <C2> (tests <C1>; base main <C0>). Full c
 You report; you never fix. The verifier's and reviewer's job in one:
 1. pa-full-suite once at HEAD (never under a timeout), output to full-suite-check.out. Known flakes: test_a test_x1; test_b test_y (a race). If only those fail, rerun each failing one alone and say so.
 2. Failing-first: the tests of <C1> fail at <C0> with the tests overlay and pass at HEAD (pa-run, --local only where a test needs this Mac; say where each ran) -> check-failing-first.out.
-3. At most 2 mutations on changed logic (r-few-mutations, low tier), each running only the tests that cover it -> check-mut.log.
+3. No mutations: this handoff names none (the default). A test gap you find is a Recorded limit, never a Must fix, unless the spec or plan names it.
 4. Review against each intent item. Judge D2 (the cache).
 Must-fix bar: breaks an intent item, a verification point, safety or security. Else Recorded limit (name a follow-up) or Nit.
 Write VERIFY.md and REVIEW.md, each ending 'Checked: <full HEAD id>' and 'Verdict: pass' or 'Verdict: must fix (<n>)'; REVIEW.md has 'Reviewer:' your own address (echo $HC_TERMINAL_ID).

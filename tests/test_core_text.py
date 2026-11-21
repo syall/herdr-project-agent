@@ -284,10 +284,16 @@ class Orchestrator(unittest.TestCase):
         workers = flat(self.raw[self.raw.index("## Workers"):self.raw.index("## Phases and gates")])
         self.assertIn("- Checks by tier (`sdlc.md`): low tier gets one `check` worker; normal a verifier and a "
                       "reviewer; high a verifier and two reviewers when its review is full, one on a diff review. Size the verifier's brief by "
-                      "tier: low, the full suite once, the diff, at most 5 mutations on changed logic; normal, add a "
-                      "failing-first run for each fix commit, at most 15 mutations; high, what the plan's "
-                      "verification points ask. Record a `check` worker in the ledger with role `check`; the gate "
+                      "tier: low, the full suite once and the diff; normal, add a failing-first run for each fix commit; "
+                      "high, what the plan's verification points ask. No tier runs mutations by default: a check "
+                      "runs one only where the spec or plan names it as a verification point, at most 3 per check, "
+                      "each running only the tests that cover it, and `pa-handoff` lists it (`--mutation`). Record a `check` worker in the ledger with role `check`; the gate "
                       "counts it as the reviewer only for a low-tier task. - One git worktree", workers)  # J10
+
+    def test_t198_r1_no_mutation_counts(self):  # t-198 R1, V1
+        text = flat(self.raw)
+        for gone in ("at most 5 mutations", "at most 15 mutations", "A space rule may set other numbers."):
+            self.assertNotIn(gone, text)
 
     def test_t017_j5_interim_sentence_gone(self):  # J5 removes the amendment B4 interim
         for name in ("orchestrator.md", "worker.md", "sdlc.md"):
@@ -425,10 +431,19 @@ class Worker(unittest.TestCase):
         self.assertIn("- Run the full test suite once per round with `pa-full-suite`; it appends the output to your "
                       "task's `build.log`. A verifier or check worker runs it at HEAD and no other suite-wide run at "
                       "that commit (not `--affected`, not the suite's own script); re-run single tests only (a "
-                      "failing-first check, a mutation). Builders: high tier, run it at the end of the Test phase, "
+                      "failing-first check, a mutation your handoff names). Builders: high tier, run it at the end of the Test phase, "
                       "before the commit; low and normal tier, the affected tests are enough, the verifier's run is "
                       "the round's.", verification)
         self.assertNotIn("Run the full test suite once, at the end of the Test phase", self.text)
+
+    def test_t198_r2_2_no_mutations_unless_named(self):  # t-198 R2.2, V2
+        verification = flat(self.raw[self.raw.index("## Verification"):self.raw.index("## Safety")])
+        self.assertIn("the verifier's run is the round's. Start it as `pa-full-suite`", verification)
+        self.assertIn("runs it on this Mac. - Run no mutations unless your handoff names one (from the spec or plan): "
+                      "at most 3 per check, each running only the tests that cover it, never the suite. A named "
+                      "mutation that survives fails its verification point (Must fix). A test gap found any other "
+                      "way (a line no test would catch) is a Recorded limit, never a Must fix, unless the spec or "
+                      "plan names it. - Run other test commands as `pa-run", verification)
 
     def test_t017_nit_lines_wrapped(self):  # VERIFY J1 recheck N1
         long = [line for line in self.raw.splitlines() if len(line) > 95]

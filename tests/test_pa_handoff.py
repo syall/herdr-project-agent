@@ -69,6 +69,11 @@ RULES = {"version": 1, "rules": [
     {"id": "r-few-mutations", "title": "Few mutations", "text": FEW, "status": "active", "order": 110},
     {"id": "r-test-runs", "title": "Where test runs go", "text": "Every other test run runs with pa-run.",
      "status": "active", "order": 175}]}
+NO_FEW = {"version": 1, "rules": [RULES["rules"][1]]}  # t-198: r-test-runs only
+DEFAULT_LINE = ("3. No mutations: this handoff names none (the default). A test gap you find is a Recorded limit, "
+                "never a Must fix, unless the spec or plan names it.")
+FEW_NOTE = ("r-few-mutations is active but no longer read: a check names no mutations unless --mutation names one "
+            "(the default); retire the rule in rules.json")
 GIT_ENV = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid", "GIT_COMMITTER_NAME": "t",
            "GIT_COMMITTER_EMAIL": "t@example.invalid", "GIT_AUTHOR_DATE": "2026-01-01T00:00:00Z",
            "GIT_COMMITTER_DATE": "2026-01-01T00:00:00Z", "GIT_CONFIG_NOSYSTEM": "1"}
@@ -252,24 +257,28 @@ class Golden(Base):
 
 
 class Numbers(Base):
-    """R3: the numbers come from the active rules, never from copied text."""
+    """t-198: no mutations by default; an active r-few-mutations is ignored with a note (d-306 Q1 b); --no-mutations
+    and --logic still accepted (Q3 a)."""
 
-    def test_n1_field_wins_over_text(self):
+    def test_n1_field_is_ignored_with_a_note(self):
         doc = json.loads(json.dumps(RULES))
         doc["rules"][0]["mutations"] = {"low": 1, "normal": 4, "high": 6, "recheck": 2}
         self.write_rules(doc)
-        _p, text, _ = self.ok("check", "t-1")
-        self.assertIn("3. At most 1 mutations on changed logic (r-few-mutations, low tier)", text)
+        _p, text, err = self.ok("check", "t-1")
+        self.assertIn("\n" + DEFAULT_LINE + "\n", text)
+        self.assertNotIn("At most", text)
+        self.assertEqual(err, "pa-handoff: note: " + FEW_NOTE + "\n")
 
-    def test_n2_no_rule_no_number(self):
+    def test_n2_no_rule_default(self):
         doc = json.loads(json.dumps(RULES))
         doc["rules"][0]["status"] = "retired"
         doc["rules"][1]["status"] = "retired"
         self.write_rules(doc)
-        _p, text, _ = self.ok("check", "t-1")
-        self.assertIn("3. A few mutations on changed logic (no active r-few-mutations rule gives a number), each running "
-                      "only the tests that cover it -> check-mut.log.", text)
+        _p, text, err = self.ok("check", "t-1")
+        self.assertIn("\n" + DEFAULT_LINE + "\n", text)
         self.assertNotIn("At most", text)
+        self.assertNotIn("A few mutations", text)
+        self.assertEqual(err, "")
         self.assertIn("(pa-run --local; say so)", text)  # no r-test-runs: the old wording
 
     def test_n3_unparsed_text_is_noted(self):
@@ -277,24 +286,29 @@ class Numbers(Base):
         doc["rules"][0]["text"] = "Mutations are few."
         self.write_rules(doc)
         _p, text, err = self.ok("verify", "t-2")
-        self.assertIn("A few mutations on changed logic (no active r-few-mutations rule gives a number)", text)
-        self.assertIn("r-few-mutations", err)
+        self.assertIn("\n" + DEFAULT_LINE + "\n", text)
+        self.assertEqual(err, "pa-handoff: note: " + FEW_NOTE + "\n")
 
-    def test_n4_recheck_without_logic_asks_none(self):
+    def test_n4_recheck_without_logic(self):
         self.round2()
-        _p, text, _ = self.ok("recheck", "t-1", "--round", "2")
-        self.assertIn("3. No mutations (r-few-mutations: a recheck whose fix changed no logic).", text)
+        _p, text, err = self.ok("recheck", "t-1", "--round", "2")
+        self.assertIn("\n" + DEFAULT_LINE + "\n", text)
         self.assertNotIn("check-mut-r2.log", text)
+        self.assertIn(FEW_NOTE, err)
 
     def test_n5_no_mutations_flag(self):
-        _p, text, _ = self.ok("check", "t-1", "--no-mutations")
-        self.assertIn("3. No mutations (r-few-mutations: a docs-only or test-only change).", text)
+        for rules in (RULES, NO_FEW):
+            with self.subTest(few=rules is RULES):
+                self.write_rules(rules)
+                _p, text, _ = self.ok("check", "t-1", "--no-mutations", "--force")
+                self.assertIn("\n3. No mutations (a docs-only or test-only change).\n", text)
+                self.assertNotIn("r-few-mutations: a docs-only", text)
 
     def test_n6_high_tier(self):
         self.task("t-2")["tier"] = "high"
         self.write_ledger()
         _p, text, _ = self.ok("verify", "t-2")
-        self.assertIn("At most 5 mutations on changed logic (r-few-mutations, high tier, first check)", text)
+        self.assertIn("\n" + DEFAULT_LINE + "\n", text)
         _p, text, _ = self.ok("fix", "t-2", "--base", self.c["C2"])
         self.assertIn("pa-full-suite once at the end of the Test phase, before the commit.", text)
         self.assertNotIn("No pa-full-suite", text)
@@ -304,7 +318,7 @@ class Numbers(Base):
         shutil.copy(os.path.join(self.ev("t-1"), "REVIEW.md"), os.path.join(self.ev("t-2"), "REVIEW.md"))
         _p, text, _ = self.ok("verify", "t-2", "--diff", "--round", "2", "--logic")
         self.assertIn("Diff: {}..{}.".format(self.c["C2"], self.c["C4"]), text)
-        self.assertIn("At most 3 mutations, on the changed lines only (r-few-mutations, a fix that changed logic)", text)
+        self.assertIn("\n" + DEFAULT_LINE + "\n", text)
         self.assertIn("Append '## Round 2 (diff {}..{})' to VERIFY.md".format(self.c["C2"], self.c["C4"]), text)
         self.assertTrue(_p.endswith("handoff-verify-r2.md"), _p)
 
@@ -486,6 +500,23 @@ class Wiring(unittest.TestCase):
     def test_w3_readme_and_37_parse(self):
         self.assertIn("## Handoffs (`pa-handoff`)", read(os.path.join(REPO, "README.md")))
         self.assertIn("runtime/tools/pa_handoff.py", read(os.path.join(REPO, "tests", "run-all.sh")))
+
+
+    def test_t198_readme_and_docstring(self):  # t-198 R7, R8, V8
+        readme = read(os.path.join(REPO, "README.md"))
+        section = " ".join(readme.split("## Handoffs (`pa-handoff`)", 1)[1].split("\n## ", 1)[0].split())
+        self.assertIn("pa-handoff verify t-30 --mutation \"plan V4: drop the lock re-read\" # a mutation the plan "
+                      "names (up to 3)", section)
+        self.assertIn("`--mutation TEXT` (up to 3) names a mutation the spec or plan asks for; `--no-mutations` asks "
+                      "for none.", section)
+        self.assertIn("A check names no mutations unless `--mutation` names one; an active `r-few-mutations` is not "
+                      "read (a note on stderr asks to retire it).", section)
+        self.assertNotIn("its `mutations` field", section)
+        doc = " ".join(pa_handoff.__doc__.split())
+        self.assertIn("[--no-mutations] [--mutation TEXT ...]", doc)
+        self.assertIn("r-few-mutations is not read (a note asks to retire it): no mutations unless --mutation names "
+                      "one;", doc)
+        self.assertIn("mutation", pa_handoff.FILE_OPTIONS)
 
 
 class T192JobFiles(Base):
@@ -706,6 +737,199 @@ class T190RulesBlock(Base):
         before = sorted(os.listdir(self.ev("t-2")))
         self.block("t-2", "--role", "build")
         self.assertEqual(sorted(os.listdir(self.ev("t-2"))), before)
+
+
+class Default(Base):
+    """t-198 R3, V3: with no r-few-mutations, every check, recheck and verify handoff names no mutations; no note."""
+
+    def setUp(self):
+        super().setUp()
+        self.write_rules(NO_FEW)
+
+    def clean(self, *argv):
+        _p, text, err = self.ok(*argv)
+        self.assertIn("\n" + DEFAULT_LINE + "\n", text)
+        self.assertEqual(err, "")
+        return text
+
+    def test_v3_check_recheck_verify(self):
+        self.clean("check", "t-1")
+        self.task("t-2")["tier"] = "high"
+        self.write_ledger()
+        self.clean("verify", "t-2")
+        self.task("t-2")["tier"] = "normal"
+        self.write_ledger()
+        self.clean("verify", "t-2", "--force")
+        self.round2()
+        self.clean("recheck", "t-1", "--round", "2")
+        self.clean("recheck", "t-1", "--round", "2", "--logic", "--force")
+        shutil.copy(os.path.join(self.ev("t-1"), "REVIEW.md"), os.path.join(self.ev("t-2"), "REVIEW.md"))
+        self.clean("verify", "t-2", "--diff", "--round", "2")
+        self.clean("verify", "t-2", "--diff", "--round", "2", "--logic", "--force")
+
+    def test_v3_no_few_text_under_runtime(self):
+        runtime = os.path.join(REPO, "runtime")
+        hits = []
+        for root, _dirs, files in os.walk(runtime):
+            for name in files:
+                try:
+                    text = read(os.path.join(root, name))
+                except (UnicodeDecodeError, OSError):
+                    continue
+                if "A few mutations" in text:
+                    hits.append(os.path.join(root, name))
+        self.assertEqual(hits, [])
+
+
+class Named(Base):
+    """t-198 R4, V4: --mutation names the spec's or plan's mutations, up to 3, in argv order, stripped."""
+
+    def line(self, out, *values):
+        return ("3. Only the mutations the spec or plan names, each running only the tests that cover it, never the "
+                "suite -> {}: {}. A named one that survives fails its verification point (Must fix). Run no "
+                "others.".format(out, "; ".join("({}) {}".format("abc"[i], v) for i, v in enumerate(values))))
+
+    def test_v4_one(self):
+        self.write_rules(NO_FEW)
+        _p, text, err = self.ok("check", "t-1", "--mutation", "  plan V4: drop the re.ASCII flag \t")
+        self.assertIn("\n" + self.line("check-mut.log", "plan V4: drop the re.ASCII flag") + "\n", text)
+        self.assertEqual(err, "")
+
+    def test_v4_three_in_argv_order(self):
+        self.write_rules(NO_FEW)
+        _p, text, _ = self.ok("verify", "t-2", "--job", "j2", "--mutation", "Z last first", "--mutation=b two",
+                              "--mutation", "a three")
+        self.assertIn("\n" + self.line("verify-j2-mut.log", "Z last first", "b two", "a three") + "\n", text)
+
+    def test_v4_recheck_round_2_and_rule_ignored(self):
+        self.round2()
+        _p, text, err = self.ok("recheck", "t-1", "--round", "2", "--mutation", "spec V2: skip the lock")
+        self.assertIn("\n" + self.line("check-mut-r2.log", "spec V2: skip the lock") + "\n", text)
+        self.assertEqual(err, "pa-handoff: note: " + FEW_NOTE + "\n")
+        self.assertNotIn("At most", text)
+
+    def test_h16_written_verbatim(self):
+        self.write_rules(NO_FEW)
+        for n, value in enumerate(("a `$(rm -rf ~)` b", "**bold**", "..", "/etc/passwd", "~/x")):
+            with self.subTest(value=value):
+                _p, text, _ = self.ok("check", "t-1", "--mutation", value, "--force")
+                self.assertIn("-> check-mut.log: (a) {}. A named".format(value), text)
+        self.assertTrue(os.path.isdir(os.path.expanduser("~")))
+
+
+class NamedRefusals(Base):
+    """t-198 §5 H1-H15, V5: each refusal writes no file and keeps an existing handoff's bytes."""
+
+    CASES = [  # (argv after the kind and task, exit code, part of the message)
+        (["--mutation", ""], 1, "empty"),
+        (["--mutation", " \t "], 1, "empty"),
+        (["--mutation", "a\nb"], 1, "one line"),
+        (["--mutation", "a\rb"], 1, "one line"),
+        (["--mutation", "a\u2028b"], 1, "one line"),
+        (["--mutation", "a\u2029b"], 1, "one line"),
+        (["--mutation", "a\x85b"], 1, "one line"),
+        (["--mutation", "a\x0bb"], 1, "one line"),
+        (["--mutation", "a\x0cb"], 1, "one line"),
+        (["--mutation", "a\x1cb"], 1, "one line"),
+        (["--mutation", "a\x1bb"], 1, "control character"),
+        (["--mutation", "a\x00b"], 1, "control character"),
+        (["--mutation", "a\tb"], 1, "control character"),
+        (["--mutation", "a\x7fb"], 1, "control character"),
+        (["--mutation=--force"], 1, "starts with '-'"),
+        (["--mutation=-x"], 1, "starts with '-'"),
+        (["--mutation", " -x"], 1, "starts with '-'"),
+        (["--mutation", "--force"], 2, "expected one argument"),
+        (["--mutation"], 2, "expected one argument"),
+        (["--mutation", "a", "--mutation", "b", "--mutation", "c", "--mutation", "d"], 1, "at most 3"),
+        (["--mutation", "Drop X", "--mutation", "drop x "], 1, "named twice"),
+        (["--mutation", "x" * 241], 1, "too long"),
+        (["--mutation", "a\udcffb"], 1, "not valid text"),
+        (["--mutation", "x", "--no-mutations"], 1, "--mutation and --no-mutations"),
+        (["--no-mutations", "--mutation", "x"], 1, "--mutation and --no-mutations"),
+        (["--mutations", "x"], 2, "unrecognized"),
+        (["--Mutation", "x"], 2, "unrecognized"),
+        (["--mut", "x"], 2, "unrecognized"),
+        (["--mutat", "x"], 2, "unrecognized"),
+        (["--no-mut"], 2, "unrecognized"),
+        (["-mutation", "x"], 2, "unrecognized"),
+    ]
+
+    def test_h1_h12_h14_h15(self):
+        path = os.path.join(self.ev("t-1"), "handoff-check.md")
+        for argv, code, part in self.CASES:
+            for force in ([], ["--force"]):
+                for existing in (False, True):
+                    with self.subTest(argv=argv, force=force, existing=existing):
+                        if existing:
+                            write(path, "the PA's edit\n")
+                        elif os.path.exists(path):
+                            os.unlink(path)
+                        got, out, err = self.run_tool("check", "t-1", *(argv + force))
+                        self.assertEqual(got, code, err)
+                        self.assertEqual(out, "")
+                        self.assertIn(part, err)
+                        self.assertNotIn("Traceback", err)
+                        if existing:
+                            self.assertEqual(read(path), "the PA's edit\n")
+                        else:
+                            self.assertFalse(os.path.exists(path))
+
+    def test_h11_240_is_accepted(self):
+        _p, text, _ = self.ok("check", "t-1", "--mutation", " " + "x" * 240 + " ")
+        self.assertIn("(a) {}.".format("x" * 240), text)
+
+    def test_h13_other_kinds(self):
+        full = git(self.wt, "rev-parse", "HEAD")
+        write(os.path.join(self.ev("t-1"), "REVIEW.md"), "## Must fix\n\nM1\n\nChecked: {}\nVerdict: must fix (1)\n".format(full))
+        for argv in (["fix", "t-1"], ["review", "t-2"], ["queue", "t-1"], ["rules", "t-1", "--role", "check"]):
+            with self.subTest(argv=argv):
+                before = sorted(os.listdir(self.ev(argv[1])))
+                code, out, err = self.run_tool(*(argv + ["--mutation", "x"]))
+                self.assertEqual(code, 1, err)
+                self.assertEqual(out, "")
+                self.assertIn("--mutation is for check, recheck and verify", err)
+                self.assertEqual(sorted(os.listdir(self.ev(argv[1]))), before)
+
+    def test_r9_no_abbreviations(self):
+        for argv in (["--pub"], ["--no-mutation"], ["--log"], ["--item", "x"], ["--forc"], ["--ro", "check"]):
+            with self.subTest(argv=argv):
+                code, out, _err = self.run_tool("check", "t-1", *argv)
+                self.assertEqual(code, 2)
+                self.assertEqual(out, "")
+
+
+class RuleShapes(Base):
+    """t-198 H17-H19: only id 'r-few-mutations' with status 'active' is the rule (then ignored, with a note)."""
+
+    def few(self, **change):
+        rule = dict(RULES["rules"][0], **change)
+        return {"version": 1, "rules": [rule, RULES["rules"][1]]}
+
+    def case(self, doc, noted):
+        if isinstance(doc, str):
+            write(os.path.join(self.space, "rules.json"), doc)
+        elif doc is None:
+            os.unlink(os.path.join(self.space, "rules.json"))
+        else:
+            self.write_rules(doc)
+        _p, text, err = self.ok("check", "t-1", "--force")
+        self.assertIn("\n" + DEFAULT_LINE + "\n", text)
+        self.assertEqual(FEW_NOTE in err, noted, err)
+
+    def test_h17_not_the_rule(self):
+        for change in ({"id": "R-few-mutations"}, {"id": "r-few-mutations "}, {"status": "Active"}, {"status": True}):
+            with self.subTest(change=change):
+                self.case(self.few(**change), False)
+
+    def test_h18_field_shapes(self):
+        for field in ({"low": True}, {"low": "2"}, {"low": -1}, {"low": 2.0}, [2]):
+            with self.subTest(field=field):
+                self.case(self.few(mutations=field), True)
+
+    def test_h19_rules_file_shapes(self):
+        for doc in (None, "{not json", json.dumps({"version": 1, "rules": {"r-few-mutations": {}}})):
+            with self.subTest(doc=doc):
+                self.case(doc, False)
 
 
 if __name__ == "__main__":
