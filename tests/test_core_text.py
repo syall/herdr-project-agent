@@ -287,12 +287,15 @@ class Orchestrator(unittest.TestCase):
                       "tier: low, the full suite once and the diff; normal, add a failing-first run for each fix commit; "
                       "high, what the plan's verification points ask. No tier runs mutations by default: a check "
                       "runs one only where the spec or plan names it as a verification point, at most 3 per check, "
-                      "each running only the tests that cover it, and `pa-handoff` lists it (`--mutation`). Record a `check` worker in the ledger with role `check`; the gate "
+                      "each running only the tests that cover it, and `pa-handoff` lists it (`--mutation`). A space rule may set other numbers. "
+                      "Record a `check` worker in the ledger with role `check`; the gate "
                       "counts it as the reviewer only for a low-tier task. - One git worktree", workers)  # J10
 
     def test_t198_r1_no_mutation_counts(self):  # t-198 R1, V1
         text = flat(self.raw)
-        for gone in ("at most 5 mutations", "at most 15 mutations", "A space rule may set other numbers."):
+        self.assertIn("and `pa-handoff` lists it (`--mutation`). A space rule may set other numbers. Record a "
+                      "`check` worker", text)
+        for gone in ("at most 5 mutations", "at most 15 mutations"):
             self.assertNotIn(gone, text)
 
     def test_t017_j5_interim_sentence_gone(self):  # J5 removes the amendment B4 interim
@@ -1474,7 +1477,7 @@ class T131WorktreesShape(unittest.TestCase):  # t-131 (t-020 J6 RL1): RECIPE.md 
 
 
 CORE_LINES_AT_BASE = {"orchestrator.md": 646, "worker.md": 112, "sdlc.md": 55}  # main 9928f7f, before t-190
-CORE_GROWTH_MAX = 12  # t-190 R9
+CORE_GROWTH_MAX = 19  # t-190 R9; 12 -> 19 for t-198's R1 + R2.2 text (card d-307 A)
 T190_STEP3 = ("decision card. Check each against the text of the active rules that govern it (a new task, a "
               "handoff's numbers, a merge, a card). Take new work from `pa-places tasks`")
 T190_RESTART = ("A rule `pa-doctor` lists as changed since your checkpoint is a `rules changed` notice you have not "

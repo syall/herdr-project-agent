@@ -3,7 +3,8 @@
 Python standard library only (3.7+).
 
   pa-handoff check|recheck|fix|verify|review|queue <task> [--job J] [--base B] [--round N] [--diff] [--logic]
-             [--no-mutations] [--public] [--items TEXT | --items-file PATH] [--repo R] [--space S] [--force]
+             [--no-mutations] [--mutation TEXT ...] [--public] [--items TEXT | --items-file PATH] [--repo R] [--space S]
+             [--force]
   pa-handoff rules <task> --role design|build|verifier|reviewer|check [--space S]
 
 It writes <space>/evidence/<task>/handoff-<kind>[-<job>][-r<round>].md and prints its path; the Project Agent adds
@@ -13,9 +14,10 @@ only its judgement lines (--items). What it reads:
   - git in that worktree: the branch, HEAD, the base (--base; else the merge-base with main; a recheck, a --diff
     verify or review and a fix: the last `Checked:` commit in REVIEW.md, else VERIFY.md) and the test commits in
     base..HEAD (a commit whose files are all under tests/; its subject is not read);
-  - rules.json: r-few-mutations (its `mutations` field {low, normal, high, recheck}, else the numbers in its text) and
-    r-test-runs (pa-run, --local only where a test needs this Mac) when active; no number is ever copied from an
-    inactive rule or from an earlier handoff;
+  - rules.json: r-test-runs (pa-run, --local only where a test needs this Mac) when active; an active
+    r-few-mutations is not read (a note asks to retire it): no mutations unless --mutation names one; --mutation
+    (check, recheck and verify, up to 3) lists the ones the spec or plan names (t-198); nothing is copied from an
+    earlier handoff;
   - <space>/flakes.txt: the known flakes, one per line (blank lines and lines starting with # skipped);
   - agent.json: the Project Agent's address (`terminal`) and profile (the --public line).
 queue wraps `pa-queue brief <task> --repo <main checkout>` from the task's queue.json entry (its repository and job;
@@ -33,6 +35,7 @@ import io
 import os
 import re
 import sys
+import unicodedata
 
 sys.dont_write_bytecode = True  # keep tools/ free of caches
 import pa  # noqa: E402
@@ -45,7 +48,14 @@ KIND_ROLE = {"check": "check", "recheck": "check", "queue": "check", "fix": "bui
 ROLE_TARGETS = {"design": ("design",), "build": ("build", "plan", "test"), "verifier": ("verifier", "test"),
                 "reviewer": ("reviewer", "review"), "check": ("check", "verifier", "reviewer", "test", "review")}
 BLOCK_MAX = 6000  # characters of the rules block
-FILE_OPTIONS = ("job", "base", "round", "diff", "logic", "no_mutations", "public", "items", "items_file", "repo", "force")
+FILE_OPTIONS = ("job", "base", "round", "diff", "logic", "no_mutations", "mutation", "public", "items", "items_file",
+                "repo", "force")
+MUTATION_KINDS = ("check", "recheck", "verify")  # t-198 R4: the kinds with a mutation step
+MUTATION_MAX, MUTATION_CHARS = 3, 240
+DEFAULT_MUTATIONS = ("No mutations: this handoff names none (the default). A test gap you find is a Recorded limit, "
+                     "never a Must fix, unless the spec or plan names it.")
+FEW_NOTE = ("r-few-mutations is active but no longer read: a check names no mutations unless --mutation names one "
+            "(the default); retire the rule in rules.json")
 TIERS = ("low", "normal", "high")
 FLAKES_FILE = "flakes.txt"
 QUEUE_FILE = "queue.json"  # pa-queue's file (read only here)
@@ -92,25 +102,41 @@ def active_rule(doc, rid):
     return None
 
 
-TEXT_NUMBERS = {"low": r"low tier at most (\d+)", "normal": r"normal(?: and high)? tier at most (\d+)",
-                "high": r"(?:normal and )?high tier at most (\d+)", "recheck": r"changed logic \(then at most (\d+)"}
-
-
-def mutation_numbers(doc):
-    """{low, normal, high, recheck: int or None} from the active r-few-mutations ({} when it is not active)."""
-    rule = active_rule(doc, "r-few-mutations")
-    if not rule:
-        return {}
-    field = rule.get("mutations") if isinstance(rule.get("mutations"), dict) else {}
-    text = rule.get("text") if isinstance(rule.get("text"), str) else ""
-    out = {}
-    for key, pattern in TEXT_NUMBERS.items():
-        value = field.get(key)
-        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
-            out[key] = value
-            continue
-        m = re.search(pattern, text)
-        out[key] = int(m.group(1)) if m else None
+def named_mutations(args):
+    """t-198 R4, §5: the --mutation values, stripped and checked, before any git or file read (a refusal writes
+    nothing). The messages name a value by its place, never echo it (a lone surrogate would not print)."""
+    values = args.mutation or []
+    if not values:
+        return []
+    if args.command not in MUTATION_KINDS:
+        raise Refused("--mutation is for check, recheck and verify")
+    if args.no_mutations:
+        raise Refused("--mutation and --no-mutations together")
+    if len(values) > MUTATION_MAX:
+        raise Refused("--mutation: at most {} per check (got {})".format(MUTATION_MAX, len(values)))
+    out, seen = [], set()
+    for n, raw in enumerate(values, 1):
+        v = raw.strip()
+        where = "--mutation {}".format(n)
+        if not v:
+            raise Refused("{}: empty".format(where))
+        try:
+            v.encode("utf-8")
+        except UnicodeEncodeError:
+            raise Refused("{}: not valid text".format(where))
+        if len(("x" + v + "x").splitlines()) > 1:
+            raise Refused("{}: one line only (no line break)".format(where))
+        if any(unicodedata.category(c) == "Cc" for c in v):
+            raise Refused("{}: a control character".format(where))
+        if v.startswith("-"):
+            raise Refused("{}: starts with '-'".format(where))
+        if len(v) > MUTATION_CHARS:
+            raise Refused("{}: too long (over {} characters; put detail in --items)".format(where, MUTATION_CHARS))
+        key = v.casefold()
+        if key in seen:
+            raise Refused("{}: named twice".format(where))
+        seen.add(key)
+        out.append(v)
     return out
 
 
@@ -317,7 +343,7 @@ def gather(args, directory, agent):
         f.tests = test_commits(f.wt, f.base)
     # rules and flakes
     rules = pa.read_json_safe(os.path.join(directory, "rules.json")) or {}
-    f.mutations = mutation_numbers(rules)
+    f.few = active_rule(rules, "r-few-mutations") is not None  # t-198 (d-306 Q1 b): ignored, with a note
     f.runs = RUNS if active_rule(rules, "r-test-runs") else RUNS_LOCAL
     return f
 
@@ -396,23 +422,17 @@ def failing_first(f):
 
 
 def mutations_line(f, out):
-    """(the mutation step's text, ending in ' -> out.' or '.')."""
+    """t-198: the mutation step's text. None by default; --mutation lists the named ones (up to 3); an active
+    r-few-mutations is not read, only noted."""
+    if f.few and FEW_NOTE not in f.notes:
+        f.notes.append(FEW_NOTE)
     if f.no_mutations:
-        return "No mutations (r-few-mutations: a docs-only or test-only change)."
-    if f.diff and not f.logic:
-        return "No mutations (r-few-mutations: a recheck whose fix changed no logic)."
-    key = "recheck" if f.diff else f.tier
-    n = f.mutations.get(key)
-    cover = "each running only the tests that cover it -> {}.".format(out)
-    if n is None and f.mutations:
-        f.notes.append("r-few-mutations is active but gives no {} number (its mutations field or text); the handoff "
-                       "names none".format(key))
-    if n is None:
-        return "A few mutations on changed logic (no active r-few-mutations rule gives a number), " + cover
-    if f.diff:
-        return "At most {} mutations, on the changed lines only (r-few-mutations, a fix that changed logic), {}".format(n, cover)
-    first = "" if f.tier == "low" else ", first check"
-    return "At most {} mutations on changed logic (r-few-mutations, {} tier{}), {}".format(n, f.tier, first, cover)
+        return "No mutations (a docs-only or test-only change)."
+    if f.named:
+        return ("Only the mutations the spec or plan names, each running only the tests that cover it, never the suite "
+                "-> {}: {}. A named one that survives fails its verification point (Must fix). Run no others.".format(
+                    out, "; ".join("({}) {}".format("abc"[i], v) for i, v in enumerate(f.named))))
+    return DEFAULT_MUTATIONS
 
 
 def rules_line(f, builder=False, reviewer=False):
@@ -570,10 +590,10 @@ def file_name(f):
 
 # ---- command ------------------------------------------------------------------------------------------------------
 
-def cmd_write(args):
+def cmd_write(args, named):
     directory, agent = pa.space_for_command(args.space)
     f = gather(args, directory, agent)
-    f.public, f.logic, f.no_mutations = args.public, args.logic, args.no_mutations
+    f.public, f.logic, f.no_mutations, f.named = args.public, args.logic, args.no_mutations, named
     builders = {"check": text_check, "recheck": text_recheck, "fix": text_fix, "verify": text_verify,
                 "review": text_review}
     lines = text_queue(f, args.repo) if f.kind == "queue" else builders[f.kind](f)
@@ -610,7 +630,8 @@ def cmd_rules(args):
 
 
 def parser():
-    p = argparse.ArgumentParser(prog="pa-handoff", description="Write a worker's handoff (t-169).")
+    p = argparse.ArgumentParser(prog="pa-handoff", description="Write a worker's handoff (t-169).",
+                                allow_abbrev=False)  # t-198 R9: no option is read from a prefix
     p.add_argument("command", choices=KINDS + ("rules",))
     p.add_argument("--role", help="rules: the job's role ({})".format(", ".join(ROLES)))
     p.add_argument("task")
@@ -618,8 +639,11 @@ def parser():
     p.add_argument("--base", help="the base commit (a fix: the checked commit)")
     p.add_argument("--round", type=int, help="default: the task's highest build round (a fix: one more)")
     p.add_argument("--diff", action="store_true", help="verify or review: a diff check from the checked commit")
-    p.add_argument("--logic", action="store_true", help="a diff check whose fix changed logic (r-few-mutations)")
-    p.add_argument("--no-mutations", action="store_true", help="a docs-only or test-only change")
+    p.add_argument("--logic", action="store_true",
+                   help="accepted for older commands; changes nothing (name a mutation with --mutation)")
+    p.add_argument("--no-mutations", action="store_true", help="no mutations (a docs-only or test-only change)")
+    p.add_argument("--mutation", action="append", metavar="TEXT",
+                   help="check, recheck, verify: a mutation the spec or plan names (up to {})".format(MUTATION_MAX))
     p.add_argument("--public", action="store_true", help="the repository is public (the Rules line says so)")
     items = p.add_mutually_exclusive_group()
     items.add_argument("--items", help="the Project Agent's judgement lines")
@@ -634,6 +658,7 @@ def main(argv=None):
     args = parser().parse_args(sys.argv[1:] if argv is None else argv)
     try:
         pa.ident(args.task, "task id")
+        named = named_mutations(args)
         if args.command == "rules":
             given = [o for o in FILE_OPTIONS if getattr(args, o) not in (None, False)]
             if given:
@@ -645,7 +670,7 @@ def main(argv=None):
             raise pa.Problem("--role is for pa-handoff rules")
         if args.job:
             pa.ident(args.job, "job")
-        return cmd_write(args)
+        return cmd_write(args, named)
     except Refused as r:
         print("pa-handoff: refused: {}".format(r), file=sys.stderr)
         return 1

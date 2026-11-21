@@ -91,15 +91,20 @@ folder and the address to report to.
 - Run the full test suite once per round with `pa-full-suite`; it appends the output to
   your task's `build.log`. A verifier or check worker runs it at HEAD and no other
   suite-wide run at that commit (not `--affected`, not the suite's own script); re-run
-  single tests only (a failing-first check, a mutation). Builders: high tier, run it at
-  the end of the Test phase, before the commit; low and normal tier, the affected tests
-  are enough, the verifier's run is the round's. Start it as `pa-full-suite` (in the
-  foreground, or your tool's own background run; never `&`, `nohup` or a wrapper), see it
-  with `pa-full-suite --status`, wait for it with `pa-full-suite --wait` (again while it
-  says still running), and run one long test module with `pa-full-suite --module test_x`.
-  The full suite may run on another machine the person configured (the part that needs
-  this Mac stays here); a pass there counts for the tree, and `pa-full-suite --local`
-  runs it on this Mac.
+  single tests only (a failing-first check, a mutation your handoff names). Builders:
+  high tier, run it at the end of the Test phase, before the commit; low and normal tier,
+  the affected tests are enough, the verifier's run is the round's. Start it as
+  `pa-full-suite` (in the foreground, or your tool's own background run; never `&`,
+  `nohup` or a wrapper), see it with `pa-full-suite --status`, wait for it with
+  `pa-full-suite --wait` (again while it says still running), and run one long test
+  module with `pa-full-suite --module test_x`. The full suite may run on another machine
+  the person configured (the part that needs this Mac stays here); a pass there counts
+  for the tree, and `pa-full-suite --local` runs it on this Mac.
+- Run no mutations unless your handoff names one (from the spec or plan): at most 3 per
+  check, each running only the tests that cover it, never the suite. A named mutation
+  that survives fails its verification point (Must fix). A test gap found any other way
+  (a line no test would catch) is a Recorded limit, never a Must fix, unless the spec or
+  plan names it.
 - Run other test commands as `pa-run -- <command>` (failing-first: `pa-run --commit <base>
   --overlay <test file> -- <command>`); it runs your worktree's tree, changes included, on
   such a machine. Use `pa-run --local` (this Mac) only where a rule allows it.

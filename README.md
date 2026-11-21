@@ -889,17 +889,19 @@ pa-handoff check t-12 --public --items "Judge D2."    # low tier: full check of 
 pa-handoff fix t-12 --items "M1 only"                 # the next round, from REVIEW.md's last Checked: and Verdict:
 pa-handoff recheck t-12 --logic                       # low tier: the diff from the checked commit to HEAD
 pa-handoff verify t-30 --job j2                       # normal or high tier (review is the same; --diff for a recheck)
+pa-handoff verify t-30 --mutation "plan V4: drop the lock re-read"   # a mutation the plan names (up to 3)
 pa-handoff queue t-12                                 # wraps `pa-queue brief` with the reviewer's lines
 pa-handoff rules t-12 --role build                    # only the rules block below, printed; writes nothing
 ```
 
 It reads the ledger task (title, tier, the job's worktree, its evidence folder, the round from its build workers),
-git in that worktree (branch, HEAD, base, the failing-test commits), the active `r-few-mutations` (its `mutations`
-field `{low, normal, high, recheck}`, else the numbers in its text) and `r-test-runs`, the known flakes in the
-space's `flakes.txt` (one per line, `#` for comments) and the address in `agent.json`. It writes
-`evidence/<task>/handoff-<kind>[-<job>][-r<round>].md`, prints its path, keeps an existing one unless `--force`,
-and writes nothing else: no ledger change, no worker started. `--items` (or `--items-file`) adds the judgement
-lines; `--public` adds the public-repository rule; `--no-mutations` is for docs-only or test-only changes.
+git in that worktree (branch, HEAD, base, the failing-test commits), the active `r-test-runs`, the known flakes in
+the space's `flakes.txt` (one per line, `#` for comments) and the address in `agent.json`. A check names no
+mutations unless `--mutation` names one; an active `r-few-mutations` is not read (a note on stderr asks to retire
+it). It writes `evidence/<task>/handoff-<kind>[-<job>][-r<round>].md`, prints its path, keeps an existing one
+unless `--force`, and writes nothing else: no ledger change, no worker started. `--items` (or `--items-file`) adds
+the judgement lines; `--public` adds the public-repository rule; `--mutation TEXT` (up to 3) names a mutation the
+spec or plan asks for; `--no-mutations` asks for none.
 
 **The space's rules in every handoff.** Each handoff ends, before its last line, with the rules for that job:
 every active rule in `rules.json` whose `appliesTo` is all, one of the job role's names (a build job also takes

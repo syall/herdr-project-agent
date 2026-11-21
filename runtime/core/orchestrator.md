@@ -416,11 +416,13 @@ Run `hc --skill` once to learn `hc`. Start workers with the profile's commands (
   names the file and, once a fresh reviewer wrote it, records it; then pa-gate and add.
 - Checks by tier (`sdlc.md`): low tier gets one `check` worker; normal a verifier and a
   reviewer; high a verifier and two reviewers when its review is full, one on a diff
-  review. Size the verifier's brief by tier: low, the full suite once, the diff, at most
-  5 mutations on changed logic; normal, add a failing-first run for each fix commit, at
-  most 15 mutations; high, what the plan's verification points ask. Record a `check`
-  worker in the ledger with role `check`; the gate counts it as the reviewer only for a
-  low-tier task.
+  review. Size the verifier's brief by tier: low, the full suite once and the diff;
+  normal, add a failing-first run for each fix commit; high, what the plan's verification
+  points ask. No tier runs mutations by default: a check runs one only where the spec or
+  plan names it as a verification point, at most 3 per check, each running only the
+  tests that cover it, and `pa-handoff` lists it (`--mutation`). A space rule may set
+  other numbers. Record a `check` worker in the ledger with role `check`; the gate counts
+  it as the reviewer only for a low-tier task.
 - One git worktree per job (a bug fix's tests and fix jobs share one, in turn). Record it in the
   task's `worktrees` with its job in the same ledger write as creating it, before starting a worker
   in it, and record the worker's `worktree` (its `--cwd`) in its entry. A task's `extraWorktrees`
